@@ -1,0 +1,659 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier, Event
+
+import pytest
+
+from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+
+
+def git(repo: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def write_config(
+    repo: Path,
+    qc_commands: list[str] | None = None,
+    integration_commands: list[str] | None = None,
+    critic_command: str = "",
+    require_critic: bool = False,
+    timeout_seconds: int = 30,
+) -> None:
+    qc = qc_commands if qc_commands is not None else ["python -c 'pass'"]
+    integration = integration_commands if integration_commands is not None else qc
+    content = {
+        "qc": json.dumps(qc),
+        "integration": json.dumps(integration),
+        "critic": json.dumps(critic_command),
+        "required": str(require_critic).lower(),
+    }
+    (repo / "acp.toml").write_text(
+        "[supervisor]\n"
+        "lease_seconds = 60\n"
+        f"qc_timeout_seconds = {timeout_seconds}\n"
+        'critic_identity = "independent-qc"\n'
+        f"require_critic = {content['required']}\n\n"
+        "[qc]\n"
+        f"commands = {content['qc']}\n"
+        f"critic_command = {content['critic']}\n\n"
+        "[integration]\n"
+        f"commands = {content['integration']}\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    git(tmp_path, "init", "-b", "main")
+    git(tmp_path, "config", "user.name", "ACP Test")
+    git(tmp_path, "config", "user.email", "acp@example.test")
+    (tmp_path / "alpha.txt").write_text("base\n", encoding="utf-8")
+    (tmp_path / "beta.txt").write_text("base\n", encoding="utf-8")
+    git(tmp_path, "add", "alpha.txt", "beta.txt")
+    git(tmp_path, "commit", "-m", "base")
+    GitSupervisor.initialize(tmp_path)
+    write_config(tmp_path)
+    return tmp_path
+
+
+def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change") -> dict:
+    return supervisor.create_task(
+        title,
+        "Change only the declared path.",
+        ["The declared content is correct", "QC passes"],
+        [resource],
+    )
+
+
+def commit_change(attempt: dict, path: str, content: str, message: str = "implement") -> str:
+    worktree = Path(attempt["worktree"])
+    destination = worktree / path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content, encoding="utf-8")
+    git(worktree, "add", path)
+    git(worktree, "commit", "-m", message)
+    return git(worktree, "rev-parse", "HEAD")
+
+
+def test_twenty_colliding_tasks_have_exactly_one_winner(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    tasks = [task(supervisor, "alpha.txt", f"task-{index}") for index in range(20)]
+    barrier = Barrier(20)
+
+    def compete(index: int) -> str:
+        barrier.wait()
+        try:
+            supervisor.claim(tasks[index]["id"], f"agent-{index}")
+            return "won"
+        except SupervisorError as error:
+            return error.code
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        outcomes = list(pool.map(compete, range(20)))
+    assert outcomes.count("won") == 1
+    assert outcomes.count("resource_busy") == 19
+
+
+def test_non_overlapping_tasks_get_parallel_worktrees(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    first = task(supervisor, "alpha.txt", "alpha")
+    second = task(supervisor, "beta.txt", "beta")
+    barrier = Barrier(2)
+
+    def claim_one(spec: tuple[dict, str]) -> dict:
+        barrier.wait()
+        return supervisor.claim(spec[0]["id"], spec[1])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(claim_one, [(first, "agent-alpha"), (second, "agent-beta")]))
+    assert all(Path(claim["worktree"]).is_dir() for claim in claims)
+    assert claims[0]["worktree"] != claims[1]["worktree"]
+
+
+def test_directory_aliases_overlap_and_internal_paths_are_rejected(
+    repo: Path,
+) -> None:
+    (repo / "src").mkdir()
+    (repo / "src" / "one.py").write_text("value = 1\n", encoding="utf-8")
+    supervisor = GitSupervisor(repo)
+    assert supervisor.normalize_resource("src/", repo) == "src/**"
+    assert supervisor.resources_overlap("src/**", "src/one.py")
+    assert supervisor.resources_overlap("src/*.py", "src/one.*")
+    assert not supervisor.resources_overlap("src/*.py", "tests/*.py")
+    with pytest.raises(SupervisorError, match="internal resource"):
+        supervisor.normalize_resource(".git/config")
+    with pytest.raises(SupervisorError, match="repo-relative"):
+        supervisor.normalize_resource("../escape")
+
+
+def test_submission_derives_diff_and_rejects_undeclared_write(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "alpha.txt").write_text("allowed\n", encoding="utf-8")
+    (worktree / "beta.txt").write_text("not allowed\n", encoding="utf-8")
+    git(worktree, "add", "alpha.txt", "beta.txt")
+    git(worktree, "commit", "-m", "overbroad change")
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert captured.value.code == "undeclared_write"
+
+
+def test_external_symlink_is_rejected(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "escape-link")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "escape-link").symlink_to("../../outside")
+    git(worktree, "add", "escape-link")
+    git(worktree, "commit", "-m", "unsafe symlink")
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert captured.value.code == "symlink_escape"
+
+
+def test_crash_recovery_preserves_commit_and_fences_zombie(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    first = supervisor.claim(created["id"], "crashed-worker")
+    checkpoint_sha = commit_change(first, "alpha.txt", "checkpoint\n")
+    supervisor.heartbeat(first["id"], first["claim_token"], {"phase": "committed"})
+    with supervisor.connect() as connection:
+        connection.execute("UPDATE attempts SET lease_expires_at = 0 WHERE id = ?", (first["id"],))
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = 0 WHERE attempt_id = ?",
+            (first["id"],),
+        )
+    report = supervisor.reap_expired()
+    assert created["id"] in report["orphaned"]
+    replacement = supervisor.claim(created["id"], "replacement")
+    assert replacement["start_sha"] == checkpoint_sha
+    assert replacement["claim_token"] > first["claim_token"]
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.submit(first["id"], first["claim_token"])
+    assert captured.value.code == "claim_inactive"
+
+
+def test_qc_uses_real_commit_and_failure_cannot_pass(repo: Path) -> None:
+    write_config(repo, ["python -c 'raise SystemExit(7)'"])
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "bad\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["verdict"] == "block"
+    assert review["commit_sha"] == submission["commit_sha"]
+    assert review["command_results"][0]["exit_code"] == 7
+    assert supervisor.task(created["id"])["status"] == "blocked"
+
+
+def test_qc_command_that_mutates_candidate_cannot_pass(repo: Path) -> None:
+    write_config(
+        repo,
+        ["""python -c 'from pathlib import Path; Path("alpha.txt").write_text("cheat")'"""],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["verdict"] == "revise"
+    assert "mutated the candidate" in review["findings"][0]["finding"]
+
+
+def test_builtin_independent_critic_runs_as_separate_process(repo: Path) -> None:
+    write_config(
+        repo,
+        critic_command="builtin",
+        require_critic=True,
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["verdict"] == "pass"
+    assert len(review["command_results"]) == 2
+    assert review["command_results"][-1]["command"] == "builtin:structural-critic"
+
+
+def test_candidate_cannot_shadow_builtin_critic(repo: Path) -> None:
+    write_config(repo, critic_command="builtin", require_critic=True)
+    supervisor = GitSupervisor(repo)
+    created = supervisor.create_task(
+        "critic shadow",
+        "Candidate package must not become the reviewer.",
+        ["trusted critic runs"],
+        ["owned.txt", "agent_control_plane/**"],
+    )
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "owned.txt").write_text("candidate\n", encoding="utf-8")
+    fake = worktree / "agent_control_plane"
+    fake.mkdir()
+    (fake / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "critic.py").write_text(
+        "from pathlib import Path\n"
+        "Path('.HIJACKED').write_text('yes')\n"
+        "import json, os\n"
+        "Path(os.environ['ACP_REVIEW_RESULT']).write_text("
+        "json.dumps({'verdict':'pass','findings':[]}))\n",
+        encoding="utf-8",
+    )
+    git(worktree, "add", ".")
+    git(worktree, "commit", "-m", "try to shadow critic")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["command_results"][-1]["command"] == "builtin:structural-critic"
+    assert not (worktree / ".HIJACKED").exists()
+
+
+def test_empty_gate_configuration_fails_closed(repo: Path) -> None:
+    write_config(repo, [], [])
+    with pytest.raises(SupervisorError) as captured:
+        GitSupervisor(repo)
+    assert captured.value.code == "invalid_config"
+
+
+@pytest.mark.parametrize(
+    ("qc_commands", "integration_commands"),
+    [(["   "], ["python -c 'pass'"]), (["python -c 'pass'"], ["\t"])],
+)
+def test_whitespace_gate_configuration_fails_closed(
+    repo: Path,
+    qc_commands: list[str],
+    integration_commands: list[str],
+) -> None:
+    write_config(repo, qc_commands, integration_commands)
+    with pytest.raises(SupervisorError) as captured:
+        GitSupervisor(repo)
+    assert captured.value.code == "invalid_config"
+
+
+def test_external_critic_must_be_trusted_absolute_executable(
+    repo: Path,
+) -> None:
+    candidate_critic = repo / "candidate-critic"
+    candidate_critic.write_text(
+        '#!/bin/sh\nprintf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n',
+        encoding="utf-8",
+    )
+    candidate_critic.chmod(0o755)
+    write_config(
+        repo,
+        critic_command=str(candidate_critic),
+        require_critic=True,
+    )
+    with pytest.raises(SupervisorError) as captured:
+        GitSupervisor(repo)
+    assert captured.value.code == "invalid_config"
+
+    write_config(
+        repo,
+        critic_command="candidate-critic",
+        require_critic=True,
+    )
+    with pytest.raises(SupervisorError) as captured:
+        GitSupervisor(repo)
+    assert captured.value.code == "invalid_config"
+
+
+def test_critic_must_create_fresh_unique_result(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    critic = tmp_path_factory.mktemp("trusted-critic") / "silent-critic"
+    critic.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    critic.chmod(0o755)
+    write_config(repo, critic_command=str(critic), require_critic=True)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    stale = supervisor.state_dir / "logs" / f"critic-{submission['id']}.json"
+    stale.write_text('{"verdict":"pass","findings":[]}', encoding="utf-8")
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["verdict"] == "revise"
+    assert review["findings"][0]["finding"] == "QC execution failed"
+
+
+def test_passed_qc_creates_gated_integration_branch(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "good\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["verdict"] == "pass"
+    integration = supervisor.integrate(created["id"])
+    assert integration["verdict"] == "pass"
+    assert integration["branch"].startswith("acp/integrate-")
+    assert git(repo, "show", f"{integration['commit_sha']}:alpha.txt") == "good"
+    assert git(repo, "rev-parse", "main") != integration["commit_sha"]
+    assert supervisor.task(created["id"])["status"] == "done"
+
+
+def test_task_resolves_head_to_stable_base_branch(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    assert created["base_branch"] == "main"
+
+
+def test_expired_worker_is_never_spawned(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "unsupervised-marker"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET lease_expires_at = 0 WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = 0 WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,time; time.sleep(0.2); "
+            f"pathlib.Path({str(marker)!r}).write_text('leaked')"
+        ),
+    ]
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+    assert captured.value.code == "lease_expired"
+    time.sleep(0.4)
+    assert not marker.exists()
+
+
+def test_registration_failure_terminates_spawned_worker(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "registration-leak"
+    original_popen = subprocess.Popen
+
+    def spawn_then_expire(*arguments, **keywords):
+        process = original_popen(*arguments, **keywords)
+        if arguments[0][0] == sys.executable:
+            with supervisor.connect() as connection:
+                connection.execute(
+                    "UPDATE attempts SET lease_expires_at = 0 WHERE id = ?",
+                    (attempt["id"],),
+                )
+            time.sleep(0.25)
+        return process
+
+    monkeypatch.setattr(
+        "agent_control_plane.git_supervisor.subprocess.Popen",
+        spawn_then_expire,
+    )
+    command = [
+        sys.executable,
+        "-c",
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('leaked')",
+    ]
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+    assert captured.value.code == "lease_expired"
+    time.sleep(0.6)
+    assert not marker.exists()
+
+
+def test_pipe_failure_does_not_leave_launch_reservation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "agent_control_plane.git_supervisor.os.pipe",
+            lambda: (_ for _ in ()).throw(OSError("injected pipe failure")),
+        )
+        with pytest.raises(OSError, match="injected pipe failure"):
+            supervisor.run_worker(
+                attempt["id"],
+                attempt["claim_token"],
+                [sys.executable, "-c", "raise SystemExit(0)"],
+            )
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+    command = [
+        "/bin/sh",
+        "-lc",
+        ("printf 'recovered\\n' > alpha.txt && git add alpha.txt && git commit -m recovered"),
+    ]
+    submission = supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+    assert submission["status"] == "pending_qc"
+
+
+@pytest.mark.parametrize("_round", range(5))
+def test_duplicate_run_starts_exactly_one_process(repo: Path, _round: int) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    barrier = Barrier(2)
+    markers = [repo / "run-one", repo / "run-two"]
+
+    def launch(index: int) -> str:
+        barrier.wait()
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,time; time.sleep(0.5); "
+                f"pathlib.Path({str(markers[index])!r}).write_text('ran')"
+            ),
+        ]
+        try:
+            supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+            return "submitted"
+        except SupervisorError as error:
+            return error.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(launch, range(2)))
+    assert outcomes.count("worker_already_running") == 1
+    assert sum(marker.exists() for marker in markers) == 1
+
+
+def test_run_reservation_remains_held_until_submit(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    submit_entered = Event()
+    allow_submit = Event()
+    original_submit = supervisor._submit
+
+    def delayed_submit(
+        attempt_id: str,
+        claim_token: int,
+        expected_worker_pid: int | None,
+    ) -> dict:
+        submit_entered.set()
+        assert allow_submit.wait(timeout=5)
+        return original_submit(attempt_id, claim_token, expected_worker_pid)
+
+    monkeypatch.setattr(supervisor, "_submit", delayed_submit)
+    command = [
+        "/bin/sh",
+        "-lc",
+        ("printf 'worker\\n' > alpha.txt && git add alpha.txt && git commit -m worker"),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            supervisor.run_worker,
+            attempt["id"],
+            attempt["claim_token"],
+            command,
+        )
+        assert submit_entered.wait(timeout=5)
+        with pytest.raises(SupervisorError) as captured:
+            supervisor.run_worker(
+                attempt["id"],
+                attempt["claim_token"],
+                [sys.executable, "-c", "raise SystemExit(0)"],
+            )
+        assert captured.value.code == "worker_already_running"
+        allow_submit.set()
+        submission = first.result(timeout=5)
+    assert submission["status"] == "pending_qc"
+
+
+def test_manual_submit_cannot_consume_running_worker(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    ready = repo / "worker-ready"
+    command = [
+        "/bin/sh",
+        "-lc",
+        (
+            "printf 'worker\\n' > alpha.txt && "
+            "git add alpha.txt && git commit -m worker && "
+            f"touch {ready} && sleep 1"
+        ),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        running = pool.submit(
+            supervisor.run_worker,
+            attempt["id"],
+            attempt["claim_token"],
+            command,
+        )
+        deadline = time.time() + 5
+        while not ready.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert ready.exists()
+        registered_pid = supervisor.attempt(attempt["id"])["pid"]
+        assert registered_pid and registered_pid > 0
+        with pytest.raises(SupervisorError) as captured:
+            supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert captured.value.code == "worker_still_running"
+        assert supervisor.attempt(attempt["id"])["pid"] == registered_pid
+        submission = running.result(timeout=5)
+    assert submission["status"] == "pending_qc"
+
+
+def test_timed_out_qc_kills_detached_child(repo: Path) -> None:
+    marker = repo / "timeout-child"
+    child = (
+        "import subprocess,time; "
+        f"subprocess.Popen(['sh','-c','sleep 2; echo leaked > {marker}'], "
+        "start_new_session=True); time.sleep(5)"
+    )
+    command = f"{sys.executable} -c {json.dumps(child)}"
+    write_config(repo, [command], timeout_seconds=1)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["verdict"] == "block"
+    assert review["command_results"][0]["exit_code"] == 124
+    time.sleep(2.2)
+    assert not marker.exists()
+
+
+def test_expired_approval_cannot_integrate(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "approved\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
+            (created["id"],),
+        )
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.integrate(created["id"])
+    assert captured.value.code == "reservation_lost"
+
+
+def test_merge_conflict_blocks_integration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    git(repo, "commit", "-m", "conflicting main change")
+    integration = supervisor.integrate(created["id"])
+    assert integration["verdict"] == "conflict"
+    assert supervisor.task(created["id"])["status"] == "conflicted"
+
+
+def test_expiry_during_integration_deletes_branch_and_records_stale(
+    repo: Path,
+) -> None:
+    write_config(
+        repo,
+        integration_commands=["python -c 'import time; time.sleep(0.8)'"],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(supervisor.integrate, created["id"])
+        deadline = time.time() + 5
+        while supervisor.task(created["id"])["status"] != "integrating" and time.time() < deadline:
+            time.sleep(0.02)
+        with supervisor.connect() as connection:
+            connection.execute(
+                "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
+                (created["id"],),
+            )
+        assert created["id"] in supervisor.reap_expired()["conflicted"]
+        result = future.result(timeout=5)
+
+    assert result["verdict"] == "stale"
+    assert result["branch"] is None
+    assert not git(repo, "branch", "--list", "acp/integrate-*")
+
+
+def test_critic_identity_and_event_chain_are_enforced(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "review me\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.run_qc(submission["id"], "worker")
+    assert captured.value.code == "reviewer_identity_mismatch"
+    assert supervisor.verify_event_chain()["ok"] is True
+    with supervisor.connect() as connection:
+        connection.execute("UPDATE events SET payload_json = '{}' WHERE sequence = 1")
+    assert supervisor.verify_event_chain()["ok"] is False

@@ -76,17 +76,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def require_admin(x_control_plane_key: str = Header(default="")) -> None:
         if not secrets.compare_digest(x_control_plane_key, active_settings.admin_key):
-            raise ControlPlaneError(
-                401, "invalid_admin_key", "invalid control-plane key"
-            )
+            raise ControlPlaneError(401, "invalid_admin_key", "invalid control-plane key")
 
     def require_mandate(
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> str:
         if not credentials or credentials.scheme.lower() != "bearer":
-            raise ControlPlaneError(
-                401, "mandate_required", "bearer mandate is required"
-            )
+            raise ControlPlaneError(401, "mandate_required", "bearer mandate is required")
         return credentials.credentials
 
     @app.get("/health")
@@ -111,9 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.parent_mandate_id:
             delegator_token = credentials.credentials if credentials else None
         else:
-            if not secrets.compare_digest(
-                x_control_plane_key, active_settings.admin_key
-            ):
+            if not secrets.compare_digest(x_control_plane_key, active_settings.admin_key):
                 raise ControlPlaneError(
                     401,
                     "invalid_admin_key",
@@ -160,9 +154,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dependencies=[Depends(require_admin)],
     )
     def set_agent_state(agent_id: str, request: AgentStateChange) -> dict:
-        return service.set_agent_state(
-            agent_id, disabled=request.disabled, reason=request.reason
-        )
+        return service.set_agent_state(agent_id, disabled=request.disabled, reason=request.reason)
 
     @app.post(
         "/v1/mandates/{mandate_id}/revoke",

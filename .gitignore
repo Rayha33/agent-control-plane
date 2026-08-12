@@ -1,4 +1,5 @@
 .firecrawl/
+.acp/
 .venv/
 .pytest_cache/
 .ruff_cache/

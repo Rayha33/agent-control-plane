@@ -21,13 +21,13 @@ uv sync --extra dev
 Run the same checks as CI:
 
 ```bash
-uvx ruff format --check src tests
-uvx ruff check src tests
-uv run pytest
+uv run --extra dev ruff format --check src tests
+uv run --extra dev ruff check src tests
+uv run --extra dev pytest
 uv build
 ```
 
-Use `uvx ruff format src tests` to apply formatting.
+Use <code>uv run --extra dev ruff format src tests</code> to apply formatting.
 
 ## Pull requests
 
@@ -51,5 +51,6 @@ artifacts.
 - Preserve evidence across retries and reassignments.
 - Keep the worker and its reviewer independent.
 - Make crash recovery observable and auditable.
+- Derive changed paths and immutable candidate evidence from Git, not workers.
 
 Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).

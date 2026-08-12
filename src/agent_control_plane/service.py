@@ -129,9 +129,7 @@ class ControlPlaneService:
                 )
             parent_scopes = parent_claims["scopes"]
             requested_scopes = [scope.model_dump() for scope in request.scopes]
-            if not all(
-                scope_is_delegable(scope, parent_scopes) for scope in requested_scopes
-            ):
+            if not all(scope_is_delegable(scope, parent_scopes) for scope in requested_scopes):
                 raise ControlPlaneError(
                     403, "scope_escalation", "child scopes exceed parent authority"
                 )
@@ -141,8 +139,7 @@ class ControlPlaneService:
                 )
             parent_max = parent["max_amount_cents"]
             if parent_max is not None and (
-                request.max_amount_cents is None
-                or request.max_amount_cents > parent_max
+                request.max_amount_cents is None or request.max_amount_cents > parent_max
             ):
                 raise ControlPlaneError(
                     403,
@@ -222,9 +219,7 @@ class ControlPlaneService:
             raise ControlPlaneError(401, "mandate_expired", "mandate is expired")
         self._assert_mandate_chain_active(mandate)
         if json.loads(mandate["scopes_json"]) != claims["scopes"]:
-            raise ControlPlaneError(
-                401, "scope_mismatch", "token scopes do not match mandate"
-            )
+            raise ControlPlaneError(401, "scope_mismatch", "token scopes do not match mandate")
         return claims, mandate
 
     def authenticated_agent(
@@ -279,9 +274,7 @@ class ControlPlaneService:
             if policy_matches(policy, request.action, request.resource)
         ]
         if any(policy["effect"] == "deny" for policy in matching):
-            return self._decision(
-                "denied", "denied by policy", claims["actor"], request, base
-            )
+            return self._decision("denied", "denied by policy", claims["actor"], request, base)
 
         limits = [
             policy["max_amount_cents"]
@@ -310,12 +303,8 @@ class ControlPlaneService:
 
         return self._decision("allowed", "authorized", claims["actor"], request, base)
 
-    def resolve_approval(
-        self, action_id: str, request: ApprovalResolve
-    ) -> dict[str, Any]:
-        row = self.database.one(
-            "SELECT * FROM action_requests WHERE id = ?", (action_id,)
-        )
+    def resolve_approval(self, action_id: str, request: ApprovalResolve) -> dict[str, Any]:
+        row = self.database.one("SELECT * FROM action_requests WHERE id = ?", (action_id,))
         if not row:
             raise ControlPlaneError(404, "action_not_found", "action request not found")
         if row["status"] != "pending":
@@ -340,9 +329,7 @@ class ControlPlaneService:
         return self.action_request(action_id)
 
     def action_request(self, action_id: str) -> dict[str, Any]:
-        row = self.database.one(
-            "SELECT * FROM action_requests WHERE id = ?", (action_id,)
-        )
+        row = self.database.one("SELECT * FROM action_requests WHERE id = ?", (action_id,))
         if not row:
             raise ControlPlaneError(404, "action_not_found", "action request not found")
         return {
@@ -358,9 +345,7 @@ class ControlPlaneService:
             "resolved_at": row["resolved_at"],
         }
 
-    def set_agent_state(
-        self, agent_id: str, *, disabled: bool, reason: str
-    ) -> dict[str, Any]:
+    def set_agent_state(self, agent_id: str, *, disabled: bool, reason: str) -> dict[str, Any]:
         agent = self._agent(agent_id)
         if not agent:
             raise ControlPlaneError(404, "agent_not_found", "agent not found")
@@ -380,12 +365,8 @@ class ControlPlaneService:
         if not row:
             raise ControlPlaneError(404, "mandate_not_found", "mandate not found")
         if row["revoked"]:
-            raise ControlPlaneError(
-                409, "mandate_revoked", "mandate is already revoked"
-            )
-        self.database.execute(
-            "UPDATE mandates SET revoked = 1 WHERE id = ?", (mandate_id,)
-        )
+            raise ControlPlaneError(409, "mandate_revoked", "mandate is already revoked")
+        self.database.execute("UPDATE mandates SET revoked = 1 WHERE id = ?", (mandate_id,))
         self.database.append_audit(
             "mandate.revoked",
             "admin",
@@ -430,9 +411,7 @@ class ControlPlaneService:
     def _agent_view(agent: dict[str, Any]) -> dict[str, Any]:
         return agent | {"disabled": bool(agent["disabled"])}
 
-    def _create_action_request(
-        self, mandate: dict[str, Any], request: AuthorizationRequest
-    ) -> str:
+    def _create_action_request(self, mandate: dict[str, Any], request: AuthorizationRequest) -> str:
         action_id = str(uuid.uuid4())
         self.database.execute(
             """
@@ -461,13 +440,9 @@ class ControlPlaneService:
         request: AuthorizationRequest,
         base: dict[str, Any],
     ) -> dict[str, Any]:
-        row = self.database.one(
-            "SELECT * FROM action_requests WHERE id = ?", (approval_id,)
-        )
+        row = self.database.one("SELECT * FROM action_requests WHERE id = ?", (approval_id,))
         if not row:
-            return self._decision(
-                "denied", "approval does not exist", actor, request, base
-            )
+            return self._decision("denied", "approval does not exist", actor, request, base)
         matches_request = (
             row["mandate_id"] == mandate["id"]
             and row["action"] == request.action
@@ -490,9 +465,7 @@ class ControlPlaneService:
             (approval_id,),
         )
         if updated != 1:
-            return self._decision(
-                "denied", "approval was already consumed", actor, request, base
-            )
+            return self._decision("denied", "approval was already consumed", actor, request, base)
         return self._decision(
             "allowed",
             "authorized with one-time approval",

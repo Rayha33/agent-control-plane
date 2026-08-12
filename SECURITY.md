@@ -4,6 +4,20 @@ Agent Control Plane is an early reference implementation. Do not treat it as a
 production security boundary without the hardening described in the README and
 architecture document.
 
+The Git supervisor executes configured QC, critic, worker, and integration
+commands. Those commands may execute candidate repository code. Use an
+OS/container sandbox and restricted network credentials for untrusted code.
+Only trusted maintainers should change <code>acp.toml</code>.
+
+Local reviewer names are policy identities, not cryptographically authenticated
+humans or model providers. A high-assurance deployment must authenticate each
+runner and place the critic behind separate credentials.
+
+The local event hash chain detects missing or modified records but is not
+tamper-proof against a database administrator who can rewrite and recompute the
+chain. Export chain heads to an independent append-only store when that threat
+matters.
+
 ## Supported versions
 
 Security fixes are applied to the latest commit on `main`. No released version
@@ -30,6 +44,9 @@ the private advisory.
 - stale fencing-token acceptance;
 - double claims or resource-lease races;
 - worker self-approval;
+- undeclared Git writes, path traversal, or symlink escape;
+- QC that observes the wrong or mutable commit;
+- arbitrary code execution through untrusted QC configuration;
 - audit-chain corruption or evidence replacement;
 - authentication, injection, or denial-of-service flaws; and
 - secrets committed to the repository or logs.

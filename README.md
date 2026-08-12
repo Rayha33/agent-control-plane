@@ -1,165 +1,229 @@
-# Agent Control Plane
+# ACP: Git work safety for AI coding agents
 
 [![CI](https://github.com/Rayha33/agent-control-plane/actions/workflows/ci.yml/badge.svg)](https://github.com/Rayha33/agent-control-plane/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](pyproject.toml)
 
-An open-source reference control plane for AI-agent teams: delegated authority,
-collision-free work ownership, independent quality control, and tamper-evident
-audit.
+ACP is a provider-neutral safety kernel for teams running several coding agents
+against one Git repository.
 
-Agent Control Plane is designed around two failure modes that become more
-expensive as agents become more capable:
+It sits below Claude Code, Codex, Cursor, custom runners, and CI. ACP gives each
+task an exclusive write set and dedicated worktree, rejects stale workers with
+monotonic fencing tokens, preserves committed work after crashes, derives
+submission evidence from Git, and runs quality control in a fresh detached
+checkout before creating an integration branch.
 
-- an agent acts with more authority than it should; and
-- multiple agents edit or ship the same thing without a reliable owner or
-  independent reviewer.
+The narrow promise is:
 
-The service provides the coordination primitives needed to prevent both.
+> Parallel agents may fail, restart, or disagree. Only work that still owns its
+> resources and passes independent, reproducible gates can reach integration.
 
-## What it guarantees
+## Why this exists
 
-### Authority
+Worktrees solve checkout isolation, but not ownership or acceptance:
 
-- Signed, expiring mandate tokens
-- User → agent → child-agent delegation chains
-- Scope attenuation: a child cannot receive more authority than its parent
-- Deny-first policy overlays, transaction limits, and one-time approvals
-- Immediate agent kill switches and mandate revocation
+- two agents can still be assigned overlapping files;
+- a delayed agent can resume after a replacement and publish stale work;
+- a crashed session can leave useful commits but no durable recovery record;
+- the worker's own summary is not independent evidence; and
+- review can inspect the wrong checkout or a mutable branch.
 
-### Collision-free coordination
+Vendor documentation acknowledges these failure classes. Anthropic warns that
+same-file edits can overwrite, task status can lag, and in-process teammates
+cannot be resumed. OpenAI recommends parallel subagents mainly for read-heavy
+work because write-heavy work creates conflicts and coordination overhead.
+Existing worktree products isolate execution but generally leave overlap
+partitioning and final review to the operator.
 
-- Dependency-aware task DAGs
-- Atomic task claims
-- Exact-resource leases for files, services, datasets, or deployment targets
-- Monotonic fencing tokens that reject stale or “zombie” workers
-- Heartbeats, checkpoints, expired-claim recovery, and explicit conflict states
-- Immutable artifact submissions tied to the claim and resource versions
+See [Research](docs/RESEARCH.md) for the evidence, alternatives, and product
+wedge.
 
-### Independent QC
+## What is implemented
 
-- Separate worker and QC roles
-- A worker cannot review its own submission
-- Structured findings with severity, evidence, and required fixes
-- Resources stay reserved during review, preventing another agent from
-  overwriting work that has not passed QC
-- Completion remains closed until the latest submission receives an independent
-  pass
+| Control | Enforced behavior |
+|---|---|
+| Normalized resources | Repo-relative paths, globs, directory scopes, and logical resources |
+| Atomic claims | SQLite immediate transactions make a colliding claim fail closed |
+| Fencing | Every attempt and exact resource receives a monotonic token |
+| Worktree ownership | Every successful claim provisions a dedicated branch and worktree |
+| Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
+| Server-derived evidence | Commit, tree, binary patch hash, and changed paths come from Git |
+| Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
+| Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
+| Structured critic | An optional external critic returns evidence-based findings |
+| Integration gate | ACP merges into a new integration branch and reruns configured commands |
+| Audit | Git-supervisor mutations and hash-chained events share a transaction |
 
-### Evidence
+ACP never pushes or updates the base branch. A passing integration leaves a
+named integration branch for a human or existing merge queue.
 
-- Append-only, hash-chained audit events
-- Audit-chain verification endpoint
-- Review and submission history attached to every task
+## Quick start
 
-## Architecture
+Requirements: Git, Python 3.11+, and
+[uv](https://docs.astral.sh/uv/).
 
-```text
- planner / admin
-       │ creates task DAG + declares exact resources
-       ▼
-┌──────────────────────── Agent Control Plane ─────────────────────────┐
-│ authority │ atomic claims + leases │ submissions │ independent QC   │
-│ mandates  │ fencing + heartbeats   │ evidence    │ completion gate  │
-└─────┬──────────────┬────────────────────┬───────────────────┬────────┘
-      │              │                    │                   │
-      ▼              ▼                    ▼                   ▼
- worker A       isolated workspace   QC agent B        hash-chain audit
-      │              │                    │
-      └──── artifact + test evidence ─────┘
-```
-
-The control plane owns coordination state. Agent runners should give each claim
-its own branch, worktree, container, or sandbox. Every write-capable operation
-must carry the current fencing tokens; a stale token is rejected even if an old
-worker resumes after a crash.
-
-See [Architecture](docs/ARCHITECTURE.md) for the state machine, invariants, and
-production boundaries.
-
-## Run locally
-
-Prerequisites: Python 3.11+ and [uv](https://docs.astral.sh/uv/).
-
-```bash
+~~~bash
 git clone https://github.com/Rayha33/agent-control-plane.git
 cd agent-control-plane
 uv sync --extra dev
+uv run --extra dev acp doctor
+~~~
 
+Initialize another repository:
+
+~~~bash
+uv run --project /path/to/agent-control-plane acp --repo /path/to/your-repo init
+~~~
+
+Create and claim bounded work:
+
+~~~bash
+uv run --extra dev acp task-add --title "Harden token refresh" --accept "refresh regression tests pass" --resource "src/auth/**" --resource "tests/auth/**"
+
+uv run --extra dev acp claim TASK_ID --agent codex-session-17
+~~~
+
+The claim response contains <code>worktree</code>, <code>claim_token</code>,
+and per-resource fencing tokens. Run your agent in that worktree, or let ACP
+supervise it:
+
+~~~bash
+uv run --extra dev acp run ATTEMPT_ID --token CLAIM_TOKEN -- your-agent-command
+~~~
+
+The command must leave a clean, committed worktree. A successful supervised run
+submits automatically. For a manually operated agent:
+
+~~~bash
+uv run --extra dev acp heartbeat ATTEMPT_ID --token CLAIM_TOKEN --checkpoint '{"phase":"tests"}'
+uv run --extra dev acp submit ATTEMPT_ID --token CLAIM_TOKEN
+uv run --extra dev acp qc SUBMISSION_ID
+uv run --extra dev acp integrate TASK_ID
+~~~
+
+All commands emit JSON. Local runtime state and logs live under ignored
+<code>.acp/</code>; configuration is tracked in <code>acp.toml</code>.
+
+## Independent critic contract
+
+Deterministic QC commands are always authoritative: a failing command cannot be
+overridden by a critic.
+
+ACP init enables a separate built-in structural critic process and requires at
+least one deterministic QC command, one integration command, and a critic.
+Replace the baseline critic with a different model/provider wrapper for semantic
+or high-assurance review:
+
+~~~toml
+[supervisor]
+critic_identity = "independent-qc"
+require_critic = true
+
+[qc]
+commands = [
+  "uv run --extra dev ruff check .",
+  "uv run --extra dev pytest -q",
+]
+critic_command = "/absolute/path/outside/the/repository/critic-wrapper"
+~~~
+
+ACP starts the critic itself in the detached candidate worktree. It provides:
+
+- <code>ACP_REVIEW_PACKET</code>: task specification and Git-derived evidence;
+- <code>ACP_REVIEW_RESULT</code>: destination for structured JSON.
+
+The worker's conclusion is deliberately excluded. The critic must emit:
+
+~~~json
+{
+  "verdict": "pass",
+  "findings": []
+}
+~~~
+
+Negative verdicts require findings with severity, requirement, finding,
+evidence, and required fix. Use a different provider/model in the wrapper when
+correlated model bias is unacceptable.
+
+External critic configuration is deliberately strict: it must be a single
+absolute executable path outside the repository. ACP invokes it directly, not
+through the candidate's shell or import path. Put model/provider arguments and
+credentials inside that trusted wrapper.
+
+The built-in critic checks review scope, regression-test signals, sensitive
+paths, conflict markers, and deterministic results. It is an independent
+process, but it is rule-based—not a substitute for a separately credentialed AI
+or human reviewer when semantic judgment matters.
+
+## Recovery model
+
+<code>acp reap</code> or any new claim discovers expired attempts. ACP:
+
+1. records the old worktree's current committed SHA;
+2. marks the attempt orphaned;
+3. releases its lease but preserves its branch and worktree;
+4. increments fencing for the replacement; and
+5. starts the replacement from the last recorded commit.
+
+An old process may continue modifying its isolated worktree, but its stale token
+cannot heartbeat, submit, pass QC, or integrate.
+
+## API and authority layer
+
+The repository also retains the FastAPI authority prototype from v0.1: signed
+mandates, delegation attenuation, policy checks, approvals, agent kill
+switches, and coordination endpoints.
+
+~~~bash
 export ACP_ADMIN_KEY="replace-with-a-long-random-value"
 export ACP_SIGNING_KEY="replace-with-an-independent-long-random-value"
 export ACP_DATABASE_PATH="agent_control_plane.db"
+uv run uvicorn agent_control_plane.app:create_app --factory
+~~~
 
-uv run uvicorn agent_control_plane.app:create_app --factory --reload
-```
+The Git supervisor is the primary v0.2 product path. The HTTP authority API is a
+separate reference layer and does not create Git worktrees.
 
-Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive
-API. The built-in defaults are intentionally obvious and must only be used for
-local development.
+## Honest boundaries
 
-## Minimal coordinated-work flow
+ACP v0.2 is a local-first alpha, not a complete sandbox or distributed lock
+service.
 
-1. An administrator registers one `worker` agent and a different `qc` agent.
-2. Each agent receives a mandate containing `coordination.*` on `task:*`.
-3. The administrator creates a task with acceptance criteria, dependencies, and
-   every resource it may mutate.
-4. The worker atomically claims the task and receives task/resource fencing
-   tokens.
-5. The worker heartbeats while working and submits an artifact hash plus test
-   evidence.
-6. The independent QC agent returns `pass`, `revise`, `block`, or
-   `human_required`.
-7. Only a passing review lets the administrator mark the task complete and
-   release its resources.
+- SQLite assumes one trusted host and filesystem.
+- Agents should be launched through ACP or another gateway; direct writes to the
+  base checkout happen outside ACP's enforcement boundary.
+- Tests and critic commands execute candidate code. Use a container or sandbox
+  for untrusted repositories.
+- Process-group cleanup covers ordinary descendants, including detached children
+  present at timeout. Adversarial processes can escape host-level process
+  supervision; a container/cgroup boundary is required for guaranteed
+  containment.
+- Reviewer identity is policy-enforced locally, not backed by SSO or hardware
+  identity.
+- The hash chain detects accidental or partial tampering; a database
+  administrator can rewrite the database and recompute it.
+- ACP validates submitted Git changes, not arbitrary network, database, or
+  deployment side effects. Put fencing checks at those gateways too.
 
-The OpenAPI document contains the complete request schemas. Important endpoints:
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /v1/tasks` | Create a task with dependencies and resources |
-| `POST /v1/tasks/{id}/claim` | Atomically claim work and obtain fencing tokens |
-| `POST /v1/tasks/{id}/heartbeat` | Renew the claim and store a checkpoint |
-| `POST /v1/tasks/{id}/submissions` | Submit immutable artifact evidence |
-| `POST /v1/submissions/{id}/reviews` | Record independent structured QC |
-| `POST /v1/tasks/{id}/complete` | Open the completion gate after QC passes |
-| `POST /v1/coordination/reap` | Recover expired workers and reservations |
-| `POST /v1/authorize` | Evaluate an intended agent action |
-| `GET /v1/audit/verify` | Verify the audit hash chain |
+Distributed leases, authenticated runners, container isolation, merge-queue
+adapters, MCP/A2A adapters, and externally anchored audit receipts are logical
+next layers. The core model is intentionally provider-neutral.
 
 ## Development
 
-```bash
+~~~bash
 uv sync --extra dev
-uvx ruff format --check src tests
-uvx ruff check src tests
-uv run pytest
-```
+uv run --extra dev ruff format --check src tests
+uv run --extra dev ruff check src tests
+uv run --extra dev pytest
+uv build
+~~~
 
-The tests cover delegation attenuation, approval replay, kill switches,
-hash-chain tampering, atomic collision rejection, independent QC, fencing-token
-rollover, dependency gates, and crash recovery.
+The test suite uses real temporary Git repositories, branches, worktrees,
+commits, processes, QC commands, and merges.
 
-## Current boundaries
-
-This is a reference implementation, not a production security product.
-
-- SQLite is intentionally single-node. Use a transactional shared database for
-  a distributed deployment.
-- Resource names are exact strings; hierarchical and intent-level conflict
-  detection are future work.
-- The service coordinates work but does not itself create Git worktrees,
-  containers, or merge commits.
-- Artifact URIs and hashes are recorded but artifact storage is external.
-- Shared HMAC signing should be replaced by asymmetric keys or managed KMS.
-- Multi-tenant isolation, SSO/RBAC, authenticated human approvers, rate limits,
-  durable event export, and gateway enforcement remain production work.
-
-## Project
-
+- [Architecture](docs/ARCHITECTURE.md)
+- [Research](docs/RESEARCH.md)
 - [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security](SECURITY.md)
 - [License](LICENSE): Apache-2.0
-
-The commercial research brief is deliberately kept out of the public package;
-this repository contains the open implementation and technical design.

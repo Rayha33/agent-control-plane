@@ -1,0 +1,18 @@
+[supervisor]
+lease_seconds = 300
+qc_timeout_seconds = 900
+critic_identity = "independent-qc"
+require_critic = true
+
+[qc]
+commands = [
+  "uv run --extra dev ruff check .",
+  "uv run --extra dev pytest -q",
+]
+critic_command = "builtin"
+
+[integration]
+commands = [
+  "uv run --extra dev ruff check .",
+  "uv run --extra dev pytest -q",
+]
