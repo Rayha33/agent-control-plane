@@ -166,8 +166,33 @@ command itself. The review packet contains the original task and Git-derived
 facts, not the worker's claims about correctness.
 
 Deterministic command failure always blocks. Medium-or-higher critic findings
-prevent a pass. The reviewer identity must equal the configured critic identity
-and differ from the worker identity.
+prevent a pass. The reviewer identity must be a declared reviewer (or the
+configured critic identity) and differ from the worker identity.
+
+### 6b. The reviewer is itself evidence
+
+A verdict is only as trustworthy as the thing that issued it, so every QC row
+stores signed provenance — identity, provider, model, prompt policy, resolved
+command hash — plus the fingerprint of the evaluation policy in force and the
+hash of a deterministic reproduction bundle.
+
+The evaluation policy is fingerprinted as a whole. Swapping a model, editing a
+prompt policy, adding a reviewer, or relaxing a high-risk rule all change that
+fingerprint, and QC fails closed with <code>reviewer_policy_changed</code> until
+an operator ratifies it. The first policy is adopted automatically because there
+is nothing to compare it against; every later change is an explicit event. This
+is what stops a reviewer upgrade from silently replacing the policy that
+approved earlier work.
+
+Calibration closes the loop: golden cases seed known defects, run the real
+critic through the same entry point QC uses, and report false-pass and
+false-block rates separately with Wilson 95% intervals. Separately, because a
+critic that rejects everything has a perfect false-pass rate and no value.
+
+High-risk paths escalate rather than trust one opinion: a passing verdict parks
+the submission in <code>pending_second_review</code> until a second distinct
+reviewer — optionally from a different provider — also passes, or in
+<code>human_required</code> when policy demands a person.
 
 ### 7. Integration cannot mutate the base branch
 

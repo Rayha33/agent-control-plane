@@ -157,3 +157,39 @@ def test_cli_artifact_dependency_blocks_a_claim(tmp_path: Path) -> None:
     assert refused.returncode == 1
     assert json.loads(refused.stderr)["error"] == "dependency_incomplete"
     assert json.loads(run_cli(repo, "merge-plan").stdout)["count"] == 0
+
+
+def test_cli_reviewers_ratify_and_bundle(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    config = (repo / "acp.toml").read_text(encoding="utf-8")
+    (repo / "acp.toml").write_text(
+        config + '\n[reviewers."independent-qc"]\nprovider = "builtin"\nmodel = "v1"\n',
+        encoding="utf-8",
+    )
+
+    listed = json.loads(run_cli(repo, "reviewers").stdout)
+    assert listed["ratified"] is False
+    assert listed["reviewers"][0]["model"] == "v1"
+
+    ratified = run_cli(repo, "ratify-reviewers")
+    assert ratified.returncode == 0, ratified.stderr
+    assert json.loads(run_cli(repo, "reviewers").stdout)["ratified"] is True
+
+    calibrated = run_cli(repo, "calibrate")
+    assert calibrated.returncode == 1
+    assert json.loads(calibrated.stderr)["error"] == "no_golden_cases"
+
+    task = _add(repo, "reviewed", "owned.txt")
+    claimed = json.loads(run_cli(repo, "claim", task["id"], "--agent", "cli-worker").stdout)
+    worktree = Path(claimed["worktree"])
+    (worktree / "owned.txt").write_text("changed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "commit", "-am", "change"], check=True)
+    submission = json.loads(
+        run_cli(repo, "submit", claimed["id"], "--token", str(claimed["claim_token"])).stdout
+    )
+    review = json.loads(run_cli(repo, "qc", submission["id"]).stdout)
+    assert review["reviewer_provenance"]["model"] == "v1"
+
+    bundle = json.loads(run_cli(repo, "bundle", review["id"]).stdout)
+    assert bundle["signature_valid"] is True
+    assert bundle["bundle"]["commit_sha"] == submission["commit_sha"]

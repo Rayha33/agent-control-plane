@@ -16,11 +16,12 @@ import unicodedata
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .assurance import REJECT_VERDICTS, Assurance, Reviewer, load_policy
 from .scheduling import Scheduler, normalize_artifact
 from .status import DEFAULT_LEASE_RISK_SECONDS, StatusView
 
@@ -137,8 +138,20 @@ CREATE TABLE IF NOT EXISTS qc_runs (
   findings_json TEXT NOT NULL,
   results_json TEXT NOT NULL,
   packet_sha256 TEXT NOT NULL,
+  reviewer_provenance_json TEXT NOT NULL DEFAULT '{}',
+  reviewer_signature TEXT NOT NULL DEFAULT '',
+  bundle_sha256 TEXT NOT NULL DEFAULT '',
+  policy_fingerprint TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL,
   finished_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS calibration_runs (
+  id TEXT PRIMARY KEY,
+  policy_fingerprint TEXT NOT NULL,
+  reviewer_id TEXT NOT NULL,
+  results_json TEXT NOT NULL,
+  summary_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS integrations (
   id TEXT PRIMARY KEY,
@@ -219,6 +232,19 @@ class GitSupervisor:
                 connection.execute(
                     f"ALTER TABLE tasks ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
                 )
+        qc_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(qc_runs)").fetchall()
+        }
+        for column, default in (
+            ("reviewer_provenance_json", "'{}'"),
+            ("reviewer_signature", "''"),
+            ("bundle_sha256", "''"),
+            ("policy_fingerprint", "''"),
+        ):
+            if column not in qc_columns:
+                connection.execute(
+                    f"ALTER TABLE qc_runs ADD COLUMN {column} TEXT NOT NULL DEFAULT {default}"
+                )
 
     @classmethod
     def initialize(cls, repo: str | Path = ".") -> GitSupervisor:
@@ -262,6 +288,39 @@ class GitSupervisor:
             )
         return Path(result.stdout.strip()).resolve()
 
+    def _resolve_critic_command(self, critic_command: str) -> str:
+        """Every reviewer command obeys the same rule: `builtin`, or one absolute
+        executable outside the candidate worktree so a candidate cannot replace it."""
+        if not critic_command or critic_command == "builtin":
+            return critic_command
+        critic_path = Path(critic_command).expanduser()
+        if not critic_path.is_absolute():
+            raise SupervisorError(
+                "invalid_config",
+                "external critic_command must be one absolute executable path",
+            )
+        try:
+            critic_path = critic_path.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise SupervisorError(
+                "invalid_config", "external critic executable does not exist"
+            ) from error
+        try:
+            critic_path.relative_to(self.root)
+        except ValueError:
+            pass
+        else:
+            raise SupervisorError(
+                "invalid_config",
+                "external critic executable must be outside the repository",
+            )
+        if not critic_path.is_file() or not os.access(critic_path, os.X_OK):
+            raise SupervisorError(
+                "invalid_config",
+                "external critic_command must name an executable file",
+            )
+        return str(critic_path)
+
     def _load_config(self) -> Config:
         with self.config_path.open("rb") as handle:
             raw = tomllib.load(handle)
@@ -288,34 +347,7 @@ class GitSupervisor:
             raise SupervisorError(
                 "invalid_config", "require_critic needs a non-empty critic_command"
             )
-        if critic_command and critic_command != "builtin":
-            critic_path = Path(critic_command).expanduser()
-            if not critic_path.is_absolute():
-                raise SupervisorError(
-                    "invalid_config",
-                    "external critic_command must be one absolute executable path",
-                )
-            try:
-                critic_path = critic_path.resolve(strict=True)
-            except FileNotFoundError as error:
-                raise SupervisorError(
-                    "invalid_config", "external critic executable does not exist"
-                ) from error
-            try:
-                critic_path.relative_to(self.root)
-            except ValueError:
-                pass
-            else:
-                raise SupervisorError(
-                    "invalid_config",
-                    "external critic executable must be outside the repository",
-                )
-            if not critic_path.is_file() or not os.access(critic_path, os.X_OK):
-                raise SupervisorError(
-                    "invalid_config",
-                    "external critic_command must name an executable file",
-                )
-            critic_command = str(critic_path)
+        critic_command = self._resolve_critic_command(critic_command)
         runtime_setup_commands = tuple(map(str, runtime.get("setup_commands", [])))
         runtime_teardown_commands = tuple(map(str, runtime.get("teardown_commands", [])))
         for label, commands in (
@@ -383,6 +415,18 @@ class GitSupervisor:
                         "invalid_config",
                         f"runtime port pools {other.env_name} and {pool.env_name} overlap",
                     )
+        # Loaded here so a reviewer's command obeys the same trust rule as the
+        # legacy single critic, and so a bad policy fails at construction.
+        policy = load_policy(
+            raw, str(supervisor.get("critic_identity", "")).strip(), critic_command
+        )
+        self.assurance_policy = replace(
+            policy,
+            reviewers=tuple(
+                replace(item, command=self._resolve_critic_command(item.command))
+                for item in policy.reviewers
+            ),
+        )
         return Config(
             lease_seconds=lease,
             timeout_seconds=timeout,
@@ -605,6 +649,180 @@ class GitSupervisor:
     def merge_plan(self) -> dict[str, Any]:
         """Integration ordering preview for approved submissions. Read-only."""
         return Scheduler(self).merge_plan()
+
+    @property
+    def assurance(self) -> Assurance:
+        return Assurance(self)
+
+    def reviewers(self) -> dict[str, Any]:
+        """Declared reviewers, the policy fingerprint, and whether it is ratified."""
+        ratified = self.assurance.ratified_fingerprint()
+        described = self.assurance_policy.describe()
+        return {
+            **described,
+            "ratified_fingerprint": ratified,
+            "ratified": ratified == described["fingerprint"],
+        }
+
+    def ratify_reviewers(self) -> dict[str, Any]:
+        """Accept the current evaluation policy, recording the change in the event log."""
+        return self.assurance.ratify()
+
+    def calibrate(self, reviewer_id: str | None = None) -> dict[str, Any]:
+        """Measure the reviewer against repository-specific golden cases.
+
+        Each case is materialised in a detached worktree at HEAD, mutated to
+        seed a known defect (or left clean), and handed to the *real* configured
+        critic through the same entry point QC uses. Anything else would measure
+        a simulation of the reviewer rather than the reviewer.
+        """
+        reviewer = self._calibration_reviewer(reviewer_id)
+        self.assurance.assert_policy_ratified()
+        cases = self.assurance.golden_cases()
+        if not cases:
+            raise SupervisorError(
+                "no_golden_cases",
+                f"no golden cases in {self.assurance_policy.golden_dir}/; "
+                "add *.toml cases with an expected verdict",
+            )
+        head = self._git_text("rev-parse", "HEAD")
+        results: list[dict[str, Any]] = []
+        for case in cases:
+            worktree = self.state_dir / "worktrees" / f"golden-{uuid.uuid4().hex}"
+            packet_path = self.state_dir / "logs" / f"golden-{uuid.uuid4().hex}.json"
+            result_path = self.state_dir / "logs" / f"golden-result-{uuid.uuid4().hex}.json"
+            verdict = "block"
+            error = ""
+            touched: list[str] = []
+            try:
+                self._git("worktree", "add", "--detach", str(worktree), head)
+                touched = self.assurance.apply_mutations(worktree, case.mutations)
+                packet_path.write_text(
+                    json.dumps(self._golden_packet(case, head, touched), indent=2),
+                    encoding="utf-8",
+                )
+                critic = self._run_critic(
+                    reviewer.command or "builtin",
+                    worktree,
+                    {
+                        "ACP_PHASE": "calibration",
+                        "ACP_WORKTREE": str(worktree),
+                        "ACP_REPO_ROOT": str(self.root),
+                        "ACP_REVIEW_PACKET": str(packet_path),
+                        "ACP_REVIEW_RESULT": str(result_path),
+                    },
+                )
+                if critic["exit_code"]:
+                    error = f"critic exited {critic['exit_code']}"
+                else:
+                    verdict = self._critic_payload(result_path)["verdict"]
+            except (OSError, subprocess.SubprocessError, SupervisorError, ValueError) as failure:
+                error = str(failure)
+            finally:
+                result_path.unlink(missing_ok=True)
+                packet_path.unlink(missing_ok=True)
+                if worktree.exists():
+                    self._remove_worktree(worktree, delete_branch=False)
+            results.append(
+                {
+                    "name": case.name,
+                    "description": case.description,
+                    "expected": case.expect,
+                    "verdict": verdict,
+                    "rejected": verdict in REJECT_VERDICTS,
+                    "correct": (verdict in REJECT_VERDICTS) == case.expects_rejection,
+                    "mutated_paths": touched,
+                    "error": error,
+                }
+            )
+        summary = self.assurance.summarize(results)
+        calibration_id = str(uuid.uuid4())
+        created = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO calibration_runs
+                  (id, policy_fingerprint, reviewer_id, results_json, summary_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    calibration_id,
+                    self.assurance_policy.fingerprint,
+                    reviewer.identity,
+                    canonical_json(results),
+                    canonical_json(summary),
+                    created,
+                ),
+            )
+            self._event(
+                connection,
+                "calibration.completed",
+                reviewer.identity,
+                {
+                    "calibration_id": calibration_id,
+                    "fingerprint": self.assurance_policy.fingerprint,
+                    "summary": summary,
+                },
+            )
+        return {
+            "id": calibration_id,
+            "reviewer": reviewer.provenance(),
+            "policy_fingerprint": self.assurance_policy.fingerprint,
+            "created_at": created,
+            "results": results,
+            "summary": summary,
+        }
+
+    def _calibration_reviewer(self, reviewer_id: str | None) -> Reviewer:
+        if reviewer_id:
+            reviewer = self.assurance_policy.reviewer(reviewer_id)
+            if reviewer is None:
+                raise SupervisorError(
+                    "reviewer_identity_mismatch", f"{reviewer_id} is not a declared reviewer"
+                )
+            return reviewer
+        if self.assurance_policy.reviewers:
+            return self.assurance_policy.reviewers[0]
+        return Reviewer(
+            identity=self.config.critic_identity or "independent-qc",
+            provider="unknown",
+            model="unknown",
+            prompt_policy="unset",
+            command=self.config.critic_command or "builtin",
+        )
+
+    def _golden_packet(self, case: Any, head: str, touched: list[str]) -> dict[str, Any]:
+        """A review packet shaped exactly like a real one, for a synthetic candidate."""
+        return {
+            "task": {
+                "id": f"golden:{case.name}",
+                "title": f"calibration case {case.name}",
+                "description": case.description,
+                "acceptance": ["the seeded repository state is judged correctly"],
+                "declared_resources": sorted(touched),
+                "base_sha": head,
+            },
+            "submission": {
+                "id": f"golden:{case.name}",
+                "commit_sha": head,
+                "tree_sha": head,
+                "patch_sha256": "",
+                "changed_paths": sorted(touched),
+                "commits": [],
+                "diff_stat": "",
+            },
+            "deterministic_results": [],
+            "policy": {
+                "inspect_repository": True,
+                "reproduce_acceptance": True,
+                "worker_conclusions_excluded": True,
+            },
+        }
+
+    def reproduction_bundle(self, qc_id: str) -> dict[str, Any]:
+        """The signed, deterministic bundle for one QC verdict."""
+        return self.assurance.read_bundle(qc_id)
 
     def status(
         self,
@@ -1508,17 +1726,31 @@ class GitSupervisor:
             return self._submission_view(connection, row)
 
     def run_qc(self, submission_id: str, reviewer_id: str) -> dict[str, Any]:
-        if reviewer_id != self.config.critic_identity:
-            raise SupervisorError(
-                "reviewer_identity_mismatch",
-                f"reviewer must be configured identity {self.config.critic_identity}",
+        reviewer = self.assurance_policy.reviewer(reviewer_id)
+        if reviewer is None:
+            if reviewer_id != self.config.critic_identity:
+                raise SupervisorError(
+                    "reviewer_identity_mismatch",
+                    f"reviewer must be a declared reviewer or {self.config.critic_identity}",
+                )
+            reviewer = Reviewer(
+                identity=reviewer_id,
+                provider="unknown",
+                model="unknown",
+                prompt_policy="unset",
+                command=self.config.critic_command,
             )
+        # A reviewer upgrade must be ratified before it can judge anything.
+        self.assurance.assert_policy_ratified()
         started = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             submission = self._submission_row(connection, submission_id)
             task = self._task_row(connection, submission["task_id"])
-            if submission["status"] != "pending_qc" or task["status"] != "qc_review":
+            if (
+                submission["status"] not in {"pending_qc", "pending_second_review"}
+                or task["status"] != "qc_review"
+            ):
                 raise SupervisorError("submission_not_reviewable", "submission is not pending QC")
             if submission["worker_agent_id"] == reviewer_id:
                 raise SupervisorError(
@@ -1565,7 +1797,7 @@ class GitSupervisor:
                             "required_fix": "make the command read-only for tracked source",
                         }
                     )
-            if self.config.critic_command:
+            if reviewer.command:
                 packet["deterministic_results"] = results
                 packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
                 self._restore_candidate(qc_dir, submission["commit_sha"])
@@ -1573,7 +1805,7 @@ class GitSupervisor:
                     self.state_dir / "logs" / f"critic-{submission_id}-{uuid.uuid4().hex}.json"
                 )
                 critic = self._run_critic(
-                    self.config.critic_command,
+                    reviewer.command,
                     qc_dir,
                     self._phase_runtime_env(runtime_env, "critic", qc_dir)
                     | {
@@ -1641,19 +1873,33 @@ class GitSupervisor:
         finished = utc_now()
         qc_id = str(uuid.uuid4())
         packet_hash = sha256(packet_path.read_bytes()) if packet_path.exists() else sha256(b"")
+        bundle = self.assurance.bundle(
+            qc_id,
+            dict(submission),
+            task["base_sha"],
+            [*self.config.qc_commands, *([reviewer.command] if reviewer.command else [])],
+            reviewer,
+            verdict,
+            packet_hash,
+        )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = self._submission_row(connection, submission_id)
             current_task = self._task_row(connection, current["task_id"])
-            if current["status"] != "pending_qc" or current_task["status"] != "qc_review":
+            if (
+                current["status"] not in {"pending_qc", "pending_second_review"}
+                or current_task["status"] != "qc_review"
+            ):
                 raise SupervisorError("submission_not_reviewable", "submission changed during QC")
             self._assert_reservations(connection, current_task, current)
             connection.execute(
                 """
                 INSERT INTO qc_runs
                   (id, submission_id, reviewer_id, commit_sha, verdict,
-                   findings_json, results_json, packet_sha256, started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   findings_json, results_json, packet_sha256,
+                   reviewer_provenance_json, reviewer_signature, bundle_sha256,
+                   policy_fingerprint, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     qc_id,
@@ -1664,9 +1910,31 @@ class GitSupervisor:
                     canonical_json(findings),
                     canonical_json(results),
                     packet_hash,
+                    canonical_json(reviewer.provenance()),
+                    bundle["record"]["signature"],
+                    bundle["sha256"],
+                    self.assurance_policy.fingerprint,
                     started,
                     finished,
                 ),
+            )
+            passing = [
+                {
+                    "reviewer_id": row["reviewer_id"],
+                    "provider": json.loads(row["reviewer_provenance_json"] or "{}").get(
+                        "provider", "unknown"
+                    ),
+                }
+                for row in connection.execute(
+                    "SELECT reviewer_id, reviewer_provenance_json FROM qc_runs "
+                    "WHERE submission_id = ? AND verdict = 'pass'",
+                    (submission_id,),
+                ).fetchall()
+            ]
+            if verdict == "pass":
+                passing.append({"reviewer_id": reviewer_id, "provider": reviewer.provider})
+            requirement = self.assurance.review_requirement(
+                json.loads(current["changed_paths_json"]), passing
             )
             submission_status = {
                 "pass": "approved",
@@ -1681,6 +1949,27 @@ class GitSupervisor:
                 if verdict == "revise"
                 else "blocked"
             )
+            if verdict == "pass" and requirement["high_risk"] and not requirement["satisfied"]:
+                # A passing verdict is not an approval while policy still owes a
+                # second reviewer, a second provider, or a human.
+                findings = [
+                    *findings,
+                    {
+                        "severity": "low",
+                        "requirement": "high-risk paths satisfy the reviewer policy",
+                        "finding": requirement["reason"],
+                        "evidence": ", ".join(requirement["paths"][:20]),
+                        "required_fix": "obtain the additional review the policy requires",
+                    },
+                ]
+                if self.assurance_policy.high_risk_mode == "human":
+                    submission_status, task_status = "human_required", "blocked"
+                else:
+                    submission_status, task_status = "pending_second_review", "qc_review"
+                connection.execute(
+                    "UPDATE qc_runs SET findings_json = ? WHERE id = ?",
+                    (canonical_json(findings), qc_id),
+                )
             connection.execute(
                 "UPDATE submissions SET status = ? WHERE id = ?",
                 (submission_status, submission_id),
@@ -1689,7 +1978,7 @@ class GitSupervisor:
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
                 (task_status, finished, current_task["id"]),
             )
-            if verdict == "pass":
+            if verdict == "pass" and submission_status != "human_required":
                 reserve_until = int(time.time()) + max(3600, self.config.timeout_seconds * 3)
                 connection.execute(
                     """
@@ -2377,6 +2666,10 @@ class GitSupervisor:
             "findings": json.loads(row["findings_json"]),
             "command_results": json.loads(row["results_json"]),
             "review_packet_sha256": row["packet_sha256"],
+            "reviewer_provenance": json.loads(row["reviewer_provenance_json"] or "{}"),
+            "reviewer_signature": row["reviewer_signature"],
+            "bundle_sha256": row["bundle_sha256"],
+            "policy_fingerprint": row["policy_fingerprint"],
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
         }

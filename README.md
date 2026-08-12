@@ -56,6 +56,10 @@ wedge.
 | Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
 | Merge scheduling | Approved submissions get an ordering preview, shared-path conflict prediction, and staleness when the base moves |
 | Operator status | One read-only screen ranks what needs a human, what failed cleanup, and what is merely running |
+| Reviewer provenance | Signed identity/provider/model/prompt-policy on every verdict, with a replayable bundle |
+| Policy ratification | A reviewer or prompt upgrade stops QC until a human ratifies the new fingerprint |
+| Evaluator calibration | Golden seeded defects score false-pass/false-block rates with Wilson intervals |
+| High-risk review | Configured paths can demand two reviewers, provider diversity, or a human |
 | Server-derived evidence | Commit, tree, binary patch hash, and changed paths come from Git |
 | Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
 | Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
@@ -277,6 +281,94 @@ paths, conflict markers, and deterministic results. It is an independent
 process, but it is rule-based—not a substitute for a separately credentialed AI
 or human reviewer when semantic judgment matters.
 
+## Reviewer provenance and calibration
+
+Independent review reduces self-approval, but a critic can share the worker's
+blind spots, prefer its own output, or drift when someone upgrades the model
+behind it. ACP makes the reviewer itself auditable.
+
+Declare who is reviewing, with what:
+
+~~~toml
+[reviewers."independent-qc"]
+provider = "builtin"
+model = "structural-v1"
+prompt_policy = "policy-2026-08"
+command = "builtin"
+
+[reviewers."second-opinion"]
+provider = "other-vendor"
+model = "reviewer-9"
+command = "/absolute/path/outside/the/repository/second-critic"
+
+[policy]
+high_risk_paths = ["src/auth/**", "migrations/**"]
+high_risk_mode = "two_reviewer"   # off | two_reviewer | human
+require_provider_diversity = true
+
+[calibration]
+golden_dir = "acp-golden"
+~~~
+
+Every QC record then carries signed provenance — identity, provider, model,
+prompt policy, and the hash of the resolved command — plus a deterministic
+reproduction bundle written to ignored <code>.acp/bundles/</code>:
+
+~~~bash
+uv run --extra dev acp reviewers          # who reviews, and is the policy ratified?
+uv run --extra dev acp bundle QC_ID       # signed, replayable record of one verdict
+~~~
+
+**A reviewer upgrade cannot take effect silently.** The whole evaluation policy
+is fingerprinted. Changing a model, a prompt policy, a command, a reviewer, or a
+high-risk rule changes that fingerprint, and QC then refuses to run until a
+human accepts the change:
+
+~~~bash
+uv run --extra dev acp ratify-reviewers
+~~~
+
+The first policy a repository sees is adopted automatically — there is nothing
+to compare it against — and every later change is an explicit, event-logged
+ratification.
+
+### High-risk paths
+
+When a submission touches <code>high_risk_paths</code>, a single passing verdict
+is not an approval. Under <code>two_reviewer</code> the submission parks in
+<code>pending_second_review</code> until a *second, distinct* reviewer also
+passes — and if <code>require_provider_diversity</code> is set, a reviewer from
+a different provider. Under <code>human_required</code> mode it parks for a
+person. The same reviewer running twice never satisfies the rule.
+
+### Calibration
+
+"The critic is fine" should be a number with an error bar. Golden cases are
+repository-specific seeded defects:
+
+~~~toml
+# acp-golden/conflict-markers.toml
+name = "conflict-markers"
+expect = "reject"          # or "pass" for a known-clean case
+
+[[mutations]]
+path = "src/app.py"
+content = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n"
+~~~
+
+~~~bash
+uv run --extra dev acp calibrate --reviewer independent-qc
+~~~
+
+Each case is materialised in a detached worktree, mutated, and handed to the
+*real* configured critic through the same entry point QC uses. The report gives
+false-pass and false-block rates separately — a critic that rejects everything
+scores perfectly on one and uselessly on the other — each with a **Wilson 95%
+confidence interval**, keyed by the policy fingerprint that produced it. Wilson
+rather than the normal approximation because calibration sets are small and
+often land on 0% or 100%, where the naive interval collapses to zero width and
+reports false certainty.
+
 ## Recovery model
 
 <code>acp reap</code> or any new claim discovers expired attempts. ACP:
@@ -337,7 +429,13 @@ service.
   other without touching the same line merge cleanly and still fail
   integration, which is why integration reruns the configured commands.
 - Reviewer identity is policy-enforced locally, not backed by SSO or hardware
-  identity.
+  identity. Provenance signatures are a local HMAC whose key lives in ignored
+  `.acp/`: tamper-evident on one trusted host, like the event chain, not
+  external non-repudiation.
+- Calibration measures the reviewer against the golden cases a repository
+  actually wrote. It is a floor, not a guarantee: a defect class with no golden
+  case is unmeasured, and the confidence interval reflects sample size only —
+  not whether the sample resembles real submissions.
 - The hash chain detects accidental or partial tampering; a database
   administrator can rewrite the database and recompute it.
 - ACP coordinates configured local runtime resources and validates submitted

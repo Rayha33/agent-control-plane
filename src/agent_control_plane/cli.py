@@ -53,6 +53,16 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("task_id")
     commands.add_parser("queue", help="ordered ready queue with overlap and dependency blockers")
     commands.add_parser("merge-plan", help="integration ordering preview for approved work")
+    commands.add_parser("reviewers", help="declared reviewers and the evaluation policy state")
+    commands.add_parser(
+        "ratify-reviewers", help="accept a changed reviewer policy so QC may run again"
+    )
+    calibrate = commands.add_parser(
+        "calibrate", help="score a reviewer against repository golden cases"
+    )
+    calibrate.add_argument("--reviewer", dest="reviewer_id")
+    bundle = commands.add_parser("bundle", help="show the reproduction bundle for a QC verdict")
+    bundle.add_argument("qc_id")
     status = commands.add_parser("status", help="read-only operator view of every agent")
     status.add_argument("--limit", type=int, help="show at most this many tasks")
     status.add_argument("--format", choices=("json", "text"), default="json", dest="output_format")
@@ -179,6 +189,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.ready_queue()
         elif args.action == "merge-plan":
             result = supervisor.merge_plan()
+        elif args.action == "reviewers":
+            result = supervisor.reviewers()
+        elif args.action == "ratify-reviewers":
+            result = supervisor.ratify_reviewers()
+        elif args.action == "calibrate":
+            result = supervisor.calibrate(args.reviewer_id)
+        elif args.action == "bundle":
+            result = supervisor.reproduction_bundle(args.qc_id)
         elif args.action == "status":
             return watch_status(supervisor, args)
         elif args.action == "claim":
