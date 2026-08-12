@@ -21,6 +21,14 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .runner_identity import (
+    IdentityError,
+    assert_distinct,
+    credential_digest,
+    issue_credential,
+    validate_role,
+    verify_credential,
+)
 from .runtime_drivers import (
     DriverContext,
     DriverDefinition,
@@ -165,6 +173,13 @@ CREATE TABLE IF NOT EXISTS runtime_environments (
   teardown_results_json TEXT NOT NULL,
   log_path TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runner_identities (
+  agent_id TEXT PRIMARY KEY,
+  role TEXT NOT NULL,
+  credential_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT
 );
 CREATE TABLE IF NOT EXISTS runtime_driver_resources (
   attempt_id TEXT NOT NULL REFERENCES attempts(id),
@@ -721,6 +736,114 @@ class GitSupervisor:
     def _phase_runtime_env(environment: dict[str, str], phase: str, cwd: Path) -> dict[str, str]:
         return environment | {"ACP_PHASE": phase, "ACP_WORKTREE": str(cwd)}
 
+    # -- authenticated runner identities -----------------------------------
+
+    def enroll_runner(self, agent_id: str, role: str) -> dict[str, Any]:
+        """Register a runner and return its credential exactly once.
+
+        Only the digest is stored, so the state file never holds a usable
+        credential — losing the returned value means re-enrolling, not reading
+        it back out of the database.
+        """
+
+        if not agent_id.strip():
+            raise SupervisorError("invalid_agent", "agent_id is required")
+        try:
+            validate_role(role)
+        except IdentityError as error:
+            raise SupervisorError(error.code, error.message) from error
+        credential = issue_credential()
+        stamp = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT agent_id FROM runner_identities WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
+            if existing:
+                raise SupervisorError(
+                    "runner_already_enrolled",
+                    f"{agent_id} is already enrolled; revoke it before re-enrolling",
+                )
+            connection.execute(
+                """
+                INSERT INTO runner_identities
+                  (agent_id, role, credential_digest, created_at, revoked_at)
+                VALUES (?, ?, ?, ?, NULL)
+                """,
+                (agent_id, role, credential_digest(credential), stamp),
+            )
+            self._event(
+                connection,
+                "runner.enrolled",
+                "supervisor",
+                {"agent_id": agent_id, "role": role},
+            )
+        return {"agent_id": agent_id, "role": role, "credential": credential}
+
+    def revoke_runner(self, agent_id: str) -> dict[str, Any]:
+        stamp = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM runner_identities WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
+            if not row:
+                raise SupervisorError("runner_not_found", f"{agent_id} is not enrolled")
+            connection.execute(
+                "UPDATE runner_identities SET revoked_at = ? WHERE agent_id = ?",
+                (stamp, agent_id),
+            )
+            self._event(
+                connection, "runner.revoked", "supervisor", {"agent_id": agent_id}
+            )
+        return {"agent_id": agent_id, "revoked_at": stamp}
+
+    def runners(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT agent_id, role, created_at, revoked_at FROM runner_identities "
+                "ORDER BY agent_id"
+            ).fetchall()
+        # credential_digest is deliberately not returned.
+        return [dict(row) for row in rows]
+
+    def _identity_enforced(self) -> bool:
+        """Authentication activates once anything is enrolled.
+
+        An empty registry keeps the single-host default behaviour, so enabling
+        this is a deliberate act rather than a breaking upgrade.
+        """
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM runner_identities WHERE revoked_at IS NULL LIMIT 1"
+            ).fetchone()
+        return bool(row)
+
+    def _authenticate(self, agent_id: str, role: str, credential: str | None) -> None:
+        if not self._identity_enforced():
+            return
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runner_identities WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
+        if not row:
+            raise SupervisorError(
+                "runner_not_enrolled",
+                f"{agent_id} is not an enrolled runner; enroll it or revoke the registry",
+            )
+        if row["revoked_at"] is not None:
+            raise SupervisorError("runner_revoked", f"{agent_id} credential is revoked")
+        if row["role"] != role:
+            raise SupervisorError(
+                "runner_role_mismatch",
+                f"{agent_id} is enrolled as {row['role']}, not {role}",
+            )
+        if not credential or not verify_credential(credential, row["credential_digest"]):
+            raise SupervisorError(
+                "runner_authentication_failed",
+                f"{agent_id} did not present a valid {role} credential",
+            )
+
     # -- trusted runtime drivers -------------------------------------------
 
     def _driver_secret(self) -> bytes:
@@ -1131,10 +1254,15 @@ class GitSupervisor:
         return self.runtime_environment(attempt_id)
 
     def claim(
-        self, task_id: str, agent_id: str, lease_seconds: int | None = None
+        self,
+        task_id: str,
+        agent_id: str,
+        lease_seconds: int | None = None,
+        credential: str | None = None,
     ) -> dict[str, Any]:
         if not agent_id.strip():
             raise SupervisorError("invalid_agent", "agent_id is required")
+        self._authenticate(agent_id, "worker", credential)
         self.reap_expired()
         ttl = lease_seconds or self.config.lease_seconds
         if ttl < 10:
@@ -1688,7 +1816,15 @@ class GitSupervisor:
             row = self._submission_row(connection, submission_id)
             return self._submission_view(connection, row)
 
-    def run_qc(self, submission_id: str, reviewer_id: str) -> dict[str, Any]:
+    def run_qc(
+        self,
+        submission_id: str,
+        reviewer_id: str,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        # Prove the reviewer holds the critic credential before anything else.
+        # Until this existed, "independent QC" was a string a worker could type.
+        self._authenticate(reviewer_id, "critic", credential)
         if reviewer_id != self.config.critic_identity:
             raise SupervisorError(
                 "reviewer_identity_mismatch",
@@ -1701,10 +1837,10 @@ class GitSupervisor:
             task = self._task_row(connection, submission["task_id"])
             if submission["status"] != "pending_qc" or task["status"] != "qc_review":
                 raise SupervisorError("submission_not_reviewable", "submission is not pending QC")
-            if submission["worker_agent_id"] == reviewer_id:
-                raise SupervisorError(
-                    "self_review_forbidden", "worker cannot review its own submission"
-                )
+            try:
+                assert_distinct(submission["worker_agent_id"], reviewer_id)
+            except IdentityError as error:
+                raise SupervisorError(error.code, error.message) from error
             self._assert_reservations(connection, task, submission)
             runtime = connection.execute(
                 "SELECT * FROM runtime_environments WHERE attempt_id = ?",

@@ -63,6 +63,16 @@ def parser() -> argparse.ArgumentParser:
     runtime_down = commands.add_parser(
         "runtime-down", help="retry teardown and release an attempt runtime"
     )
+    enroll = commands.add_parser(
+        "runner-enroll",
+        help="register a runner identity and print its credential once",
+    )
+    enroll.add_argument("agent_id")
+    enroll.add_argument("--role", required=True, choices=["worker", "critic", "integrator"])
+    revoke = commands.add_parser("runner-revoke", help="revoke a runner credential")
+    revoke.add_argument("agent_id")
+    commands.add_parser("runner-list", help="list enrolled runner identities")
+
     driver_resources = commands.add_parser(
         "runtime-resources",
         help="show driver-managed resources and their cleanup proofs for an attempt",
@@ -157,6 +167,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.terminate_worker(args.attempt_id)
         elif args.action == "environment":
             result = supervisor.runtime_environment(args.attempt_id)
+        elif args.action == "runner-enroll":
+            result = supervisor.enroll_runner(args.agent_id, args.role)
+        elif args.action == "runner-revoke":
+            result = supervisor.revoke_runner(args.agent_id)
+        elif args.action == "runner-list":
+            result = supervisor.runners()
         elif args.action == "runtime-resources":
             result = supervisor.driver_resources(args.attempt_id)
         elif args.action == "runtime-quarantine":
