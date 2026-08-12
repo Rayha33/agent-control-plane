@@ -52,6 +52,10 @@ wedge.
 | Worktree ownership | Every successful claim provisions a dedicated branch and worktree |
 | Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
 | Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
+| Overlap preview | A dry-run claim reports exact and potential scope collisions, and who owns them, before an agent starts |
+| Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
+| Merge scheduling | Approved submissions get an ordering preview, shared-path conflict prediction, and staleness when the base moves |
+| Operator status | One read-only screen ranks what needs a human, what failed cleanup, and what is merely running |
 | Server-derived evidence | Commit, tree, binary patch hash, and changed paths come from Git |
 | Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
 | Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
@@ -108,6 +112,72 @@ uv run --extra dev acp integrate TASK_ID
 
 All commands emit JSON. Local runtime state and logs live under ignored
 <code>.acp/</code>; configuration is tracked in <code>acp.toml</code>.
+
+## Planning before launch
+
+Deciding what to run in parallel is the operator's remaining manual step. ACP
+answers it from state it already holds, without launching anything:
+
+~~~bash
+uv run --extra dev acp plan TASK_ID     # would this claim succeed, and if not, who is in the way?
+uv run --extra dev acp queue            # ordered set of tasks that can run concurrently
+uv run --extra dev acp merge-plan       # integration order for approved work
+~~~
+
+`plan` classifies every collision as <code>exact</code> (identical normalized
+scopes) or <code>potential</code> (different scopes that can still match one
+path) and names the owning task, attempt, and agent, so the fix — re-partition
+or re-order — is obvious from the output.
+
+`queue` reserves each admitted task's scopes as it goes. Its <code>ready</code>
+list is a set of tasks that can run **at the same time**, not a list of tasks
+that could each run alone.
+
+Tasks can also declare logical artifacts instead of restating task ids:
+
+~~~bash
+uv run --extra dev acp task-add --title "Publish the API schema" \
+  --accept "schema is generated" --resource "schema/**" --produces api-schema
+
+uv run --extra dev acp task-add --title "Generate the client" \
+  --accept "client compiles" --resource "client/**" --consumes api-schema
+~~~
+
+The consumer cannot be claimed until every producer of <code>api-schema</code>
+is <code>done</code>. Cycles are reported as a <code>dependency_cycle</code>
+blocker naming the cycle, not followed.
+
+`merge-plan` orders approved submissions topologically by dependency, then
+deterministically by priority, creation time, and id. Each entry reports the
+paths it shares with earlier entries, and becomes <code>stale</code> with an
+<code>upstream_commits</code> count when commits land on the base branch after
+approval.
+
+All four planning commands are read-only. Unlike <code>claim</code> and
+<code>list</code>, they never reap: looking at the board does not orphan an
+agent's attempt.
+
+## Operator status
+
+Running three to six agents turns attention itself into the bottleneck — which
+session is stuck, which finished, which is quietly holding a resource.
+
+~~~bash
+uv run --extra dev acp status                      # canonical JSON
+uv run --extra dev acp status --format text        # one screen
+uv run --extra dev acp status --watch --interval 2 --format text
+~~~
+
+The attention queue is ranked, worst first: <code>human_required</code>,
+<code>cleanup_failed</code>, <code>lease_risk</code>, <code>review</code>, then
+<code>active</code>. Every task reports its phase, heartbeat age, checkpoint,
+claimed paths, runtime allocations, worker liveness, latest QC verdict, and
+blockers. Attempts whose lease has expired but which no reaper has visited yet
+are reported as <code>awaiting_reap</code> rather than being reaped by the act
+of looking at them.
+
+JSON remains canonical; <code>--format text</code> renders that same snapshot.
+Use <code>--limit</code> to bound large boards.
 
 ## Runtime isolation
 
@@ -258,6 +328,14 @@ service.
 - Lifecycle hooks are trusted operator configuration. They can create isolated
   database schemas or containers, but ACP cannot infer or fence side effects
   the hooks do not declare.
+- Scheduling previews are advisory and point-in-time. `plan` and `queue` report
+  the board as it was read; only `claim` is authoritative, and it re-checks
+  under an immediate transaction. A preview that says "ready" can still lose a
+  race to a concurrent claim.
+- Conflict prediction is textual, not semantic. Shared changed paths and
+  `git merge-tree` catch overlapping edits; two submissions that break each
+  other without touching the same line merge cleanly and still fail
+  integration, which is why integration reruns the configured commands.
 - Reviewer identity is policy-enforced locally, not backed by SSO or hardware
   identity.
 - The hash chain detects accidental or partial tampering; a database
@@ -267,8 +345,8 @@ service.
   deployment side effects; put fencing checks at those gateways too.
 
 Distributed leases, authenticated runners, container isolation, merge-queue
-adapters, MCP/A2A adapters, and externally anchored audit receipts are logical
-next layers. The core model is intentionally provider-neutral.
+adapters, MCP/A2A adapters, a TUI over the status JSON, and externally anchored
+audit receipts are logical next layers. The core model is intentionally provider-neutral.
 
 ## Development
 

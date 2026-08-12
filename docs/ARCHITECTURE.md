@@ -71,6 +71,34 @@ logical:deployment/production
 Logical resources collide only by exact normalized name. They model non-file
 side effects, but downstream gateways must enforce their fencing tokens.
 
+Enforcement is fail-closed at claim time, but an operator should not have to
+launch an agent to discover a collision. `acp plan` and `acp queue` answer the
+same question in advance, classifying each collision as `exact` (identical
+normalized scopes) or `potential` (different scopes that can still match one
+path), and naming the owning task, attempt, and agent.
+
+### 1b. Planning is a preview, never a mutation
+
+`plan`, `queue`, `merge-plan`, and `status` are read-only. They deliberately do
+not call `reap_expired()`, unlike `claim` and `list`: a view that reaped would
+orphan an attempt merely because an operator looked at the dashboard, and would
+change the state it was asked to report. Expired-but-unreaped attempts are
+reported as `awaiting_reap` instead. Expired leases are ignored when previewing
+a claim, so a preview and the claim that follows agree.
+
+The ready queue reserves each admitted task's scopes for the remainder of the
+pass. Its `ready` list is therefore a set of tasks that can run *concurrently*,
+not a list of tasks that could each run alone.
+
+### 1c. Artifact dependencies are derived, not declared twice
+
+A task may declare `--produces` and `--consumes` logical artifact names. A
+consumer depends on every non-`done` producer of an artifact it consumes; those
+edges are derived at read time and enforced at claim time alongside explicit
+`--depends-on` edges. Cycles — reachable once artifacts create edges the
+operator never wrote — are reported as a `dependency_cycle` blocker with the
+concrete cycle, never followed into an infinite walk.
+
 ### 2. Time is not authority
 
 Each successful claim increments a global claim token. Each exact normalized
@@ -150,6 +178,17 @@ branch only on success. Merge conflict or command failure moves the task to
 
 Promotion of that branch is left to the user's existing human review or merge
 queue.
+
+`acp merge-plan` previews that promotion order before anyone runs it. Approved
+submissions are ordered topologically by dependency and then deterministically
+by priority, creation time, and id. Each entry reports the paths it shares with
+earlier entries as `predicted_conflict_paths`, and is marked `stale` with an
+`upstream_commits` count once commits land on the base branch beneath it —
+approval is evidence about a base that may since have moved. Conflict prediction
+against the current base uses `git merge-tree --write-tree`, which computes the
+merge in memory: it writes only unreferenced objects and touches no worktree,
+index, or ref. Where the installed Git is too old, `base_conflicts` is `null`
+rather than a silently empty list.
 
 ### 8. Events cannot be lost independently of state
 

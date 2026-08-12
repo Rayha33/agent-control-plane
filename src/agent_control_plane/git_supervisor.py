@@ -21,6 +21,9 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .scheduling import Scheduler, normalize_artifact
+from .status import DEFAULT_LEASE_RISK_SECONDS, StatusView
+
 GENESIS_HASH = "0" * 64
 
 
@@ -75,6 +78,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   acceptance_json TEXT NOT NULL,
   resources_json TEXT NOT NULL,
   dependencies_json TEXT NOT NULL,
+  produces_json TEXT NOT NULL DEFAULT '[]',
+  consumes_json TEXT NOT NULL DEFAULT '[]',
   base_branch TEXT NOT NULL,
   base_sha TEXT NOT NULL,
   priority INTEGER NOT NULL,
@@ -196,9 +201,24 @@ class GitSupervisor:
         (self.state_dir / "runtime").mkdir(exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('claim_counter', '0')"
             )
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS silently leaves an older table alone, so new
+        columns have to be added explicitly. Each step is idempotent.
+        """
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)").fetchall()}
+        for column in ("produces_json", "consumes_json"):
+            if column not in columns:
+                connection.execute(
+                    f"ALTER TABLE tasks ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
+                )
 
     @classmethod
     def initialize(cls, repo: str | Path = ".") -> GitSupervisor:
@@ -498,12 +518,16 @@ class GitSupervisor:
         dependencies: Sequence[str] = (),
         priority: int = 50,
         base_branch: str = "HEAD",
+        produces: Sequence[str] = (),
+        consumes: Sequence[str] = (),
     ) -> dict[str, Any]:
         if not title.strip() or not acceptance:
             raise SupervisorError("invalid_task", "title and acceptance criteria are required")
         normalized = sorted({self.normalize_resource(item, self.root) for item in resources})
         if not normalized:
             raise SupervisorError("invalid_task", "at least one write resource is required")
+        produced = sorted({normalize_artifact(item) for item in produces})
+        consumed = sorted({normalize_artifact(item) for item in consumes})
         base_sha = self._git_text("rev-parse", base_branch)
         resolved_branch = base_branch
         if base_branch == "HEAD":
@@ -524,9 +548,9 @@ class GitSupervisor:
                 """
                 INSERT INTO tasks
                   (id, title, description, acceptance_json, resources_json,
-                   dependencies_json, base_branch, base_sha, priority, status,
-                   current_attempt_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
+                   dependencies_json, produces_json, consumes_json, base_branch,
+                   base_sha, priority, status, current_attempt_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
                 """,
                 (
                     task_id,
@@ -535,6 +559,8 @@ class GitSupervisor:
                     canonical_json(list(acceptance)),
                     canonical_json(normalized),
                     canonical_json(list(dependencies)),
+                    canonical_json(produced),
+                    canonical_json(consumed),
                     resolved_branch,
                     base_sha,
                     priority,
@@ -546,7 +572,13 @@ class GitSupervisor:
                 connection,
                 "task.created",
                 "operator",
-                {"task_id": task_id, "resources": normalized, "base_sha": base_sha},
+                {
+                    "task_id": task_id,
+                    "resources": normalized,
+                    "produces": produced,
+                    "consumes": consumed,
+                    "base_sha": base_sha,
+                },
             )
         return self.task(task_id)
 
@@ -561,6 +593,31 @@ class GitSupervisor:
                 "SELECT * FROM tasks ORDER BY priority DESC, created_at"
             ).fetchall()
             return [self._task_view(connection, row) for row in rows]
+
+    def plan_claim(self, task_id: str) -> dict[str, Any]:
+        """Dry-run a claim. Read-only: it never reaps, claims, or provisions."""
+        return Scheduler(self).plan_claim(task_id)
+
+    def ready_queue(self) -> dict[str, Any]:
+        """Deterministic launch plan for every claimable task. Read-only."""
+        return Scheduler(self).ready_queue()
+
+    def merge_plan(self) -> dict[str, Any]:
+        """Integration ordering preview for approved submissions. Read-only."""
+        return Scheduler(self).merge_plan()
+
+    def status(
+        self,
+        limit: int | None = None,
+        lease_risk_seconds: int = DEFAULT_LEASE_RISK_SECONDS,
+    ) -> dict[str, Any]:
+        """Operator snapshot: attention queue, phases, runtimes, blockers. Read-only."""
+        return StatusView(self).snapshot(limit, lease_risk_seconds)
+
+    @staticmethod
+    def render_status(snapshot: dict[str, Any]) -> str:
+        """Human-readable rendering of a `status()` snapshot; JSON stays canonical."""
+        return StatusView.render(snapshot)
 
     @staticmethod
     def _port_available(port: int) -> bool:
@@ -893,11 +950,32 @@ class GitSupervisor:
                     raise SupervisorError(
                         "dependency_incomplete", f"dependency {dependency} is not done"
                     )
+            for artifact in json.loads(task["consumes_json"]):
+                producer = connection.execute(
+                    """
+                    SELECT id, status FROM tasks
+                    WHERE id != ? AND status != 'done'
+                      AND EXISTS (
+                        SELECT 1 FROM json_each(tasks.produces_json) WHERE value = ?
+                      )
+                    ORDER BY id LIMIT 1
+                    """,
+                    (task_id, artifact),
+                ).fetchone()
+                if producer:
+                    raise SupervisorError(
+                        "dependency_incomplete",
+                        f"artifact {artifact} is produced by task {producer['id']} "
+                        f"which is {producer['status']}",
+                    )
             requested = json.loads(task["resources_json"])
             leases = connection.execute(
                 """
-                SELECT resource, task_id FROM resource_leases
-                WHERE task_id IS NOT NULL AND lease_expires_at > ?
+                SELECT lease.resource, lease.task_id, lease.attempt_id,
+                       attempt.agent_id AS agent_id
+                FROM resource_leases AS lease
+                LEFT JOIN attempts AS attempt ON attempt.id = lease.attempt_id
+                WHERE lease.task_id IS NOT NULL AND lease.lease_expires_at > ?
                 """,
                 (int(time.time()),),
             ).fetchall()
@@ -906,9 +984,13 @@ class GitSupervisor:
                     if lease["task_id"] != task_id and self.resources_overlap(
                         resource, lease["resource"]
                     ):
+                        overlap = "exact" if resource == lease["resource"] else "potential"
                         raise SupervisorError(
                             "resource_busy",
-                            f"{resource} overlaps active lease {lease['resource']}",
+                            f"{resource} has an {overlap} overlap with active lease "
+                            f"{lease['resource']} held by task {lease['task_id']} "
+                            f"(agent {lease['agent_id'] or 'unknown'}, "
+                            f"attempt {lease['attempt_id'] or 'unknown'})",
                         )
             counter_row = connection.execute(
                 "SELECT value FROM meta WHERE key = 'claim_counter'"
@@ -2196,6 +2278,8 @@ class GitSupervisor:
             "acceptance": json.loads(row["acceptance_json"]),
             "resources": json.loads(row["resources_json"]),
             "dependencies": json.loads(row["dependencies_json"]),
+            "produces": json.loads(row["produces_json"]),
+            "consumes": json.loads(row["consumes_json"]),
             "base_branch": row["base_branch"],
             "base_sha": row["base_sha"],
             "priority": row["priority"],

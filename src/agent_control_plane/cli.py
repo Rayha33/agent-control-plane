@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Sequence
 from typing import Any
 
 from .git_supervisor import GitSupervisor, SupervisorError
+from .status import DEFAULT_LEASE_RISK_SECONDS
 
 
 def parser() -> argparse.ArgumentParser:
@@ -28,11 +30,46 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--accept", action="append", required=True, dest="acceptance")
     add.add_argument("--resource", action="append", required=True, dest="resources")
     add.add_argument("--depends-on", action="append", default=[], dest="dependencies")
+    add.add_argument(
+        "--produces",
+        action="append",
+        default=[],
+        dest="produces",
+        help="logical artifact this task publishes for other tasks",
+    )
+    add.add_argument(
+        "--consumes",
+        action="append",
+        default=[],
+        dest="consumes",
+        help="logical artifact this task requires; its producers must finish first",
+    )
     add.add_argument("--priority", type=int, default=50)
     add.add_argument("--base", default="HEAD", dest="base_branch")
 
     show = commands.add_parser("show", help="show a task")
     show.add_argument("task_id")
+    plan = commands.add_parser("plan", help="dry-run a claim and report what would block it")
+    plan.add_argument("task_id")
+    commands.add_parser("queue", help="ordered ready queue with overlap and dependency blockers")
+    commands.add_parser("merge-plan", help="integration ordering preview for approved work")
+    status = commands.add_parser("status", help="read-only operator view of every agent")
+    status.add_argument("--limit", type=int, help="show at most this many tasks")
+    status.add_argument("--format", choices=("json", "text"), default="json", dest="output_format")
+    status.add_argument(
+        "--lease-risk-seconds",
+        type=int,
+        default=DEFAULT_LEASE_RISK_SECONDS,
+        help="flag an attempt whose lease expires within this many seconds",
+    )
+    status.add_argument("--watch", action="store_true", help="refresh until interrupted")
+    status.add_argument("--interval", type=float, default=2.0, help="seconds between refreshes")
+    status.add_argument(
+        "--iterations",
+        type=int,
+        default=0,
+        help="stop after this many refreshes (0 means run until interrupted)",
+    )
     claim = commands.add_parser("claim", help="claim resources and create a worktree")
     claim.add_argument("task_id")
     claim.add_argument("--agent", required=True, dest="agent_id")
@@ -76,6 +113,28 @@ def emit(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
+def watch_status(supervisor: GitSupervisor, args: Any) -> int:
+    """Render the read-only status view once, or repeatedly under --watch.
+
+    JSON stays canonical; --format text is a convenience rendering of the same
+    snapshot. Ctrl-C ends a watch cleanly instead of raising.
+    """
+    iteration = 0
+    try:
+        while True:
+            snapshot = supervisor.status(args.limit, args.lease_risk_seconds)
+            if args.output_format == "text":
+                print(supervisor.render_status(snapshot), flush=True)
+            else:
+                emit(snapshot)
+            iteration += 1
+            if not args.watch or (args.iterations and iteration >= args.iterations):
+                return 0
+            time.sleep(max(0.1, args.interval))
+    except KeyboardInterrupt:
+        return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     root = parser()
     args = root.parse_args(argv)
@@ -109,9 +168,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.dependencies,
                 args.priority,
                 args.base_branch,
+                args.produces,
+                args.consumes,
             )
         elif args.action == "show":
             result = supervisor.task(args.task_id)
+        elif args.action == "plan":
+            result = supervisor.plan_claim(args.task_id)
+        elif args.action == "queue":
+            result = supervisor.ready_queue()
+        elif args.action == "merge-plan":
+            result = supervisor.merge_plan()
+        elif args.action == "status":
+            return watch_status(supervisor, args)
         elif args.action == "claim":
             result = supervisor.claim(args.task_id, args.agent_id, args.lease_seconds)
         elif args.action == "heartbeat":
