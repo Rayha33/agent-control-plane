@@ -1,0 +1,13 @@
+.firecrawl/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+docs/FOUNDER_BRIEF.md
