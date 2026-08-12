@@ -4,10 +4,21 @@ Agent Control Plane is an early reference implementation. Do not treat it as a
 production security boundary without the hardening described in the README and
 architecture document.
 
-The Git supervisor executes configured QC, critic, worker, and integration
-commands. Those commands may execute candidate repository code. Use an
-OS/container sandbox and restricted network credentials for untrusted code.
-Only trusted maintainers should change <code>acp.toml</code>.
+The Git supervisor executes configured runtime setup/teardown, QC, critic,
+worker, and integration commands. Those commands may execute candidate
+repository code. Use an OS/container sandbox and restricted network credentials
+for untrusted code. Only trusted maintainers should change
+<code>acp.toml</code>. Runtime hook output is stored under ignored local
+<code>.acp/logs/</code>; hooks must not print credentials. Prefer absolute hook
+wrappers outside candidate worktrees. The current alpha does not yet enforce
+that path boundary for lifecycle hooks.
+
+Runtime port pools prevent two cooperating ACP attempts from receiving the same
+configured TCP port. They are not kernel reservations: an unrelated local
+process can race the availability probe. ACP quarantines a port that remains
+occupied after teardown, but it cannot prove cleanup of database schemas,
+containers, cloud resources, or other side effects. Use idempotent trusted hooks
+and provider-native deletion/fencing for those resources.
 
 Local reviewer names are policy identities, not cryptographically authenticated
 humans or model providers. A high-assurance deployment must authenticate each
@@ -43,6 +54,10 @@ the private advisory.
 - approval replay;
 - stale fencing-token acceptance;
 - double claims or resource-lease races;
+- duplicate runtime allocation, unsafe environment-variable override, cleanup
+  races, or premature port reuse;
+- candidate-controlled lifecycle hooks or teardown that reports success while
+  external state remains;
 - worker self-approval;
 - undeclared Git writes, path traversal, or symlink escape;
 - QC that observes the wrong or mutable commit;

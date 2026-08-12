@@ -11,7 +11,7 @@ open
   │ atomic claim + write-set reservation
   ▼
 provisioning ── failure ──► open
-  │ branch + worktree created
+  │ branch + worktree + runtime environment created
   ▼
 working ── lease expiry ──► orphaned ── replacement claim ──► working
   │ clean committed Git evidence
@@ -28,9 +28,10 @@ integrating ── conflict/failure ──► conflicted
 done + preserved integration branch
 ~~~
 
-Resources remain reserved from claim through QC and integration. A negative QC
-verdict releases them. An expired post-submission reservation makes the task
-conflicted; ACP never treats the old approval as current.
+Source and runtime resources remain reserved from claim through QC and
+integration. A negative QC verdict releases them. An expired post-submission
+reservation makes the task conflicted and triggers teardown; ACP never treats
+the old approval as current.
 
 ## Durable records
 
@@ -39,6 +40,8 @@ conflicted; ACP never treats the old approval as current.
 | task | specification, acceptance criteria, dependencies, declared resources, base |
 | attempt | agent, branch, worktree, claim token, checkpoint, PID, latest commit |
 | resource lease | normalized resource, owner, monotonic fencing token, expiry |
+| runtime environment | generated environment, setup/teardown evidence and lifecycle state |
+| runtime allocation | unique local port-pool value, attempt owner and expiry |
 | submission | immutable commit/tree/patch hashes, changed paths, resource tokens |
 | QC run | reviewer, immutable commit, commands, outputs, structured findings |
 | integration | merge result, integration commands, branch and commit |
@@ -92,17 +95,42 @@ The worktree must be clean and committed. Every changed path must match the
 declared write set. A changed symlink resolving outside the assigned worktree is
 rejected.
 
-### 4. A crash does not erase committed work
+### 4. Runtime isolation follows the attempt
+
+Worktree isolation stops direct file overwrites but does not isolate ports,
+database schemas, browser profiles, or service state. During the same claim
+transaction, ACP allocates one available value from every configured local port
+pool and persists the assignment against the attempt.
+
+After the worktree exists, ACP creates a private runtime directory and runs
+configured setup commands with generated environment variables. The environment
+is then injected into the supervised worker, deterministic QC, the critic, and
+integration commands. This prevents a verifier from accidentally testing
+another attempt's localhost service or database configuration.
+
+Runtime teardown is triggered by negative QC, completed integration, or lease
+expiry. Port values are released only after every teardown command passes and
+the OS confirms that the ports can be rebound. Failed cleanup remains durable
+as <code>teardown_failed</code> and keeps the allocation quarantined for an
+operator retry.
+
+Port allocation is a local coordination guarantee, not a kernel reservation.
+An unrelated process can still bind after ACP's availability check. Database or
+container isolation is provided by the configured idempotent hooks, not inferred
+by ACP.
+
+### 5. A crash does not erase committed work
 
 Heartbeats persist the latest commit and arbitrary JSON checkpoint. The reaper
 also reads the old worktree's current HEAD when possible. It does not delete the
-old branch or worktree. A replacement starts from the latest durable commit and
-receives new fencing tokens.
+old branch or worktree. It stops a registered supervised process group before
+tearing down and recycling runtime allocations. A replacement starts from the
+latest durable commit and receives new fencing tokens.
 
 Uncommitted editor state is deliberately not treated as recoverable evidence.
 Agent runners should commit checkpoints or use an external snapshot layer.
 
-### 5. QC observes an immutable candidate
+### 6. QC observes an immutable candidate
 
 ACP checks out the submission commit into a fresh detached worktree. It runs
 trusted deterministic commands and then, if configured, starts the critic
@@ -113,7 +141,7 @@ Deterministic command failure always blocks. Medium-or-higher critic findings
 prevent a pass. The reviewer identity must equal the configured critic identity
 and differ from the worker identity.
 
-### 6. Integration cannot mutate the base branch
+### 7. Integration cannot mutate the base branch
 
 ACP creates a fresh worktree and new integration branch from the current base,
 merges the immutable candidate, reruns integration commands, and preserves the
@@ -123,7 +151,7 @@ branch only on success. Merge conflict or command failure moves the task to
 Promotion of that branch is left to the user's existing human review or merge
 queue.
 
-### 7. Events cannot be lost independently of state
+### 8. Events cannot be lost independently of state
 
 Every Git-supervisor state mutation and its event append occur in the same
 transaction. Events include the previous event hash. The verify-events command
@@ -140,9 +168,10 @@ planner / issue tracker / user
            ▼
       ACP local kernel
       ├── SQLite state + leases + event chain
-      ├── task worktree ── worker process
-      ├── detached QC worktree ── commands + critic
-      └── integration worktree ── merge + commands
+      ├── runtime allocator ── ports + setup/teardown hooks
+      ├── task worktree ── worker process + runtime env
+      ├── detached QC worktree ── commands + critic + runtime env
+      └── integration worktree ── merge + commands + runtime env
                                    │
                                    ▼
                          integration branch / merge queue
@@ -160,11 +189,13 @@ The data model is intentionally portable:
    advisory locks for multi-host use.
 2. Authenticate runner, worker, critic, and integrator identities.
 3. Put each worktree and QC command in a filesystem/network sandbox.
-4. Enforce logical-resource fencing in deployment, database, and artifact
+4. Add container/network namespace drivers behind the runtime lifecycle
+   contract.
+5. Enforce logical-resource fencing in deployment, database, and artifact
    gateways.
-5. Export lifecycle through MCP Tasks or A2A and telemetry through
+6. Export lifecycle through MCP Tasks or A2A and telemetry through
    OpenTelemetry.
-6. Anchor event-chain heads in an external append-only store.
+7. Anchor event-chain heads in an external append-only store.
 
 Those layers strengthen enforcement without changing the task, attempt, lease,
 submission, QC, or integration contracts.

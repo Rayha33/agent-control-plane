@@ -56,6 +56,19 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("command", nargs=argparse.REMAINDER)
     terminate = commands.add_parser("terminate", help="stop a supervised worker")
     terminate.add_argument("attempt_id")
+    environment = commands.add_parser(
+        "environment", help="show the isolated runtime assigned to an attempt"
+    )
+    environment.add_argument("attempt_id")
+    runtime_down = commands.add_parser(
+        "runtime-down", help="retry teardown and release an attempt runtime"
+    )
+    runtime_down.add_argument("attempt_id")
+    runtime_down.add_argument(
+        "--force",
+        action="store_true",
+        help="recover a teardown left in-progress by a crashed supervisor",
+    )
     return root
 
 
@@ -128,6 +141,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.run_worker(args.attempt_id, args.claim_token, command)
         elif args.action == "terminate":
             result = supervisor.terminate_worker(args.attempt_id)
+        elif args.action == "environment":
+            result = supervisor.runtime_environment(args.attempt_id)
+        elif args.action == "runtime-down":
+            result = supervisor.runtime_down(args.attempt_id, args.force)
         else:
             root.error(f"unknown action {args.action}")
             return 2

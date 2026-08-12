@@ -16,6 +16,25 @@ The stronger open-source wedge is the layer those systems can call:
 The unmet job is to make overlapping ownership, stale writers, recovery, and
 independent acceptance mechanically enforceable across vendors.
 
+## What practitioners are talking about
+
+A second research pass focused on first-hand issue reports and practitioner
+threads rather than product positioning. Six themes recur:
+
+| Rank | Repeated challenge | Evidence | Product response |
+|---|---|---|---|
+| 1 | Runtime and test-data collisions | In the [Parallel agents in Zed discussion](https://news.ycombinator.com/item?id=47866750), users describe port conflicts, copied secrets, separate services, shared migrations, and abandoning parallel agents because test-data isolation became too costly. [Trigger.dev's account](https://trigger.dev/blog/parallel-agents-gitbutler) reports the same PostgreSQL, Redis, ClickHouse, port, dependency, and disk duplication problems in a production monorepo. | Allocate per-attempt runtime resources and carry them through verification |
+| 2 | Missing setup and teardown lifecycle | The same Zed thread asks for VM-like create/destroy hooks and automatic cleanup. [Claude Code issue #26725](https://github.com/anthropics/claude-code/issues/26725) reports stale worktrees after interrupted sessions. | Durable idempotent setup/teardown with reaper-triggered cleanup |
+| 3 | Verification is still manual or correlated | A practitioner in the Zed thread says manual verification is the largest remaining burden and that agents can encode the bug into their own tests. [Anthropic's evaluation guidance](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) recommends combining deterministic, rubric-based, and state-based evaluation. | Immutable evidence, deterministic gates, independent critic, no self-approval |
+| 4 | Operator attention becomes the bottleneck | A [multi-agent terminal discussion](https://news.ycombinator.com/item?id=47268777) describes 3–6 agents spread across terminals and asks how overlapping changes, merge timing, accountability, and traceability should work. | One durable task/attempt state model and machine-readable status |
+| 5 | Cross-session coordination remains fragile | [Claude Code issue #24798](https://github.com/anthropics/claude-code/issues/24798) asks for inter-session coordination and describes readers seeing partial files after a writer crashes. [Codex issue #23515](https://github.com/openai/codex/issues/23515) reports one worktree session being interrupted by another. | Atomic write scopes, checkpoints, fencing, and one worktree per attempt |
+| 6 | Parallelism can erase its own economics | User reports include [202 GB of unreaped run copies](https://github.com/openai/codex/issues/35383) and [128 GB memory exhaustion](https://github.com/openai/codex/issues/23749). Trigger.dev also reports duplicated dependencies and service stacks. | Bounded pools, explicit cleanup state, quotas and telemetry next |
+
+The most important new finding is that a worktree is only source isolation. A
+credible safety kernel also needs a runtime lifecycle: unique ports and
+namespaces, setup evidence, teardown evidence, and quarantine when cleanup
+cannot prove that a resource is free.
+
 ## Evidence of the need
 
 | Evidence | What the source says | Product implication |
@@ -28,6 +47,8 @@ independent acceptance mechanically enforceable across vendors.
 | [GitHub Agent HQ mission control](https://github.blog/ai-and-ml/github-copilot/how-to-orchestrate-agents-using-mission-control/) | Operators are told to partition overlapping work and inspect sessions, files, and checks | Human partitioning is still carrying correctness |
 | [Conductor parallel agents](https://www.conductor.build/docs/concepts/parallel-agents) | Workspaces use worktrees, while agents in one workspace can edit the same files | A pre-write overlap gate remains valuable |
 | [Augment Intent](https://www.augmentcode.com/blog/intent-a-workspace-for-agent-orchestration) | Coordinator, implementors, verifier, worktrees, living specification, and bring-your-own-agent | This validates demand; ACP should interoperate rather than duplicate the workspace |
+| [Neon worktree/database branching guide](https://neon.com/guides/git-worktrees-neon-branching) | Parallel tests and migrations collide when worktrees share one database | Runtime and data isolation must accompany source isolation |
+| [Ecluse](https://github.com/hefgi/ecluse) | Gives each worktree isolated ports, services, data, and teardown across Docker/host stacks | Environment lifecycle is a validated adjacent category; ACP should provide a small policy kernel and hooks rather than own every stack |
 
 The pattern is consistent: products are improving how agents are launched and
 observed. The weakest common layer is the correctness protocol between task
@@ -55,6 +76,7 @@ verifiable.
 |---|---|---|
 | Vendor agent teams | Delegation, context sharing, native UX | Cross-vendor ownership and fencing |
 | Worktree managers | Filesystem isolation and parallel sessions | Overlap arbitration and stale-writer rejection |
+| Environment managers | Per-worktree ports, services, data and teardown | Durable ownership, fencing, evidence and QC integration |
 | Orchestrators | Planning, spawning, dashboards, queues | Small embeddable safety kernel |
 | CI systems | Deterministic tests after push | Pre-integration task ownership and recovery |
 | Code review agents | Semantic critique | Immutable candidate selection and no-self-approval policy |
@@ -73,11 +95,14 @@ them.
    checkpoint, and process identity.
 4. **Server-derived Git evidence.** Never trust a worker to report its own
    changed files, patch hash, or candidate revision.
-5. **Independent QC in a fresh checkout.** Run deterministic gates and a
+5. **Per-attempt runtime lifecycle.** Allocate collision-free local resources,
+   inject one environment from worker through integration, and fail closed when
+   teardown leaves a resource occupied.
+6. **Independent QC in a fresh checkout.** Run deterministic gates and a
    separately configured critic against one immutable commit.
-6. **Integration against current base.** Re-merge and rerun gates before marking
+7. **Integration against current base.** Re-merge and rerun gates before marking
    done; do not update the base branch directly.
-7. **Honest boundaries.** Local worktree safety is not a code sandbox,
+8. **Honest boundaries.** Local worktree safety is not a code sandbox,
    distributed lock, or deployment gateway.
 
 ## Why the design is future-proof
@@ -87,6 +112,7 @@ The durable concepts are protocol-level, not model-specific:
 - task specification and acceptance criteria;
 - attempt identity and checkpoints;
 - resource ownership and fencing;
+- runtime allocation and lifecycle evidence;
 - immutable artifacts and provenance;
 - independent verification; and
 - integration outcome.

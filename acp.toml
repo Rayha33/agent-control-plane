@@ -16,3 +16,7 @@ commands = [
   "uv run --extra dev ruff check .",
   "uv run --extra dev pytest -q",
 ]
+
+[runtime]
+setup_commands = []
+teardown_commands = []

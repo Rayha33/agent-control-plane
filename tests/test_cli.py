@@ -58,6 +58,9 @@ def test_cli_init_create_claim_and_doctor(tmp_path: Path) -> None:
     attempt = json.loads(claimed.stdout)
     assert Path(attempt["worktree"]).is_dir()
     assert attempt["claim_token"] >= 1
+    environment = run_cli(tmp_path, "environment", attempt["id"])
+    assert environment.returncode == 0, environment.stderr
+    assert json.loads(environment.stdout)["state"] == "ready"
 
     doctor = run_cli(tmp_path, "doctor")
     assert doctor.returncode == 0, doctor.stderr

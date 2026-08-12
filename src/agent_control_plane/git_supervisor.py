@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +43,13 @@ def sha256(value: bytes) -> str:
 
 
 @dataclass(frozen=True)
+class RuntimePortPool:
+    env_name: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
 class Config:
     lease_seconds: int
     timeout_seconds: int
@@ -49,6 +58,9 @@ class Config:
     critic_command: str
     critic_identity: str
     require_critic: bool
+    runtime_setup_commands: tuple[str, ...]
+    runtime_teardown_commands: tuple[str, ...]
+    runtime_port_pools: tuple[RuntimePortPool, ...]
 
 
 SCHEMA = """
@@ -134,6 +146,23 @@ CREATE TABLE IF NOT EXISTS integrations (
   error TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runtime_environments (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+  state TEXT NOT NULL,
+  env_json TEXT NOT NULL,
+  setup_results_json TEXT NOT NULL,
+  teardown_results_json TEXT NOT NULL,
+  log_path TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_allocations (
+  pool_name TEXT NOT NULL,
+  value INTEGER NOT NULL,
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  lease_expires_at INTEGER NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(pool_name, value)
+);
 CREATE TABLE IF NOT EXISTS events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
@@ -147,6 +176,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, priority DESC);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, number DESC);
 CREATE INDEX IF NOT EXISTS idx_submissions_task ON submissions(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_allocations_attempt
+  ON runtime_allocations(attempt_id);
 """
 
 
@@ -162,6 +193,7 @@ class GitSupervisor:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "worktrees").mkdir(exist_ok=True)
         (self.state_dir / "logs").mkdir(exist_ok=True)
+        (self.state_dir / "runtime").mkdir(exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             connection.execute(
@@ -183,7 +215,10 @@ class GitSupervisor:
                 'commands = ["python -m pytest -q"]\n'
                 'critic_command = "builtin"\n\n'
                 "[integration]\n"
-                'commands = ["python -m pytest -q"]\n',
+                'commands = ["python -m pytest -q"]\n\n'
+                "[runtime]\n"
+                "setup_commands = []\n"
+                "teardown_commands = []\n",
                 encoding="utf-8",
             )
         ignore = root / ".gitignore"
@@ -213,6 +248,7 @@ class GitSupervisor:
         supervisor = raw.get("supervisor", {})
         qc = raw.get("qc", {})
         integration = raw.get("integration", {})
+        runtime = raw.get("runtime", {})
         lease = int(supervisor.get("lease_seconds", 300))
         timeout = int(supervisor.get("qc_timeout_seconds", 900))
         if lease < 10 or timeout < 1:
@@ -260,6 +296,73 @@ class GitSupervisor:
                     "external critic_command must name an executable file",
                 )
             critic_command = str(critic_path)
+        runtime_setup_commands = tuple(map(str, runtime.get("setup_commands", [])))
+        runtime_teardown_commands = tuple(map(str, runtime.get("teardown_commands", [])))
+        for label, commands in (
+            ("runtime setup", runtime_setup_commands),
+            ("runtime teardown", runtime_teardown_commands),
+        ):
+            if any(not command.strip() for command in commands):
+                raise SupervisorError(
+                    "invalid_config", f"every {label} command must contain a command"
+                )
+        raw_ports = runtime.get("ports", {})
+        if not isinstance(raw_ports, dict):
+            raise SupervisorError("invalid_config", "runtime.ports must be a table")
+        reserved_env = {
+            "ACP_ATTEMPT_ID",
+            "ACP_TASK_ID",
+            "ACP_WORKTREE",
+            "ACP_REPO_ROOT",
+            "ACP_RUNTIME_DIR",
+            "ACP_PHASE",
+            "PATH",
+            "HOME",
+            "SHELL",
+            "USER",
+            "LOGNAME",
+            "PWD",
+            "OLDPWD",
+            "TMPDIR",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "SSH_AUTH_SOCK",
+        }
+        runtime_port_pools: list[RuntimePortPool] = []
+        for env_name, bounds in sorted(raw_ports.items()):
+            if (
+                not re.fullmatch(r"[A-Z_][A-Z0-9_]*", env_name)
+                or env_name in reserved_env
+                or env_name.startswith("ACP_")
+            ):
+                raise SupervisorError(
+                    "invalid_config",
+                    f"runtime port name {env_name!r} is not a safe environment variable",
+                )
+            if (
+                not isinstance(bounds, list)
+                or len(bounds) != 2
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in bounds)
+            ):
+                raise SupervisorError(
+                    "invalid_config", f"runtime port pool {env_name} must be [start, end]"
+                )
+            start, end = bounds
+            if start < 1024 or end > 65535 or start > end:
+                raise SupervisorError(
+                    "invalid_config",
+                    f"runtime port pool {env_name} must stay within 1024..65535",
+                )
+            runtime_port_pools.append(RuntimePortPool(env_name, start, end))
+        for index, pool in enumerate(runtime_port_pools):
+            for other in runtime_port_pools[:index]:
+                if max(pool.start, other.start) <= min(pool.end, other.end):
+                    raise SupervisorError(
+                        "invalid_config",
+                        f"runtime port pools {other.env_name} and {pool.env_name} overlap",
+                    )
         return Config(
             lease_seconds=lease,
             timeout_seconds=timeout,
@@ -268,6 +371,9 @@ class GitSupervisor:
             critic_command=critic_command,
             critic_identity=str(supervisor.get("critic_identity", "independent-qc")),
             require_critic=require_critic,
+            runtime_setup_commands=runtime_setup_commands,
+            runtime_teardown_commands=runtime_teardown_commands,
+            runtime_port_pools=tuple(runtime_port_pools),
         )
 
     @contextmanager
@@ -456,6 +562,311 @@ class GitSupervisor:
             ).fetchall()
             return [self._task_view(connection, row) for row in rows]
 
+    @staticmethod
+    def _port_available(port: int) -> bool:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+        finally:
+            probe.close()
+        return True
+
+    def _allocate_runtime(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        task_id: str,
+        worktree: Path,
+        expires: int,
+        stamp: str,
+    ) -> None:
+        runtime_dir = self.state_dir / "runtime" / attempt_id
+        log_path = self.state_dir / "logs" / f"runtime-{attempt_id}.log"
+        environment = {
+            "ACP_ATTEMPT_ID": attempt_id,
+            "ACP_TASK_ID": task_id,
+            "ACP_WORKTREE": str(worktree),
+            "ACP_REPO_ROOT": str(self.root),
+            "ACP_RUNTIME_DIR": str(runtime_dir),
+        }
+        for pool in self.config.runtime_port_pools:
+            allocated = None
+            for value in range(pool.start, pool.end + 1):
+                held = connection.execute(
+                    "SELECT 1 FROM runtime_allocations WHERE pool_name = ? AND value = ?",
+                    (pool.env_name, value),
+                ).fetchone()
+                if not held and self._port_available(value):
+                    allocated = value
+                    break
+            if allocated is None:
+                raise SupervisorError(
+                    "runtime_pool_exhausted",
+                    f"no available value remains in runtime port pool {pool.env_name}",
+                )
+            connection.execute(
+                """
+                INSERT INTO runtime_allocations
+                  (pool_name, value, attempt_id, lease_expires_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (pool.env_name, allocated, attempt_id, expires, stamp),
+            )
+            environment[pool.env_name] = str(allocated)
+        connection.execute(
+            """
+            INSERT INTO runtime_environments
+              (attempt_id, state, env_json, setup_results_json,
+               teardown_results_json, log_path, updated_at)
+            VALUES (?, 'allocated', ?, '[]', '[]', ?, ?)
+            """,
+            (attempt_id, canonical_json(environment), str(log_path), stamp),
+        )
+        self._event(
+            connection,
+            "runtime.allocated",
+            "supervisor",
+            {
+                "attempt_id": attempt_id,
+                "ports": {
+                    pool.env_name: environment[pool.env_name]
+                    for pool in self.config.runtime_port_pools
+                },
+            },
+        )
+
+    def runtime_environment(self, attempt_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise SupervisorError(
+                    "runtime_not_found", f"attempt {attempt_id} has no runtime environment"
+                )
+            return self._runtime_view(connection, row)
+
+    def _runtime_env(self, attempt_id: str, require_ready: bool = True) -> dict[str, str]:
+        runtime = self.runtime_environment(attempt_id)
+        if require_ready and runtime["state"] != "ready":
+            raise SupervisorError(
+                "runtime_not_ready",
+                f"attempt runtime state is {runtime['state']}",
+            )
+        return runtime["environment"]
+
+    def _run_runtime_commands(
+        self,
+        commands: Sequence[str],
+        cwd: Path,
+        environment: dict[str, str],
+        log_path: Path,
+        stop_on_failure: bool,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        for command in commands:
+            result = self._run_command(command, cwd, environment)
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(json.dumps(result, sort_keys=True) + "\n")
+            results.append(
+                {
+                    "command": command,
+                    "exit_code": result["exit_code"],
+                    "duration_ms": result["duration_ms"],
+                }
+            )
+            if result["exit_code"] and stop_on_failure:
+                break
+        return results
+
+    @staticmethod
+    def _phase_runtime_env(environment: dict[str, str], phase: str, cwd: Path) -> dict[str, str]:
+        return environment | {"ACP_PHASE": phase, "ACP_WORKTREE": str(cwd)}
+
+    def _runtime_up(self, attempt_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise SupervisorError("runtime_not_found", "runtime allocation is missing")
+            if row["state"] != "allocated":
+                raise SupervisorError(
+                    "runtime_not_ready", f"runtime cannot start from state {row['state']}"
+                )
+            connection.execute(
+                "UPDATE runtime_environments SET state = 'setting_up', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (utc_now(), attempt_id),
+            )
+            self._event(
+                connection,
+                "runtime.setup_started",
+                "supervisor",
+                {"attempt_id": attempt_id},
+            )
+        attempt = self.attempt(attempt_id)
+        environment = json.loads(row["env_json"])
+        runtime_dir = Path(environment["ACP_RUNTIME_DIR"])
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        results = self._run_runtime_commands(
+            self.config.runtime_setup_commands,
+            Path(attempt["worktree"]),
+            self._phase_runtime_env(environment, "setup", Path(attempt["worktree"])),
+            Path(row["log_path"]),
+            stop_on_failure=True,
+        )
+        failed = any(result["exit_code"] for result in results)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = "setup_failed" if failed else "ready"
+            connection.execute(
+                """
+                UPDATE runtime_environments
+                SET state = ?, setup_results_json = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (state, canonical_json(results), utc_now(), attempt_id),
+            )
+            self._event(
+                connection,
+                "runtime.setup_failed" if failed else "runtime.ready",
+                "supervisor",
+                {"attempt_id": attempt_id, "results": results},
+            )
+        if failed:
+            raise SupervisorError(
+                "runtime_setup_failed",
+                f"runtime setup failed; log: {row['log_path']}",
+            )
+        return self.runtime_environment(attempt_id)
+
+    def _abandon_runtime(self, attempt_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if not row or row["state"] == "released":
+                return
+            stamp = utc_now()
+            connection.execute(
+                "DELETE FROM runtime_allocations WHERE attempt_id = ?", (attempt_id,)
+            )
+            connection.execute(
+                "UPDATE runtime_environments SET state = 'released', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (stamp, attempt_id),
+            )
+            self._event(
+                connection,
+                "runtime.released",
+                "supervisor",
+                {"attempt_id": attempt_id, "reason": "provision_abandoned"},
+            )
+
+    def runtime_down(
+        self,
+        attempt_id: str,
+        force: bool = False,
+        _allow_active: bool = False,
+    ) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise SupervisorError("runtime_not_found", "runtime environment is missing")
+            if row["state"] == "released":
+                return self._runtime_view(connection, row)
+            task = connection.execute(
+                """
+                SELECT task.status FROM tasks AS task
+                JOIN attempts AS attempt ON attempt.task_id = task.id
+                WHERE attempt.id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            active_states = {"provisioning", "working", "qc_review", "approved", "integrating"}
+            if task and task["status"] in active_states and not _allow_active:
+                raise SupervisorError(
+                    "runtime_in_use",
+                    f"runtime is still required while task status is {task['status']}",
+                )
+            if row["state"] == "tearing_down" and not force:
+                raise SupervisorError(
+                    "runtime_cleanup_in_progress",
+                    "runtime cleanup is already in progress; use force only after a crashed cleanup",
+                )
+            connection.execute(
+                "UPDATE runtime_environments SET state = 'tearing_down', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (utc_now(), attempt_id),
+            )
+            self._event(
+                connection,
+                "runtime.teardown_started",
+                "supervisor",
+                {"attempt_id": attempt_id, "force": force},
+            )
+            environment = json.loads(row["env_json"])
+        attempt = self.attempt(attempt_id)
+        worktree = Path(attempt["worktree"])
+        cwd = worktree if worktree.is_dir() else self.root
+        results = self._run_runtime_commands(
+            self.config.runtime_teardown_commands,
+            cwd,
+            self._phase_runtime_env(environment, "teardown", cwd),
+            Path(row["log_path"]),
+            stop_on_failure=False,
+        )
+        with self.connect() as connection:
+            allocations = connection.execute(
+                "SELECT pool_name, value FROM runtime_allocations "
+                "WHERE attempt_id = ? ORDER BY pool_name",
+                (attempt_id,),
+            ).fetchall()
+        occupied = [
+            f"{allocation['pool_name']}={allocation['value']}"
+            for allocation in allocations
+            if not self._port_available(allocation["value"])
+        ]
+        failed = any(result["exit_code"] for result in results) or bool(occupied)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            stamp = utc_now()
+            state = "teardown_failed" if failed else "released"
+            connection.execute(
+                """
+                UPDATE runtime_environments
+                SET state = ?, teardown_results_json = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (state, canonical_json(results), stamp, attempt_id),
+            )
+            if not failed:
+                connection.execute(
+                    "DELETE FROM runtime_allocations WHERE attempt_id = ?", (attempt_id,)
+                )
+            self._event(
+                connection,
+                "runtime.teardown_failed" if failed else "runtime.released",
+                "supervisor",
+                {
+                    "attempt_id": attempt_id,
+                    "results": results,
+                    "occupied": occupied,
+                },
+            )
+        if not failed:
+            shutil.rmtree(environment["ACP_RUNTIME_DIR"], ignore_errors=True)
+        return self.runtime_environment(attempt_id)
+
     def claim(
         self, task_id: str, agent_id: str, lease_seconds: int | None = None
     ) -> dict[str, Any]:
@@ -547,6 +958,14 @@ class GitSupervisor:
                     now,
                 ),
             )
+            self._allocate_runtime(
+                connection,
+                attempt_id,
+                task_id,
+                worktree,
+                expires,
+                now,
+            )
             for resource in requested:
                 prior = connection.execute(
                     "SELECT fencing_token FROM resource_leases WHERE resource = ?",
@@ -586,9 +1005,19 @@ class GitSupervisor:
                     "start_sha": start_sha,
                 },
             )
+        worktree_created = False
         try:
             self._git("worktree", "add", "-b", branch, str(worktree), start_sha)
-        except SupervisorError:
+            worktree_created = True
+            self._runtime_up(attempt_id)
+        except (OSError, subprocess.SubprocessError, SupervisorError):
+            if worktree_created:
+                try:
+                    self.runtime_down(attempt_id, force=True, _allow_active=True)
+                except (OSError, subprocess.SubprocessError, SupervisorError):
+                    pass
+            else:
+                self._abandon_runtime(attempt_id)
             self._git("worktree", "remove", "--force", str(worktree), check=False)
             if worktree.exists():
                 shutil.rmtree(worktree)
@@ -656,6 +1085,14 @@ class GitSupervisor:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
             task = self._task_row(connection, attempt["task_id"])
+            runtime = connection.execute(
+                "SELECT state FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if not runtime or runtime["state"] != "ready":
+                raise SupervisorError(
+                    "runtime_not_ready",
+                    f"attempt runtime state is {runtime['state'] if runtime else 'missing'}",
+                )
             expected = set(json.loads(task["resources_json"]))
             rows = connection.execute(
                 "SELECT * FROM resource_leases WHERE attempt_id = ?", (attempt_id,)
@@ -685,6 +1122,13 @@ class GitSupervisor:
             ).rowcount
             if count != len(expected):
                 raise SupervisorError("stale_fencing_token", "resource lease set changed")
+            connection.execute(
+                """
+                UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (expires, now, attempt_id),
+            )
             self._event(
                 connection,
                 "attempt.heartbeat",
@@ -706,6 +1150,8 @@ class GitSupervisor:
         epoch = int(time.time()) if now is None else now
         orphaned: list[str] = []
         conflicted: list[str] = []
+        cleanup_attempts: set[str] = set()
+        workers_to_stop: list[tuple[str, int]] = []
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempts = connection.execute(
@@ -753,6 +1199,9 @@ class GitSupervisor:
                     (stamp, attempt["id"]),
                 )
                 orphaned.append(attempt["task_id"])
+                cleanup_attempts.add(attempt["id"])
+                if attempt["pid"] and attempt["pid"] > 0:
+                    workers_to_stop.append((attempt["id"], attempt["pid"]))
                 self._event(
                     connection,
                     "attempt.orphaned",
@@ -783,13 +1232,48 @@ class GitSupervisor:
                     (stamp, row["id"]),
                 )
                 conflicted.append(row["id"])
+                submission = connection.execute(
+                    """
+                    SELECT attempt_id FROM submissions WHERE task_id = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (row["id"],),
+                ).fetchone()
+                if submission:
+                    cleanup_attempts.add(submission["attempt_id"])
                 self._event(
                     connection,
                     "reservation.expired",
                     "reaper",
                     {"task_id": row["id"]},
                 )
-        return {"orphaned": orphaned, "conflicted": conflicted}
+            expired_runtime = connection.execute(
+                """
+                SELECT DISTINCT attempt_id FROM runtime_allocations
+                WHERE lease_expires_at <= ?
+                """,
+                (epoch,),
+            ).fetchall()
+            cleanup_attempts.update(row["attempt_id"] for row in expired_runtime)
+        terminated_workers: list[dict[str, Any]] = []
+        for attempt_id, pid in workers_to_stop:
+            self._terminate_registered_group(pid)
+            terminated_workers.append({"attempt_id": attempt_id, "pid": pid})
+        runtime_cleanup: list[dict[str, Any]] = []
+        for attempt_id in sorted(cleanup_attempts):
+            try:
+                runtime = self.runtime_down(attempt_id)
+                runtime_cleanup.append({"attempt_id": attempt_id, "state": runtime["state"]})
+            except (OSError, subprocess.SubprocessError, SupervisorError) as error:
+                runtime_cleanup.append(
+                    {"attempt_id": attempt_id, "state": "cleanup_error", "error": str(error)}
+                )
+        return {
+            "orphaned": orphaned,
+            "conflicted": conflicted,
+            "terminated_workers": terminated_workers,
+            "runtime_cleanup": runtime_cleanup,
+        }
 
     def submit(self, attempt_id: str, claim_token: int) -> dict[str, Any]:
         return self._submit(attempt_id, claim_token, expected_worker_pid=None)
@@ -916,6 +1400,13 @@ class GitSupervisor:
                 """,
                 (reserve_until, stamp, task["id"], attempt_id),
             )
+            connection.execute(
+                """
+                UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (reserve_until, stamp, attempt_id),
+            )
             self._event(
                 connection,
                 "submission.created",
@@ -952,6 +1443,16 @@ class GitSupervisor:
                     "self_review_forbidden", "worker cannot review its own submission"
                 )
             self._assert_reservations(connection, task, submission)
+            runtime = connection.execute(
+                "SELECT * FROM runtime_environments WHERE attempt_id = ?",
+                (submission["attempt_id"],),
+            ).fetchone()
+            if not runtime or runtime["state"] != "ready":
+                raise SupervisorError(
+                    "runtime_not_ready",
+                    f"submission runtime state is {runtime['state'] if runtime else 'missing'}",
+                )
+            runtime_env = json.loads(runtime["env_json"])
 
         qc_dir = self.state_dir / "worktrees" / f"qc-{uuid.uuid4().hex}"
         packet_path = self.state_dir / "logs" / f"review-{submission_id}.json"
@@ -964,7 +1465,11 @@ class GitSupervisor:
             packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
             for command in self.config.qc_commands:
                 self._restore_candidate(qc_dir, submission["commit_sha"])
-                result = self._run_command(command, qc_dir)
+                result = self._run_command(
+                    command,
+                    qc_dir,
+                    self._phase_runtime_env(runtime_env, "qc", qc_dir),
+                )
                 results.append(result)
                 if result["exit_code"]:
                     findings.append(self._command_finding(command, result))
@@ -988,7 +1493,8 @@ class GitSupervisor:
                 critic = self._run_critic(
                     self.config.critic_command,
                     qc_dir,
-                    {
+                    self._phase_runtime_env(runtime_env, "critic", qc_dir)
+                    | {
                         "ACP_REVIEW_PACKET": str(packet_path),
                         "ACP_REVIEW_RESULT": str(result_path),
                     },
@@ -1102,16 +1608,24 @@ class GitSupervisor:
                 (task_status, finished, current_task["id"]),
             )
             if verdict == "pass":
+                reserve_until = int(time.time()) + max(3600, self.config.timeout_seconds * 3)
                 connection.execute(
                     """
                     UPDATE resource_leases SET lease_expires_at = ?, updated_at = ?
                     WHERE task_id = ?
                     """,
                     (
-                        int(time.time()) + max(3600, self.config.timeout_seconds * 3),
+                        reserve_until,
                         finished,
                         current_task["id"],
                     ),
+                )
+                connection.execute(
+                    """
+                    UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (reserve_until, finished, current["attempt_id"]),
                 )
             else:
                 self._release_task_leases(connection, current_task["id"], finished)
@@ -1126,7 +1640,10 @@ class GitSupervisor:
                     "finding_count": len(findings),
                 },
             )
-        return self.qc_run(qc_id)
+        result = self.qc_run(qc_id)
+        if verdict != "pass":
+            result["runtime_cleanup"] = self.runtime_down(submission["attempt_id"])
+        return result
 
     def qc_run(self, qc_id: str) -> dict[str, Any]:
         with self.connect() as connection:
@@ -1162,6 +1679,16 @@ class GitSupervisor:
             if not qc or qc["commit_sha"] != submission["commit_sha"]:
                 raise SupervisorError("qc_evidence_missing", "QC did not pass this commit")
             self._assert_reservations(connection, task, submission)
+            runtime = connection.execute(
+                "SELECT * FROM runtime_environments WHERE attempt_id = ?",
+                (submission["attempt_id"],),
+            ).fetchone()
+            if not runtime or runtime["state"] != "ready":
+                raise SupervisorError(
+                    "runtime_not_ready",
+                    f"submission runtime state is {runtime['state'] if runtime else 'missing'}",
+                )
+            runtime_env = json.loads(runtime["env_json"])
             connection.execute(
                 "UPDATE tasks SET status = 'integrating', updated_at = ? WHERE id = ?",
                 (utc_now(), task_id),
@@ -1215,7 +1742,11 @@ class GitSupervisor:
             integration_commit = self._git_text("-C", str(worktree), "rev-parse", "HEAD")
             for command in self.config.integration_commands:
                 self._restore_candidate(worktree, integration_commit)
-                result = self._run_command(command, worktree)
+                result = self._run_command(
+                    command,
+                    worktree,
+                    self._phase_runtime_env(runtime_env, "integration", worktree),
+                )
                 results.append(result)
                 if result["exit_code"]:
                     raise SupervisorError(
@@ -1300,6 +1831,14 @@ class GitSupervisor:
                 self._remove_worktree(worktree, delete_branch=not recorded or verdict != "pass")
             elif not recorded or verdict != "pass":
                 self._git("branch", "-D", branch, check=False)
+        try:
+            runtime_cleanup: dict[str, Any] = self.runtime_down(submission["attempt_id"])
+        except (OSError, subprocess.SubprocessError, SupervisorError) as cleanup_error:
+            runtime_cleanup = {
+                "attempt_id": submission["attempt_id"],
+                "state": "cleanup_error",
+                "error": str(cleanup_error),
+            }
         return {
             "id": integration_id,
             "task_id": task_id,
@@ -1309,6 +1848,7 @@ class GitSupervisor:
             "verdict": verdict,
             "error": error_message,
             "command_results": results,
+            "runtime_cleanup": runtime_cleanup,
         }
 
     def run_worker(
@@ -1323,6 +1863,12 @@ class GitSupervisor:
             attempt_id,
             claim_token,
             {"phase": "launching", "command": list(command)},
+        )
+        worker_env = os.environ.copy()
+        worker_env.update(
+            self._phase_runtime_env(
+                self._runtime_env(attempt_id), "worker", Path(attempt["worktree"])
+            )
         )
         log_path = self.state_dir / "logs" / f"worker-{attempt_id}.log"
         with log_path.open("ab") as log:
@@ -1348,6 +1894,7 @@ class GitSupervisor:
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     pass_fds=(handshake_read,),
+                    env=worker_env,
                 )
                 os.close(handshake_read)
                 handshake_read = -1
@@ -1530,6 +2077,24 @@ class GitSupervisor:
     def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
         GitSupervisor._terminate_process_group(process)
 
+    @staticmethod
+    def _terminate_registered_group(pid: int) -> None:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (PermissionError, ProcessLookupError):
+            return
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)
+            except (PermissionError, ProcessLookupError):
+                return
+            time.sleep(0.05)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+
     def doctor(self) -> dict[str, Any]:
         checks: list[dict[str, Any]] = [
             {"name": "git", "ok": shutil.which("git") is not None},
@@ -1546,6 +2111,35 @@ class GitSupervisor:
             checks.append({"name": "sqlite", "ok": integrity == "ok", "detail": integrity})
         except sqlite3.Error as error:
             checks.append({"name": "sqlite", "ok": False, "detail": str(error)})
+        with self.connect() as connection:
+            runtime_rows = connection.execute(
+                """
+                SELECT runtime.attempt_id, runtime.state, task.status AS task_status
+                FROM runtime_environments AS runtime
+                JOIN attempts AS attempt ON attempt.id = runtime.attempt_id
+                JOIN tasks AS task ON task.id = attempt.task_id
+                ORDER BY runtime.updated_at
+                """
+            ).fetchall()
+        active_states = {"provisioning", "working", "qc_review", "approved", "integrating"}
+        unhealthy_runtime = [
+            {
+                "attempt_id": row["attempt_id"],
+                "runtime_state": row["state"],
+                "task_status": row["task_status"],
+            }
+            for row in runtime_rows
+            if (row["task_status"] in active_states and row["state"] != "ready")
+            or (row["task_status"] not in active_states and row["state"] != "released")
+        ]
+        checks.append(
+            {
+                "name": "runtime_environments",
+                "ok": not unhealthy_runtime,
+                "detail": unhealthy_runtime
+                or f"{sum(row['state'] == 'ready' for row in runtime_rows)} active environments",
+            }
+        )
         checks.append({"name": "event_chain", **self.verify_event_chain()})
         return {"ok": all(check["ok"] for check in checks), "checks": checks}
 
@@ -1623,6 +2217,9 @@ class GitSupervisor:
             """,
             (row["id"],),
         ).fetchall()
+        runtime = connection.execute(
+            "SELECT * FROM runtime_environments WHERE attempt_id = ?", (row["id"],)
+        ).fetchone()
         return {
             "id": row["id"],
             "task_id": row["task_id"],
@@ -1639,7 +2236,26 @@ class GitSupervisor:
             "status": row["status"],
             "lease_expires_at": row["lease_expires_at"],
             "resource_leases": [dict(lease) for lease in leases],
+            "runtime": self._runtime_view(connection, runtime) if runtime else None,
             "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _runtime_view(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        allocations = connection.execute(
+            "SELECT pool_name, value, lease_expires_at FROM runtime_allocations "
+            "WHERE attempt_id = ? ORDER BY pool_name",
+            (row["attempt_id"],),
+        ).fetchall()
+        return {
+            "attempt_id": row["attempt_id"],
+            "state": row["state"],
+            "environment": json.loads(row["env_json"]),
+            "allocations": [dict(allocation) for allocation in allocations],
+            "setup_results": json.loads(row["setup_results_json"]),
+            "teardown_results": json.loads(row["teardown_results_json"]),
+            "log_path": row["log_path"],
             "updated_at": row["updated_at"],
         }
 

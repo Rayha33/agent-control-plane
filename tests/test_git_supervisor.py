@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
 import sys
 import time
@@ -30,6 +31,9 @@ def write_config(
     critic_command: str = "",
     require_critic: bool = False,
     timeout_seconds: int = 30,
+    runtime_setup_commands: list[str] | None = None,
+    runtime_teardown_commands: list[str] | None = None,
+    runtime_ports: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     qc = qc_commands if qc_commands is not None else ["python -c 'pass'"]
     integration = integration_commands if integration_commands is not None else qc
@@ -38,7 +42,13 @@ def write_config(
         "integration": json.dumps(integration),
         "critic": json.dumps(critic_command),
         "required": str(require_critic).lower(),
+        "runtime_setup": json.dumps(runtime_setup_commands or []),
+        "runtime_teardown": json.dumps(runtime_teardown_commands or []),
     }
+    port_lines = "".join(
+        f"{name} = [{bounds[0]}, {bounds[1]}]\n"
+        for name, bounds in sorted((runtime_ports or {}).items())
+    )
     (repo / "acp.toml").write_text(
         "[supervisor]\n"
         "lease_seconds = 60\n"
@@ -49,7 +59,12 @@ def write_config(
         f"commands = {content['qc']}\n"
         f"critic_command = {content['critic']}\n\n"
         "[integration]\n"
-        f"commands = {content['integration']}\n",
+        f"commands = {content['integration']}\n\n"
+        "[runtime]\n"
+        f"setup_commands = {content['runtime_setup']}\n"
+        f"teardown_commands = {content['runtime_teardown']}\n\n"
+        "[runtime.ports]\n"
+        f"{port_lines}",
         encoding="utf-8",
     )
 
@@ -87,6 +102,25 @@ def commit_change(attempt: dict, path: str, content: str, message: str = "implem
     return git(worktree, "rev-parse", "HEAD")
 
 
+def free_port_range(count: int) -> tuple[int, int]:
+    for start in range(30000, 60000 - count):
+        sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
+        try:
+            for offset, candidate in enumerate(sockets):
+                candidate.bind(("127.0.0.1", start + offset))
+            return start, start + count - 1
+        except OSError:
+            continue
+        finally:
+            for candidate in sockets:
+                candidate.close()
+    raise AssertionError("no adjacent test ports available")
+
+
+def two_free_ports() -> tuple[int, int]:
+    return free_port_range(2)
+
+
 def test_twenty_colliding_tasks_have_exactly_one_winner(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     tasks = [task(supervisor, "alpha.txt", f"task-{index}") for index in range(20)]
@@ -120,6 +154,158 @@ def test_non_overlapping_tasks_get_parallel_worktrees(repo: Path) -> None:
         claims = list(pool.map(claim_one, [(first, "agent-alpha"), (second, "agent-beta")]))
     assert all(Path(claim["worktree"]).is_dir() for claim in claims)
     assert claims[0]["worktree"] != claims[1]["worktree"]
+
+
+def test_runtime_ports_are_unique_and_reach_supervised_worker(repo: Path) -> None:
+    start, end = two_free_ports()
+    write_config(repo, runtime_ports={"APP_PORT": (start, end)})
+    supervisor = GitSupervisor(repo)
+    first = supervisor.claim(task(supervisor, "alpha.txt")["id"], "agent-a")
+    second = supervisor.claim(task(supervisor, "beta.txt")["id"], "agent-b")
+
+    first_port = first["runtime"]["environment"]["APP_PORT"]
+    second_port = second["runtime"]["environment"]["APP_PORT"]
+    assert first_port != second_port
+    worker = (
+        "import os, pathlib, subprocess; "
+        "assert os.environ['ACP_PHASE'] == 'worker'; "
+        "assert pathlib.Path(os.environ['ACP_WORKTREE']).resolve() == pathlib.Path.cwd().resolve(); "
+        "pathlib.Path('alpha.txt').write_text(os.environ['APP_PORT'] + '\\n'); "
+        "subprocess.run(['git', 'add', 'alpha.txt'], check=True); "
+        "subprocess.run(['git', 'commit', '-m', 'record isolated port'], check=True)"
+    )
+    submission = supervisor.run_worker(
+        first["id"], first["claim_token"], [sys.executable, "-c", worker]
+    )
+
+    assert submission["status"] == "pending_qc"
+    assert (Path(first["worktree"]) / "alpha.txt").read_text().strip() == first_port
+    with pytest.raises(SupervisorError) as active_cleanup:
+        supervisor.runtime_down(first["id"])
+    assert active_cleanup.value.code == "runtime_in_use"
+
+
+def test_parallel_runtime_claims_receive_unique_ports(repo: Path) -> None:
+    start, end = free_port_range(6)
+    write_config(repo, runtime_ports={"APP_PORT": (start, end)})
+    supervisor = GitSupervisor(repo)
+    created = [
+        task(supervisor, f"logical:runtime/{index}", f"runtime {index}") for index in range(6)
+    ]
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        attempts = list(
+            pool.map(
+                lambda item: supervisor.claim(item[1]["id"], f"agent-{item[0]}"),
+                enumerate(created),
+            )
+        )
+
+    ports = [attempt["runtime"]["environment"]["APP_PORT"] for attempt in attempts]
+    assert len(set(ports)) == len(attempts)
+
+
+def test_runtime_lifecycle_is_shared_with_qc_and_integration(repo: Path) -> None:
+    start, end = two_free_ports()
+    gate = (
+        "python -c 'import os; from pathlib import Path; "
+        'assert os.environ.get("APP_PORT"); '
+        'assert Path(os.environ["ACP_WORKTREE"]).resolve() == Path.cwd().resolve(); '
+        'assert os.environ["ACP_PHASE"] in {"qc", "integration"}\''
+    )
+    write_config(
+        repo,
+        qc_commands=[gate],
+        integration_commands=[gate],
+        runtime_ports={"APP_PORT": (start, end)},
+        runtime_setup_commands=['printf "%s" "$APP_PORT" > "$ACP_RUNTIME_DIR/setup-port"'],
+        runtime_teardown_commands=['printf done > "$ACP_REPO_ROOT/.acp/teardown-$ACP_ATTEMPT_ID"'],
+    )
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    runtime_dir = Path(attempt["runtime"]["environment"]["ACP_RUNTIME_DIR"])
+    assert (runtime_dir / "setup-port").read_text() == attempt["runtime"]["environment"]["APP_PORT"]
+
+    commit_change(attempt, "alpha.txt", "isolated\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.runtime_environment(attempt["id"])["state"] == "ready"
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    integration = supervisor.integrate(attempt["task_id"])
+
+    assert integration["verdict"] == "pass"
+    assert integration["runtime_cleanup"]["state"] == "released"
+    assert not runtime_dir.exists()
+    assert (repo / ".acp" / f"teardown-{attempt['id']}").read_text() == "done"
+
+
+def test_occupied_runtime_port_is_quarantined_until_cleanup(repo: Path) -> None:
+    start, _ = two_free_ports()
+    write_config(repo, runtime_ports={"APP_PORT": (start, start)})
+    supervisor = GitSupervisor(repo)
+    first = supervisor.claim(task(supervisor, "alpha.txt")["id"], "agent-a")
+    second_task = task(supervisor, "beta.txt")
+    port = int(first["runtime"]["environment"]["APP_PORT"])
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", port))
+    try:
+        reaped = supervisor.reap_expired(now=first["lease_expires_at"])
+        assert reaped["runtime_cleanup"] == [
+            {"attempt_id": first["id"], "state": "teardown_failed"}
+        ]
+        with pytest.raises(SupervisorError, match="runtime port pool") as exhausted:
+            supervisor.claim(second_task["id"], "agent-b")
+        assert exhausted.value.code == "runtime_pool_exhausted"
+    finally:
+        listener.close()
+
+    assert supervisor.runtime_down(first["id"])["state"] == "released"
+    second = supervisor.claim(second_task["id"], "agent-b")
+    assert second["runtime"]["environment"]["APP_PORT"] == str(port)
+
+
+def test_reaper_tears_down_expired_runtime(repo: Path) -> None:
+    start, _ = two_free_ports()
+    write_config(repo, runtime_ports={"APP_PORT": (start, start)})
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+
+    result = supervisor.reap_expired(now=attempt["lease_expires_at"])
+
+    assert attempt["task_id"] in result["orphaned"]
+    assert result["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
+    assert supervisor.runtime_environment(attempt["id"])["state"] == "released"
+
+
+def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> None:
+    start, _ = two_free_ports()
+    write_config(repo, runtime_ports={"APP_PORT": (start, start)})
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    port = int(attempt["runtime"]["environment"]["APP_PORT"])
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import os,socket,time; "
+            "listener=socket.socket(); "
+            "listener.bind(('127.0.0.1',int(os.environ['APP_PORT']))); "
+            "listener.listen(); time.sleep(60)"
+        ),
+    ]
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
+        deadline = time.time() + 5
+        while supervisor._port_available(port) and time.time() < deadline:
+            time.sleep(0.02)
+        assert not supervisor._port_available(port)
+        result = supervisor.reap_expired(now=supervisor.attempt(attempt["id"])["lease_expires_at"])
+        with pytest.raises(SupervisorError):
+            worker.result(timeout=5)
+
+    assert result["terminated_workers"][0]["attempt_id"] == attempt["id"]
+    assert result["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
+    assert supervisor._port_available(port)
 
 
 def test_directory_aliases_overlap_and_internal_paths_are_rejected(
@@ -284,6 +470,31 @@ def test_whitespace_gate_configuration_fails_closed(
     with pytest.raises(SupervisorError) as captured:
         GitSupervisor(repo)
     assert captured.value.code == "invalid_config"
+
+
+def test_runtime_configuration_rejects_unsafe_names_and_blank_hooks(repo: Path) -> None:
+    write_config(repo, runtime_ports={"bad-name": (41000, 41001)})
+    with pytest.raises(SupervisorError) as unsafe:
+        GitSupervisor(repo)
+    assert unsafe.value.code == "invalid_config"
+
+    write_config(repo, runtime_setup_commands=["   "])
+    with pytest.raises(SupervisorError) as blank:
+        GitSupervisor(repo)
+    assert blank.value.code == "invalid_config"
+
+    write_config(
+        repo,
+        runtime_ports={"APP_PORT": (41000, 41002), "TEST_PORT": (41002, 41004)},
+    )
+    with pytest.raises(SupervisorError) as overlap:
+        GitSupervisor(repo)
+    assert overlap.value.code == "invalid_config"
+
+    write_config(repo, runtime_ports={"PATH": (41000, 41001)})
+    with pytest.raises(SupervisorError) as reserved:
+        GitSupervisor(repo)
+    assert reserved.value.code == "invalid_config"
 
 
 def test_external_critic_must_be_trusted_absolute_executable(
