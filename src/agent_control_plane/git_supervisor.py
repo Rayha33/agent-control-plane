@@ -21,6 +21,16 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .runtime_drivers import (
+    DriverContext,
+    DriverDefinition,
+    DriverError,
+    PhaseEvidence,
+    build_driver,
+    parse_driver_definitions,
+    run_trusted,
+)
+
 GENESIS_HASH = "0" * 64
 
 
@@ -61,6 +71,7 @@ class Config:
     runtime_setup_commands: tuple[str, ...]
     runtime_teardown_commands: tuple[str, ...]
     runtime_port_pools: tuple[RuntimePortPool, ...]
+    runtime_drivers: tuple[DriverDefinition, ...]
 
 
 SCHEMA = """
@@ -154,6 +165,18 @@ CREATE TABLE IF NOT EXISTS runtime_environments (
   teardown_results_json TEXT NOT NULL,
   log_path TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_driver_resources (
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  driver TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  ownership_token TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(attempt_id, driver)
 );
 CREATE TABLE IF NOT EXISTS runtime_allocations (
   pool_name TEXT NOT NULL,
@@ -298,6 +321,17 @@ class GitSupervisor:
             critic_command = str(critic_path)
         runtime_setup_commands = tuple(map(str, runtime.get("setup_commands", [])))
         runtime_teardown_commands = tuple(map(str, runtime.get("teardown_commands", [])))
+        # Drivers are validated here, against the supervisor's OWN acp.toml at the
+        # repository root — never a copy inside a candidate worktree.
+        raw_drivers = runtime.get("drivers", [])
+        if not isinstance(raw_drivers, list):
+            raise SupervisorError(
+                "invalid_config", "runtime.drivers must be an array of tables"
+            )
+        try:
+            runtime_drivers = parse_driver_definitions(raw_drivers, self.root)
+        except DriverError as error:
+            raise SupervisorError(error.code, error.message) from error
         for label, commands in (
             ("runtime setup", runtime_setup_commands),
             ("runtime teardown", runtime_teardown_commands),
@@ -374,6 +408,7 @@ class GitSupervisor:
             runtime_setup_commands=runtime_setup_commands,
             runtime_teardown_commands=runtime_teardown_commands,
             runtime_port_pools=tuple(runtime_port_pools),
+            runtime_drivers=runtime_drivers,
         )
 
     @contextmanager
@@ -686,6 +721,200 @@ class GitSupervisor:
     def _phase_runtime_env(environment: dict[str, str], phase: str, cwd: Path) -> dict[str, str]:
         return environment | {"ACP_PHASE": phase, "ACP_WORKTREE": str(cwd)}
 
+    # -- trusted runtime drivers -------------------------------------------
+
+    def _driver_secret(self) -> bytes:
+        """Per-supervisor secret backing resource ownership tokens."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = 'driver_secret'"
+            ).fetchone()
+            if row:
+                return bytes.fromhex(row["value"])
+            secret = os.urandom(32)
+            connection.execute(
+                "INSERT INTO meta (key, value) VALUES ('driver_secret', ?)",
+                (secret.hex(),),
+            )
+            return secret
+
+    def _driver_context(self, attempt_id: str, environment: dict[str, str]) -> DriverContext:
+        attempt = self.attempt(attempt_id)
+        runtime_dir = Path(environment["ACP_RUNTIME_DIR"])
+        return DriverContext(
+            attempt_id=attempt_id,
+            task_id=str(attempt["task_id"]),
+            runtime_dir=runtime_dir,
+            expires_at=int(time.time()) + self.config.lease_seconds,
+            secret=self._driver_secret(),
+            environment=environment,
+        )
+
+    def _run_driver_phase(
+        self, phase: str, attempt_id: str, environment: dict[str, str]
+    ) -> list[PhaseEvidence]:
+        """Run *phase* for every configured driver.
+
+        Drivers execute with the runtime directory as cwd — never the candidate
+        worktree — and through ``run_trusted``, which re-validates argv[0]
+        immediately before exec.
+        """
+
+        if not self.config.runtime_drivers:
+            return []
+        context = self._driver_context(attempt_id, environment)
+        evidence: list[PhaseEvidence] = []
+        for definition in self.config.runtime_drivers:
+            driver = build_driver(definition)
+            try:
+                evidence.append(driver.run_phase(phase, context, run_trusted))
+            except DriverError as error:
+                evidence.append(
+                    PhaseEvidence(
+                        driver=definition.name,
+                        kind=definition.kind,
+                        phase=phase,
+                        resource_id="",
+                        ownership_token="",
+                        expires_at=context.expires_at,
+                        exit_code=1,
+                        present=None,
+                        proof={"error": error.message, "code": error.code},
+                    )
+                )
+        self._record_driver_evidence(attempt_id, phase, evidence)
+        return evidence
+
+    def _record_driver_evidence(
+        self, attempt_id: str, phase: str, evidence: Sequence[PhaseEvidence]
+    ) -> None:
+        if not evidence:
+            return
+        stamp = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for item in evidence:
+                if phase == "teardown":
+                    state = "released" if item.proof.get("cleanup_proved") else "quarantined"
+                elif phase == "setup":
+                    state = "active" if item.ok else "setup_failed"
+                else:
+                    state = "active" if item.present else "absent"
+                connection.execute(
+                    """
+                    INSERT INTO runtime_driver_resources
+                      (attempt_id, driver, kind, resource_id, ownership_token,
+                       expires_at, state, evidence_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(attempt_id, driver) DO UPDATE SET
+                      resource_id = excluded.resource_id,
+                      ownership_token = excluded.ownership_token,
+                      expires_at = excluded.expires_at,
+                      state = excluded.state,
+                      evidence_json = excluded.evidence_json,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        attempt_id,
+                        item.driver,
+                        item.kind,
+                        item.resource_id,
+                        item.ownership_token,
+                        item.expires_at,
+                        state,
+                        canonical_json(item.as_dict()),
+                        stamp,
+                    ),
+                )
+                self._event(
+                    connection,
+                    f"runtime.driver.{phase}",
+                    "supervisor",
+                    {
+                        "attempt_id": attempt_id,
+                        "driver": item.driver,
+                        "kind": item.kind,
+                        "resource_id": item.resource_id,
+                        "state": state,
+                        "exit_code": item.exit_code,
+                        "present": item.present,
+                        "cleanup_proved": item.proof.get("cleanup_proved"),
+                    },
+                )
+
+    def driver_resources(self, attempt_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runtime_driver_resources WHERE attempt_id = ? ORDER BY driver",
+                (attempt_id,),
+            ).fetchall()
+        return [
+            {
+                "driver": row["driver"],
+                "kind": row["kind"],
+                "resource_id": row["resource_id"],
+                "ownership_token": row["ownership_token"],
+                "expires_at": row["expires_at"],
+                "state": row["state"],
+                "evidence": json.loads(row["evidence_json"]),
+            }
+            for row in rows
+        ]
+
+    def quarantined_resources(self) -> list[dict[str, Any]]:
+        """Allocations whose cleanup could not be proven.
+
+        These are deliberately NOT recycled: an unproven teardown is the case
+        where something may still be running, so reuse is the one thing that
+        must not happen automatically.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runtime_driver_resources WHERE state = 'quarantined' "
+                "ORDER BY updated_at"
+            ).fetchall()
+        return [
+            {
+                "attempt_id": row["attempt_id"],
+                "driver": row["driver"],
+                "kind": row["kind"],
+                "resource_id": row["resource_id"],
+                "state": row["state"],
+                "evidence": json.loads(row["evidence_json"]),
+            }
+            for row in rows
+        ]
+
+    def runtime_restart(self, attempt_id: str) -> dict[str, Any]:
+        """Tear down and re-create driver resources between phases.
+
+        QC must not be able to reach a service the worker left running: a stale
+        app server can make a reviewer pass a candidate whose code never
+        actually starts.
+        """
+        environment = self._runtime_env(attempt_id, require_ready=False)
+        teardown = self._run_driver_phase("teardown", attempt_id, environment)
+        unproven = [item for item in teardown if not item.proof.get("cleanup_proved")]
+        if unproven:
+            raise SupervisorError(
+                "runtime_cleanup_unproven",
+                "cannot restart runtime: cleanup proof missing for "
+                + ", ".join(sorted(item.driver for item in unproven)),
+            )
+        setup = self._run_driver_phase("setup", attempt_id, environment)
+        failed = [item for item in setup if not item.ok]
+        if failed:
+            raise SupervisorError(
+                "runtime_setup_failed",
+                "driver setup failed for " + ", ".join(sorted(item.driver for item in failed)),
+            )
+        return {
+            "attempt_id": attempt_id,
+            "restarted": [item.driver for item in setup],
+            "resources": self.driver_resources(attempt_id),
+        }
+
     def _runtime_up(self, attempt_id: str) -> dict[str, Any]:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -721,6 +950,17 @@ class GitSupervisor:
             stop_on_failure=True,
         )
         failed = any(result["exit_code"] for result in results)
+        if not failed:
+            driver_evidence = self._run_driver_phase("setup", attempt_id, environment)
+            failed = any(not item.ok for item in driver_evidence)
+            results = results + [
+                {
+                    "command": f"driver:{item.driver}:setup",
+                    "exit_code": item.exit_code,
+                    "duration_ms": 0,
+                }
+                for item in driver_evidence
+            ]
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             state = "setup_failed" if failed else "ready"
@@ -825,6 +1065,21 @@ class GitSupervisor:
             Path(row["log_path"]),
             stop_on_failure=False,
         )
+        # Drivers tear down AFTER the shell hooks and are then independently
+        # re-probed. A hook that exits 0 proves only that a process exited 0.
+        driver_evidence = self._run_driver_phase("teardown", attempt_id, environment)
+        unproven = [
+            item.driver for item in driver_evidence if not item.proof.get("cleanup_proved")
+        ]
+        results = results + [
+            {
+                "command": f"driver:{item.driver}:teardown",
+                "exit_code": item.exit_code,
+                "duration_ms": 0,
+                "cleanup_proved": bool(item.proof.get("cleanup_proved")),
+            }
+            for item in driver_evidence
+        ]
         with self.connect() as connection:
             allocations = connection.execute(
                 "SELECT pool_name, value FROM runtime_allocations "
@@ -836,7 +1091,14 @@ class GitSupervisor:
             for allocation in allocations
             if not self._port_available(allocation["value"])
         ]
-        failed = any(result["exit_code"] for result in results) or bool(occupied)
+        # Missing cleanup proof quarantines the allocation: the ports are NOT
+        # returned to the pool, so nothing is handed to a later attempt while a
+        # resource from this one may still be alive.
+        failed = (
+            any(result["exit_code"] for result in results)
+            or bool(occupied)
+            or bool(unproven)
+        )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             stamp = utc_now()
@@ -861,6 +1123,7 @@ class GitSupervisor:
                     "attempt_id": attempt_id,
                     "results": results,
                     "occupied": occupied,
+                    "unproven_cleanup": unproven,
                 },
             )
         if not failed:
@@ -1463,6 +1726,29 @@ class GitSupervisor:
             self._git("worktree", "add", "--detach", str(qc_dir), submission["commit_sha"])
             packet = self._review_packet(task, submission, qc_dir)
             packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+            # Fresh services before review. Otherwise QC can pass against an app
+            # server the worker left running, which proves the worker's old code
+            # works, not the code being reviewed.
+            if self.config.runtime_drivers:
+                try:
+                    self.runtime_restart(submission["attempt_id"])
+                except SupervisorError as error:
+                    findings.append(
+                        {
+                            "severity": "high",
+                            "requirement": "review runs against freshly started services",
+                            "finding": f"runtime restart before QC failed: {error.code}",
+                            "evidence": error.message,
+                            "required_fix": (
+                                "resolve the runtime cleanup/startup failure; a review against a "
+                                "stale or unproven runtime is not evidence"
+                            ),
+                        }
+                    )
+                else:
+                    runtime_env = self._runtime_env(
+                        submission["attempt_id"], require_ready=False
+                    )
             for command in self.config.qc_commands:
                 self._restore_candidate(qc_dir, submission["commit_sha"])
                 result = self._run_command(

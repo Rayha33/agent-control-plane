@@ -63,6 +63,20 @@ def parser() -> argparse.ArgumentParser:
     runtime_down = commands.add_parser(
         "runtime-down", help="retry teardown and release an attempt runtime"
     )
+    driver_resources = commands.add_parser(
+        "runtime-resources",
+        help="show driver-managed resources and their cleanup proofs for an attempt",
+    )
+    driver_resources.add_argument("attempt_id")
+    commands.add_parser(
+        "runtime-quarantine",
+        help="list allocations whose cleanup could not be proven",
+    )
+    runtime_restart = commands.add_parser(
+        "runtime-restart",
+        help="tear down and re-create driver resources so review gets fresh services",
+    )
+    runtime_restart.add_argument("attempt_id")
     runtime_down.add_argument("attempt_id")
     runtime_down.add_argument(
         "--force",
@@ -143,6 +157,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.terminate_worker(args.attempt_id)
         elif args.action == "environment":
             result = supervisor.runtime_environment(args.attempt_id)
+        elif args.action == "runtime-resources":
+            result = supervisor.driver_resources(args.attempt_id)
+        elif args.action == "runtime-quarantine":
+            result = supervisor.quarantined_resources()
+        elif args.action == "runtime-restart":
+            result = supervisor.runtime_restart(args.attempt_id)
         elif args.action == "runtime-down":
             result = supervisor.runtime_down(args.attempt_id, args.force)
         else:

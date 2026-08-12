@@ -20,3 +20,26 @@ commands = [
 [runtime]
 setup_commands = []
 teardown_commands = []
+
+# Trusted phase-scoped drivers. Unlike setup_commands/teardown_commands — which
+# run as `/bin/sh -lc` with the candidate's worktree as the working directory —
+# a driver is an absolute executable outside this repository, invoked as argv
+# with the runtime directory as cwd, and every teardown is followed by an
+# independent probe that must observe the resource absent. No proof means the
+# allocation is quarantined instead of recycled.
+#
+# [[runtime.drivers]]
+# name = "stack"
+# kind = "docker_compose"           # project name is derived per attempt
+# executable = "/usr/local/bin/docker"
+# compose_file = "/srv/acp/docker-compose.yml"
+#
+# [[runtime.drivers]]
+# name = "db"
+# kind = "postgres_schema"          # schema is created and dropped per attempt
+# executable = "/usr/local/bin/psql"
+# dsn = "postgresql://acp@127.0.0.1/acp"
+#
+# [[runtime.drivers]]
+# name = "browser"
+# kind = "browser_profile"          # filesystem only; declares no executable
