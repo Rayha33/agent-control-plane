@@ -182,6 +182,39 @@ so upgrades cannot erase an executable still referenced by either table.
 `doctor` audits the current pointer and every distinct durable pin and returns
 the full set of owner, mode, symlink, manifest, inode, size, and digest errors.
 
+### 4c. External mutations cross one fenced gateway
+
+Worktree and runtime isolation do not stop a delayed process from reaching a
+shared database schema, deploy namespace, or artifact tag. Every supported
+external mutation therefore carries its task ID, authenticated actor, claim
+fencing token, complete resource fencing-token map, target resource,
+idempotency key, and payload through one provider-neutral gate.
+
+The order is an invariant: authenticate and authorize the mandate, derive the
+actor and role from durable state, derive the target identity from the payload,
+prove it is an exact task resource, and re-run the coordination service's live
+claim predicate inside an immediate transaction. Only then may an adapter call
+its provider. Expired, superseded, incomplete, wrong-role, undeclared, and
+cross-task requests cannot reach provider code. A delayed zombie therefore
+loses even if its token was valid when its work began; the later owner's higher
+claim and resource generations are authoritative when the call lands.
+
+PostgreSQL schema/migration, deploy/preview namespace, and artifact/tag adapters
+only differ in their canonical resource derivation and injected driver. A
+driver receives a `ProviderCall` containing the request digest, idempotency key,
+identity, and both generations, with no transport credential. It must carry the
+idempotency key and resource generation to the remote provider's native
+transaction or compare-and-set boundary. The local transaction serializes
+concurrent retries and persists a single credential-free receipt binding the
+request, actor, target, operation, result digest, and generations. Remote
+idempotency closes the crash interval between the external effect and local
+receipt commit.
+
+MCP/A2A requests supply durable task and artifact identity. Their adapter maps
+that identity into the same canonical resource namespace and invokes the same
+authenticated service; protocol transport does not create an alternate
+authority path.
+
 ### 5. A crash does not erase committed work
 
 Heartbeats persist the latest commit and arbitrary JSON checkpoint. The reaper

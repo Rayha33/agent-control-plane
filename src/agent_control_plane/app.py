@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Mapping
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
@@ -25,6 +26,7 @@ from .coordination_schemas import (
 )
 from .database import Database
 from .schemas import (
+    A2ASideEffectMutation,
     ActionRequestView,
     AgentCreate,
     AgentStateChange,
@@ -39,18 +41,39 @@ from .schemas import (
     PolicyCreate,
     PolicyView,
     RevokeMandate,
+    SideEffectMutation,
+    SideEffectReceiptView,
 )
 from .service import ControlPlaneError, ControlPlaneService
+from .side_effects import (
+    A2ASideEffectEnvelope,
+    AuthenticatedSideEffectService,
+    CoordinationClaimVerifier,
+    FencedGateway,
+    MCPA2ASideEffectAdapter,
+    ProviderDriver,
+    default_side_effect_adapters,
+)
 
 bearer = HTTPBearer(auto_error=False)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    side_effect_drivers: Mapping[str, ProviderDriver] | None = None,
+) -> FastAPI:
     active_settings = settings or Settings.from_env()
     database = Database(active_settings.database_path)
     database.initialize()
     service = ControlPlaneService(database, active_settings)
     coordination = CoordinationService(database, service)
+    side_effect_gateway = FencedGateway(
+        database,
+        CoordinationClaimVerifier(coordination),
+        default_side_effect_adapters(side_effect_drivers),
+    )
+    side_effects = AuthenticatedSideEffectService(service, side_effect_gateway)
+    a2a_side_effects = MCPA2ASideEffectAdapter(side_effects)
 
     app = FastAPI(
         title="Agent Control Plane",
@@ -63,6 +86,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.service = service
     app.state.coordination = coordination
+    app.state.side_effect_gateway = side_effect_gateway
+    app.state.side_effects = side_effects
+    app.state.a2a_side_effects = a2a_side_effects
     app.state.settings = active_settings
 
     @app.exception_handler(ControlPlaneError)
@@ -225,6 +251,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         token: str = Depends(require_mandate),
     ) -> dict:
         return coordination.heartbeat(task_id, token, request)
+
+    @app.post(
+        "/v1/side-effects/{operation}",
+        response_model=SideEffectReceiptView,
+        status_code=201,
+    )
+    def execute_side_effect(
+        operation: str,
+        request: SideEffectMutation,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return side_effects.execute(
+            token,
+            task_id=request.task_id,
+            operation=operation,
+            claim_fencing_token=request.claim_fencing_token,
+            resource_fencing_tokens=request.resource_fencing_tokens,
+            target_resource=request.target_resource,
+            idempotency_key=request.idempotency_key,
+            payload=request.payload,
+        ).to_dict()
+
+    @app.post(
+        "/v1/a2a/side-effects/{operation}",
+        response_model=SideEffectReceiptView,
+        status_code=201,
+    )
+    def execute_a2a_side_effect(
+        operation: str,
+        request: A2ASideEffectMutation,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return a2a_side_effects.execute(
+            token,
+            A2ASideEffectEnvelope(
+                task_id=request.task_id,
+                artifact_id=request.artifact_id,
+                kind=request.kind,
+                operation=operation,
+                claim_fencing_token=request.claim_fencing_token,
+                resource_fencing_tokens=request.resource_fencing_tokens,
+                idempotency_key=request.idempotency_key,
+                payload=request.payload,
+            ),
+        ).to_dict()
+
+    @app.get(
+        "/v1/tasks/{task_id}/side-effect-receipts",
+        response_model=list[SideEffectReceiptView],
+        dependencies=[Depends(require_admin)],
+    )
+    def side_effect_receipts(task_id: str) -> list[dict]:
+        return side_effect_gateway.receipts(task_id)
 
     @app.post(
         "/v1/tasks/{task_id}/submissions",

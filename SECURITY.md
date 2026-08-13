@@ -42,6 +42,20 @@ Compose project, PostgreSQL schema, or browser profile; ACP cannot prove
 undeclared cloud or application side effects. Use provider-native
 deletion/fencing for those resources.
 
+Database schema/migration, deploy namespace, and artifact/tag mutations routed
+through the side-effect gateway are checked against the authenticated worker,
+mandate scope, live task claim, complete resource-token map, and
+provider-derived target before a driver can run. HTTP bodies cannot supply an
+actor or role, and the MCP/A2A path maps durable task/artifact identity into the
+same gate. The provider call carries the idempotency key and both fencing
+generations; a production driver must enforce them at the remote mutation
+boundary. The local receipt transaction prevents duplicate concurrent calls on
+one ACP host, but it cannot roll back a remote mutation if ACP crashes before
+committing the receipt. Provider-native idempotency closes that window. Treat
+payload and provider result data as secret-bearing: drivers must not log or
+return credentials. Receipts persist only identities, generations, and
+request/result digests.
+
 After the first runner enrollment, every worker heartbeat/submission/process
 transition, critic review, and integration transition requires a role-scoped
 bearer credential. Attempts bind to the credential digest used at claim, and
@@ -98,6 +112,8 @@ the private advisory.
 - arbitrary code execution through untrusted QC configuration;
 - trust-helper substitution, source/destination symlink races, mutable bundle
   parents, non-atomic rotation, or deletion/fallback of a pinned old bundle;
+- side-effect target aliasing, idempotency bypass, stale/cross-task fencing,
+  provider calls before admission, or secrets exposed through receipts;
 - audit-chain corruption or evidence replacement;
 - authentication, injection, or denial-of-service flaws; and
 - secrets committed to the repository or logs.
