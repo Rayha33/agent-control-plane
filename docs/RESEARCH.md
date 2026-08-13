@@ -29,7 +29,7 @@ threads rather than product positioning. Six themes recur:
 | 4 | Operator attention becomes the bottleneck | A [multi-agent terminal discussion](https://news.ycombinator.com/item?id=47268777) describes 3–6 agents spread across terminals and asks how overlapping changes, merge timing, accountability, and traceability should work. | One durable task/attempt state model and machine-readable status |
 | 5 | Cross-session coordination remains fragile | [Claude Code issue #24798](https://github.com/anthropics/claude-code/issues/24798) asks for inter-session coordination and describes readers seeing partial files after a writer crashes. [Codex issue #23515](https://github.com/openai/codex/issues/23515) reports one worktree session being interrupted by another. | Atomic write scopes, checkpoints, fencing, and one worktree per attempt |
 | 6 | Parallelism can erase its own economics | User reports include [202 GB of unreaped run copies](https://github.com/openai/codex/issues/35383) and [128 GB memory exhaustion](https://github.com/openai/codex/issues/23749). Trigger.dev also reports duplicated dependencies and service stacks. | Bounded pools, explicit cleanup state, quotas and telemetry next |
-| 7 | Credentials cross the candidate boundary | Practitioners describe passing API keys through environment variables as the simplest integration pattern in [MCP credential discussions](https://www.reddit.com/r/mcp/comments/1vg8vng/how_are_you_giving_coding_agents_access_to/), while [agent-execution security research](https://arxiv.org/abs/2510.21236) highlights the risk of host-native tool servers. | Role-scoped credentials, a minimal candidate environment, isolated driver secrets, and redacted evidence |
+| 7 | Credentials cross the candidate boundary | A [Claude Code issue](https://github.com/anthropics/claude-code/issues/58173) reports a shell hook dumping GitHub, Vercel, Slack, Supabase, Anthropic, and search credentials into a transcript despite explicit prompt rules. An [MCP implementer](https://github.com/orgs/modelcontextprotocol/discussions/561) asks how a remote multi-API proxy can safely retain per-user keys without token passthrough. | Hard tool-boundary controls: minimal candidate env, scoped version handles, descriptor-only delivery, and literal-secret absence tests |
 | 8 | The reviewer can be correlated, stale, or silently changed | [Self-preference research](https://arxiv.org/abs/2410.21819) finds that model judges can favor outputs from the same model family; production guidance recommends calibration and multiple evaluation modes. | Signed reviewer provenance, policy fingerprints, explicit ratification, golden cases, provider diversity, and rejection of old-policy passes |
 
 The most important new finding is that a worktree is only source isolation. A
@@ -72,6 +72,35 @@ The product response is not to special-case those tools. It is to make the
 candidate commit, ownership token, checkout, and review evidence explicit and
 verifiable.
 
+## Credential delivery findings
+
+Prompt instructions and redaction after the fact are insufficient controls for
+agent credentials. The practitioner issue above asks for hard tool-call
+blocking because a memory rule was repeatedly ignored, and the MCP discussion
+shows that environment variables remain the default precisely because a
+portable scoped alternative is unclear.
+
+The platform primitives support a narrow provider-neutral contract:
+
+- Linux [<code>memfd_create</code>](https://man7.org/linux/man-pages/man2/memfd_create.2.html)
+  creates an anonymous descriptor that can be inherited across exec and sealed
+  against writes.
+- Python [<code>subprocess pass_fds</code>](https://docs.python.org/3/library/subprocess.html#subprocess.Popen)
+  keeps only explicitly named descriptors open in a POSIX child.
+- PostgreSQL [password files](https://www.postgresql.org/docs/current/libpq-pgpass.html)
+  require private permissions and can be selected with <code>PGPASSFILE</code>
+  or the <code>passfile</code> connection option.
+- systemd's [credential model](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#Credentials)
+  similarly presents service secrets as files in a private credential
+  directory instead of ordinary environment values.
+
+ACP therefore treats the provider output as an opaque version handle, not a
+string. Plaintext exists only while materializing a short-lived private
+descriptor for a trusted driver. The exact handle remains attached to the
+attempt until teardown is proved, which turns secret rotation from a global
+environment mutation into an ordered old-target-cleanup/new-target-setup
+transition.
+
 ## Competitive boundary
 
 | Category | Strong at | Gap ACP targets |
@@ -112,6 +141,9 @@ them.
 10. **Versioned assurance policy.** Reviewer identity, provider, model, prompt
     policy, and command are one ratified fingerprint. A pass is valid only for
     its exact commit and current policy, including at integration time.
+11. **Versioned, scoped credential material.** Persist opaque provider handles
+    and keyed target fingerprints; deliver plaintext only over protected
+    descriptors; retain old versions until cleanup is proved.
 
 ## Why the design is future-proof
 

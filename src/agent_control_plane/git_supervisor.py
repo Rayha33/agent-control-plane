@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -9,6 +11,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +26,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .assurance import REJECT_VERDICTS, Assurance, Reviewer, load_policy
+from .credential_providers import (
+    CredentialDefinition,
+    CredentialError,
+    CredentialHandle,
+    CredentialRegistry,
+    parse_credential_definitions,
+)
 from .runner_identity import (
     IdentityError,
     assert_distinct,
@@ -96,6 +106,7 @@ class Config:
     runtime_setup_commands: tuple[str, ...]
     runtime_teardown_commands: tuple[str, ...]
     runtime_port_pools: tuple[RuntimePortPool, ...]
+    credentials: tuple[CredentialDefinition, ...]
     runtime_drivers: tuple[DriverDefinition, ...]
 
 
@@ -200,6 +211,8 @@ CREATE TABLE IF NOT EXISTS integrations (
 CREATE TABLE IF NOT EXISTS runtime_environments (
   attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
   state TEXT NOT NULL,
+  restart_token TEXT NOT NULL DEFAULT '',
+  restart_started_at INTEGER NOT NULL DEFAULT 0,
   env_json TEXT NOT NULL,
   setup_results_json TEXT NOT NULL,
   teardown_results_json TEXT NOT NULL,
@@ -220,6 +233,7 @@ CREATE TABLE IF NOT EXISTS runtime_driver_resources (
   resource_id TEXT NOT NULL,
   ownership_token TEXT NOT NULL,
   definition_json TEXT NOT NULL DEFAULT '{}',
+  credential_handle_json TEXT NOT NULL DEFAULT '{}',
   expires_at INTEGER NOT NULL,
   state TEXT NOT NULL,
   evidence_json TEXT NOT NULL,
@@ -284,6 +298,24 @@ class GitSupervisor:
                 connection.execute(
                     "ALTER TABLE runtime_driver_resources "
                     "ADD COLUMN definition_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "credential_handle_json" not in driver_columns:
+                connection.execute(
+                    "ALTER TABLE runtime_driver_resources "
+                    "ADD COLUMN credential_handle_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            runtime_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(runtime_environments)")
+            }
+            if "restart_token" not in runtime_columns:
+                connection.execute(
+                    "ALTER TABLE runtime_environments "
+                    "ADD COLUMN restart_token TEXT NOT NULL DEFAULT ''"
+                )
+            if "restart_started_at" not in runtime_columns:
+                connection.execute(
+                    "ALTER TABLE runtime_environments "
+                    "ADD COLUMN restart_started_at INTEGER NOT NULL DEFAULT 0"
                 )
             # Upgrade registries created before the explicit flag existed. Once
             # enabled, authentication never silently downgrades because the last
@@ -422,13 +454,22 @@ class GitSupervisor:
         critic_command = self._resolve_critic_command(critic_command)
         runtime_setup_commands = tuple(map(str, runtime.get("setup_commands", [])))
         runtime_teardown_commands = tuple(map(str, runtime.get("teardown_commands", [])))
+        raw_credentials = raw.get("credentials", [])
+        if not isinstance(raw_credentials, list):
+            raise SupervisorError("invalid_config", "credentials must be an array of tables")
+        try:
+            credentials = parse_credential_definitions(raw_credentials, self.root)
+        except CredentialError as error:
+            raise SupervisorError(error.code, error.message) from error
         # Drivers are validated here, against the supervisor's OWN acp.toml at the
         # repository root — never a copy inside a candidate worktree.
         raw_drivers = runtime.get("drivers", [])
         if not isinstance(raw_drivers, list):
             raise SupervisorError("invalid_config", "runtime.drivers must be an array of tables")
         try:
-            runtime_drivers = parse_driver_definitions(raw_drivers, self.root)
+            runtime_drivers = parse_driver_definitions(
+                raw_drivers, self.root, {item.name for item in credentials}
+            )
         except DriverError as error:
             raise SupervisorError(error.code, error.message) from error
         for label, commands in (
@@ -519,6 +560,7 @@ class GitSupervisor:
             runtime_setup_commands=runtime_setup_commands,
             runtime_teardown_commands=runtime_teardown_commands,
             runtime_port_pools=tuple(runtime_port_pools),
+            credentials=credentials,
             runtime_drivers=runtime_drivers,
         )
 
@@ -529,6 +571,7 @@ class GitSupervisor:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA secure_delete = ON")
         try:
             yield connection
             connection.commit()
@@ -1351,22 +1394,103 @@ class GitSupervisor:
     # -- trusted runtime drivers -------------------------------------------
 
     def _driver_secret(self) -> bytes:
-        """Per-supervisor secret backing resource ownership tokens."""
+        """Per-supervisor key stored separately from the SQLite evidence DB.
+
+        Keeping the HMAC key in the same backup as keyed credential
+        fingerprints would turn weak credential material into an offline
+        guessing oracle. Older databases are migrated by writing their key to
+        the protected file before deleting the meta row.
+        """
+
+        key_path = self.state_dir / "driver.key"
+
+        def read_key() -> bytes:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(key_path, flags)
+            except OSError as error:
+                raise SupervisorError(
+                    "driver_key_unavailable", "driver key file is unavailable"
+                ) from error
+            try:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+                ):
+                    raise SupervisorError(
+                        "driver_key_unsafe",
+                        "driver key must be a current-user-owned 0600 regular file",
+                    )
+                value = os.read(fd, 33)
+                if len(value) != 32:
+                    raise SupervisorError(
+                        "driver_key_invalid", "driver key must contain exactly 32 bytes"
+                    )
+                return value
+            finally:
+                os.close(fd)
+
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if key_path.exists():
+                secret = read_key()
+                connection.execute("DELETE FROM meta WHERE key = 'driver_secret'")
+                return secret
             row = connection.execute(
                 "SELECT value FROM meta WHERE key = 'driver_secret'"
             ).fetchone()
-            if row:
-                return bytes.fromhex(row["value"])
-            secret = os.urandom(32)
-            connection.execute(
-                "INSERT INTO meta (key, value) VALUES ('driver_secret', ?)",
-                (secret.hex(),),
+            try:
+                secret = bytes.fromhex(row["value"]) if row else os.urandom(32)
+            except ValueError as error:
+                raise SupervisorError(
+                    "driver_key_invalid", "legacy driver key is invalid"
+                ) from error
+            if len(secret) != 32:
+                raise SupervisorError("driver_key_invalid", "legacy driver key is invalid")
+            temporary = self.state_dir / f".driver-key-{uuid.uuid4().hex}.tmp"
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
             )
+            try:
+                fd = os.open(temporary, flags, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                    written = os.write(fd, secret)
+                    if written != len(secret):
+                        raise OSError("short driver key write")
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(temporary, key_path)
+                directory_fd = os.open(self.state_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError as error:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                raise SupervisorError(
+                    "driver_key_unavailable", "could not persist protected driver key"
+                ) from error
+            connection.execute("DELETE FROM meta WHERE key = 'driver_secret'")
             return secret
 
-    def _driver_context(self, attempt_id: str, environment: dict[str, str]) -> DriverContext:
+    def _driver_context(
+        self,
+        attempt_id: str,
+        environment: dict[str, str],
+        registry: CredentialRegistry | None = None,
+        handles: dict[str, CredentialHandle] | None = None,
+    ) -> DriverContext:
         attempt = self.attempt(attempt_id)
         runtime_dir = Path(environment["ACP_RUNTIME_DIR"])
         return DriverContext(
@@ -1376,6 +1500,8 @@ class GitSupervisor:
             expires_at=int(time.time()) + self.config.lease_seconds,
             secret=self._driver_secret(),
             environment=environment,
+            credential_registry=registry,
+            credential_handles=handles or {},
         )
 
     @staticmethod
@@ -1460,7 +1586,13 @@ class GitSupervisor:
         )
 
     def _run_driver_phase(
-        self, phase: str, attempt_id: str, environment: dict[str, str]
+        self,
+        phase: str,
+        attempt_id: str,
+        environment: dict[str, str],
+        only_drivers: set[str] | None = None,
+        restart_token: str | None = None,
+        restart_guard_fd: int | None = None,
     ) -> list[PhaseEvidence]:
         """Run *phase* for every configured driver.
 
@@ -1484,28 +1616,92 @@ class GitSupervisor:
                 ) from error
         else:
             definitions = self.config.runtime_drivers
+        if only_drivers is not None:
+            definitions = tuple(
+                definition for definition in definitions if definition.name in only_drivers
+            )
         if not definitions:
             return []
-        context = self._driver_context(attempt_id, environment)
+        registry = CredentialRegistry(self.config.credentials, self.root, self._driver_secret())
+        handles: dict[str, CredentialHandle] = {}
+        handle_errors: dict[str, DriverError] = {}
+        for definition in definitions:
+            credential_name = definition.option("credential")
+            if not credential_name:
+                continue
+            stored = stored_by_name.get(definition.name)
+            use_stored = stored is not None and not (
+                phase == "setup" and stored["state"] == "released"
+            )
+            try:
+                if use_stored:
+                    raw_handle = json.loads(stored["credential_handle_json"])
+                    if not raw_handle:
+                        raise CredentialError(
+                            "credential_handle_missing",
+                            "stored credential handle is unavailable",
+                        )
+                    handles[definition.name] = CredentialHandle.from_internal_dict(raw_handle)
+                else:
+                    handles[definition.name] = registry.resolve_current(credential_name)
+            except (CredentialError, json.JSONDecodeError) as error:
+                if isinstance(error, CredentialError):
+                    handle_errors[definition.name] = DriverError(error.code, error.message)
+                else:
+                    handle_errors[definition.name] = DriverError(
+                        "credential_handle_invalid",
+                        "stored credential handle is invalid",
+                    )
+        context = self._driver_context(attempt_id, environment, registry=registry, handles=handles)
         evidence: list[PhaseEvidence] = []
         definitions_by_name = {definition.name: definition for definition in definitions}
         for definition in definitions:
+            if restart_token is not None:
+                self._assert_restart_owner(attempt_id, restart_token)
             driver = build_driver(definition)
+            intent_resource = ""
+            intent_token = ""
+            intent_recorded = False
             try:
+                if definition.name in handle_errors:
+                    raise handle_errors[definition.name]
                 stored = stored_by_name.get(definition.name)
+                intent_resource = driver.resource_id(context)
+                intent_token = driver.ownership_token(context)
                 if stored:
-                    expected_resource = driver.resource_id(context)
-                    expected_token = driver.ownership_token(context)
-                    if (
+                    replacing_released = phase == "setup" and stored["state"] == "released"
+                    if not replacing_released and (
                         stored["kind"] != definition.kind
-                        or stored["resource_id"] != expected_resource
-                        or not hmac.compare_digest(stored["ownership_token"], expected_token)
+                        or stored["resource_id"] != intent_resource
+                        or not hmac.compare_digest(stored["ownership_token"], intent_token)
                     ):
                         raise DriverError(
                             "runtime_driver_identity_mismatch",
                             f"stored ownership proof does not match driver {definition.name}",
                         )
-                evidence.append(driver.run_phase(phase, context, run_trusted))
+                if phase == "setup":
+                    self._record_driver_setup_intent(
+                        attempt_id,
+                        definition,
+                        intent_resource,
+                        intent_token,
+                        handles.get(definition.name),
+                        context.expires_at,
+                        restart_token=restart_token,
+                    )
+                    intent_recorded = True
+
+                def guarded_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+                    return run_trusted(
+                        argv,
+                        cwd,
+                        env,
+                        timeout,
+                        credential,
+                        guard_fd=restart_guard_fd,
+                    )
+
+                evidence.append(driver.run_phase(phase, context, guarded_runner))
             except DriverError as error:
                 stored = stored_by_name.get(definition.name)
                 evidence.append(
@@ -1513,16 +1709,106 @@ class GitSupervisor:
                         driver=definition.name,
                         kind=definition.kind,
                         phase=phase,
-                        resource_id=stored["resource_id"] if stored else "",
-                        ownership_token=stored["ownership_token"] if stored else "",
+                        resource_id=(
+                            intent_resource
+                            if intent_recorded
+                            else stored["resource_id"]
+                            if stored
+                            else ""
+                        ),
+                        ownership_token=(
+                            intent_token
+                            if intent_recorded
+                            else stored["ownership_token"]
+                            if stored
+                            else ""
+                        ),
                         expires_at=context.expires_at,
                         exit_code=1,
                         present=None,
                         proof={"error": error.message, "code": error.code},
+                        credential_handle=handles.get(definition.name),
                     )
                 )
-        self._record_driver_evidence(attempt_id, phase, evidence, definitions_by_name)
+        self._record_driver_evidence(
+            attempt_id,
+            phase,
+            evidence,
+            definitions_by_name,
+            restart_token=restart_token,
+        )
         return evidence
+
+    def _record_driver_setup_intent(
+        self,
+        attempt_id: str,
+        definition: DriverDefinition,
+        resource_id: str,
+        capability: str,
+        handle: CredentialHandle | None,
+        expires_at: int,
+        restart_token: str | None = None,
+    ) -> None:
+        """Persist exact cleanup identity before any external setup action."""
+
+        stamp = utc_now()
+        evidence = canonical_json(
+            {
+                "driver": definition.name,
+                "kind": definition.kind,
+                "phase": "setup",
+                "resource_id": resource_id,
+                "expires_at": expires_at,
+                "exit_code": 1,
+                "present": None,
+                "proof": {"pending": True},
+            }
+        )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_restart_owner_in(connection, attempt_id, restart_token)
+            connection.execute(
+                """
+                INSERT INTO runtime_driver_resources
+                  (attempt_id, driver, kind, resource_id, ownership_token,
+                   definition_json, credential_handle_json, expires_at, state,
+                   evidence_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'setup_pending', ?, ?)
+                ON CONFLICT(attempt_id, driver) DO UPDATE SET
+                  kind = excluded.kind,
+                  resource_id = excluded.resource_id,
+                  ownership_token = excluded.ownership_token,
+                  definition_json = excluded.definition_json,
+                  credential_handle_json = excluded.credential_handle_json,
+                  expires_at = excluded.expires_at,
+                  state = excluded.state,
+                  evidence_json = excluded.evidence_json,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    attempt_id,
+                    definition.name,
+                    definition.kind,
+                    resource_id,
+                    capability,
+                    self._driver_definition_json(definition),
+                    canonical_json(handle.as_internal_dict()) if handle else "{}",
+                    expires_at,
+                    evidence,
+                    stamp,
+                ),
+            )
+            self._event(
+                connection,
+                "runtime.driver.setup_pending",
+                "supervisor",
+                {
+                    "attempt_id": attempt_id,
+                    "driver": definition.name,
+                    "kind": definition.kind,
+                    "resource_id": resource_id,
+                },
+            )
 
     def _record_driver_evidence(
         self,
@@ -1530,12 +1816,14 @@ class GitSupervisor:
         phase: str,
         evidence: Sequence[PhaseEvidence],
         definitions: dict[str, DriverDefinition],
+        restart_token: str | None = None,
     ) -> None:
         if not evidence:
             return
         stamp = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._assert_restart_owner_in(connection, attempt_id, restart_token)
             for item in evidence:
                 if phase == "teardown":
                     state = "released" if item.proof.get("cleanup_proved") else "quarantined"
@@ -1547,9 +1835,19 @@ class GitSupervisor:
                     """
                     INSERT INTO runtime_driver_resources
                       (attempt_id, driver, kind, resource_id, ownership_token,
-                       definition_json, expires_at, state, evidence_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       definition_json, credential_handle_json, expires_at, state,
+                       evidence_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(attempt_id, driver) DO UPDATE SET
+                      kind = excluded.kind,
+                      resource_id = excluded.resource_id,
+                      ownership_token = excluded.ownership_token,
+                      definition_json = excluded.definition_json,
+                      credential_handle_json = CASE
+                        WHEN excluded.credential_handle_json = '{}'
+                        THEN runtime_driver_resources.credential_handle_json
+                        ELSE excluded.credential_handle_json
+                      END,
                       expires_at = excluded.expires_at,
                       state = excluded.state,
                       evidence_json = excluded.evidence_json,
@@ -1562,6 +1860,9 @@ class GitSupervisor:
                         item.resource_id,
                         item.ownership_token,
                         self._driver_definition_json(definitions[item.driver]),
+                        canonical_json(item.credential_handle.as_internal_dict())
+                        if item.credential_handle
+                        else "{}",
                         item.expires_at,
                         state,
                         canonical_json(item.as_dict()),
@@ -1634,7 +1935,86 @@ class GitSupervisor:
             )
         return resources
 
-    def runtime_restart(self, attempt_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _assert_restart_owner_in(
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        restart_token: str | None,
+    ) -> None:
+        if restart_token is None:
+            return
+        row = connection.execute(
+            "SELECT state, restart_token FROM runtime_environments WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if (
+            not row
+            or row["state"] != "restarting"
+            or not hmac.compare_digest(row["restart_token"], restart_token)
+        ):
+            raise SupervisorError("runtime_restart_stale", "restart generation is no longer active")
+
+    def _assert_restart_owner(self, attempt_id: str, restart_token: str) -> None:
+        with self.connect() as connection:
+            self._assert_restart_owner_in(connection, attempt_id, restart_token)
+
+    @contextmanager
+    def _runtime_restart_guard(self, attempt_id: str, recover: bool) -> Iterator[int]:
+        """Hold a kernel lifetime lock across every restart side effect.
+
+        The descriptor is also inherited by each trusted driver process. If
+        the supervisor dies while a teardown is running, the kernel therefore
+        keeps the lock until that process (and any inheriting descendants)
+        exits. A recovery may age out a DB generation, but it may never run
+        concurrently with an executor that can still mutate the resource.
+        """
+
+        lock_dir = self.state_dir / "restart-locks"
+        lock_dir.mkdir(mode=0o700, exist_ok=True)
+        lock_path = lock_dir / f"{sha256(attempt_id.encode())}.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            lock_fd = os.open(lock_path, flags, 0o600)
+        except OSError as error:
+            raise SupervisorError(
+                "runtime_restart_lock_unavailable",
+                "runtime restart lock could not be opened",
+            ) from error
+        try:
+            opened = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+            ):
+                raise SupervisorError(
+                    "runtime_restart_lock_unsafe",
+                    "runtime restart lock must be a current-user-owned 0600 regular file",
+                )
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise SupervisorError(
+                        "runtime_restart_lock_unavailable",
+                        "runtime restart lock could not be acquired",
+                    ) from error
+                code = (
+                    "runtime_restart_executor_alive" if recover else "runtime_restart_in_progress"
+                )
+                raise SupervisorError(
+                    code,
+                    "runtime restart executor is still alive; recovery is unsafe",
+                ) from error
+            yield lock_fd
+        finally:
+            # Do not issue LOCK_UN: a trusted child may still hold an inherited
+            # duplicate after an interrupted supervisor. Closing only our copy
+            # keeps the kernel lock alive until every such executor exits.
+            os.close(lock_fd)
+
+    def runtime_restart(self, attempt_id: str, recover: bool = False) -> dict[str, Any]:
         """Tear down and re-create driver resources between phases.
 
         QC must not be able to reach a service the worker left running: a stale
@@ -1642,21 +2022,154 @@ class GitSupervisor:
         actually starts.
         """
         self._assert_driver_config_unchanged(attempt_id)
-        environment = self._runtime_env(attempt_id, require_ready=False)
-        teardown = self._run_driver_phase("teardown", attempt_id, environment)
+        if recover:
+            now = int(time.time())
+            with self.connect() as connection:
+                runtime = connection.execute(
+                    "SELECT state, restart_started_at FROM runtime_environments "
+                    "WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+            if not runtime:
+                raise SupervisorError("runtime_not_found", "runtime environment is missing")
+            if runtime["state"] != "restarting":
+                raise SupervisorError(
+                    "runtime_recovery_not_needed",
+                    "runtime has no interrupted restart to recover",
+                )
+            if now - int(runtime["restart_started_at"]) < self.config.lease_seconds:
+                raise SupervisorError(
+                    "runtime_restart_not_stale",
+                    "runtime restart is still within its recovery lease",
+                )
+        with self._runtime_restart_guard(attempt_id, recover) as guard_fd:
+            return self._runtime_restart_locked(attempt_id, recover, guard_fd)
+
+    def _runtime_restart_locked(
+        self,
+        attempt_id: str,
+        recover: bool,
+        guard_fd: int,
+    ) -> dict[str, Any]:
+        """Restart while holding the kernel guard returned above."""
+
+        restart_token = uuid.uuid4().hex
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            runtime = connection.execute(
+                "SELECT * FROM runtime_environments WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if not runtime:
+                raise SupervisorError("runtime_not_found", "runtime environment is missing")
+            recovering = runtime["state"] == "restarting"
+            if recovering and not recover:
+                raise SupervisorError(
+                    "runtime_restart_in_progress",
+                    "runtime restart is already in progress; use --recover only after its lease",
+                )
+            if recovering and now - int(runtime["restart_started_at"]) < self.config.lease_seconds:
+                raise SupervisorError(
+                    "runtime_restart_not_stale",
+                    "runtime restart is still within its recovery lease",
+                )
+            if recover and not recovering:
+                raise SupervisorError(
+                    "runtime_recovery_not_needed",
+                    "runtime has no interrupted restart to recover",
+                )
+            if runtime["state"] not in {"ready", "restarting"}:
+                raise SupervisorError(
+                    "runtime_not_ready",
+                    f"runtime cannot restart from state {runtime['state']}",
+                )
+            connection.execute(
+                "UPDATE runtime_environments "
+                "SET state = 'restarting', restart_token = ?, restart_started_at = ?, updated_at = ? "
+                "WHERE attempt_id = ?",
+                (restart_token, now, utc_now(), attempt_id),
+            )
+            self._event(
+                connection,
+                "runtime.restart_started",
+                "supervisor",
+                {"attempt_id": attempt_id, "recovery": recovering},
+            )
+            environment = json.loads(runtime["env_json"])
+
+        # A crash after cleanup proof but before setup must not require the old
+        # credential again. Released rows are durable proof that teardown has
+        # already completed; retry proceeds directly to current-version setup.
+        rows = self._stored_driver_rows(attempt_id)
+        teardown_names = {row["driver"] for row in rows if row["state"] != "released"}
+        teardown = self._run_driver_phase(
+            "teardown",
+            attempt_id,
+            environment,
+            teardown_names,
+            restart_token=restart_token,
+            restart_guard_fd=guard_fd,
+        )
+        self._assert_restart_owner(attempt_id, restart_token)
         unproven = [item for item in teardown if not item.proof.get("cleanup_proved")]
         if unproven:
+            with self.connect() as connection:
+                updated = connection.execute(
+                    "UPDATE runtime_environments SET state = 'teardown_failed', updated_at = ? "
+                    "WHERE attempt_id = ? AND state = 'restarting' AND restart_token = ?",
+                    (utc_now(), attempt_id, restart_token),
+                )
+                if updated.rowcount != 1:
+                    raise SupervisorError(
+                        "runtime_restart_stale", "restart generation lost during teardown"
+                    )
             raise SupervisorError(
                 "runtime_cleanup_unproven",
                 "cannot restart runtime: cleanup proof missing for "
                 + ", ".join(sorted(item.driver for item in unproven)),
             )
-        setup = self._run_driver_phase("setup", attempt_id, environment)
+        setup = self._run_driver_phase(
+            "setup",
+            attempt_id,
+            environment,
+            restart_token=restart_token,
+            restart_guard_fd=guard_fd,
+        )
+        self._assert_restart_owner(attempt_id, restart_token)
         failed = [item for item in setup if not item.ok]
         if failed:
+            with self.connect() as connection:
+                updated = connection.execute(
+                    "UPDATE runtime_environments SET state = 'setup_failed', updated_at = ? "
+                    "WHERE attempt_id = ? AND state = 'restarting' AND restart_token = ?",
+                    (utc_now(), attempt_id, restart_token),
+                )
+                if updated.rowcount != 1:
+                    raise SupervisorError(
+                        "runtime_restart_stale", "restart generation lost during setup"
+                    )
             raise SupervisorError(
                 "runtime_setup_failed",
                 "driver setup failed for " + ", ".join(sorted(item.driver for item in failed)),
+            )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                "UPDATE runtime_environments "
+                "SET state = 'ready', restart_token = '', restart_started_at = 0, updated_at = ? "
+                "WHERE attempt_id = ? AND state = 'restarting' AND restart_token = ?",
+                (utc_now(), attempt_id, restart_token),
+            )
+            if updated.rowcount != 1:
+                raise SupervisorError(
+                    "runtime_restart_stale", "restart generation lost before completion"
+                )
+            self._event(
+                connection,
+                "runtime.restart_completed",
+                "supervisor",
+                {"attempt_id": attempt_id, "drivers": [item.driver for item in setup]},
             )
         return {
             "attempt_id": attempt_id,

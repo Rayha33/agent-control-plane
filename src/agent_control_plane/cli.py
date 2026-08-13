@@ -169,6 +169,11 @@ def parser() -> argparse.ArgumentParser:
         help="tear down and re-create driver resources so review gets fresh services",
     )
     runtime_restart.add_argument("attempt_id")
+    runtime_restart.add_argument(
+        "--recover",
+        action="store_true",
+        help="take over a crashed restart only after its restart lease is stale",
+    )
     runtime_down.add_argument("attempt_id")
     runtime_down.add_argument(
         "--force",
@@ -416,7 +421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "runtime-quarantine":
             result = supervisor.quarantined_resources()
         elif args.action == "runtime-restart":
-            result = supervisor.runtime_restart(args.attempt_id)
+            result = supervisor.runtime_restart(args.attempt_id, recover=args.recover)
         elif args.action == "runtime-down":
             result = supervisor.runtime_down(args.attempt_id, args.force)
         else:

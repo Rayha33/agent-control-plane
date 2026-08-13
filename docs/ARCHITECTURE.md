@@ -43,6 +43,7 @@ the old approval as current.
 | runtime environment | generated environment, setup/teardown evidence and lifecycle state |
 | runtime allocation | unique local port-pool value, attempt owner and expiry |
 | runtime driver resource | scoped resource, internal ownership capability, lifecycle state and cleanup proof |
+| credential handle | provider/name/version, exact internal source reference, and keyed target fingerprint—never plaintext |
 | runner identity | one role, credential digest, enrollment and revocation state |
 | submission | immutable commit/tree/patch hashes, changed paths, resource tokens |
 | QC run | reviewer, immutable commit, commands, outputs, structured findings |
@@ -151,9 +152,23 @@ require a post-teardown absence observation. Executables are outside the repo
 with a root-owned, non-writable parent chain, opened and identity-checked
 immediately before execution, and run without a shell under a fixed PATH and
 allowlisted environment. Definitions and resource identities are immutable per
-attempt; the ownership capability binds secret connection targets without
-disclosing them, and configuration or target drift quarantines the allocation
-and blocks restart. Generic shell
+attempt. Secret-bearing drivers resolve one named provider to an opaque version
+handle at setup. PostgreSQL receives the private libpq passfile through a sealed
+or unlinked descriptor; argv and environment values contain only the public
+connection target and descriptor path, and startup files/interactive password
+fallback are disabled. The handle and ownership capability are persisted as a
+<code>setup_pending</code> intent before the external action, so a crash cannot
+create an untracked target. The handle is persisted internally so
+teardown reopens the exact old version even after <code>current</code> rotates.
+Its keyed target/version fingerprint participates in the ownership capability,
+without disclosing a raw or guessable digest; the HMAC key is a separate
+<code>0600</code> state file rather than part of SQLite. Restart generations are
+exclusive and intent/evidence/final-state writes are token-fenced. Explicit
+recovery can replace only a stale generation after an inherited kernel
+lifetime lock proves that its prior supervisor and driver executors are dead.
+Restart must prove teardown on
+the old handle before resolving the new one; missing or modified versions and
+provider drift quarantine the allocation. Generic shell
 hooks remain operator-trusted and do not provide a cleanup proof.
 
 ### 5. A crash does not erase committed work
@@ -274,13 +289,15 @@ The data model is intentionally portable:
 2. Replace local bearer identities with asymmetric workload identity and remote
    attestation where the threat model requires it.
 3. Put each worktree and QC command in a filesystem/network sandbox.
-4. Add container/network namespace drivers behind the runtime lifecycle
+4. Replace local version files with native secret-manager providers behind the
+   same opaque handle/materialize contract.
+5. Add container/network namespace drivers behind the runtime lifecycle
    contract.
-5. Enforce logical-resource fencing in deployment, database, and artifact
+6. Enforce logical-resource fencing in deployment, database, and artifact
    gateways.
-6. Export lifecycle through MCP Tasks or A2A and telemetry through
+7. Export lifecycle through MCP Tasks or A2A and telemetry through
    OpenTelemetry.
-7. Anchor event-chain heads in an external append-only store.
+8. Anchor event-chain heads in an external append-only store.
 
 Those layers strengthen enforcement without changing the task, attempt, lease,
 submission, QC, or integration contracts.

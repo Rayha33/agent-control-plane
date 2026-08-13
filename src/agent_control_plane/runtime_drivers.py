@@ -33,15 +33,24 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+
+from .credential_providers import (
+    CredentialError,
+    CredentialHandle,
+    CredentialMaterial,
+    CredentialRegistry,
+)
 
 PHASES: tuple[str, ...] = ("setup", "verify", "teardown")
 DRIVER_KINDS: tuple[str, ...] = (
@@ -188,6 +197,8 @@ class DriverContext:
     expires_at: int
     secret: bytes
     environment: Mapping[str, str]
+    credential_registry: CredentialRegistry | None = None
+    credential_handles: Mapping[str, CredentialHandle] | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +212,7 @@ class PhaseEvidence:
     exit_code: int
     present: bool | None
     proof: dict[str, Any]
+    credential_handle: CredentialHandle | None = None
 
     @property
     def ok(self) -> bool:
@@ -241,7 +253,10 @@ def _sanitize(value: str, *, allow: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-CommandRunner = Callable[[Sequence[str], Path, Mapping[str, str], int], dict[str, Any]]
+CommandRunner = Callable[
+    [Sequence[str], Path, Mapping[str, str], int, CredentialMaterial | None],
+    dict[str, Any],
+]
 
 
 def run_trusted(
@@ -249,8 +264,17 @@ def run_trusted(
     cwd: Path,
     env: Mapping[str, str],
     timeout: int = DEFAULT_PHASE_TIMEOUT_SECONDS,
+    credential: CredentialMaterial | None = None,
+    *,
+    guard_fd: int | None = None,
 ) -> dict[str, Any]:
-    """Execute *argv* directly — no shell, no PATH search, no worktree cwd."""
+    """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
+
+    ``guard_fd`` is a supervisor-owned lifetime lock. Passing it through exec
+    makes the external operation keep that lock if its supervisor dies, so a
+    recovery process cannot overlap an old teardown that is still capable of
+    changing the resource.
+    """
 
     if not argv:
         raise DriverError("invalid_driver_invocation", "empty driver argv")
@@ -317,6 +341,8 @@ def run_trusted(
             or any(marker in name for marker in ("PASSWORD", "TOKEN", "SECRET", "CREDENTIAL"))
         )
     ]
+    if credential is not None:
+        secrets.extend(credential.redactions)
 
     def redact(value: str) -> str:
         for secret in secrets:
@@ -326,6 +352,14 @@ def run_trusted(
     execution_argv = [str(executable), *argv[1:]]
     started = time.monotonic()
     try:
+        inherited_fds = {
+            fd
+            for fd in (
+                credential.fd if credential is not None else None,
+                guard_fd,
+            )
+            if fd is not None
+        }
         process = subprocess.run(
             execution_argv,
             cwd=str(cwd),
@@ -334,6 +368,7 @@ def run_trusted(
             text=True,
             timeout=timeout,
             check=False,
+            pass_fds=tuple(sorted(inherited_fds)),
         )
     except subprocess.TimeoutExpired:
         return {
@@ -408,6 +443,9 @@ class ResourceDriver:
             self.ownership_identity(context),
         )
 
+    def credential_handle(self, context: DriverContext) -> CredentialHandle | None:
+        return (context.credential_handles or {}).get(self.definition.name)
+
     def run_phase(
         self,
         phase: str,
@@ -418,6 +456,7 @@ class ResourceDriver:
             raise DriverError("invalid_phase", f"unknown driver phase {phase!r}")
         resource = self.resource_id(context)
         token = self.ownership_token(context)
+        credential_handle = self.credential_handle(context)
 
         if phase == "setup":
             result = self.setup(context, runner)
@@ -440,6 +479,7 @@ class ResourceDriver:
                 exit_code=exit_code,
                 present=present,
                 proof=proof,
+                credential_handle=credential_handle,
             )
 
         if phase == "verify":
@@ -454,6 +494,7 @@ class ResourceDriver:
                 exit_code=0 if observation.get("exit_code", 0) == 0 else 1,
                 present=present,
                 proof={"observation": observation},
+                credential_handle=credential_handle,
             )
 
         result = self.teardown(context, runner)
@@ -479,6 +520,7 @@ class ResourceDriver:
             exit_code=exit_code,
             present=present,
             proof=proof,
+            credential_handle=credential_handle,
         )
 
 
@@ -505,19 +547,19 @@ class DockerComposeDriver(ResourceDriver):
         if compose_file:
             argv.extend(["-f", compose_file])
         argv.extend(["up", "-d", "--remove-orphans"])
-        return runner(argv, context.runtime_dir, self._env(context), self._timeout())
+        return runner(argv, context.runtime_dir, self._env(context), self._timeout(), None)
 
     def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
         # Addressed by project name only — no compose file, so the proof cannot
         # be steered by candidate content.
         argv = [*self._base(context), "ps", "--all", "--quiet"]
-        result = runner(argv, context.runtime_dir, self._env(context), self._timeout())
+        result = runner(argv, context.runtime_dir, self._env(context), self._timeout(), None)
         present = bool(result.get("stdout", "").strip())
         return present, result
 
     def teardown(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         argv = [*self._base(context), "down", "--volumes", "--remove-orphans"]
-        return runner(argv, context.runtime_dir, self._env(context), self._timeout())
+        return runner(argv, context.runtime_dir, self._env(context), self._timeout(), None)
 
     def _timeout(self) -> int:
         return int(
@@ -542,85 +584,102 @@ class PostgresSchemaDriver(ResourceDriver):
     ) -> list[str]:
         if self.definition.executable is None:
             raise DriverError("invalid_config", "postgres driver executable is missing")
-        argv = [str(self.definition.executable)]
+        # -X prevents candidate-writable ~/.psqlrc from executing backslash
+        # commands inside the otherwise trusted psql process while its
+        # credential descriptor is live. --no-password prevents an inherited
+        # terminal from becoming an implicit credential/input channel.
+        argv = [str(self.definition.executable), "-X", "--no-password"]
+        for option, flag in (
+            ("host", "--host"),
+            ("port", "--port"),
+            ("database", "--dbname"),
+            ("user", "--username"),
+        ):
+            value = self.definition.option(option)
+            if value:
+                argv.extend([flag, value])
         argv.extend(["-v", "ON_ERROR_STOP=1"])
         for name, value in sorted((variables or {}).items()):
             argv.extend(["--set", f"{name}={value}"])
         argv.extend(["-tAc", sql])
         return argv
 
-    def _dsn(self) -> str | None:
-        dsn = self.definition.option("dsn")
-        dsn_env = self.definition.option("dsn_env")
-        if dsn and dsn_env:
-            raise DriverError(
-                "invalid_config", "postgres driver accepts only one of dsn or dsn_env"
-            )
-        if dsn_env:
-            if not dsn_env.isidentifier() or dsn_env not in os.environ:
-                raise DriverError(
-                    "invalid_config", f"postgres credential environment is unavailable: {dsn_env}"
-                )
-            dsn = os.environ[dsn_env]
-        return dsn
-
     def ownership_identity(self, context: DriverContext) -> str:
-        dsn = self._dsn()
-        if not dsn:
-            raise DriverError("invalid_config", "postgres credential target is unavailable")
-        # The DSN never leaves this HMAC input. The stored token binds cleanup
-        # to the exact database target without disclosing or guessably hashing it.
-        return f"{self.resource_id(context)}\x00{dsn}"
+        handle = self.credential_handle(context)
+        if handle is None:
+            raise DriverError("credential_unavailable", "postgres credential handle is missing")
+        target = "\x00".join(
+            self.definition.option(name, "") or "" for name in ("host", "port", "database", "user")
+        )
+        # The stored capability binds both the public connection target and a
+        # keyed fingerprint of the exact credential version. Neither plaintext
+        # nor a guessable raw digest is persisted.
+        return (
+            f"{self.resource_id(context)}\x00{target}\x00{handle.version}"
+            f"\x00{handle.target_fingerprint}"
+        )
 
-    def _env(self, context: DriverContext) -> dict[str, str]:
-        env = super()._env(context)
-        dsn = self._dsn()
-        if dsn:
-            # libpq accepts a URI or keyword connection string in PGDATABASE.
-            # Keeping it out of argv prevents process-list and evidence leaks.
-            env["PGDATABASE"] = dsn
-        return env
+    @contextmanager
+    def _connection(self, context: DriverContext) -> Any:
+        handle = self.credential_handle(context)
+        if handle is None or context.credential_registry is None:
+            raise DriverError("credential_unavailable", "postgres credential is unavailable")
+        try:
+            with context.credential_registry.materialize(handle, context.runtime_dir) as material:
+                env = super()._env(context)
+                # PGPASSFILE contains only a descriptor path. The password is
+                # passed on that descriptor and never becomes an env value.
+                env["PGPASSFILE"] = material.path
+                yield env, material
+        except CredentialError as error:
+            raise DriverError(error.code, error.message) from error
 
     def setup(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         schema = self.resource_id(context)
-        return runner(
-            self._psql(
-                context,
-                'CREATE SCHEMA IF NOT EXISTS :"schema"',
-                {"schema": schema},
-            ),
-            context.runtime_dir,
-            self._env(context),
-            DEFAULT_PHASE_TIMEOUT_SECONDS,
-        )
+        with self._connection(context) as (env, material):
+            return runner(
+                self._psql(
+                    context,
+                    'CREATE SCHEMA IF NOT EXISTS :"schema"',
+                    {"schema": schema},
+                ),
+                context.runtime_dir,
+                env,
+                DEFAULT_PHASE_TIMEOUT_SECONDS,
+                material,
+            )
 
     def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
         schema = self.resource_id(context)
-        result = runner(
-            self._psql(
-                context,
-                "SELECT 1 FROM information_schema.schemata WHERE schema_name = :'schema'",
-                {"schema": schema},
-            ),
-            context.runtime_dir,
-            self._env(context),
-            DEFAULT_PHASE_TIMEOUT_SECONDS,
-        )
+        with self._connection(context) as (env, material):
+            result = runner(
+                self._psql(
+                    context,
+                    "SELECT 1 FROM information_schema.schemata WHERE schema_name = :'schema'",
+                    {"schema": schema},
+                ),
+                context.runtime_dir,
+                env,
+                DEFAULT_PHASE_TIMEOUT_SECONDS,
+                material,
+            )
         present = result.get("stdout", "").strip() == "1"
         return present, result
 
     def teardown(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         schema = self.resource_id(context)
-        return runner(
-            self._psql(
-                context,
-                'DROP SCHEMA IF EXISTS :"schema" CASCADE',
-                {"schema": schema},
-            ),
-            context.runtime_dir,
-            self._env(context),
-            DEFAULT_PHASE_TIMEOUT_SECONDS,
-        )
+        with self._connection(context) as (env, material):
+            return runner(
+                self._psql(
+                    context,
+                    'DROP SCHEMA IF EXISTS :"schema" CASCADE',
+                    {"schema": schema},
+                ),
+                context.runtime_dir,
+                env,
+                DEFAULT_PHASE_TIMEOUT_SECONDS,
+                material,
+            )
 
 
 class BrowserProfileDriver(ResourceDriver):
@@ -717,7 +776,9 @@ def build_driver(definition: DriverDefinition) -> ResourceDriver:
 
 
 def parse_driver_definitions(
-    entries: Sequence[Mapping[str, Any]], repo_root: Path
+    entries: Sequence[Mapping[str, Any]],
+    repo_root: Path,
+    credential_names: set[str] | None = None,
 ) -> tuple[DriverDefinition, ...]:
     """Validate ``[[runtime.drivers]]`` entries at configuration load."""
 
@@ -751,15 +812,46 @@ def parse_driver_definitions(
             if key not in {"name", "kind", "executable"}
         }
         if kind == PostgresSchemaDriver.kind:
-            if options.get("dsn"):
+            if options.get("dsn") or options.get("dsn_env"):
                 raise DriverError(
                     "invalid_config",
-                    "postgres driver requires dsn_env; literal DSNs are forbidden",
+                    "postgres driver requires a credential handle; DSNs and dsn_env are forbidden",
                 )
-            if not options.get("dsn_env"):
+            credential = options.get("credential", "").strip()
+            if not credential:
                 raise DriverError(
-                    "invalid_config", "postgres driver requires a dsn_env credential reference"
+                    "invalid_config", "postgres driver requires a credential reference"
                 )
+            if credential_names is not None and credential not in credential_names:
+                raise DriverError(
+                    "invalid_config",
+                    f"postgres driver references unknown credential {credential!r}",
+                )
+            for required in ("host", "database", "user"):
+                if not options.get(required, "").strip():
+                    raise DriverError(
+                        "invalid_config", f"postgres driver requires a {required} target"
+                    )
+            database = options["database"]
+            user = options["user"]
+            host = options["host"]
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,62}", database):
+                raise DriverError(
+                    "invalid_config",
+                    "postgres database must be a plain name, not URI or conninfo",
+                )
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,62}", user):
+                raise DriverError("invalid_config", "postgres user must be a plain role name")
+            if (
+                not re.fullmatch(r"[A-Za-z0-9._:/-]{1,255}", host)
+                or "://" in host
+                or host.startswith("-")
+            ):
+                raise DriverError("invalid_config", "postgres host is not a safe plain target")
+            port = options.get("port", "5432")
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise DriverError("invalid_config", "postgres driver port must be 1..65535")
+            options["port"] = port
         definitions.append(
             DriverDefinition(name=name, kind=kind, executable=executable, options=options)
         )

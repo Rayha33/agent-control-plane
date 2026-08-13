@@ -53,6 +53,7 @@ wedge.
 | Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
 | Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
 | Trusted resource drivers | Compose projects, PostgreSQL schemas, and browser profiles have scoped setup/probe/teardown proofs |
+| Scoped credential handles | Drivers receive one immutable credential version over a private descriptor; plaintext never enters argv, inherited env values, state, or evidence |
 | Runner authentication | Worker, critic, and integrator credentials are role-scoped and attempts bind to the credential version that claimed them |
 | Overlap preview | A dry-run claim reports exact and potential scope collisions, and who owns them, before an agent starts |
 | Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
@@ -242,6 +243,7 @@ Inspect or retry cleanup:
 ~~~bash
 uv run --extra dev acp environment ATTEMPT_ID
 uv run --extra dev acp runtime-down ATTEMPT_ID
+uv run --extra dev acp runtime-restart ATTEMPT_ID --recover
 ~~~
 
 Use <code>--force</code> only to recover a cleanup left in-progress by a crashed
@@ -253,11 +255,20 @@ not print secrets because hook output is written to ignored local logs.
 For resources with stronger cleanup requirements, use phase-scoped drivers:
 
 ~~~toml
+[[credentials]]
+name = "postgres-main"
+provider = "versioned_file"
+current = "/etc/acp/credentials/postgres-main/current"
+
 [[runtime.drivers]]
 name = "database"
 kind = "postgres_schema"
 executable = "/usr/local/bin/psql"
-dsn_env = "ACP_TEST_DATABASE_DSN"
+credential = "postgres-main"
+host = "database.internal"
+port = "5432"
+database = "app"
+user = "acp"
 
 [[runtime.drivers]]
 name = "browser"
@@ -269,17 +280,42 @@ External driver executables and their parent chain must be root-owned and not
 group/world writable because candidate code runs as the ACP user. ACP opens and verifies the exact
 executable identity immediately before invoking it without a shell, from the
 runtime directory, with a fixed PATH and a scrubbed
-environment. PostgreSQL drivers require a <code>dsn_env</code> reference and
-reject literal DSNs in tracked configuration. The secret is supplied only to
-the trusted driver through <code>PGDATABASE</code>, not argv, and is redacted
-from persisted observations. Every
+environment. PostgreSQL drivers reject literal DSNs and environment-secret
+references. Their named credential must point to an atomic <code>current</code>
+symlink outside the repository; the symlink target is a private, immutable
+<code>0600</code> libpq password file containing
+<code>host:port:database:user:password</code>. ACP stores only an opaque version
+handle and keyed target fingerprint. It materializes the exact version as a
+sealed memory file on Linux, or an immediately unlinked private file elsewhere,
+and gives psql only a <code>PGPASSFILE=/dev/fd/…</code> descriptor path. Psql runs
+with <code>-X --no-password</code>, so user startup files cannot execute while
+that descriptor is live and no interactive fallback can request another
+credential. Public target fields accept only plain host/name/role values; URI
+and conninfo smuggling is rejected. Plaintext
+never becomes argv or an environment value, and literal output is redacted from
+observations. Every
 teardown is followed by an independent absence probe; an unproven cleanup is
 quarantined rather than recycled. <code>runtime-resources</code> exposes the
-proof but not its internal ownership capability.
+proof but not its internal ownership capability or credential handle.
 
-That capability also binds the effective PostgreSQL target. Changing the
-referenced DSN or any driver definition after allocation blocks restart and
-quarantines cleanup instead of probing a different resource.
+Before setup touches an external resource, ACP durably writes a
+<code>setup_pending</code> record containing its exact internal cleanup handle
+and ownership capability. A crash after creation but before evidence therefore
+cannot make cleanup resolve a newly rotated credential. The fingerprint HMAC
+key lives in a separate ignored <code>.acp/driver.key</code> file with
+<code>0600</code> permissions—not in SQLite—so a database snapshot alone is not
+an offline credential verifier.
+
+Rotate by writing a new immutable version, setting it to <code>0600</code>, and
+atomically replacing the <code>current</code> symlink. Retain every old version
+while an ACP attempt may still reference it. Restart first tears down and probes
+the old target through its stored handle; only after cleanup proof does setup
+resolve the new version. A missing, modified, or provider-mismatched old version
+quarantines the allocation instead of probing a different target.
+Restart is single-owner and generation-fenced. A second call fails while one is
+live; <code>--recover</code> works only after the prior restart lease is stale and
+only after a kernel lifetime lock proves no old supervisor or inherited driver
+executor remains alive.
 
 ## Independent critic contract
 
@@ -476,6 +512,11 @@ service.
 - Runner credentials are local bearer secrets hashed in SQLite, not SSO,
   hardware identity, or remote attestation. Protect the host and credential
   sinks; a process that steals a live bearer secret can act as that role.
+- Descriptor delivery prevents accidental argv, environment, log, and state
+  exposure; it is not cross-UID isolation by itself. In production run ACP and
+  candidate code in separate OS/container identities so the candidate cannot
+  inspect ACP memory, its retained credential store, or another same-UID
+  process's descriptors.
 - Scheduling previews are advisory and point-in-time. `plan` and `queue` report
   the board as it was read; only `claim` is authoritative, and it re-checks
   under an immediate transaction. A preview that says "ready" can still lose a

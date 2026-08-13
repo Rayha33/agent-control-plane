@@ -34,11 +34,20 @@ teardown_commands = []
 # executable = "/usr/local/bin/docker"
 # compose_file = "/srv/acp/docker-compose.yml"
 #
+# [[credentials]]
+# name = "postgres-main"
+# provider = "versioned_file"
+# current = "/etc/acp/credentials/postgres-main/current"
+#
 # [[runtime.drivers]]
 # name = "db"
 # kind = "postgres_schema"          # schema is created and dropped per attempt
 # executable = "/usr/local/bin/psql"
-# dsn_env = "ACP_TEST_DATABASE_DSN" # required: literal DSNs are rejected
+# credential = "postgres-main"      # current -> retained immutable 0600 pgpass
+# host = "database.internal"
+# port = "5432"
+# database = "app"
+# user = "acp"
 #
 # [[runtime.drivers]]
 # name = "browser"

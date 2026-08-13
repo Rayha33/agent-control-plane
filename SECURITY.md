@@ -36,9 +36,35 @@ Candidate-facing child environments use a small public allowlist plus explicit
 ACP runtime variables; arbitrary host secrets are not inherited. The CLI
 accepts credentials from a private file, inherited environment, or
 file descriptor and never from argv. Enrollment writes the one-time secret to a
-private file or descriptor rather than JSON. PostgreSQL driver DSNs stay out of
-argv and are redacted from evidence; drivers require <code>dsn_env</code> and
-reject literal DSNs in tracked configuration.
+private file or descriptor rather than JSON. Runtime-driver credentials are
+separate versioned handles: PostgreSQL rejects DSNs and environment-secret
+references, retains the exact private version needed for cleanup, and supplies
+the password as an anonymous descriptor-backed <code>PGPASSFILE</code>. Psql
+startup files and interactive password fallback are disabled, and public target
+fields reject URI/conninfo syntax. Only a
+keyed fingerprint and opaque internal handle reach SQLite; handles are omitted
+from CLI/API views and literal material is redacted from driver observations.
+Missing or changed retained versions quarantine cleanup.
+
+The fingerprint HMAC key is stored separately in the ignored,
+current-user-owned <code>0600 .acp/driver.key</code>, never in SQLite. Protect
+backups created by older ACP versions whose database and key previously
+co-resided.
+
+Descriptor delivery reduces accidental disclosure but does not stop a hostile
+process with the same OS identity from inspecting ACP memory, the credential
+store, or open descriptors through host debugging interfaces. Use separate
+container/OS identities and a root- or supervisor-owned private credential
+store when candidate code is untrusted. Credential versions must remain
+available until every referencing attempt has proved teardown.
+
+Restart is single-owner and generation-fenced. A kernel lifetime lock is held
+by the supervisor and inherited by every trusted driver process, so
+<code>--recover</code> refuses takeover while any old executor capable of a side
+effect remains alive. The database lease determines when recovery may be
+attempted; it never overrides the kernel liveness proof. Container/cgroup
+supervision or a provider-native fenced gateway is still recommended for
+host-loss and distributed deployments where a local file lock is unavailable.
 
 The local event hash chain detects missing or modified records but is not
 tamper-proof against a database administrator who can rewrite and recompute the
