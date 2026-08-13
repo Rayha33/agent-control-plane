@@ -20,7 +20,7 @@ import unicodedata
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -53,6 +53,12 @@ from .runtime_drivers import (
 )
 from .scheduling import Scheduler, normalize_artifact
 from .status import DEFAULT_LEASE_RISK_SECONDS, StatusView
+from .trust_bundles import (
+    TrustBundleError,
+    executable_from_pin,
+    load_current_bundle,
+    verify_bundle_pin,
+)
 
 GENESIS_HASH = "0" * 64
 SUPERVISOR_SECRET_ENV = {"ACP_RUNNER_CREDENTIAL"}
@@ -108,6 +114,10 @@ class Config:
     runtime_port_pools: tuple[RuntimePortPool, ...]
     credentials: tuple[CredentialDefinition, ...]
     runtime_drivers: tuple[DriverDefinition, ...]
+    runtime_driver_entries: tuple[dict[str, Any], ...]
+    critic_selector: str
+    trust_root: Path | None
+    trust_owner_uid: int
 
 
 SCHEMA = """
@@ -144,6 +154,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   start_sha TEXT NOT NULL,
   latest_sha TEXT,
   checkpoint_json TEXT NOT NULL,
+  trust_bundle_json TEXT NOT NULL DEFAULT '{}',
   pid INTEGER,
   log_path TEXT,
   status TEXT NOT NULL,
@@ -186,6 +197,7 @@ CREATE TABLE IF NOT EXISTS qc_runs (
   reviewer_signature TEXT NOT NULL DEFAULT '',
   bundle_sha256 TEXT NOT NULL DEFAULT '',
   policy_fingerprint TEXT NOT NULL DEFAULT '',
+  trust_bundle_json TEXT NOT NULL DEFAULT '{}',
   started_at TEXT NOT NULL,
   finished_at TEXT NOT NULL
 );
@@ -267,8 +279,10 @@ CREATE INDEX IF NOT EXISTS idx_runtime_allocations_attempt
 
 
 class GitSupervisor:
-    def __init__(self, repo: str | Path = "."):
+    def __init__(self, repo: str | Path = ".", *, diagnostic: bool = False):
         self.root = self._root(Path(repo).resolve())
+        self._diagnostic = diagnostic
+        self._trust_config_error: str | None = None
         self.config_path = self.root / "acp.toml"
         self.state_dir = self.root / ".acp"
         self.db_path = self.state_dir / "control.db"
@@ -338,6 +352,13 @@ class GitSupervisor:
                 connection.execute(
                     f"ALTER TABLE tasks ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
                 )
+        attempt_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(attempts)").fetchall()
+        }
+        if "trust_bundle_json" not in attempt_columns:
+            connection.execute(
+                "ALTER TABLE attempts ADD COLUMN trust_bundle_json TEXT NOT NULL DEFAULT '{}'"
+            )
         qc_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(qc_runs)").fetchall()
         }
@@ -346,6 +367,7 @@ class GitSupervisor:
             ("reviewer_signature", "''"),
             ("bundle_sha256", "''"),
             ("policy_fingerprint", "''"),
+            ("trust_bundle_json", "'{}'"),
         ):
             if column not in qc_columns:
                 connection.execute(
@@ -394,11 +416,23 @@ class GitSupervisor:
             )
         return Path(result.stdout.strip()).resolve()
 
-    def _resolve_critic_command(self, critic_command: str) -> str:
+    def _resolve_critic_command(
+        self, critic_command: str, trust_pin: dict[str, Any] | None = None
+    ) -> str:
         """Every reviewer command obeys the same rule: `builtin`, or one absolute
         executable outside the candidate worktree so a candidate cannot replace it."""
         if not critic_command or critic_command == "builtin":
             return critic_command
+        if critic_command.startswith("trusted:"):
+            if trust_pin is None:
+                raise SupervisorError(
+                    "invalid_config", "trusted: commands require a configured trust bundle"
+                )
+            name = critic_command.removeprefix("trusted:")
+            try:
+                return str(executable_from_pin(trust_pin, name))
+            except TrustBundleError as error:
+                raise SupervisorError(error.code, error.message) from error
         critic_path = Path(critic_command).expanduser()
         if not critic_path.is_absolute():
             raise SupervisorError(
@@ -432,13 +466,33 @@ class GitSupervisor:
         qc = raw.get("qc", {})
         integration = raw.get("integration", {})
         runtime = raw.get("runtime", {})
+        trust = raw.get("trust")
+        if trust is not None and not isinstance(trust, dict):
+            raise SupervisorError("invalid_config", "trust must be a table")
+        trust_root: Path | None = None
+        trust_owner_uid = 0
+        trust_pin: dict[str, Any] | None = None
+        if trust is not None:
+            root_value = str(trust.get("root", "")).strip()
+            if not root_value:
+                raise SupervisorError("invalid_config", "trust.root must be an absolute path")
+            trust_root = Path(root_value).expanduser()
+            if not trust_root.is_absolute():
+                raise SupervisorError("invalid_config", "trust.root must be an absolute path")
+            trust_owner_uid = int(trust.get("owner_uid", 0))
+            try:
+                trust_pin = load_current_bundle(trust_root, owner_uid=trust_owner_uid)
+            except TrustBundleError as error:
+                if not self._diagnostic:
+                    raise SupervisorError(error.code, error.message) from error
+                self._trust_config_error = f"{error.code}: {error.message}"
         lease = int(supervisor.get("lease_seconds", 300))
         timeout = int(supervisor.get("qc_timeout_seconds", 900))
         if lease < 10 or timeout < 1:
             raise SupervisorError("invalid_config", "lease must be >= 10 and timeout >= 1")
         qc_commands = tuple(map(str, qc.get("commands", [])))
         integration_commands = tuple(map(str, integration.get("commands", qc.get("commands", []))))
-        critic_command = str(qc.get("critic_command", "")).strip()
+        critic_selector = str(qc.get("critic_command", "")).strip()
         require_critic = bool(supervisor.get("require_critic", False))
         if not qc_commands or any(not command.strip() for command in qc_commands):
             raise SupervisorError(
@@ -447,11 +501,14 @@ class GitSupervisor:
             )
         if not integration_commands or any(not command.strip() for command in integration_commands):
             raise SupervisorError("invalid_config", "every integration gate must contain a command")
-        if require_critic and not critic_command:
+        if require_critic and not critic_selector:
             raise SupervisorError(
                 "invalid_config", "require_critic needs a non-empty critic_command"
             )
-        critic_command = self._resolve_critic_command(critic_command)
+        if self._diagnostic and trust_pin is None and critic_selector.startswith("trusted:"):
+            critic_command = critic_selector
+        else:
+            critic_command = self._resolve_critic_command(critic_selector, trust_pin)
         runtime_setup_commands = tuple(map(str, runtime.get("setup_commands", [])))
         runtime_teardown_commands = tuple(map(str, runtime.get("teardown_commands", [])))
         raw_credentials = raw.get("credentials", [])
@@ -466,12 +523,34 @@ class GitSupervisor:
         raw_drivers = runtime.get("drivers", [])
         if not isinstance(raw_drivers, list):
             raise SupervisorError("invalid_config", "runtime.drivers must be an array of tables")
-        try:
-            runtime_drivers = parse_driver_definitions(
-                raw_drivers, self.root, {item.name for item in credentials}
+        if any(not isinstance(entry, dict) for entry in raw_drivers):
+            raise SupervisorError("invalid_config", "each runtime driver must be a table")
+        driver_entries = tuple(dict(entry) for entry in raw_drivers)
+        resolved_driver_entries: list[dict[str, Any]] = []
+        for entry in driver_entries:
+            resolved = dict(entry)
+            executable = str(resolved.get("executable", ""))
+            if executable.startswith("trusted:") and not (self._diagnostic and trust_pin is None):
+                resolved["executable"] = self._resolve_critic_command(executable, trust_pin)
+            resolved_driver_entries.append(resolved)
+        if (
+            self._diagnostic
+            and trust_pin is None
+            and any(
+                str(entry.get("executable", "")).startswith("trusted:") for entry in driver_entries
             )
-        except DriverError as error:
-            raise SupervisorError(error.code, error.message) from error
+        ):
+            runtime_drivers = ()
+        else:
+            try:
+                runtime_drivers = parse_driver_definitions(
+                    resolved_driver_entries,
+                    self.root,
+                    credential_names={item.name for item in credentials},
+                    expected_owners={0, trust_owner_uid} if trust_pin else None,
+                )
+            except DriverError as error:
+                raise SupervisorError(error.code, error.message) from error
         for label, commands in (
             ("runtime setup", runtime_setup_commands),
             ("runtime teardown", runtime_teardown_commands),
@@ -540,15 +619,17 @@ class GitSupervisor:
         # Loaded here so a reviewer's command obeys the same trust rule as the
         # legacy single critic, and so a bad policy fails at construction.
         policy = load_policy(
-            raw, str(supervisor.get("critic_identity", "")).strip(), critic_command
+            raw, str(supervisor.get("critic_identity", "")).strip(), critic_selector
         )
-        self.assurance_policy = replace(
-            policy,
-            reviewers=tuple(
-                replace(item, command=self._resolve_critic_command(item.command))
-                for item in policy.reviewers
-            ),
-        )
+        # Validate every declared command now, but retain its logical selector
+        # in policy provenance. A safe bundle rotation must not silently mutate
+        # the reviewer-policy fingerprint.
+        for reviewer in policy.reviewers:
+            if not (
+                self._diagnostic and trust_pin is None and reviewer.command.startswith("trusted:")
+            ):
+                self._resolve_critic_command(reviewer.command, trust_pin)
+        self.assurance_policy = policy
         return Config(
             lease_seconds=lease,
             timeout_seconds=timeout,
@@ -562,6 +643,157 @@ class GitSupervisor:
             runtime_port_pools=tuple(runtime_port_pools),
             credentials=credentials,
             runtime_drivers=runtime_drivers,
+            runtime_driver_entries=driver_entries,
+            critic_selector=critic_selector,
+            trust_root=trust_root,
+            trust_owner_uid=trust_owner_uid,
+        )
+
+    def _current_trust_pin(self) -> dict[str, Any]:
+        if self.config.trust_root is None:
+            return {}
+        try:
+            return load_current_bundle(
+                self.config.trust_root, owner_uid=self.config.trust_owner_uid
+            )
+        except TrustBundleError as error:
+            raise SupervisorError(error.code, error.message) from error
+
+    def _driver_definitions_for_pin(
+        self, pin: dict[str, Any] | None
+    ) -> tuple[DriverDefinition, ...]:
+        entries: list[dict[str, Any]] = []
+        for configured in self.config.runtime_driver_entries:
+            entry = dict(configured)
+            selector = str(entry.get("executable", ""))
+            if selector.startswith("trusted:"):
+                entry["executable"] = self._resolve_critic_command(selector, pin)
+            entries.append(entry)
+        try:
+            return parse_driver_definitions(
+                entries,
+                self.root,
+                credential_names={item.name for item in self.config.credentials},
+                expected_owners={0, self.config.trust_owner_uid} if pin else None,
+            )
+        except DriverError as error:
+            raise SupervisorError(error.code, error.message) from error
+
+    def _attempt_trust_pin(self, attempt_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT trust_bundle_json FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+        if not row:
+            raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
+        try:
+            value = json.loads(row["trust_bundle_json"] or "{}")
+        except (json.JSONDecodeError, TypeError) as error:
+            self._quarantine_trust_attempt(attempt_id, ["stored trust pin is invalid JSON"])
+            raise SupervisorError(
+                "trust_bundle_invalid", "stored trust pin is invalid JSON"
+            ) from error
+        if not isinstance(value, dict):
+            self._quarantine_trust_attempt(attempt_id, ["stored trust pin is not an object"])
+            raise SupervisorError("trust_bundle_invalid", "stored trust pin is not an object")
+        return value
+
+    def _quarantine_trust_attempt(self, attempt_id: str, errors: Sequence[str]) -> None:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._quarantine_trust_attempt_in(connection, attempt_id, errors)
+
+    def _quarantine_trust_attempt_in(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        errors: Sequence[str],
+    ) -> None:
+        """Quarantine a pin inside the caller's finalization transaction."""
+
+        stamp = utc_now()
+        attempt = connection.execute(
+            "SELECT task_id FROM attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if not attempt:
+            return
+        connection.execute(
+            "UPDATE attempts SET status = 'quarantined', pid = NULL, updated_at = ? WHERE id = ?",
+            (stamp, attempt_id),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?",
+            (stamp, attempt["task_id"]),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'teardown_failed', updated_at = ? "
+            "WHERE attempt_id = ?",
+            (stamp, attempt_id),
+        )
+        connection.execute(
+            "UPDATE runtime_driver_resources SET state = 'quarantined', updated_at = ? "
+            "WHERE attempt_id = ?",
+            (stamp, attempt_id),
+        )
+        self._event(
+            connection,
+            "trust_bundle.quarantined",
+            "supervisor",
+            {"attempt_id": attempt_id, "errors": list(errors)},
+        )
+
+    def _verify_attempt_trust_in(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        """Verify the exact pin while fencing a final state transition."""
+
+        row = connection.execute(
+            "SELECT trust_bundle_json FROM attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if not row:
+            raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
+        try:
+            pin = json.loads(row["trust_bundle_json"] or "{}")
+        except (json.JSONDecodeError, TypeError) as error:
+            errors = ["stored trust pin is invalid JSON"]
+            self._quarantine_trust_attempt_in(connection, attempt_id, errors)
+            raise SupervisorError("trust_bundle_invalid", errors[0]) from error
+        if not isinstance(pin, dict):
+            errors = ["stored trust pin is not an object"]
+            self._quarantine_trust_attempt_in(connection, attempt_id, errors)
+            raise SupervisorError("trust_bundle_invalid", errors[0])
+        if not pin:
+            if self.config.trust_root is not None:
+                errors = ["attempt has no trust pin; refusing to adopt the current bundle"]
+                self._quarantine_trust_attempt_in(connection, attempt_id, errors)
+                raise SupervisorError("trust_bundle_quarantined", errors[0])
+            return {}
+        result = verify_bundle_pin(pin)
+        if result["ok"]:
+            return pin
+        self._quarantine_trust_attempt_in(connection, attempt_id, result["errors"])
+        raise SupervisorError(
+            "trust_bundle_quarantined",
+            "pinned trust bundle failed: " + "; ".join(result["errors"]),
+        )
+
+    def _verify_attempt_trust(self, attempt_id: str) -> dict[str, Any]:
+        pin = self._attempt_trust_pin(attempt_id)
+        if not pin:
+            if self.config.trust_root is not None:
+                errors = ["attempt has no trust pin; refusing to adopt the current bundle"]
+                self._quarantine_trust_attempt(attempt_id, errors)
+                raise SupervisorError("trust_bundle_quarantined", errors[0])
+            return {}
+        result = verify_bundle_pin(pin)
+        if result["ok"]:
+            return pin
+        self._quarantine_trust_attempt(attempt_id, result["errors"])
+        raise SupervisorError(
+            "trust_bundle_quarantined",
+            "pinned trust bundle failed: " + "; ".join(result["errors"]),
         )
 
     @contextmanager
@@ -814,7 +1046,7 @@ class GitSupervisor:
                 provider="unknown",
                 model="unknown",
                 prompt_policy="unset",
-                command=self.config.critic_command,
+                command=self.config.critic_selector,
             )
         return None
 
@@ -824,9 +1056,19 @@ class GitSupervisor:
         submission: sqlite3.Row | dict[str, Any],
     ) -> list[dict[str, str]]:
         """Return unique passes made by the current declared reviewer versions."""
+        attempt = connection.execute(
+            "SELECT trust_bundle_json FROM attempts WHERE id = ?",
+            (submission["attempt_id"],),
+        ).fetchone()
+        if not attempt:
+            return []
+        try:
+            expected_trust_pin = json.loads(attempt["trust_bundle_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return []
         rows = connection.execute(
             """
-            SELECT reviewer_id, reviewer_provenance_json FROM qc_runs
+            SELECT reviewer_id, reviewer_provenance_json, trust_bundle_json FROM qc_runs
             WHERE submission_id = ? AND commit_sha = ? AND verdict = 'pass'
               AND policy_fingerprint = ?
             ORDER BY finished_at
@@ -846,9 +1088,10 @@ class GitSupervisor:
                 continue
             try:
                 provenance = json.loads(row["reviewer_provenance_json"] or "{}")
-            except json.JSONDecodeError:
+                review_trust_pin = json.loads(row["trust_bundle_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
                 continue
-            if provenance != reviewer.provenance():
+            if provenance != reviewer.provenance() or review_trust_pin != expected_trust_pin:
                 continue
             passes.append({"reviewer_id": reviewer_id, "provider": reviewer.provider})
             seen.add(reviewer_id)
@@ -1032,7 +1275,7 @@ class GitSupervisor:
             provider="unknown",
             model="unknown",
             prompt_policy="unset",
-            command=self.config.critic_command or "builtin",
+            command=self.config.critic_selector or "builtin",
         )
 
     def _golden_packet(self, case: Any, head: str, touched: list[str]) -> dict[str, Any]:
@@ -1557,12 +1800,13 @@ class GitSupervisor:
         rows = self._stored_driver_rows(attempt_id)
         if not rows:
             return
+        pin = self._verify_attempt_trust(attempt_id)
         stored = {
             row["driver"]: row["definition_json"] for row in rows if row["definition_json"] != "{}"
         }
         current = {
             definition.name: self._driver_definition_json(definition)
-            for definition in self.config.runtime_drivers
+            for definition in self._driver_definitions_for_pin(pin)
         }
         if stored == current:
             return
@@ -1601,6 +1845,7 @@ class GitSupervisor:
         immediately before exec.
         """
 
+        pin = self._verify_attempt_trust(attempt_id)
         stored_rows = self._stored_driver_rows(attempt_id)
         stored_by_name = {row["driver"]: row for row in stored_rows}
         if stored_rows:
@@ -1615,7 +1860,7 @@ class GitSupervisor:
                     "stored driver definition is unavailable; cleanup is quarantined",
                 ) from error
         else:
-            definitions = self.config.runtime_drivers
+            definitions = self._driver_definitions_for_pin(pin)
         if only_drivers is not None:
             definitions = tuple(
                 definition for definition in definitions if definition.name in only_drivers
@@ -1655,6 +1900,25 @@ class GitSupervisor:
         context = self._driver_context(attempt_id, environment, registry=registry, handles=handles)
         evidence: list[PhaseEvidence] = []
         definitions_by_name = {definition.name: definition for definition in definitions}
+        trusted_owners = {0, self.config.trust_owner_uid} if pin else None
+
+        def trusted_runner(  # type: ignore[no-untyped-def]
+            argv, cwd, env, timeout, credential
+        ) -> dict[str, Any]:
+            execution_options: dict[str, Any] = {}
+            if restart_guard_fd is not None:
+                execution_options["guard_fd"] = restart_guard_fd
+            if trusted_owners is not None:
+                execution_options["expected_owners"] = trusted_owners
+            return run_trusted(
+                argv,
+                cwd,
+                env,
+                timeout,
+                credential,
+                **execution_options,
+            )
+
         for definition in definitions:
             if restart_token is not None:
                 self._assert_restart_owner(attempt_id, restart_token)
@@ -1690,18 +1954,7 @@ class GitSupervisor:
                         restart_token=restart_token,
                     )
                     intent_recorded = True
-
-                def guarded_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
-                    return run_trusted(
-                        argv,
-                        cwd,
-                        env,
-                        timeout,
-                        credential,
-                        guard_fd=restart_guard_fd,
-                    )
-
-                evidence.append(driver.run_phase(phase, context, guarded_runner))
+                evidence.append(driver.run_phase(phase, context, trusted_runner))
             except DriverError as error:
                 stored = stored_by_name.get(definition.name)
                 evidence.append(
@@ -2404,6 +2657,9 @@ class GitSupervisor:
         attempt_id = str(uuid.uuid4())
         worktree = self.state_dir / "worktrees" / attempt_id
         now = utc_now()
+        # Resolve ``current`` once, before the attempt exists. Every later phase
+        # reads this stored pin, so a rotation affects only subsequent claims.
+        trust_pin = self._current_trust_pin()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             identity = self._authenticate(agent_id, "worker", credential, connection)
@@ -2489,9 +2745,10 @@ class GitSupervisor:
                 INSERT INTO attempts
                   (id, task_id, number, agent_id, runner_credential_digest,
                    branch, worktree, claim_token,
-                   start_sha, latest_sha, checkpoint_json, pid, log_path, status,
+                   start_sha, latest_sha, checkpoint_json, trust_bundle_json,
+                   pid, log_path, status,
                    lease_expires_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL, NULL,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, NULL, NULL,
                         'provisioning', ?, ?, ?)
                 """,
                 (
@@ -2505,6 +2762,7 @@ class GitSupervisor:
                     counter,
                     start_sha,
                     start_sha,
+                    canonical_json(trust_pin),
                     expires,
                     now,
                     now,
@@ -3001,6 +3259,9 @@ class GitSupervisor:
         # Until this existed, "independent QC" was a string a worker could type.
         reviewer_identity = self._authenticate(reviewer_id, "critic", credential)
         reviewer_digest = reviewer_identity["credential_digest"] if reviewer_identity else None
+        with self.connect() as connection:
+            pending_submission = self._submission_row(connection, submission_id)
+        trust_pin = self._verify_attempt_trust(pending_submission["attempt_id"])
         reviewer = self.assurance_policy.reviewer(reviewer_id)
         if reviewer is None:
             if reviewer_id != self.config.critic_identity:
@@ -3013,7 +3274,7 @@ class GitSupervisor:
                 provider="unknown",
                 model="unknown",
                 prompt_policy="unset",
-                command=self.config.critic_command,
+                command=self.config.critic_selector,
             )
         # A reviewer upgrade must be ratified before it can judge anything.
         self.assurance.assert_policy_ratified()
@@ -3098,6 +3359,8 @@ class GitSupervisor:
                 packet["deterministic_results"] = results
                 packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
                 self._restore_candidate(qc_dir, submission["commit_sha"])
+                if reviewer.command.startswith("trusted:"):
+                    trust_pin = self._verify_attempt_trust(submission["attempt_id"])
                 result_path = (
                     self.state_dir / "logs" / f"critic-{submission_id}-{uuid.uuid4().hex}.json"
                 )
@@ -3109,6 +3372,7 @@ class GitSupervisor:
                         "ACP_REVIEW_PACKET": str(packet_path),
                         "ACP_REVIEW_RESULT": str(result_path),
                     },
+                    trust_pin,
                 )
                 results.append(critic)
                 if critic["exit_code"] or not self._worktree_matches(
@@ -3188,6 +3452,13 @@ class GitSupervisor:
                 credential,
                 reviewer_digest,
             )
+            try:
+                trust_pin = self._verify_attempt_trust_in(connection, submission["attempt_id"])
+            except SupervisorError:
+                # Preserve the quarantine even though this verdict must not be
+                # recorded. The context manager's later rollback is then a no-op.
+                connection.commit()
+                raise
             if self.assurance.ratified_fingerprint(connection) != self.assurance_policy.fingerprint:
                 raise SupervisorError(
                     "reviewer_policy_changed",
@@ -3207,8 +3478,8 @@ class GitSupervisor:
                   (id, submission_id, reviewer_id, commit_sha, verdict,
                    findings_json, results_json, packet_sha256,
                    reviewer_provenance_json, reviewer_signature, bundle_sha256,
-                   policy_fingerprint, started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   policy_fingerprint, trust_bundle_json, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     qc_id,
@@ -3223,6 +3494,7 @@ class GitSupervisor:
                     bundle["record"]["signature"],
                     bundle["sha256"],
                     self.assurance_policy.fingerprint,
+                    canonical_json(trust_pin),
                     started,
                     finished,
                 ),
@@ -3344,6 +3616,13 @@ class GitSupervisor:
             ).fetchone()
             if not submission:
                 raise SupervisorError("qc_evidence_missing", "approved submission is missing")
+            try:
+                self._verify_attempt_trust_in(connection, submission["attempt_id"])
+            except SupervisorError:
+                # Persist quarantine while rejecting integration before it can
+                # create a branch or invoke an external gate.
+                connection.commit()
+                raise
             self._assert_submission_assurance(connection, submission)
             self._assert_reservations(connection, task, submission)
             runtime = connection.execute(
@@ -3450,8 +3729,14 @@ class GitSupervisor:
                 except SupervisorError as auth_error:
                     verdict = "stale"
                     error_message = f"{auth_error.code}: {auth_error}"
+                trust_valid = True
+                try:
+                    self._verify_attempt_trust_in(connection, submission["attempt_id"])
+                except SupervisorError as trust_error:
+                    trust_valid = False
+                    error_message = f"{trust_error.code}: {trust_error}"
                 current_task = self._task_row(connection, task_id)
-                reservation_valid = current_task["status"] == "integrating"
+                reservation_valid = trust_valid and current_task["status"] == "integrating"
                 if reservation_valid:
                     try:
                         self._assert_submission_assurance(connection, submission)
@@ -3464,7 +3749,7 @@ class GitSupervisor:
                     except SupervisorError as error:
                         reservation_valid = False
                         error_message = str(error)
-                else:
+                elif not error_message:
                     error_message = "task or reservation changed while integration was running"
                 if not reservation_valid:
                     verdict = "stale"
@@ -3814,6 +4099,26 @@ class GitSupervisor:
             checks.append({"name": "sqlite", "ok": integrity == "ok", "detail": integrity})
         except sqlite3.Error as error:
             checks.append({"name": "sqlite", "ok": False, "detail": str(error)})
+        if self.config.trust_root is not None:
+            try:
+                current_pin = load_current_bundle(
+                    self.config.trust_root, owner_uid=self.config.trust_owner_uid
+                )
+                current_health = verify_bundle_pin(current_pin)
+            except TrustBundleError as error:
+                current_health = {
+                    "ok": False,
+                    "bundle_id": None,
+                    "errors": [f"{error.code}: {item}" for item in error.errors],
+                }
+            checks.append(
+                {
+                    "name": "trust_current",
+                    "ok": current_health["ok"],
+                    "detail": current_health,
+                }
+            )
+        referenced_pins: dict[tuple[str, str], dict[str, Any]] = {}
         with self.connect() as connection:
             runtime_rows = connection.execute(
                 """
@@ -3824,6 +4129,38 @@ class GitSupervisor:
                 ORDER BY runtime.updated_at
                 """
             ).fetchall()
+            trust_queries = (
+                (
+                    "attempts",
+                    "SELECT trust_bundle_json FROM attempts WHERE trust_bundle_json != '{}'",
+                ),
+                (
+                    "qc_runs",
+                    "SELECT trust_bundle_json FROM qc_runs WHERE trust_bundle_json != '{}'",
+                ),
+            )
+            for table, query in trust_queries:
+                for row in connection.execute(query):
+                    try:
+                        pin = json.loads(row["trust_bundle_json"])
+                        key = (str(pin.get("bundle_id", "?")), str(pin.get("manifest_sha256", "?")))
+                        referenced_pins[key] = pin
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        key = (f"invalid-{table}", str(len(referenced_pins)))
+                        referenced_pins[key] = {}
+        for (bundle_id, manifest_digest), pin in sorted(referenced_pins.items()):
+            health = (
+                verify_bundle_pin(pin)
+                if pin
+                else {"ok": False, "bundle_id": bundle_id, "errors": ["stored pin is invalid"]}
+            )
+            checks.append(
+                {
+                    "name": f"trust_pinned:{bundle_id}:{manifest_digest[:12]}",
+                    "ok": health["ok"],
+                    "detail": health,
+                }
+            )
         active_states = {"provisioning", "working", "qc_review", "approved", "integrating"}
         unhealthy_runtime = [
             {
@@ -3925,6 +4262,7 @@ class GitSupervisor:
         runtime = connection.execute(
             "SELECT * FROM runtime_environments WHERE attempt_id = ?", (row["id"],)
         ).fetchone()
+        trust_pin = json.loads(row["trust_bundle_json"] or "{}")
         return {
             "id": row["id"],
             "task_id": row["task_id"],
@@ -3942,6 +4280,14 @@ class GitSupervisor:
             "lease_expires_at": row["lease_expires_at"],
             "resource_leases": [dict(lease) for lease in leases],
             "runtime": self._runtime_view(connection, runtime) if runtime else None,
+            "trust_bundle": (
+                {
+                    "bundle_id": trust_pin.get("bundle_id"),
+                    "manifest_sha256": trust_pin.get("manifest_sha256"),
+                }
+                if trust_pin
+                else None
+            ),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -3989,6 +4335,7 @@ class GitSupervisor:
 
     @staticmethod
     def _qc_view(row: sqlite3.Row) -> dict[str, Any]:
+        trust_pin = json.loads(row["trust_bundle_json"] or "{}")
         return {
             "id": row["id"],
             "submission_id": row["submission_id"],
@@ -4002,6 +4349,14 @@ class GitSupervisor:
             "reviewer_signature": row["reviewer_signature"],
             "bundle_sha256": row["bundle_sha256"],
             "policy_fingerprint": row["policy_fingerprint"],
+            "trust_bundle": (
+                {
+                    "bundle_id": trust_pin.get("bundle_id"),
+                    "manifest_sha256": trust_pin.get("manifest_sha256"),
+                }
+                if trust_pin
+                else None
+            ),
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
         }
@@ -4192,10 +4547,27 @@ class GitSupervisor:
         command: str,
         cwd: Path,
         extra_env: dict[str, str],
+        trust_pin: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if command != "builtin":
             env = self._child_env(extra_env)
-            return self._run_process([command], command, cwd, env)
+            resolved = self._resolve_critic_command(
+                command,
+                trust_pin if trust_pin is not None else self._current_trust_pin(),
+            )
+            try:
+                result = run_trusted(
+                    [resolved],
+                    cwd,
+                    env,
+                    self.config.timeout_seconds,
+                    expected_owners=(
+                        {0, self.config.trust_owner_uid} if command.startswith("trusted:") else None
+                    ),
+                )
+            except DriverError as error:
+                raise SupervisorError(error.code, error.message) from error
+            return {"command": command, **result}
         env = self._child_env(extra_env)
         critic_path = Path(__file__).with_name("critic.py").resolve()
         return self._run_process(

@@ -5,6 +5,12 @@ import os
 import sqlite3
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from agent_control_plane import cli
+from agent_control_plane.trust_bundles import install_bundle
 
 
 def run_cli(
@@ -89,6 +95,100 @@ def test_cli_init_create_claim_and_doctor(tmp_path: Path) -> None:
     assert invalid_json.returncode == 1
     assert json.loads(invalid_json.stdout)["ok"] is False
     assert not invalid_json.stderr
+
+
+def test_cli_trust_list_does_not_require_supervisor_initialization(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    driver = source / "driver"
+    driver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    driver.chmod(0o755)
+    trust_root = tmp_path / "trust"
+    pin = install_bundle(
+        source,
+        trust_root,
+        "v1",
+        {"driver": "driver"},
+        owner_uid=os.geteuid(),
+        require_privilege=False,
+    )
+
+    listed = run_cli(
+        tmp_path,
+        "trust",
+        "list",
+        "--root",
+        str(trust_root),
+        "--owner-uid",
+        str(os.geteuid()),
+    )
+
+    assert listed.returncode == 0, listed.stderr
+    payload = json.loads(listed.stdout)
+    assert payload["current"] == pin["bundle_id"]
+    assert payload["bundles"] == [
+        {
+            "bundle_id": pin["bundle_id"],
+            "current": True,
+            "retired": False,
+            "health": {
+                "bundle_id": pin["bundle_id"],
+                "errors": [],
+                "ok": True,
+            },
+        }
+    ]
+
+
+def test_cli_trust_install_invokes_validated_helper_without_a_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli,
+        "resolve_trusted_executable",
+        lambda raw, repo, owners: Path("/trusted/acp-trust-helper"),
+    )
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 0)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, '{"bundle_id":"v1-digest"}', "")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    args = SimpleNamespace(
+        repo=str(tmp_path),
+        helper="/configured/helper",
+        trust_action="install",
+        root=str(tmp_path / "trust"),
+        owner_uid=0,
+        source=str(tmp_path / "release"),
+        version="v1",
+        executable=["critic=bin/critic", "docker=bin/docker"],
+    )
+
+    result = cli._run_trust_helper(args)
+
+    assert result == {"bundle_id": "v1-digest"}
+    assert captured["command"] == [
+        "/trusted/acp-trust-helper",
+        "install",
+        "--root",
+        str(tmp_path / "trust"),
+        "--owner-uid",
+        "0",
+        "--source",
+        str(tmp_path / "release"),
+        "--version",
+        "v1",
+        "--executable",
+        "critic=bin/critic",
+        "--executable",
+        "docker=bin/docker",
+    ]
+    assert captured["check"] is False
+    assert "shell" not in captured
 
 
 def _repo(tmp_path: Path) -> Path:

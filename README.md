@@ -54,6 +54,8 @@ wedge.
 | Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
 | Trusted resource drivers | Compose projects, PostgreSQL schemas, and browser profiles have scoped setup/probe/teardown proofs |
 | Scoped credential handles | Drivers receive one immutable credential version over a private descriptor; plaintext never enters argv, inherited env values, state, or evidence |
+| Privileged trust bundles | Versioned critic/driver executables are installed by a narrow helper and pinned per attempt/QC by manifest, inode, and content digest |
+| Fenced side effects | Database schema/migration, deploy namespace, and artifact/tag mutations require the live task and resource fencing tokens and emit durable, credential-free receipts |
 | Runner authentication | Worker, critic, and integrator credentials are role-scoped and attempts bind to the credential version that claimed them |
 | Overlap preview | A dry-run claim reports exact and potential scope collisions, and who owns them, before an agent starts |
 | Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
@@ -137,6 +139,93 @@ rotates its secret; attempts claimed by the old secret remain fenced.
 
 All commands emit JSON. Local runtime state and logs live under ignored
 <code>.acp/</code>; configuration is tracked in <code>acp.toml</code>.
+
+## Privileged critic and driver bundles
+
+Production critic and runtime-driver executables should live outside both the
+candidate repository and the ACP service account's writable paths. The package
+exports a narrow second entry point, `acp-trust-helper`. Install that entry
+point and every interpreter/library it needs from a root-controlled OS package;
+do not point it at a development virtual environment.
+
+Linux packages should place the helper at
+`/usr/local/libexec/acp-trust-helper` (or patch `DEFAULT_HELPER` to the distro's
+libexec directory), owned by root and mode `0755`. Create
+`/var/lib/agent-control-plane/trust` and its `bundles` and `retired`
+subdirectories root-owned and mode `0755`. A dedicated trust UID may own the
+tree instead; pass its numeric UID consistently and keep the candidate runner
+under a different account. `/proc/self/fd` lets Linux execute the exact
+descriptor ACP validated.
+
+~~~bash
+sudo install -d -o root -g root -m 0755 \
+  /var/lib/agent-control-plane/trust/bundles \
+  /var/lib/agent-control-plane/trust/retired
+~~~
+
+macOS packages should place the helper at
+`/Library/PrivilegedHelperTools/acp-trust-helper` and pre-create
+`/Library/Application Support/AgentControlPlane/trust/{bundles,retired}` as
+root, mode `0755`; those are ACP's macOS defaults. Keep both outside
+Homebrew/user-writable prefixes. Darwin does not execute Mach-O files through
+`/dev/fd`, so the root/dedicated-UID-owned, non-writable directory chain is the
+enforcement that prevents replacement between validation and launch. A package
+using another location passes `--helper`/`--root` and records the same root in
+`acp.toml`.
+
+~~~bash
+sudo install -d -o root -g wheel -m 0755 \
+  "/Library/Application Support/AgentControlPlane/trust/bundles" \
+  "/Library/Application Support/AgentControlPlane/trust/retired"
+~~~
+
+Stage and atomically activate a bundle:
+
+~~~bash
+acp trust install --source /secure/release/acp-tools-2026.08 \
+  --version 2026.08 \
+  --executable critic=bin/critic \
+  --executable docker=bin/docker
+~~~
+
+`acp` validates the installed helper before invoking it directly or through
+`sudo`; no shell or inherited secret environment is used. The helper rejects
+absolute/traversing source names and symlinks, copies from no-follow open file
+descriptors, detects in-place mutation, writes a canonical manifest, freezes
+the version directory, and atomically replaces a regular `current` pointer.
+
+Reference bundle members from `acp.toml` by logical name:
+
+~~~toml
+[trust]
+root = "/var/lib/agent-control-plane/trust"
+owner_uid = 0
+
+[qc]
+commands = ["python -m pytest -q"]
+critic_command = "trusted:critic"
+
+[[runtime.drivers]]
+name = "compose"
+kind = "docker_compose"
+executable = "trusted:docker"
+compose_file = "compose.yaml"
+~~~
+
+Every new claim snapshots the current bundle's manifest digest and each used
+executable's device, inode, size, and SHA-256. Rotating by installing another
+version affects only later claims. Live attempts and their QC keep the old pin;
+if it disappears or changes, ACP quarantines the attempt and blocks its task
+instead of switching to `current`.
+
+`acp trust retire BUNDLE_ID` and `acp trust uninstall BUNDLE_ID` only create a
+retirement marker. They never remove the version directory, so attempts and QC
+records cannot lose referenced evidence. `acp trust list` shows health and
+retirement state. Physical garbage collection is intentionally outside ACP;
+packaging must first prove that no `attempts.trust_bundle_json` or
+`qc_runs.trust_bundle_json` record references the bundle. `acp doctor` reports
+every ownership, mode, manifest, inode, size, digest, missing-file, and symlink
+failure it observes.
 
 ## Planning before launch
 
@@ -489,6 +578,42 @@ uv run uvicorn agent_control_plane.app:create_app --factory
 The Git supervisor is the primary v0.2 product path. The HTTP authority API is a
 separate reference layer and does not create Git worktrees.
 
+### Fenced external side effects
+
+The authority API exposes a provider-neutral gate for mutations that worktrees
+cannot isolate:
+
+- `POST /v1/side-effects/{operation}` for ordinary HTTP callers; and
+- `POST /v1/a2a/side-effects/{operation}` for durable MCP/A2A task and artifact
+  identities.
+
+Supported operations are `db.schema`, `db.migrate`, `deploy.publish`,
+`deploy.delete`, `artifact.publish`, and `artifact.tag`. Database resources use
+`db:DATABASE/SCHEMA`, deploy resources use `deploy:ENVIRONMENT/NAMESPACE`, and
+artifact resources use `artifact:REPOSITORY/TAG`; individual components are URL
+encoded so one external object has one unambiguous lease identity.
+
+Callers present their mandate, task claim token, complete resource-token map,
+target resource, idempotency key, and provider payload. Actor and role are
+derived from the signed mandate and current agent registry, never accepted from
+the body. The gate checks mandate scope, the live task owner, lease expiry,
+claim and resource generations, the exact declared target, and provider-derived
+resource identity before the provider is reachable. The MCP/A2A adapter maps
+durable protocol identity into that same path; it is not a second enforcement
+implementation.
+
+Applications inject provider drivers into `create_app(side_effect_drivers=...)`.
+Each driver receives a `ProviderCall` with the durable idempotency key, request
+digest, task/actor/target identity, and both fencing generations. Drivers must
+forward the idempotency key and resource token to a provider-native
+transaction, compare-and-set, or equivalent boundary. ACP's SQLite transaction
+serializes local retries and records one receipt, but provider-native
+idempotency is what closes a service-crash window after the remote mutation and
+before the receipt commits. Receipts bind request, actor, target, operation,
+result, and fencing generations by identity or digest without storing payloads
+or credentials. Administrators can read them at
+`GET /v1/tasks/{task_id}/side-effect-receipts`.
+
 ## Honest boundaries
 
 ACP v0.2 is a local-first alpha, not a complete sandbox or distributed lock
@@ -507,8 +632,9 @@ service.
   kernel-level reservations. ACP checks OS availability at allocation and
   teardown; unrelated processes can still race between those checks.
 - Lifecycle hooks are trusted operator configuration. They can create isolated
-  database schemas or containers, but ACP cannot infer or fence side effects
-  the hooks do not declare.
+  database schemas or containers. The fenced gateway covers only calls routed
+  through configured provider drivers; ACP cannot infer or fence side effects
+  performed directly or by hooks that do not declare them.
 - Runner credentials are local bearer secrets hashed in SQLite, not SSO,
   hardware identity, or remote attestation. Protect the host and credential
   sinks; a process that steals a live bearer secret can act as that role.
@@ -536,13 +662,14 @@ service.
 - The hash chain detects accidental or partial tampering; a database
   administrator can rewrite the database and recompute it.
 - ACP coordinates configured local runtime resources and validates submitted
-  Git changes. It does not automatically fence arbitrary network, database, or
-  deployment side effects; put fencing checks at those gateways too.
+  Git changes. Its gateway fences the supported database, deployment, and
+  artifact operations only when providers honor the passed idempotency and
+  fencing context; arbitrary direct network side effects remain outside ACP.
 
 Distributed leases, asymmetric/remote runner identity, container isolation,
-merge-queue adapters, MCP/A2A adapters, a TUI over the status JSON, and
-externally anchored audit receipts are logical next layers. The core model is
-intentionally provider-neutral.
+merge-queue adapters, production provider drivers, a TUI over the status JSON,
+and externally anchored audit receipts are logical next layers. The core model
+is intentionally provider-neutral.
 
 ## Development
 

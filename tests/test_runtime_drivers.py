@@ -268,6 +268,32 @@ def test_run_trusted_inherits_restart_guard_fd(tmp_path: Path) -> None:
     assert result["exit_code"] == 0
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc FD execution")
+def test_run_trusted_executes_open_inode_during_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir(mode=0o755)
+    tool = make_executable(trusted / "tool", "#!/bin/sh\necho safe\n")
+    attacker = make_executable(tmp_path / "attacker", "#!/bin/sh\necho replaced\n")
+    real_run = subprocess.run
+
+    def racing_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        attacker.replace(tool)
+        return real_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", racing_run)
+    result = run_trusted(
+        [str(tool)],
+        tmp_path / "wd",
+        {},
+        expected_owners={0, os.geteuid()},
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout"] == "safe\n"
+
+
 # ---------------------------------------------------------------------------
 # Ownership
 # ---------------------------------------------------------------------------
@@ -848,7 +874,7 @@ def rotate_version(current: Path, version: Path) -> None:
 
 def fake_postgres_runner(active: set[str], operations: list[tuple[str, str]]):
     def runner(  # type: ignore[no-untyped-def]
-        argv, cwd, env, timeout, credential, *, guard_fd=None
+        argv, cwd, env, timeout, credential, *, guard_fd=None, expected_owners=None
     ):
         assert credential is not None
         target = os.pread(credential.fd, 1024, 0).decode().strip()
@@ -1001,7 +1027,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
     release_teardown = threading.Event()
 
     def blocked_runner(  # type: ignore[no-untyped-def]
-        argv, cwd, env, timeout, credential, *, guard_fd=None
+        argv, cwd, env, timeout, credential, *, guard_fd=None, expected_owners=None
     ):
         if argv[-1].startswith("DROP SCHEMA") and not teardown_entered.is_set():
             teardown_entered.set()
@@ -1013,6 +1039,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
             timeout,
             credential,
             guard_fd=guard_fd,
+            expected_owners=expected_owners,
         )
 
     monkeypatch.setattr(supervisor_module, "run_trusted", blocked_runner)

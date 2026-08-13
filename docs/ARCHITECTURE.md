@@ -38,7 +38,7 @@ the old approval as current.
 | Record | Purpose |
 |---|---|
 | task | specification, acceptance criteria, dependencies, declared resources, base |
-| attempt | agent, bound credential digest, branch, worktree, claim token, checkpoint, PID, latest commit |
+| attempt | agent, bound credential digest, branch, worktree, claim token, checkpoint, PID, latest commit, pinned trust manifest and executable identities |
 | resource lease | normalized resource, owner, monotonic fencing token, expiry |
 | runtime environment | generated environment, setup/teardown evidence and lifecycle state |
 | runtime allocation | unique local port-pool value, attempt owner and expiry |
@@ -46,7 +46,7 @@ the old approval as current.
 | credential handle | provider/name/version, exact internal source reference, and keyed target fingerprint—never plaintext |
 | runner identity | one role, credential digest, enrollment and revocation state |
 | submission | immutable commit/tree/patch hashes, changed paths, resource tokens |
-| QC run | reviewer, immutable commit, commands, outputs, structured findings |
+| QC run | reviewer, immutable commit, commands, outputs, structured findings, inherited attempt trust pin |
 | integration | merge result, integration commands, branch and commit |
 | event | same-transaction domain event in a hash chain |
 
@@ -171,6 +171,65 @@ the old handle before resolving the new one; missing or modified versions and
 provider drift quarantine the allocation. Generic shell
 hooks remain operator-trusted and do not provide a cleanup proof.
 
+### 4b. Trust rotation is attempt-scoped
+
+The privileged helper stages each release under
+`trust/bundles/VERSION-MANIFEST_DIGEST`, fsyncs its files and manifest, removes
+write bits from the immutable version directory, and only then replaces the
+regular `trust/current` pointer with `rename(2)`. Source components and final
+files are opened with no-follow semantics; identity metadata before and after a
+copy exposes concurrent in-place mutation. A path replacement after open does
+not alter the bytes copied from that descriptor.
+
+Claim reads `current` exactly once and persists a complete pin in the attempt:
+bundle ID, canonical manifest SHA-256, and every executable's absolute path,
+device, inode, size, and SHA-256. Runtime phases and QC read only that stored
+pin and revalidate it immediately before privileged use. They never resolve
+`current` as fallback. Therefore rotation has two simultaneous truths: claims
+after the atomic pointer swap use the new bundle, while existing attempts keep
+the old directory until they drain. Missing or changed old evidence moves the
+attempt to `quarantined`, its task to `blocked`, and its runtime resources to
+quarantine.
+
+QC copies the attempt pin into its own durable row. Retirement/uninstall is a
+monotonic marker, not deletion. The helper has no physical-delete operation,
+so upgrades cannot erase an executable still referenced by either table.
+`doctor` audits the current pointer and every distinct durable pin and returns
+the full set of owner, mode, symlink, manifest, inode, size, and digest errors.
+
+### 4c. External mutations cross one fenced gateway
+
+Worktree and runtime isolation do not stop a delayed process from reaching a
+shared database schema, deploy namespace, or artifact tag. Every supported
+external mutation therefore carries its task ID, authenticated actor, claim
+fencing token, complete resource fencing-token map, target resource,
+idempotency key, and payload through one provider-neutral gate.
+
+The order is an invariant: authenticate and authorize the mandate, derive the
+actor and role from durable state, derive the target identity from the payload,
+prove it is an exact task resource, and re-run the coordination service's live
+claim predicate inside an immediate transaction. Only then may an adapter call
+its provider. Expired, superseded, incomplete, wrong-role, undeclared, and
+cross-task requests cannot reach provider code. A delayed zombie therefore
+loses even if its token was valid when its work began; the later owner's higher
+claim and resource generations are authoritative when the call lands.
+
+PostgreSQL schema/migration, deploy/preview namespace, and artifact/tag adapters
+only differ in their canonical resource derivation and injected driver. A
+driver receives a `ProviderCall` containing the request digest, idempotency key,
+identity, and both generations, with no transport credential. It must carry the
+idempotency key and resource generation to the remote provider's native
+transaction or compare-and-set boundary. The local transaction serializes
+concurrent retries and persists a single credential-free receipt binding the
+request, actor, target, operation, result digest, and generations. Remote
+idempotency closes the crash interval between the external effect and local
+receipt commit.
+
+MCP/A2A requests supply durable task and artifact identity. Their adapter maps
+that identity into the same canonical resource namespace and invokes the same
+authenticated service; protocol transport does not create an alternate
+authority path.
+
 ### 5. A crash does not erase committed work
 
 Heartbeats persist the latest commit and arbitrary JSON checkpoint. The reaper
@@ -196,8 +255,8 @@ configured critic identity) and differ from the worker identity.
 ### 6b. The reviewer is itself evidence
 
 A verdict is only as trustworthy as the thing that issued it, so every QC row
-stores signed provenance — identity, provider, model, prompt policy, resolved
-command hash — plus the fingerprint of the evaluation policy in force and the
+stores signed provenance — identity, provider, model, prompt policy, logical
+command-selector hash — plus the fingerprint of the evaluation policy in force and the
 hash of a deterministic reproduction bundle.
 
 The evaluation policy is fingerprinted as a whole. Swapping a model, editing a

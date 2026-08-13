@@ -16,6 +16,24 @@ and non-group/world-writable,
 execution uses a scrubbed environment and immediate open/stat identity check, and teardown
 must prove resource absence.
 
+For production, configure `[trust]` and use `trusted:NAME` selectors instead of
+loose executable paths. The root-owned `acp-trust-helper` installs immutable,
+versioned bundles from no-follow file descriptors and atomically rotates a
+regular `current` pointer. ACP stores the manifest digest plus executable
+device/inode/content digest on the attempt and QC row. A missing, writable,
+replaced, or digest-mismatched old bundle quarantines the attempt; ACP never
+falls forward to the current version. Retirement and uninstall create markers
+only and never delete bundle evidence. Treat manual deletion as destructive:
+first prove no attempt or QC record references that bundle ID and manifest.
+
+On Linux, trusted execution uses the already-open `/proc/self/fd` descriptor to
+close the final path-to-exec race. macOS does not support executable `/dev/fd`
+entries, so its guarantee depends on a root/dedicated-UID-owned directory chain
+with no group/world write bit. The trust UID must not be the candidate runner
+UID. The helper, its Python interpreter and imported package files must also be
+installed in root-controlled paths; a root-owned wrapper importing user-writable
+Python is not a privilege boundary.
+
 Runtime port pools prevent two cooperating ACP attempts from receiving the same
 configured TCP port. They are not kernel reservations: an unrelated local
 process can race the availability probe. ACP quarantines a port that remains
@@ -23,6 +41,20 @@ occupied after teardown. Built-in drivers prove cleanup of their declared
 Compose project, PostgreSQL schema, or browser profile; ACP cannot prove
 undeclared cloud or application side effects. Use provider-native
 deletion/fencing for those resources.
+
+Database schema/migration, deploy namespace, and artifact/tag mutations routed
+through the side-effect gateway are checked against the authenticated worker,
+mandate scope, live task claim, complete resource-token map, and
+provider-derived target before a driver can run. HTTP bodies cannot supply an
+actor or role, and the MCP/A2A path maps durable task/artifact identity into the
+same gate. The provider call carries the idempotency key and both fencing
+generations; a production driver must enforce them at the remote mutation
+boundary. The local receipt transaction prevents duplicate concurrent calls on
+one ACP host, but it cannot roll back a remote mutation if ACP crashes before
+committing the receipt. Provider-native idempotency closes that window. Treat
+payload and provider result data as secret-bearing: drivers must not log or
+return credentials. Receipts persist only identities, generations, and
+request/result digests.
 
 After the first runner enrollment, every worker heartbeat/submission/process
 transition, critic review, and integration transition requires a role-scoped
@@ -104,6 +136,10 @@ the private advisory.
 - undeclared Git writes, path traversal, or symlink escape;
 - QC that observes the wrong or mutable commit;
 - arbitrary code execution through untrusted QC configuration;
+- trust-helper substitution, source/destination symlink races, mutable bundle
+  parents, non-atomic rotation, or deletion/fallback of a pinned old bundle;
+- side-effect target aliasing, idempotency bypass, stale/cross-task fencing,
+  provider calls before admission, or secrets exposed through receipts;
 - audit-chain corruption or evidence replacement;
 - authentication, injection, or denial-of-service flaws; and
 - secrets committed to the repository or logs.
