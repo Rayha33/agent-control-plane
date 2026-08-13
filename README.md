@@ -53,6 +53,7 @@ wedge.
 | Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
 | Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
 | Trusted resource drivers | Compose projects, PostgreSQL schemas, and browser profiles have scoped setup/probe/teardown proofs |
+| Privileged trust bundles | Versioned critic/driver executables are installed by a narrow helper and pinned per attempt/QC by manifest, inode, and content digest |
 | Runner authentication | Worker, critic, and integrator credentials are role-scoped and attempts bind to the credential version that claimed them |
 | Overlap preview | A dry-run claim reports exact and potential scope collisions, and who owns them, before an agent starts |
 | Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
@@ -136,6 +137,93 @@ rotates its secret; attempts claimed by the old secret remain fenced.
 
 All commands emit JSON. Local runtime state and logs live under ignored
 <code>.acp/</code>; configuration is tracked in <code>acp.toml</code>.
+
+## Privileged critic and driver bundles
+
+Production critic and runtime-driver executables should live outside both the
+candidate repository and the ACP service account's writable paths. The package
+exports a narrow second entry point, `acp-trust-helper`. Install that entry
+point and every interpreter/library it needs from a root-controlled OS package;
+do not point it at a development virtual environment.
+
+Linux packages should place the helper at
+`/usr/local/libexec/acp-trust-helper` (or patch `DEFAULT_HELPER` to the distro's
+libexec directory), owned by root and mode `0755`. Create
+`/var/lib/agent-control-plane/trust` and its `bundles` and `retired`
+subdirectories root-owned and mode `0755`. A dedicated trust UID may own the
+tree instead; pass its numeric UID consistently and keep the candidate runner
+under a different account. `/proc/self/fd` lets Linux execute the exact
+descriptor ACP validated.
+
+~~~bash
+sudo install -d -o root -g root -m 0755 \
+  /var/lib/agent-control-plane/trust/bundles \
+  /var/lib/agent-control-plane/trust/retired
+~~~
+
+macOS packages should place the helper at
+`/Library/PrivilegedHelperTools/acp-trust-helper` and pre-create
+`/Library/Application Support/AgentControlPlane/trust/{bundles,retired}` as
+root, mode `0755`; those are ACP's macOS defaults. Keep both outside
+Homebrew/user-writable prefixes. Darwin does not execute Mach-O files through
+`/dev/fd`, so the root/dedicated-UID-owned, non-writable directory chain is the
+enforcement that prevents replacement between validation and launch. A package
+using another location passes `--helper`/`--root` and records the same root in
+`acp.toml`.
+
+~~~bash
+sudo install -d -o root -g wheel -m 0755 \
+  "/Library/Application Support/AgentControlPlane/trust/bundles" \
+  "/Library/Application Support/AgentControlPlane/trust/retired"
+~~~
+
+Stage and atomically activate a bundle:
+
+~~~bash
+acp trust install --source /secure/release/acp-tools-2026.08 \
+  --version 2026.08 \
+  --executable critic=bin/critic \
+  --executable docker=bin/docker
+~~~
+
+`acp` validates the installed helper before invoking it directly or through
+`sudo`; no shell or inherited secret environment is used. The helper rejects
+absolute/traversing source names and symlinks, copies from no-follow open file
+descriptors, detects in-place mutation, writes a canonical manifest, freezes
+the version directory, and atomically replaces a regular `current` pointer.
+
+Reference bundle members from `acp.toml` by logical name:
+
+~~~toml
+[trust]
+root = "/var/lib/agent-control-plane/trust"
+owner_uid = 0
+
+[qc]
+commands = ["python -m pytest -q"]
+critic_command = "trusted:critic"
+
+[[runtime.drivers]]
+name = "compose"
+kind = "docker_compose"
+executable = "trusted:docker"
+compose_file = "compose.yaml"
+~~~
+
+Every new claim snapshots the current bundle's manifest digest and each used
+executable's device, inode, size, and SHA-256. Rotating by installing another
+version affects only later claims. Live attempts and their QC keep the old pin;
+if it disappears or changes, ACP quarantines the attempt and blocks its task
+instead of switching to `current`.
+
+`acp trust retire BUNDLE_ID` and `acp trust uninstall BUNDLE_ID` only create a
+retirement marker. They never remove the version directory, so attempts and QC
+records cannot lose referenced evidence. `acp trust list` shows health and
+retirement state. Physical garbage collection is intentionally outside ACP;
+packaging must first prove that no `attempts.trust_bundle_json` or
+`qc_runs.trust_bundle_json` record references the bundle. `acp doctor` reports
+every ownership, mode, manifest, inode, size, digest, missing-file, and symlink
+failure it observes.
 
 ## Planning before launch
 

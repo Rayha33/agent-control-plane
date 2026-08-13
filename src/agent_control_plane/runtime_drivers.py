@@ -36,6 +36,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -76,7 +77,9 @@ class DriverError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _validate_trusted_path(resolved: Path) -> os.stat_result:
+def _validate_trusted_path(
+    resolved: Path, expected_owners: set[int] | None = None
+) -> os.stat_result:
     """Validate the executable and its directory chain.
 
     A safe file inside a replaceable directory is not safe. Root-owned sticky
@@ -87,7 +90,7 @@ def _validate_trusted_path(resolved: Path) -> os.stat_result:
 
     # Candidate commands run as the ACP user in the local alpha. A same-UID
     # executable is therefore candidate-replaceable and cannot be a trust root.
-    expected_owners = {0}
+    expected_owners = expected_owners or {0}
     file_stat = resolved.stat()
     if file_stat.st_uid not in expected_owners:
         raise DriverError(
@@ -121,7 +124,9 @@ def _validate_trusted_path(resolved: Path) -> os.stat_result:
     return file_stat
 
 
-def resolve_trusted_executable(raw: str, repo_root: Path) -> Path:
+def resolve_trusted_executable(
+    raw: str, repo_root: Path, expected_owners: set[int] | None = None
+) -> Path:
     """Resolve *raw* to an executable that a candidate cannot influence.
 
     Mirrors the existing ``critic_command`` contract and adds a writability
@@ -159,7 +164,7 @@ def resolve_trusted_executable(raw: str, repo_root: Path) -> Path:
             "invalid_config", f"driver executable is not an executable file: {resolved}"
         )
 
-    _validate_trusted_path(resolved)
+    _validate_trusted_path(resolved, expected_owners)
     return resolved
 
 
@@ -249,6 +254,8 @@ def run_trusted(
     cwd: Path,
     env: Mapping[str, str],
     timeout: int = DEFAULT_PHASE_TIMEOUT_SECONDS,
+    *,
+    expected_owners: set[int] | None = None,
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd."""
 
@@ -283,7 +290,7 @@ def run_trusted(
             "untrusted_driver",
             f"driver executable disappeared or lost its exec bit: {executable}",
         )
-    expected = _validate_trusted_path(executable)
+    expected = _validate_trusted_path(executable, expected_owners)
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -324,10 +331,23 @@ def run_trusted(
         return value
 
     execution_argv = [str(executable), *argv[1:]]
+    # Linux can execute the inode we opened and checked through /proc. Darwin
+    # rejects executable /dev/fd entries; there the non-writable, privileged
+    # parent chain is what makes the already-verified path non-replaceable.
+    descriptor_root = Path("/proc/self/fd")
+    descriptor_execution = sys.platform.startswith("linux") and descriptor_root.is_dir()
     started = time.monotonic()
     try:
         process = subprocess.run(
             execution_argv,
+            **(
+                {
+                    "executable": str(descriptor_root / str(executable_fd)),
+                    "pass_fds": (executable_fd,),
+                }
+                if descriptor_execution
+                else {}
+            ),
             cwd=str(cwd),
             env=safe_env,
             capture_output=True,
@@ -717,7 +737,9 @@ def build_driver(definition: DriverDefinition) -> ResourceDriver:
 
 
 def parse_driver_definitions(
-    entries: Sequence[Mapping[str, Any]], repo_root: Path
+    entries: Sequence[Mapping[str, Any]],
+    repo_root: Path,
+    expected_owners: set[int] | None = None,
 ) -> tuple[DriverDefinition, ...]:
     """Validate ``[[runtime.drivers]]`` entries at configuration load."""
 
@@ -739,7 +761,9 @@ def parse_driver_definitions(
         raw_executable = entry.get("executable")
         executable: Path | None = None
         if kind != BrowserProfileDriver.kind:
-            executable = resolve_trusted_executable(str(raw_executable or ""), repo_root)
+            executable = resolve_trusted_executable(
+                str(raw_executable or ""), repo_root, expected_owners
+            )
         elif raw_executable:
             raise DriverError(
                 "invalid_config",

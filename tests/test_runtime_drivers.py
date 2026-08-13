@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -197,6 +198,32 @@ def test_run_trusted_never_forwards_supervisor_runner_credential(tmp_path: Path)
     )
     assert result["exit_code"] == 0
     assert secret not in str(result)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc FD execution")
+def test_run_trusted_executes_open_inode_during_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir(mode=0o755)
+    tool = make_executable(trusted / "tool", "#!/bin/sh\necho safe\n")
+    attacker = make_executable(tmp_path / "attacker", "#!/bin/sh\necho replaced\n")
+    real_run = subprocess.run
+
+    def racing_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        attacker.replace(tool)
+        return real_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", racing_run)
+    result = run_trusted(
+        [str(tool)],
+        tmp_path / "wd",
+        {},
+        expected_owners={0, os.geteuid()},
+    )
+
+    assert result["exit_code"] == 0
+    assert result["stdout"] == "safe\n"
 
 
 # ---------------------------------------------------------------------------

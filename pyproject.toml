@@ -29,6 +29,7 @@ Security = "https://github.com/Rayha33/agent-control-plane/security/policy"
 
 [project.scripts]
 acp = "agent_control_plane.cli:main"
+acp-trust-helper = "agent_control_plane.trust_helper:main"
 
 [project.optional-dependencies]
 dev = [

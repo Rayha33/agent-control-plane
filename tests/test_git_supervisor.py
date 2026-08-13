@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from threading import Barrier, Event
 import pytest
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -119,6 +121,41 @@ def free_port_range(count: int) -> tuple[int, int]:
 
 def two_free_ports() -> tuple[int, int]:
     return free_port_range(2)
+
+
+def install_test_bundle(source: Path, root: Path, version: str, message: str) -> dict:
+    source.mkdir(exist_ok=True)
+    executable = source / "critic"
+    executable.write_text(
+        "#!/bin/sh\n"
+        f"# {message}\n"
+        'printf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return install_bundle(
+        source,
+        root,
+        version,
+        {"critic": "critic"},
+        owner_uid=os.geteuid(),
+        require_privilege=False,
+    )
+
+
+def configure_trust(repo: Path, root: Path) -> None:
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[trust]\nroot = {json.dumps(str(root))}\nowner_uid = {os.geteuid()}\n")
+
+
+def require_trusted_critic(repo: Path) -> None:
+    config = (repo / "acp.toml").read_text(encoding="utf-8")
+    (repo / "acp.toml").write_text(
+        config.replace("require_critic = false", "require_critic = true").replace(
+            'critic_command = ""', 'critic_command = "trusted:critic"'
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_twenty_colliding_tasks_have_exactly_one_winner(repo: Path) -> None:
@@ -864,3 +901,68 @@ def test_critic_identity_and_event_chain_are_enforced(repo: Path) -> None:
     with supervisor.connect() as connection:
         connection.execute("UPDATE events SET payload_json = '{}' WHERE sequence = 1")
     assert supervisor.verify_event_chain()["ok"] is False
+
+
+def test_rotation_pins_old_attempt_and_qc_while_new_claim_uses_current(repo: Path) -> None:
+    trust_root = repo.parent / f"trust-{repo.name}"
+    source = repo.parent / f"bundle-source-{repo.name}"
+    old = install_test_bundle(source, trust_root, "v1", "old")
+    configure_trust(repo, trust_root)
+    require_trusted_critic(repo)
+    supervisor = GitSupervisor(repo)
+    old_task = task(supervisor, "alpha.txt", "old bundle task")
+    new_task = task(supervisor, "beta.txt", "new bundle task")
+    old_attempt = supervisor.claim(old_task["id"], "worker-old")
+
+    new = install_test_bundle(source, trust_root, "v2", "new")
+    new_attempt = supervisor.claim(new_task["id"], "worker-new")
+
+    assert old_attempt["trust_bundle"]["bundle_id"] == old["bundle_id"]
+    assert new_attempt["trust_bundle"]["bundle_id"] == new["bundle_id"]
+    assert verify_bundle_pin(old)["ok"] is True
+    commit_change(old_attempt, "alpha.txt", "old remains pinned\n")
+    submission = supervisor.submit(old_attempt["id"], old_attempt["claim_token"])
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+    assert review["trust_bundle"]["bundle_id"] == old["bundle_id"]
+    assert review["reviewer_provenance"]["command"] == "trusted:critic"
+
+
+def test_missing_old_pin_quarantines_instead_of_switching_to_current(repo: Path) -> None:
+    trust_root = repo.parent / f"trust-{repo.name}"
+    source = repo.parent / f"bundle-source-{repo.name}"
+    old = install_test_bundle(source, trust_root, "v1", "old")
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    new = install_test_bundle(source, trust_root, "v2", "new")
+    old_directory = trust_root / "bundles" / old["bundle_id"]
+    old_directory.rename(trust_root / "bundles" / f"gone-{old['bundle_id']}")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.runtime_restart(attempt["id"])
+
+    assert error.value.code == "trust_bundle_quarantined"
+    quarantined = supervisor.attempt(attempt["id"])
+    assert quarantined["status"] == "quarantined"
+    assert supervisor.task(created["id"])["status"] == "blocked"
+    assert quarantined["trust_bundle"]["bundle_id"] != new["bundle_id"]
+    doctor = supervisor.doctor()
+    failed = [check for check in doctor["checks"] if check["name"].startswith("trust_pinned:")]
+    assert failed and any(not check["ok"] for check in failed)
+    assert any("missing" in error for check in failed for error in check["detail"]["errors"])
+
+    current_directory = trust_root / "bundles" / new["bundle_id"]
+    current_driver = current_directory / "critic"
+    current_directory.chmod(0o755)
+    current_driver.chmod(0o777)
+    current_driver.write_text("tampered", encoding="utf-8")
+    diagnostic = GitSupervisor(repo, diagnostic=True).doctor()
+    current_check = next(
+        check for check in diagnostic["checks"] if check["name"] == "trust_current"
+    )
+    joined = "\n".join(current_check["detail"]["errors"])
+    assert current_check["ok"] is False
+    assert "group/world-writable" in joined
+    assert "digest mismatch" in joined
+    assert "size mismatch" in joined

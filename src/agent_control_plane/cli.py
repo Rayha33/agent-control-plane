@@ -4,13 +4,17 @@ import argparse
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from .git_supervisor import GitSupervisor, SupervisorError
+from .runtime_drivers import DriverError, resolve_trusted_executable
 from .status import DEFAULT_LEASE_RISK_SECONDS
+from .trust_bundles import DEFAULT_HELPER, DEFAULT_TRUST_ROOT, TrustBundleError, list_bundles
 
 
 def add_credential_source(command: argparse.ArgumentParser) -> None:
@@ -38,6 +42,40 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("list", help="list tasks")
     commands.add_parser("reap", help="orphan expired attempts without deleting work")
     commands.add_parser("verify-events", help="verify the hash-chained event log")
+
+    trust = commands.add_parser("trust", help="install and rotate privileged executable bundles")
+    trust_commands = trust.add_subparsers(dest="trust_action", required=True)
+    trust_install = trust_commands.add_parser(
+        "install", help="stage an immutable bundle and atomically make it current"
+    )
+    trust_install.add_argument("--source", required=True)
+    trust_install.add_argument("--version", required=True)
+    trust_install.add_argument(
+        "--executable",
+        action="append",
+        required=True,
+        help="trusted executable as NAME=RELATIVE_PATH (repeatable)",
+    )
+    for command in (trust_install,):
+        command.add_argument("--root", default=str(DEFAULT_TRUST_ROOT))
+        command.add_argument("--owner-uid", type=int, default=0)
+        command.add_argument("--helper", default=str(DEFAULT_HELPER), help=argparse.SUPPRESS)
+    trust_list = trust_commands.add_parser("list", help="show installed bundles and trust checks")
+    trust_list.add_argument("--root", default=str(DEFAULT_TRUST_ROOT))
+    trust_list.add_argument("--owner-uid", type=int, default=0)
+    for action in ("activate", "retire", "uninstall"):
+        command = trust_commands.add_parser(
+            action,
+            help=(
+                "atomically select an installed bundle"
+                if action == "activate"
+                else "retire a bundle without deleting pinned evidence"
+            ),
+        )
+        command.add_argument("bundle_id")
+        command.add_argument("--root", default=str(DEFAULT_TRUST_ROOT))
+        command.add_argument("--owner-uid", type=int, default=0)
+        command.add_argument("--helper", default=str(DEFAULT_HELPER), help=argparse.SUPPRESS)
 
     add = commands.add_parser("task-add", help="create a resource-scoped task")
     add.add_argument("--title", required=True)
@@ -182,6 +220,65 @@ def emit(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
+def _run_trust_helper(args: argparse.Namespace) -> dict[str, Any]:
+    """Cross the privilege boundary without a shell or inherited secrets."""
+
+    helper = Path(args.helper).expanduser()
+    if not helper.is_absolute():
+        raise SupervisorError("invalid_trust_helper", "trust helper path must be absolute")
+    try:
+        helper = resolve_trusted_executable(
+            str(helper), Path(args.repo).expanduser().absolute(), {0, args.owner_uid}
+        )
+    except DriverError as error:
+        raise SupervisorError("invalid_trust_helper", error.message) from error
+    action = "retire" if args.trust_action == "uninstall" else args.trust_action
+    command = [
+        str(helper),
+        action,
+        "--root",
+        str(Path(args.root).expanduser().absolute()),
+        "--owner-uid",
+        str(args.owner_uid),
+    ]
+    if action == "install":
+        command.extend(["--source", str(Path(args.source).expanduser().absolute())])
+        command.extend(["--version", args.version])
+        for executable in args.executable:
+            command.extend(["--executable", executable])
+    else:
+        command.insert(2, args.bundle_id)
+    if os.geteuid() not in {0, args.owner_uid}:
+        sudo = next((path for path in ("/usr/bin/sudo", "/bin/sudo") if Path(path).is_file()), None)
+        if sudo is None:
+            raise SupervisorError(
+                "trust_helper_privilege_required", "sudo is unavailable; run the helper as root"
+            )
+        command = [sudo, "--", *command]
+    environment = {
+        name: os.environ[name] for name in ("LANG", "LC_ALL", "TERM") if name in os.environ
+    }
+    result = subprocess.run(command, capture_output=True, text=True, check=False, env=environment)
+    if result.returncode:
+        try:
+            error = json.loads(result.stderr)
+        except json.JSONDecodeError:
+            error = {}
+        raise SupervisorError(
+            str(error.get("error", "trust_helper_failed")),
+            str(error.get("message", result.stderr.strip() or "trust helper failed")),
+        )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SupervisorError(
+            "trust_helper_failed", "trust helper returned invalid JSON"
+        ) from error
+    if not isinstance(value, dict):
+        raise SupervisorError("trust_helper_failed", "trust helper returned invalid output")
+    return value
+
+
 def _read_credential(args: argparse.Namespace) -> str | None:
     credential_file = getattr(args, "credential_file", None)
     credential_fd = getattr(args, "credential_fd", None)
@@ -306,7 +403,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
             return 0
-        supervisor = GitSupervisor(args.repo)
+        if args.action == "trust":
+            if args.trust_action == "list":
+                result = list_bundles(args.root, owner_uid=args.owner_uid)
+            else:
+                result = _run_trust_helper(args)
+            emit(result)
+            return 0
+        supervisor = GitSupervisor(args.repo, diagnostic=args.action == "doctor")
         if args.action == "doctor":
             result = supervisor.doctor()
         elif args.action == "list":
@@ -426,7 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action in {"doctor", "verify-events"} and not result["ok"]:
             return 1
         return 0
-    except SupervisorError as error:
+    except (SupervisorError, TrustBundleError) as error:
         print(
             json.dumps({"ok": False, "error": error.code, "message": str(error)}),
             file=sys.stderr,

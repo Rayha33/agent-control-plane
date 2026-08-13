@@ -16,6 +16,24 @@ and non-group/world-writable,
 execution uses a scrubbed environment and immediate open/stat identity check, and teardown
 must prove resource absence.
 
+For production, configure `[trust]` and use `trusted:NAME` selectors instead of
+loose executable paths. The root-owned `acp-trust-helper` installs immutable,
+versioned bundles from no-follow file descriptors and atomically rotates a
+regular `current` pointer. ACP stores the manifest digest plus executable
+device/inode/content digest on the attempt and QC row. A missing, writable,
+replaced, or digest-mismatched old bundle quarantines the attempt; ACP never
+falls forward to the current version. Retirement and uninstall create markers
+only and never delete bundle evidence. Treat manual deletion as destructive:
+first prove no attempt or QC record references that bundle ID and manifest.
+
+On Linux, trusted execution uses the already-open `/proc/self/fd` descriptor to
+close the final path-to-exec race. macOS does not support executable `/dev/fd`
+entries, so its guarantee depends on a root/dedicated-UID-owned directory chain
+with no group/world write bit. The trust UID must not be the candidate runner
+UID. The helper, its Python interpreter and imported package files must also be
+installed in root-controlled paths; a root-owned wrapper importing user-writable
+Python is not a privilege boundary.
+
 Runtime port pools prevent two cooperating ACP attempts from receiving the same
 configured TCP port. They are not kernel reservations: an unrelated local
 process can race the availability probe. ACP quarantines a port that remains
@@ -78,6 +96,8 @@ the private advisory.
 - undeclared Git writes, path traversal, or symlink escape;
 - QC that observes the wrong or mutable commit;
 - arbitrary code execution through untrusted QC configuration;
+- trust-helper substitution, source/destination symlink races, mutable bundle
+  parents, non-atomic rotation, or deletion/fallback of a pinned old bundle;
 - audit-chain corruption or evidence replacement;
 - authentication, injection, or denial-of-service flaws; and
 - secrets committed to the repository or logs.
