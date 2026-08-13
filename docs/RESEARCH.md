@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research date: 2026-08-12.
+Research date: 2026-08-13.
 
 ## Verdict
 
@@ -29,6 +29,8 @@ threads rather than product positioning. Six themes recur:
 | 4 | Operator attention becomes the bottleneck | A [multi-agent terminal discussion](https://news.ycombinator.com/item?id=47268777) describes 3–6 agents spread across terminals and asks how overlapping changes, merge timing, accountability, and traceability should work. | One durable task/attempt state model and machine-readable status |
 | 5 | Cross-session coordination remains fragile | [Claude Code issue #24798](https://github.com/anthropics/claude-code/issues/24798) asks for inter-session coordination and describes readers seeing partial files after a writer crashes. [Codex issue #23515](https://github.com/openai/codex/issues/23515) reports one worktree session being interrupted by another. | Atomic write scopes, checkpoints, fencing, and one worktree per attempt |
 | 6 | Parallelism can erase its own economics | User reports include [202 GB of unreaped run copies](https://github.com/openai/codex/issues/35383) and [128 GB memory exhaustion](https://github.com/openai/codex/issues/23749). Trigger.dev also reports duplicated dependencies and service stacks. | Bounded pools, explicit cleanup state, quotas and telemetry next |
+| 7 | Credentials cross the candidate boundary | Practitioners describe passing API keys through environment variables as the simplest integration pattern in [MCP credential discussions](https://www.reddit.com/r/mcp/comments/1vg8vng/how_are_you_giving_coding_agents_access_to/), while [agent-execution security research](https://arxiv.org/abs/2510.21236) highlights the risk of host-native tool servers. | Role-scoped credentials, a minimal candidate environment, isolated driver secrets, and redacted evidence |
+| 8 | The reviewer can be correlated, stale, or silently changed | [Self-preference research](https://arxiv.org/abs/2410.21819) finds that model judges can favor outputs from the same model family; production guidance recommends calibration and multiple evaluation modes. | Signed reviewer provenance, policy fingerprints, explicit ratification, golden cases, provider diversity, and rejection of old-policy passes |
 
 The most important new finding is that a worktree is only source isolation. A
 credible safety kernel also needs a runtime lifecycle: unique ports and
@@ -104,6 +106,12 @@ them.
    done; do not update the base branch directly.
 8. **Honest boundaries.** Local worktree safety is not a code sandbox,
    distributed lock, or deployment gateway.
+9. **Role-bound authority and secret isolation.** Worker, critic, and integrator
+   transitions need distinct credentials; candidate-facing processes receive a
+   minimal public environment, never the supervisor's ambient secrets.
+10. **Versioned assurance policy.** Reviewer identity, provider, model, prompt
+    policy, and command are one ratified fingerprint. A pass is valid only for
+    its exact commit and current policy, including at integration time.
 
 ## Why the design is future-proof
 

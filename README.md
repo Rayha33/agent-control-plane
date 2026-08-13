@@ -54,6 +54,14 @@ wedge.
 | Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
 | Trusted resource drivers | Compose projects, PostgreSQL schemas, and browser profiles have scoped setup/probe/teardown proofs |
 | Runner authentication | Worker, critic, and integrator credentials are role-scoped and attempts bind to the credential version that claimed them |
+| Overlap preview | A dry-run claim reports exact and potential scope collisions, and who owns them, before an agent starts |
+| Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
+| Merge scheduling | Approved submissions get an ordering preview, shared-path conflict prediction, and staleness when the base moves |
+| Operator status | One read-only screen ranks what needs a human, what failed cleanup, and what is merely running |
+| Reviewer provenance | Signed identity/provider/model/prompt-policy on every verdict, with a replayable bundle |
+| Policy ratification | A reviewer or prompt upgrade stops QC until a human ratifies the new fingerprint |
+| Evaluator calibration | Golden seeded defects score false-pass/false-block rates with Wilson intervals |
+| High-risk review | Configured paths can demand two reviewers, provider diversity, or a human |
 | Server-derived evidence | Commit, tree, binary patch hash, and changed paths come from Git |
 | Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
 | Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
@@ -128,6 +136,72 @@ rotates its secret; attempts claimed by the old secret remain fenced.
 
 All commands emit JSON. Local runtime state and logs live under ignored
 <code>.acp/</code>; configuration is tracked in <code>acp.toml</code>.
+
+## Planning before launch
+
+Deciding what to run in parallel is the operator's remaining manual step. ACP
+answers it from state it already holds, without launching anything:
+
+~~~bash
+uv run --extra dev acp plan TASK_ID     # would this claim succeed, and if not, who is in the way?
+uv run --extra dev acp queue            # ordered set of tasks that can run concurrently
+uv run --extra dev acp merge-plan       # integration order for approved work
+~~~
+
+`plan` classifies every collision as <code>exact</code> (identical normalized
+scopes) or <code>potential</code> (different scopes that can still match one
+path) and names the owning task, attempt, and agent, so the fix — re-partition
+or re-order — is obvious from the output.
+
+`queue` reserves each admitted task's scopes as it goes. Its <code>ready</code>
+list is a set of tasks that can run **at the same time**, not a list of tasks
+that could each run alone.
+
+Tasks can also declare logical artifacts instead of restating task ids:
+
+~~~bash
+uv run --extra dev acp task-add --title "Publish the API schema" \
+  --accept "schema is generated" --resource "schema/**" --produces api-schema
+
+uv run --extra dev acp task-add --title "Generate the client" \
+  --accept "client compiles" --resource "client/**" --consumes api-schema
+~~~
+
+The consumer cannot be claimed until every producer of <code>api-schema</code>
+is <code>done</code>. Cycles are reported as a <code>dependency_cycle</code>
+blocker naming the cycle, not followed.
+
+`merge-plan` orders approved submissions topologically by dependency, then
+deterministically by priority, creation time, and id. Each entry reports the
+paths it shares with earlier entries, and becomes <code>stale</code> with an
+<code>upstream_commits</code> count when commits land on the base branch after
+approval.
+
+All four planning commands are read-only. Unlike <code>claim</code> and
+<code>list</code>, they never reap: looking at the board does not orphan an
+agent's attempt.
+
+## Operator status
+
+Running three to six agents turns attention itself into the bottleneck — which
+session is stuck, which finished, which is quietly holding a resource.
+
+~~~bash
+uv run --extra dev acp status                      # canonical JSON
+uv run --extra dev acp status --format text        # one screen
+uv run --extra dev acp status --watch --interval 2 --format text
+~~~
+
+The attention queue is ranked, worst first: <code>human_required</code>,
+<code>cleanup_failed</code>, <code>lease_risk</code>, <code>review</code>, then
+<code>active</code>. Every task reports its phase, heartbeat age, checkpoint,
+claimed paths, runtime allocations, worker liveness, latest QC verdict, and
+blockers. Attempts whose lease has expired but which no reaper has visited yet
+are reported as <code>awaiting_reap</code> rather than being reaped by the act
+of looking at them.
+
+JSON remains canonical; <code>--format text</code> renders that same snapshot.
+Use <code>--limit</code> to bound large boards.
 
 ## Runtime isolation
 
@@ -259,6 +333,95 @@ paths, conflict markers, and deterministic results. It is an independent
 process, but it is rule-based—not a substitute for a separately credentialed AI
 or human reviewer when semantic judgment matters.
 
+## Reviewer provenance and calibration
+
+Independent review reduces self-approval, but a critic can share the worker's
+blind spots, prefer its own output, or drift when someone upgrades the model
+behind it. ACP makes the reviewer itself auditable.
+
+Declare who is reviewing, with what:
+
+~~~toml
+[reviewers."independent-qc"]
+provider = "builtin"
+model = "structural-v1"
+prompt_policy = "policy-2026-08"
+command = "builtin"
+
+[reviewers."second-opinion"]
+provider = "other-vendor"
+model = "reviewer-9"
+command = "/absolute/path/outside/the/repository/second-critic"
+
+[policy]
+high_risk_paths = ["src/auth/**", "migrations/**"]
+high_risk_mode = "two_reviewer"   # off | two_reviewer | human
+require_provider_diversity = true
+
+[calibration]
+golden_dir = "acp-golden"
+~~~
+
+Every QC record then carries signed provenance — identity, provider, model,
+prompt policy, and the hash of the resolved command — plus a deterministic
+reproduction bundle written to ignored <code>.acp/bundles/</code>:
+
+~~~bash
+uv run --extra dev acp reviewers          # who reviews, and is the policy ratified?
+uv run --extra dev acp bundle QC_ID       # signed, replayable record of one verdict
+~~~
+
+**A reviewer upgrade cannot take effect silently.** The whole evaluation policy
+is fingerprinted. Changing a model, a prompt policy, a command, a reviewer, or a
+high-risk rule changes that fingerprint, and QC then refuses to run until a
+human accepts the change:
+
+~~~bash
+uv run --extra dev acp ratify-reviewers --integrator release-integrator --credential-file ../release-integrator.credential
+~~~
+
+The first policy a repository sees is adopted automatically — there is nothing
+to compare it against — and every later change is an authenticated,
+event-logged ratification. Old-policy passes never count toward the new policy,
+and integration refuses an approval whose policy is no longer current.
+
+### High-risk paths
+
+When a submission touches <code>high_risk_paths</code>, a single passing verdict
+is not an approval. Under <code>two_reviewer</code> the submission parks in
+<code>pending_second_review</code> until a *second, distinct* reviewer also
+passes — and if <code>require_provider_diversity</code> is set, a reviewer from
+a different provider. Under <code>human_required</code> mode it parks for a
+person. The same reviewer running twice never satisfies the rule.
+
+### Calibration
+
+"The critic is fine" should be a number with an error bar. Golden cases are
+repository-specific seeded defects:
+
+~~~toml
+# acp-golden/conflict-markers.toml
+name = "conflict-markers"
+expect = "reject"          # or "pass" for a known-clean case
+
+[[mutations]]
+path = "src/app.py"
+content = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n"
+~~~
+
+~~~bash
+uv run --extra dev acp calibrate --reviewer independent-qc
+~~~
+
+Each case is materialised in a detached worktree, mutated, and handed to the
+*real* configured critic through the same entry point QC uses. The report gives
+false-pass and false-block rates separately — a critic that rejects everything
+scores perfectly on one and uselessly on the other — each with a **Wilson 95%
+confidence interval**, keyed by the policy fingerprint that produced it. Wilson
+rather than the normal approximation because calibration sets are small and
+often land on 0% or 100%, where the naive interval collapses to zero width and
+reports false certainty.
+
 ## Recovery model
 
 <code>acp reap</code> or any new claim discovers expired attempts. ACP:
@@ -313,6 +476,22 @@ service.
 - Runner credentials are local bearer secrets hashed in SQLite, not SSO,
   hardware identity, or remote attestation. Protect the host and credential
   sinks; a process that steals a live bearer secret can act as that role.
+- Scheduling previews are advisory and point-in-time. `plan` and `queue` report
+  the board as it was read; only `claim` is authoritative, and it re-checks
+  under an immediate transaction. A preview that says "ready" can still lose a
+  race to a concurrent claim.
+- Conflict prediction is textual, not semantic. Shared changed paths and
+  `git merge-tree` catch overlapping edits; two submissions that break each
+  other without touching the same line merge cleanly and still fail
+  integration, which is why integration reruns the configured commands.
+- Reviewer identity is policy-enforced locally, not backed by SSO or hardware
+  identity. Provenance signatures are a local HMAC whose key lives in ignored
+  `.acp/`: tamper-evident on one trusted host, like the event chain, not
+  external non-repudiation.
+- Calibration measures the reviewer against the golden cases a repository
+  actually wrote. It is a floor, not a guarantee: a defect class with no golden
+  case is unmeasured, and the confidence interval reflects sample size only —
+  not whether the sample resembles real submissions.
 - The hash chain detects accidental or partial tampering; a database
   administrator can rewrite the database and recompute it.
 - ACP coordinates configured local runtime resources and validates submitted
@@ -320,8 +499,9 @@ service.
   deployment side effects; put fencing checks at those gateways too.
 
 Distributed leases, asymmetric/remote runner identity, container isolation,
-merge-queue adapters, MCP/A2A adapters, and externally anchored audit receipts
-are logical next layers. The core model is intentionally provider-neutral.
+merge-queue adapters, MCP/A2A adapters, a TUI over the status JSON, and
+externally anchored audit receipts are logical next layers. The core model is
+intentionally provider-neutral.
 
 ## Development
 
