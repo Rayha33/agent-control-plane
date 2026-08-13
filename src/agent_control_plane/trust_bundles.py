@@ -180,7 +180,8 @@ def _prepare_root(root: Path, owner_uid: int, *, allow_create: bool = False) -> 
             )
         root.mkdir(parents=True, mode=0o755)
         _chown(root, owner_uid)
-        os.chmod(root, 0o755, follow_symlinks=False)
+        # Traversal/read is intentional; no write bit is granted beyond owner.
+        os.chmod(root, 0o755, follow_symlinks=False)  # nosec B103
     _validate_parent_chain(root, owner_uid)
     _secure_directory(root, owner_uid)
     for name in ("bundles", "retired"):
@@ -289,7 +290,8 @@ def install_bundle(
                         _write_all(target_fd, chunk)
                         total += len(chunk)
                     os.fsync(target_fd)
-                    os.fchmod(target_fd, 0o555)
+                    # Bundle executables are deliberately immutable after staging.
+                    os.fchmod(target_fd, 0o555)  # nosec B103
                     if os.geteuid() == 0:
                         os.fchown(target_fd, owner_uid, -1)
                 finally:
@@ -333,7 +335,8 @@ def install_bundle(
                 os.fchown(manifest_fd, owner_uid, -1)
         finally:
             os.close(manifest_fd)
-        os.chmod(staging, 0o555, follow_symlinks=False)
+        # Freeze the directory before it can become current.
+        os.chmod(staging, 0o555, follow_symlinks=False)  # nosec B103
         final = destination_root / "bundles" / bundle_id
         if final.exists():
             existing_manifest = _read_regular(final / "manifest.json")

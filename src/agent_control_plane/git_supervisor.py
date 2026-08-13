@@ -3536,10 +3536,18 @@ class GitSupervisor:
                 ORDER BY runtime.updated_at
                 """
             ).fetchall()
-            for table in ("attempts", "qc_runs"):
-                for row in connection.execute(
-                    f"SELECT trust_bundle_json FROM {table} WHERE trust_bundle_json != '{{}}'"
-                ):
+            trust_queries = (
+                (
+                    "attempts",
+                    "SELECT trust_bundle_json FROM attempts WHERE trust_bundle_json != '{}'",
+                ),
+                (
+                    "qc_runs",
+                    "SELECT trust_bundle_json FROM qc_runs WHERE trust_bundle_json != '{}'",
+                ),
+            )
+            for table, query in trust_queries:
+                for row in connection.execute(query):
                     try:
                         pin = json.loads(row["trust_bundle_json"])
                         key = (str(pin.get("bundle_id", "?")), str(pin.get("manifest_sha256", "?")))
