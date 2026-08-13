@@ -254,12 +254,22 @@ def run_trusted(
 
     if not argv:
         raise DriverError("invalid_driver_invocation", "empty driver argv")
-    executable = Path(argv[0])
-    if not executable.is_absolute():
+    requested_executable = Path(argv[0])
+    if not requested_executable.is_absolute():
         raise DriverError(
             "invalid_driver_invocation",
             f"driver argv[0] must be absolute, got {argv[0]!r}",
         )
+    try:
+        # Normalize a platform alias such as Ubuntu's /bin/sh -> /usr/bin/dash
+        # before the O_NOFOLLOW open. The final inode is still validated and
+        # executed by its resolved absolute path, never by the mutable alias.
+        executable = requested_executable.resolve(strict=True)
+    except OSError as error:
+        raise DriverError(
+            "untrusted_driver",
+            f"driver executable could not be resolved: {requested_executable}",
+        ) from error
     try:
         cwd.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -313,10 +323,11 @@ def run_trusted(
             value = value.replace(secret, "[REDACTED]")
         return value
 
+    execution_argv = [str(executable), *argv[1:]]
     started = time.monotonic()
     try:
         process = subprocess.run(
-            list(argv),
+            execution_argv,
             cwd=str(cwd),
             env=safe_env,
             capture_output=True,
@@ -326,7 +337,7 @@ def run_trusted(
         )
     except subprocess.TimeoutExpired:
         return {
-            "argv": [redact(value) for value in argv],
+            "argv": [redact(value) for value in execution_argv],
             "exit_code": 124,
             "stdout": "",
             "stderr": f"driver timed out after {timeout}s",
@@ -340,7 +351,7 @@ def run_trusted(
     finally:
         os.close(executable_fd)
     return {
-        "argv": [redact(value) for value in argv],
+        "argv": [redact(value) for value in execution_argv],
         "exit_code": process.returncode,
         "stdout": redact(process.stdout),
         "stderr": redact(process.stderr),

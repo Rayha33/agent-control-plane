@@ -129,6 +129,18 @@ def test_run_trusted_executes_platform_binary_without_copying_it(tmp_path: Path)
     result = run_trusted(["/bin/echo", "ok"], tmp_path / "wd", {})
     assert result["exit_code"] == 0
     assert result["stdout"] == "ok\n"
+    assert result["argv"][0] == str(Path("/bin/echo").resolve())
+
+
+def test_run_trusted_resolves_platform_symlink_before_nofollow_open(tmp_path: Path) -> None:
+    shell = Path("/bin/sh").resolve()
+    shell_alias = tmp_path / "shell-alias"
+    shell_alias.symlink_to(shell)
+
+    result = run_trusted([str(shell_alias), "-c", "exit 0"], tmp_path / "wd", {})
+
+    assert result["exit_code"] == 0
+    assert result["argv"][0] == str(shell)
 
 
 def test_run_trusted_does_not_use_a_shell(tmp_path: Path) -> None:
