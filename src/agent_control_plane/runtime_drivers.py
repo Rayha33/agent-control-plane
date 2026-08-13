@@ -52,6 +52,14 @@ DRIVER_KINDS: tuple[str, ...] = (
 
 # Drivers are infrastructure operations; they get a bounded, generous budget.
 DEFAULT_PHASE_TIMEOUT_SECONDS = 300
+TRUSTED_DRIVER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+SENSITIVE_ENV_NAMES = {
+    "PGDATABASE",
+    "PGPASSWORD",
+    "PGPASSFILE",
+    "DATABASE_URL",
+    "DSN",
+}
 
 
 class DriverError(Exception):
@@ -66,6 +74,51 @@ class DriverError(Exception):
 # ---------------------------------------------------------------------------
 # Trust boundary
 # ---------------------------------------------------------------------------
+
+
+def _validate_trusted_path(resolved: Path) -> os.stat_result:
+    """Validate the executable and its directory chain.
+
+    A safe file inside a replaceable directory is not safe. Root-owned sticky
+    temporary directories are accepted as anchors because sticky semantics
+    prevent another user from replacing an owner-controlled entry beneath
+    them; other group/world-writable parents are rejected.
+    """
+
+    # Candidate commands run as the ACP user in the local alpha. A same-UID
+    # executable is therefore candidate-replaceable and cannot be a trust root.
+    expected_owners = {0}
+    file_stat = resolved.stat()
+    if file_stat.st_uid not in expected_owners:
+        raise DriverError(
+            "untrusted_driver",
+            f"driver executable has an unexpected owner: {resolved}",
+        )
+    if file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise DriverError(
+            "untrusted_driver",
+            f"driver executable is group/world writable and cannot be trusted: {resolved}",
+        )
+
+    parent = resolved.parent
+    while True:
+        parent_stat = parent.stat()
+        if parent_stat.st_uid not in expected_owners:
+            raise DriverError(
+                "untrusted_driver",
+                f"driver parent has an unexpected owner: {parent}",
+            )
+        writable = parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        sticky_root_anchor = parent_stat.st_uid == 0 and bool(parent_stat.st_mode & stat.S_ISVTX)
+        if writable and not sticky_root_anchor:
+            raise DriverError(
+                "untrusted_driver",
+                f"driver parent is group/world writable: {parent}",
+            )
+        if sticky_root_anchor or parent == parent.parent:
+            break
+        parent = parent.parent
+    return file_stat
 
 
 def resolve_trusted_executable(raw: str, repo_root: Path) -> Path:
@@ -87,9 +140,7 @@ def resolve_trusted_executable(raw: str, repo_root: Path) -> Path:
     try:
         resolved = path.resolve(strict=True)
     except FileNotFoundError as error:
-        raise DriverError(
-            "invalid_config", f"driver executable does not exist: {raw}"
-        ) from error
+        raise DriverError("invalid_config", f"driver executable does not exist: {raw}") from error
 
     # resolve() has already collapsed symlinks, so a link pointing into the
     # repository is caught here rather than at exec time.
@@ -108,12 +159,7 @@ def resolve_trusted_executable(raw: str, repo_root: Path) -> Path:
             "invalid_config", f"driver executable is not an executable file: {resolved}"
         )
 
-    mode = resolved.stat().st_mode
-    if mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise DriverError(
-            "untrusted_driver",
-            f"driver executable is group/world writable and cannot be trusted: {resolved}",
-        )
+    _validate_trusted_path(resolved)
     return resolved
 
 
@@ -214,6 +260,12 @@ def run_trusted(
             "invalid_driver_invocation",
             f"driver argv[0] must be absolute, got {argv[0]!r}",
         )
+    try:
+        cwd.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise DriverError(
+            "driver_staging_failed", "driver runtime directory is unavailable"
+        ) from error
     # Re-check immediately before exec. Validation at config load proves nothing
     # about the file we are about to run.
     if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -221,20 +273,52 @@ def run_trusted(
             "untrusted_driver",
             f"driver executable disappeared or lost its exec bit: {executable}",
         )
-    mode = executable.stat().st_mode
-    if mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise DriverError(
-            "untrusted_driver",
-            f"driver executable became group/world writable: {executable}",
-        )
+    expected = _validate_trusted_path(executable)
 
-    cwd.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        executable_fd = os.open(executable, flags)
+    except OSError as error:
+        raise DriverError(
+            "untrusted_driver", f"could not open trusted executable: {executable}"
+        ) from error
+    opened = os.fstat(executable_fd)
+    if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+        os.close(executable_fd)
+        raise DriverError("untrusted_driver", "driver executable changed while it was being opened")
+
+    safe_env = {
+        "PATH": TRUSTED_DRIVER_PATH,
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    for name, value in env.items():
+        if name != "ACP_RUNNER_CREDENTIAL" and (
+            name.startswith("ACP_") or name in SENSITIVE_ENV_NAMES
+        ):
+            safe_env[name] = value
+
+    secrets = [
+        value
+        for name, value in safe_env.items()
+        if value
+        and (
+            name in SENSITIVE_ENV_NAMES
+            or any(marker in name for marker in ("PASSWORD", "TOKEN", "SECRET", "CREDENTIAL"))
+        )
+    ]
+
+    def redact(value: str) -> str:
+        for secret in secrets:
+            value = value.replace(secret, "[REDACTED]")
+        return value
+
     started = time.monotonic()
     try:
         process = subprocess.run(
             list(argv),
             cwd=str(cwd),
-            env=dict(env),
+            env=safe_env,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -242,18 +326,24 @@ def run_trusted(
         )
     except subprocess.TimeoutExpired:
         return {
-            "argv": list(argv),
+            "argv": [redact(value) for value in argv],
             "exit_code": 124,
             "stdout": "",
             "stderr": f"driver timed out after {timeout}s",
             "duration_ms": int((time.monotonic() - started) * 1000),
             "timed_out": True,
         }
+    except OSError as error:
+        raise DriverError(
+            "driver_execution_failed", "verified driver executable could not start"
+        ) from error
+    finally:
+        os.close(executable_fd)
     return {
-        "argv": list(argv),
+        "argv": [redact(value) for value in argv],
         "exit_code": process.returncode,
-        "stdout": process.stdout,
-        "stderr": process.stderr,
+        "stdout": redact(process.stdout),
+        "stderr": redact(process.stderr),
         "duration_ms": int((time.monotonic() - started) * 1000),
         "timed_out": False,
     }
@@ -280,9 +370,7 @@ class ResourceDriver:
     def setup(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         raise NotImplementedError
 
-    def probe(
-        self, context: DriverContext, runner: CommandRunner
-    ) -> tuple[bool, dict[str, Any]]:
+    def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
         """Return ``(present, observation)``."""
         raise NotImplementedError
 
@@ -291,10 +379,23 @@ class ResourceDriver:
 
     # -- shared ------------------------------------------------------------
     def _env(self, context: DriverContext) -> dict[str, str]:
-        env = os.environ.copy()
-        env.update(context.environment)
+        env = {
+            name: value for name, value in context.environment.items() if name.startswith("ACP_")
+        }
         env["ACP_RESOURCE_ID"] = self.resource_id(context)
         return env
+
+    def ownership_identity(self, context: DriverContext) -> str:
+        """Secret input bound into the non-disclosing ownership capability."""
+        return self.resource_id(context)
+
+    def ownership_token(self, context: DriverContext) -> str:
+        return ownership_token(
+            context.secret,
+            context.attempt_id,
+            self.kind,
+            self.ownership_identity(context),
+        )
 
     def run_phase(
         self,
@@ -305,15 +406,18 @@ class ResourceDriver:
         if phase not in PHASES:
             raise DriverError("invalid_phase", f"unknown driver phase {phase!r}")
         resource = self.resource_id(context)
-        token = ownership_token(context.secret, context.attempt_id, self.kind, resource)
+        token = self.ownership_token(context)
 
         if phase == "setup":
             result = self.setup(context, runner)
             present, observation = self.probe(context, runner)
             proof = {"action": result, "observation": observation}
-            # A setup that exits 0 without creating anything is a false success.
-            exit_code = result.get("exit_code", 0) or (0 if present else 1)
-            if result.get("exit_code", 0) == 0 and not present:
+            action_ok = result.get("exit_code", 0) == 0
+            probe_ok = observation.get("exit_code", 0) == 0
+            exit_code = 0 if action_ok and probe_ok and present else 1
+            if action_ok and not probe_ok:
+                proof["error"] = "setup probe failed; resource presence is unproven"
+            elif action_ok and not present:
                 proof["error"] = "setup reported success but resource is absent"
             return PhaseEvidence(
                 driver=self.definition.name,
@@ -375,7 +479,8 @@ class DockerComposeDriver(ResourceDriver):
         return _sanitize(f"{prefix}-{context.attempt_id}", allow="-_").lower()
 
     def _base(self, context: DriverContext) -> list[str]:
-        assert self.definition.executable is not None
+        if self.definition.executable is None:
+            raise DriverError("invalid_config", "compose driver executable is missing")
         return [
             str(self.definition.executable),
             "compose",
@@ -391,9 +496,7 @@ class DockerComposeDriver(ResourceDriver):
         argv.extend(["up", "-d", "--remove-orphans"])
         return runner(argv, context.runtime_dir, self._env(context), self._timeout())
 
-    def probe(
-        self, context: DriverContext, runner: CommandRunner
-    ) -> tuple[bool, dict[str, Any]]:
+    def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
         # Addressed by project name only — no compose file, so the proof cannot
         # be steered by candidate content.
         argv = [*self._base(context), "ps", "--all", "--quiet"]
@@ -406,7 +509,10 @@ class DockerComposeDriver(ResourceDriver):
         return runner(argv, context.runtime_dir, self._env(context), self._timeout())
 
     def _timeout(self) -> int:
-        return int(self.definition.option("timeout_seconds", str(DEFAULT_PHASE_TIMEOUT_SECONDS)) or DEFAULT_PHASE_TIMEOUT_SECONDS)
+        return int(
+            self.definition.option("timeout_seconds", str(DEFAULT_PHASE_TIMEOUT_SECONDS))
+            or DEFAULT_PHASE_TIMEOUT_SECONDS
+        )
 
 
 class PostgresSchemaDriver(ResourceDriver):
@@ -417,33 +523,74 @@ class PostgresSchemaDriver(ResourceDriver):
         raw = _sanitize(f"{prefix}_{context.attempt_id}", allow="_").lower()
         return raw.replace("-", "_")
 
-    def _psql(self, context: DriverContext, sql: str) -> list[str]:
-        assert self.definition.executable is not None
-        argv = [str(self.definition.executable), "-v", "ON_ERROR_STOP=1", "-tAc", sql]
-        dsn = self.definition.option("dsn")
-        if dsn:
-            argv[1:1] = [dsn]
+    def _psql(
+        self,
+        context: DriverContext,
+        sql: str,
+        variables: Mapping[str, str] | None = None,
+    ) -> list[str]:
+        if self.definition.executable is None:
+            raise DriverError("invalid_config", "postgres driver executable is missing")
+        argv = [str(self.definition.executable)]
+        argv.extend(["-v", "ON_ERROR_STOP=1"])
+        for name, value in sorted((variables or {}).items()):
+            argv.extend(["--set", f"{name}={value}"])
+        argv.extend(["-tAc", sql])
         return argv
+
+    def _dsn(self) -> str | None:
+        dsn = self.definition.option("dsn")
+        dsn_env = self.definition.option("dsn_env")
+        if dsn and dsn_env:
+            raise DriverError(
+                "invalid_config", "postgres driver accepts only one of dsn or dsn_env"
+            )
+        if dsn_env:
+            if not dsn_env.isidentifier() or dsn_env not in os.environ:
+                raise DriverError(
+                    "invalid_config", f"postgres credential environment is unavailable: {dsn_env}"
+                )
+            dsn = os.environ[dsn_env]
+        return dsn
+
+    def ownership_identity(self, context: DriverContext) -> str:
+        dsn = self._dsn()
+        if not dsn:
+            raise DriverError("invalid_config", "postgres credential target is unavailable")
+        # The DSN never leaves this HMAC input. The stored token binds cleanup
+        # to the exact database target without disclosing or guessably hashing it.
+        return f"{self.resource_id(context)}\x00{dsn}"
+
+    def _env(self, context: DriverContext) -> dict[str, str]:
+        env = super()._env(context)
+        dsn = self._dsn()
+        if dsn:
+            # libpq accepts a URI or keyword connection string in PGDATABASE.
+            # Keeping it out of argv prevents process-list and evidence leaks.
+            env["PGDATABASE"] = dsn
+        return env
 
     def setup(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         schema = self.resource_id(context)
         return runner(
-            self._psql(context, f'CREATE SCHEMA IF NOT EXISTS "{schema}"'),
+            self._psql(
+                context,
+                'CREATE SCHEMA IF NOT EXISTS :"schema"',
+                {"schema": schema},
+            ),
             context.runtime_dir,
             self._env(context),
             DEFAULT_PHASE_TIMEOUT_SECONDS,
         )
 
-    def probe(
-        self, context: DriverContext, runner: CommandRunner
-    ) -> tuple[bool, dict[str, Any]]:
+    def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
         schema = self.resource_id(context)
-        sql = (
-            "SELECT 1 FROM information_schema.schemata "
-            f"WHERE schema_name = '{schema}'"
-        )
         result = runner(
-            self._psql(context, sql),
+            self._psql(
+                context,
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name = :'schema'",
+                {"schema": schema},
+            ),
             context.runtime_dir,
             self._env(context),
             DEFAULT_PHASE_TIMEOUT_SECONDS,
@@ -454,7 +601,11 @@ class PostgresSchemaDriver(ResourceDriver):
     def teardown(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         schema = self.resource_id(context)
         return runner(
-            self._psql(context, f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'),
+            self._psql(
+                context,
+                'DROP SCHEMA IF EXISTS :"schema" CASCADE',
+                {"schema": schema},
+            ),
             context.runtime_dir,
             self._env(context),
             DEFAULT_PHASE_TIMEOUT_SECONDS,
@@ -487,12 +638,20 @@ class BrowserProfileDriver(ResourceDriver):
                 encoding="utf-8",
             )
         except OSError as error:
-            return {"argv": ["<builtin>", "mkdir", str(target)], "exit_code": 1, "stderr": str(error), "stdout": ""}
-        return {"argv": ["<builtin>", "mkdir", str(target)], "exit_code": 0, "stdout": "", "stderr": ""}
+            return {
+                "argv": ["<builtin>", "mkdir", str(target)],
+                "exit_code": 1,
+                "stderr": str(error),
+                "stdout": "",
+            }
+        return {
+            "argv": ["<builtin>", "mkdir", str(target)],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }
 
-    def probe(
-        self, context: DriverContext, runner: CommandRunner
-    ) -> tuple[bool, dict[str, Any]]:
+    def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
         target = Path(self.resource_id(context))
         present = target.exists()
         return present, {
@@ -510,8 +669,18 @@ class BrowserProfileDriver(ResourceDriver):
             # Idempotent: tearing down what is already gone is success.
             pass
         except OSError as error:
-            return {"argv": ["<builtin>", "rmtree", str(target)], "exit_code": 1, "stderr": str(error), "stdout": ""}
-        return {"argv": ["<builtin>", "rmtree", str(target)], "exit_code": 0, "stdout": "", "stderr": ""}
+            return {
+                "argv": ["<builtin>", "rmtree", str(target)],
+                "exit_code": 1,
+                "stderr": str(error),
+                "stdout": "",
+            }
+        return {
+            "argv": ["<builtin>", "rmtree", str(target)],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }
 
 
 _ADAPTERS: dict[str, type[ResourceDriver]] = {
@@ -570,6 +739,16 @@ def parse_driver_definitions(
             for key, value in entry.items()
             if key not in {"name", "kind", "executable"}
         }
+        if kind == PostgresSchemaDriver.kind:
+            if options.get("dsn"):
+                raise DriverError(
+                    "invalid_config",
+                    "postgres driver requires dsn_env; literal DSNs are forbidden",
+                )
+            if not options.get("dsn_env"):
+                raise DriverError(
+                    "invalid_config", "postgres driver requires a dsn_env credential reference"
+                )
         definitions.append(
             DriverDefinition(name=name, kind=kind, executable=executable, options=options)
         )

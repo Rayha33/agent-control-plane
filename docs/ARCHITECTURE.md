@@ -38,10 +38,12 @@ the old approval as current.
 | Record | Purpose |
 |---|---|
 | task | specification, acceptance criteria, dependencies, declared resources, base |
-| attempt | agent, branch, worktree, claim token, checkpoint, PID, latest commit |
+| attempt | agent, bound credential digest, branch, worktree, claim token, checkpoint, PID, latest commit |
 | resource lease | normalized resource, owner, monotonic fencing token, expiry |
 | runtime environment | generated environment, setup/teardown evidence and lifecycle state |
 | runtime allocation | unique local port-pool value, attempt owner and expiry |
+| runtime driver resource | scoped resource, internal ownership capability, lifecycle state and cleanup proof |
+| runner identity | one role, credential digest, enrollment and revocation state |
 | submission | immutable commit/tree/patch hashes, changed paths, resource tokens |
 | QC run | reviewer, immutable commit, commands, outputs, structured findings |
 | integration | merge result, integration commands, branch and commit |
@@ -103,7 +105,7 @@ transaction, ACP allocates one available value from every configured local port
 pool and persists the assignment against the attempt.
 
 After the worktree exists, ACP creates a private runtime directory and runs
-configured setup commands with generated environment variables. The environment
+configured setup commands or trusted resource drivers with generated environment variables. The environment
 is then injected into the supervised worker, deterministic QC, the critic, and
 integration commands. This prevents a verifier from accidentally testing
 another attempt's localhost service or database configuration.
@@ -115,9 +117,16 @@ as <code>teardown_failed</code> and keeps the allocation quarantined for an
 operator retry.
 
 Port allocation is a local coordination guarantee, not a kernel reservation.
-An unrelated process can still bind after ACP's availability check. Database or
-container isolation is provided by the configured idempotent hooks, not inferred
-by ACP.
+An unrelated process can still bind after ACP's availability check. Drivers
+scope Compose projects, PostgreSQL schemas, and browser profiles by attempt and
+require a post-teardown absence observation. Executables are outside the repo
+with a root-owned, non-writable parent chain, opened and identity-checked
+immediately before execution, and run without a shell under a fixed PATH and
+allowlisted environment. Definitions and resource identities are immutable per
+attempt; the ownership capability binds secret connection targets without
+disclosing them, and configuration or target drift quarantines the allocation
+and blocks restart. Generic shell
+hooks remain operator-trusted and do not provide a cleanup proof.
 
 ### 5. A crash does not erase committed work
 
@@ -160,6 +169,17 @@ recomputes the chain.
 This is tamper-evident bookkeeping, not external non-repudiation. A future
 deployment can export or anchor event hashes.
 
+### 9. Names are not runner authority
+
+The first enrollment permanently enables local runner authentication. Worker,
+critic, and integrator identities have one role and store only a credential
+digest. Claims bind the exact worker credential digest into the attempt;
+heartbeat, run, terminate, and submit re-authenticate both the identity and that
+binding. A revoked-and-rotated secret cannot adopt an attempt claimed by its
+predecessor. QC authenticates the configured critic and integration
+authenticates its integrator. Credentials enter the CLI through environment,
+private files, or file descriptors—not argv or JSON output.
+
 ## Process topology
 
 ~~~text
@@ -187,7 +207,8 @@ The data model is intentionally portable:
 
 1. Replace SQLite transactions with PostgreSQL serializable transactions and
    advisory locks for multi-host use.
-2. Authenticate runner, worker, critic, and integrator identities.
+2. Replace local bearer identities with asymmetric workload identity and remote
+   attestation where the threat model requires it.
 3. Put each worktree and QC command in a filesystem/network sandbox.
 4. Add container/network namespace drivers behind the runtime lifecycle
    contract.

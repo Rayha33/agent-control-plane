@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -39,9 +40,7 @@ teardown_commands = []
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     def git(*arguments: str) -> None:
-        subprocess.run(
-            ["git", "-C", str(tmp_path), *arguments], check=True, capture_output=True
-        )
+        subprocess.run(["git", "-C", str(tmp_path), *arguments], check=True, capture_output=True)
 
     git("init", "-b", "main")
     git("config", "user.name", "ACP Test")
@@ -160,7 +159,7 @@ def test_worker_cannot_review_by_asserting_the_critic_name(repo: Path) -> None:
     created = make_task(supervisor)
     attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
     commit_change(attempt, "candidate\n")
-    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
 
     # The worker knows the critic's NAME — it is in acp.toml — but not its key.
     with pytest.raises(SupervisorError) as error:
@@ -181,11 +180,9 @@ def test_enrolled_critic_can_review(repo: Path) -> None:
     created = make_task(supervisor)
     attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
     commit_change(attempt, "candidate\n")
-    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
 
-    review = supervisor.run_qc(
-        submission["id"], "independent-qc", credential=critic["credential"]
-    )
+    review = supervisor.run_qc(submission["id"], "independent-qc", credential=critic["credential"])
     assert review["verdict"] == "pass"
 
 
@@ -196,14 +193,12 @@ def test_revoked_critic_cannot_review(repo: Path) -> None:
     created = make_task(supervisor)
     attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
     commit_change(attempt, "candidate\n")
-    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
 
     supervisor.revoke_runner("independent-qc")
 
     with pytest.raises(SupervisorError) as error:
-        supervisor.run_qc(
-            submission["id"], "independent-qc", credential=critic["credential"]
-        )
+        supervisor.run_qc(submission["id"], "independent-qc", credential=critic["credential"])
     assert error.value.code == "runner_revoked"
 
 
@@ -216,9 +211,7 @@ def test_role_confusion_is_rejected(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     misrole = supervisor.enroll_runner("independent-qc", "worker")
     with pytest.raises(SupervisorError) as error:
-        supervisor.run_qc(
-            "any-submission", "independent-qc", credential=misrole["credential"]
-        )
+        supervisor.run_qc("any-submission", "independent-qc", credential=misrole["credential"])
     assert error.value.code == "runner_role_mismatch"
 
 
@@ -254,3 +247,200 @@ def test_one_identity_cannot_hold_both_worker_and_critic_roles(repo: Path) -> No
     with pytest.raises(SupervisorError) as error:
         supervisor.enroll_runner("ambidextrous", "critic")
     assert error.value.code == "runner_already_enrolled"
+
+
+def test_revoking_last_identity_does_not_disable_authentication(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    enrolled = supervisor.enroll_runner("worker-1", "worker")
+    supervisor.revoke_runner("worker-1")
+    created = make_task(supervisor)
+
+    with pytest.raises(SupervisorError) as missing:
+        supervisor.claim(created["id"], "stranger")
+    assert missing.value.code == "runner_not_enrolled"
+
+    with pytest.raises(SupervisorError) as revoked:
+        supervisor.claim(created["id"], "worker-1", credential=enrolled["credential"])
+    assert revoked.value.code == "runner_revoked"
+
+
+def test_revoked_identity_can_rotate_but_old_attempt_stays_fenced(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    old = supervisor.enroll_runner("worker-1", "worker")
+    created = make_task(supervisor)
+    attempt = supervisor.claim(created["id"], "worker-1", credential=old["credential"])
+    supervisor.revoke_runner("worker-1")
+    rotated = supervisor.enroll_runner("worker-1", "worker")
+    assert rotated["credential"] != old["credential"]
+
+    with pytest.raises(SupervisorError) as stale:
+        supervisor.heartbeat(
+            attempt["id"],
+            attempt["claim_token"],
+            credential=rotated["credential"],
+        )
+    assert stale.value.code == "attempt_identity_stale"
+
+    with pytest.raises(SupervisorError) as old_secret:
+        supervisor.heartbeat(attempt["id"], attempt["claim_token"], credential=old["credential"])
+    assert old_secret.value.code == "runner_authentication_failed"
+
+
+def test_every_privileged_transition_requires_its_role_credential(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    worker = supervisor.enroll_runner("worker-1", "worker")
+    critic = supervisor.enroll_runner("independent-qc", "critic")
+    integrator = supervisor.enroll_runner("integrator-1", "integrator")
+    created = make_task(supervisor)
+    attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
+
+    for operation in (
+        lambda: supervisor.heartbeat(attempt["id"], attempt["claim_token"]),
+        lambda: supervisor.run_worker(attempt["id"], attempt["claim_token"], ["/bin/true"]),
+        lambda: supervisor.terminate_worker(attempt["id"]),
+    ):
+        with pytest.raises(SupervisorError) as error:
+            operation()
+        assert error.value.code == "runner_authentication_failed"
+
+    supervisor.heartbeat(attempt["id"], attempt["claim_token"], credential=worker["credential"])
+    commit_change(attempt, "candidate\n")
+    with pytest.raises(SupervisorError) as submit_error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert submit_error.value.code == "runner_authentication_failed"
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
+    review = supervisor.run_qc(submission["id"], "independent-qc", credential=critic["credential"])
+    assert review["verdict"] == "pass"
+
+    with pytest.raises(SupervisorError) as integration_error:
+        supervisor.integrate(created["id"], "integrator-1")
+    assert integration_error.value.code == "runner_authentication_failed"
+    integration = supervisor.integrate(created["id"], "integrator-1", integrator["credential"])
+    assert integration["verdict"] == "pass"
+
+
+def test_runner_credential_is_not_inherited_by_candidate_processes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    worker = supervisor.enroll_runner("worker-1", "worker")
+    created = make_task(supervisor)
+    attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
+    monkeypatch.setenv("ACP_RUNNER_CREDENTIAL", worker["credential"])
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import os, pathlib, subprocess; "
+            "assert 'ACP_RUNNER_CREDENTIAL' not in os.environ; "
+            "pathlib.Path('alpha.txt').write_text('candidate\\n'); "
+            "subprocess.run(['git','add','alpha.txt'], check=True); "
+            "subprocess.run(['git','commit','-m','candidate'], check=True)"
+        ),
+    ]
+    submission = supervisor.run_worker(
+        attempt["id"],
+        attempt["claim_token"],
+        command,
+        credential=worker["credential"],
+    )
+    assert submission["status"] == "pending_qc"
+
+
+def test_candidate_child_environment_is_allowlisted(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    secrets = {
+        "ACP_TEST_DATABASE_DSN": "postgresql://user:secret@db/app",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "GITHUB_TOKEN": "github-secret",
+        "RANDOM_PASSWORD": "password-secret",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    environment = supervisor._child_env({"ACP_ATTEMPT_ID": "attempt-1"})
+    assert environment["ACP_ATTEMPT_ID"] == "attempt-1"
+    assert not set(secrets) & set(environment)
+
+
+def test_runner_credential_is_scrubbed_from_qc_critic_and_integration(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = (repo / "acp.toml").read_text(encoding="utf-8")
+    config = config.replace(
+        "commands = [\"python -c 'pass'\"]",
+        'commands = ["test -z \\"${ACP_RUNNER_CREDENTIAL:-}\\""]',
+    ).replace('critic_command = ""', 'critic_command = "builtin"')
+    (repo / "acp.toml").write_text(config, encoding="utf-8")
+
+    supervisor = GitSupervisor(repo)
+    worker = supervisor.enroll_runner("worker-1", "worker")
+    reviewer = supervisor.enroll_runner("independent-qc", "critic")
+    integrator = supervisor.enroll_runner("integrator-1", "integrator")
+    created = make_task(supervisor)
+    attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
+    commit_change(attempt, "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
+    monkeypatch.setenv("ACP_RUNNER_CREDENTIAL", reviewer["credential"])
+    review = supervisor.run_qc(
+        submission["id"], "independent-qc", credential=reviewer["credential"]
+    )
+    assert review["verdict"] == "pass"
+    integration = supervisor.integrate(created["id"], "integrator-1", integrator["credential"])
+    assert integration["verdict"] == "pass"
+
+
+def test_revoked_critic_cannot_finalize_a_running_review(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    worker = supervisor.enroll_runner("worker-1", "worker")
+    critic = supervisor.enroll_runner("independent-qc", "critic")
+    created = make_task(supervisor)
+    attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
+    commit_change(attempt, "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
+    original = supervisor._run_command
+    revoked = False
+
+    def revoke_during_qc(command, cwd, extra_env=None):  # type: ignore[no-untyped-def]
+        nonlocal revoked
+        if not revoked:
+            revoked = True
+            supervisor.revoke_runner("independent-qc")
+        return original(command, cwd, extra_env)
+
+    monkeypatch.setattr(supervisor, "_run_command", revoke_during_qc)
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_qc(submission["id"], "independent-qc", credential=critic["credential"])
+    assert error.value.code == "runner_revoked"
+    assert supervisor.submission(submission["id"])["status"] == "pending_qc"
+
+
+def test_revoked_integrator_cannot_finalize_a_running_integration(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    worker = supervisor.enroll_runner("worker-1", "worker")
+    critic = supervisor.enroll_runner("independent-qc", "critic")
+    integrator = supervisor.enroll_runner("integrator-1", "integrator")
+    created = make_task(supervisor)
+    attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
+    commit_change(attempt, "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
+    supervisor.run_qc(submission["id"], "independent-qc", credential=critic["credential"])
+    original = supervisor._run_command
+    revoked = False
+
+    def revoke_during_integration(command, cwd, extra_env=None):  # type: ignore[no-untyped-def]
+        nonlocal revoked
+        if not revoked:
+            revoked = True
+            supervisor.revoke_runner("integrator-1")
+        return original(command, cwd, extra_env)
+
+    monkeypatch.setattr(supervisor, "_run_command", revoke_during_integration)
+    result = supervisor.integrate(created["id"], "integrator-1", integrator["credential"])
+    assert result["verdict"] == "stale"
+    assert supervisor.task(created["id"])["status"] == "conflicted"

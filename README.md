@@ -52,6 +52,8 @@ wedge.
 | Worktree ownership | Every successful claim provisions a dedicated branch and worktree |
 | Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
 | Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
+| Trusted resource drivers | Compose projects, PostgreSQL schemas, and browser profiles have scoped setup/probe/teardown proofs |
+| Runner authentication | Worker, critic, and integrator credentials are role-scoped and attempts bind to the credential version that claimed them |
 | Server-derived evidence | Commit, tree, binary patch hash, and changed paths come from Git |
 | Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
 | Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
@@ -88,23 +90,41 @@ uv run --extra dev acp task-add --title "Harden token refresh" --accept "refresh
 uv run --extra dev acp claim TASK_ID --agent codex-session-17
 ~~~
 
+The zero-configuration local mode is intentionally unauthenticated. Enable
+role-scoped authentication by enrolling the first runner. Authentication then
+stays enabled even if every credential is revoked. Credentials are written only
+to a caller-selected private file or file descriptor—never argv or JSON:
+
+~~~bash
+uv run --extra dev acp runner-enroll codex-session-17 --role worker --credential-output-file ../codex-session-17.credential
+uv run --extra dev acp runner-enroll independent-qc --role critic --credential-output-file ../independent-qc.credential
+uv run --extra dev acp runner-enroll release-integrator --role integrator --credential-output-file ../release-integrator.credential
+
+uv run --extra dev acp claim TASK_ID --agent codex-session-17 --credential-file ../codex-session-17.credential
+~~~
+
 The claim response contains <code>worktree</code>, <code>claim_token</code>,
 per-resource fencing tokens, and a <code>runtime</code> environment. Run your
 agent in that worktree, or let ACP supervise it:
 
 ~~~bash
-uv run --extra dev acp run ATTEMPT_ID --token CLAIM_TOKEN -- your-agent-command
+uv run --extra dev acp run ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../codex-session-17.credential -- your-agent-command
 ~~~
 
 The command must leave a clean, committed worktree. A successful supervised run
 submits automatically. For a manually operated agent:
 
 ~~~bash
-uv run --extra dev acp heartbeat ATTEMPT_ID --token CLAIM_TOKEN --checkpoint '{"phase":"tests"}'
-uv run --extra dev acp submit ATTEMPT_ID --token CLAIM_TOKEN
-uv run --extra dev acp qc SUBMISSION_ID
-uv run --extra dev acp integrate TASK_ID
+uv run --extra dev acp heartbeat ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../codex-session-17.credential --checkpoint '{"phase":"tests"}'
+uv run --extra dev acp submit ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../codex-session-17.credential
+uv run --extra dev acp qc SUBMISSION_ID --credential-file ../independent-qc.credential
+uv run --extra dev acp integrate TASK_ID --integrator release-integrator --credential-file ../release-integrator.credential
 ~~~
+
+For ephemeral automation, pass the same secret through
+<code>ACP_RUNNER_CREDENTIAL</code> or <code>--credential-fd</code>. Never commit
+credential files to the repository. Revoking and re-enrolling an identity
+rotates its secret; attempts claimed by the old secret remain fenced.
 
 All commands emit JSON. Local runtime state and logs live under ignored
 <code>.acp/</code>; configuration is tracked in <code>acp.toml</code>.
@@ -156,6 +176,37 @@ absolute wrappers outside the candidate worktree. Put local database schema
 creation, Compose project setup, config copying, and removal in those hooks; do
 not print secrets because hook output is written to ignored local logs.
 
+For resources with stronger cleanup requirements, use phase-scoped drivers:
+
+~~~toml
+[[runtime.drivers]]
+name = "database"
+kind = "postgres_schema"
+executable = "/usr/local/bin/psql"
+dsn_env = "ACP_TEST_DATABASE_DSN"
+
+[[runtime.drivers]]
+name = "browser"
+kind = "browser_profile"
+profile_prefix = "acp"
+~~~
+
+External driver executables and their parent chain must be root-owned and not
+group/world writable because candidate code runs as the ACP user. ACP opens and verifies the exact
+executable identity immediately before invoking it without a shell, from the
+runtime directory, with a fixed PATH and a scrubbed
+environment. PostgreSQL drivers require a <code>dsn_env</code> reference and
+reject literal DSNs in tracked configuration. The secret is supplied only to
+the trusted driver through <code>PGDATABASE</code>, not argv, and is redacted
+from persisted observations. Every
+teardown is followed by an independent absence probe; an unproven cleanup is
+quarantined rather than recycled. <code>runtime-resources</code> exposes the
+proof but not its internal ownership capability.
+
+That capability also binds the effective PostgreSQL target. Changing the
+referenced DSN or any driver definition after allocation blocks restart and
+quarantines cleanup instead of probing a different resource.
+
 ## Independent critic contract
 
 Deterministic QC commands are always authoritative: a failing command cannot be
@@ -198,7 +249,8 @@ evidence, and required fix. Use a different provider/model in the wrapper when
 correlated model bias is unacceptable.
 
 External critic configuration is deliberately strict: it must be a single
-absolute executable path outside the repository. ACP invokes it directly, not
+absolute executable path outside the repository with a root-owned,
+non-group/world-writable parent chain. ACP invokes it directly, not
 through the candidate's shell or import path. Put model/provider arguments and
 credentials inside that trusted wrapper.
 
@@ -258,17 +310,18 @@ service.
 - Lifecycle hooks are trusted operator configuration. They can create isolated
   database schemas or containers, but ACP cannot infer or fence side effects
   the hooks do not declare.
-- Reviewer identity is policy-enforced locally, not backed by SSO or hardware
-  identity.
+- Runner credentials are local bearer secrets hashed in SQLite, not SSO,
+  hardware identity, or remote attestation. Protect the host and credential
+  sinks; a process that steals a live bearer secret can act as that role.
 - The hash chain detects accidental or partial tampering; a database
   administrator can rewrite the database and recompute it.
 - ACP coordinates configured local runtime resources and validates submitted
   Git changes. It does not automatically fence arbitrary network, database, or
   deployment side effects; put fencing checks at those gateways too.
 
-Distributed leases, authenticated runners, container isolation, merge-queue
-adapters, MCP/A2A adapters, and externally anchored audit receipts are logical
-next layers. The core model is intentionally provider-neutral.
+Distributed leases, asymmetric/remote runner identity, container isolation,
+merge-queue adapters, MCP/A2A adapters, and externally anchored audit receipts
+are logical next layers. The core model is intentionally provider-neutral.
 
 ## Development
 

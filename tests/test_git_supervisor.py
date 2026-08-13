@@ -525,13 +525,8 @@ def test_external_critic_must_be_trusted_absolute_executable(
     assert captured.value.code == "invalid_config"
 
 
-def test_critic_must_create_fresh_unique_result(
-    repo: Path, tmp_path_factory: pytest.TempPathFactory
-) -> None:
-    critic = tmp_path_factory.mktemp("trusted-critic") / "silent-critic"
-    critic.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    critic.chmod(0o755)
-    write_config(repo, critic_command=str(critic), require_critic=True)
+def test_critic_must_create_fresh_unique_result(repo: Path) -> None:
+    write_config(repo, critic_command="/usr/bin/true", require_critic=True)
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
@@ -702,10 +697,11 @@ def test_run_reservation_remains_held_until_submit(
         attempt_id: str,
         claim_token: int,
         expected_worker_pid: int | None,
+        credential: str | None,
     ) -> dict:
         submit_entered.set()
         assert allow_submit.wait(timeout=5)
-        return original_submit(attempt_id, claim_token, expected_worker_pid)
+        return original_submit(attempt_id, claim_token, expected_worker_pid, credential)
 
     monkeypatch.setattr(supervisor, "_submit", delayed_submit)
     command = [

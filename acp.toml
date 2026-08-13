@@ -38,7 +38,7 @@ teardown_commands = []
 # name = "db"
 # kind = "postgres_schema"          # schema is created and dropped per attempt
 # executable = "/usr/local/bin/psql"
-# dsn = "postgresql://acp@127.0.0.1/acp"
+# dsn_env = "ACP_TEST_DATABASE_DSN" # required: literal DSNs are rejected
 #
 # [[runtime.drivers]]
 # name = "browser"

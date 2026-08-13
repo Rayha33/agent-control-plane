@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -36,10 +37,23 @@ from .runtime_drivers import (
     PhaseEvidence,
     build_driver,
     parse_driver_definitions,
+    resolve_trusted_executable,
     run_trusted,
 )
 
 GENESIS_HASH = "0" * 64
+SUPERVISOR_SECRET_ENV = {"ACP_RUNNER_CREDENTIAL"}
+PUBLIC_CHILD_ENV = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER",
+}
 
 
 class SupervisorError(RuntimeError):
@@ -107,6 +121,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   task_id TEXT NOT NULL REFERENCES tasks(id),
   number INTEGER NOT NULL,
   agent_id TEXT NOT NULL,
+  runner_credential_digest TEXT,
   branch TEXT NOT NULL,
   worktree TEXT NOT NULL,
   claim_token INTEGER NOT NULL,
@@ -187,6 +202,7 @@ CREATE TABLE IF NOT EXISTS runtime_driver_resources (
   kind TEXT NOT NULL,
   resource_id TEXT NOT NULL,
   ownership_token TEXT NOT NULL,
+  definition_json TEXT NOT NULL DEFAULT '{}',
   expires_at INTEGER NOT NULL,
   state TEXT NOT NULL,
   evidence_json TEXT NOT NULL,
@@ -237,6 +253,27 @@ class GitSupervisor:
             connection.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('claim_counter', '0')"
             )
+            attempt_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(attempts)")
+            }
+            if "runner_credential_digest" not in attempt_columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN runner_credential_digest TEXT")
+            driver_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(runtime_driver_resources)")
+            }
+            if "definition_json" not in driver_columns:
+                connection.execute(
+                    "ALTER TABLE runtime_driver_resources "
+                    "ADD COLUMN definition_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            # Upgrade registries created before the explicit flag existed. Once
+            # enabled, authentication never silently downgrades because the last
+            # credential was revoked.
+            if connection.execute("SELECT 1 FROM runner_identities LIMIT 1").fetchone():
+                connection.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES('runner_auth_enabled', '1')"
+                )
 
     @classmethod
     def initialize(cls, repo: str | Path = ".") -> GitSupervisor:
@@ -328,21 +365,17 @@ class GitSupervisor:
                     "invalid_config",
                     "external critic executable must be outside the repository",
                 )
-            if not critic_path.is_file() or not os.access(critic_path, os.X_OK):
-                raise SupervisorError(
-                    "invalid_config",
-                    "external critic_command must name an executable file",
-                )
-            critic_command = str(critic_path)
+            try:
+                critic_command = str(resolve_trusted_executable(str(critic_path), self.root))
+            except DriverError as error:
+                raise SupervisorError(error.code, error.message) from error
         runtime_setup_commands = tuple(map(str, runtime.get("setup_commands", [])))
         runtime_teardown_commands = tuple(map(str, runtime.get("teardown_commands", [])))
         # Drivers are validated here, against the supervisor's OWN acp.toml at the
         # repository root — never a copy inside a candidate worktree.
         raw_drivers = runtime.get("drivers", [])
         if not isinstance(raw_drivers, list):
-            raise SupervisorError(
-                "invalid_config", "runtime.drivers must be an array of tables"
-            )
+            raise SupervisorError("invalid_config", "runtime.drivers must be an array of tables")
         try:
             runtime_drivers = parse_driver_definitions(raw_drivers, self.root)
         except DriverError as error:
@@ -736,6 +769,15 @@ class GitSupervisor:
     def _phase_runtime_env(environment: dict[str, str], phase: str, cwd: Path) -> dict[str, str]:
         return environment | {"ACP_PHASE": phase, "ACP_WORKTREE": str(cwd)}
 
+    @staticmethod
+    def _child_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
+        """Build candidate/driver child env without ACP's own bearer secret."""
+        env = {name: value for name, value in os.environ.items() if name in PUBLIC_CHILD_ENV}
+        env.update(extra_env or {})
+        for name in SUPERVISOR_SECRET_ENV:
+            env.pop(name, None)
+        return env
+
     # -- authenticated runner identities -----------------------------------
 
     def enroll_runner(self, agent_id: str, role: str) -> dict[str, Any]:
@@ -757,26 +799,40 @@ class GitSupervisor:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT agent_id FROM runner_identities WHERE agent_id = ?", (agent_id,)
+                "SELECT * FROM runner_identities WHERE agent_id = ?", (agent_id,)
             ).fetchone()
-            if existing:
+            if existing and existing["revoked_at"] is None:
                 raise SupervisorError(
                     "runner_already_enrolled",
                     f"{agent_id} is already enrolled; revoke it before re-enrolling",
                 )
+            digest = credential_digest(credential)
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE runner_identities
+                    SET role = ?, credential_digest = ?, created_at = ?, revoked_at = NULL
+                    WHERE agent_id = ?
+                    """,
+                    (role, digest, stamp, agent_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO runner_identities
+                      (agent_id, role, credential_digest, created_at, revoked_at)
+                    VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (agent_id, role, digest, stamp),
+                )
             connection.execute(
-                """
-                INSERT INTO runner_identities
-                  (agent_id, role, credential_digest, created_at, revoked_at)
-                VALUES (?, ?, ?, ?, NULL)
-                """,
-                (agent_id, role, credential_digest(credential), stamp),
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('runner_auth_enabled', '1')"
             )
             self._event(
                 connection,
                 "runner.enrolled",
                 "supervisor",
-                {"agent_id": agent_id, "role": role},
+                {"agent_id": agent_id, "role": role, "rotated": bool(existing)},
             )
         return {"agent_id": agent_id, "role": role, "credential": credential}
 
@@ -793,9 +849,7 @@ class GitSupervisor:
                 "UPDATE runner_identities SET revoked_at = ? WHERE agent_id = ?",
                 (stamp, agent_id),
             )
-            self._event(
-                connection, "runner.revoked", "supervisor", {"agent_id": agent_id}
-            )
+            self._event(connection, "runner.revoked", "supervisor", {"agent_id": agent_id})
         return {"agent_id": agent_id, "revoked_at": stamp}
 
     def runners(self) -> list[dict[str, Any]]:
@@ -807,22 +861,39 @@ class GitSupervisor:
         # credential_digest is deliberately not returned.
         return [dict(row) for row in rows]
 
-    def _identity_enforced(self) -> bool:
-        """Authentication activates once anything is enrolled.
+    def _identity_enforced(self, connection: sqlite3.Connection | None = None) -> bool:
+        """Authentication activates permanently after the first enrollment.
 
         An empty registry keeps the single-host default behaviour, so enabling
-        this is a deliberate act rather than a breaking upgrade.
+        this is a deliberate act rather than a breaking upgrade. Revocation
+        cannot turn authentication back off.
         """
-        with self.connect() as connection:
+        if connection is not None:
             row = connection.execute(
-                "SELECT 1 FROM runner_identities WHERE revoked_at IS NULL LIMIT 1"
+                "SELECT value FROM meta WHERE key = 'runner_auth_enabled'"
+            ).fetchone()
+            return bool(row and row["value"] == "1")
+        with self.connect() as owned_connection:
+            row = owned_connection.execute(
+                "SELECT value FROM meta WHERE key = 'runner_auth_enabled'"
             ).fetchone()
         return bool(row)
 
-    def _authenticate(self, agent_id: str, role: str, credential: str | None) -> None:
-        if not self._identity_enforced():
-            return
-        with self.connect() as connection:
+    def _authenticate(
+        self,
+        agent_id: str,
+        role: str,
+        credential: str | None,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        if not self._identity_enforced(connection):
+            return None
+        if connection is None:
+            with self.connect() as owned_connection:
+                row = owned_connection.execute(
+                    "SELECT * FROM runner_identities WHERE agent_id = ?", (agent_id,)
+                ).fetchone()
+        else:
             row = connection.execute(
                 "SELECT * FROM runner_identities WHERE agent_id = ?", (agent_id,)
             ).fetchone()
@@ -842,6 +913,47 @@ class GitSupervisor:
             raise SupervisorError(
                 "runner_authentication_failed",
                 f"{agent_id} did not present a valid {role} credential",
+            )
+        return row
+
+    def _authenticate_attempt(
+        self,
+        connection: sqlite3.Connection,
+        attempt: sqlite3.Row,
+        credential: str | None,
+    ) -> None:
+        identity = self._authenticate(attempt["agent_id"], "worker", credential, connection)
+        if identity is None:
+            return
+        bound_digest = attempt["runner_credential_digest"]
+        if not bound_digest:
+            raise SupervisorError(
+                "attempt_identity_unbound",
+                "attempt predates runner authentication and cannot cross the trust boundary",
+            )
+        if not hmac.compare_digest(bound_digest, identity["credential_digest"]):
+            raise SupervisorError(
+                "attempt_identity_stale",
+                "attempt is bound to an older runner credential",
+            )
+
+    def _reauthenticate_bound(
+        self,
+        connection: sqlite3.Connection,
+        agent_id: str,
+        role: str,
+        credential: str | None,
+        expected_digest: str | None,
+    ) -> None:
+        identity = self._authenticate(agent_id, role, credential, connection)
+        if identity is None:
+            return
+        if not expected_digest or not hmac.compare_digest(
+            expected_digest, identity["credential_digest"]
+        ):
+            raise SupervisorError(
+                "runner_identity_stale",
+                f"{role} credential changed while the operation was running",
             )
 
     # -- trusted runtime drivers -------------------------------------------
@@ -874,6 +986,87 @@ class GitSupervisor:
             environment=environment,
         )
 
+    @staticmethod
+    def _driver_definition_json(definition: DriverDefinition) -> str:
+        return canonical_json(
+            {
+                "name": definition.name,
+                "kind": definition.kind,
+                "executable": str(definition.executable) if definition.executable else None,
+                "options": dict(definition.options),
+            }
+        )
+
+    @staticmethod
+    def _driver_definition_from_json(value: str) -> DriverDefinition:
+        raw = json.loads(value)
+        return DriverDefinition(
+            name=str(raw["name"]),
+            kind=str(raw["kind"]),
+            executable=Path(raw["executable"]) if raw.get("executable") else None,
+            options={str(key): str(item) for key, item in raw.get("options", {}).items()},
+        )
+
+    def _stored_driver_rows(self, attempt_id: str) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM runtime_driver_resources WHERE attempt_id = ? ORDER BY driver",
+                (attempt_id,),
+            ).fetchall()
+
+    def _quarantine_driver_attempt(self, attempt_id: str, code: str) -> None:
+        stamp = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE runtime_driver_resources SET state = 'quarantined', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (stamp, attempt_id),
+            )
+            connection.execute(
+                "UPDATE runtime_environments SET state = 'teardown_failed', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (stamp, attempt_id),
+            )
+            self._event(
+                connection,
+                "runtime.driver.quarantined",
+                "supervisor",
+                {"attempt_id": attempt_id, "reason": code},
+            )
+
+    def _assert_driver_config_unchanged(self, attempt_id: str) -> None:
+        rows = self._stored_driver_rows(attempt_id)
+        if not rows:
+            return
+        stored = {
+            row["driver"]: row["definition_json"] for row in rows if row["definition_json"] != "{}"
+        }
+        current = {
+            definition.name: self._driver_definition_json(definition)
+            for definition in self.config.runtime_drivers
+        }
+        if stored == current:
+            return
+        stamp = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE runtime_driver_resources SET state = 'quarantined', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (stamp, attempt_id),
+            )
+            self._event(
+                connection,
+                "runtime.driver.config_drift",
+                "supervisor",
+                {"attempt_id": attempt_id, "stored": sorted(stored), "current": sorted(current)},
+            )
+        raise SupervisorError(
+            "runtime_driver_config_drift",
+            "driver configuration changed after allocation; restore it before restart",
+        )
+
     def _run_driver_phase(
         self, phase: str, attempt_id: str, environment: dict[str, str]
     ) -> list[PhaseEvidence]:
@@ -884,33 +1077,67 @@ class GitSupervisor:
         immediately before exec.
         """
 
-        if not self.config.runtime_drivers:
+        stored_rows = self._stored_driver_rows(attempt_id)
+        stored_by_name = {row["driver"]: row for row in stored_rows}
+        if stored_rows:
+            try:
+                definitions = tuple(
+                    self._driver_definition_from_json(row["definition_json"]) for row in stored_rows
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                self._quarantine_driver_attempt(attempt_id, "runtime_driver_definition_missing")
+                raise SupervisorError(
+                    "runtime_driver_definition_missing",
+                    "stored driver definition is unavailable; cleanup is quarantined",
+                ) from error
+        else:
+            definitions = self.config.runtime_drivers
+        if not definitions:
             return []
         context = self._driver_context(attempt_id, environment)
         evidence: list[PhaseEvidence] = []
-        for definition in self.config.runtime_drivers:
+        definitions_by_name = {definition.name: definition for definition in definitions}
+        for definition in definitions:
             driver = build_driver(definition)
             try:
+                stored = stored_by_name.get(definition.name)
+                if stored:
+                    expected_resource = driver.resource_id(context)
+                    expected_token = driver.ownership_token(context)
+                    if (
+                        stored["kind"] != definition.kind
+                        or stored["resource_id"] != expected_resource
+                        or not hmac.compare_digest(stored["ownership_token"], expected_token)
+                    ):
+                        raise DriverError(
+                            "runtime_driver_identity_mismatch",
+                            f"stored ownership proof does not match driver {definition.name}",
+                        )
                 evidence.append(driver.run_phase(phase, context, run_trusted))
             except DriverError as error:
+                stored = stored_by_name.get(definition.name)
                 evidence.append(
                     PhaseEvidence(
                         driver=definition.name,
                         kind=definition.kind,
                         phase=phase,
-                        resource_id="",
-                        ownership_token="",
+                        resource_id=stored["resource_id"] if stored else "",
+                        ownership_token=stored["ownership_token"] if stored else "",
                         expires_at=context.expires_at,
                         exit_code=1,
                         present=None,
                         proof={"error": error.message, "code": error.code},
                     )
                 )
-        self._record_driver_evidence(attempt_id, phase, evidence)
+        self._record_driver_evidence(attempt_id, phase, evidence, definitions_by_name)
         return evidence
 
     def _record_driver_evidence(
-        self, attempt_id: str, phase: str, evidence: Sequence[PhaseEvidence]
+        self,
+        attempt_id: str,
+        phase: str,
+        evidence: Sequence[PhaseEvidence],
+        definitions: dict[str, DriverDefinition],
     ) -> None:
         if not evidence:
             return
@@ -928,11 +1155,9 @@ class GitSupervisor:
                     """
                     INSERT INTO runtime_driver_resources
                       (attempt_id, driver, kind, resource_id, ownership_token,
-                       expires_at, state, evidence_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       definition_json, expires_at, state, evidence_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(attempt_id, driver) DO UPDATE SET
-                      resource_id = excluded.resource_id,
-                      ownership_token = excluded.ownership_token,
                       expires_at = excluded.expires_at,
                       state = excluded.state,
                       evidence_json = excluded.evidence_json,
@@ -944,6 +1169,7 @@ class GitSupervisor:
                         item.kind,
                         item.resource_id,
                         item.ownership_token,
+                        self._driver_definition_json(definitions[item.driver]),
                         item.expires_at,
                         state,
                         canonical_json(item.as_dict()),
@@ -972,18 +1198,21 @@ class GitSupervisor:
                 "SELECT * FROM runtime_driver_resources WHERE attempt_id = ? ORDER BY driver",
                 (attempt_id,),
             ).fetchall()
-        return [
-            {
-                "driver": row["driver"],
-                "kind": row["kind"],
-                "resource_id": row["resource_id"],
-                "ownership_token": row["ownership_token"],
-                "expires_at": row["expires_at"],
-                "state": row["state"],
-                "evidence": json.loads(row["evidence_json"]),
-            }
-            for row in rows
-        ]
+        resources: list[dict[str, Any]] = []
+        for row in rows:
+            evidence = json.loads(row["evidence_json"])
+            evidence.pop("ownership_token", None)
+            resources.append(
+                {
+                    "driver": row["driver"],
+                    "kind": row["kind"],
+                    "resource_id": row["resource_id"],
+                    "expires_at": row["expires_at"],
+                    "state": row["state"],
+                    "evidence": evidence,
+                }
+            )
+        return resources
 
     def quarantined_resources(self) -> list[dict[str, Any]]:
         """Allocations whose cleanup could not be proven.
@@ -997,17 +1226,21 @@ class GitSupervisor:
                 "SELECT * FROM runtime_driver_resources WHERE state = 'quarantined' "
                 "ORDER BY updated_at"
             ).fetchall()
-        return [
-            {
-                "attempt_id": row["attempt_id"],
-                "driver": row["driver"],
-                "kind": row["kind"],
-                "resource_id": row["resource_id"],
-                "state": row["state"],
-                "evidence": json.loads(row["evidence_json"]),
-            }
-            for row in rows
-        ]
+        resources: list[dict[str, Any]] = []
+        for row in rows:
+            evidence = json.loads(row["evidence_json"])
+            evidence.pop("ownership_token", None)
+            resources.append(
+                {
+                    "attempt_id": row["attempt_id"],
+                    "driver": row["driver"],
+                    "kind": row["kind"],
+                    "resource_id": row["resource_id"],
+                    "state": row["state"],
+                    "evidence": evidence,
+                }
+            )
+        return resources
 
     def runtime_restart(self, attempt_id: str) -> dict[str, Any]:
         """Tear down and re-create driver resources between phases.
@@ -1016,6 +1249,7 @@ class GitSupervisor:
         app server can make a reviewer pass a candidate whose code never
         actually starts.
         """
+        self._assert_driver_config_unchanged(attempt_id)
         environment = self._runtime_env(attempt_id, require_ready=False)
         teardown = self._run_driver_phase("teardown", attempt_id, environment)
         unproven = [item for item in teardown if not item.proof.get("cleanup_proved")]
@@ -1191,9 +1425,7 @@ class GitSupervisor:
         # Drivers tear down AFTER the shell hooks and are then independently
         # re-probed. A hook that exits 0 proves only that a process exited 0.
         driver_evidence = self._run_driver_phase("teardown", attempt_id, environment)
-        unproven = [
-            item.driver for item in driver_evidence if not item.proof.get("cleanup_proved")
-        ]
+        unproven = [item.driver for item in driver_evidence if not item.proof.get("cleanup_proved")]
         results = results + [
             {
                 "command": f"driver:{item.driver}:teardown",
@@ -1217,11 +1449,7 @@ class GitSupervisor:
         # Missing cleanup proof quarantines the allocation: the ports are NOT
         # returned to the pool, so nothing is handed to a later attempt while a
         # resource from this one may still be alive.
-        failed = (
-            any(result["exit_code"] for result in results)
-            or bool(occupied)
-            or bool(unproven)
-        )
+        failed = any(result["exit_code"] for result in results) or bool(occupied) or bool(unproven)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             stamp = utc_now()
@@ -1273,6 +1501,7 @@ class GitSupervisor:
         now = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            identity = self._authenticate(agent_id, "worker", credential, connection)
             task = self._task_row(connection, task_id)
             if task["status"] not in {"open", "orphaned", "changes_requested"}:
                 raise SupervisorError("task_unavailable", f"task status is {task['status']}")
@@ -1328,10 +1557,11 @@ class GitSupervisor:
             connection.execute(
                 """
                 INSERT INTO attempts
-                  (id, task_id, number, agent_id, branch, worktree, claim_token,
+                  (id, task_id, number, agent_id, runner_credential_digest,
+                   branch, worktree, claim_token,
                    start_sha, latest_sha, checkpoint_json, pid, log_path, status,
                    lease_expires_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL, NULL,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL, NULL,
                         'provisioning', ?, ?, ?)
                 """,
                 (
@@ -1339,6 +1569,7 @@ class GitSupervisor:
                     task_id,
                     number,
                     agent_id,
+                    identity["credential_digest"] if identity else None,
                     branch,
                     str(worktree),
                     counter,
@@ -1469,12 +1700,14 @@ class GitSupervisor:
         claim_token: int,
         checkpoint: dict[str, Any] | None = None,
         lease_seconds: int | None = None,
+        credential: str | None = None,
     ) -> dict[str, Any]:
         ttl = lease_seconds or self.config.lease_seconds
         expires = int(time.time()) + ttl
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
             task = self._task_row(connection, attempt["task_id"])
             runtime = connection.execute(
                 "SELECT state FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
@@ -1666,19 +1899,31 @@ class GitSupervisor:
             "runtime_cleanup": runtime_cleanup,
         }
 
-    def submit(self, attempt_id: str, claim_token: int) -> dict[str, Any]:
-        return self._submit(attempt_id, claim_token, expected_worker_pid=None)
+    def submit(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        return self._submit(
+            attempt_id,
+            claim_token,
+            expected_worker_pid=None,
+            credential=credential,
+        )
 
     def _submit(
         self,
         attempt_id: str,
         claim_token: int,
         expected_worker_pid: int | None,
+        credential: str | None,
     ) -> dict[str, Any]:
         epoch = int(time.time())
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, epoch)
+            self._authenticate_attempt(connection, attempt, credential)
             if expected_worker_pid is None and attempt["pid"] is not None:
                 raise SupervisorError(
                     "worker_still_running",
@@ -1824,7 +2069,8 @@ class GitSupervisor:
     ) -> dict[str, Any]:
         # Prove the reviewer holds the critic credential before anything else.
         # Until this existed, "independent QC" was a string a worker could type.
-        self._authenticate(reviewer_id, "critic", credential)
+        reviewer_identity = self._authenticate(reviewer_id, "critic", credential)
+        reviewer_digest = reviewer_identity["credential_digest"] if reviewer_identity else None
         if reviewer_id != self.config.critic_identity:
             raise SupervisorError(
                 "reviewer_identity_mismatch",
@@ -1833,6 +2079,7 @@ class GitSupervisor:
         started = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._authenticate(reviewer_id, "critic", credential, connection)
             submission = self._submission_row(connection, submission_id)
             task = self._task_row(connection, submission["task_id"])
             if submission["status"] != "pending_qc" or task["status"] != "qc_review":
@@ -1882,9 +2129,7 @@ class GitSupervisor:
                         }
                     )
                 else:
-                    runtime_env = self._runtime_env(
-                        submission["attempt_id"], require_ready=False
-                    )
+                    runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
             for command in self.config.qc_commands:
                 self._restore_candidate(qc_dir, submission["commit_sha"])
                 result = self._run_command(
@@ -1983,6 +2228,13 @@ class GitSupervisor:
         packet_hash = sha256(packet_path.read_bytes()) if packet_path.exists() else sha256(b"")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._reauthenticate_bound(
+                connection,
+                reviewer_id,
+                "critic",
+                credential,
+                reviewer_digest,
+            )
             current = self._submission_row(connection, submission_id)
             current_task = self._task_row(connection, current["task_id"])
             if current["status"] != "pending_qc" or current_task["status"] != "qc_review":
@@ -2074,9 +2326,19 @@ class GitSupervisor:
                 raise SupervisorError("qc_not_found", f"QC run {qc_id} not found")
             return self._qc_view(row)
 
-    def integrate(self, task_id: str) -> dict[str, Any]:
+    def integrate(
+        self,
+        task_id: str,
+        integrator_id: str = "integration",
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        integrator_identity = self._authenticate(integrator_id, "integrator", credential)
+        integrator_digest = (
+            integrator_identity["credential_digest"] if integrator_identity else None
+        )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._authenticate(integrator_id, "integrator", credential, connection)
             task = self._task_row(connection, task_id)
             if task["status"] != "approved":
                 raise SupervisorError("qc_gate_not_passed", "task is not approved")
@@ -2118,7 +2380,7 @@ class GitSupervisor:
             self._event(
                 connection,
                 "integration.started",
-                "integration",
+                integrator_id,
                 {"task_id": task_id, "submission_id": submission["id"]},
             )
 
@@ -2194,6 +2456,17 @@ class GitSupervisor:
         try:
             with self.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._reauthenticate_bound(
+                        connection,
+                        integrator_id,
+                        "integrator",
+                        credential,
+                        integrator_digest,
+                    )
+                except SupervisorError as auth_error:
+                    verdict = "stale"
+                    error_message = f"{auth_error.code}: {auth_error}"
                 current_task = self._task_row(connection, task_id)
                 reservation_valid = current_task["status"] == "integrating"
                 if reservation_valid:
@@ -2238,7 +2511,7 @@ class GitSupervisor:
                 self._event(
                     connection,
                     "integration.completed",
-                    "integration",
+                    integrator_id,
                     {
                         "integration_id": integration_id,
                         "task_id": task_id,
@@ -2278,6 +2551,7 @@ class GitSupervisor:
         attempt_id: str,
         claim_token: int,
         command: Sequence[str],
+        credential: str | None = None,
     ) -> dict[str, Any]:
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
@@ -2285,9 +2559,9 @@ class GitSupervisor:
             attempt_id,
             claim_token,
             {"phase": "launching", "command": list(command)},
+            credential=credential,
         )
-        worker_env = os.environ.copy()
-        worker_env.update(
+        worker_env = self._child_env(
             self._phase_runtime_env(
                 self._runtime_env(attempt_id), "worker", Path(attempt["worktree"])
             )
@@ -2300,7 +2574,7 @@ class GitSupervisor:
             launch_reserved = False
             try:
                 handshake_read, handshake_write = os.pipe()
-                self._reserve_worker_launch(attempt_id, claim_token, str(log_path))
+                self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
                 launch_reserved = True
                 trampoline = Path(__file__).with_name("worker_trampoline.py").resolve()
                 process = subprocess.Popen(
@@ -2325,6 +2599,7 @@ class GitSupervisor:
                     active = self._active_attempt(
                         connection, attempt_id, claim_token, int(time.time())
                     )
+                    self._authenticate_attempt(connection, active, credential)
                     changed = connection.execute(
                         """
                         UPDATE attempts SET pid = ?, log_path = ?, updated_at = ?
@@ -2360,6 +2635,7 @@ class GitSupervisor:
                             attempt_id,
                             claim_token,
                             {"pid": process.pid, "command": list(command)},
+                            credential=credential,
                         )
             except BaseException:
                 for descriptor in (handshake_read, handshake_write):
@@ -2394,6 +2670,7 @@ class GitSupervisor:
                 attempt_id,
                 claim_token,
                 expected_worker_pid=process.pid,
+                credential=credential,
             )
         except BaseException:
             self._clear_worker_registration(
@@ -2404,10 +2681,17 @@ class GitSupervisor:
             )
             raise
 
-    def _reserve_worker_launch(self, attempt_id: str, claim_token: int, log_path: str) -> None:
+    def _reserve_worker_launch(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        log_path: str,
+        credential: str | None,
+    ) -> None:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
             if attempt["pid"] is not None:
                 raise SupervisorError(
                     "worker_already_running",
@@ -2479,8 +2763,16 @@ class GitSupervisor:
                 },
             )
 
-    def terminate_worker(self, attempt_id: str) -> dict[str, Any]:
-        attempt = self.attempt(attempt_id)
+    def terminate_worker(self, attempt_id: str, credential: str | None = None) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
+            self._authenticate_attempt(connection, row, credential)
+            attempt = self._attempt_view(connection, row)
         if not attempt["pid"]:
             raise SupervisorError("worker_not_running", "attempt has no running worker")
         if attempt["pid"] < 0:
@@ -2897,8 +3189,7 @@ class GitSupervisor:
         cwd: Path,
         extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        env = os.environ.copy()
-        env.update(extra_env or {})
+        env = self._child_env(extra_env)
         return self._run_process(["/bin/sh", "-lc", command], command, cwd, env)
 
     def _run_critic(
@@ -2908,11 +3199,9 @@ class GitSupervisor:
         extra_env: dict[str, str],
     ) -> dict[str, Any]:
         if command != "builtin":
-            env = os.environ.copy()
-            env.update(extra_env)
+            env = self._child_env(extra_env)
             return self._run_process([command], command, cwd, env)
-        env = os.environ.copy()
-        env.update(extra_env)
+        env = self._child_env(extra_env)
         critic_path = Path(__file__).with_name("critic.py").resolve()
         return self._run_process(
             [sys.executable, "-I", str(critic_path)],

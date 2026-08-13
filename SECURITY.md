@@ -9,20 +9,36 @@ worker, and integration commands. Those commands may execute candidate
 repository code. Use an OS/container sandbox and restricted network credentials
 for untrusted code. Only trusted maintainers should change
 <code>acp.toml</code>. Runtime hook output is stored under ignored local
-<code>.acp/logs/</code>; hooks must not print credentials. Prefer absolute hook
-wrappers outside candidate worktrees. The current alpha does not yet enforce
-that path boundary for lifecycle hooks.
+<code>.acp/logs/</code>; hooks must not print credentials. Legacy shell hooks
+remain trusted operator configuration. Prefer phase-scoped runtime drivers for
+supported resource types: their executable and parent chain must be root-owned
+and non-group/world-writable,
+execution uses a scrubbed environment and immediate open/stat identity check, and teardown
+must prove resource absence.
 
 Runtime port pools prevent two cooperating ACP attempts from receiving the same
 configured TCP port. They are not kernel reservations: an unrelated local
 process can race the availability probe. ACP quarantines a port that remains
-occupied after teardown, but it cannot prove cleanup of database schemas,
-containers, cloud resources, or other side effects. Use idempotent trusted hooks
-and provider-native deletion/fencing for those resources.
+occupied after teardown. Built-in drivers prove cleanup of their declared
+Compose project, PostgreSQL schema, or browser profile; ACP cannot prove
+undeclared cloud or application side effects. Use provider-native
+deletion/fencing for those resources.
 
-Local reviewer names are policy identities, not cryptographically authenticated
-humans or model providers. A high-assurance deployment must authenticate each
-runner and place the critic behind separate credentials.
+After the first runner enrollment, every worker heartbeat/submission/process
+transition, critic review, and integration transition requires a role-scoped
+bearer credential. Attempts bind to the credential digest used at claim, and
+revocation cannot disable authentication. These are local bearer identities,
+not cryptographically authenticated humans, model providers, or remote hosts.
+Use distinct credential sinks and OS accounts or an external identity gateway
+for higher assurance.
+
+Candidate-facing child environments use a small public allowlist plus explicit
+ACP runtime variables; arbitrary host secrets are not inherited. The CLI
+accepts credentials from a private file, inherited environment, or
+file descriptor and never from argv. Enrollment writes the one-time secret to a
+private file or descriptor rather than JSON. PostgreSQL driver DSNs stay out of
+argv and are redacted from evidence; drivers require <code>dsn_env</code> and
+reject literal DSNs in tracked configuration.
 
 The local event hash chain detects missing or modified records but is not
 tamper-proof against a database administrator who can rewrite and recompute the

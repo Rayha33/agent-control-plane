@@ -2,11 +2,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 from collections.abc import Sequence
 from typing import Any
 
 from .git_supervisor import GitSupervisor, SupervisorError
+
+
+def add_credential_source(command: argparse.ArgumentParser) -> None:
+    source = command.add_mutually_exclusive_group()
+    source.add_argument(
+        "--credential-file",
+        help="read the runner credential from a private (0600) file",
+    )
+    source.add_argument(
+        "--credential-fd",
+        type=int,
+        help="read the runner credential from an already-open file descriptor",
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -37,25 +52,33 @@ def parser() -> argparse.ArgumentParser:
     claim.add_argument("task_id")
     claim.add_argument("--agent", required=True, dest="agent_id")
     claim.add_argument("--lease-seconds", type=int)
+    add_credential_source(claim)
     heartbeat = commands.add_parser("heartbeat", help="renew a fenced attempt")
     heartbeat.add_argument("attempt_id")
     heartbeat.add_argument("--token", type=int, required=True, dest="claim_token")
     heartbeat.add_argument("--checkpoint", default="{}")
     heartbeat.add_argument("--lease-seconds", type=int)
+    add_credential_source(heartbeat)
     submit = commands.add_parser("submit", help="submit committed Git evidence")
     submit.add_argument("attempt_id")
     submit.add_argument("--token", type=int, required=True, dest="claim_token")
+    add_credential_source(submit)
     qc = commands.add_parser("qc", help="run QC in a fresh detached worktree")
     qc.add_argument("submission_id")
     qc.add_argument("--reviewer", help="must match critic_identity in acp.toml")
+    add_credential_source(qc)
     integrate = commands.add_parser("integrate", help="create a gated integration branch")
     integrate.add_argument("task_id")
+    integrate.add_argument("--integrator", default="integration")
+    add_credential_source(integrate)
     run = commands.add_parser("run", help="run an agent command in its worktree")
     run.add_argument("attempt_id")
     run.add_argument("--token", type=int, required=True, dest="claim_token")
+    add_credential_source(run)
     run.add_argument("command", nargs=argparse.REMAINDER)
     terminate = commands.add_parser("terminate", help="stop a supervised worker")
     terminate.add_argument("attempt_id")
+    add_credential_source(terminate)
     environment = commands.add_parser(
         "environment", help="show the isolated runtime assigned to an attempt"
     )
@@ -65,10 +88,20 @@ def parser() -> argparse.ArgumentParser:
     )
     enroll = commands.add_parser(
         "runner-enroll",
-        help="register a runner identity and print its credential once",
+        help="register a runner identity and write its credential to a private sink",
     )
     enroll.add_argument("agent_id")
     enroll.add_argument("--role", required=True, choices=["worker", "critic", "integrator"])
+    output = enroll.add_mutually_exclusive_group(required=True)
+    output.add_argument(
+        "--credential-output-file",
+        help="create this private file (must not already exist) for the credential",
+    )
+    output.add_argument(
+        "--credential-output-fd",
+        type=int,
+        help="write the credential to an already-open file descriptor",
+    )
     revoke = commands.add_parser("runner-revoke", help="revoke a runner credential")
     revoke.add_argument("agent_id")
     commands.add_parser("runner-list", help="list enrolled runner identities")
@@ -98,6 +131,93 @@ def parser() -> argparse.ArgumentParser:
 
 def emit(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _read_credential(args: argparse.Namespace) -> str | None:
+    credential_file = getattr(args, "credential_file", None)
+    credential_fd = getattr(args, "credential_fd", None)
+    if credential_file:
+        path = os.path.abspath(os.path.expanduser(credential_file))
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as error:
+            raise SupervisorError(
+                "credential_source_unavailable", "credential file is unavailable"
+            ) from error
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode) or details.st_mode & 0o077:
+                raise SupervisorError(
+                    "insecure_credential_file",
+                    "credential file must be a regular file with no group/other permissions",
+                )
+            value = os.read(descriptor, 4097).decode("utf-8")
+        except (OSError, UnicodeError) as error:
+            raise SupervisorError(
+                "credential_source_unavailable", "credential file could not be read"
+            ) from error
+        finally:
+            os.close(descriptor)
+    elif credential_fd is not None:
+        if credential_fd < 0:
+            raise SupervisorError("invalid_credential_fd", "credential fd must be non-negative")
+        try:
+            value = os.read(credential_fd, 4097).decode("utf-8")
+        except (OSError, UnicodeError) as error:
+            raise SupervisorError(
+                "credential_source_unavailable", "credential fd could not be read"
+            ) from error
+    else:
+        value = os.environ.get("ACP_RUNNER_CREDENTIAL", "")
+    value = value.strip()
+    if len(value) > 4096:
+        raise SupervisorError("invalid_credential", "runner credential is too long")
+    return value or None
+
+
+def _deliver_enrollment_credential(
+    enrolled: dict[str, Any], descriptor: int, sink: str
+) -> dict[str, Any]:
+    secret = enrolled.pop("credential")
+    payload = (secret + "\n").encode()
+    written = 0
+    while written < len(payload):
+        written += os.write(descriptor, payload[written:])
+    enrolled["credential_sink"] = sink
+    return enrolled
+
+
+def _prepare_enrollment_sink(
+    args: argparse.Namespace,
+) -> tuple[int, str, str | None]:
+    output_file = getattr(args, "credential_output_file", None)
+    output_fd = getattr(args, "credential_output_fd", None)
+    if output_file:
+        path = os.path.abspath(os.path.expanduser(output_file))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as error:
+            raise SupervisorError(
+                "credential_sink_unavailable",
+                "credential output file must be a new writable private file",
+            ) from error
+        return descriptor, path, path
+    if output_fd is not None:
+        if output_fd <= 2:
+            raise SupervisorError(
+                "invalid_credential_fd",
+                "credential output fd must be 3 or greater, never stdout/stderr",
+            )
+        try:
+            descriptor = os.dup(output_fd)
+        except OSError as error:
+            raise SupervisorError(
+                "credential_sink_unavailable", "credential output fd is not open"
+            ) from error
+        return descriptor, f"fd:{output_fd}", None
+    # argparse makes this unreachable; keep the API fail-closed.
+    raise SupervisorError("credential_sink_required", "secure credential sink is required")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -137,7 +257,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "show":
             result = supervisor.task(args.task_id)
         elif args.action == "claim":
-            result = supervisor.claim(args.task_id, args.agent_id, args.lease_seconds)
+            result = supervisor.claim(
+                args.task_id,
+                args.agent_id,
+                args.lease_seconds,
+                _read_credential(args),
+            )
         elif args.action == "heartbeat":
             try:
                 checkpoint = json.loads(args.checkpoint)
@@ -152,23 +277,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.claim_token,
                 checkpoint,
                 args.lease_seconds,
+                _read_credential(args),
             )
         elif args.action == "submit":
-            result = supervisor.submit(args.attempt_id, args.claim_token)
+            result = supervisor.submit(args.attempt_id, args.claim_token, _read_credential(args))
         elif args.action == "qc":
             reviewer = args.reviewer or supervisor.config.critic_identity
-            result = supervisor.run_qc(args.submission_id, reviewer)
+            result = supervisor.run_qc(args.submission_id, reviewer, _read_credential(args))
         elif args.action == "integrate":
-            result = supervisor.integrate(args.task_id)
+            result = supervisor.integrate(args.task_id, args.integrator, _read_credential(args))
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
-            result = supervisor.run_worker(args.attempt_id, args.claim_token, command)
+            result = supervisor.run_worker(
+                args.attempt_id, args.claim_token, command, _read_credential(args)
+            )
         elif args.action == "terminate":
-            result = supervisor.terminate_worker(args.attempt_id)
+            result = supervisor.terminate_worker(args.attempt_id, _read_credential(args))
         elif args.action == "environment":
             result = supervisor.runtime_environment(args.attempt_id)
         elif args.action == "runner-enroll":
-            result = supervisor.enroll_runner(args.agent_id, args.role)
+            descriptor, sink, created_path = _prepare_enrollment_sink(args)
+            enrolled = False
+            delivered = False
+            try:
+                result = supervisor.enroll_runner(args.agent_id, args.role)
+                enrolled = True
+                result = _deliver_enrollment_credential(result, descriptor, sink)
+                delivered = True
+            except OSError as error:
+                if enrolled:
+                    supervisor.revoke_runner(args.agent_id)
+                raise SupervisorError(
+                    "credential_delivery_failed",
+                    "credential sink failed; the new identity was revoked",
+                ) from error
+            finally:
+                os.close(descriptor)
+                if created_path and not delivered:
+                    try:
+                        os.unlink(created_path)
+                    except FileNotFoundError:
+                        pass
         elif args.action == "runner-revoke":
             result = supervisor.revoke_runner(args.agent_id)
         elif args.action == "runner-list":

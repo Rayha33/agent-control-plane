@@ -89,6 +89,4 @@ def assert_distinct(worker_agent_id: str, reviewer_agent_id: str) -> None:
     """
 
     if worker_agent_id == reviewer_agent_id:
-        raise IdentityError(
-            "self_review_forbidden", "worker cannot review its own submission"
-        )
+        raise IdentityError("self_review_forbidden", "worker cannot review its own submission")
