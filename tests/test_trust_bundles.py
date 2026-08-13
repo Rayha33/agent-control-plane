@@ -119,9 +119,10 @@ def test_verifier_reports_all_replacement_and_permission_failures(tmp_path: Path
     bundle = root / "bundles" / pin["bundle_id"]
     target = bundle / "driver"
     bundle.chmod(0o755)
-    target.unlink()
-    target.write_text("replaced", encoding="utf-8")
-    target.chmod(0o777)
+    replacement = bundle / "replacement"
+    replacement.write_text("replaced", encoding="utf-8")
+    replacement.chmod(0o777)
+    replacement.replace(target)
 
     health = verify_bundle_pin(pin)
 
