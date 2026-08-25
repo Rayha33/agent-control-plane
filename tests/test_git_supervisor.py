@@ -821,7 +821,7 @@ if first == 0:
     pathlib.Path({str(marker)!r}).write_text("leaked")
     os._exit(0)
 
-pathlib.Path("alpha.txt").write_text("contained\n")
+pathlib.Path("alpha.txt").write_text("contained\\n")
 subprocess.run(["git", "add", "alpha.txt"], check=True)
 subprocess.run(["git", "commit", "-m", "contained worker"], check=True)
 """
