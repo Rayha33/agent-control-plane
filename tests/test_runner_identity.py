@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from support import python_command
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
 from agent_control_plane.runner_identity import (
@@ -17,7 +19,12 @@ from agent_control_plane.runner_identity import (
     verify_credential,
 )
 
-CONFIG = """
+requires_linux_worker = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="long-running worker containment requires Linux child-subreaper support",
+)
+
+CONFIG = f"""
 [supervisor]
 lease_seconds = 60
 qc_timeout_seconds = 30
@@ -25,11 +32,11 @@ critic_identity = "independent-qc"
 require_critic = false
 
 [qc]
-commands = ["python -c 'pass'"]
+commands = {json.dumps([python_command("pass")])}
 critic_command = ""
 
 [integration]
-commands = ["python -c 'pass'"]
+commands = {json.dumps([python_command("pass")])}
 
 [runtime]
 setup_commands = []
@@ -319,6 +326,7 @@ def test_every_privileged_transition_requires_its_role_credential(repo: Path) ->
     assert integration["verdict"] == "pass"
 
 
+@requires_linux_worker
 def test_runner_credential_is_not_inherited_by_candidate_processes(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -369,7 +377,7 @@ def test_runner_credential_is_scrubbed_from_qc_critic_and_integration(
 ) -> None:
     config = (repo / "acp.toml").read_text(encoding="utf-8")
     config = config.replace(
-        "commands = [\"python -c 'pass'\"]",
+        f"commands = {json.dumps([python_command('pass')])}",
         'commands = ["test -z \\"${ACP_RUNNER_CREDENTIAL:-}\\""]',
     ).replace('critic_command = ""', 'critic_command = "builtin"')
     (repo / "acp.toml").write_text(config, encoding="utf-8")
@@ -404,12 +412,14 @@ def test_revoked_critic_cannot_finalize_a_running_review(
     original = supervisor._run_command
     revoked = False
 
-    def revoke_during_qc(command, cwd, extra_env=None):  # type: ignore[no-untyped-def]
+    def revoke_during_qc(  # type: ignore[no-untyped-def]
+        command, cwd, extra_env=None, pass_fds=()
+    ):
         nonlocal revoked
         if not revoked:
             revoked = True
             supervisor.revoke_runner("independent-qc")
-        return original(command, cwd, extra_env)
+        return original(command, cwd, extra_env, pass_fds=pass_fds)
 
     monkeypatch.setattr(supervisor, "_run_command", revoke_during_qc)
     with pytest.raises(SupervisorError) as error:
@@ -433,12 +443,14 @@ def test_revoked_integrator_cannot_finalize_a_running_integration(
     original = supervisor._run_command
     revoked = False
 
-    def revoke_during_integration(command, cwd, extra_env=None):  # type: ignore[no-untyped-def]
+    def revoke_during_integration(  # type: ignore[no-untyped-def]
+        command, cwd, extra_env=None, pass_fds=()
+    ):
         nonlocal revoked
         if not revoked:
             revoked = True
             supervisor.revoke_runner("integrator-1")
-        return original(command, cwd, extra_env)
+        return original(command, cwd, extra_env, pass_fds=pass_fds)
 
     monkeypatch.setattr(supervisor, "_run_command", revoke_during_integration)
     result = supervisor.integrate(created["id"], "integrator-1", integrator["credential"])

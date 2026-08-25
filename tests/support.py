@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 from agent_control_plane.git_supervisor import GitSupervisor
+
+
+def python_command(source: str) -> str:
+    """Run test code with the interpreter that is running pytest."""
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -26,7 +33,7 @@ def write_config(
     require_critic: bool = False,
     timeout_seconds: int = 30,
 ) -> None:
-    qc = qc_commands if qc_commands is not None else ["python -c 'pass'"]
+    qc = qc_commands if qc_commands is not None else [python_command("pass")]
     integration = integration_commands if integration_commands is not None else qc
     (repo / "acp.toml").write_text(
         "[supervisor]\n"

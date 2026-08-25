@@ -11,9 +11,19 @@ from pathlib import Path
 from threading import Barrier, Event
 
 import pytest
+from support import python_command
 
-from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.git_supervisor import (
+    CLEANUP_FENCE_EPOCH,
+    GitSupervisor,
+    SupervisorError,
+)
 from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
+
+requires_linux_worker = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="long-running worker containment requires Linux child-subreaper support",
+)
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -37,7 +47,7 @@ def write_config(
     runtime_teardown_commands: list[str] | None = None,
     runtime_ports: dict[str, tuple[int, int]] | None = None,
 ) -> None:
-    qc = qc_commands if qc_commands is not None else ["python -c 'pass'"]
+    qc = qc_commands if qc_commands is not None else [python_command("pass")]
     integration = integration_commands if integration_commands is not None else qc
     content = {
         "qc": json.dumps(qc),
@@ -123,13 +133,22 @@ def two_free_ports() -> tuple[int, int]:
     return free_port_range(2)
 
 
-def install_test_bundle(source: Path, root: Path, version: str, message: str) -> dict:
+def install_test_bundle(
+    source: Path,
+    root: Path,
+    version: str,
+    message: str,
+    script: str | None = None,
+) -> dict:
     source.mkdir(exist_ok=True)
     executable = source / "critic"
     executable.write_text(
-        "#!/bin/sh\n"
-        f"# {message}\n"
-        'printf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n',
+        script
+        or (
+            "#!/bin/sh\n"
+            f"# {message}\n"
+            'printf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n'
+        ),
         encoding="utf-8",
     )
     executable.chmod(0o755)
@@ -193,6 +212,7 @@ def test_non_overlapping_tasks_get_parallel_worktrees(repo: Path) -> None:
     assert claims[0]["worktree"] != claims[1]["worktree"]
 
 
+@requires_linux_worker
 def test_runtime_ports_are_unique_and_reach_supervised_worker(repo: Path) -> None:
     start, end = two_free_ports()
     write_config(repo, runtime_ports={"APP_PORT": (start, end)})
@@ -244,11 +264,11 @@ def test_parallel_runtime_claims_receive_unique_ports(repo: Path) -> None:
 
 def test_runtime_lifecycle_is_shared_with_qc_and_integration(repo: Path) -> None:
     start, end = two_free_ports()
-    gate = (
-        "python -c 'import os; from pathlib import Path; "
+    gate = python_command(
+        "import os; from pathlib import Path; "
         'assert os.environ.get("APP_PORT"); '
         'assert Path(os.environ["ACP_WORKTREE"]).resolve() == Path.cwd().resolve(); '
-        'assert os.environ["ACP_PHASE"] in {"qc", "integration"}\''
+        'assert os.environ["ACP_PHASE"] in {"qc", "integration"}'
     )
     write_config(
         repo,
@@ -313,6 +333,7 @@ def test_reaper_tears_down_expired_runtime(repo: Path) -> None:
     assert supervisor.runtime_environment(attempt["id"])["state"] == "released"
 
 
+@requires_linux_worker
 def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> None:
     start, _ = two_free_ports()
     write_config(repo, runtime_ports={"APP_PORT": (start, start)})
@@ -343,6 +364,68 @@ def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> 
     assert result["terminated_workers"][0]["attempt_id"] == attempt["id"]
     assert result["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
     assert supervisor._port_available(port)
+
+
+def test_failed_worker_termination_keeps_cleanup_fence_and_runtime(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    first_task = task(supervisor, "alpha.txt", "first")
+    second_task = task(supervisor, "alpha.txt", "second")
+    attempt = supervisor.claim(first_task["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = 424242, pid_identity = 'linux:424242:1' WHERE id = ?",
+            (attempt["id"],),
+        )
+    monkeypatch.setattr(supervisor, "_terminate_registered_group", lambda *_: "failed")
+
+    result = supervisor.reap_expired(now=attempt["lease_expires_at"])
+
+    assert result["orphaned"] == []
+    assert result["runtime_cleanup"][0]["state"] == "cleanup_error"
+    retained = supervisor.attempt(attempt["id"])
+    assert retained["status"] == "terminating"
+    assert retained["runtime"]["state"] == "ready"
+    assert retained["resource_leases"][0]["lease_expires_at"] > 2**61
+    with pytest.raises(SupervisorError) as collision:
+        supervisor.claim(second_task["id"], "agent-b")
+    assert collision.value.code == "resource_busy"
+
+
+def test_concurrent_claim_cannot_pass_a_reaper_blocked_on_worker_termination(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    first_task = task(supervisor, "alpha.txt", "first")
+    second_task = task(supervisor, "alpha.txt", "second")
+    attempt = supervisor.claim(first_task["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = 424242, pid_identity = 'linux:424242:1' WHERE id = ?",
+            (attempt["id"],),
+        )
+    termination_entered = Event()
+    release_termination = Event()
+
+    def blocked_termination(_pid: int, _identity: str) -> str:
+        termination_entered.set()
+        assert release_termination.wait(timeout=5)
+        return "failed"
+
+    monkeypatch.setattr(supervisor, "_terminate_registered_group", blocked_termination)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        reaping = pool.submit(supervisor.reap_expired, attempt["lease_expires_at"])
+        assert termination_entered.wait(timeout=5)
+        with pytest.raises(SupervisorError) as collision:
+            supervisor.claim(second_task["id"], "agent-b")
+        assert collision.value.code == "resource_busy"
+        assert supervisor.attempt(attempt["id"])["status"] == "terminating"
+        release_termination.set()
+        result = reaping.result(timeout=5)
+
+    assert result["orphaned"] == []
+    assert supervisor.task(second_task["id"])["status"] == "open"
 
 
 def test_directory_aliases_overlap_and_internal_paths_are_rejected(
@@ -411,7 +494,7 @@ def test_crash_recovery_preserves_commit_and_fences_zombie(repo: Path) -> None:
 
 
 def test_qc_uses_real_commit_and_failure_cannot_pass(repo: Path) -> None:
-    write_config(repo, ["python -c 'raise SystemExit(7)'"])
+    write_config(repo, [python_command("raise SystemExit(7)")])
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
@@ -427,7 +510,7 @@ def test_qc_uses_real_commit_and_failure_cannot_pass(repo: Path) -> None:
 def test_qc_command_that_mutates_candidate_cannot_pass(repo: Path) -> None:
     write_config(
         repo,
-        ["""python -c 'from pathlib import Path; Path("alpha.txt").write_text("cheat")'"""],
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("cheat")')],
     )
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
@@ -496,7 +579,7 @@ def test_empty_gate_configuration_fails_closed(repo: Path) -> None:
 
 @pytest.mark.parametrize(
     ("qc_commands", "integration_commands"),
-    [(["   "], ["python -c 'pass'"]), (["python -c 'pass'"], ["\t"])],
+    [(["   "], [python_command("pass")]), ([python_command("pass")], ["\t"])],
 )
 def test_whitespace_gate_configuration_fails_closed(
     repo: Path,
@@ -592,6 +675,79 @@ def test_passed_qc_creates_gated_integration_branch(repo: Path) -> None:
     assert supervisor.task(created["id"])["status"] == "done"
 
 
+def test_integration_gate_cannot_leave_a_detached_child(repo: Path) -> None:
+    marker = repo / "integration-detached-child"
+    daemon = (
+        f"import pathlib,time; time.sleep(1); pathlib.Path({str(marker)!r}).write_text('leaked')"
+    )
+    root = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {daemon!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, start_new_session=True)"
+    )
+    write_config(repo, integration_commands=[python_command(root)])
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "good\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    integration = supervisor.integrate(created["id"])
+
+    if sys.platform == "darwin":
+        assert integration["verdict"] != "pass"
+    else:
+        assert integration["verdict"] == "pass"
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
+def test_integration_merge_disables_detached_and_blocking_repository_hooks(repo: Path) -> None:
+    marker = repo / "post-merge-hook-escaped"
+    hook = repo / ".git" / "hooks" / "post-merge"
+    hook.write_text(
+        f"#!/bin/sh\n(sleep 1; printf leaked > {str(marker)!r}) &\nsleep 5\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    write_config(repo, timeout_seconds=1)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "good\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    started = time.monotonic()
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "pass"
+    assert time.monotonic() - started < 3
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
+def test_integration_rejects_local_git_merge_driver(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "good\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "merge.hostile.driver", "/usr/bin/true"],
+        check=True,
+    )
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "failed"
+    assert "refuses executable Git config" in integration["error"]
+    assert supervisor.task(created["id"])["status"] == "conflicted"
+
+
 def test_task_resolves_head_to_stable_base_branch(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
@@ -627,6 +783,59 @@ def test_expired_worker_is_never_spawned(repo: Path) -> None:
     assert not marker.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform.startswith("linux"),
+    reason="Darwin-specific fail-closed platform contract",
+)
+def test_long_running_worker_fails_closed_without_linux_subreaper(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], ["/bin/true"])
+
+    assert error.value.code == "process_containment_unavailable"
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+
+
+@requires_linux_worker
+def test_worker_subreaper_contains_rapid_double_fork_on_success(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "double-fork-worker-leak"
+    command = f"""
+import os
+import pathlib
+import subprocess
+import time
+
+first = os.fork()
+if first == 0:
+    os.setsid()
+    second = os.fork()
+    if second > 0:
+        os._exit(0)
+    time.sleep(1)
+    pathlib.Path({str(marker)!r}).write_text("leaked")
+    os._exit(0)
+
+pathlib.Path("alpha.txt").write_text("contained\n")
+subprocess.run(["git", "add", "alpha.txt"], check=True)
+subprocess.run(["git", "commit", "-m", "contained worker"], check=True)
+"""
+
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
+
+    assert submission["status"] == "pending_qc"
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
+@requires_linux_worker
 def test_registration_failure_terminates_spawned_worker(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -663,6 +872,7 @@ def test_registration_failure_terminates_spawned_worker(
     assert not marker.exists()
 
 
+@requires_linux_worker
 def test_pipe_failure_does_not_leave_launch_reservation(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -691,6 +901,7 @@ def test_pipe_failure_does_not_leave_launch_reservation(
 
 
 @pytest.mark.parametrize("_round", range(5))
+@requires_linux_worker
 def test_duplicate_run_starts_exactly_one_process(repo: Path, _round: int) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
@@ -720,6 +931,7 @@ def test_duplicate_run_starts_exactly_one_process(repo: Path, _round: int) -> No
     assert sum(marker.exists() for marker in markers) == 1
 
 
+@requires_linux_worker
 def test_run_reservation_remains_held_until_submit(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -766,6 +978,7 @@ def test_run_reservation_remains_held_until_submit(
     assert submission["status"] == "pending_qc"
 
 
+@requires_linux_worker
 def test_manual_submit_cannot_consume_running_worker(
     repo: Path,
 ) -> None:
@@ -819,7 +1032,98 @@ def test_timed_out_qc_kills_detached_child(repo: Path) -> None:
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     review = supervisor.run_qc(submission["id"], "independent-qc")
     assert review["verdict"] == "block"
-    assert review["command_results"][0]["exit_code"] == 124
+    if sys.platform == "darwin":
+        assert review["command_results"][0]["exit_code"] != 0
+        assert "Operation not permitted" in review["command_results"][0]["stderr"]
+    else:
+        assert review["command_results"][0]["exit_code"] == 124
+    time.sleep(2.2)
+    assert not marker.exists()
+
+
+def test_successful_qc_kills_detached_child(repo: Path) -> None:
+    marker = repo / "successful-qc-child"
+    daemon = (
+        f"import pathlib,time; time.sleep(1); pathlib.Path({str(marker)!r}).write_text('leaked')"
+    )
+    root = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {daemon!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, start_new_session=True)"
+    )
+    write_config(repo, [python_command(root)], timeout_seconds=5)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    if sys.platform == "darwin":
+        # Current Darwin has no supported recursive process tracking primitive.
+        # The kernel sandbox therefore denies fork and fails the review closed.
+        assert review["verdict"] == "block"
+        assert review["command_results"][0]["exit_code"] != 0
+    else:
+        assert review["verdict"] == "pass"
+        assert review["command_results"][0]["exit_code"] == 0
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
+def test_trusted_external_critic_cannot_leave_a_detached_child(repo: Path) -> None:
+    marker = repo / "critic-detached-child"
+    trust_root = repo.parent / "critic-containment-trust"
+    source = repo.parent / "critic-containment-source"
+    script = (
+        "#!/bin/sh\n"
+        f"(/bin/sleep 1; /usr/bin/touch '{marker}') >/dev/null 2>&1 &\n"
+        'printf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n'
+    )
+    install_test_bundle(source, trust_root, "v1", "daemon critic", script)
+    configure_trust(repo, trust_root)
+    require_trusted_critic(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    if sys.platform == "darwin":
+        assert review["verdict"] != "pass", "Darwin must deny critic forks"
+    else:
+        assert review["verdict"] == "pass"
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
+def test_timed_out_external_critic_cannot_leave_a_detached_child(repo: Path) -> None:
+    marker = repo / "critic-timeout-child"
+    trust_root = repo.parent / "critic-timeout-trust"
+    source = repo.parent / "critic-timeout-source"
+    script = (
+        "#!/bin/sh\n"
+        f"(/bin/sleep 2; /usr/bin/touch '{marker}') >/dev/null 2>&1 &\n"
+        "/bin/sleep 5\n"
+        'printf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n'
+    )
+    write_config(repo, timeout_seconds=1)
+    install_test_bundle(source, trust_root, "v1", "timeout critic", script)
+    configure_trust(repo, trust_root)
+    require_trusted_critic(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    assert review["verdict"] != "pass"
     time.sleep(2.2)
     assert not marker.exists()
 
@@ -861,7 +1165,7 @@ def test_expiry_during_integration_deletes_branch_and_records_stale(
 ) -> None:
     write_config(
         repo,
-        integration_commands=["python -c 'import time; time.sleep(0.8)'"],
+        integration_commands=[python_command("import time; time.sleep(0.8)")],
     )
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
@@ -880,12 +1184,94 @@ def test_expiry_during_integration_deletes_branch_and_records_stale(
                 "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
                 (created["id"],),
             )
-        assert created["id"] in supervisor.reap_expired()["conflicted"]
-        result = future.result(timeout=5)
+        reaped = supervisor.reap_expired()
+        assert created["id"] not in reaped["conflicted"]
+        assert supervisor.task(created["id"])["status"] == "cleanup_pending"
+        with supervisor.connect() as connection:
+            held = connection.execute(
+                "SELECT lease_expires_at FROM resource_leases WHERE task_id = ?",
+                (created["id"],),
+            ).fetchone()
+        assert held and held["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+        result = future.result(timeout=15)
 
     assert result["verdict"] == "stale"
+    assert supervisor.task(created["id"])["status"] == "conflicted"
     assert result["branch"] is None
     assert not git(repo, "branch", "--list", "acp/integrate-*")
+
+
+def test_concurrent_qc_is_rejected_before_a_second_worktree_starts(repo: Path) -> None:
+    write_config(repo, qc_commands=[python_command("import time; time.sleep(0.6)")])
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(supervisor.run_qc, submission["id"], "independent-qc")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            current = supervisor.submission(submission["id"])
+            if current["status"] == "qc_running":
+                break
+            time.sleep(0.02)
+        assert current["status"] == "qc_running"
+        assert current["qc_resume_status"] == "pending_qc"
+        qc_worktrees = repo / ".acp" / "worktrees"
+        while len(list(qc_worktrees.glob("qc-*"))) != 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(list(qc_worktrees.glob("qc-*"))) == 1
+        with pytest.raises(SupervisorError) as captured:
+            supervisor.run_qc(submission["id"], "independent-qc")
+        assert captured.value.code == "task_operation_in_progress"
+        assert future.result(timeout=15)["verdict"] == "pass"
+
+    with supervisor.connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) AS count FROM qc_runs WHERE submission_id = ?",
+            (submission["id"],),
+        ).fetchone()["count"]
+    assert count == 1
+
+
+def test_expired_live_qc_keeps_collision_fence_until_executor_and_runtime_end(
+    repo: Path,
+) -> None:
+    write_config(repo, qc_commands=[python_command("import time; time.sleep(0.6)")])
+    supervisor = GitSupervisor(repo)
+    first = task(supervisor, "alpha.txt")
+    second = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(first["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(supervisor.run_qc, submission["id"], "independent-qc")
+        deadline = time.time() + 5
+        while supervisor.submission(submission["id"])["status"] != "qc_running":
+            assert time.time() < deadline
+            time.sleep(0.02)
+        with supervisor.connect() as connection:
+            connection.execute(
+                "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
+                (first["id"],),
+            )
+        first_reap = supervisor.reap_expired()
+        assert first_reap["conflicted"] == []
+        assert supervisor.task(first["id"])["status"] == "cleanup_pending"
+        with pytest.raises(SupervisorError) as captured:
+            supervisor.claim(second["id"], "other-worker")
+        assert captured.value.code == "resource_busy"
+        with pytest.raises(SupervisorError) as qc_error:
+            future.result(timeout=15)
+        assert qc_error.value.code == "submission_not_reviewable"
+
+    second_reap = supervisor.reap_expired()
+    assert first["id"] in second_reap["conflicted"]
+    assert supervisor.runtime_environment(attempt["id"])["state"] == "released"
+    assert supervisor.claim(second["id"], "other-worker")["status"] == "working"
 
 
 def test_critic_identity_and_event_chain_are_enforced(repo: Path) -> None:
@@ -945,7 +1331,8 @@ def test_missing_old_pin_quarantines_instead_of_switching_to_current(repo: Path)
     assert error.value.code == "trust_bundle_quarantined"
     quarantined = supervisor.attempt(attempt["id"])
     assert quarantined["status"] == "quarantined"
-    assert supervisor.task(created["id"])["status"] == "blocked"
+    assert supervisor.task(created["id"])["status"] == "cleanup_pending"
+    assert supervisor.task(created["id"])["cleanup_target_status"] == "blocked"
     assert quarantined["trust_bundle"]["bundle_id"] != new["bundle_id"]
     doctor = supervisor.doctor()
     failed = [check for check in doctor["checks"] if check["name"].startswith("trust_pinned:")]
@@ -976,6 +1363,7 @@ def test_missing_qc_trust_pin_blocks_integration_before_branch_creation(repo: Pa
     require_trusted_critic(repo)
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
+    colliding = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
     commit_change(attempt, "alpha.txt", "reviewed\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
@@ -987,7 +1375,22 @@ def test_missing_qc_trust_pin_blocks_integration_before_branch_creation(repo: Pa
     with pytest.raises(SupervisorError) as error:
         supervisor.integrate(created["id"])
     assert error.value.code == "trust_bundle_quarantined"
-    assert supervisor.task(created["id"])["status"] == "blocked"
+    fenced = supervisor.task(created["id"])
+    assert fenced["status"] == "cleanup_pending"
+    assert fenced["cleanup_target_status"] == "blocked"
+    install_test_bundle(source, trust_root, "v2", "replacement")
+    with supervisor.connect() as connection:
+        lease = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert lease and lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+    assert any(
+        item["state"] == "cleanup_error" for item in supervisor.reap_expired()["runtime_cleanup"]
+    )
+    with pytest.raises(SupervisorError) as claim_error:
+        supervisor.claim(colliding["id"], "other-worker")
+    assert claim_error.value.code == "resource_busy"
     assert not git(repo, "branch", "--list", "acp/integrate-*")
 
 
@@ -995,9 +1398,8 @@ def test_trust_pin_invalidated_during_integration_records_stale_and_deletes_bran
     repo: Path,
 ) -> None:
     marker = repo.parent / f"integration-running-{repo.name}"
-    integration_command = (
-        'python -c "import pathlib,time; '
-        f"pathlib.Path({str(marker)!r}).write_text('running'); time.sleep(0.8)\""
+    integration_command = python_command(
+        f"import pathlib,time; pathlib.Path({str(marker)!r}).write_text('running'); time.sleep(0.8)"
     )
     write_config(
         repo,
@@ -1010,6 +1412,7 @@ def test_trust_pin_invalidated_during_integration_records_stale_and_deletes_bran
     require_trusted_critic(repo)
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
+    colliding = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
     commit_change(attempt, "alpha.txt", "reviewed\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
@@ -1023,20 +1426,34 @@ def test_trust_pin_invalidated_during_integration_records_stale_and_deletes_bran
         assert marker.exists()
         bundle = trust_root / "bundles" / pin["bundle_id"]
         bundle.rename(bundle.with_name(f"gone-{pin['bundle_id']}"))
-        result = future.result(timeout=5)
+        result = future.result(timeout=15)
 
     assert result["verdict"] == "stale"
     assert result["branch"] is None
     assert "trust_bundle_quarantined" in result["error"]
-    assert supervisor.task(created["id"])["status"] == "blocked"
+    fenced = supervisor.task(created["id"])
+    assert fenced["status"] == "cleanup_pending"
+    assert fenced["cleanup_target_status"] == "blocked"
+    install_test_bundle(source, trust_root, "v2", "replacement")
+    with supervisor.connect() as connection:
+        lease = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert lease and lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+    assert any(
+        item["state"] == "cleanup_error" for item in supervisor.reap_expired()["runtime_cleanup"]
+    )
+    with pytest.raises(SupervisorError) as claim_error:
+        supervisor.claim(colliding["id"], "other-worker")
+    assert claim_error.value.code == "resource_busy"
     assert not git(repo, "branch", "--list", "acp/integrate-*")
 
 
 def test_trust_pin_invalidated_during_qc_cannot_record_approval(repo: Path) -> None:
     marker = repo.parent / f"qc-running-{repo.name}"
-    qc_command = (
-        'python -c "import pathlib,time; '
-        f"pathlib.Path({str(marker)!r}).write_text('running'); time.sleep(0.8)\""
+    qc_command = python_command(
+        f"import pathlib,time; pathlib.Path({str(marker)!r}).write_text('running'); time.sleep(0.8)"
     )
     write_config(repo, qc_commands=[qc_command])
     trust_root = repo.parent / f"trust-{repo.name}"
@@ -1046,6 +1463,7 @@ def test_trust_pin_invalidated_during_qc_cannot_record_approval(repo: Path) -> N
     require_trusted_critic(repo)
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
+    colliding = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
     commit_change(attempt, "alpha.txt", "reviewed\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
@@ -1059,10 +1477,28 @@ def test_trust_pin_invalidated_during_qc_cannot_record_approval(repo: Path) -> N
         bundle = trust_root / "bundles" / pin["bundle_id"]
         bundle.rename(bundle.with_name(f"gone-{pin['bundle_id']}"))
         with pytest.raises(SupervisorError) as error:
-            future.result(timeout=5)
+            future.result(timeout=15)
 
     assert error.value.code == "trust_bundle_quarantined"
-    assert supervisor.task(created["id"])["status"] == "blocked"
+    fenced = supervisor.task(created["id"])
+    assert fenced["status"] == "cleanup_pending"
+    assert fenced["cleanup_target_status"] == "blocked"
+    install_test_bundle(source, trust_root, "v2", "replacement")
+    current_submission = supervisor.submission(submission["id"])
+    assert current_submission["status"] == "blocked"
+    assert current_submission["qc_resume_status"] == ""
+    with supervisor.connect() as connection:
+        lease = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert lease and lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+    assert any(
+        item["state"] == "cleanup_error" for item in supervisor.reap_expired()["runtime_cleanup"]
+    )
+    with pytest.raises(SupervisorError) as claim_error:
+        supervisor.claim(colliding["id"], "other-worker")
+    assert claim_error.value.code == "resource_busy"
     with supervisor.connect() as connection:
         count = connection.execute(
             "SELECT COUNT(*) FROM qc_runs WHERE submission_id = ?", (submission["id"],)

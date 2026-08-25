@@ -36,8 +36,9 @@ CATEGORY_RANKS: dict[str, int] = {
 
 HUMAN_REQUIRED_STATUSES = frozenset({"blocked", "conflicted", "changes_requested"})
 REVIEW_STATUSES = frozenset({"submitted", "qc_review", "approved"})
-ACTIVE_STATUSES = frozenset({"provisioning", "working"})
-LIVE_ATTEMPT_STATUSES = frozenset({"provisioning", "working"})
+ACTIVE_STATUSES = frozenset({"provisioning", "working", "terminating", "cleanup_pending"})
+LIVE_ATTEMPT_STATUSES = frozenset({"provisioning", "working", "terminating"})
+CLEANUP_STATUSES = frozenset({"terminating", "cleanup_pending"})
 DEFAULT_LEASE_RISK_SECONDS = 30
 
 
@@ -84,6 +85,8 @@ class StatusView:
             submissions = self._latest_submissions(connection)
             runtimes = self._runtimes(connection)
             allocations = self._allocations(connection)
+            quarantines = self._quarantines(connection, now)
+            held_resources = self._held_resources(holders)
 
         # One admission pass, shared with `acp queue`: readiness here means
         # "launchable now, alongside everything above it", not "launchable alone".
@@ -98,11 +101,13 @@ class StatusView:
                     task=task,
                     attempt=attempt,
                     runtime=runtime,
+                    quarantine=quarantines.get(attempt["id"]) if attempt else None,
                     allocations=allocations.get(attempt["id"], []) if attempt else [],
                     submission=submissions.get(task["id"]),
                     preview=previews.get(task["id"]),
                     now=now,
                     lease_risk_seconds=lease_risk_seconds,
+                    held_resources=held_resources.get(task["id"], []),
                 )
             )
 
@@ -115,10 +120,28 @@ class StatusView:
                 "attempt_id": entry["attempt_id"],
                 "task_id": entry["task_id"],
                 "state": entry["runtime"]["state"],
+                "owner": entry["agent_id"],
+                "severity": (entry["runtime"].get("quarantine") or {}).get("severity"),
+                "age_seconds": (entry["runtime"].get("quarantine") or {}).get("age_seconds"),
+                "quarantined_resources": (entry["runtime"].get("quarantine") or {}).get("count", 0),
             }
             for entry in entries
             if entry["runtime"] and entry["runtime"]["state"] == "teardown_failed"
         ]
+        cleanup_failures.extend(
+            {
+                "attempt_id": entry["attempt_id"],
+                "task_id": entry["task_id"],
+                "state": entry["status"],
+                "owner": entry["agent_id"],
+                "severity": "critical",
+                "age_seconds": entry["heartbeat_age_seconds"],
+                "quarantined_resources": len(entry["held_resources"]),
+            }
+            for entry in entries
+            if entry["status"] in CLEANUP_STATUSES
+            and not (entry["runtime"] and entry["runtime"]["state"] == "teardown_failed")
+        )
         counts = {
             "tasks": len(entries),
             "ready": sum(1 for entry in entries if entry["ready"] is True),
@@ -174,6 +197,47 @@ class StatusView:
         return {row["attempt_id"]: dict(row) for row in rows}
 
     @staticmethod
+    def _quarantines(connection: sqlite3.Connection, now: float) -> dict[str, dict[str, Any]]:
+        """Per-attempt quarantine summary for the operator view (#740).
+
+        `cleanup_failed` already outranks review here, but it said only that a
+        teardown had failed — not how long ago, nor whether anything might still
+        be RUNNING. Those are the two facts that decide whether this is tonight's
+        problem or next week's, so they belong on the one screen an operator
+        actually reads.
+
+        Severity is computed locally rather than imported: git_supervisor imports
+        this module, so a reverse import would cycle.
+        """
+
+        rows = connection.execute(
+            "SELECT attempt_id, driver, evidence_json, updated_at "
+            "FROM runtime_driver_resources WHERE state = 'quarantined' ORDER BY driver"
+        ).fetchall()
+        summary: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                evidence = json.loads(row["evidence_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = {}
+            present = bool(evidence.get("present")) if isinstance(evidence, dict) else False
+            proof = evidence.get("proof") if isinstance(evidence, dict) else None
+            cleanup_unproven = isinstance(proof, dict) and not proof.get("cleanup_proved")
+            item = summary.setdefault(
+                row["attempt_id"],
+                {"count": 0, "drivers": [], "age_seconds": None, "severity": "high"},
+            )
+            item["count"] += 1
+            item["drivers"].append(row["driver"])
+            age = _age_seconds(row["updated_at"], now)
+            if age is not None and (item["age_seconds"] is None or age > item["age_seconds"]):
+                item["age_seconds"] = age
+            if present or cleanup_unproven:
+                # Something may still be alive: that outranks a merely unproven row.
+                item["severity"] = "critical"
+        return summary
+
+    @staticmethod
     def _allocations(connection: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
         rows = connection.execute(
             "SELECT attempt_id, pool_name, value FROM runtime_allocations ORDER BY pool_name"
@@ -185,6 +249,15 @@ class StatusView:
             )
         return grouped
 
+    @staticmethod
+    def _held_resources(holders: list[dict[str, Any]]) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        for holder in holders:
+            task_id = holder.get("task_id")
+            if task_id:
+                grouped.setdefault(task_id, []).append(holder["resource"])
+        return grouped
+
     # ------------------------------------------------------------------ shaping
 
     def _task_entry(
@@ -192,11 +265,13 @@ class StatusView:
         task: dict[str, Any],
         attempt: dict[str, Any] | None,
         runtime: dict[str, Any] | None,
+        quarantine: dict[str, Any] | None,
         allocations: list[dict[str, Any]],
         submission: dict[str, Any] | None,
         preview: dict[str, Any] | None,
         now: float,
         lease_risk_seconds: int,
+        held_resources: list[str],
     ) -> dict[str, Any]:
         live = bool(attempt and attempt["status"] in LIVE_ATTEMPT_STATUSES)
         remaining = int(attempt["lease_expires_at"] - now) if live else None
@@ -214,20 +289,29 @@ class StatusView:
             "heartbeat_age_seconds": _age_seconds(attempt["updated_at"], now) if attempt else None,
             "lease_seconds_remaining": remaining,
             "lease_expired": bool(live and remaining is not None and remaining <= 0),
-            "awaiting_reap": bool(live and remaining is not None and remaining <= 0),
+            "awaiting_reap": bool(
+                task["status"] in CLEANUP_STATUSES
+                or (live and remaining is not None and remaining <= 0)
+            ),
             "claimed_paths": task["resources"],
+            "held_resources": held_resources,
+            "cleanup_target_status": task.get("cleanup_target_status", ""),
+            "cleanup_error": task.get("cleanup_error", ""),
             "produces": task["produces"],
             "consumes": task["consumes"],
             "runtime": {
                 "state": runtime["state"],
+                "recovery_action": runtime["recovery_action"],
                 "allocations": allocations,
                 "log_path": runtime["log_path"],
+                "quarantine": quarantine,
             }
             if runtime
             else None,
             "worker": {
                 "status": attempt["status"],
                 "pid": attempt["pid"],
+                "pid_identity": attempt.get("pid_identity", ""),
                 "alive": _process_alive(attempt["pid"]),
                 "log_path": attempt["log_path"],
             }
@@ -249,12 +333,46 @@ class StatusView:
 
     @staticmethod
     def _categorize(entry: dict[str, Any], lease_risk_seconds: int) -> tuple[str | None, str]:
+        if entry["status"] in CLEANUP_STATUSES:
+            worker = entry["worker"] or {}
+            held = entry["held_resources"]
+            details = [f"{len(held)} collision fence(s) held"]
+            if worker.get("pid"):
+                details.append(
+                    f"worker pid {worker['pid']} "
+                    + ("alive" if worker.get("alive") else "not alive")
+                    + (
+                        f" identity {worker.get('pid_identity')}"
+                        if worker.get("pid_identity")
+                        else ""
+                    )
+                )
+            if entry["cleanup_error"]:
+                details.append(f"last error: {entry['cleanup_error']}")
+            return "cleanup_failed", "; ".join(details)
         if entry["status"] in HUMAN_REQUIRED_STATUSES:
             verdict = (entry["qc"] or {}).get("verdict")
             return "human_required", f"task is {entry['status']}" + (
                 f" after a {verdict} verdict" if verdict else ""
             )
         if entry["runtime"] and entry["runtime"]["state"] == "teardown_failed":
+            quarantine = entry["runtime"].get("quarantine")
+            if quarantine:
+                age = quarantine["age_seconds"]
+                owner = entry["agent_id"] or "an unknown agent"
+                return "cleanup_failed", (
+                    f"{quarantine['severity']}: {quarantine['count']} resource(s) quarantined"
+                    + (f" for {age}s" if age is not None else "")
+                    + f", owned by {owner}"
+                    f" — acp runtime-quarantine explain {entry['attempt_id']}"
+                )
+            recovery_action = entry["runtime"].get("recovery_action")
+            if recovery_action:
+                return "cleanup_failed", (
+                    f"interrupted {recovery_action} recovery; resume with "
+                    f"acp runtime-quarantine recover {entry['attempt_id']} "
+                    f"--action {recovery_action}"
+                )
             return "cleanup_failed", "runtime teardown failed; resources stay quarantined"
         remaining = entry["lease_seconds_remaining"]
         if remaining is not None and remaining <= lease_risk_seconds:

@@ -7,6 +7,8 @@ import hmac
 import json
 import os
 import re
+import select
+import shlex
 import shutil
 import signal
 import socket
@@ -18,7 +20,7 @@ import time
 import tomllib
 import unicodedata
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -47,20 +49,23 @@ from .runtime_drivers import (
     DriverError,
     PhaseEvidence,
     build_driver,
+    ownership_token,
     parse_driver_definitions,
     resolve_trusted_executable,
     run_trusted,
 )
 from .scheduling import Scheduler, normalize_artifact
-from .status import DEFAULT_LEASE_RISK_SECONDS, StatusView
+from .status import DEFAULT_LEASE_RISK_SECONDS, StatusView, _age_seconds
 from .trust_bundles import (
     TrustBundleError,
     executable_from_pin,
     load_current_bundle,
     verify_bundle_pin,
 )
+from .worker_trampoline import MONITOR_MODE
 
 GENESIS_HASH = "0" * 64
+CLEANUP_FENCE_EPOCH = 2**62
 SUPERVISOR_SECRET_ENV = {"ACP_RUNNER_CREDENTIAL"}
 PUBLIC_CHILD_ENV = {
     "HOME",
@@ -138,6 +143,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   base_sha TEXT NOT NULL,
   priority INTEGER NOT NULL,
   status TEXT NOT NULL,
+  cleanup_target_status TEXT NOT NULL DEFAULT '',
+  cleanup_error TEXT NOT NULL DEFAULT '',
   current_attempt_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -156,6 +163,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   checkpoint_json TEXT NOT NULL,
   trust_bundle_json TEXT NOT NULL DEFAULT '{}',
   pid INTEGER,
+  pid_identity TEXT NOT NULL DEFAULT '',
   log_path TEXT,
   status TEXT NOT NULL,
   lease_expires_at INTEGER NOT NULL,
@@ -182,6 +190,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   changed_paths_json TEXT NOT NULL,
   resource_tokens_json TEXT NOT NULL,
   status TEXT NOT NULL,
+  qc_resume_status TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS qc_runs (
@@ -225,6 +234,7 @@ CREATE TABLE IF NOT EXISTS runtime_environments (
   state TEXT NOT NULL,
   restart_token TEXT NOT NULL DEFAULT '',
   restart_started_at INTEGER NOT NULL DEFAULT 0,
+  recovery_action TEXT NOT NULL DEFAULT '',
   env_json TEXT NOT NULL,
   setup_results_json TEXT NOT NULL,
   teardown_results_json TEXT NOT NULL,
@@ -260,6 +270,20 @@ CREATE TABLE IF NOT EXISTS runtime_allocations (
   updated_at TEXT NOT NULL,
   PRIMARY KEY(pool_name, value)
 );
+CREATE TABLE IF NOT EXISTS runtime_quarantine_receipts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  driver TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  operator TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  absence_proved INTEGER NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_receipts_attempt
+  ON runtime_quarantine_receipts(attempt_id, recorded_at DESC);
 CREATE TABLE IF NOT EXISTS events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
@@ -304,6 +328,10 @@ class GitSupervisor:
             }
             if "runner_credential_digest" not in attempt_columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN runner_credential_digest TEXT")
+            if "pid_identity" not in attempt_columns:
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN pid_identity TEXT NOT NULL DEFAULT ''"
+                )
             driver_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(runtime_driver_resources)")
@@ -331,6 +359,11 @@ class GitSupervisor:
                     "ALTER TABLE runtime_environments "
                     "ADD COLUMN restart_started_at INTEGER NOT NULL DEFAULT 0"
                 )
+            if "recovery_action" not in runtime_columns:
+                connection.execute(
+                    "ALTER TABLE runtime_environments "
+                    "ADD COLUMN recovery_action TEXT NOT NULL DEFAULT ''"
+                )
             # Upgrade registries created before the explicit flag existed. Once
             # enabled, authentication never silently downgrades because the last
             # credential was revoked.
@@ -352,12 +385,27 @@ class GitSupervisor:
                 connection.execute(
                     f"ALTER TABLE tasks ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"
                 )
+        if "cleanup_target_status" not in columns:
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN cleanup_target_status TEXT NOT NULL DEFAULT ''"
+            )
+        if "cleanup_error" not in columns:
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN cleanup_error TEXT NOT NULL DEFAULT ''"
+            )
         attempt_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(attempts)").fetchall()
         }
         if "trust_bundle_json" not in attempt_columns:
             connection.execute(
                 "ALTER TABLE attempts ADD COLUMN trust_bundle_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        submission_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(submissions)").fetchall()
+        }
+        if "qc_resume_status" not in submission_columns:
+            connection.execute(
+                "ALTER TABLE submissions ADD COLUMN qc_resume_status TEXT NOT NULL DEFAULT ''"
             )
         qc_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(qc_runs)").fetchall()
@@ -379,6 +427,7 @@ class GitSupervisor:
         root = cls._root(Path(repo).resolve())
         config = root / "acp.toml"
         if not config.exists():
+            pytest_command = f"{shlex.quote(sys.executable)} -m pytest -q"
             config.write_text(
                 "[supervisor]\n"
                 "lease_seconds = 300\n"
@@ -386,10 +435,10 @@ class GitSupervisor:
                 'critic_identity = "independent-qc"\n'
                 "require_critic = true\n\n"
                 "[qc]\n"
-                'commands = ["python -m pytest -q"]\n'
+                f"commands = {json.dumps([pytest_command])}\n"
                 'critic_command = "builtin"\n\n'
                 "[integration]\n"
-                'commands = ["python -m pytest -q"]\n\n'
+                f"commands = {json.dumps([pytest_command])}\n\n"
                 "[runtime]\n"
                 "setup_commands = []\n"
                 "teardown_commands = []\n",
@@ -718,12 +767,26 @@ class GitSupervisor:
         if not attempt:
             return
         connection.execute(
-            "UPDATE attempts SET status = 'quarantined', pid = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE attempts SET status = 'quarantined', pid = NULL, "
+            "pid_identity = '', updated_at = ? WHERE id = ?",
             (stamp, attempt_id),
         )
+        self._fence_task_cleanup(
+            connection,
+            attempt["task_id"],
+            attempt_id,
+            "blocked",
+            "supervisor",
+            "trust_bundle_quarantined",
+        )
         connection.execute(
-            "UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?",
-            (stamp, attempt["task_id"]),
+            "UPDATE tasks SET cleanup_error = ?, updated_at = ? WHERE id = ?",
+            ("trust bundle invalid: " + "; ".join(errors), stamp, attempt["task_id"]),
+        )
+        connection.execute(
+            "UPDATE submissions SET status = 'blocked', qc_resume_status = '' "
+            "WHERE task_id = ? AND status = 'qc_running'",
+            (attempt["task_id"],),
         )
         connection.execute(
             "UPDATE runtime_environments SET state = 'teardown_failed', updated_at = ? "
@@ -1181,6 +1244,7 @@ class GitSupervisor:
             error = ""
             touched: list[str] = []
             try:
+                self._assert_safe_git_execution_config()
                 self._git("worktree", "add", "--detach", str(worktree), head)
                 touched = self.assurance.apply_mutations(worktree, case.mutations)
                 packet_path.write_text(
@@ -1425,11 +1489,12 @@ class GitSupervisor:
         environment: dict[str, str],
         log_path: Path,
         stop_on_failure: bool,
+        pass_fds: Sequence[int] = (),
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         log_path.parent.mkdir(parents=True, exist_ok=True)
         for command in commands:
-            result = self._run_command(command, cwd, environment)
+            result = self._run_command(command, cwd, environment, pass_fds=pass_fds)
             with log_path.open("a", encoding="utf-8") as log:
                 log.write(json.dumps(result, sort_keys=True) + "\n")
             results.append(
@@ -1635,6 +1700,58 @@ class GitSupervisor:
             )
 
     # -- trusted runtime drivers -------------------------------------------
+
+    def _driver_secret_read_only(self) -> bytes:
+        """Read the driver HMAC key without migrating or creating state.
+
+        Operator views call this path. A diagnostic command must not turn a
+        missing key into a new key or perform the legacy meta-table migration;
+        either mutation would make ``runtime-quarantine explain`` an unsafe
+        recovery operation disguised as a read.
+        """
+
+        key_path = self.state_dir / "driver.key"
+        if key_path.exists():
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(key_path, flags)
+            except OSError as error:
+                raise SupervisorError(
+                    "driver_key_unavailable", "driver key file is unavailable"
+                ) from error
+            try:
+                info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+                ):
+                    raise SupervisorError(
+                        "driver_key_unsafe",
+                        "driver key must be a current-user-owned 0600 regular file",
+                    )
+                value = os.read(descriptor, 33)
+                if len(value) != 32:
+                    raise SupervisorError(
+                        "driver_key_invalid", "driver key must contain exactly 32 bytes"
+                    )
+                return value
+            finally:
+                os.close(descriptor)
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = 'driver_secret'"
+            ).fetchone()
+        if not row:
+            raise SupervisorError("driver_key_unavailable", "driver key file is unavailable")
+        try:
+            value = bytes.fromhex(row["value"])
+        except ValueError as error:
+            raise SupervisorError("driver_key_invalid", "legacy driver key is invalid") from error
+        if len(value) != 32:
+            raise SupervisorError("driver_key_invalid", "legacy driver key is invalid")
+        return value
 
     def _driver_secret(self) -> bytes:
         """Per-supervisor key stored separately from the SQLite evidence DB.
@@ -1910,6 +2027,7 @@ class GitSupervisor:
                 execution_options["guard_fd"] = restart_guard_fd
             if trusted_owners is not None:
                 execution_options["expected_owners"] = trusted_owners
+            execution_options["process_runner"] = self._run_trusted_contained
             return run_trusted(
                 argv,
                 cwd,
@@ -2188,6 +2306,745 @@ class GitSupervisor:
             )
         return resources
 
+    # ------------------------------------------------------------------ #
+    # Quarantine explain / recover (#740)
+    #
+    # Quarantine is deliberately fail-closed: an unproven teardown parks the
+    # allocation rather than recycling it. That is correct, and it was also a
+    # dead end — reading WHY a resource was parked, or getting it out, needed
+    # someone to open the SQLite file by hand. These two entry points are the
+    # supported path, and they keep every guarantee the fail-closed design
+    # exists to provide:
+    #
+    #   * explain NEVER exposes an ownership token or credential material. The
+    #     token is the capability that authorises teardown of a real resource;
+    #     an operator diagnosing a stuck row has no need of it.
+    #   * recover NEVER rewrites immutable allocation identity. attempt_id,
+    #     driver, kind, resource_id and ownership_token are what bind a row to
+    #     the thing it allocated; rewriting any of them to make a mismatch go
+    #     away would forge exactly the proof the mismatch is reporting.
+    #   * recover NEVER releases an allocation on an assertion. A port returns
+    #     to the pool only against a POSITIVE ABSENCE PROOF — the driver's own
+    #     verify phase reporting present=False, or the port failing to accept a
+    #     bind. An operator receipt is authenticated and recorded, but it is
+    #     testimony, not proof, and it cannot release anything on its own.
+    # ------------------------------------------------------------------ #
+
+    _QUARANTINE_ACTIONS: tuple[str, ...] = (
+        "restore-definition",
+        "retry-cleanup",
+        "manual-receipt",
+    )
+
+    @staticmethod
+    def _public_evidence(raw: str) -> dict[str, Any]:
+        """Evidence with every capability and secret stripped.
+
+        Redaction is by ALLOW-list on the nested credential handle and by
+        explicit removal of the token, because evidence is driver-authored: a
+        deny-list would silently start leaking the day a driver adds a field.
+        """
+
+        try:
+            evidence = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"unreadable": True}
+        if not isinstance(evidence, dict):
+            return {"unreadable": True}
+        evidence.pop("ownership_token", None)
+        handle = evidence.get("credential_handle")
+        if isinstance(handle, dict):
+            evidence["credential_handle"] = {
+                key: handle[key] for key in ("name", "version") if key in handle
+            }
+        return evidence
+
+    def _identity_proved(self, row: sqlite3.Row) -> bool:
+        """Does this row still prove it owns the resource it names?
+
+        Recomputes the HMAC over the immutable triple. A legacy or corrupted
+        row whose token still verifies is provably the same allocation and may
+        be migrated; one whose token does not verify is NOT, and no amount of
+        operator intent can make it so.
+        """
+
+        stored = row["ownership_token"] or ""
+        if not stored:
+            return False
+        try:
+            secret = self._driver_secret_read_only()
+        except SupervisorError:
+            return False
+        expected = ownership_token(secret, row["attempt_id"], row["kind"], row["resource_id"])
+        return hmac.compare_digest(stored, expected)
+
+    def _pinned_definitions(self, attempt_id: str) -> tuple[dict[str, str], str | None]:
+        """Current pinned definition JSON by driver name, or why it is unavailable.
+
+        Never raises: explain must keep working on exactly the broken attempts
+        it exists to describe, including ones whose trust pin no longer
+        verifies.
+        """
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT trust_bundle_json FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+        if not row:
+            return {}, "attempt_not_found"
+        try:
+            pin = json.loads(row["trust_bundle_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return {}, "trust_bundle_invalid"
+        if not isinstance(pin, dict):
+            return {}, "trust_bundle_invalid"
+        if not pin and self.config.trust_root is not None:
+            return {}, "trust_bundle_quarantined"
+        if pin:
+            try:
+                verified = verify_bundle_pin(pin)
+            except TrustBundleError as error:
+                return {}, error.code
+            if not verified["ok"]:
+                return {}, "trust_bundle_quarantined"
+        try:
+            return {
+                definition.name: self._driver_definition_json(definition)
+                for definition in self._driver_definitions_for_pin(pin)
+            }, None
+        except (SupervisorError, TrustBundleError) as error:
+            return {}, error.code
+
+    def _mismatch_class(
+        self, row: sqlite3.Row, pinned: dict[str, str], pin_error: str | None
+    ) -> str:
+        stored_definition = row["definition_json"]
+        if stored_definition == "{}":
+            return "definition_missing"
+        try:
+            self._driver_definition_from_json(stored_definition)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return "definition_corrupt"
+        if pin_error:
+            return "trust_pin_unavailable"
+        current = pinned.get(row["driver"])
+        if current is None:
+            return "driver_removed_from_config"
+        if current != stored_definition:
+            return "config_drift"
+        evidence = self._public_evidence(row["evidence_json"])
+        proof = evidence.get("proof")
+        if isinstance(proof, dict) and not proof.get("cleanup_proved"):
+            return "cleanup_unproven"
+        if evidence.get("present"):
+            return "resource_still_present"
+        return "unclassified"
+
+    @staticmethod
+    def _quarantine_severity(mismatch: str, evidence: dict[str, Any]) -> str:
+        """Severity is about what may still be RUNNING, not about tidiness."""
+
+        if evidence.get("present"):
+            return "critical"
+        if mismatch in {"cleanup_unproven", "resource_still_present"}:
+            return "critical"
+        if mismatch in {
+            "definition_missing",
+            "definition_corrupt",
+            "config_drift",
+            "driver_removed_from_config",
+            "trust_pin_unavailable",
+        }:
+            return "high"
+        return "normal"
+
+    @staticmethod
+    def _safe_next_actions(mismatch: str, identity_proved: bool) -> list[str]:
+        if not identity_proved:
+            return [
+                (
+                    "identity is NOT proven for this row: its ownership token does "
+                    "not match the attempt/kind/resource it names"
+                ),
+                (
+                    "do NOT recover it — recovery would have to forge the binding it "
+                    "is failing to prove"
+                ),
+                (
+                    "investigate by hand, then record an authenticated manual receipt "
+                    "once the real resource is confirmed gone"
+                ),
+            ]
+        if mismatch in {"definition_missing", "definition_corrupt", "config_drift"}:
+            return [
+                (
+                    "acp runtime-quarantine recover ATTEMPT --action restore-definition "
+                    "(re-pins the stored definition from the trusted bundle; identity "
+                    "is verified first and never rewritten)"
+                ),
+                "then: --action retry-cleanup",
+            ]
+        if mismatch in {"cleanup_unproven", "resource_still_present"}:
+            return [
+                (
+                    "acp runtime-quarantine recover ATTEMPT --action retry-cleanup "
+                    "(re-runs the exact stored teardown and re-probes)"
+                ),
+                (
+                    "if the resource is genuinely gone but the driver cannot prove it: "
+                    "--action manual-receipt --operator ID --reason TEXT (records the "
+                    "claim; releases nothing without a positive absence proof)"
+                ),
+            ]
+        if mismatch == "driver_removed_from_config":
+            return [
+                (
+                    "the driver is no longer configured, so its definition cannot be "
+                    "re-pinned: restore it in acp.toml, or clean up by hand and record "
+                    "a manual receipt"
+                ),
+            ]
+        if mismatch == "trust_pin_unavailable":
+            return [
+                (
+                    "the attempt's trust pin does not verify, so no definition can be "
+                    "restored from it: fix trust first (acp trust list)"
+                ),
+            ]
+        return ["inspect the evidence below; no automatic action is safe"]
+
+    def quarantine_explain(self, attempt_id: str) -> dict[str, Any]:
+        """Why each resource on *attempt_id* is parked, and what is safe next.
+
+        Read-only by construction: it opens no driver, runs no phase and takes
+        no lock. Diagnosing a stuck runtime must never be able to change it.
+        """
+
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT id, agent_id, task_id FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if not attempt:
+                raise SupervisorError("attempt_not_found", "attempt does not exist")
+            runtime = connection.execute(
+                "SELECT state, updated_at FROM runtime_environments WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT * FROM runtime_driver_resources WHERE attempt_id = ? ORDER BY driver",
+                (attempt_id,),
+            ).fetchall()
+            receipts = connection.execute(
+                "SELECT driver, action, operator, reason, absence_proved, recorded_at "
+                "FROM runtime_quarantine_receipts WHERE attempt_id = ? "
+                "ORDER BY recorded_at DESC",
+                (attempt_id,),
+            ).fetchall()
+            allocations = connection.execute(
+                "SELECT pool_name, value FROM runtime_allocations WHERE attempt_id = ? "
+                "ORDER BY pool_name",
+                (attempt_id,),
+            ).fetchall()
+
+        pinned, pin_error = self._pinned_definitions(attempt_id)
+        now = time.time()
+        resources: list[dict[str, Any]] = []
+        for row in rows:
+            if row["state"] != "quarantined":
+                continue
+            evidence = self._public_evidence(row["evidence_json"])
+            mismatch = self._mismatch_class(row, pinned, pin_error)
+            proved = self._identity_proved(row)
+            resources.append(
+                {
+                    "driver": row["driver"],
+                    "kind": row["kind"],
+                    "resource_id": row["resource_id"],
+                    "state": row["state"],
+                    "owner": attempt["agent_id"],
+                    "quarantined_at": row["updated_at"],
+                    "age_seconds": _age_seconds(row["updated_at"], now),
+                    "severity": self._quarantine_severity(mismatch, evidence),
+                    "mismatch_class": mismatch,
+                    "identity_proved": proved,
+                    "last_trusted_evidence": evidence,
+                    "safe_next_actions": self._safe_next_actions(mismatch, proved),
+                }
+            )
+        return {
+            "ok": True,
+            "attempt_id": attempt_id,
+            "task_id": attempt["task_id"],
+            "owner": attempt["agent_id"],
+            "runtime_state": runtime["state"] if runtime else None,
+            "trust_pin_error": pin_error,
+            "quarantined": len(resources),
+            "resources": resources,
+            "held_allocations": [
+                {
+                    "pool": allocation["pool_name"],
+                    "value": allocation["value"],
+                    "port_free_now": self._port_available(allocation["value"]),
+                }
+                for allocation in allocations
+            ],
+            "receipts": [dict(receipt) for receipt in receipts],
+        }
+
+    def _restore_pinned_definitions(self, attempt_id: str) -> dict[str, Any]:
+        pinned, pin_error = self._pinned_definitions(attempt_id)
+        if pin_error:
+            raise SupervisorError(
+                "runtime_trust_pin_unavailable",
+                f"cannot restore definitions while the trust pin is unusable ({pin_error})",
+            )
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runtime_driver_resources WHERE attempt_id = ? "
+                "AND state = 'quarantined' ORDER BY driver",
+                (attempt_id,),
+            ).fetchall()
+        restored: list[str] = []
+        refused: list[dict[str, str]] = []
+        for row in rows:
+            if not self._identity_proved(row):
+                refused.append({"driver": row["driver"], "reason": "identity_unproved"})
+                continue
+            current = pinned.get(row["driver"])
+            if current is None:
+                refused.append({"driver": row["driver"], "reason": "driver_not_in_pin"})
+                continue
+            if current == row["definition_json"]:
+                continue
+            restored.append(row["driver"])
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                # Identity columns are absent from this UPDATE on purpose.
+                connection.execute(
+                    "UPDATE runtime_driver_resources SET definition_json = ?, updated_at = ? "
+                    "WHERE attempt_id = ? AND driver = ?",
+                    (current, utc_now(), attempt_id, row["driver"]),
+                )
+                self._event(
+                    connection,
+                    "runtime.quarantine.definition_restored",
+                    "supervisor",
+                    {
+                        "attempt_id": attempt_id,
+                        "driver": row["driver"],
+                        "kind": row["kind"],
+                    },
+                )
+        if refused:
+            # A row we could not prove stays parked, and the runtime is pinned to
+            # teardown_failed atomically so nothing downstream reads it as healthy.
+            self._quarantine_driver_attempt(attempt_id, "runtime_quarantine_identity_unproved")
+        return {"restored": restored, "refused": refused}
+
+    def _retry_quarantined_cleanup(self, attempt_id: str, guard_fd: int) -> dict[str, Any]:
+        with self.connect() as connection:
+            runtime = connection.execute(
+                "SELECT env_json FROM runtime_environments WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if not runtime:
+                raise SupervisorError("runtime_not_found", "runtime environment is missing")
+            drivers = [
+                row["driver"]
+                for row in connection.execute(
+                    "SELECT driver FROM runtime_driver_resources WHERE attempt_id = ? "
+                    "AND state = 'quarantined'",
+                    (attempt_id,),
+                ).fetchall()
+            ]
+        if not drivers:
+            return {"retried": [], "still_quarantined_drivers": [], "released": []}
+        environment = json.loads(runtime["env_json"])
+        # The exact stored definition is re-run — _run_driver_phase reads
+        # definition_json for an attempt that already has rows, so this is a
+        # retry of the recorded cleanup and not a fresh interpretation of config.
+        evidence = self._run_driver_phase(
+            "teardown",
+            attempt_id,
+            environment,
+            only_drivers=set(drivers),
+            restart_guard_fd=guard_fd,
+        )
+        released = [item.driver for item in evidence if item.proof.get("cleanup_proved")]
+        still = [item.driver for item in evidence if not item.proof.get("cleanup_proved")]
+        # Named *_drivers so it cannot collide with the integer count the caller
+        # adds; an earlier revision returned both under one key and the list won.
+        return {"retried": drivers, "released": released, "still_quarantined_drivers": still}
+
+    def _authenticate_operator(self, operator: str, credential: str) -> None:
+        if not operator or not credential:
+            raise SupervisorError(
+                "quarantine_receipt_unauthenticated",
+                "a manual cleanup receipt requires an operator id and its runner credential",
+            )
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT role, credential_digest, revoked_at FROM runner_identities "
+                "WHERE agent_id = ?",
+                (operator,),
+            ).fetchone()
+        if not row or row["revoked_at"] or row["role"] != "integrator":
+            raise SupervisorError(
+                "quarantine_receipt_unauthenticated",
+                "operator is not an enrolled, unrevoked integrator identity",
+            )
+        if not verify_credential(credential, row["credential_digest"]):
+            raise SupervisorError(
+                "quarantine_receipt_unauthenticated",
+                "operator credential does not verify",
+            )
+
+    def _authenticate_recovery_operator(self, operator: str, credential: str) -> None:
+        """Require a privileged identity once runner authentication is enabled."""
+
+        if not self._identity_enforced():
+            return
+        try:
+            self._authenticate(operator, "integrator", credential or None)
+        except SupervisorError as error:
+            raise SupervisorError(
+                "quarantine_recovery_unauthenticated",
+                "quarantine recovery requires a valid integrator credential",
+            ) from error
+
+    def _record_manual_receipt(
+        self,
+        attempt_id: str,
+        operator: str,
+        credential: str,
+        reason: str,
+        guard_fd: int,
+    ) -> dict[str, Any]:
+        if not reason.strip():
+            raise SupervisorError(
+                "quarantine_receipt_invalid", "a manual cleanup receipt requires a reason"
+            )
+        self._authenticate_operator(operator, credential)
+        with self.connect() as connection:
+            runtime = connection.execute(
+                "SELECT env_json FROM runtime_environments WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT * FROM runtime_driver_resources WHERE attempt_id = ? "
+                "AND state = 'quarantined' ORDER BY driver",
+                (attempt_id,),
+            ).fetchall()
+        if not rows:
+            return {"receipts": [], "released": []}
+
+        # THE RECEIPT IS TESTIMONY; THE VERIFY PHASE IS THE PROOF. An operator
+        # saying "I removed it" is recorded either way, but a row is only
+        # released when the driver itself reports the resource absent.
+        absent: set[str] = set()
+        probe_error: str | None = None
+        eligible = {row["driver"] for row in rows if self._identity_proved(row)}
+        if runtime is not None and eligible:
+            try:
+                evidence = self._run_driver_phase(
+                    "verify",
+                    attempt_id,
+                    json.loads(runtime["env_json"]),
+                    only_drivers=eligible,
+                    restart_guard_fd=guard_fd,
+                )
+                absent = {
+                    item.driver
+                    for item in evidence
+                    if item.present is False and item.exit_code == 0
+                }
+            except (SupervisorError, DriverError) as error:
+                probe_error = error.code
+
+        stamp = utc_now()
+        receipts: list[dict[str, Any]] = []
+        released: list[str] = []
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for row in rows:
+                proved = row["driver"] in absent
+                connection.execute(
+                    "INSERT INTO runtime_quarantine_receipts"
+                    "  (attempt_id, driver, kind, resource_id, action, operator, reason,"
+                    "   absence_proved, recorded_at)"
+                    " VALUES (?, ?, ?, ?, 'manual-receipt', ?, ?, ?, ?)",
+                    (
+                        attempt_id,
+                        row["driver"],
+                        row["kind"],
+                        row["resource_id"],
+                        operator,
+                        reason.strip(),
+                        1 if proved else 0,
+                        stamp,
+                    ),
+                )
+                receipts.append(
+                    {
+                        "driver": row["driver"],
+                        "absence_proved": proved,
+                        "operator": operator,
+                    }
+                )
+                # 🔴 THE PROBE ITSELF MOVES STATE, so this re-asserts it. The verify
+                # phase records evidence like any other phase, and
+                # _record_driver_evidence maps a verify result to active/absent —
+                # which silently lifts the quarantine on a row we have NOT proved
+                # absent. Caught by the test that files a false receipt against a
+                # profile still on disk: released was correctly empty, yet the row
+                # had stopped being quarantined. State is therefore set explicitly
+                # here, in the same transaction as the receipt, for both outcomes.
+                connection.execute(
+                    "UPDATE runtime_driver_resources SET state = ?, updated_at = ? "
+                    "WHERE attempt_id = ? AND driver = ?",
+                    ("released" if proved else "quarantined", stamp, attempt_id, row["driver"]),
+                )
+                if proved:
+                    released.append(row["driver"])
+                self._event(
+                    connection,
+                    "runtime.quarantine.manual_receipt",
+                    "supervisor",
+                    {
+                        "attempt_id": attempt_id,
+                        "driver": row["driver"],
+                        "operator": operator,
+                        "absence_proved": proved,
+                    },
+                )
+        return {"receipts": receipts, "released": released, "probe_error": probe_error}
+
+    def _release_proven_allocations(self, attempt_id: str) -> list[str]:
+        """Return ports to the pool ONLY where absence is positively proved.
+
+        A quarantined driver row anywhere on the attempt keeps every allocation
+        parked: the ports and the resources belong to one runtime, and a port
+        that merely looks free is not evidence that the thing which was using it
+        is gone.
+        """
+
+        with self.connect() as connection:
+            runtime = connection.execute(
+                "SELECT state FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            unsafe = connection.execute(
+                "SELECT COUNT(*) FROM runtime_driver_resources WHERE attempt_id = ? "
+                "AND state NOT IN ('released', 'absent')",
+                (attempt_id,),
+            ).fetchone()[0]
+            allocations = connection.execute(
+                "SELECT pool_name, value FROM runtime_allocations WHERE attempt_id = ? "
+                "ORDER BY pool_name",
+                (attempt_id,),
+            ).fetchall()
+        if not runtime or runtime["state"] != "teardown_failed" or unsafe or not allocations:
+            return []
+        freed: list[str] = []
+        for allocation in allocations:
+            if not self._port_available(allocation["value"]):
+                continue
+            if self._release_proven_allocation(
+                attempt_id,
+                allocation["pool_name"],
+                allocation["value"],
+            ):
+                freed.append(f"{allocation['pool_name']}={allocation['value']}")
+        return freed
+
+    def _release_proven_allocation(self, attempt_id: str, pool: str, value: int) -> bool:
+        """Delete one allocation durably so a crash can resume at the next row."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            deleted = connection.execute(
+                "DELETE FROM runtime_allocations WHERE attempt_id = ? AND pool_name = ? "
+                "AND value = ?",
+                (attempt_id, pool, value),
+            )
+            if deleted.rowcount != 1:
+                return False
+            self._event(
+                connection,
+                "runtime.quarantine.allocation_released",
+                "supervisor",
+                {
+                    "attempt_id": attempt_id,
+                    "pool": pool,
+                    "value": value,
+                    "proof": "port_bind_succeeded",
+                },
+            )
+        return True
+
+    def quarantine_recover(
+        self,
+        attempt_id: str,
+        action: str,
+        operator: str = "",
+        credential: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Supported recovery for a quarantined runtime.
+
+        Idempotent by construction: every action re-reads current state and is a
+        no-op once its condition already holds, so repeating a recovery after a
+        crash mid-way is always safe.
+        """
+
+        if action not in self._QUARANTINE_ACTIONS:
+            raise SupervisorError(
+                "quarantine_action_invalid",
+                f"action must be one of {', '.join(self._QUARANTINE_ACTIONS)}",
+            )
+        with self._runtime_restart_guard(attempt_id, recover=False) as guard_fd:
+            with self.connect() as connection:
+                attempt = connection.execute(
+                    "SELECT id FROM attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                runtime = connection.execute(
+                    "SELECT state, recovery_action FROM runtime_environments WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                quarantined = connection.execute(
+                    "SELECT COUNT(*) FROM runtime_driver_resources WHERE attempt_id = ? "
+                    "AND state = 'quarantined'",
+                    (attempt_id,),
+                ).fetchone()[0]
+            if not attempt:
+                raise SupervisorError("attempt_not_found", "attempt does not exist")
+            if not runtime:
+                raise SupervisorError("runtime_not_found", "runtime environment is missing")
+            if runtime["state"] == "released" and not quarantined:
+                result: dict[str, Any] = {
+                    "ok": True,
+                    "attempt_id": attempt_id,
+                    "action": action,
+                    "still_quarantined": 0,
+                    "held_allocations": 0,
+                    "allocations_released": [],
+                    "noop": True,
+                }
+                if action == "restore-definition":
+                    result.update({"restored": [], "refused": []})
+                elif action == "retry-cleanup":
+                    result.update({"retried": [], "released": [], "still_quarantined_drivers": []})
+                else:
+                    result.update({"receipts": [], "released": []})
+                return result
+            if runtime["state"] != "teardown_failed":
+                raise SupervisorError(
+                    "runtime_not_quarantined",
+                    f"runtime state is {runtime['state']}; recovery is only valid after failed teardown",
+                )
+            recovery_action = runtime["recovery_action"]
+            if not quarantined and recovery_action != action:
+                raise SupervisorError(
+                    "runtime_quarantine_empty",
+                    "failed teardown has no quarantined driver proof or resumable recovery intent",
+                )
+            if recovery_action and recovery_action != action:
+                raise SupervisorError(
+                    "runtime_recovery_action_mismatch",
+                    f"resume the interrupted {recovery_action} action before starting {action}",
+                )
+            if action != "manual-receipt":
+                self._authenticate_recovery_operator(operator, credential)
+            else:
+                if not reason.strip():
+                    raise SupervisorError(
+                        "quarantine_receipt_invalid",
+                        "a manual cleanup receipt requires a reason",
+                    )
+                self._authenticate_operator(operator, credential)
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                changed = connection.execute(
+                    "UPDATE runtime_environments SET recovery_action = ?, updated_at = ? "
+                    "WHERE attempt_id = ? AND state = 'teardown_failed' "
+                    "AND recovery_action IN ('', ?)",
+                    (action, utc_now(), attempt_id, action),
+                )
+                if changed.rowcount != 1:
+                    raise SupervisorError(
+                        "runtime_recovery_stale",
+                        "runtime recovery intent changed before it could be fenced",
+                    )
+            outcome: dict[str, Any]
+            if action == "restore-definition":
+                outcome = self._restore_pinned_definitions(attempt_id)
+            elif action == "retry-cleanup":
+                outcome = self._retry_quarantined_cleanup(attempt_id, guard_fd)
+            else:
+                outcome = self._record_manual_receipt(
+                    attempt_id, operator, credential, reason, guard_fd
+                )
+
+            freed = self._release_proven_allocations(attempt_id)
+            with self.connect() as connection:
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM runtime_driver_resources WHERE attempt_id = ? "
+                    "AND state = 'quarantined'",
+                    (attempt_id,),
+                ).fetchone()[0]
+                held_allocations = connection.execute(
+                    "SELECT COUNT(*) FROM runtime_allocations WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()[0]
+            if not remaining and not held_allocations:
+                runtime_dir = self.state_dir / "runtime" / attempt_id
+                try:
+                    shutil.rmtree(runtime_dir)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise SupervisorError(
+                        "runtime_staging_cleanup_failed",
+                        "recovered runtime staging directory could not be removed",
+                    ) from error
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    updated = connection.execute(
+                        "UPDATE runtime_environments SET state = 'released', "
+                        "recovery_action = '', updated_at = ? "
+                        "WHERE attempt_id = ? AND state = 'teardown_failed' "
+                        "AND recovery_action = ?",
+                        (utc_now(), attempt_id, action),
+                    )
+                    if updated.rowcount != 1:
+                        raise SupervisorError(
+                            "runtime_recovery_stale",
+                            "runtime recovery intent changed before completion",
+                        )
+                    self._event(
+                        connection,
+                        "runtime.quarantine.cleared",
+                        "supervisor",
+                        {"attempt_id": attempt_id, "action": action},
+                    )
+            elif remaining:
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "UPDATE runtime_environments SET recovery_action = '', updated_at = ? "
+                        "WHERE attempt_id = ? AND state = 'teardown_failed' "
+                        "AND recovery_action = ?",
+                        (utc_now(), attempt_id, action),
+                    )
+        return {
+            "ok": True,
+            "attempt_id": attempt_id,
+            "action": action,
+            "still_quarantined": remaining,
+            "held_allocations": held_allocations,
+            "allocations_released": freed,
+            **outcome,
+        }
+
     @staticmethod
     def _assert_restart_owner_in(
         connection: sqlite3.Connection,
@@ -2265,6 +3122,57 @@ class GitSupervisor:
             # Do not issue LOCK_UN: a trusted child may still hold an inherited
             # duplicate after an interrupted supervisor. Closing only our copy
             # keeps the kernel lock alive until every such executor exits.
+            os.close(lock_fd)
+
+    @contextmanager
+    def _task_operation_guard(self, task_id: str, recover: bool = False) -> Iterator[int]:
+        """Serialize every QC/integration side effect for one task.
+
+        The descriptor is inherited by review and integration commands. A
+        crashed supervisor therefore cannot make an expired reservation look
+        reusable while one of its children can still touch the candidate or
+        shared runtime.
+        """
+
+        lock_dir = self.state_dir / "operation-locks"
+        lock_dir.mkdir(mode=0o700, exist_ok=True)
+        lock_path = lock_dir / f"{sha256(task_id.encode())}.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            lock_fd = os.open(lock_path, flags, 0o600)
+        except OSError as error:
+            raise SupervisorError(
+                "task_operation_lock_unavailable",
+                "task operation lock could not be opened",
+            ) from error
+        try:
+            opened = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+            ):
+                raise SupervisorError(
+                    "task_operation_lock_unsafe",
+                    "task operation lock must be a current-user-owned 0600 regular file",
+                )
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise SupervisorError(
+                        "task_operation_lock_unavailable",
+                        "task operation lock could not be acquired",
+                    ) from error
+                code = "task_operation_executor_alive" if recover else "task_operation_in_progress"
+                raise SupervisorError(
+                    code,
+                    "another QC or integration operation for this task is still alive",
+                ) from error
+            yield lock_fd
+        finally:
+            # Closing our copy cannot drop a lock still inherited by a child.
             os.close(lock_fd)
 
     def runtime_restart(self, attempt_id: str, recover: bool = False) -> dict[str, Any]:
@@ -2431,6 +3339,10 @@ class GitSupervisor:
         }
 
     def _runtime_up(self, attempt_id: str) -> dict[str, Any]:
+        with self._runtime_restart_guard(attempt_id, recover=False) as guard_fd:
+            return self._runtime_up_locked(attempt_id, guard_fd)
+
+    def _runtime_up_locked(self, attempt_id: str, guard_fd: int) -> dict[str, Any]:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -2463,10 +3375,16 @@ class GitSupervisor:
             self._phase_runtime_env(environment, "setup", Path(attempt["worktree"])),
             Path(row["log_path"]),
             stop_on_failure=True,
+            pass_fds=(guard_fd,),
         )
         failed = any(result["exit_code"] for result in results)
         if not failed:
-            driver_evidence = self._run_driver_phase("setup", attempt_id, environment)
+            driver_evidence = self._run_driver_phase(
+                "setup",
+                attempt_id,
+                environment,
+                restart_guard_fd=guard_fd,
+            )
             failed = any(not item.ok for item in driver_evidence)
             results = results + [
                 {
@@ -2530,6 +3448,16 @@ class GitSupervisor:
         force: bool = False,
         _allow_active: bool = False,
     ) -> dict[str, Any]:
+        with self._runtime_restart_guard(attempt_id, recover=False) as guard_fd:
+            return self._runtime_down_locked(attempt_id, force, _allow_active, guard_fd)
+
+    def _runtime_down_locked(
+        self,
+        attempt_id: str,
+        force: bool,
+        _allow_active: bool,
+        guard_fd: int,
+    ) -> dict[str, Any]:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -2539,6 +3467,11 @@ class GitSupervisor:
                 raise SupervisorError("runtime_not_found", "runtime environment is missing")
             if row["state"] == "released":
                 return self._runtime_view(connection, row)
+            if row["recovery_action"]:
+                raise SupervisorError(
+                    "runtime_quarantine_recovery_in_progress",
+                    "an interrupted quarantine recovery must be resumed through runtime-quarantine",
+                )
             task = connection.execute(
                 """
                 SELECT task.status FROM tasks AS task
@@ -2579,10 +3512,16 @@ class GitSupervisor:
             self._phase_runtime_env(environment, "teardown", cwd),
             Path(row["log_path"]),
             stop_on_failure=False,
+            pass_fds=(guard_fd,),
         )
         # Drivers tear down AFTER the shell hooks and are then independently
         # re-probed. A hook that exits 0 proves only that a process exited 0.
-        driver_evidence = self._run_driver_phase("teardown", attempt_id, environment)
+        driver_evidence = self._run_driver_phase(
+            "teardown",
+            attempt_id,
+            environment,
+            restart_guard_fd=guard_fd,
+        )
         unproven = [item.driver for item in driver_evidence if not item.proof.get("cleanup_proved")]
         results = results + [
             {
@@ -2608,6 +3547,22 @@ class GitSupervisor:
         # returned to the pool, so nothing is handed to a later attempt while a
         # resource from this one may still be alive.
         failed = any(result["exit_code"] for result in results) or bool(occupied) or bool(unproven)
+        staging_failed = False
+        if not failed:
+            try:
+                shutil.rmtree(environment["ACP_RUNTIME_DIR"])
+            except FileNotFoundError:
+                pass
+            except OSError:
+                staging_failed = True
+                failed = True
+                results.append(
+                    {
+                        "command": "runtime-staging:remove",
+                        "exit_code": 1,
+                        "duration_ms": 0,
+                    }
+                )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             stamp = utc_now()
@@ -2615,10 +3570,16 @@ class GitSupervisor:
             connection.execute(
                 """
                 UPDATE runtime_environments
-                SET state = ?, teardown_results_json = ?, updated_at = ?
+                SET state = ?, teardown_results_json = ?, recovery_action = ?, updated_at = ?
                 WHERE attempt_id = ?
                 """,
-                (state, canonical_json(results), stamp, attempt_id),
+                (
+                    state,
+                    canonical_json(results),
+                    "retry-cleanup" if staging_failed else "",
+                    stamp,
+                    attempt_id,
+                ),
             )
             if not failed:
                 connection.execute(
@@ -2635,8 +3596,6 @@ class GitSupervisor:
                     "unproven_cleanup": unproven,
                 },
             )
-        if not failed:
-            shutil.rmtree(environment["ACP_RUNTIME_DIR"], ignore_errors=True)
         return self.runtime_environment(attempt_id)
 
     def claim(
@@ -2817,6 +3776,7 @@ class GitSupervisor:
             )
         worktree_created = False
         try:
+            self._assert_safe_git_execution_config()
             self._git("worktree", "add", "-b", branch, str(worktree), start_sha)
             worktree_created = True
             self._runtime_up(attempt_id)
@@ -2963,14 +3923,15 @@ class GitSupervisor:
         orphaned: list[str] = []
         conflicted: list[str] = []
         cleanup_attempts: set[str] = set()
-        workers_to_stop: list[tuple[str, int]] = []
+        workers_to_stop: list[tuple[str, int, str]] = []
+        task_cleanups: dict[str, str] = {}
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempts = connection.execute(
                 """
                 SELECT * FROM attempts
-                WHERE status IN ('provisioning', 'working')
-                  AND lease_expires_at <= ?
+                WHERE (status IN ('provisioning', 'working') AND lease_expires_at <= ?)
+                   OR status = 'terminating'
                 """,
                 (epoch,),
             ).fetchall()
@@ -2990,60 +3951,55 @@ class GitSupervisor:
                 stamp = utc_now()
                 connection.execute(
                     """
-                    UPDATE attempts SET status = 'orphaned', latest_sha = ?,
-                      pid = NULL, updated_at = ? WHERE id = ?
+                    UPDATE attempts SET status = 'terminating', latest_sha = ?,
+                      updated_at = ? WHERE id = ?
                     """,
                     (latest, stamp, attempt["id"]),
                 )
                 connection.execute(
                     """
-                    UPDATE tasks SET status = 'orphaned',
-                      current_attempt_id = NULL, updated_at = ?
+                    UPDATE tasks SET status = 'terminating', updated_at = ?
                     WHERE id = ? AND current_attempt_id = ?
                     """,
                     (stamp, attempt["task_id"], attempt["id"]),
                 )
                 connection.execute(
                     """
-                    UPDATE resource_leases SET task_id = NULL, attempt_id = NULL,
-                      lease_expires_at = 0, updated_at = ? WHERE attempt_id = ?
+                    UPDATE resource_leases SET lease_expires_at = ?, updated_at = ?
+                    WHERE attempt_id = ?
                     """,
-                    (stamp, attempt["id"]),
+                    (CLEANUP_FENCE_EPOCH, stamp, attempt["id"]),
                 )
-                orphaned.append(attempt["task_id"])
+                connection.execute(
+                    "UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ? "
+                    "WHERE attempt_id = ?",
+                    (CLEANUP_FENCE_EPOCH, stamp, attempt["id"]),
+                )
                 cleanup_attempts.add(attempt["id"])
                 if attempt["pid"] and attempt["pid"] > 0:
-                    workers_to_stop.append((attempt["id"], attempt["pid"]))
-                self._event(
-                    connection,
-                    "attempt.orphaned",
-                    "reaper",
-                    {"attempt_id": attempt["id"], "latest_sha": latest},
-                )
+                    workers_to_stop.append((attempt["id"], attempt["pid"], attempt["pid_identity"]))
+                if attempt["status"] != "terminating":
+                    self._event(
+                        connection,
+                        "attempt.termination_started",
+                        "reaper",
+                        {"attempt_id": attempt["id"], "latest_sha": latest},
+                    )
             expired = connection.execute(
                 """
-                SELECT DISTINCT task.id
+                SELECT DISTINCT task.id, task.status, task.cleanup_target_status
                 FROM tasks AS task
                 JOIN resource_leases AS lease ON lease.task_id = task.id
-                WHERE task.status IN ('qc_review', 'approved', 'integrating')
-                  AND lease.lease_expires_at <= ?
+                WHERE lease.attempt_id IS NULL
+                  AND (
+                    (task.status IN ('qc_review', 'approved', 'integrating')
+                     AND lease.lease_expires_at <= ?)
+                    OR task.status = 'cleanup_pending'
+                  )
                 """,
                 (epoch,),
             ).fetchall()
             for row in expired:
-                stamp = utc_now()
-                connection.execute(
-                    "UPDATE tasks SET status = 'conflicted', updated_at = ? WHERE id = ?",
-                    (stamp, row["id"]),
-                )
-                connection.execute(
-                    """
-                    UPDATE resource_leases SET task_id = NULL, attempt_id = NULL,
-                      lease_expires_at = 0, updated_at = ? WHERE task_id = ?
-                    """,
-                    (stamp, row["id"]),
-                )
-                conflicted.append(row["id"])
                 submission = connection.execute(
                     """
                     SELECT attempt_id FROM submissions WHERE task_id = ?
@@ -3052,13 +4008,27 @@ class GitSupervisor:
                     (row["id"],),
                 ).fetchone()
                 if submission:
-                    cleanup_attempts.add(submission["attempt_id"])
-                self._event(
-                    connection,
-                    "reservation.expired",
-                    "reaper",
-                    {"task_id": row["id"]},
-                )
+                    task_cleanups[row["id"]] = submission["attempt_id"]
+                    if row["status"] != "cleanup_pending":
+                        self._fence_task_cleanup(
+                            connection,
+                            row["id"],
+                            submission["attempt_id"],
+                            "conflicted",
+                            "reaper",
+                            "reservation_expired",
+                        )
+                        connection.execute(
+                            "UPDATE submissions SET status = 'blocked', qc_resume_status = '' "
+                            "WHERE task_id = ? AND status = 'qc_running'",
+                            (row["id"],),
+                        )
+                        self._event(
+                            connection,
+                            "reservation.expired",
+                            "reaper",
+                            {"task_id": row["id"], "cleanup_fenced": True},
+                        )
             expired_runtime = connection.execute(
                 """
                 SELECT DISTINCT attempt_id FROM runtime_allocations
@@ -3068,18 +4038,131 @@ class GitSupervisor:
             ).fetchall()
             cleanup_attempts.update(row["attempt_id"] for row in expired_runtime)
         terminated_workers: list[dict[str, Any]] = []
-        for attempt_id, pid in workers_to_stop:
-            self._terminate_registered_group(pid)
-            terminated_workers.append({"attempt_id": attempt_id, "pid": pid})
+        workers = {attempt_id: (pid, identity) for attempt_id, pid, identity in workers_to_stop}
         runtime_cleanup: list[dict[str, Any]] = []
+        completed_cleanup: set[str] = set()
         for attempt_id in sorted(cleanup_attempts):
             try:
-                runtime = self.runtime_down(attempt_id)
+                with self._runtime_restart_guard(attempt_id, recover=False) as guard_fd:
+                    worker = workers.get(attempt_id)
+                    if worker:
+                        pid, identity = worker
+                        termination = self._terminate_registered_group(pid, identity)
+                        terminated_workers.append(
+                            {
+                                "attempt_id": attempt_id,
+                                "pid": pid,
+                                "termination": termination,
+                            }
+                        )
+                        if termination == "failed":
+                            raise SupervisorError(
+                                "worker_containment_failed",
+                                "worker subreaper did not terminate; cleanup fence remains held",
+                            )
+                    runtime = self._runtime_down_locked(
+                        attempt_id,
+                        force=True,
+                        _allow_active=False,
+                        guard_fd=guard_fd,
+                    )
                 runtime_cleanup.append({"attempt_id": attempt_id, "state": runtime["state"]})
+                if runtime["state"] == "released":
+                    completed_cleanup.add(attempt_id)
             except (OSError, subprocess.SubprocessError, SupervisorError) as error:
                 runtime_cleanup.append(
                     {"attempt_id": attempt_id, "state": "cleanup_error", "error": str(error)}
                 )
+                with self.connect() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET cleanup_error = ?, updated_at = ? "
+                        "WHERE current_attempt_id = ?",
+                        (str(error), utc_now(), attempt_id),
+                    )
+        for task_id, attempt_id in sorted(task_cleanups.items()):
+            try:
+                with self._task_operation_guard(task_id, recover=True):
+                    with self._runtime_restart_guard(attempt_id, recover=False) as guard_fd:
+                        runtime = self._runtime_down_locked(
+                            attempt_id,
+                            force=True,
+                            _allow_active=False,
+                            guard_fd=guard_fd,
+                        )
+                    if runtime["state"] != "released":
+                        raise SupervisorError(
+                            "runtime_cleanup_unproven",
+                            "runtime cleanup did not reach released state",
+                        )
+                    with self.connect() as connection:
+                        connection.execute("BEGIN IMMEDIATE")
+                        target = self._complete_task_cleanup(
+                            connection,
+                            task_id,
+                            attempt_id,
+                            "reaper",
+                        )
+                    runtime_cleanup.append(
+                        {"task_id": task_id, "attempt_id": attempt_id, "state": "released"}
+                    )
+                    if target == "conflicted":
+                        conflicted.append(task_id)
+            except (OSError, subprocess.SubprocessError, SupervisorError) as error:
+                runtime_cleanup.append(
+                    {
+                        "task_id": task_id,
+                        "attempt_id": attempt_id,
+                        "state": "cleanup_error",
+                        "error": str(error),
+                    }
+                )
+                with self.connect() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET cleanup_error = ?, updated_at = ? WHERE id = ? "
+                        "AND status = 'cleanup_pending'",
+                        (str(error), utc_now(), task_id),
+                    )
+        if completed_cleanup:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for attempt_id in sorted(completed_cleanup):
+                    attempt = connection.execute(
+                        "SELECT task_id, status FROM attempts WHERE id = ?", (attempt_id,)
+                    ).fetchone()
+                    runtime = connection.execute(
+                        "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+                        (attempt_id,),
+                    ).fetchone()
+                    if (
+                        not attempt
+                        or attempt["status"] != "terminating"
+                        or not runtime
+                        or runtime["state"] != "released"
+                    ):
+                        continue
+                    stamp = utc_now()
+                    connection.execute(
+                        "UPDATE attempts SET status = 'orphaned', pid = NULL, "
+                        "pid_identity = '', updated_at = ? WHERE id = ?",
+                        (stamp, attempt_id),
+                    )
+                    connection.execute(
+                        "UPDATE tasks SET status = 'orphaned', current_attempt_id = NULL, "
+                        "updated_at = ? WHERE id = ? AND current_attempt_id = ?",
+                        (stamp, attempt["task_id"], attempt_id),
+                    )
+                    connection.execute(
+                        "UPDATE resource_leases SET task_id = NULL, attempt_id = NULL, "
+                        "lease_expires_at = 0, updated_at = ? WHERE attempt_id = ?",
+                        (stamp, attempt_id),
+                    )
+                    orphaned.append(attempt["task_id"])
+                    self._event(
+                        connection,
+                        "attempt.orphaned",
+                        "reaper",
+                        {"attempt_id": attempt_id, "cleanup_proved": True},
+                    )
         return {
             "orphaned": orphaned,
             "conflicted": conflicted,
@@ -3207,7 +4290,7 @@ class GitSupervisor:
             connection.execute(
                 """
                 UPDATE attempts SET status = 'submitted', latest_sha = ?,
-                  pid = NULL, updated_at = ? WHERE id = ?
+                  pid = NULL, pid_identity = '', updated_at = ? WHERE id = ?
                 """,
                 (commit, stamp, attempt_id),
             )
@@ -3254,6 +4337,48 @@ class GitSupervisor:
         submission_id: str,
         reviewer_id: str,
         credential: str | None = None,
+    ) -> dict[str, Any]:
+        # Authenticate before looking up the task whose operation lock must be
+        # taken; this keeps submission identifiers from becoming an oracle.
+        self._authenticate(reviewer_id, "critic", credential)
+        with self.connect() as connection:
+            pending_submission = self._submission_row(connection, submission_id)
+        with self._task_operation_guard(pending_submission["task_id"]) as operation_guard_fd:
+            try:
+                return self._run_qc_locked(
+                    submission_id,
+                    reviewer_id,
+                    credential,
+                    operation_guard_fd,
+                )
+            except Exception:
+                # A normal exception unwinds only after every contained child
+                # has ended, so the same process can safely restore the exact
+                # sequential-review state it claimed. Process death cannot run
+                # this block; the durable qc_running state then goes through
+                # the reaper's fenced crash-recovery path.
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = self._submission_row(connection, submission_id)
+                    current_task = self._task_row(connection, current["task_id"])
+                    if (
+                        current["status"] == "qc_running"
+                        and current["qc_resume_status"] in {"pending_qc", "pending_second_review"}
+                        and current_task["status"] == "qc_review"
+                    ):
+                        connection.execute(
+                            "UPDATE submissions SET status = qc_resume_status, "
+                            "qc_resume_status = '' WHERE id = ?",
+                            (submission_id,),
+                        )
+                raise
+
+    def _run_qc_locked(
+        self,
+        submission_id: str,
+        reviewer_id: str,
+        credential: str | None,
+        operation_guard_fd: int,
     ) -> dict[str, Any]:
         # Prove the reviewer holds the critic credential before anything else.
         # Until this existed, "independent QC" was a string a worker could type.
@@ -3304,6 +4429,23 @@ class GitSupervisor:
                     f"submission runtime state is {runtime['state'] if runtime else 'missing'}",
                 )
             runtime_env = json.loads(runtime["env_json"])
+            operation_until = int(time.time()) + max(
+                3600,
+                self.config.timeout_seconds * (len(self.config.qc_commands) + 2) * 2,
+            )
+            connection.execute(
+                "UPDATE submissions SET status = 'qc_running', qc_resume_status = ? WHERE id = ?",
+                (submission["status"], submission_id),
+            )
+            connection.execute(
+                "UPDATE resource_leases SET lease_expires_at = ?, updated_at = ? WHERE task_id = ?",
+                (operation_until, utc_now(), task["id"]),
+            )
+            connection.execute(
+                "UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ? "
+                "WHERE attempt_id = ?",
+                (operation_until, utc_now(), submission["attempt_id"]),
+            )
 
         qc_dir = self.state_dir / "worktrees" / f"qc-{uuid.uuid4().hex}"
         packet_path = self.state_dir / "logs" / f"review-{submission_id}.json"
@@ -3311,6 +4453,7 @@ class GitSupervisor:
         findings: list[dict[str, str]] = []
         critic_verdict = "pass"
         try:
+            self._assert_safe_git_execution_config()
             self._git("worktree", "add", "--detach", str(qc_dir), submission["commit_sha"])
             packet = self._review_packet(task, submission, qc_dir)
             packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
@@ -3333,6 +4476,7 @@ class GitSupervisor:
                             ),
                         }
                     )
+                    raise
                 else:
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
             for command in self.config.qc_commands:
@@ -3341,6 +4485,7 @@ class GitSupervisor:
                     command,
                     qc_dir,
                     self._phase_runtime_env(runtime_env, "qc", qc_dir),
+                    pass_fds=(operation_guard_fd,),
                 )
                 results.append(result)
                 if result["exit_code"]:
@@ -3373,6 +4518,7 @@ class GitSupervisor:
                         "ACP_REVIEW_RESULT": str(result_path),
                     },
                     trust_pin,
+                    pass_fds=(operation_guard_fd,),
                 )
                 results.append(critic)
                 if critic["exit_code"] or not self._worktree_matches(
@@ -3467,7 +4613,8 @@ class GitSupervisor:
             current = self._submission_row(connection, submission_id)
             current_task = self._task_row(connection, current["task_id"])
             if (
-                current["status"] not in {"pending_qc", "pending_second_review"}
+                current["status"] != "qc_running"
+                or current["qc_resume_status"] not in {"pending_qc", "pending_second_review"}
                 or current_task["status"] != "qc_review"
             ):
                 raise SupervisorError("submission_not_reviewable", "submission changed during QC")
@@ -3538,14 +4685,16 @@ class GitSupervisor:
                     (canonical_json(findings), qc_id),
                 )
             connection.execute(
-                "UPDATE submissions SET status = ? WHERE id = ?",
+                "UPDATE submissions SET status = ?, qc_resume_status = '' WHERE id = ?",
                 (submission_status, submission_id),
             )
-            connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (task_status, finished, current_task["id"]),
-            )
-            if verdict == "pass" and submission_status != "human_required":
+            cleanup_required = not (verdict == "pass" and submission_status != "human_required")
+            if not cleanup_required:
+                connection.execute(
+                    "UPDATE tasks SET status = ?, cleanup_target_status = '', "
+                    "cleanup_error = '', updated_at = ? WHERE id = ?",
+                    (task_status, finished, current_task["id"]),
+                )
                 reserve_until = int(time.time()) + max(3600, self.config.timeout_seconds * 3)
                 connection.execute(
                     """
@@ -3566,7 +4715,14 @@ class GitSupervisor:
                     (reserve_until, finished, current["attempt_id"]),
                 )
             else:
-                self._release_task_leases(connection, current_task["id"], finished)
+                self._fence_task_cleanup(
+                    connection,
+                    current_task["id"],
+                    current["attempt_id"],
+                    task_status,
+                    reviewer_id,
+                    "qc_completed_without_approval",
+                )
             self._event(
                 connection,
                 "qc.completed",
@@ -3579,8 +4735,30 @@ class GitSupervisor:
                 },
             )
         result = self.qc_run(qc_id)
-        if verdict != "pass":
-            result["runtime_cleanup"] = self.runtime_down(submission["attempt_id"])
+        if cleanup_required:
+            try:
+                result["runtime_cleanup"] = self.runtime_down(submission["attempt_id"])
+            except (OSError, subprocess.SubprocessError, SupervisorError) as cleanup_error:
+                result["runtime_cleanup"] = {
+                    "attempt_id": submission["attempt_id"],
+                    "state": "cleanup_error",
+                    "error": str(cleanup_error),
+                }
+                with self.connect() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET cleanup_error = ?, updated_at = ? "
+                        "WHERE id = ? AND status = 'cleanup_pending'",
+                        (str(cleanup_error), utc_now(), task["id"]),
+                    )
+            if result["runtime_cleanup"]["state"] == "released":
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._complete_task_cleanup(
+                        connection,
+                        task["id"],
+                        submission["attempt_id"],
+                        reviewer_id,
+                    )
         return result
 
     def qc_run(self, qc_id: str) -> dict[str, Any]:
@@ -3595,6 +4773,22 @@ class GitSupervisor:
         task_id: str,
         integrator_id: str = "integration",
         credential: str | None = None,
+    ) -> dict[str, Any]:
+        self._authenticate(integrator_id, "integrator", credential)
+        with self._task_operation_guard(task_id) as operation_guard_fd:
+            return self._integrate_locked(
+                task_id,
+                integrator_id,
+                credential,
+                operation_guard_fd,
+            )
+
+    def _integrate_locked(
+        self,
+        task_id: str,
+        integrator_id: str,
+        credential: str | None,
+        operation_guard_fd: int,
     ) -> dict[str, Any]:
         integrator_identity = self._authenticate(integrator_id, "integrator", credential)
         integrator_digest = (
@@ -3639,6 +4833,19 @@ class GitSupervisor:
                 "UPDATE tasks SET status = 'integrating', updated_at = ? WHERE id = ?",
                 (utc_now(), task_id),
             )
+            operation_until = int(time.time()) + max(
+                3600,
+                self.config.timeout_seconds * (len(self.config.integration_commands) + 2) * 2,
+            )
+            connection.execute(
+                "UPDATE resource_leases SET lease_expires_at = ?, updated_at = ? WHERE task_id = ?",
+                (operation_until, utc_now(), task_id),
+            )
+            connection.execute(
+                "UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ? "
+                "WHERE attempt_id = ?",
+                (operation_until, utc_now(), submission["attempt_id"]),
+            )
             self._event(
                 connection,
                 "integration.started",
@@ -3654,36 +4861,19 @@ class GitSupervisor:
         commit: str | None = None
         error_message = ""
         try:
+            self._assert_safe_git_execution_config()
             current_base = self._git_text("rev-parse", task["base_branch"])
             self._git("worktree", "add", "-b", branch, str(worktree), current_base)
-            started = time.monotonic()
-            merge = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(worktree),
-                    "merge",
-                    "--no-ff",
-                    "--no-edit",
-                    submission["commit_sha"],
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
+            merge = self._run_integration_merge(
+                worktree,
+                submission["commit_sha"],
+                operation_guard_fd,
             )
-            results.append(
-                {
-                    "command": f"git merge {submission['commit_sha']}",
-                    "exit_code": merge.returncode,
-                    "stdout": merge.stdout[-12000:],
-                    "stderr": merge.stderr[-12000:],
-                    "duration_ms": int((time.monotonic() - started) * 1000),
-                }
-            )
-            if merge.returncode:
+            results.append(merge)
+            if merge["exit_code"]:
                 raise SupervisorError(
                     "merge_conflict",
-                    merge.stderr.strip() or merge.stdout.strip() or "merge failed",
+                    merge["stderr"].strip() or merge["stdout"].strip() or "merge failed",
                 )
             integration_commit = self._git_text("-C", str(worktree), "rev-parse", "HEAD")
             for command in self.config.integration_commands:
@@ -3692,6 +4882,7 @@ class GitSupervisor:
                     command,
                     worktree,
                     self._phase_runtime_env(runtime_env, "integration", worktree),
+                    pass_fds=(operation_guard_fd,),
                 )
                 results.append(result)
                 if result["exit_code"]:
@@ -3753,6 +4944,7 @@ class GitSupervisor:
                     error_message = "task or reservation changed while integration was running"
                 if not reservation_valid:
                     verdict = "stale"
+                target_status = "done" if verdict == "pass" else "conflicted"
                 connection.execute(
                     """
                     INSERT INTO integrations
@@ -3773,15 +4965,14 @@ class GitSupervisor:
                     ),
                 )
                 if current_task["status"] == "integrating":
-                    connection.execute(
-                        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                        (
-                            "done" if verdict == "pass" else "conflicted",
-                            created,
-                            task_id,
-                        ),
+                    self._fence_task_cleanup(
+                        connection,
+                        task_id,
+                        submission["attempt_id"],
+                        target_status,
+                        integrator_id,
+                        "integration_completed",
                     )
-                self._release_task_leases(connection, task_id, created)
                 self._event(
                     connection,
                     "integration.completed",
@@ -3808,6 +4999,21 @@ class GitSupervisor:
                 "state": "cleanup_error",
                 "error": str(cleanup_error),
             }
+            with self.connect() as connection:
+                connection.execute(
+                    "UPDATE tasks SET cleanup_error = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'cleanup_pending'",
+                    (str(cleanup_error), utc_now(), task_id),
+                )
+        if runtime_cleanup["state"] == "released":
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._complete_task_cleanup(
+                    connection,
+                    task_id,
+                    submission["attempt_id"],
+                    integrator_id,
+                )
         return {
             "id": integration_id,
             "task_id": task_id,
@@ -3835,6 +5041,11 @@ class GitSupervisor:
             {"phase": "launching", "command": list(command)},
             credential=credential,
         )
+        if not sys.platform.startswith("linux"):
+            raise SupervisorError(
+                "process_containment_unavailable",
+                "long-running workers require Linux child-subreaper containment",
+            )
         worker_env = self._child_env(
             self._phase_runtime_env(
                 self._runtime_env(attempt_id), "worker", Path(attempt["worktree"])
@@ -3857,6 +5068,7 @@ class GitSupervisor:
                         "-I",
                         str(trampoline),
                         str(handshake_read),
+                        MONITOR_MODE,
                         *command,
                     ],
                     cwd=attempt["worktree"],
@@ -3866,6 +5078,12 @@ class GitSupervisor:
                     pass_fds=(handshake_read,),
                     env=worker_env,
                 )
+                process_identity = self._process_identity(process.pid)
+                if process_identity is None:
+                    raise SupervisorError(
+                        "worker_identity_unavailable",
+                        "worker kernel identity could not be recorded",
+                    )
                 os.close(handshake_read)
                 handshake_read = -1
                 with self.connect() as connection:
@@ -3876,10 +5094,16 @@ class GitSupervisor:
                     self._authenticate_attempt(connection, active, credential)
                     changed = connection.execute(
                         """
-                        UPDATE attempts SET pid = ?, log_path = ?, updated_at = ?
+                        UPDATE attempts SET pid = ?, pid_identity = ?, log_path = ?, updated_at = ?
                         WHERE id = ? AND pid = -1
                         """,
-                        (process.pid, str(log_path), utc_now(), attempt_id),
+                        (
+                            process.pid,
+                            process_identity,
+                            str(log_path),
+                            utc_now(),
+                            attempt_id,
+                        ),
                     ).rowcount
                     if changed != 1:
                         raise SupervisorError(
@@ -3915,8 +5139,8 @@ class GitSupervisor:
                 for descriptor in (handshake_read, handshake_write):
                     if descriptor >= 0:
                         os.close(descriptor)
-                if process is not None and process.poll() is None:
-                    self._stop_process_group(process)
+                if process is not None:
+                    self._stop_kernel_monitor(process)
                 if launch_reserved:
                     self._clear_worker_registration(
                         attempt_id,
@@ -3973,7 +5197,7 @@ class GitSupervisor:
                 )
             changed = connection.execute(
                 """
-                UPDATE attempts SET pid = -1, log_path = ?, updated_at = ?
+                UPDATE attempts SET pid = -1, pid_identity = '', log_path = ?, updated_at = ?
                 WHERE id = ? AND pid IS NULL
                 """,
                 (log_path, utc_now(), attempt_id),
@@ -4005,7 +5229,7 @@ class GitSupervisor:
             if not attempt or attempt["pid"] not in expected_pids:
                 return
             connection.execute(
-                "UPDATE attempts SET pid = NULL, updated_at = ? WHERE id = ?",
+                "UPDATE attempts SET pid = NULL, pid_identity = '', updated_at = ? WHERE id = ?",
                 (utc_now(), attempt_id),
             )
             self._event(
@@ -4053,35 +5277,60 @@ class GitSupervisor:
             raise SupervisorError(
                 "worker_launching", "worker launch is reserved but has no PID yet"
             )
+        pidfd = self._open_registered_pidfd(attempt["pid"], attempt["pid_identity"])
+        if pidfd is None:
+            raise SupervisorError(
+                "worker_identity_mismatch",
+                "registered worker PID was reused; refusing to signal it",
+            )
         try:
-            os.killpg(attempt["pid"], signal.SIGTERM)
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
         except ProcessLookupError as error:
             raise SupervisorError(
                 "worker_not_running", "worker process no longer exists"
             ) from error
+        finally:
+            os.close(pidfd)
         return {"attempt_id": attempt_id, "pid": attempt["pid"], "signal": "SIGTERM"}
 
     @staticmethod
-    def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
-        GitSupervisor._terminate_process_group(process)
+    def _terminate_registered_group(pid: int, identity: str) -> str:
+        pidfd = GitSupervisor._open_registered_pidfd(pid, identity)
+        if pidfd is None:
+            return "identity-gone"
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except (PermissionError, ProcessLookupError):
+            os.close(pidfd)
+            return "identity-gone"
+        try:
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            if poller.poll(2000):
+                return "terminated"
+            # Never SIGKILL the subreaper: doing so would orphan exactly the tree
+            # it exists to contain. The cleanup fence remains held instead.
+            return "failed"
+        finally:
+            os.close(pidfd)
 
     @staticmethod
-    def _terminate_registered_group(pid: int) -> None:
+    def _open_registered_pidfd(pid: int, identity: str) -> int | None:
+        """Open an identity-bound signal handle, then revalidate its process."""
+
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise SupervisorError(
+                "worker_pidfd_unavailable",
+                "identity-safe worker signalling requires Linux pidfd support",
+            )
         try:
-            os.killpg(pid, signal.SIGTERM)
-        except (PermissionError, ProcessLookupError):
-            return
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(pid, 0)
-            except (PermissionError, ProcessLookupError):
-                return
-            time.sleep(0.05)
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except (PermissionError, ProcessLookupError):
-            pass
+            pidfd = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            return None
+        if GitSupervisor._process_identity(pid) != identity:
+            os.close(pidfd)
+            return None
+        return pidfd
 
     def doctor(self) -> dict[str, Any]:
         checks: list[dict[str, Any]] = [
@@ -4242,6 +5491,8 @@ class GitSupervisor:
             "base_sha": row["base_sha"],
             "priority": row["priority"],
             "status": row["status"],
+            "cleanup_target_status": row["cleanup_target_status"],
+            "cleanup_error": row["cleanup_error"],
             "current_attempt_id": row["current_attempt_id"],
             "latest_attempt": self._attempt_view(connection, attempt) if attempt else None,
             "latest_submission": self._submission_view(connection, submission)
@@ -4275,6 +5526,7 @@ class GitSupervisor:
             "latest_sha": row["latest_sha"],
             "checkpoint": json.loads(row["checkpoint_json"]),
             "pid": row["pid"],
+            "pid_identity": row["pid_identity"],
             "log_path": row["log_path"],
             "status": row["status"],
             "lease_expires_at": row["lease_expires_at"],
@@ -4302,6 +5554,7 @@ class GitSupervisor:
         return {
             "attempt_id": row["attempt_id"],
             "state": row["state"],
+            "recovery_action": row["recovery_action"],
             "environment": json.loads(row["env_json"]),
             "allocations": [dict(allocation) for allocation in allocations],
             "setup_results": json.loads(row["setup_results_json"]),
@@ -4329,6 +5582,7 @@ class GitSupervisor:
             "changed_paths": json.loads(row["changed_paths_json"]),
             "resource_tokens": json.loads(row["resource_tokens_json"]),
             "status": row["status"],
+            "qc_resume_status": row["qc_resume_status"],
             "latest_qc": self._qc_view(qc) if qc else None,
             "created_at": row["created_at"],
         }
@@ -4432,6 +5686,86 @@ class GitSupervisor:
             """,
             (stamp, task_id),
         )
+
+    def _fence_task_cleanup(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        attempt_id: str,
+        target_status: str,
+        actor: str,
+        reason: str,
+    ) -> None:
+        """Persist a collision fence before any runtime cleanup side effect."""
+
+        stamp = utc_now()
+        connection.execute(
+            "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = ?, "
+            "cleanup_error = '', updated_at = ? WHERE id = ?",
+            (target_status, stamp, task_id),
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = ?, updated_at = ? WHERE task_id = ?",
+            (CLEANUP_FENCE_EPOCH, stamp, task_id),
+        )
+        connection.execute(
+            "UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ? "
+            "WHERE attempt_id = ?",
+            (CLEANUP_FENCE_EPOCH, stamp, attempt_id),
+        )
+        self._event(
+            connection,
+            "task.cleanup_started",
+            actor,
+            {
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "target_status": target_status,
+                "reason": reason,
+            },
+        )
+
+    def _complete_task_cleanup(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        attempt_id: str,
+        actor: str,
+    ) -> str | None:
+        """Release reservations only after durable runtime-release proof."""
+
+        task = connection.execute(
+            "SELECT status, cleanup_target_status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        runtime = connection.execute(
+            "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if (
+            not task
+            or task["status"] != "cleanup_pending"
+            or not task["cleanup_target_status"]
+            or not runtime
+            or runtime["state"] != "released"
+        ):
+            return None
+        target = task["cleanup_target_status"]
+        stamp = utc_now()
+        connection.execute(
+            "UPDATE tasks SET status = ?, cleanup_target_status = '', cleanup_error = '', "
+            "updated_at = ? "
+            "WHERE id = ? AND status = 'cleanup_pending'",
+            (target, stamp, task_id),
+        )
+        self._release_task_leases(connection, task_id, stamp)
+        self._event(
+            connection,
+            "task.cleanup_completed",
+            actor,
+            {"task_id": task_id, "attempt_id": attempt_id, "target_status": target},
+        )
+        return target
 
     @staticmethod
     def _path_matches(path: str, resource: str) -> bool:
@@ -4538,9 +5872,165 @@ class GitSupervisor:
         command: str,
         cwd: Path,
         extra_env: dict[str, str] | None = None,
+        pass_fds: Sequence[int] = (),
     ) -> dict[str, Any]:
         env = self._child_env(extra_env)
-        return self._run_process(["/bin/sh", "-lc", command], command, cwd, env)
+        return self._run_process(
+            ["/bin/sh", "-c", command],
+            command,
+            cwd,
+            env,
+            pass_fds=pass_fds,
+        )
+
+    def _run_integration_merge(
+        self,
+        worktree: Path,
+        commit_sha: str,
+        operation_guard_fd: int,
+    ) -> dict[str, Any]:
+        """Merge without executing repository-configured helpers or hooks.
+
+        Linux additionally runs Git under the child-subreaper monitor. macOS
+        Git needs to fork its own built-ins, so its fail-closed boundary is an
+        empty hooks directory plus rejection of every local configuration key
+        that can name an executable. Candidate content cannot modify local Git
+        config, and custom attribute drivers have nothing executable to resolve
+        to after this preflight.
+        """
+
+        self._assert_safe_git_execution_config()
+        hooks_dir = self._disabled_git_hooks_dir()
+
+        git = shutil.which("git")
+        if not git or not Path(git).is_absolute():
+            raise SupervisorError("git_unavailable", "an absolute Git executable is required")
+        arguments = [
+            *self._supervisor_git_prefix(git, hooks_dir),
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "merge.verifySignatures=false",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "user.name=Agent Control Plane",
+            "-c",
+            "user.email=acp@localhost.invalid",
+            "-C",
+            str(worktree),
+            "merge",
+            "--strategy=ort",
+            "--no-ff",
+            "--no-edit",
+            commit_sha,
+        ]
+        label = f"git merge {commit_sha}"
+        env = self._supervisor_git_env()
+        if sys.platform.startswith("linux"):
+            return self._run_process(
+                arguments,
+                label,
+                worktree,
+                env,
+                pass_fds=(operation_guard_fd,),
+            )
+        if sys.platform != "darwin":
+            raise SupervisorError(
+                "process_containment_unavailable",
+                "integration merge containment is supported only on Linux and macOS",
+            )
+        started = time.monotonic()
+        process = subprocess.run(
+            arguments,
+            cwd=worktree,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=self.config.timeout_seconds,
+            pass_fds=(operation_guard_fd,),
+        )
+        return {
+            "command": label,
+            "exit_code": process.returncode,
+            "stdout": process.stdout[-12000:],
+            "stderr": process.stderr[-12000:],
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    def _assert_safe_git_execution_config(self) -> None:
+        executable_config = self._git(
+            "config",
+            "--local",
+            "--name-only",
+            "--get-regexp",
+            (
+                r"^(filter\..*\.(clean|smudge|process|required)|merge\..*\.driver|"
+                r"core\.(fsmonitor|sshcommand)|diff\.external|difftool\..*\.cmd|"
+                r"mergetool\..*\.cmd|gpg(\..*)?\.program|credential(\..*)?\.helper|"
+                r"include\.path|includeif\..*\.path)$"
+            ),
+            check=False,
+        )
+        if executable_config.returncode not in {0, 1}:
+            raise SupervisorError(
+                "git_config_unreadable",
+                executable_config.stderr.decode(errors="replace").strip()
+                or "local Git execution config could not be inspected",
+            )
+        configured = executable_config.stdout.decode(errors="replace").splitlines()
+        if configured:
+            raise SupervisorError(
+                "unsafe_git_execution_config",
+                "integration refuses executable Git config: " + ", ".join(configured),
+            )
+
+    def _disabled_git_hooks_dir(self) -> Path:
+        hooks_dir = self.state_dir / "disabled-hooks"
+        hooks_dir.mkdir(mode=0o700, exist_ok=True)
+        opened = hooks_dir.stat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or any(hooks_dir.iterdir())
+        ):
+            raise SupervisorError(
+                "unsafe_git_hooks_directory",
+                "the supervisor's disabled-hooks directory must be empty, current-user-owned 0700",
+            )
+        return hooks_dir
+
+    @staticmethod
+    def _supervisor_git_prefix(git: str, hooks_dir: Path) -> list[str]:
+        return [
+            git,
+            "-c",
+            f"core.hooksPath={hooks_dir}",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "merge.verifySignatures=false",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+        ]
+
+    def _supervisor_git_env(self) -> dict[str, str]:
+        env = self._child_env()
+        env.update(
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+        return env
 
     def _run_critic(
         self,
@@ -4548,6 +6038,7 @@ class GitSupervisor:
         cwd: Path,
         extra_env: dict[str, str],
         trust_pin: dict[str, Any] | None = None,
+        pass_fds: Sequence[int] = (),
     ) -> dict[str, Any]:
         if command != "builtin":
             env = self._child_env(extra_env)
@@ -4564,6 +6055,8 @@ class GitSupervisor:
                     expected_owners=(
                         {0, self.config.trust_owner_uid} if command.startswith("trusted:") else None
                     ),
+                    guard_fd=pass_fds[0] if pass_fds else None,
+                    process_runner=self._run_trusted_contained,
                 )
             except DriverError as error:
                 raise SupervisorError(error.code, error.message) from error
@@ -4575,6 +6068,7 @@ class GitSupervisor:
             "builtin:structural-critic",
             cwd,
             env,
+            pass_fds=pass_fds,
         )
 
     def _run_process(
@@ -4583,87 +6077,125 @@ class GitSupervisor:
         label: str,
         cwd: Path,
         env: dict[str, str],
+        *,
+        timeout_seconds: int | None = None,
+        pass_fds: Sequence[int] = (),
     ) -> dict[str, Any]:
+        if sys.platform == "darwin":
+            sandbox = Path("/usr/bin/sandbox-exec")
+            if not sandbox.is_file():
+                raise SupervisorError(
+                    "process_containment_unavailable",
+                    "Darwin requires sandbox-exec for fail-closed command containment",
+                )
+            # EVFILT_PROC descendant tracking is unsupported on current Darwin.
+            # Denying fork in the kernel leaves exactly one process identity to
+            # supervise; the session leader cannot setsid() and escape.
+            arguments = [
+                str(sandbox),
+                "-p",
+                "(version 1)(allow default)(deny process-fork)",
+                *arguments,
+            ]
+        elif not sys.platform.startswith("linux"):
+            raise SupervisorError(
+                "process_containment_unavailable",
+                "hard process-tree containment is supported only on Linux and Darwin",
+            )
         started = time.monotonic()
-        process = subprocess.Popen(
-            list(arguments),
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        handshake_read, handshake_write = os.pipe()
+        trampoline = Path(__file__).with_name("worker_trampoline.py").resolve()
+        inherited_fds = tuple(sorted({handshake_read, *pass_fds}))
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-I",
+                    str(trampoline),
+                    str(handshake_read),
+                    MONITOR_MODE,
+                    *arguments,
+                ],
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                pass_fds=inherited_fds,
+            )
+        except BaseException:
+            os.close(handshake_write)
+            raise
+        finally:
+            os.close(handshake_read)
+        try:
+            os.write(handshake_write, b"G")
+        except BaseException:
+            os.close(handshake_write)
+            self._stop_kernel_monitor(process)
+            raise
+        os.close(handshake_write)
         timed_out = False
         try:
-            stdout, stderr = process.communicate(timeout=self.config.timeout_seconds)
+            stdout, stderr = process.communicate(
+                timeout=timeout_seconds or self.config.timeout_seconds
+            )
         except subprocess.TimeoutExpired:
             timed_out = True
-            self._terminate_process_group(process)
-            stdout, stderr = process.communicate()
+            self._stop_kernel_monitor(process)
+            stdout, stderr = process.communicate(timeout=3)
         return {
             "command": label,
             "exit_code": 124 if timed_out else process.returncode,
             "stdout": stdout[-12000:],
             "stderr": stderr[-12000:],
             "duration_ms": int((time.monotonic() - started) * 1000),
+            "timed_out": timed_out,
         }
 
-    @staticmethod
-    def _terminate_process_group(
-        process: subprocess.Popen[Any],
-    ) -> None:
-        descendants = GitSupervisor._descendant_pids(process.pid)
-        for pid in reversed(descendants):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (PermissionError, ProcessLookupError):
-                pass
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
-        except PermissionError:
-            try:
-                process.terminate()
-                process.wait(timeout=2)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                process.kill()
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (PermissionError, ProcessLookupError):
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-        for pid in reversed(descendants):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (PermissionError, ProcessLookupError):
-                pass
+    def _run_trusted_contained(
+        self,
+        arguments: Sequence[str],
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_seconds: int,
+        pass_fds: Sequence[int],
+    ) -> dict[str, Any]:
+        return self._run_process(
+            arguments,
+            str(arguments[0]),
+            cwd,
+            dict(env),
+            timeout_seconds=timeout_seconds,
+            pass_fds=pass_fds,
+        )
 
     @staticmethod
-    def _descendant_pids(root_pid: int) -> list[int]:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,ppid="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        children: dict[int, list[int]] = {}
-        for line in result.stdout.splitlines():
-            try:
-                pid, parent = map(int, line.split())
-            except (TypeError, ValueError):
-                continue
-            children.setdefault(parent, []).append(pid)
-        descendants: list[int] = []
-        pending = list(children.get(root_pid, []))
-        while pending:
-            pid = pending.pop()
-            descendants.append(pid)
-            pending.extend(children.get(pid, []))
-        return descendants
+    def _stop_kernel_monitor(process: subprocess.Popen[Any]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired as error:
+            raise SupervisorError(
+                "process_containment_failed",
+                "kernel process monitor did not reap its descendants",
+            ) from error
+
+    @staticmethod
+    def _process_identity(pid: int) -> str | None:
+        """Return Linux's PID-reuse-resistant kernel start identity."""
+
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            fields = raw.rsplit(")", 1)[1].split()
+            return f"linux:{pid}:{fields[19]}"
+        except (FileNotFoundError, IndexError, OSError, ValueError):
+            return None
 
     @staticmethod
     def _command_finding(command: str, result: dict[str, Any]) -> dict[str, str]:
@@ -4723,13 +6255,44 @@ class GitSupervisor:
         if delete_branch and branch:
             self._git("branch", "-D", branch, check=False)
 
+    @contextmanager
+    def _git_operation_guard(self) -> Iterator[None]:
+        """Serialize Git's shared administrative files across workers/processes."""
+
+        lock_path = self.state_dir / "git-operations.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            lock_fd = os.open(lock_path, flags, 0o600)
+        except OSError as error:
+            raise SupervisorError(
+                "git_lock_unavailable", "Git operation lock could not be opened"
+            ) from error
+        try:
+            metadata = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise SupervisorError(
+                    "git_lock_unsafe",
+                    "Git operation lock must be a current-user-owned 0600 regular file",
+                )
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(lock_fd)
+
     def _git_text(self, *arguments: str, check: bool = True) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(self.root), *arguments],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with self._git_operation_guard():
+            result = subprocess.run(
+                ["git", "-C", str(self.root), *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         if check and result.returncode:
             raise SupervisorError(
                 "git_error",
@@ -4738,11 +6301,20 @@ class GitSupervisor:
         return result.stdout.strip()
 
     def _git_bytes(self, *arguments: str, check: bool = True) -> bytes:
-        result = subprocess.run(
-            ["git", "-C", str(self.root), *arguments],
-            capture_output=True,
-            check=False,
-        )
+        git = shutil.which("git") or "git"
+        argv = [
+            *self._supervisor_git_prefix(git, self._disabled_git_hooks_dir()),
+            "-C",
+            str(self.root),
+            *arguments,
+        ]
+        with self._git_operation_guard():
+            result = subprocess.run(
+                argv,
+                env=self._supervisor_git_env(),
+                capture_output=True,
+                check=False,
+            )
         if check and result.returncode:
             raise SupervisorError(
                 "git_error",
@@ -4751,11 +6323,20 @@ class GitSupervisor:
         return result.stdout
 
     def _git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-        result = subprocess.run(
-            ["git", "-C", str(self.root), *arguments],
-            capture_output=True,
-            check=False,
-        )
+        git = shutil.which("git") or "git"
+        argv = [
+            *self._supervisor_git_prefix(git, self._disabled_git_hooks_dir()),
+            "-C",
+            str(self.root),
+            *arguments,
+        ]
+        with self._git_operation_guard():
+            result = subprocess.run(
+                argv,
+                env=self._supervisor_git_env(),
+                capture_output=True,
+                check=False,
+            )
         if check and result.returncode:
             raise SupervisorError(
                 "git_error",

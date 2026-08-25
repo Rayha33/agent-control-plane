@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from support import python_command
 
 import agent_control_plane.git_supervisor as supervisor_module
 from agent_control_plane.credential_providers import (
@@ -23,6 +24,7 @@ from agent_control_plane.runtime_drivers import (
     DriverContext,
     DriverDefinition,
     DriverError,
+    NamespaceRuntimeDriver,
     PostgresSchemaDriver,
     build_driver,
     ownership_token,
@@ -50,7 +52,7 @@ def context(
         runtime_dir=tmp_path / "runtime",
         expires_at=1_800_000_000,
         secret=b"test-secret",
-        environment={"ACP_ATTEMPT_ID": attempt_id},
+        environment={"ACP_ATTEMPT_ID": attempt_id, "ACP_WORKTREE": str(tmp_path)},
         credential_registry=credential_registry,
         credential_handles=credential_handles,
     )
@@ -609,7 +611,7 @@ def test_build_driver_requires_executable_for_external_kinds() -> None:
 # ---------------------------------------------------------------------------
 
 
-DRIVER_CONFIG = """
+DRIVER_CONFIG = f"""
 [supervisor]
 lease_seconds = 60
 qc_timeout_seconds = 30
@@ -617,11 +619,11 @@ critic_identity = "independent-qc"
 require_critic = false
 
 [qc]
-commands = ["python -c 'pass'"]
+commands = {json.dumps([python_command("pass")])}
 critic_command = ""
 
 [integration]
-commands = ["python -c 'pass'"]
+commands = {json.dumps([python_command("pass")])}
 
 [runtime]
 setup_commands = []
@@ -821,11 +823,11 @@ critic_identity = "independent-qc"
 require_critic = false
 
 [qc]
-commands = ["python -c 'pass'"]
+commands = {json.dumps([python_command("pass")])}
 critic_command = ""
 
 [integration]
-commands = ["python -c 'pass'"]
+commands = {json.dumps([python_command("pass")])}
 
 [[credentials]]
 name = "postgres-main"
@@ -874,7 +876,15 @@ def rotate_version(current: Path, version: Path) -> None:
 
 def fake_postgres_runner(active: set[str], operations: list[tuple[str, str]]):
     def runner(  # type: ignore[no-untyped-def]
-        argv, cwd, env, timeout, credential, *, guard_fd=None, expected_owners=None
+        argv,
+        cwd,
+        env,
+        timeout,
+        credential,
+        *,
+        guard_fd=None,
+        expected_owners=None,
+        process_runner=None,
     ):
         assert credential is not None
         target = os.pread(credential.fd, 1024, 0).decode().strip()
@@ -1027,7 +1037,15 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
     release_teardown = threading.Event()
 
     def blocked_runner(  # type: ignore[no-untyped-def]
-        argv, cwd, env, timeout, credential, *, guard_fd=None, expected_owners=None
+        argv,
+        cwd,
+        env,
+        timeout,
+        credential,
+        *,
+        guard_fd=None,
+        expected_owners=None,
+        process_runner=None,
     ):
         if argv[-1].startswith("DROP SCHEMA") and not teardown_entered.is_set():
             teardown_entered.set()
@@ -1040,6 +1058,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
             credential,
             guard_fd=guard_fd,
             expected_owners=expected_owners,
+            process_runner=process_runner,
         )
 
     monkeypatch.setattr(supervisor_module, "run_trusted", blocked_runner)
@@ -1278,3 +1297,433 @@ def test_restart_gives_review_a_fresh_resource(driver_repo: Path) -> None:
 
     assert profile.is_dir()
     assert not stale.exists(), "review must not inherit worker state"
+
+
+# ---------------------------------------------------------------------------
+# Namespace runtime: containment backend (#567)
+# ---------------------------------------------------------------------------
+
+
+def namespace_driver(**options: str) -> NamespaceRuntimeDriver:
+    merged = {
+        "payload": "/bin/sleep 30",
+        "memory_max": "64M",
+        "tasks_max": "16",
+        "cpu_quota": "50%",
+        "wall_clock_seconds": "120",
+        **options,
+    }
+    return NamespaceRuntimeDriver(
+        DriverDefinition(
+            name="runtime",
+            kind="namespace_runtime",
+            executable=Path("/usr/bin/systemd-run"),
+            options=merged,
+        )
+    )
+
+
+def recording_runner(stdout_for: dict[str, str] | None = None):
+    """Capture argv per call and answer `show` with a canned unit state."""
+    calls: list[list[str]] = []
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        calls.append(list(argv))
+        stdout = ""
+        for needle, canned in (stdout_for or {}).items():
+            if needle in argv:
+                stdout = canned
+        return {"argv": list(argv), "exit_code": 0, "stdout": stdout, "stderr": ""}
+
+    return runner, calls
+
+
+# /bin/sh is root-owned on both macOS and Linux, so it satisfies the trust
+# boundary in a parse test without needing systemd present.
+TRUSTED_BIN = "/bin/sh"
+
+ACTIVE_SHOW = (
+    "ActiveState=active\nResult=success\nExecMainStatus=0\nTasksMax=16\nMemoryMax=67108864\n"
+)
+GONE_SHOW = "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
+NOT_FOUND_SHOW = "LoadState=not-found\nActiveState=inactive\n"
+OOM_SHOW = "ActiveState=failed\nResult=oom-kill\nExecMainStatus=137\n"
+
+
+def test_namespace_runtime_never_uses_a_scope(tmp_path: Path) -> None:
+    """🔴 THE design pin, measured on the target host before it was written.
+
+    Same payload, both arms: under `systemd-run --user --scope` a `setsid nohup`
+    grandchild was ALIVE after the unit finished (survivors=1); under a service
+    unit it was dead (survivors=0), because KillMode=control-group kills the
+    whole cgroup. A mocked runner cannot observe that difference, so the choice
+    is asserted structurally here — if someone "simplifies" setup to a scope,
+    the detached-daemon acceptance criterion silently regresses and this fails.
+    """
+    driver = namespace_driver()
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+    assert "--scope" not in argv
+    assert "--property=KillMode=control-group" in argv
+
+
+def test_namespace_runtime_applies_every_quota_as_a_unit_property(tmp_path: Path) -> None:
+    driver = namespace_driver()
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+    assert "--property=MemoryMax=64M" in argv
+    assert "--property=TasksMax=16" in argv
+    assert "--property=CPUQuota=50%" in argv
+    assert "--property=RuntimeMaxSec=120" in argv
+
+
+def test_namespace_runtime_denies_egress_by_default(tmp_path: Path) -> None:
+    driver = namespace_driver()
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+    assert "/usr/bin/unshare" in argv and "--net" in argv
+    # 🔴 Detaching a netns needs CAP_SYS_ADMIN: plain `unshare --net` fails
+    # EPERM unprivileged, the unit never starts, and a "can the host reach it"
+    # check then finds nothing listening and reads as CONTAINED. That false
+    # pass is why the user namespace is asserted here and not assumed.
+    assert "--user" in argv and "--map-root-user" in argv
+    assert argv.index("--user") < argv.index("--net")
+    # The payload runs INSIDE the namespace, never before it.
+    assert argv.index("--net") < argv.index("--")
+    assert "/bin/sleep 30" in argv[-1]
+
+
+def test_namespace_runtime_egress_allow_skips_only_the_network_namespace(tmp_path: Path) -> None:
+    driver = namespace_driver(egress="allow")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+    assert "--net" not in argv
+    assert "--mount" in argv and "--pid" in argv and "--fork" in argv
+
+
+def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path) -> None:
+    driver = namespace_driver()
+    runner, _ = recording_runner({"show": ACTIVE_SHOW})
+    present, observation = driver.probe(context(tmp_path), runner)
+    assert present is True
+    assert observation["writable_layer_bytes"] is None
+    assert observation["writable_layer_accounting"] == "kernel-enforced-tmpfs-cap"
+
+    runner, _ = recording_runner({"show": GONE_SHOW})
+    present, _observation = driver.probe(context(tmp_path), runner)
+    assert present is False
+
+    runner, _ = recording_runner({"show": NOT_FOUND_SHOW})
+    present, observation = driver.probe(context(tmp_path), runner)
+    assert present is False
+    assert observation["absence_proved_by"] == "systemd-unit-not-found"
+
+
+def test_namespace_runtime_unloaded_transient_unit_is_positive_absence_proof(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver()
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        if "show" in argv:
+            unit = next(item for item in argv if item.endswith(".service"))
+            return {
+                "argv": list(argv),
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": f"Failed to get properties: Unit {unit} could not be found.\n",
+            }
+        return {"argv": list(argv), "exit_code": 0, "stdout": "", "stderr": ""}
+
+    evidence = driver.run_phase("teardown", context(tmp_path), runner)
+
+    assert evidence.exit_code == 0
+    assert evidence.present is False
+    assert evidence.proof["cleanup_proved"] is True
+    observation = evidence.proof["observation"]
+    assert observation["exit_code"] == 0
+    assert observation["original_exit_code"] == 1
+    assert observation["absence_proved_by"] == "systemd-unit-not-found"
+
+
+def test_namespace_runtime_quota_violation_produces_a_structured_finding(tmp_path: Path) -> None:
+    driver = namespace_driver()
+    runner, _ = recording_runner({"show": OOM_SHOW})
+    present, observation = driver.probe(context(tmp_path), runner)
+    assert present is False
+    finding = observation["quota_violation"]
+    assert finding["result"] == "oom-kill"
+    assert finding["reason"] == "memory quota exceeded"
+    assert finding["exec_main_status"] == "137"
+
+
+def test_namespace_runtime_teardown_always_clears_a_failed_unit(tmp_path: Path) -> None:
+    """A quota kill leaves the unit `failed`, holding its name.
+
+    Without reset-failed the next attempt's setup collides with the corpse, so
+    "always reap" would be true of the processes and false of the unit.
+    """
+    driver = namespace_driver()
+    runner, calls = recording_runner({"show": GONE_SHOW})
+    result = driver.teardown(context(tmp_path), runner)
+    assert ["stop" in call for call in calls].count(True) == 1
+    assert any("reset-failed" in call for call in calls)
+    assert result["reset_failed"]["exit_code"] == 0
+
+
+def test_namespace_runtime_teardown_absence_is_the_cleanup_criterion(tmp_path: Path) -> None:
+    driver = namespace_driver()
+    # Unit still active after a "successful" stop: exit 0 must NOT read as clean.
+    runner, _ = recording_runner({"show": ACTIVE_SHOW})
+    evidence = driver.run_phase("teardown", context(tmp_path), runner)
+    assert evidence.present is True
+    assert evidence.proof["cleanup_proved"] is False
+    assert not evidence.ok
+
+
+def test_namespace_runtime_resource_id_is_deterministic_and_sanitized(tmp_path: Path) -> None:
+    driver = namespace_driver()
+    ctx = context(tmp_path, attempt_id="Attempt/../weird id")
+    first = driver.resource_id(ctx)
+    assert first == driver.resource_id(ctx)
+    assert "/" not in first and " " not in first and ".." not in first
+
+
+def test_namespace_runtime_requires_a_payload(tmp_path: Path) -> None:
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions(
+            [{"name": "rt", "kind": "namespace_runtime", "executable": TRUSTED_BIN}],
+            tmp_path,
+        )
+    assert "payload" in str(error.value)
+
+
+def test_namespace_runtime_rejects_an_unknown_egress_mode(tmp_path: Path) -> None:
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions(
+            [
+                {
+                    "name": "rt",
+                    "kind": "namespace_runtime",
+                    "executable": TRUSTED_BIN,
+                    "payload": "/bin/true",
+                    "egress": "sometimes",
+                }
+            ],
+            tmp_path,
+        )
+    assert "egress" in str(error.value)
+
+
+def test_namespace_runtime_validates_every_helper_binary(tmp_path: Path) -> None:
+    """Every helper in the privileged namespace prelude is part of the trust root."""
+    attacker = make_executable(tmp_path / "systemctl")
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions(
+            [
+                {
+                    "name": "rt",
+                    "kind": "namespace_runtime",
+                    "executable": TRUSTED_BIN,
+                    "payload": "/bin/true",
+                    "systemctl_path": str(attacker),
+                }
+            ],
+            tmp_path,
+        )
+    assert error.value.code == "untrusted_driver"
+
+
+def test_namespace_runtime_grants_no_credential_unless_one_is_named(tmp_path: Path) -> None:
+    """Deny by default — the point of a containment backend.
+
+    "No credential named" must mean none, not "inherits whatever the supervisor
+    holds". run_trusted already drops ACP_RUNNER_CREDENTIAL on the way out; this
+    asserts the driver never introduces one on the way in.
+    """
+    driver = namespace_driver()
+    captured: dict[str, object] = {}
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        captured["argv"] = list(argv)
+        captured["env"] = dict(env)
+        captured["credential"] = credential
+        return {"argv": list(argv), "exit_code": 0, "stdout": "", "stderr": ""}
+
+    driver.setup(context(tmp_path), runner)
+    assert captured["credential"] is None
+    assert "ACP_RUNTIME_CREDENTIAL" not in captured["env"]
+    assert not any("CREDENTIAL" in k for k in captured["env"])
+
+
+def test_namespace_runtime_delivers_a_named_credential_as_a_descriptor(tmp_path: Path) -> None:
+    """A named credential reaches the runtime as /dev/fd/N, never as a value.
+
+    No plaintext on disk and no env value means nothing for the contained payload
+    to copy into its writable layer or leave for the next attempt — and
+    run_trusted folds material.redactions into its scrub list, so it cannot
+    resurface through this driver's own evidence either.
+    """
+    ctx = postgres_context(tmp_path)  # builds a real versioned credential store
+    registry = ctx.credential_registry
+    handle = registry.resolve_current("postgres-main") if registry else None
+    assert handle is not None
+
+    driver = namespace_driver()
+    named = DriverContext(
+        attempt_id=ctx.attempt_id,
+        task_id=ctx.task_id,
+        runtime_dir=ctx.runtime_dir,
+        expires_at=ctx.expires_at,
+        secret=ctx.secret,
+        environment=ctx.environment,
+        credential_registry=registry,
+        credential_handles={"runtime": handle},
+    )
+    captured: dict[str, object] = {}
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        captured["argv"] = list(argv)
+        captured["env"] = dict(env)
+        captured["credential"] = credential
+        return {"argv": list(argv), "exit_code": 0, "stdout": "", "stderr": ""}
+
+    driver.setup(named, runner)
+    material = captured["credential"]
+    assert material is not None
+    argv = captured["argv"]
+    assert any(
+        str(part).startswith("--property=LoadCredential=acp-runtime:/proc/")
+        for part in argv  # type: ignore[union-attr]
+    )
+    assert "ACP_RUNTIME_CREDENTIAL=/credential" in argv[-1]  # type: ignore[index]
+    assert "ACP_RUNTIME_CREDENTIAL" not in captured["env"]  # type: ignore[operator]
+    # The secret itself must not be anywhere in the environment.
+    assert not any("postgres-password" in v for v in captured["env"].values())  # type: ignore[union-attr]
+
+
+def test_namespace_runtime_refuses_a_named_credential_with_no_registry(tmp_path: Path) -> None:
+    driver = NamespaceRuntimeDriver(
+        DriverDefinition(
+            name="runtime",
+            kind="namespace_runtime",
+            executable=Path("/usr/bin/systemd-run"),
+            options={"payload": "/bin/true", "tasks_max": "8"},
+        )
+    )
+    ctx = DriverContext(
+        attempt_id="a",
+        task_id="t",
+        runtime_dir=tmp_path / "rt",
+        expires_at=0,
+        secret=b"s",
+        environment={},
+        credential_registry=None,
+        credential_handles={
+            "runtime": CredentialHandle(
+                provider="versioned_file",
+                credential="runtime",
+                version="1",
+                provider_fingerprint="p",
+                source_reference="r",
+                source_device=1,
+                source_inode=2,
+                target_fingerprint="x",
+            )
+        },
+    )
+    with pytest.raises(DriverError) as error:
+        driver.setup(ctx, lambda *a: {"exit_code": 0, "stdout": "", "stderr": "", "argv": []})
+    assert error.value.code == "credential_unavailable"
+
+
+def test_namespace_runtime_disk_quota_is_a_sized_tmpfs(tmp_path: Path) -> None:
+    """`io` is not a delegated controller, so the cap is a mount, not a cgroup attr.
+
+    tmpfs is one of the mount types an unprivileged user namespace may create and
+    its `size=` is kernel-enforced. Measured on the host: a 64M write into a 16M
+    tmpfs stopped at exactly 16777216 bytes, against a control that wrote all 64M.
+    """
+    driver = namespace_driver(disk_max="16M", egress="allow")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+    assert "--mount" in argv  # a tmpfs needs the mount namespace
+    script = argv[-1]
+    assert " -t tmpfs -o size=16M,mode=0700 tmpfs /tmp" in script
+
+
+def test_namespace_runtime_reenters_the_writable_layer_after_mounting_it(tmp_path: Path) -> None:
+    """🔴 The trap that makes this fail OPEN, pinned so it cannot regress.
+
+    systemd applies --working-directory BEFORE the unshare runs, so the payload's
+    cwd is an inode reference to the UNDERLYING directory and survives the mount.
+    Without re-entering, writes to "." bypass the cap entirely AND land on the
+    host filesystem — measured 67108864 bytes written and left on the real fs,
+    versus 16777216 contained and 0 leaked once the `cd` is present. A quota that
+    reads as configured while capping nothing is worse than none.
+    """
+    driver = namespace_driver(disk_max="16M", egress="allow")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    script = calls[-1][-1]
+    assert "cd /work" in script
+    # and it must be the inner chroot cwd before the payload starts.
+    assert script.index("mount -t tmpfs") < script.index("cd ")
+    assert script.index("cd ") < script.index("/bin/sleep 30")
+
+
+def test_namespace_runtime_combines_disk_quota_with_read_only_base(tmp_path: Path) -> None:
+    driver = namespace_driver(disk_max="32M", read_only_paths="/opt/base", egress="deny")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+    script = argv[-1]
+    # one mount namespace serves both, and the netns is still applied
+    assert argv.count("--mount") == 1 and "--net" in argv
+    assert script.index("mount -t tmpfs") < script.index("/tmp/acp-root/workspace")
+    assert script.index("/tmp/acp-root/workspace") < script.index("cd ")
+    assert script.index("cd ") < script.index("/bin/sleep 30")
+
+
+def test_namespace_runtime_without_disk_max_uses_a_safe_default(tmp_path: Path) -> None:
+    driver = namespace_driver(egress="allow")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    assert "size=64M" in calls[0][-1]
+
+
+def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver(egress="allow")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+    script = argv[-1]
+
+    assert "/tmp/acp-root" in script
+    assert 'remount,bind,ro "/tmp/acp-root$acp_path"' in script
+    assert "exec /usr/sbin/chroot /tmp/acp-root" in script
+    assert "--pid" in argv and "-t proc" in script
+    assert "--no-new-privs" in script
+    assert "--bounding-set=-all" in script
+    assert script.index("remount,bind,ro") < script.index("chroot")
+    assert script.index("chroot") < script.index("--bounding-set=-all")
+
+
+def test_namespace_runtime_exports_only_sandbox_paths_to_the_service(tmp_path: Path) -> None:
+    driver = namespace_driver(egress="allow", read_only_paths="/opt/base")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    argv = calls[0]
+
+    assert "--working-directory=/" in argv
+    assert "--setenv=ACP_WORKTREE=/workspace" in argv
+    assert "--setenv=ACP_REPO_ROOT=/workspace" in argv
+    assert "--setenv=ACP_RUNTIME_DIR=/work" in argv
+    assert "--setenv=ACP_READ_ONLY_0=/readonly/0" in argv

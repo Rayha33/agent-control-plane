@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from support import commit_change, git, init_repo, make_task
+from support import commit_change, git, init_repo, make_task, python_command
 
 from agent_control_plane.assurance import wilson_interval
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
@@ -24,7 +24,7 @@ def write_assurance_config(
     golden_dir: str = "acp-golden",
     qc_commands: list[str] | None = None,
 ) -> None:
-    commands = json.dumps(qc_commands or ["python -c 'pass'"])
+    commands = json.dumps(qc_commands or [python_command("pass")])
     reviewers = reviewers or {}
     blocks = ""
     for identity, entry in sorted(reviewers.items()):

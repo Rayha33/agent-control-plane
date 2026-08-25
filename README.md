@@ -69,6 +69,7 @@ wedge.
 | Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
 | Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
 | Structured critic | An optional external critic returns evidence-based findings |
+| Process lifecycle boundary | Linux subreaper monitors retain descendants and lifecycle locks; Darwin QC/critics run in a no-fork kernel sandbox |
 | Integration gate | ACP merges into a new integration branch and reruns configured commands |
 | Audit | Git-supervisor mutations and hash-chained events share a transaction |
 
@@ -79,6 +80,21 @@ named integration branch for a human or existing merge queue.
 
 Requirements: Git, Python 3.11+, and
 [uv](https://docs.astral.sh/uv/).
+
+Linux with `/proc` is the production platform for `acp run`: its monitor uses
+the kernel child-subreaper contract and does not exit until every adopted
+descendant is reaped. Current macOS has no supported recursive process-tracking
+primitive, so ACP fails closed instead of polling: QC, critic, hook, and driver
+commands run under a kernel no-fork sandbox, while long-running supervised
+workers are rejected. Manually operated macOS agents can still use claim,
+heartbeat, submit, QC, and integration. CI exercises the complete worker path
+on Linux.
+
+Supervisor-owned Git operations disable repository hooks, signing, background
+maintenance, global/system Git configuration, and filesystem monitors.
+Integration also rejects local filters, custom merge drivers, external diff or
+merge tools, credential helpers, and config includes because those settings can
+launch processes outside the declared gate lifecycle.
 
 ~~~bash
 git clone https://github.com/Rayha33/agent-control-plane.git
@@ -552,15 +568,23 @@ reports false certainty.
 <code>acp reap</code> or any new claim discovers expired attempts. ACP:
 
 1. records the old worktree's current committed SHA;
-2. marks the attempt orphaned;
-3. stops its registered supervised process group;
-4. releases its lease but preserves its branch and worktree;
-5. tears down and releases its configured runtime environment;
-6. increments fencing for the replacement; and
-7. starts the replacement from the last recorded commit.
+2. moves it to <code>terminating</code> and raises every resource/runtime lease
+   to a cleanup fence that cannot expire;
+3. signals the registered kernel process identity and waits for its pidfd;
+4. acquires the operation and runtime lifetime locks, then tears down until the
+   runtime has durable <code>released</code> proof;
+5. only then marks it orphaned and releases the collision lease while preserving
+   its branch and worktree; and
+6. increments fencing for a replacement started from the last recorded commit.
 
-An old process may continue modifying its isolated worktree, but its stale token
-cannot heartbeat, submit, pass QC, or integrate.
+Expired QC and integration reservations use the same two-phase path through
+<code>cleanup_pending</code>. A lock-busy condition, failed signal, invalid trust
+pin, quarantine, or teardown error keeps the fence held and appears in
+<code>acp status</code>; it never makes the resource claimable.
+
+An old process is either terminated before replacement admission or its cleanup
+fence remains held. Its stale token cannot heartbeat, submit, pass QC, or
+integrate.
 
 ## API and authority layer
 
@@ -622,12 +646,16 @@ service.
 - SQLite assumes one trusted host and filesystem.
 - Agents should be launched through ACP or another gateway; direct writes to the
   base checkout happen outside ACP's enforcement boundary.
-- Tests and critic commands execute candidate code. Use a container or sandbox
-  for untrusted repositories.
-- Process-group cleanup covers ordinary descendants, including detached children
-  present at timeout. Adversarial processes can escape host-level process
-  supervision; a container/cgroup boundary is required for guaranteed
-  containment.
+- Tests and critic commands execute candidate code. Linux uses a child subreaper
+  to adopt and kill double-fork/`setsid` descendants on both success and timeout;
+  Darwin denies process creation for these short commands and fails the gate if
+  a command tries to fork. Repositories whose tests need subprocesses therefore
+  need the Linux path or a configured container runtime.
+- The lifecycle monitor prevents accidental daemon escape; it is not a hostile
+  same-UID security boundary. A same-UID process can attack its supervisor or
+  sibling processes directly. Run untrusted candidates under a separate OS
+  identity and the namespace/systemd driver or another container/cgroup
+  boundary.
 - Runtime port pools coordinate ACP attempts on one host, but they are not
   kernel-level reservations. ACP checks OS availability at allocation and
   teardown; unrelated processes can still race between those checks.

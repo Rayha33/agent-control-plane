@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 from pathlib import Path
 
 import pytest
-from support import approve, commit_change, init_repo, make_task, state_fingerprint, write_config
+from support import (
+    approve,
+    commit_change,
+    init_repo,
+    make_task,
+    python_command,
+    state_fingerprint,
+    write_config,
+)
 
 from agent_control_plane.git_supervisor import GitSupervisor
 
@@ -75,7 +84,7 @@ def test_heartbeat_age_shrinks_after_a_heartbeat(repo: Path) -> None:
 
 
 def test_attention_queue_ranks_human_required_above_active_work(repo: Path) -> None:
-    write_config(repo, qc_commands=["python -c 'raise SystemExit(1)'"])
+    write_config(repo, qc_commands=[python_command("raise SystemExit(1)")])
     supervisor = GitSupervisor(repo)
     failing = make_task(supervisor, "alpha.txt", title="needs a human")
     busy = make_task(supervisor, "beta.txt", title="ordinary work")
@@ -112,7 +121,15 @@ def test_failed_cleanup_outranks_review_and_is_listed(repo: Path) -> None:
     categories = [item["category"] for item in snapshot["attention"]]
     assert categories.index("cleanup_failed") < categories.index("review")
     assert snapshot["cleanup_failures"] == [
-        {"attempt_id": attempt["id"], "task_id": created["id"], "state": "teardown_failed"}
+        {
+            "attempt_id": attempt["id"],
+            "task_id": created["id"],
+            "state": "teardown_failed",
+            "owner": "agent-a",
+            "severity": None,
+            "age_seconds": None,
+            "quarantined_resources": 0,
+        }
     ]
 
 
@@ -174,6 +191,47 @@ def test_status_survives_a_dead_worker_pid(repo: Path) -> None:
 
     assert entry["worker"]["pid"] == 999999
     assert entry["worker"]["alive"] is False
+
+
+@pytest.mark.parametrize(
+    ("task_status", "attempt_status"),
+    [("terminating", "terminating"), ("cleanup_pending", "submitted")],
+)
+def test_status_surfaces_collision_fences_and_cleanup_error(
+    repo: Path,
+    task_status: str,
+    attempt_status: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="fenced cleanup")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET status = ?, cleanup_target_status = 'conflicted', "
+            "cleanup_error = 'termination proof missing' WHERE id = ?",
+            (task_status, created["id"]),
+        )
+        connection.execute(
+            "UPDATE attempts SET status = ?, pid = ?, pid_identity = 'kernel-start-7' WHERE id = ?",
+            (attempt_status, os.getpid(), attempt["id"]),
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = ? WHERE task_id = ?",
+            (2**62, created["id"]),
+        )
+
+    snapshot = supervisor.status()
+    entry = entry_for(snapshot, created["id"])
+    attention = next(item for item in snapshot["attention"] if item["task_id"] == created["id"])
+
+    assert snapshot["counts"]["active"] == 1
+    assert entry["awaiting_reap"] is True
+    assert entry["held_resources"] == ["alpha.txt"]
+    assert entry["cleanup_error"] == "termination proof missing"
+    assert entry["worker"]["pid_identity"] == "kernel-start-7"
+    assert attention["category"] == "cleanup_failed"
+    assert "1 collision fence(s) held" in attention["reason"]
+    assert "last error: termination proof missing" in attention["reason"]
 
 
 def test_render_text_is_a_single_screen_summary(repo: Path) -> None:

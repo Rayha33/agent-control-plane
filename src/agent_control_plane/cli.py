@@ -198,9 +198,38 @@ def parser() -> argparse.ArgumentParser:
         help="show driver-managed resources and their cleanup proofs for an attempt",
     )
     driver_resources.add_argument("attempt_id")
-    commands.add_parser(
+    quarantine = commands.add_parser(
         "runtime-quarantine",
-        help="list allocations whose cleanup could not be proven",
+        help="list, explain and recover allocations whose cleanup could not be proven",
+    )
+    # Bare `acp runtime-quarantine` keeps listing, as it always has — the
+    # subcommands are additive so existing operator habits and scripts survive.
+    quarantine_commands = quarantine.add_subparsers(dest="quarantine_action")
+    quarantine_commands.add_parser("list", help="list allocations with unproven cleanup")
+    quarantine_explain = quarantine_commands.add_parser(
+        "explain",
+        help="why each resource is quarantined, and what is safe to do next",
+    )
+    quarantine_explain.add_argument("attempt_id")
+    quarantine_recover = quarantine_commands.add_parser(
+        "recover",
+        help="supported recovery: re-pin the definition, retry cleanup, or file a receipt",
+    )
+    quarantine_recover.add_argument("attempt_id")
+    quarantine_recover.add_argument(
+        "--action",
+        # dest is explicit: the root subparsers already own `action`, and letting
+        # argparse derive it here would overwrite the command name mid-dispatch.
+        dest="recover_action",
+        required=True,
+        choices=["restore-definition", "retry-cleanup", "manual-receipt"],
+    )
+    quarantine_recover.add_argument(
+        "--operator", default="", help="enrolled runner id filing a manual receipt"
+    )
+    add_credential_source(quarantine_recover)
+    quarantine_recover.add_argument(
+        "--reason", default="", help="what was done by hand, recorded with the receipt"
     )
     runtime_restart = commands.add_parser(
         "runtime-restart",
@@ -523,7 +552,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "runtime-resources":
             result = supervisor.driver_resources(args.attempt_id)
         elif args.action == "runtime-quarantine":
-            result = supervisor.quarantined_resources()
+            quarantine_action = getattr(args, "quarantine_action", None)
+            if quarantine_action == "explain":
+                result = supervisor.quarantine_explain(args.attempt_id)
+            elif quarantine_action == "recover":
+                result = supervisor.quarantine_recover(
+                    args.attempt_id,
+                    args.recover_action,
+                    operator=args.operator,
+                    credential=_read_credential(args) or "",
+                    reason=args.reason,
+                )
+            else:
+                result = supervisor.quarantined_resources()
         elif args.action == "runtime-restart":
             result = supervisor.runtime_restart(args.attempt_id, recover=args.recover)
         elif args.action == "runtime-down":

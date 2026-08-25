@@ -34,6 +34,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -58,6 +59,7 @@ DRIVER_KINDS: tuple[str, ...] = (
     "docker_compose",
     "postgres_schema",
     "browser_profile",
+    "namespace_runtime",
 )
 
 # Drivers are infrastructure operations; they get a bounded, generous budget.
@@ -262,6 +264,10 @@ CommandRunner = Callable[
     [Sequence[str], Path, Mapping[str, str], int, CredentialMaterial | None],
     dict[str, Any],
 ]
+ContainedProcessRunner = Callable[
+    [Sequence[str], Path, Mapping[str, str], int, Sequence[int]],
+    dict[str, Any],
+]
 
 
 def run_trusted(
@@ -273,6 +279,7 @@ def run_trusted(
     *,
     guard_fd: int | None = None,
     expected_owners: set[int] | None = None,
+    process_runner: ContainedProcessRunner | None = None,
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
 
@@ -371,6 +378,26 @@ def run_trusted(
             )
             if fd is not None
         }
+        if process_runner is not None:
+            contained_argv = list(execution_argv)
+            if descriptor_execution:
+                contained_argv[0] = str(descriptor_root / str(executable_fd))
+                inherited_fds.add(executable_fd)
+            contained = process_runner(
+                contained_argv,
+                cwd,
+                safe_env,
+                timeout,
+                tuple(sorted(inherited_fds)),
+            )
+            return {
+                "argv": [redact(value) for value in execution_argv],
+                "exit_code": int(contained["exit_code"]),
+                "stdout": redact(str(contained.get("stdout", ""))),
+                "stderr": redact(str(contained.get("stderr", ""))),
+                "duration_ms": int(contained["duration_ms"]),
+                "timed_out": bool(contained.get("timed_out", False)),
+            }
         execution_options: dict[str, Any] = {}
         if descriptor_execution:
             execution_options["executable"] = str(descriptor_root / str(executable_fd))
@@ -769,10 +796,395 @@ class BrowserProfileDriver(ResourceDriver):
         }
 
 
+class NamespaceRuntimeDriver(ResourceDriver):
+    """Containment backend: one transient systemd user unit per attempt.
+
+    Local port allocation coordinates cooperative processes; this contains
+    uncooperative ones. Every quota is a cgroup v2 attribute on a delegated
+    user slice, so no root, no daemon and no container image is involved.
+
+    🔴 THE UNIT IS A SERVICE, NEVER A ``--scope``, and that is the whole design
+    rather than a preference. A scope hands lifetime to its caller and does not
+    kill the cgroup members that remain, so a ``setsid nohup`` grandchild
+    outlives it. Measured on the target host with both arms of the same payload:
+    under ``--scope`` the daemon was ALIVE afterwards (survivors=1); under a
+    service unit, whose default ``KillMode=control-group`` kills the whole
+    cgroup once the main process exits, it was dead (survivors=0). A mocked
+    test cannot catch that difference, so the choice is pinned here in code.
+    """
+
+    kind = "namespace_runtime"
+
+    # cgroup v2 on a delegated user slice carries cpu/memory/pids. It does NOT
+    # carry io unless the host delegates it, so a disk quota cannot be spelled
+    # as a cgroup attribute here; the writable layer is bounded by inspection
+    # instead, and `probe` reports its size as evidence rather than pretending.
+    _QUOTA_PROPERTIES: tuple[tuple[str, str], ...] = (
+        ("memory_max", "MemoryMax"),
+        ("memory_swap_max", "MemorySwapMax"),
+        ("tasks_max", "TasksMax"),
+        ("cpu_quota", "CPUQuota"),
+        ("wall_clock_seconds", "RuntimeMaxSec"),
+    )
+    _DEFAULT_DISK_MAX = "64M"
+
+    def resource_id(self, context: DriverContext) -> str:
+        prefix = self.definition.option("unit_prefix", "acp") or "acp"
+        return _sanitize(f"{prefix}-{context.attempt_id}", allow="-_").lower()
+
+    def _unit(self, context: DriverContext) -> str:
+        return f"{self.resource_id(context)}.service"
+
+    def _systemctl(self) -> str:
+        # Resolved and ownership-checked at config load, exactly like
+        # `executable`; probe and teardown need a second trusted binary.
+        return (
+            self.definition.option("systemctl_path", "/usr/bin/systemctl") or "/usr/bin/systemctl"
+        )
+
+    def setup(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
+        if self.definition.executable is None:
+            raise DriverError("invalid_config", "namespace runtime driver executable is missing")
+        payload = self.definition.option("payload")
+        if not payload:
+            raise DriverError(
+                "invalid_config",
+                f"driver {self.definition.name!r} needs a payload to run inside the runtime",
+            )
+        argv = [
+            str(self.definition.executable),
+            "--user",
+            f"--unit={self.resource_id(context)}",
+            "--property=KillMode=control-group",
+            "--property=UMask=0077",
+            "--working-directory=/",
+        ]
+        for option_name, property_name in self._QUOTA_PROPERTIES:
+            value = self.definition.option(option_name)
+            if value:
+                argv.append(f"--property={property_name}={value}")
+        read_only = self._read_only_paths()
+        disk_max = self.definition.option("disk_max", self._DEFAULT_DISK_MAX)
+
+        # Environment is copied explicitly into the service. systemd-run is a
+        # client of the user manager; its own env/FD table is not the service's
+        # env/FD table. Paths are translated to the sandbox mounts, and runtime
+        # pool values (for example APP_PORT) remain available to the payload.
+        service_env = dict(context.environment)
+        service_env.update(self._env(context))
+        service_env["ACP_WORKTREE"] = "/workspace"
+        service_env["ACP_REPO_ROOT"] = "/workspace"
+        service_env["ACP_RUNTIME_DIR"] = "/work"
+        service_env["HOME"] = "/work"
+        service_env["TMPDIR"] = "/tmp"
+        for index, _path in enumerate(read_only):
+            service_env[f"ACP_READ_ONLY_{index}"] = f"/readonly/{index}"
+        for name, value in sorted(service_env.items()):
+            if re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+                argv.append(f"--setenv={name}={value}")
+
+        # PrivateNetwork= is privileged for user units. A user namespace gives
+        # this wrapper CAP_SYS_ADMIN only long enough to build its private mount,
+        # PID and optional network namespaces. The payload is exec'd after every
+        # capability is removed, so it cannot undo those mounts.
+        argv.extend(
+            [
+                self._unshare(),
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+            ]
+        )
+        if self._egress_denied():
+            argv.append("--net")
+        argv.append("--")
+
+        with self._scoped_credential(context) as (cred_env, material):
+            del cred_env
+            if material is not None:
+                argv.insert(
+                    argv.index(self._unshare()),
+                    f"--property=LoadCredential=acp-runtime:/proc/{os.getpid()}/fd/{material.fd}",
+                )
+            return self._launch(
+                argv,
+                payload,
+                read_only,
+                disk_max or self._DEFAULT_DISK_MAX,
+                context,
+                runner,
+                self._env(context),
+                material,
+            )
+
+    # -- credential policy -------------------------------------------------
+    @contextmanager
+    def _scoped_credential(self, context: DriverContext) -> Any:
+        """Deny by default: a runtime sees ONLY the credential its definition names.
+
+        The whole point of a containment backend is that the contained thing gets
+        what it was granted and nothing else, so "no credential named" must mean
+        no credential — not "inherits whatever the supervisor has". That direction
+        is already half-held by run_trusted, which forwards only ACP_*/known-
+        sensitive names and explicitly drops ACP_RUNNER_CREDENTIAL (the
+        supervisor's own); this closes the other half by never introducing one
+        unless asked.
+
+        When one IS named it is materialized as an anonymous descriptor. The
+        systemd user manager copies that descriptor with LoadCredential= during
+        activation; the service then bind-mounts only that file into its private
+        tmpfs. This bridge is required because descriptors and client env do not
+        cross the systemd-run manager boundary.
+        """
+        handle = self.credential_handle(context)
+        if handle is None:
+            yield {}, None
+            return
+        if context.credential_registry is None:
+            raise DriverError(
+                "credential_unavailable",
+                f"driver {self.definition.name!r} names a credential but no registry was provided",
+            )
+        try:
+            with context.credential_registry.materialize(handle, context.runtime_dir) as material:
+                yield {}, material
+        except CredentialError as error:
+            raise DriverError(error.code, error.message) from error
+
+    def _launch(
+        self,
+        argv: list[str],
+        payload: str,
+        read_only: list[str],
+        disk_max: str,
+        context: DriverContext,
+        runner: CommandRunner,
+        env: dict[str, str],
+        material: CredentialMaterial | None,
+    ) -> dict[str, Any]:
+        worktree = str(context.environment.get("ACP_WORKTREE", ""))
+        if not worktree:
+            raise DriverError("invalid_runtime", "namespace runtime worktree is missing")
+        mount = shlex.quote(self._mount())
+        root = "/tmp/acp-root"
+        prelude = [
+            "set -eu",
+            f"{mount} --make-rprivate /",
+            # Build a new root instead of trying to sanitize the host root.
+            # NAS hosts contain overlay/nsfs/Btrfs mounts that an unprivileged
+            # user namespace cannot self-remount. A private root exposes only
+            # enumerated read-only system trees and no host /home, /run, /var,
+            # Docker mounts or NAS volumes at all.
+            f"{mount} -t tmpfs -o size={disk_max},mode=0700 tmpfs /tmp",
+            (
+                f"mkdir -p {root}/usr {root}/bin {root}/sbin {root}/lib "
+                f"{root}/lib64 {root}/etc {root}/dev {root}/proc {root}/sys "
+                f"{root}/workspace {root}/work {root}/tmp {root}/readonly "
+                f"{root}/home {root}/root {root}/run {root}/var"
+            ),
+            f"chmod 0700 {root}/work && chmod 1777 {root}/tmp",
+            (
+                "for acp_path in /usr /bin /sbin /lib /lib64 /etc; do "
+                'if [ -e "$acp_path" ]; then '
+                f'{mount} --bind "$acp_path" "{root}$acp_path"; '
+                f'{mount} -o remount,bind,ro "{root}$acp_path"; '
+                "fi; done"
+            ),
+            f"mkdir -p {root}/dev/shm {root}/dev/pts",
+            (
+                "for acp_dev in null zero random urandom tty; do "
+                f': > "{root}/dev/$acp_dev"; '
+                f'{mount} --bind "/dev/$acp_dev" "{root}/dev/$acp_dev"; '
+                f'{mount} -o remount,bind,ro "{root}/dev/$acp_dev"; '
+                "done"
+            ),
+            f"ln -s /proc/self/fd {root}/dev/fd",
+            f"ln -s /proc/self/fd/0 {root}/dev/stdin",
+            f"ln -s /proc/self/fd/1 {root}/dev/stdout",
+            f"ln -s /proc/self/fd/2 {root}/dev/stderr",
+            f"{mount} --bind {shlex.quote(worktree)} {root}/workspace",
+            f"{mount} -o remount,bind,ro {root}/workspace",
+        ]
+        for index, path in enumerate(read_only):
+            target = f"{root}/readonly/{index}"
+            prelude.extend(
+                [
+                    f"mkdir -p {target}",
+                    f"{mount} --bind {shlex.quote(path)} {target}",
+                    f"{mount} -o remount,bind,ro {target}",
+                ]
+            )
+        if material is not None:
+            prelude.extend(
+                [
+                    f": > {root}/credential",
+                    (f'{mount} --bind "$CREDENTIALS_DIRECTORY/acp-runtime" {root}/credential'),
+                    f"{mount} -o remount,bind,ro {root}/credential",
+                    "export ACP_RUNTIME_CREDENTIAL=/credential",
+                    "unset CREDENTIALS_DIRECTORY",
+                ]
+            )
+        prelude.extend(
+            [
+                f"{mount} -t proc -o ro,nosuid,nodev,noexec proc {root}/proc",
+                (
+                    f"exec {shlex.quote(self._chroot())} {root} "
+                    f"{shlex.quote(self._setpriv())} "
+                    "--no-new-privs --bounding-set=-all --inh-caps=-all "
+                    "--ambient-caps=-all -- /bin/sh -c "
+                    f"{shlex.quote('cd /work && exec /bin/sh -c ' + shlex.quote(payload))}"
+                ),
+            ]
+        )
+        # Newlines matter: placing a compound `for` before `&&` disables
+        # POSIX `set -e` inside that loop, which would let a failed read-only
+        # bind continue into the payload. Each setup command must fail closed.
+        argv.extend([self._shell(), "-c", "\n".join(prelude)])
+        return runner(argv, context.runtime_dir, env, self._timeout(), material)
+
+    def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
+        # Addressed by unit name only, so the proof cannot be steered by
+        # candidate content. Absence of the unit is what teardown must prove.
+        argv = [
+            self._systemctl(),
+            "--user",
+            "show",
+            self._unit(context),
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=Result",
+            "--property=ExecMainStatus",
+            "--property=TasksMax",
+            "--property=MemoryMax",
+            "--property=MemoryCurrent",
+        ]
+        result = runner(
+            argv,
+            context.runtime_dir,
+            self._env(context) | {"LC_ALL": "C"},
+            self._timeout(),
+            None,
+        )
+        load_state = self._show_value(result.get("stdout", ""), "LoadState")
+        stderr = str(result.get("stderr", ""))
+        missing = load_state == "not-found" or (
+            result.get("exit_code", 0) != 0
+            and self._unit(context).casefold() in stderr.casefold()
+            and ("not found" in stderr.casefold() or "could not be found" in stderr.casefold())
+        )
+        if missing:
+            # A transient unit is normally garbage-collected after stop and
+            # reset-failed. systemctl versions differ: some report
+            # LoadState=not-found, while others return non-zero with a
+            # unit-specific not-found diagnostic. Both are positive absence
+            # proof because the trusted query names only this owned unit.
+            result = {
+                **result,
+                "original_exit_code": result.get("exit_code", 0),
+                "exit_code": 0,
+                "absence_proved_by": "systemd-unit-not-found",
+            }
+        state = self._show_value(result.get("stdout", ""), "ActiveState")
+        present = state in {"active", "activating", "deactivating", "reloading"}
+        finding = self._quota_finding(result.get("stdout", ""))
+        if finding:
+            result = {**result, "quota_violation": finding}
+        memory_current = self._show_value(result.get("stdout", ""), "MemoryCurrent")
+        result = {
+            **result,
+            # The writable tmpfs exists only inside the unit's mount namespace.
+            # Reporting the old host staging directory as its usage was false
+            # evidence, so probe states the accounting boundary explicitly.
+            "writable_layer_bytes": None,
+            "writable_layer_accounting": "kernel-enforced-tmpfs-cap",
+            "memory_current_bytes": int(memory_current) if memory_current.isdigit() else None,
+        }
+        return present, result
+
+    def teardown(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
+        stop = runner(
+            [self._systemctl(), "--user", "stop", self._unit(context)],
+            context.runtime_dir,
+            self._env(context),
+            self._timeout(),
+            None,
+        )
+        # A unit that failed its quota lingers in `failed` and would keep the
+        # name; clearing it is what makes teardown idempotent and the next
+        # attempt's setup possible. Its exit code is deliberately not fatal —
+        # absence, proved by probe, is the cleanup criterion, not this call.
+        reset = runner(
+            [self._systemctl(), "--user", "reset-failed", self._unit(context)],
+            context.runtime_dir,
+            self._env(context),
+            self._timeout(),
+            None,
+        )
+        return {**stop, "reset_failed": {"exit_code": reset.get("exit_code")}}
+
+    # -- helpers -----------------------------------------------------------
+    def _read_only_paths(self) -> list[str]:
+        raw = self.definition.option("read_only_paths", "") or ""
+        return [item for item in (part.strip() for part in raw.split(",")) if item]
+
+    def _egress_denied(self) -> bool:
+        return (self.definition.option("egress", "deny") or "deny").lower() == "deny"
+
+    def _unshare(self) -> str:
+        return self.definition.option("unshare_path", "/usr/bin/unshare") or "/usr/bin/unshare"
+
+    def _shell(self) -> str:
+        # Only used to run the read-only bind prelude before exec'ing the
+        # payload; trusted-resolved at config load like every other binary here.
+        return self.definition.option("shell_path", "/bin/sh") or "/bin/sh"
+
+    def _setpriv(self) -> str:
+        return self.definition.option("setpriv_path", "/usr/bin/setpriv") or "/usr/bin/setpriv"
+
+    def _mount(self) -> str:
+        return self.definition.option("mount_path", "/usr/bin/mount") or "/usr/bin/mount"
+
+    def _chroot(self) -> str:
+        return self.definition.option("chroot_path", "/usr/sbin/chroot") or "/usr/sbin/chroot"
+
+    @staticmethod
+    def _show_value(stdout: str, key: str) -> str:
+        for line in stdout.splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == key:
+                return value.strip()
+        return ""
+
+    def _quota_finding(self, stdout: str) -> dict[str, Any] | None:
+        """Structured finding for a quota kill, so a violation is never silent."""
+        result = self._show_value(stdout, "Result")
+        status = self._show_value(stdout, "ExecMainStatus")
+        if result in {"oom-kill", "timeout", "exit-code", "signal"} and result != "success":
+            return {
+                "result": result,
+                "exec_main_status": status,
+                # 137 = 128+SIGKILL, what a MemoryMax kill reports.
+                "reason": {
+                    "oom-kill": "memory quota exceeded",
+                    "timeout": "wall-clock quota exceeded",
+                }.get(result, "runtime terminated abnormally"),
+            }
+        return None
+
+    def _timeout(self) -> int:
+        return int(
+            self.definition.option("timeout_seconds", str(DEFAULT_PHASE_TIMEOUT_SECONDS))
+            or DEFAULT_PHASE_TIMEOUT_SECONDS
+        )
+
+
 _ADAPTERS: dict[str, type[ResourceDriver]] = {
     DockerComposeDriver.kind: DockerComposeDriver,
     PostgresSchemaDriver.kind: PostgresSchemaDriver,
     BrowserProfileDriver.kind: BrowserProfileDriver,
+    NamespaceRuntimeDriver.kind: NamespaceRuntimeDriver,
 }
 
 
@@ -830,6 +1242,51 @@ def parse_driver_definitions(
             for key, value in entry.items()
             if key not in {"name", "kind", "executable"}
         }
+        if kind == NamespaceRuntimeDriver.kind:
+            if not options.get("payload", "").strip():
+                raise DriverError(
+                    "invalid_config",
+                    f"namespace runtime driver {name!r} requires a payload",
+                )
+            egress = options.get("egress", "deny").strip().lower() or "deny"
+            if egress not in {"deny", "allow"}:
+                raise DriverError(
+                    "invalid_config",
+                    f"namespace runtime driver {name!r} egress must be 'deny' or 'allow'",
+                )
+            options["egress"] = egress
+            disk_max = options.get("disk_max", NamespaceRuntimeDriver._DEFAULT_DISK_MAX).strip()
+            if not re.fullmatch(r"[1-9][0-9]{0,8}[KMG]", disk_max, re.IGNORECASE):
+                raise DriverError(
+                    "invalid_config",
+                    f"namespace runtime driver {name!r} disk_max must be a positive K/M/G size",
+                )
+            options["disk_max"] = disk_max.upper()
+            read_only = options.get("read_only_paths", "")
+            for raw_path in (part.strip() for part in read_only.split(",")):
+                if raw_path and not Path(raw_path).is_absolute():
+                    raise DriverError(
+                        "invalid_config",
+                        f"namespace runtime driver {name!r} read_only_paths must be absolute",
+                    )
+            # probe/teardown and the egress wrapper each exec a SECOND binary.
+            # Validating only `executable` would leave those three unchecked,
+            # which is the whole trust boundary this module exists to hold, so
+            # they get the identical ownership and writability treatment.
+            # Checked last: the cheap config faults above should not depend on
+            # a systemd binary being present to be reported.
+            for option_name, default in (
+                ("systemctl_path", "/usr/bin/systemctl"),
+                ("unshare_path", "/usr/bin/unshare"),
+                ("shell_path", "/bin/sh"),
+                ("setpriv_path", "/usr/bin/setpriv"),
+                ("mount_path", "/usr/bin/mount"),
+                ("chroot_path", "/usr/sbin/chroot"),
+            ):
+                candidate = options.get(option_name, "").strip() or default
+                resolve_trusted_executable(candidate, repo_root, expected_owners)
+                options[option_name] = candidate
+
         if kind == PostgresSchemaDriver.kind:
             if options.get("dsn") or options.get("dsn_env"):
                 raise DriverError(

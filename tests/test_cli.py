@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,7 @@ def run_cli(
     process_env.update(env or {})
     return subprocess.run(
         [
-            "python",
+            sys.executable,
             "-m",
             "agent_control_plane.cli",
             "--repo",
@@ -34,6 +35,34 @@ def run_cli(
         check=False,
         env=process_env,
     )
+
+
+def test_quarantine_recovery_accepts_only_non_argv_credential_sources() -> None:
+    parsed = cli.parser().parse_args(
+        [
+            "runtime-quarantine",
+            "recover",
+            "attempt-1",
+            "--action",
+            "retry-cleanup",
+            "--credential-fd",
+            "9",
+        ]
+    )
+    assert parsed.credential_fd == 9
+
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(
+            [
+                "runtime-quarantine",
+                "recover",
+                "attempt-1",
+                "--action",
+                "retry-cleanup",
+                "--credential",
+                "plaintext-secret",
+            ]
+        )
 
 
 def test_cli_init_create_claim_and_doctor(tmp_path: Path) -> None:
