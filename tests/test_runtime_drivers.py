@@ -251,19 +251,35 @@ def test_run_trusted_never_forwards_supervisor_runner_credential(tmp_path: Path)
     assert secret not in str(result)
 
 
-def test_run_trusted_inherits_restart_guard_fd(tmp_path: Path) -> None:
+def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) -> None:
     lock_path = tmp_path / "restart.lock"
     guard_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+
+    def contained_runner(
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        timeout: int,
+        command_fds: tuple[int, ...],
+        lifecycle_fds: tuple[int, ...],
+    ) -> dict[str, object]:
+        assert guard_fd not in command_fds
+        assert lifecycle_fds == (guard_fd,)
+        return {
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 0,
+            "timed_out": False,
+        }
+
     try:
         result = run_trusted(
-            [
-                "/bin/sh",
-                "-c",
-                f"test -e /proc/self/fd/{guard_fd} || test -e /dev/fd/{guard_fd}",
-            ],
+            ["/usr/bin/true"],
             tmp_path / "wd",
             {},
             guard_fd=guard_fd,
+            process_runner=contained_runner,
         )
     finally:
         os.close(guard_fd)

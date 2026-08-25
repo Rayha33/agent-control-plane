@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import signal
@@ -14,6 +15,7 @@ from threading import Barrier, Event
 import pytest
 from support import python_command
 
+from agent_control_plane import worker_trampoline
 from agent_control_plane.git_supervisor import (
     CLEANUP_FENCE_EPOCH,
     GitSupervisor,
@@ -113,6 +115,51 @@ def commit_change(attempt: dict, path: str, content: str, message: str = "implem
     git(worktree, "add", path)
     git(worktree, "commit", "-m", message)
     return git(worktree, "rev-parse", "HEAD")
+
+
+def reference_porcelain_merge(
+    repo: Path, base_sha: str, candidate_sha: str, label: str
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    worktree = repo.parent / f"reference-merge-{label}"
+    branch = f"reference-merge-{label}"
+    hooks = repo.parent / f"empty-hooks-{label}"
+    hooks.mkdir(mode=0o700)
+    git(repo, "worktree", "add", "-b", branch, str(worktree), base_sha)
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            f"core.hooksPath={hooks}",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "merge.verifySignatures=false",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "user.name=Agent Control Plane",
+            "-c",
+            "user.email=acp@localhost.invalid",
+            "-C",
+            str(worktree),
+            "merge",
+            "--strategy=ort",
+            "--no-ff",
+            "--no-edit",
+            candidate_sha,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    head = git(worktree, "rev-parse", "HEAD") if result.returncode == 0 else None
+    return result, head
 
 
 def free_port_range(count: int) -> tuple[int, int]:
@@ -744,6 +791,16 @@ def test_passed_qc_creates_gated_integration_branch(repo: Path) -> None:
     assert integration["branch"].startswith("acp/integrate-")
     assert git(repo, "show", f"{integration['commit_sha']}:alpha.txt") == "good"
     assert git(repo, "rev-parse", "main") != integration["commit_sha"]
+    assert [result["phase"] for result in integration["command_results"][:4]] == [
+        "ancestry-check",
+        "merge-tree",
+        "commit-tree",
+        "verify-commit",
+    ]
+    assert all(
+        result["security_boundary"] == "synthetic-config+empty-exec-path+contained"
+        for result in integration["command_results"][:4]
+    )
     assert supervisor.task(created["id"])["status"] == "done"
 
 
@@ -776,6 +833,73 @@ def test_integration_gate_cannot_leave_a_detached_child(repo: Path) -> None:
     assert not marker.exists()
 
 
+def test_candidate_cannot_unlock_the_task_lifecycle_guard(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    marker = repo / "guard-fd-result"
+    guard = supervisor._task_operation_guard(created["id"])
+    guard_fd = guard.__enter__()
+    guard_open = True
+    command = python_command(
+        "import fcntl,pathlib,time; "
+        "outcome='unlocked'; "
+        f"descriptor={guard_fd}; "
+        "\ntry:\n fcntl.flock(descriptor, fcntl.LOCK_UN)\n"
+        "except OSError:\n outcome='closed'\n"
+        f"pathlib.Path({str(marker)!r}).write_text(outcome); time.sleep(0.6)"
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(
+                supervisor._run_command,
+                command,
+                repo,
+                None,
+                (guard_fd,),
+            )
+            deadline = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.read_text(encoding="utf-8") == "closed"
+            guard.__exit__(None, None, None)
+            guard_open = False
+            with (
+                pytest.raises(SupervisorError) as captured,
+                supervisor._task_operation_guard(created["id"], recover=True),
+            ):
+                pass
+            assert captured.value.code == "task_operation_executor_alive"
+            assert running.result(timeout=3)["exit_code"] == 0
+        with supervisor._task_operation_guard(created["id"], recover=True):
+            pass
+    finally:
+        if guard_open:
+            guard.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("close_stdio", [False, True])
+def test_command_cannot_escape_by_terminating_its_monitor(repo: Path, close_stdio: bool) -> None:
+    supervisor = GitSupervisor(repo)
+    marker = repo / "monitor-escape-marker"
+    escaped = (
+        "import os,pathlib,time; "
+        + ("[os.close(fd) for fd in (0,1,2)]; " if close_stdio else "")
+        + (f"time.sleep(0.8); pathlib.Path({str(marker)!r}).write_text('escaped')")
+    )
+    command = f"kill -9 $PPID && exec {python_command(escaped)}"
+
+    result = supervisor._run_process(
+        ["/bin/sh", "-c", command],
+        command,
+        repo,
+        supervisor._child_env(),
+    )
+
+    assert result["exit_code"] != 0
+    time.sleep(1)
+    assert not marker.exists()
+
+
 def test_integration_merge_disables_detached_and_blocking_repository_hooks(repo: Path) -> None:
     marker = repo / "post-merge-hook-escaped"
     hook = repo / ".git" / "hooks" / "post-merge"
@@ -801,23 +925,776 @@ def test_integration_merge_disables_detached_and_blocking_repository_hooks(repo:
     assert not marker.exists()
 
 
-def test_integration_rejects_local_git_merge_driver(repo: Path) -> None:
+def test_integration_ignores_hostile_local_merge_driver(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (repo / ".gitattributes").write_text("alpha.txt merge=hostile\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-m", "declare hostile merge attribute")
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
-    commit_change(attempt, "alpha.txt", "good\n")
+    commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "merge.hostile.driver", "/usr/bin/true"],
-        check=True,
+    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    git(repo, "commit", "-m", "conflicting main change")
+    marker = repo / "hostile-driver-ran"
+    driver = repo.parent / "hostile-merge-driver"
+    driver.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' \"${{ACP_RUNNER_CREDENTIAL:-missing}}\" > {marker}\n"
+        f"(sleep 1; printf detached >> {marker}) &\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    driver.chmod(0o755)
+    git(repo, "config", "merge.hostile.driver", f"{driver} %O %A %B %L %P")
+    monkeypatch.setenv("ACP_RUNNER_CREDENTIAL", "integration-secret")
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "conflict"
+    time.sleep(1.2)
+    assert not marker.exists()
+    assert supervisor.task(created["id"])["status"] == "conflicted"
+
+
+def test_isolated_merge_matches_git_tree_and_parent_semantics(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    (repo / "beta.txt").write_text("main moved\n", encoding="utf-8")
+    git(repo, "add", "beta.txt")
+    git(repo, "commit", "-m", "non-conflicting main change")
+    current_base = git(repo, "rev-parse", "main")
+    expected_tree = git(
+        repo,
+        "merge-tree",
+        "--write-tree",
+        "--no-messages",
+        current_base,
+        candidate,
     )
 
     integration = supervisor.integrate(created["id"])
 
+    assert integration["verdict"] == "pass"
+    assert git(repo, "rev-parse", f"{integration['commit_sha']}^{{tree}}") == expected_tree
+    assert git(repo, "rev-list", "--parents", "-n", "1", integration["commit_sha"]).split() == [
+        integration["commit_sha"],
+        current_base,
+        candidate,
+    ]
+    assert git(repo, "show", f"{integration['commit_sha']}:alpha.txt") == "candidate"
+    assert git(repo, "show", f"{integration['commit_sha']}:beta.txt") == "main moved"
+
+
+def test_integration_never_executes_a_replaced_private_git(repo: Path) -> None:
+    marker = repo / "replacement-git-ran"
+    mutation = python_command(
+        "from pathlib import Path; "
+        "git_dir=Path(Path('.git').read_text().split(': ', 1)[1].strip()); "
+        "binary=git_dir/'supervisor-git'; binary.chmod(0o700); "
+        f"binary.write_text('#!/bin/sh\\nprintf leaked > {marker}\\n')"
+    )
+    write_config(repo, integration_commands=[mutation, python_command("pass")])
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    integration = supervisor.integrate(created["id"])
+
     assert integration["verdict"] == "failed"
-    assert "refuses executable Git config" in integration["error"]
-    assert supervisor.task(created["id"])["status"] == "conflicted"
+    assert "mutated tracked source or Git controls" in integration["error"]
+    assert not marker.exists()
+
+
+def test_integration_never_executes_path_selected_git(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    marker = repo / "path-git-ran"
+    candidate_bin = repo / "candidate-bin"
+    candidate_bin.mkdir()
+    wrapper = candidate_bin / "git"
+    wrapper.write_text(
+        f'#!/bin/sh\nprintf leaked > {marker}\nexec /usr/bin/git "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{candidate_bin}{os.pathsep}{os.environ['PATH']}")
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "pass"
+    assert not marker.exists()
+
+
+def test_publication_intent_recovers_a_crash_after_ref_creation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    published: dict[str, str] = {}
+    real_publish = supervisor._publish_integration_ref
+
+    def crash_after_publish(branch: str, commit_sha: str, operation_guard_fd: int) -> None:
+        real_publish(branch, commit_sha, operation_guard_fd)
+        published.update(branch=branch, commit=commit_sha)
+        raise KeyboardInterrupt("simulated supervisor crash")
+
+    monkeypatch.setattr(supervisor, "_publish_integration_ref", crash_after_publish)
+
+    with pytest.raises(KeyboardInterrupt, match="simulated supervisor crash"):
+        supervisor.integrate(created["id"])
+
+    with supervisor.connect() as connection:
+        pending = connection.execute(
+            "SELECT id, branch, commit_sha, verdict FROM integrations WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert {key: pending[key] for key in ("branch", "commit_sha", "verdict")} == {
+        "branch": published["branch"],
+        "commit_sha": published["commit"],
+        "verdict": "publish_pending",
+    }
+    assert git(repo, "rev-parse", f"refs/heads/{published['branch']}") == published["commit"]
+    residue = [
+        supervisor.state_dir / "worktrees" / f"integrate-{pending['id']}",
+        supervisor.state_dir / "integration-git" / f"integrate-{pending['id']}",
+    ]
+    for path in residue:
+        path.mkdir(parents=True)
+        (path / "crash-residue").write_text("left behind", encoding="utf-8")
+
+    recovered = GitSupervisor(repo)
+
+    assert not any(path.exists() for path in residue)
+    with recovered.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT verdict FROM integrations WHERE task_id = ?", (created["id"],)
+            ).fetchone()["verdict"]
+            == "pass"
+        )
+    assert recovered.task(created["id"])["status"] == "cleanup_pending"
+    recovered.reap_expired()
+    assert recovered.task(created["id"])["status"] == "done"
+
+
+def test_ref_publication_retains_task_and_git_locks_in_its_monitor(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    lifecycle_fds: tuple[int, ...] = ()
+
+    def record_containment(
+        arguments: list[str],
+        label: str,
+        cwd: Path,
+        env: dict[str, str],
+        **options: object,
+    ) -> dict[str, object]:
+        nonlocal lifecycle_fds
+        lifecycle_fds = tuple(options["lifecycle_fds"])  # type: ignore[arg-type]
+        return {
+            "command": label,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 0,
+            "timed_out": False,
+        }
+
+    monkeypatch.setattr(supervisor, "_run_process", record_containment)
+
+    with supervisor._task_operation_guard(created["id"]) as operation_guard_fd:
+        supervisor._publish_integration_ref(
+            "acp/test-publication-lock", "0" * 40, operation_guard_fd
+        )
+
+    assert operation_guard_fd in lifecycle_fds
+    assert len(lifecycle_fds) == 2
+
+
+def test_failed_ref_cleanup_remains_durable_until_restart(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    real_publish = supervisor._publish_integration_ref
+    real_delete = supervisor._delete_integration_ref
+    published: dict[str, str] = {}
+    deletion_attempts = 0
+
+    def publish_then_report_failure(branch: str, commit_sha: str, operation_guard_fd: int) -> None:
+        real_publish(branch, commit_sha, operation_guard_fd)
+        published.update(branch=branch, commit=commit_sha)
+        raise SupervisorError("simulated_publication_verification_failure", "verification failed")
+
+    def fail_first_delete(branch: str, commit_sha: str | None, operation_guard_fd: int) -> None:
+        nonlocal deletion_attempts
+        deletion_attempts += 1
+        if deletion_attempts == 1:
+            raise SupervisorError("simulated_ref_delete_failure", "delete failed")
+        real_delete(branch, commit_sha, operation_guard_fd)
+
+    monkeypatch.setattr(supervisor, "_publish_integration_ref", publish_then_report_failure)
+    monkeypatch.setattr(supervisor, "_delete_integration_ref", fail_first_delete)
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "failed"
+    with supervisor.connect() as connection:
+        pending = connection.execute(
+            "SELECT id, branch, commit_sha, verdict FROM integrations WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert pending["verdict"] == "delete_pending"
+    assert pending["branch"] == published["branch"]
+    assert pending["commit_sha"] == published["commit"]
+    assert git(repo, "rev-parse", f"refs/heads/{published['branch']}") == published["commit"]
+
+    recovered = GitSupervisor(repo)
+
+    with recovered.connect() as connection:
+        terminal = connection.execute(
+            "SELECT branch, verdict FROM integrations WHERE id = ?", (pending["id"],)
+        ).fetchone()
+    assert terminal["verdict"] == "failed"
+    assert terminal["branch"] is None
+    absent = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"refs/heads/{published['branch']}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert absent.returncode != 0
+
+
+def test_ref_verification_error_does_not_clear_delete_pending_evidence(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    integration_id = "delete-verification-error"
+    branch = "acp/delete-verification-error"
+    with supervisor.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO integrations
+              (id, task_id, submission_id, branch, commit_sha, verdict,
+               results_json, error, created_at)
+            VALUES (?, ?, ?, ?, ?, 'delete_pending', '[]', 'cleanup pending', ?)
+            """,
+            (
+                integration_id,
+                created["id"],
+                submission["id"],
+                branch,
+                candidate,
+                "2026-08-25T00:00:00+00:00",
+            ),
+        )
+
+    def fail_absence_proof(
+        arguments: list[str], label: str, operation_guard_fd: int
+    ) -> dict[str, object]:
+        return {
+            "command": label,
+            "exit_code": 128 if arguments[0] == "show-ref" else 0,
+            "stdout": "",
+            "stderr": "verification unavailable" if arguments[0] == "show-ref" else "",
+            "duration_ms": 0,
+            "timed_out": False,
+        }
+
+    monkeypatch.setattr(supervisor, "_run_ref_git_contained", fail_absence_proof)
+
+    with (
+        supervisor._task_operation_guard(created["id"]) as operation_guard_fd,
+        pytest.raises(SupervisorError) as captured,
+    ):
+        supervisor._finalize_integration_ref_deletion(
+            integration_id, branch, candidate, operation_guard_fd
+        )
+
+    assert captured.value.code == "integration_ref_deletion_unverified"
+    with supervisor.connect() as connection:
+        pending = connection.execute(
+            "SELECT branch, commit_sha, verdict FROM integrations WHERE id = ?",
+            (integration_id,),
+        ).fetchone()
+    assert pending["verdict"] == "delete_pending"
+    assert pending["branch"] == branch
+    assert pending["commit_sha"] == candidate
+
+
+def test_restart_recovers_a_crash_before_merge_side_effects_are_recorded(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    child = """
+import inspect
+import os
+import sys
+
+from agent_control_plane.git_supervisor import GitSupervisor
+
+generator = GitSupervisor._isolated_integration_git.__wrapped__
+source, start = inspect.getsourcelines(generator)
+target = [start + offset for offset, line in enumerate(source) if line.strip() == "git_dir.chmod(0o700)"]
+assert len(target) == 1
+
+def hard_exit_after_boundary_creation(frame, event, argument):
+    if (
+        event == "line"
+        and frame.f_code is generator.__code__
+        and frame.f_lineno == target[0]
+    ):
+        os._exit(89)
+    return hard_exit_after_boundary_creation
+
+instance = GitSupervisor(sys.argv[1])
+sys.settrace(hard_exit_after_boundary_creation)
+instance.integrate(sys.argv[2])
+"""
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", child, str(repo), created["id"]],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert crashed.returncode == 89, crashed.stderr
+    with supervisor.connect() as connection:
+        interrupted = connection.execute(
+            "SELECT id, verdict FROM integrations WHERE task_id = ?", (created["id"],)
+        ).fetchone()
+    assert interrupted["verdict"] == "running"
+    residue = supervisor.state_dir / "integration-git" / f"integrate-{interrupted['id']}"
+    assert residue.exists()
+
+    recovered = GitSupervisor(repo)
+
+    assert not residue.exists()
+    with recovered.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT verdict FROM integrations WHERE id = ?", (interrupted["id"],)
+            ).fetchone()["verdict"]
+            == "failed"
+        )
+    assert recovered.task(created["id"])["status"] == "cleanup_pending"
+
+
+def test_restart_removes_residue_after_terminal_integration_commit(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    child = """
+import inspect
+import os
+import sys
+
+from agent_control_plane.git_supervisor import GitSupervisor
+
+source, start = inspect.getsourcelines(GitSupervisor._integrate_locked)
+target = [start + offset for offset, line in enumerate(source) if line.strip() == 'verdict = "pass"']
+assert len(target) == 1
+
+def hard_exit_after_terminal_commit(frame, event, argument):
+    if (
+        event == "line"
+        and frame.f_code is GitSupervisor._integrate_locked.__code__
+        and frame.f_lineno == target[0]
+    ):
+        os._exit(88)
+    return hard_exit_after_terminal_commit
+
+instance = GitSupervisor(sys.argv[1])
+sys.settrace(hard_exit_after_terminal_commit)
+instance.integrate(sys.argv[2])
+"""
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", child, str(repo), created["id"]],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert crashed.returncode == 88, crashed.stderr
+    with supervisor.connect() as connection:
+        terminal = connection.execute(
+            "SELECT id, verdict FROM integrations WHERE task_id = ?", (created["id"],)
+        ).fetchone()
+    assert terminal["verdict"] == "pass"
+    residue = supervisor.state_dir / "worktrees" / f"integrate-{terminal['id']}"
+    assert residue.exists()
+
+    GitSupervisor(repo)
+
+    assert not residue.exists()
+
+
+def test_merge_renames_setting_matches_porcelain_merge(repo: Path) -> None:
+    git(repo, "config", "merge.renames", "false")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    git(repo, "mv", "alpha.txt", "renamed.txt")
+    git(repo, "commit", "-m", "rename on main")
+    current_base = git(repo, "rev-parse", "main")
+    reference, _ = reference_porcelain_merge(repo, current_base, candidate, "renames-off")
+    assert reference.returncode != 0
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "conflict"
+
+
+def test_info_attributes_union_matches_porcelain_merge(repo: Path) -> None:
+    info_attributes = repo / ".git" / "info" / "attributes"
+    info_attributes.write_text("alpha.txt merge=union\n", encoding="utf-8")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    git(repo, "commit", "-m", "main content")
+    current_base = git(repo, "rev-parse", "main")
+    reference, reference_head = reference_porcelain_merge(
+        repo, current_base, candidate, "info-union"
+    )
+    assert reference.returncode == 0
+    assert reference_head is not None
+    reference_tree = git(repo, "rev-parse", f"{reference_head}^{{tree}}")
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "pass"
+    assert git(repo, "rev-parse", f"{integration['commit_sha']}^{{tree}}") == reference_tree
+
+
+def test_core_attributes_file_matches_porcelain_merge(repo: Path) -> None:
+    attributes = repo / "operator-attributes"
+    attributes.write_text("alpha.txt merge=union\n", encoding="utf-8")
+    git(repo, "add", "operator-attributes")
+    git(repo, "commit", "-m", "add operator attributes")
+    git(repo, "config", "core.attributesFile", "operator-attributes")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    git(repo, "commit", "-m", "main content")
+    current_base = git(repo, "rev-parse", "main")
+    reference, reference_head = reference_porcelain_merge(
+        repo, current_base, candidate, "core-attributes"
+    )
+    assert reference.returncode == 0
+    assert reference_head is not None
+    reference_tree = git(repo, "rev-parse", f"{reference_head}^{{tree}}")
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "pass"
+    assert git(repo, "rev-parse", f"{integration['commit_sha']}^{{tree}}") == reference_tree
+
+
+def test_integration_persists_replayable_merge_input_evidence(repo: Path) -> None:
+    core_content = b"alpha.txt merge=union\n"
+    info_content = b"beta.txt -text\n"
+    core_attributes = repo / "operator-attributes"
+    core_attributes.write_bytes(core_content)
+    info_attributes = repo / ".git" / "info" / "attributes"
+    info_attributes.write_bytes(info_content)
+    git(repo, "config", "core.attributesFile", str(core_attributes))
+    git(repo, "config", "merge.renames", "false")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    base_sha = git(repo, "rev-parse", "main")
+
+    integration = supervisor.integrate(created["id"])
+    recorded = next(
+        result
+        for result in integration["command_results"]
+        if result.get("phase") == "merge-input-evidence"
+    )["evidence"]
+    core_attributes.write_text("changed after integration\n", encoding="utf-8")
+    info_attributes.write_text("changed after integration\n", encoding="utf-8")
+    git(repo, "config", "merge.renames", "true")
+    with supervisor.connect() as connection:
+        durable_results = json.loads(
+            connection.execute(
+                "SELECT results_json FROM integrations WHERE id = ?", (integration["id"],)
+            ).fetchone()["results_json"]
+        )
+    durable = next(
+        result for result in durable_results if result.get("phase") == "merge-input-evidence"
+    )["evidence"]
+
+    assert durable == recorded
+    assert durable["base_sha"] == base_sha
+    assert durable["candidate_sha"] == candidate
+    assert durable["contract"] == "isolated-merge-input-v1"
+    assert durable["core_attributes"]["content_b64"] == base64.b64encode(core_content).decode(
+        "ascii"
+    )
+    assert durable["info_attributes"]["content_b64"] == base64.b64encode(info_content).decode(
+        "ascii"
+    )
+    assert "merge.renames" not in durable["semantic_config"]
+    assert '[merge]\n\trenames = "false"\n' in durable["semantic_config"]
+
+
+@pytest.mark.parametrize("attributes_state", ["dirty", "untracked"])
+def test_relative_core_attributes_ignores_live_worktree_only_bytes(
+    repo: Path, attributes_state: str
+) -> None:
+    attributes = repo / "operator-attributes"
+    if attributes_state == "dirty":
+        attributes.write_text("# no merge override\n", encoding="utf-8")
+        git(repo, "add", "operator-attributes")
+        git(repo, "commit", "-m", "add baseline operator attributes")
+    attributes.write_text("alpha.txt merge=union\n", encoding="utf-8")
+    git(repo, "config", "core.attributesFile", "operator-attributes")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    git(repo, "commit", "-m", "main content")
+    current_base = git(repo, "rev-parse", "main")
+    reference, _ = reference_porcelain_merge(
+        repo, current_base, candidate, f"core-attributes-{attributes_state}"
+    )
+    assert reference.returncode != 0
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "conflict"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO regression requires POSIX")
+@pytest.mark.parametrize("attribute_source", ["core", "info"])
+def test_attribute_fifo_fails_closed_without_blocking(repo: Path, attribute_source: str) -> None:
+    fifo = (
+        repo / "attributes-fifo"
+        if attribute_source == "core"
+        else repo / ".git" / "info" / "attributes"
+    )
+    os.mkfifo(fifo)
+    if attribute_source == "core":
+        git(repo, "config", "core.attributesFile", str(fifo))
+    child = """
+import sys
+from pathlib import Path
+
+from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+
+instance = GitSupervisor(sys.argv[1])
+try:
+    if sys.argv[2] == "core":
+        instance._read_core_attributes_file(instance._git_text("rev-parse", "HEAD"))
+    else:
+        common = Path(instance._git_text("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        instance._read_integration_info_attributes(common)
+except SupervisorError as error:
+    print(error.code)
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(repo), attribute_source],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "unsafe_git_attributes"
+
+
+def test_oversized_tracked_core_attributes_is_rejected_before_blob_read(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attributes = repo / "operator-attributes"
+    attributes.write_bytes(b"#" + b"x" * (1024 * 1024))
+    git(repo, "add", "operator-attributes")
+    git(repo, "commit", "-m", "add oversized operator attributes")
+    git(repo, "config", "core.attributesFile", "operator-attributes")
+    supervisor = GitSupervisor(repo)
+    blob_read = False
+
+    def fail_blob_read(*arguments: str, **keywords: object) -> bytes:
+        nonlocal blob_read
+        blob_read = True
+        pytest.fail("oversized attribute blob was materialized")
+
+    monkeypatch.setattr(supervisor, "_git_bytes", fail_blob_read)
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor._read_core_attributes_file(git(repo, "rev-parse", "HEAD"))
+
+    assert captured.value.code == "unsafe_git_attributes"
+    assert not blob_read
+
+
+def test_unreadable_linux_child_snapshot_is_not_treated_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots: list[list[int] | None] = [None, []]
+    monkeypatch.setattr(worker_trampoline, "_linux_children", lambda: snapshots.pop(0))
+    monkeypatch.setattr(worker_trampoline.time, "sleep", lambda _seconds: None)
+
+    worker_trampoline._kill_adopted_processes()
+
+    assert snapshots == []
+
+
+def test_replace_refs_cannot_change_reviewed_submission_content(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "reviewed candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    replacement = commit_change(attempt, "alpha.txt", "replacement content\n", "replacement")
+    git(repo, "replace", candidate, replacement)
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "pass"
+    assert git(repo, "show", f"{integration['commit_sha']}:alpha.txt") == "reviewed candidate"
+
+
+def test_graft_metadata_fails_closed_before_integration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    (repo / ".git" / "info" / "grafts").write_text(
+        f"{submission['commit_sha']}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.integrate(created["id"])
+
+    assert captured.value.code == "git_grafts_unsupported"
+    assert supervisor.task(created["id"])["status"] == "approved"
+
+
+def test_child_git_contract_cannot_be_overridden(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+
+    environment = supervisor._child_env({"GIT_NO_REPLACE_OBJECTS": "0", "GIT_ATTR_NOSYSTEM": "0"})
+
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_ATTR_NOSYSTEM"] == "1"
+    assert supervisor._supervisor_git_env()["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert supervisor._supervisor_git_env()["GIT_ATTR_NOSYSTEM"] == "1"
+
+
+def test_pre_contract_approval_migrates_to_a_resubmittable_state(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE submissions SET object_contract = '' WHERE id = ?", (submission["id"],)
+        )
+
+    migrated = GitSupervisor(repo)
+    assert migrated.task(created["id"])["status"] == "cleanup_pending"
+    with pytest.raises(SupervisorError) as captured:
+        migrated.integrate(created["id"])
+
+    assert captured.value.code == "qc_gate_not_passed"
+    replacement = migrated.claim(created["id"], "replacement-worker")
+    commit_change(replacement, "alpha.txt", "replacement-free candidate\n")
+    replacement_submission = migrated.submit(replacement["id"], replacement["claim_token"])
+    assert replacement_submission["object_contract"] == "replacement-free-v1"
+    assert migrated.run_qc(replacement_submission["id"], "independent-qc")["verdict"] == "pass"
+
+
+@pytest.mark.parametrize("advance_main", [False, True])
+def test_already_integrated_candidate_preserves_current_head(
+    repo: Path, advance_main: bool
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    candidate = commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    git(repo, "merge", "--ff-only", candidate)
+    if advance_main:
+        (repo / "beta.txt").write_text("later main\n", encoding="utf-8")
+        git(repo, "add", "beta.txt")
+        git(repo, "commit", "-m", "advance main after candidate")
+    current_base = git(repo, "rev-parse", "main")
+
+    integration = supervisor.integrate(created["id"])
+
+    assert integration["verdict"] == "pass"
+    assert integration["commit_sha"] == current_base
 
 
 def test_task_resolves_head_to_stable_base_branch(repo: Path) -> None:

@@ -277,12 +277,74 @@ the submission in <code>pending_second_review</code> until a second distinct
 reviewer — optionally from a different provider — also passes, or in
 <code>human_required</code> when policy demands a person.
 
-### 7. Integration cannot mutate the base branch
+### 7. Integration cannot mutate the base branch or execute repository Git helpers
 
-ACP creates a fresh worktree and new integration branch from the current base,
-merges the immutable candidate, reruns integration commands, and preserves the
-branch only on success. Merge conflict or command failure moves the task to
-<code>conflicted</code> and releases its reservation.
+ACP computes the merge against the current base in a private synthetic Git
+directory. It invokes the built-in `merge-tree --write-tree` and `commit-tree`
+plumbing commands, materializes their result with `read-tree` and
+`checkout-index`, reruns integration commands in that synthetic workspace, and
+creates the integration ref only after every gate passes. The merge commit has
+the current base as its first parent and the immutable candidate as its second;
+its tree is the tree returned by `merge-tree`. Merge conflict or command
+failure moves the task to <code>conflicted</code> and releases its reservation.
+
+The Git boundary is identical on Linux and macOS:
+
+- ACP resolves a root-owned, non-writable system Git binary and copies its
+  verified bytes to a random private directory before candidate code runs;
+- system/global/executable repository config is absent. A strict allowlist of
+  data-only ort settings and non-blocking, no-follow, 1 MiB-capped attribute
+  snapshots preserve safe merge semantics. A relative `core.attributesFile`
+  is read from the exact current-base tree, never from dirty or untracked live
+  worktree bytes. Exact bytes, provenance, hashes, Git identity, base/candidate
+  OIDs, and canonical semantic config are persisted as replayable integration
+  evidence. Hooks and
+  `GIT_EXEC_PATH` are empty, inherited secrets are removed, and signing,
+  maintenance, pagers, filesystem monitors, and recursive submodules are
+  disabled;
+- the Linux child-subreaper or Darwin no-fork sandbox contains every plumbing
+  invocation. Lifecycle lock descriptors stay in the trusted monitor and are
+  closed in the command child before `exec`. ACP identity-pins that child before
+  release and kills the exact target if its monitor terminates unexpectedly.
+  An unreadable Linux descendant snapshot retains the monitor and its locks;
+- ACP hashes and validates the private executable, config, HEAD, alternates,
+  refs, hooks, exec directory, and workspace `.git` pointer before using the
+  result. Candidate mutation fails the gate before another Git invocation.
+
+This uses Git's documented real-merge plumbing rather than reimplementing merge
+behavior: [`merge-tree --write-tree`](https://git-scm.com/docs/git-merge-tree)
+performs the same file-level merge as `git merge` without touching the working
+tree or index, while [`commit-tree`](https://git-scm.com/docs/git-commit-tree)
+turns that tree and the two parents into the integration commit. Repository
+attributes can still select Git's built-in merge behavior, but executable
+drivers have no configuration in the synthetic boundary.
+
+All Git-derived evidence uses `GIT_NO_REPLACE_OBJECTS=1` and
+`GIT_ATTR_NOSYSTEM=1`. ACP rejects legacy `.git/info/grafts`, stores an explicit
+`replacement-free-v1` contract with each new submission, and rechecks the
+commit type and exact tree before integration. A database upgraded from an
+older release gives existing submissions an empty contract, atomically
+invalidates pending/approved evidence, and fences runtime cleanup before moving
+the task to `changes_requested`. The next claim can then resubmit and rerun QC
+under the new evidence rules.
+
+Before creating a synthetic workspace or Git directory, ACP inserts a durable
+`running` integration row in the same transaction that moves the task to
+`integrating`. Already-integrated candidates preserve the current base commit, matching
+porcelain `git merge --no-ff`; divergent or descendant candidates produce an
+exactly verified two-parent commit. Ref publication is intent-first: ACP stores
+the branch, commit, command evidence, and `publish_pending` verdict in SQLite
+after final credential/trust/reservation validation, then atomically creates
+the ref and finalizes the verdict. Startup reconciliation idempotently finishes
+that intent or fails it closed, so a supervisor crash cannot leave an
+unrecorded integration branch. Ref publication and deletion themselves run in
+the trusted monitor, which retains both task and global Git locks. Failed
+publication keeps branch/commit evidence in `delete_pending` until a contained
+delete is followed by proof that the ref is absent. Under the per-task
+operation guard, recovery
+also sweeps deterministic synthetic workspace and Git-boundary paths for every
+recorded integration, including a terminal `pass` committed immediately before
+an ungraceful process or host failure.
 
 Promotion of that branch is left to the user's existing human review or merge
 queue.

@@ -69,8 +69,8 @@ wedge.
 | Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
 | Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
 | Structured critic | An optional external critic returns evidence-based findings |
-| Process lifecycle boundary | Linux subreaper monitors retain descendants and lifecycle locks; Darwin QC/critics run in a no-fork kernel sandbox |
-| Integration gate | ACP merges into a new integration branch and reruns configured commands |
+| Process lifecycle boundary | Linux subreaper monitors retain descendants and lifecycle locks; Darwin bounded commands run in a no-fork kernel sandbox |
+| Integration gate | Candidate-inert Git plumbing creates a real merge commit, tests a synthetic workspace, and publishes only a passing branch |
 | Audit | Git-supervisor mutations and hash-chained events share a transaction |
 
 ACP never pushes or updates the base branch. A passing integration leaves a
@@ -88,13 +88,34 @@ primitive, so ACP fails closed instead of polling: QC, critic, hook, and driver
 commands run under a kernel no-fork sandbox, while long-running supervised
 workers are rejected. Manually operated macOS agents can still use claim,
 heartbeat, submit, QC, and integration. CI exercises the complete worker path
-on Linux.
+on Linux. Lifecycle lock descriptors remain in the trusted monitor and are
+closed before command execution. The command PID is identity-pinned before it
+is released; if its monitor is terminated unexpectedly, ACP kills that exact
+target and refuses to return until its exit is proven. Linux child-enumeration
+errors retain the monitor and locks; they are never treated as an empty tree.
 
 Supervisor-owned Git operations disable repository hooks, signing, background
 maintenance, global/system Git configuration, and filesystem monitors.
-Integration also rejects local filters, custom merge drivers, external diff or
-merge tools, credential helpers, and config includes because those settings can
-launch processes outside the declared gate lifecycle.
+Integration is stricter: it makes a digest-pinned private copy of a root-owned
+Git binary, uses a synthetic Git directory and empty executable path, and
+imports only a strict allowlist of data-only merge settings plus repository
+attributes. Relative `core.attributesFile` content comes from the exact base
+tree, while absolute and `.git/info/attributes` files use non-blocking,
+no-follow, 1 MiB-capped reads. Each integration durably records the exact
+base/candidate OIDs, Git binary identity, semantic config, and replayable
+attribute snapshots. Repository
+filters, custom merge drivers, hooks, credential helpers, pagers, signing tools,
+and filesystem monitors therefore have no executable definition to run. ACP
+fails closed when that private Git copy or its control files change.
+
+Integration ref publication/deletion retains both the task and global Git
+locks in the trusted monitor. A failed publication remains `delete_pending`
+with its branch/commit evidence until restart recovery proves the ref absent.
+
+Submission evidence, QC, merge planning, and integration all disable Git
+replacement refs and system attributes. Legacy graft metadata is rejected, and
+submissions persist the `replacement-free-v1` object contract; approvals made
+before that contract must be resubmitted and reviewed again.
 
 ~~~bash
 git clone https://github.com/Rayha33/agent-control-plane.git
@@ -658,6 +679,16 @@ service.
   Darwin denies process creation for these short commands and fails the gate if
   a command tries to fork. Repositories whose tests need subprocesses therefore
   need the Linux path or a configured container runtime.
+- Integration has one Linux/macOS Git security contract. ACP runs built-in
+  `merge-tree`, `commit-tree`, `read-tree`, `checkout-index`, and `diff` through
+  a private copy of root-owned Git, synthetic allowlisted config, empty hooks
+  and exec directories, and the platform process-containment boundary. It does
+  not run porcelain `git merge` or load the candidate repository's executable
+  Git configuration. Safe rename/normalization/diff settings and bounded
+  attribute snapshots are copied as inert data so the resulting tree matches
+  the prior real-merge behavior without accepting dirty/untracked relative
+  attribute bytes. Missing plumbing support or a non-root-owned Git executable
+  fails closed.
 - The lifecycle monitor prevents accidental daemon escape; it is not a hostile
   same-UID security boundary. A same-UID process can attack its supervisor or
   sibling processes directly. Run untrusted candidates under a separate OS

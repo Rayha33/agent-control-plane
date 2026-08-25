@@ -265,7 +265,7 @@ CommandRunner = Callable[
     dict[str, Any],
 ]
 ContainedProcessRunner = Callable[
-    [Sequence[str], Path, Mapping[str, str], int, Sequence[int]],
+    [Sequence[str], Path, Mapping[str, str], int, Sequence[int], Sequence[int]],
     dict[str, Any],
 ]
 
@@ -283,10 +283,10 @@ def run_trusted(
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
 
-    ``guard_fd`` is a supervisor-owned lifetime lock. Passing it through exec
-    makes the external operation keep that lock if its supervisor dies, so a
-    recovery process cannot overlap an old teardown that is still capable of
-    changing the resource.
+    ``guard_fd`` is a supervisor-owned lifetime lock. A contained process
+    runner retains it in its trusted monitor but closes it before executing the
+    external command, so recovery remains fenced without giving the command an
+    unlock capability.
     """
 
     if not argv:
@@ -370,25 +370,21 @@ def run_trusted(
     descriptor_execution = sys.platform.startswith("linux") and descriptor_root.is_dir()
     started = time.monotonic()
     try:
-        inherited_fds = {
-            fd
-            for fd in (
-                credential.fd if credential is not None else None,
-                guard_fd,
-            )
-            if fd is not None
+        command_fds = {
+            fd for fd in (credential.fd if credential is not None else None,) if fd is not None
         }
         if process_runner is not None:
             contained_argv = list(execution_argv)
             if descriptor_execution:
                 contained_argv[0] = str(descriptor_root / str(executable_fd))
-                inherited_fds.add(executable_fd)
+                command_fds.add(executable_fd)
             contained = process_runner(
                 contained_argv,
                 cwd,
                 safe_env,
                 timeout,
-                tuple(sorted(inherited_fds)),
+                tuple(sorted(command_fds)),
+                (guard_fd,) if guard_fd is not None else (),
             )
             return {
                 "argv": [redact(value) for value in execution_argv],
@@ -398,10 +394,15 @@ def run_trusted(
                 "duration_ms": int(contained["duration_ms"]),
                 "timed_out": bool(contained.get("timed_out", False)),
             }
+        if guard_fd is not None:
+            raise DriverError(
+                "lifecycle_monitor_required",
+                "a guard descriptor requires a contained process monitor",
+            )
         execution_options: dict[str, Any] = {}
         if descriptor_execution:
             execution_options["executable"] = str(descriptor_root / str(executable_fd))
-            inherited_fds.add(executable_fd)
+            command_fds.add(executable_fd)
         process = subprocess.run(
             execution_argv,
             **execution_options,
@@ -411,7 +412,7 @@ def run_trusted(
             text=True,
             timeout=timeout,
             check=False,
-            pass_fds=tuple(sorted(inherited_fds)),
+            pass_fds=tuple(sorted(command_fds)),
         )
     except subprocess.TimeoutExpired:
         return {
