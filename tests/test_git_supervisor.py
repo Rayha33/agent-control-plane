@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -391,6 +392,77 @@ def test_failed_worker_termination_keeps_cleanup_fence_and_runtime(
     with pytest.raises(SupervisorError) as collision:
         supervisor.claim(second_task["id"], "agent-b")
     assert collision.value.code == "resource_busy"
+
+
+def test_worker_termination_fails_closed_without_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        GitSupervisor,
+        "_open_registered_pidfd",
+        lambda *_: pytest.fail("an identity-less PID must never be opened for signalling"),
+    )
+
+    assert GitSupervisor._terminate_registered_group(424242, "") == "failed"
+
+
+def test_worker_termination_permission_denial_is_not_death_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(GitSupervisor, "_open_registered_pidfd", lambda *_: read_fd)
+
+    def denied(*_args: object) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(signal, "pidfd_send_signal", denied, raising=False)
+    try:
+        assert GitSupervisor._terminate_registered_group(424242, "linux:424242:1") == "failed"
+    finally:
+        os.close(write_fd)
+
+
+def test_live_pidfd_with_unreadable_identity_is_not_death_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(os, "pidfd_open", lambda *_: read_fd, raising=False)
+    monkeypatch.setattr(signal, "pidfd_send_signal", lambda *_: None, raising=False)
+    monkeypatch.setattr(GitSupervisor, "_process_identity", lambda _pid: None)
+    try:
+        assert GitSupervisor._terminate_registered_group(424242, "linux:424242:1") == "failed"
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+    finally:
+        os.close(write_fd)
+
+
+def test_legacy_registered_pid_without_identity_is_migration_fenced(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "legacy-worker")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = 424242, pid_identity = 'unavailable' WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.execute("ALTER TABLE attempts DROP COLUMN pid_identity")
+
+    upgraded = GitSupervisor(repo)
+    fenced = upgraded.attempt(attempt["id"])
+
+    assert fenced["status"] == "terminating"
+    assert fenced["termination_target_status"] == "quarantined"
+    assert fenced["termination_proof"] == ""
+    assert fenced["pid"] == 424242
+    assert fenced["pid_identity"] == ""
+    task_state = upgraded.task(created["id"])
+    assert task_state["status"] == "cleanup_pending"
+    assert task_state["cleanup_target_status"] == "blocked"
+    assert "no verifiable kernel identity" in task_state["cleanup_error"]
+    assert fenced["resource_leases"][0]["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+
+    result = upgraded.reap_expired()
+    assert result["terminated_workers"][0]["termination"] == "failed"
+    assert upgraded.attempt(attempt["id"])["pid"] == 424242
 
 
 def test_concurrent_claim_cannot_pass_a_reaper_blocked_on_worker_termination(
@@ -1353,6 +1425,326 @@ def test_missing_old_pin_quarantines_instead_of_switching_to_current(repo: Path)
     assert "group/world-writable" in joined
     assert "digest mismatch" in joined
     assert "size mismatch" in joined
+
+
+def test_trust_loss_on_heartbeat_retains_worker_identity_until_termination_proof(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trust_root = repo.parent / f"trust-{repo.name}"
+    source = repo.parent / f"bundle-source-{repo.name}"
+    pin = install_test_bundle(source, trust_root, "v1", "old")
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "fenced worker")
+    colliding = task(supervisor, "alpha.txt", "collision")
+    attempt = supervisor.claim(created["id"], "worker")
+    identity = "linux:424242:1"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = 424242, pid_identity = ? WHERE id = ?",
+            (identity, attempt["id"]),
+        )
+
+    bundle = trust_root / "bundles" / pin["bundle_id"]
+    gone_bundle = bundle.with_name(f"gone-{pin['bundle_id']}")
+    bundle.rename(gone_bundle)
+    with pytest.raises(SupervisorError) as error:
+        supervisor.heartbeat(attempt["id"], attempt["claim_token"])
+
+    assert error.value.code == "trust_bundle_quarantined"
+    fenced = supervisor.attempt(attempt["id"])
+    assert fenced["status"] == "terminating"
+    assert fenced["termination_target_status"] == "quarantined"
+    assert fenced["pid"] == 424242
+    assert fenced["pid_identity"] == identity
+    task_state = supervisor.task(created["id"])
+    assert task_state["status"] == "cleanup_pending"
+    assert task_state["cleanup_target_status"] == "blocked"
+    assert "trust bundle invalid" in task_state["cleanup_error"]
+    entry = next(item for item in supervisor.status()["tasks"] if item["task_id"] == created["id"])
+    assert entry["worker"]["status"] == "terminating"
+    assert entry["worker"]["pid"] == 424242
+    assert entry["worker"]["pid_identity"] == identity
+    assert "last error: trust bundle invalid" in entry["reason"]
+
+    monkeypatch.setattr(supervisor, "_terminate_registered_group", lambda *_: "failed")
+    failed = supervisor.reap_expired()
+    assert failed["terminated_workers"][0]["termination"] == "failed"
+    retained = supervisor.attempt(attempt["id"])
+    assert retained["status"] == "terminating"
+    assert retained["pid"] == 424242
+    install_test_bundle(source, trust_root, "v2", "replacement")
+    with pytest.raises(SupervisorError) as collision:
+        supervisor.claim(colliding["id"], "other-worker")
+    assert collision.value.code == "resource_busy"
+
+    restarted = GitSupervisor(repo)
+    monkeypatch.setattr(restarted, "_terminate_registered_group", lambda *_: "identity-gone")
+    recovered = restarted.reap_expired()
+
+    assert recovered["terminated_workers"][0]["termination"] == "identity-gone"
+    retained_after_death = restarted.attempt(attempt["id"])
+    assert retained_after_death["status"] == "terminating"
+    assert retained_after_death["termination_target_status"] == "quarantined"
+    assert retained_after_death["termination_proof"] == "identity-gone"
+    assert retained_after_death["pid"] == 424242
+    assert retained_after_death["pid_identity"] == identity
+    assert restarted.task(created["id"])["status"] == "cleanup_pending"
+    with pytest.raises(SupervisorError) as still_fenced:
+        restarted.claim(colliding["id"], "other-worker")
+    assert still_fenced.value.code == "resource_busy"
+
+    gone_bundle.rename(bundle)
+    finalized = restarted.reap_expired()
+
+    assert finalized["terminated_workers"] == []
+    quarantined = restarted.attempt(attempt["id"])
+    assert quarantined["status"] == "quarantined"
+    assert quarantined["termination_target_status"] == ""
+    assert quarantined["termination_proof"] == ""
+    assert quarantined["pid"] is None
+    assert quarantined["pid_identity"] == ""
+    assert restarted.task(created["id"])["status"] == "blocked"
+    replacement = restarted.claim(colliding["id"], "other-worker")
+    assert replacement["status"] == "working"
+
+
+def test_submit_revalidates_trust_and_commits_quarantine_before_rejection(repo: Path) -> None:
+    trust_root = repo.parent / f"trust-{repo.name}"
+    source = repo.parent / f"bundle-source-{repo.name}"
+    pin = install_test_bundle(source, trust_root, "v1", "old")
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "completed before trust loss\n")
+    identity = "linux:424242:1"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = 424242, pid_identity = ? WHERE id = ?",
+            (identity, attempt["id"]),
+        )
+
+    bundle = trust_root / "bundles" / pin["bundle_id"]
+    bundle.rename(bundle.with_name(f"gone-{pin['bundle_id']}"))
+    with pytest.raises(SupervisorError) as error:
+        supervisor._submit(
+            attempt["id"],
+            attempt["claim_token"],
+            expected_worker_pid=424242,
+            credential=None,
+        )
+
+    assert error.value.code == "trust_bundle_quarantined"
+    fenced = supervisor.attempt(attempt["id"])
+    assert fenced["status"] == "terminating"
+    assert fenced["termination_target_status"] == "quarantined"
+    assert fenced["pid"] == 424242
+    assert fenced["pid_identity"] == identity
+    assert supervisor.task(created["id"])["status"] == "cleanup_pending"
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_launch_reservation_recovers_only_after_recorded_owner_is_gone(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trust_root = repo.parent / f"trust-{repo.name}"
+    source = repo.parent / f"bundle-source-{repo.name}"
+    pin = install_test_bundle(source, trust_root, "v1", "old")
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    colliding = task(supervisor, "alpha.txt", "collision")
+    attempt = supervisor.claim(created["id"], "worker")
+    owner_pid = 31337
+    owner_identity = "linux:31337:9"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = -1, launch_owner_pid = ?, "
+            "launch_owner_identity = ? WHERE id = ?",
+            (owner_pid, owner_identity, attempt["id"]),
+        )
+
+    bundle = trust_root / "bundles" / pin["bundle_id"]
+    bundle.rename(bundle.with_name(f"gone-{pin['bundle_id']}"))
+    with pytest.raises(SupervisorError):
+        supervisor.heartbeat(attempt["id"], attempt["claim_token"])
+    install_test_bundle(source, trust_root, "v2", "replacement")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+
+    monkeypatch.setattr(
+        supervisor,
+        "_process_identity",
+        lambda pid: owner_identity if pid == owner_pid else None,
+    )
+    unresolved = supervisor.reap_expired()
+
+    assert any(
+        item["state"] == "cleanup_error" and "launch owner is still active" in item["error"]
+        for item in unresolved["runtime_cleanup"]
+    )
+    retained = supervisor.attempt(attempt["id"])
+    assert retained["status"] == "terminating"
+    assert retained["termination_target_status"] == "quarantined"
+    assert retained["termination_proof"] == ""
+    assert retained["pid"] == -1
+    assert retained["launch_owner_pid"] == owner_pid
+    assert retained["launch_owner_identity"] == owner_identity
+    assert supervisor.task(created["id"])["status"] == "cleanup_pending"
+    assert retained["resource_leases"][0]["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+    with pytest.raises(SupervisorError) as collision:
+        supervisor.claim(colliding["id"], "other-worker")
+    assert collision.value.code == "resource_busy"
+
+    restarted = GitSupervisor(repo)
+    monkeypatch.setattr(restarted, "_process_identity", lambda _pid: None)
+    recovered = restarted.reap_expired()
+
+    assert any(item["state"] == "released" for item in recovered["runtime_cleanup"])
+    final = restarted.attempt(attempt["id"])
+    assert final["status"] == "quarantined"
+    assert final["termination_target_status"] == ""
+    assert final["termination_proof"] == ""
+    assert final["pid"] is None
+    assert final["launch_owner_pid"] is None
+    assert final["launch_owner_identity"] == ""
+    assert restarted.task(created["id"])["status"] == "blocked"
+    replacement = restarted.claim(colliding["id"], "other-worker")
+    assert replacement["status"] == "working"
+
+
+@requires_linux_worker
+def test_trust_loss_during_worker_launch_fences_before_candidate_execution(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trust_root = repo.parent / f"trust-{repo.name}"
+    source = repo.parent / f"bundle-source-{repo.name}"
+    pin = install_test_bundle(source, trust_root, "v1", "old")
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo.parent / f"worker-launch-escaped-{repo.name}"
+    identity_started = Event()
+    release_identity = Event()
+    original_identity = supervisor._process_identity
+    first_call = True
+
+    def blocked_identity(pid: int) -> str | None:
+        nonlocal first_call
+        if pid != os.getpid() and first_call:
+            first_call = False
+            identity_started.set()
+            assert release_identity.wait(timeout=5)
+        return original_identity(pid)
+
+    monkeypatch.setattr(supervisor, "_process_identity", blocked_identity)
+    command = [
+        sys.executable,
+        "-c",
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('escaped')",
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            supervisor.run_worker,
+            attempt["id"],
+            attempt["claim_token"],
+            command,
+        )
+        assert identity_started.wait(timeout=5)
+        bundle = trust_root / "bundles" / pin["bundle_id"]
+        bundle.rename(bundle.with_name(f"gone-{pin['bundle_id']}"))
+        with pytest.raises(SupervisorError) as quarantine:
+            supervisor.runtime_restart(attempt["id"])
+        assert quarantine.value.code == "trust_bundle_quarantined"
+        reserved = supervisor.attempt(attempt["id"])
+        assert reserved["status"] == "terminating"
+        assert reserved["pid"] == -1
+        release_identity.set()
+        with pytest.raises(SupervisorError) as worker_error:
+            future.result(timeout=10)
+
+    assert worker_error.value.code == "worker_launch_fenced"
+    assert not marker.exists()
+    final = supervisor.attempt(attempt["id"])
+    assert final["status"] == "terminating"
+    assert final["termination_target_status"] == "quarantined"
+    assert final["termination_proof"] == "worker.launch_aborted"
+    assert final["pid"] and final["pid"] > 0
+    assert final["pid_identity"]
+    assert supervisor.task(created["id"])["status"] == "cleanup_pending"
+
+
+@requires_linux_worker
+def test_trust_loss_after_worker_exit_blocks_submission_and_retains_proved_identity(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trust_root = repo.parent / f"trust-{repo.name}"
+    source = repo.parent / f"bundle-source-{repo.name}"
+    pin = install_test_bundle(source, trust_root, "v1", "old")
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    worker_exited = Event()
+    release_exit = Event()
+    original_record_exit = supervisor._record_worker_exit
+
+    def blocked_record_exit(attempt_id: str, pid: int, exit_code: int) -> None:
+        worker_exited.set()
+        assert release_exit.wait(timeout=5)
+        original_record_exit(attempt_id, pid, exit_code)
+
+    monkeypatch.setattr(supervisor, "_record_worker_exit", blocked_record_exit)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,subprocess; "
+            "pathlib.Path('alpha.txt').write_text('complete\\n'); "
+            "subprocess.run(['git','add','alpha.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','worker complete'],check=True)"
+        ),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            supervisor.run_worker,
+            attempt["id"],
+            attempt["claim_token"],
+            command,
+        )
+        assert worker_exited.wait(timeout=10)
+        bundle = trust_root / "bundles" / pin["bundle_id"]
+        bundle.rename(bundle.with_name(f"gone-{pin['bundle_id']}"))
+        with pytest.raises(SupervisorError) as quarantine:
+            supervisor.runtime_restart(attempt["id"])
+        assert quarantine.value.code == "trust_bundle_quarantined"
+        retained = supervisor.attempt(attempt["id"])
+        assert retained["status"] == "terminating"
+        assert retained["pid"] and retained["pid"] > 0
+        assert retained["pid_identity"]
+        release_exit.set()
+        with pytest.raises(SupervisorError) as worker_error:
+            future.result(timeout=10)
+
+    assert worker_error.value.code == "claim_inactive"
+    final = supervisor.attempt(attempt["id"])
+    assert final["status"] == "terminating"
+    assert final["termination_target_status"] == "quarantined"
+    assert final["termination_proof"] == "worker.submission_failed"
+    assert final["pid"] and final["pid"] > 0
+    assert final["pid_identity"]
+    assert supervisor.task(created["id"])["status"] == "cleanup_pending"
 
 
 def test_missing_qc_trust_pin_blocks_integration_before_branch_creation(repo: Path) -> None:

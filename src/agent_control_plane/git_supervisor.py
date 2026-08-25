@@ -164,6 +164,10 @@ CREATE TABLE IF NOT EXISTS attempts (
   trust_bundle_json TEXT NOT NULL DEFAULT '{}',
   pid INTEGER,
   pid_identity TEXT NOT NULL DEFAULT '',
+  termination_target_status TEXT NOT NULL DEFAULT '',
+  termination_proof TEXT NOT NULL DEFAULT '',
+  launch_owner_pid INTEGER,
+  launch_owner_identity TEXT NOT NULL DEFAULT '',
   log_path TEXT,
   status TEXT NOT NULL,
   lease_expires_at INTEGER NOT NULL,
@@ -326,12 +330,72 @@ class GitSupervisor:
             attempt_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(attempts)")
             }
+            legacy_worker_identity_missing = "pid_identity" not in attempt_columns
             if "runner_credential_digest" not in attempt_columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN runner_credential_digest TEXT")
-            if "pid_identity" not in attempt_columns:
+            if legacy_worker_identity_missing:
                 connection.execute(
                     "ALTER TABLE attempts ADD COLUMN pid_identity TEXT NOT NULL DEFAULT ''"
                 )
+            if "termination_target_status" not in attempt_columns:
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN termination_target_status "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            if "termination_proof" not in attempt_columns:
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN termination_proof TEXT NOT NULL DEFAULT ''"
+                )
+            if "launch_owner_pid" not in attempt_columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN launch_owner_pid INTEGER")
+            if "launch_owner_identity" not in attempt_columns:
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN launch_owner_identity TEXT NOT NULL DEFAULT ''"
+                )
+            if legacy_worker_identity_missing:
+                # Older databases stored a PID without the kernel start-time
+                # identity needed to distinguish the worker from PID reuse.
+                # Fence every such live registration during the one-time
+                # migration. Guessing or clearing it could signal an unrelated
+                # process or release resources while the original worker lives.
+                stamp = utc_now()
+                legacy_workers = connection.execute(
+                    "SELECT id, task_id, agent_id FROM attempts WHERE pid > 0"
+                ).fetchall()
+                for worker in legacy_workers:
+                    connection.execute(
+                        "UPDATE attempts SET status = 'terminating', "
+                        "termination_target_status = 'quarantined', "
+                        "termination_proof = '', updated_at = ? WHERE id = ?",
+                        (stamp, worker["id"]),
+                    )
+                    connection.execute(
+                        "UPDATE tasks SET status = 'cleanup_pending', "
+                        "cleanup_target_status = 'blocked', cleanup_error = ?, "
+                        "updated_at = ? WHERE id = ? AND current_attempt_id = ?",
+                        (
+                            "legacy worker PID has no verifiable kernel identity; cleanup remains fenced",
+                            stamp,
+                            worker["task_id"],
+                            worker["id"],
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE resource_leases SET lease_expires_at = ?, updated_at = ? "
+                        "WHERE attempt_id = ?",
+                        (CLEANUP_FENCE_EPOCH, stamp, worker["id"]),
+                    )
+                    connection.execute(
+                        "UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ? "
+                        "WHERE attempt_id = ?",
+                        (CLEANUP_FENCE_EPOCH, stamp, worker["id"]),
+                    )
+                    self._event(
+                        connection,
+                        "worker.identity_migration_fenced",
+                        "supervisor",
+                        {"attempt_id": worker["id"], "agent_id": worker["agent_id"]},
+                    )
             driver_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(runtime_driver_resources)")
@@ -762,15 +826,32 @@ class GitSupervisor:
 
         stamp = utc_now()
         attempt = connection.execute(
-            "SELECT task_id FROM attempts WHERE id = ?", (attempt_id,)
+            "SELECT task_id, status, pid, pid_identity, termination_target_status "
+            "FROM attempts WHERE id = ?",
+            (attempt_id,),
         ).fetchone()
         if not attempt:
             return
-        connection.execute(
-            "UPDATE attempts SET status = 'quarantined', pid = NULL, "
-            "pid_identity = '', updated_at = ? WHERE id = ?",
-            (stamp, attempt_id),
-        )
+        worker_slot_fenced = attempt["pid"] is not None
+        if worker_slot_fenced:
+            # A registered PID is evidence, not disposable metadata. Keep the
+            # exact kernel identity and let the reaper prove it gone before the
+            # attempt reaches its terminal quarantine state. This also retains
+            # pid=-1 launch reservations until the blocked monitor either
+            # registers its real PID or observes the closed handshake.
+            connection.execute(
+                "UPDATE attempts SET status = 'terminating', "
+                "termination_target_status = 'quarantined', updated_at = ? "
+                "WHERE id = ?",
+                (stamp, attempt_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE attempts SET status = 'quarantined', pid = NULL, "
+                "pid_identity = '', termination_target_status = '', termination_proof = '', "
+                "launch_owner_pid = NULL, launch_owner_identity = '', updated_at = ? WHERE id = ?",
+                (stamp, attempt_id),
+            )
         self._fence_task_cleanup(
             connection,
             attempt["task_id"],
@@ -802,7 +883,13 @@ class GitSupervisor:
             connection,
             "trust_bundle.quarantined",
             "supervisor",
-            {"attempt_id": attempt_id, "errors": list(errors)},
+            {
+                "attempt_id": attempt_id,
+                "errors": list(errors),
+                "worker_slot_fenced": worker_slot_fenced,
+                "worker_pid": attempt["pid"],
+                "worker_identity_retained": bool(attempt["pid_identity"]),
+            },
         )
 
     def _verify_attempt_trust_in(
@@ -3850,6 +3937,14 @@ class GitSupervisor:
         lease_seconds: int | None = None,
         credential: str | None = None,
     ) -> dict[str, Any]:
+        # Authenticate before a verification failure is allowed to change state.
+        with self.connect() as connection:
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+        # A long-running worker must not retain authority after its immutable
+        # trust bundle disappears. Quarantine commits in its own transaction so
+        # the following claim-inactive error cannot roll the fence back.
+        self._verify_attempt_trust(attempt_id)
         ttl = lease_seconds or self.config.lease_seconds
         expires = int(time.time()) + ttl
         with self.connect() as connection:
@@ -3956,13 +4051,14 @@ class GitSupervisor:
                     """,
                     (latest, stamp, attempt["id"]),
                 )
-                connection.execute(
-                    """
-                    UPDATE tasks SET status = 'terminating', updated_at = ?
-                    WHERE id = ? AND current_attempt_id = ?
-                    """,
-                    (stamp, attempt["task_id"], attempt["id"]),
-                )
+                if not attempt["termination_target_status"]:
+                    connection.execute(
+                        """
+                        UPDATE tasks SET status = 'terminating', updated_at = ?
+                        WHERE id = ? AND current_attempt_id = ?
+                        """,
+                        (stamp, attempt["task_id"], attempt["id"]),
+                    )
                 connection.execute(
                     """
                     UPDATE resource_leases SET lease_expires_at = ?, updated_at = ?
@@ -3976,7 +4072,7 @@ class GitSupervisor:
                     (CLEANUP_FENCE_EPOCH, stamp, attempt["id"]),
                 )
                 cleanup_attempts.add(attempt["id"])
-                if attempt["pid"] and attempt["pid"] > 0:
+                if attempt["pid"] and attempt["pid"] > 0 and not attempt["termination_proof"]:
                     workers_to_stop.append((attempt["id"], attempt["pid"], attempt["pid_identity"]))
                 if attempt["status"] != "terminating":
                     self._event(
@@ -3987,15 +4083,17 @@ class GitSupervisor:
                     )
             expired = connection.execute(
                 """
-                SELECT DISTINCT task.id, task.status, task.cleanup_target_status
+                SELECT DISTINCT task.id, task.status, task.cleanup_target_status,
+                  task.current_attempt_id
                 FROM tasks AS task
                 JOIN resource_leases AS lease ON lease.task_id = task.id
-                WHERE lease.attempt_id IS NULL
-                  AND (
+                WHERE (
+                    lease.attempt_id IS NULL
+                    AND
                     (task.status IN ('qc_review', 'approved', 'integrating')
                      AND lease.lease_expires_at <= ?)
-                    OR task.status = 'cleanup_pending'
                   )
+                  OR task.status = 'cleanup_pending'
                 """,
                 (epoch,),
             ).fetchall()
@@ -4007,13 +4105,16 @@ class GitSupervisor:
                     """,
                     (row["id"],),
                 ).fetchone()
-                if submission:
-                    task_cleanups[row["id"]] = submission["attempt_id"]
+                cleanup_attempt_id = (
+                    submission["attempt_id"] if submission else row["current_attempt_id"]
+                )
+                if cleanup_attempt_id:
+                    task_cleanups[row["id"]] = cleanup_attempt_id
                     if row["status"] != "cleanup_pending":
                         self._fence_task_cleanup(
                             connection,
                             row["id"],
-                            submission["attempt_id"],
+                            cleanup_attempt_id,
                             "conflicted",
                             "reaper",
                             "reservation_expired",
@@ -4060,6 +4161,17 @@ class GitSupervisor:
                                 "worker_containment_failed",
                                 "worker subreaper did not terminate; cleanup fence remains held",
                             )
+                        if not self._record_registered_worker_termination(
+                            attempt_id,
+                            pid,
+                            identity,
+                            termination,
+                        ):
+                            raise SupervisorError(
+                                "worker_registration_lost",
+                                "worker identity changed before termination proof was recorded",
+                            )
+                    self._prepare_terminated_attempt_cleanup(attempt_id)
                     runtime = self._runtime_down_locked(
                         attempt_id,
                         force=True,
@@ -4068,6 +4180,7 @@ class GitSupervisor:
                     )
                 runtime_cleanup.append({"attempt_id": attempt_id, "state": runtime["state"]})
                 if runtime["state"] == "released":
+                    self._finalize_registered_worker_cleanup(attempt_id)
                     completed_cleanup.add(attempt_id)
             except (OSError, subprocess.SubprocessError, SupervisorError) as error:
                 runtime_cleanup.append(
@@ -4082,18 +4195,28 @@ class GitSupervisor:
         for task_id, attempt_id in sorted(task_cleanups.items()):
             try:
                 with self._task_operation_guard(task_id, recover=True):
-                    with self._runtime_restart_guard(attempt_id, recover=False) as guard_fd:
-                        runtime = self._runtime_down_locked(
-                            attempt_id,
-                            force=True,
-                            _allow_active=False,
-                            guard_fd=guard_fd,
-                        )
+                    if attempt_id in cleanup_attempts:
+                        # The attempt pass above owns process termination and
+                        # the one teardown try for this reap. Reuse its durable
+                        # state instead of executing non-idempotent hooks twice.
+                        runtime = self.runtime_environment(attempt_id)
+                        if runtime["state"] != "released":
+                            continue
+                    else:
+                        with self._runtime_restart_guard(attempt_id, recover=False) as guard_fd:
+                            self._prepare_terminated_attempt_cleanup(attempt_id)
+                            runtime = self._runtime_down_locked(
+                                attempt_id,
+                                force=True,
+                                _allow_active=False,
+                                guard_fd=guard_fd,
+                            )
                     if runtime["state"] != "released":
                         raise SupervisorError(
                             "runtime_cleanup_unproven",
                             "runtime cleanup did not reach released state",
                         )
+                    self._finalize_registered_worker_cleanup(attempt_id)
                     with self.connect() as connection:
                         connection.execute("BEGIN IMMEDIATE")
                         target = self._complete_task_cleanup(
@@ -4127,7 +4250,10 @@ class GitSupervisor:
                 connection.execute("BEGIN IMMEDIATE")
                 for attempt_id in sorted(completed_cleanup):
                     attempt = connection.execute(
-                        "SELECT task_id, status FROM attempts WHERE id = ?", (attempt_id,)
+                        "SELECT task_id, status, pid, termination_target_status, "
+                        "termination_proof "
+                        "FROM attempts WHERE id = ?",
+                        (attempt_id,),
                     ).fetchone()
                     runtime = connection.execute(
                         "SELECT state FROM runtime_environments WHERE attempt_id = ?",
@@ -4136,6 +4262,8 @@ class GitSupervisor:
                     if (
                         not attempt
                         or attempt["status"] != "terminating"
+                        or attempt["termination_target_status"]
+                        or (attempt["pid"] is not None and not attempt["termination_proof"])
                         or not runtime
                         or runtime["state"] != "released"
                     ):
@@ -4143,7 +4271,10 @@ class GitSupervisor:
                     stamp = utc_now()
                     connection.execute(
                         "UPDATE attempts SET status = 'orphaned', pid = NULL, "
-                        "pid_identity = '', updated_at = ? WHERE id = ?",
+                        "pid_identity = '', termination_target_status = '', "
+                        "termination_proof = '', launch_owner_pid = NULL, "
+                        "launch_owner_identity = '', "
+                        "updated_at = ? WHERE id = ?",
                         (stamp, attempt_id),
                     )
                     connection.execute(
@@ -4264,6 +4395,16 @@ class GitSupervisor:
                 task["base_sha"],
                 commit,
             )
+            try:
+                # This is the worker-completion authority boundary. Verify in
+                # the same write transaction immediately before creating the
+                # submission. On failure the quarantine mutations must survive
+                # the rejected submit, so commit them before propagating the
+                # error; nothing in this transaction has written before here.
+                self._verify_attempt_trust_in(connection, attempt_id)
+            except SupervisorError:
+                connection.commit()
+                raise
             submission_id = str(uuid.uuid4())
             stamp = utc_now()
             connection.execute(
@@ -4290,7 +4431,10 @@ class GitSupervisor:
             connection.execute(
                 """
                 UPDATE attempts SET status = 'submitted', latest_sha = ?,
-                  pid = NULL, pid_identity = '', updated_at = ? WHERE id = ?
+                  pid = NULL, pid_identity = '', termination_target_status = '',
+                  termination_proof = '', launch_owner_pid = NULL,
+                  launch_owner_identity = '',
+                  updated_at = ? WHERE id = ?
                 """,
                 (commit, stamp, attempt_id),
             )
@@ -5086,40 +5230,92 @@ class GitSupervisor:
                     )
                 os.close(handshake_read)
                 handshake_read = -1
+                launch_fenced = False
                 with self.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
-                    active = self._active_attempt(
-                        connection, attempt_id, claim_token, int(time.time())
-                    )
-                    self._authenticate_attempt(connection, active, credential)
-                    changed = connection.execute(
-                        """
-                        UPDATE attempts SET pid = ?, pid_identity = ?, log_path = ?, updated_at = ?
-                        WHERE id = ? AND pid = -1
-                        """,
-                        (
-                            process.pid,
-                            process_identity,
-                            str(log_path),
-                            utc_now(),
-                            attempt_id,
-                        ),
-                    ).rowcount
-                    if changed != 1:
+                    registered = connection.execute(
+                        "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+                    ).fetchone()
+                    if not registered:
                         raise SupervisorError(
-                            "worker_registration_lost",
-                            "worker launch reservation was lost",
+                            "attempt_not_found", f"attempt {attempt_id} not found"
                         )
-                    self._event(
-                        connection,
-                        "worker.started",
-                        active["agent_id"],
-                        {
-                            "attempt_id": attempt_id,
-                            "pid": process.pid,
-                            "command": list(command),
-                        },
+                    self._authenticate_attempt(connection, registered, credential)
+                    if registered["claim_token"] != claim_token:
+                        raise SupervisorError("stale_fencing_token", "claim token is stale")
+                    if registered["status"] != "working" and registered["pid"] == -1:
+                        target_status = (
+                            registered["termination_target_status"] or registered["status"]
+                        )
+                        changed = connection.execute(
+                            "UPDATE attempts SET status = 'terminating', "
+                            "termination_target_status = ?, pid = ?, pid_identity = ?, "
+                            "launch_owner_pid = NULL, launch_owner_identity = '', "
+                            "log_path = ?, updated_at = ? WHERE id = ? AND status = ? AND pid = -1",
+                            (
+                                target_status,
+                                process.pid,
+                                process_identity,
+                                str(log_path),
+                                utc_now(),
+                                attempt_id,
+                                registered["status"],
+                            ),
+                        ).rowcount
+                        if changed != 1:
+                            raise SupervisorError(
+                                "worker_registration_lost",
+                                "terminated worker launch reservation changed",
+                            )
+                        launch_fenced = True
+                        self._event(
+                            connection,
+                            "worker.launch_fenced",
+                            registered["agent_id"],
+                            {"attempt_id": attempt_id, "pid": process.pid},
+                        )
+                    else:
+                        active = self._active_attempt(
+                            connection, attempt_id, claim_token, int(time.time())
+                        )
+                        changed = connection.execute(
+                            """
+                            UPDATE attempts SET pid = ?, pid_identity = ?, log_path = ?,
+                              launch_owner_pid = NULL, launch_owner_identity = '', updated_at = ?
+                            WHERE id = ? AND status = 'working' AND pid = -1
+                            """,
+                            (
+                                process.pid,
+                                process_identity,
+                                str(log_path),
+                                utc_now(),
+                                attempt_id,
+                            ),
+                        ).rowcount
+                        if changed != 1:
+                            raise SupervisorError(
+                                "worker_registration_lost",
+                                "worker launch reservation was lost",
+                            )
+                        self._event(
+                            connection,
+                            "worker.started",
+                            active["agent_id"],
+                            {
+                                "attempt_id": attempt_id,
+                                "pid": process.pid,
+                                "command": list(command),
+                            },
+                        )
+                if launch_fenced:
+                    raise SupervisorError(
+                        "worker_launch_fenced",
+                        "trust quarantine fenced the worker before launch authorization",
                     )
+                # Revalidate after the kernel identity is durable but before the
+                # handshake authorizes candidate code. If the pin disappeared,
+                # quarantine retains this PID until the monitor is reaped.
+                self._verify_attempt_trust(attempt_id)
                 os.write(handshake_write, b"G")
                 os.close(handshake_write)
                 handshake_write = -1
@@ -5186,6 +5382,13 @@ class GitSupervisor:
         log_path: str,
         credential: str | None,
     ) -> None:
+        launch_owner_pid = os.getpid()
+        launch_owner_identity = self._process_identity(launch_owner_pid)
+        if not launch_owner_identity:
+            raise SupervisorError(
+                "worker_identity_unavailable",
+                "worker launcher kernel identity could not be recorded",
+            )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
@@ -5197,10 +5400,17 @@ class GitSupervisor:
                 )
             changed = connection.execute(
                 """
-                UPDATE attempts SET pid = -1, pid_identity = '', log_path = ?, updated_at = ?
+                UPDATE attempts SET pid = -1, pid_identity = '', termination_proof = '',
+                  launch_owner_pid = ?, launch_owner_identity = ?, log_path = ?, updated_at = ?
                 WHERE id = ? AND pid IS NULL
                 """,
-                (log_path, utc_now(), attempt_id),
+                (
+                    launch_owner_pid,
+                    launch_owner_identity,
+                    log_path,
+                    utc_now(),
+                    attempt_id,
+                ),
             ).rowcount
             if changed != 1:
                 raise SupervisorError(
@@ -5228,16 +5438,180 @@ class GitSupervisor:
             ).fetchone()
             if not attempt or attempt["pid"] not in expected_pids:
                 return
-            connection.execute(
-                "UPDATE attempts SET pid = NULL, pid_identity = '', updated_at = ? WHERE id = ?",
-                (utc_now(), attempt_id),
-            )
+            terminating = attempt["status"] == "terminating"
+            if terminating:
+                # The monitor is gone, but the runtime is not yet proven down.
+                # Retain the exact registration until that second proof is
+                # durable, so a failed cleanup remains safely retryable.
+                connection.execute(
+                    "UPDATE attempts SET termination_proof = ?, "
+                    "launch_owner_pid = NULL, launch_owner_identity = '', "
+                    "updated_at = ? WHERE id = ?",
+                    (event_type, utc_now(), attempt_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE attempts SET pid = NULL, pid_identity = '', "
+                    "termination_target_status = '', termination_proof = '', "
+                    "launch_owner_pid = NULL, launch_owner_identity = '', "
+                    "updated_at = ? WHERE id = ?",
+                    (utc_now(), attempt_id),
+                )
             self._event(
                 connection,
                 event_type,
                 attempt["agent_id"],
-                {"attempt_id": attempt_id, "exit_code": exit_code},
+                {
+                    "attempt_id": attempt_id,
+                    "exit_code": exit_code,
+                    "termination_target_status": attempt["termination_target_status"],
+                    "termination_proved": terminating,
+                },
             )
+
+    def _record_registered_worker_termination(
+        self,
+        attempt_id: str,
+        expected_pid: int,
+        expected_identity: str,
+        proof: str,
+    ) -> bool:
+        """Durably record process death without releasing its cleanup identity."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if (
+                not attempt
+                or attempt["status"] != "terminating"
+                or attempt["pid"] != expected_pid
+                or attempt["pid_identity"] != expected_identity
+            ):
+                return False
+            stamp = utc_now()
+            connection.execute(
+                "UPDATE attempts SET termination_proof = ?, launch_owner_pid = NULL, "
+                "launch_owner_identity = '', updated_at = ? WHERE id = ? "
+                "AND status = 'terminating' AND pid = ? AND pid_identity = ?",
+                (proof, stamp, attempt_id, expected_pid, expected_identity),
+            )
+            self._event(
+                connection,
+                "worker.termination_proved",
+                "reaper",
+                {
+                    "attempt_id": attempt_id,
+                    "pid": expected_pid,
+                    "proof": proof,
+                    "target_status": attempt["termination_target_status"],
+                },
+            )
+            return True
+
+    def _prepare_terminated_attempt_cleanup(self, attempt_id: str) -> None:
+        """Require process-death proof before runtime teardown may start."""
+
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+        if not attempt or attempt["status"] != "terminating" or attempt["pid"] is None:
+            return
+        if attempt["termination_proof"]:
+            return
+        if attempt["pid"] == -1:
+            owner_pid = attempt["launch_owner_pid"]
+            owner_identity = attempt["launch_owner_identity"]
+            if not owner_pid or not owner_identity:
+                raise SupervisorError(
+                    "worker_launch_identity_unavailable",
+                    "launch reservation has no verifiable owner; cleanup fence remains held",
+                )
+            if self._process_identity(owner_pid) == owner_identity:
+                raise SupervisorError(
+                    "worker_launch_unresolved",
+                    "launch owner is still active; cleanup fence remains held",
+                )
+            if not self._record_registered_worker_termination(
+                attempt_id,
+                -1,
+                "",
+                "launch-owner-gone",
+            ):
+                raise SupervisorError(
+                    "worker_registration_lost",
+                    "launch reservation changed before owner-death proof was recorded",
+                )
+            return
+        if attempt["pid"] > 0:
+            raise SupervisorError(
+                "worker_termination_unproven",
+                "registered worker death is unproven; cleanup fence remains held",
+            )
+        raise SupervisorError(
+            "worker_registration_invalid",
+            "worker registration is invalid; cleanup fence remains held",
+        )
+
+    def _finalize_registered_worker_cleanup(self, attempt_id: str) -> str | None:
+        """Clear worker identity only after runtime release is also durable."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if (
+                not attempt
+                or attempt["status"] != "terminating"
+                or not attempt["termination_target_status"]
+            ):
+                return None
+            runtime = connection.execute(
+                "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if not attempt["termination_proof"] or not runtime or runtime["state"] != "released":
+                raise SupervisorError(
+                    "worker_cleanup_unproven",
+                    "worker identity and runtime cleanup are not both proven",
+                )
+            target = attempt["termination_target_status"]
+            stamp = utc_now()
+            changed = connection.execute(
+                "UPDATE attempts SET status = ?, pid = NULL, pid_identity = '', "
+                "termination_target_status = '', termination_proof = '', "
+                "launch_owner_pid = NULL, launch_owner_identity = '', updated_at = ? "
+                "WHERE id = ? AND status = 'terminating' AND pid IS ? "
+                "AND pid_identity = ? AND termination_proof = ?",
+                (
+                    target,
+                    stamp,
+                    attempt_id,
+                    attempt["pid"],
+                    attempt["pid_identity"],
+                    attempt["termination_proof"],
+                ),
+            ).rowcount
+            if changed != 1:
+                raise SupervisorError(
+                    "worker_registration_lost",
+                    "worker cleanup identity changed before finalization",
+                )
+            self._event(
+                connection,
+                "worker.cleanup_proved",
+                "reaper",
+                {
+                    "attempt_id": attempt_id,
+                    "pid": attempt["pid"],
+                    "termination_proof": attempt["termination_proof"],
+                    "target_status": target,
+                },
+            )
+            return target
 
     def _record_worker_exit(self, attempt_id: str, pid: int, exit_code: int) -> None:
         with self.connect() as connection:
@@ -5295,12 +5669,24 @@ class GitSupervisor:
 
     @staticmethod
     def _terminate_registered_group(pid: int, identity: str) -> str:
-        pidfd = GitSupervisor._open_registered_pidfd(pid, identity)
+        if not identity:
+            # A PID without its kernel birth identity may now name an unrelated
+            # process. It is neither safe to signal nor safe to call gone.
+            return "failed"
+        try:
+            pidfd = GitSupervisor._open_registered_pidfd(pid, identity)
+        except SupervisorError as error:
+            if error.code == "worker_identity_unreadable":
+                return "failed"
+            raise
         if pidfd is None:
             return "identity-gone"
         try:
             signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-        except (PermissionError, ProcessLookupError):
+        except PermissionError:
+            os.close(pidfd)
+            return "failed"
+        except ProcessLookupError:
             os.close(pidfd)
             return "identity-gone"
         try:
@@ -5327,7 +5713,14 @@ class GitSupervisor:
             pidfd = os.pidfd_open(pid, 0)
         except ProcessLookupError:
             return None
-        if GitSupervisor._process_identity(pid) != identity:
+        current_identity = GitSupervisor._process_identity(pid)
+        if current_identity is None:
+            os.close(pidfd)
+            raise SupervisorError(
+                "worker_identity_unreadable",
+                "registered worker kernel identity could not be revalidated",
+            )
+        if current_identity != identity:
             os.close(pidfd)
             return None
         return pidfd
@@ -5527,6 +5920,10 @@ class GitSupervisor:
             "checkpoint": json.loads(row["checkpoint_json"]),
             "pid": row["pid"],
             "pid_identity": row["pid_identity"],
+            "termination_target_status": row["termination_target_status"],
+            "termination_proof": row["termination_proof"],
+            "launch_owner_pid": row["launch_owner_pid"],
+            "launch_owner_identity": row["launch_owner_identity"],
             "log_path": row["log_path"],
             "status": row["status"],
             "lease_expires_at": row["lease_expires_at"],
@@ -5742,12 +6139,19 @@ class GitSupervisor:
             "SELECT state FROM runtime_environments WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone()
+        attempt = connection.execute(
+            "SELECT pid, termination_target_status FROM attempts WHERE id = ?",
+            (attempt_id,),
+        ).fetchone()
         if (
             not task
             or task["status"] != "cleanup_pending"
             or not task["cleanup_target_status"]
             or not runtime
             or runtime["state"] != "released"
+            or not attempt
+            or attempt["pid"] is not None
+            or attempt["termination_target_status"]
         ):
             return None
         target = task["cleanup_target_status"]

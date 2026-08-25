@@ -234,6 +234,13 @@ version affects only later claims. Live attempts and their QC keep the old pin;
 if it disappears or changes, ACP quarantines the attempt and blocks its task
 instead of switching to `current`.
 
+Trust loss never erases a registered worker as a shortcut. ACP first moves the
+attempt to `terminating`, retains its exact PID plus kernel start identity, and
+holds the task in `cleanup_pending`. Only an identity-safe termination result
+records process-death proof. The registration clears and the attempt advances
+to `quarantined` only after runtime absence/release is also proven; all leases
+remain fenced until both proofs complete cleanup.
+
 `acp trust retire BUNDLE_ID` and `acp trust uninstall BUNDLE_ID` only create a
 retirement marker. They never remove the version directory, so attempts and QC
 records cannot lose referenced evidence. `acp trust list` shows health and
