@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research date: 2026-08-13.
+Research updated: 2026-08-31.
 
 ## Verdict
 
@@ -19,7 +19,7 @@ independent acceptance mechanically enforceable across vendors.
 ## What practitioners are talking about
 
 A second research pass focused on first-hand issue reports and practitioner
-threads rather than product positioning. Six themes recur:
+threads rather than product positioning. Nine themes recur:
 
 | Rank | Repeated challenge | Evidence | Product response |
 |---|---|---|---|
@@ -31,6 +31,7 @@ threads rather than product positioning. Six themes recur:
 | 6 | Parallelism can erase its own economics | User reports include [202 GB of unreaped run copies](https://github.com/openai/codex/issues/35383) and [128 GB memory exhaustion](https://github.com/openai/codex/issues/23749). Trigger.dev also reports duplicated dependencies and service stacks. | Bounded pools, explicit cleanup state, quotas and telemetry next |
 | 7 | Credentials cross the candidate boundary | A [Claude Code issue](https://github.com/anthropics/claude-code/issues/58173) reports a shell hook dumping GitHub, Vercel, Slack, Supabase, Anthropic, and search credentials into a transcript despite explicit prompt rules. An [MCP implementer](https://github.com/orgs/modelcontextprotocol/discussions/561) asks how a remote multi-API proxy can safely retain per-user keys without token passthrough. | Hard tool-boundary controls: minimal candidate env, scoped version handles, descriptor-only delivery, and literal-secret absence tests |
 | 8 | The reviewer can be correlated, stale, or silently changed | [Self-preference research](https://arxiv.org/abs/2410.21819) finds that model judges can favor outputs from the same model family; production guidance recommends calibration and multiple evaluation modes. | Signed reviewer provenance, policy fingerprints, explicit ratification, golden cases, provider diversity, and rejection of old-policy passes |
+| 9 | Stale process records and PID reuse corrupt lifecycle truth | An [Omnigent host report](https://github.com/omnigent-ai/omnigent/issues/4819) attributes 18,503 accumulated zombies to stale runner entries, a wedged reaper, and a recycled PID. A [Hermes Agent report](https://github.com/NousResearch/hermes-agent/issues/7131) describes 10–18 idle processes retaining 100–370 MB each after sessions ended. | Bind liveness, termination, and cleanup decisions to a PID-reuse-resistant process-start identity; report identity failures as unproven rather than dead or alive |
 
 The most important new finding is that a worktree is only source isolation. A
 credible safety kernel also needs a runtime lifecycle: unique ports and
@@ -67,6 +68,8 @@ vendor root-cause analyses:
 - [Continued session wrote to the original checkout](https://github.com/openai/codex/issues/34352)
 - [Unreaped run copies consumed 202 GB](https://github.com/openai/codex/issues/35383)
 - [Parallel sessions exhausted 128 GB memory](https://github.com/openai/codex/issues/23749)
+- [Stale runner records plus PID reuse wedged an orphan reaper](https://github.com/omnigent-ai/omnigent/issues/4819)
+- [Agent processes remained alive after sessions ended](https://github.com/NousResearch/hermes-agent/issues/7131)
 
 The product response is not to special-case those tools. It is to make the
 candidate commit, ownership token, checkout, and review evidence explicit and

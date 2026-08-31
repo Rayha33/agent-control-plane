@@ -185,12 +185,96 @@ def test_status_survives_a_dead_worker_pid(repo: Path) -> None:
     created = make_task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "agent-a")
     with supervisor.connect() as connection:
-        connection.execute("UPDATE attempts SET pid = 999999 WHERE id = ?", (attempt["id"],))
+        connection.execute(
+            "UPDATE attempts SET pid = 999999, pid_identity = 'kernel-start-dead' WHERE id = ?",
+            (attempt["id"],),
+        )
 
     entry = entry_for(supervisor.status(), created["id"])
 
     assert entry["worker"]["pid"] == 999999
+    assert entry["worker"]["liveness"] == "dead"
     assert entry["worker"]["alive"] is False
+
+
+def test_status_marks_missing_worker_identity_unproven(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = ?, pid_identity = '' WHERE id = ?",
+            (os.getpid(), attempt["id"]),
+        )
+
+    entry = entry_for(supervisor.status(), created["id"])
+
+    assert entry["worker"]["liveness"] == "unproven"
+    assert entry["worker"]["alive"] is None
+
+
+@pytest.mark.parametrize("reader_result", [None, OSError("identity unavailable")])
+def test_status_marks_unreadable_worker_identity_unproven(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, reader_result: str | Exception | None
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = ?, pid_identity = 'kernel-start-current' WHERE id = ?",
+            (os.getpid(), attempt["id"]),
+        )
+
+    def identity_reader(_pid: int) -> str | None:
+        if isinstance(reader_result, Exception):
+            raise reader_result
+        return reader_result
+
+    monkeypatch.setattr(supervisor, "_process_identity", identity_reader)
+
+    entry = entry_for(supervisor.status(), created["id"])
+
+    assert entry["worker"]["liveness"] == "unproven"
+    assert entry["worker"]["alive"] is None
+
+
+def test_status_rejects_a_recycled_worker_pid(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = ?, pid_identity = 'kernel-start-old' WHERE id = ?",
+            (os.getpid(), attempt["id"]),
+        )
+    monkeypatch.setattr(supervisor, "_process_identity", lambda _pid: "kernel-start-new")
+
+    entry = entry_for(supervisor.status(), created["id"])
+
+    assert entry["worker"]["pid"] == os.getpid()
+    assert entry["worker"]["pid_identity"] == "kernel-start-old"
+    assert entry["worker"]["liveness"] == "dead"
+    assert entry["worker"]["alive"] is False
+
+
+def test_status_accepts_only_the_registered_worker_identity(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = ?, pid_identity = 'kernel-start-current' WHERE id = ?",
+            (os.getpid(), attempt["id"]),
+        )
+    monkeypatch.setattr(supervisor, "_process_identity", lambda _pid: "kernel-start-current")
+
+    entry = entry_for(supervisor.status(), created["id"])
+
+    assert entry["worker"]["liveness"] == "alive"
+    assert entry["worker"]["alive"] is True
 
 
 @pytest.mark.parametrize(

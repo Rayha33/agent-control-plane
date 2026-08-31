@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -52,18 +53,32 @@ def _age_seconds(stamp: str | None, now: float) -> int | None:
     return max(0, int(now - moment.timestamp()))
 
 
-def _process_alive(pid: int | None) -> bool:
+def _process_liveness(
+    pid: int | None,
+    expected_identity: str,
+    identity_reader: Callable[[int], str | None],
+) -> str:
+    """Return alive, dead, or unproven for the exact registered process."""
+
     if not pid or pid <= 0:
-        return False
+        return "dead"
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return "dead"
     except PermissionError:
-        return True
+        pass
     except OSError:
-        return False
-    return True
+        return "unproven"
+    if not expected_identity:
+        return "unproven"
+    try:
+        current_identity = identity_reader(pid)
+    except (OSError, RuntimeError, ValueError):
+        return "unproven"
+    if current_identity is None:
+        return "unproven"
+    return "alive" if current_identity == expected_identity else "dead"
 
 
 class StatusView:
@@ -308,15 +323,7 @@ class StatusView:
             }
             if runtime
             else None,
-            "worker": {
-                "status": attempt["status"],
-                "pid": attempt["pid"],
-                "pid_identity": attempt.get("pid_identity", ""),
-                "alive": _process_alive(attempt["pid"]),
-                "log_path": attempt["log_path"],
-            }
-            if attempt
-            else None,
+            "worker": self._worker(attempt) if attempt else None,
             "qc": {
                 "submission_id": submission["id"],
                 "status": submission["status"],
@@ -331,6 +338,21 @@ class StatusView:
         entry["category"], entry["reason"] = self._categorize(entry, lease_risk_seconds)
         return entry
 
+    def _worker(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        liveness = _process_liveness(
+            attempt["pid"],
+            attempt.get("pid_identity", ""),
+            self.supervisor._process_identity,
+        )
+        return {
+            "status": attempt["status"],
+            "pid": attempt["pid"],
+            "pid_identity": attempt.get("pid_identity", ""),
+            "liveness": liveness,
+            "alive": True if liveness == "alive" else False if liveness == "dead" else None,
+            "log_path": attempt["log_path"],
+        }
+
     @staticmethod
     def _categorize(entry: dict[str, Any], lease_risk_seconds: int) -> tuple[str | None, str]:
         if entry["status"] in CLEANUP_STATUSES:
@@ -338,9 +360,14 @@ class StatusView:
             held = entry["held_resources"]
             details = [f"{len(held)} collision fence(s) held"]
             if worker.get("pid"):
+                liveness = worker.get("liveness", "unproven")
+                liveness_label = {
+                    "alive": "alive",
+                    "dead": "not alive",
+                    "unproven": "liveness unproven",
+                }.get(liveness, "liveness unproven")
                 details.append(
-                    f"worker pid {worker['pid']} "
-                    + ("alive" if worker.get("alive") else "not alive")
+                    f"worker pid {worker['pid']} {liveness_label}"
                     + (
                         f" identity {worker.get('pid_identity')}"
                         if worker.get("pid_identity")
