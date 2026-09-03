@@ -33,6 +33,7 @@ acp-trust-helper = "agent_control_plane.trust_helper:main"
 
 [project.optional-dependencies]
 dev = [
+  "httpx2>=2.12,<3",
   "httpx>=0.28,<1",
   "pytest>=9.0.3,<10",
   "ruff>=0.12,<1",
@@ -48,6 +49,20 @@ packages = ["src/agent_control_plane"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+# Starlette 1.6.0 deprecated the `httpx` transport for starlette.testclient and will
+# eventually drop it; the dev extra pins httpx2 so TestClient uses the supported
+# transport. Promoted to an error so a future regression (httpx2 dropped from the
+# environment, or a new Starlette deprecation ACP actually triggers) fails CI loudly
+# instead of scrolling past as one line of warning summary.
+#
+# NOTE: StarletteDeprecationWarning subclasses UserWarning, NOT DeprecationWarning
+# (starlette/exceptions.py:36), so `-W error::DeprecationWarning` does NOT catch it.
+# Measured 2026-09-03 with httpx2 uninstalled: `-o filterwarnings=error::Deprecation
+# Warning` still exited 0 with the warning merely reported, while this filter exited 4
+# at conftest import. The filter is therefore load-bearing, not decorative.
+filterwarnings = [
+  "error::starlette.exceptions.StarletteDeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100
