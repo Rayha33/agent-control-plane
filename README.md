@@ -87,8 +87,14 @@ descendant is reaped. Current macOS has no supported recursive process-tracking
 primitive, so ACP fails closed instead of polling: QC, critic, hook, and driver
 commands run under a kernel no-fork sandbox, while long-running supervised
 workers are rejected. Manually operated macOS agents can still use claim,
-heartbeat, submit, QC, and integration. CI exercises the complete worker path
-on Linux. Lifecycle lock descriptors remain in the trusted monitor and are
+heartbeat, submit, and integration. **QC and integration commands that spawn a
+subprocess do not run on macOS**: the no-fork sandbox denies the fork, and the
+command fails with `Operation not permitted (os error 1)` rather than executing.
+That rules out `uv run`, `pytest` through any runner, `npm test`, `go test`,
+`cargo test`, and `make` — including this repository's own `acp.toml`, whose QC
+commands cannot be run by `acp qc` on a Mac. Use `scripts/test-linux.sh`, a Linux
+host, or CI to gate a change; a macOS QC run is limited to commands that fork
+nothing. CI exercises the complete worker path on Linux. Lifecycle lock descriptors remain in the trusted monitor and are
 closed before command execution. The command PID is identity-pinned before it
 is released; if its monitor is terminated unexpectedly, ACP kills that exact
 target and refuses to return until its exit is proven. Linux child-enumeration
