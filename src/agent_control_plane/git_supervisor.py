@@ -133,6 +133,13 @@ sweep would find nothing to reclaim on exactly the tasks that finished cleanly.
 
 DEFAULT_GC_RETENTION_SECONDS = 7 * 24 * 3600
 
+EVIDENCE_STREAM_BUDGET = 2000
+"""Characters kept per output stream in a QC finding's evidence.
+
+Per stream, not in total: a run that fails loudly on both is exactly the one whose
+evidence must not be half-truncated.
+"""
+
 SCHEMA_VERSION_KEY = "schema_version"
 SCHEMA_WRITTEN_BY_KEY = "written_by"
 
@@ -8610,8 +8617,44 @@ class GitSupervisor:
         return None
 
     @staticmethod
+    def _evidence_window(text: str, budget: int = EVIDENCE_STREAM_BUDGET) -> str:
+        """Keep both ends of a long output and say what was dropped.
+
+        A plain tail loses the first failure's traceback; a plain head loses the summary
+        a test runner prints last. A reviewer reads both, so neither end is the one to
+        throw away, and the gap is marked rather than left as a silent cut that reads
+        like the output simply ended there.
+        """
+
+        stripped = text.strip()
+        if len(stripped) <= budget:
+            return stripped
+        head = budget // 3
+        tail = budget - head
+        omitted = len(stripped) - head - tail
+        return f"{stripped[:head]}\n… {omitted} characters omitted …\n{stripped[-tail:]}"
+
+    @staticmethod
     def _command_finding(command: str, result: dict[str, Any]) -> dict[str, str]:
-        output = (result["stderr"] or result["stdout"]).strip()[-2000:]
+        """Evidence for a failed QC command, from BOTH streams.
+
+        This used to be `stderr or stdout`, so stdout was read only when stderr was
+        empty. Every mainstream test runner reports failures on stdout while writing
+        something incidental to stderr, so in the normal case the finding carried the
+        incidental half and discarded the diagnosis: a real run reported
+        "Creating virtual environment at: .venv / Installed 35 packages" as the entire
+        evidence for a suite that had named two failing tests on stdout.
+
+        stdout is listed first because it is where the failure summary lives and the
+        evidence is read top-down.
+        """
+
+        sections = []
+        for stream in ("stdout", "stderr"):
+            body = GitSupervisor._evidence_window(result[stream] or "")
+            if body:
+                sections.append(f"--- {stream} ---\n{body}")
+        output = "\n".join(sections) or "(no output on either stream)"
         return {
             "severity": "high",
             "requirement": "deterministic QC command passes",
