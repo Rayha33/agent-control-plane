@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Barrier, Event
 
 import pytest
-from support import python_command
+from support import python_command, requires_linux_worker
 
 from agent_control_plane import worker_trampoline
 from agent_control_plane.git_supervisor import (
@@ -22,11 +22,6 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
 )
 from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
-
-requires_linux_worker = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="long-running worker containment requires Linux child-subreaper support",
-)
 
 
 def git(repo: Path, *arguments: str) -> str:

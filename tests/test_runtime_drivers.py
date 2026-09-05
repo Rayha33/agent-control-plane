@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from support import python_command
+from support import python_command, requires_linux_worker
 
 import agent_control_plane.git_supervisor as supervisor_module
 from agent_control_plane.credential_providers import (
@@ -286,7 +286,7 @@ def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) ->
     assert result["exit_code"] == 0
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc FD execution")
+@requires_linux_worker
 def test_run_trusted_executes_open_inode_during_path_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from support import python_command
+from support import python_command, requires_linux_worker
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
 from agent_control_plane.runner_identity import (
@@ -17,11 +17,6 @@ from agent_control_plane.runner_identity import (
     issue_credential,
     validate_role,
     verify_credential,
-)
-
-requires_linux_worker = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="long-running worker containment requires Linux child-subreaper support",
 )
 
 CONFIG = f"""

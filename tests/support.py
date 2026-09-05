@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agent_control_plane.git_supervisor import GitSupervisor
 
 
@@ -151,3 +153,21 @@ def state_fingerprint(supervisor: GitSupervisor) -> str:
             },
             sort_keys=True,
         )
+
+
+def requires_linux_worker(test):
+    """Skip off Linux, and mark the test so a Linux run can prove it actually ran.
+
+    `acp run` supervises workers through a Linux child subreaper and /proc; macOS
+    fails closed and refuses them. The skip is correct everywhere else — but on a
+    Linux runner these tests MUST execute, and a plain skipif cannot tell the
+    difference between "not applicable here" and "the platform support went away".
+    The `linux_worker` marker is what ACP_REQUIRE_LINUX_WORKER=1 checks, so the
+    control survives someone rewording the reason string.
+    """
+
+    marked = pytest.mark.linux_worker(test)
+    return pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="long-running worker containment requires Linux child-subreaper support",
+    )(marked)

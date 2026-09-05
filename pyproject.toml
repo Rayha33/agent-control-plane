@@ -49,6 +49,9 @@ packages = ["src/agent_control_plane"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+markers = [
+  "linux_worker: needs the Linux child-subreaper/proc worker path; must run on a Linux CI job",
+]
 testpaths = ["tests"]
 # Starlette 1.6.0 deprecated the `httpx` transport for starlette.testclient and will
 # eventually drop it; the dev extra pins httpx2 so TestClient uses the supported
