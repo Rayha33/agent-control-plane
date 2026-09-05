@@ -126,7 +126,7 @@ class SupervisorError(RuntimeError):
         self.code = code
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 GC_RECLAIMABLE_TASK_STATUSES = frozenset(
@@ -158,13 +158,32 @@ Per stream, not in total: a run that fails loudly on both is exactly the one who
 evidence must not be half-truncated.
 """
 
+
 # Numbered upgrades from SCHEMA_VERSION - 1 to SCHEMA_VERSION, applied in order, each
 # inside one transaction. Version 1 is the baseline: the idempotent CREATE TABLE IF NOT
 # EXISTS script plus the column adds that predate stamping, so an unstamped database is
 # brought to 1 by the code that already existed rather than by a ledger entry. Anything
 # after 1 goes here — including index, rename, backfill and data transforms, which the
 # PRAGMA/ALTER pattern cannot express.
-MIGRATIONS: tuple[Migration, ...] = ()
+def _add_declared_resources(connection: sqlite3.Connection) -> None:
+    """Keep the resource string the operator actually typed, for display only.
+
+    `normalize_resource` casefolds, and the folded string is the PRIMARY KEY of
+    `resource_leases`, so it cannot be changed without rewriting lease identity. This
+    column sits beside it: a folded -> raw map, read by the operator-facing surfaces so
+    they stop printing `changelog.md` at someone who wrote `CHANGELOG.md`. Matching is
+    untouched and still case-insensitive.
+
+    Idempotent: a fresh database already has the column from SCHEMA.
+    """
+
+    if "declared_resources_json" not in _columns(connection, "tasks"):
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN declared_resources_json TEXT NOT NULL DEFAULT '{}'"
+        )
+
+
+MIGRATIONS: tuple[Migration, ...] = ((2, _add_declared_resources),)
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -271,6 +290,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   description TEXT NOT NULL,
   acceptance_json TEXT NOT NULL,
   resources_json TEXT NOT NULL,
+  declared_resources_json TEXT NOT NULL DEFAULT '{}',
   dependencies_json TEXT NOT NULL,
   produces_json TEXT NOT NULL DEFAULT '[]',
   consumes_json TEXT NOT NULL DEFAULT '[]',
@@ -1334,7 +1354,11 @@ class GitSupervisor:
     ) -> dict[str, Any]:
         if not title.strip() or not acceptance:
             raise SupervisorError("invalid_task", "title and acceptance criteria are required")
-        normalized = sorted({self.normalize_resource(item, self.root) for item in resources})
+        declared: dict[str, str] = {}
+        for item in resources:
+            folded = self.normalize_resource(item, self.root)
+            declared.setdefault(folded, item.strip())
+        normalized = sorted(declared)
         if not normalized:
             raise SupervisorError("invalid_task", "at least one write resource is required")
         produced = sorted({normalize_artifact(item) for item in produces})
@@ -1359,9 +1383,10 @@ class GitSupervisor:
                 """
                 INSERT INTO tasks
                   (id, title, description, acceptance_json, resources_json,
+                   declared_resources_json,
                    dependencies_json, produces_json, consumes_json, base_branch,
                    base_sha, priority, status, current_attempt_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
                 """,
                 (
                     task_id,
@@ -1369,6 +1394,7 @@ class GitSupervisor:
                     description.strip(),
                     canonical_json(list(acceptance)),
                     canonical_json(normalized),
+                    canonical_json(declared),
                     canonical_json(list(dependencies)),
                     canonical_json(produced),
                     canonical_json(consumed),
@@ -4434,6 +4460,22 @@ class GitSupervisor:
             "declared": declared,
         }
 
+    @staticmethod
+    def _declared_resources(task: sqlite3.Row) -> list[str]:
+        """The write set as the operator wrote it, falling back to the folded form.
+
+        Rows created before the column existed have an empty map, and a raw form is not
+        recoverable from anywhere in the database — so the fallback is the folded string
+        rather than a guess at its capitalisation.
+        """
+
+        folded = json.loads(task["resources_json"])
+        try:
+            declared = json.loads(task["declared_resources_json"] or "{}")
+        except (KeyError, IndexError, TypeError, ValueError):
+            declared = {}
+        return [declared.get(item, item) for item in folded]
+
     def guard_context(self, attempt_id: str) -> dict[str, Any]:
         """What an agent needs to stay inside its claim: worktree and write set.
 
@@ -4459,7 +4501,7 @@ class GitSupervisor:
             "worktree": attempt["worktree"],
             "branch": attempt["branch"],
             "lease_expires_at": attempt["lease_expires_at"],
-            "declared": json.loads(task["resources_json"]) if task else [],
+            "declared": self._declared_resources(task) if task else [],
             "acceptance": json.loads(task["acceptance_json"]) if task else [],
         }
 

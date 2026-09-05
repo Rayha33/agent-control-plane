@@ -224,14 +224,15 @@ def test_the_migration_ledger_applies_in_order_and_stamps(
         applied.append(3)
         connection.execute("UPDATE meta SET value = value WHERE key = ?", (SCHEMA_VERSION_KEY,))
 
-    monkeypatch.setattr(git_supervisor, "SCHEMA_VERSION", 3)
-    monkeypatch.setattr(git_supervisor, "MIGRATIONS", ((2, add_index), (3, backfill)))
+    first, second = SCHEMA_VERSION + 1, SCHEMA_VERSION + 2
+    monkeypatch.setattr(git_supervisor, "SCHEMA_VERSION", second)
+    monkeypatch.setattr(git_supervisor, "MIGRATIONS", ((first, add_index), (second, backfill)))
 
     supervisor = GitSupervisor(repo)
 
     assert applied == [2, 3]
-    assert meta(repo)[SCHEMA_VERSION_KEY] == "3"
-    assert supervisor.schema_version_on_open == 1
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(second)
+    assert supervisor.schema_version_on_open == SCHEMA_VERSION
     # An index is the case the ADD COLUMN pattern could not express at all.
     with supervisor.connect() as connection:
         names = {row["name"] for row in connection.execute("PRAGMA index_list(tasks)")}
@@ -254,17 +255,83 @@ def test_a_failed_upgrade_leaves_the_version_where_it_started(
     def explodes(connection: sqlite3.Connection) -> None:
         raise sqlite3.OperationalError("upgrade 3 failed halfway")
 
-    monkeypatch.setattr(git_supervisor, "SCHEMA_VERSION", 3)
-    monkeypatch.setattr(git_supervisor, "MIGRATIONS", ((2, add_index), (3, explodes)))
+    first, second = SCHEMA_VERSION + 1, SCHEMA_VERSION + 2
+    monkeypatch.setattr(git_supervisor, "SCHEMA_VERSION", second)
+    monkeypatch.setattr(git_supervisor, "MIGRATIONS", ((first, add_index), (second, explodes)))
 
     with pytest.raises(sqlite3.OperationalError):
         GitSupervisor(repo)
 
-    # Not 2: the entry that succeeded rolls back with the one that did not.
-    assert meta(repo)[SCHEMA_VERSION_KEY] == "1"
+    # Not `first`: the entry that succeeded rolls back with the one that did not.
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
     connection = sqlite3.connect(db_path(repo))
     try:
         names = {row[1] for row in connection.execute("PRAGMA index_list(tasks)")}
     finally:
         connection.close()
     assert "ix_probe" not in names
+
+
+def test_the_declared_write_set_is_shown_as_the_operator_typed_it(repo: Path) -> None:
+    """`normalize_resource` casefolds, and the folded string is the lease PRIMARY KEY.
+
+    So the stored form cannot carry the operator's capitalisation without rewriting
+    lease identity. A separate column does, and only the display reads it — every
+    operator surface used to print `changelog.md` at someone who wrote `CHANGELOG.md`,
+    a path that does not exist on a case-sensitive checkout.
+    """
+
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "CHANGELOG.md", "Docs/READMEs.md")
+    attempt = supervisor.claim(created["id"], "worker")
+
+    assert created["resources"] == ["changelog.md", "docs/readmes.md"]  # lease keys, unchanged
+    assert supervisor.guard_context(attempt["id"])["declared"] == [
+        "CHANGELOG.md",
+        "Docs/READMEs.md",
+    ]
+
+
+def test_matching_is_still_case_insensitive(repo: Path) -> None:
+    """The control: preserving the display must not tighten what the guard accepts."""
+
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "CHANGELOG.md")
+    attempt = supervisor.claim(created["id"], "worker")
+    assert supervisor.guard(attempt["id"], "CHANGELOG.md")["allow"] is True
+    assert supervisor.guard(attempt["id"], "changelog.md")["allow"] is True
+
+
+def test_a_task_created_before_the_column_still_displays(repo: Path) -> None:
+    """Legacy rows have no map, and the raw form is not recoverable from anywhere.
+
+    The fallback is the folded string rather than a guess at its capitalisation.
+    """
+
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "CHANGELOG.md")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = '{}' WHERE id = ?", (created["id"],)
+        )
+    attempt = supervisor.claim(created["id"], "worker")
+    assert supervisor.guard_context(attempt["id"])["declared"] == ["changelog.md"]
+
+
+def test_the_ledger_upgrades_a_version_one_database(repo: Path) -> None:
+    """Entry 2 is the ledger's first real use; this drives it on a v1-shaped database."""
+
+    with GitSupervisor(repo).connect() as connection:
+        connection.execute("UPDATE meta SET value = '1' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+        connection.execute("ALTER TABLE tasks DROP COLUMN declared_resources_json")
+
+    supervisor = GitSupervisor(repo)
+
+    assert supervisor.schema_version_on_open == 1
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    connection = sqlite3.connect(db_path(repo))
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+    finally:
+        connection.close()
+    assert "declared_resources_json" in columns
