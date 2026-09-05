@@ -141,6 +141,16 @@ sweep would find nothing to reclaim on exactly the tasks that finished cleanly.
 
 DEFAULT_GC_RETENTION_SECONDS = 7 * 24 * 3600
 
+FORK_DENIED_EXIT_CODE = 128
+FORK_DENIED_SIGNATURE = "fork: Operation not permitted"
+"""The two halves of a denied fork, together.
+
+Measured on Darwin under this repository's own containment profile: a command that
+must fork exits 128 with `/bin/sh: fork: Operation not permitted`, while a missing
+binary exits 127 with `No such file or directory` and fork fully available. The exit
+code alone does not distinguish them.
+"""
+
 EVIDENCE_STREAM_BUDGET = 2000
 """Characters kept per output stream in a QC finding's evidence.
 
@@ -444,6 +454,7 @@ class GitSupervisor:
         self._diagnostic = diagnostic
         self.read_only = read_only
         self.schema_version_on_open: int | None = None
+        self._fork_support: bool | None = None
         self._trust_config_error: str | None = None
         self.config_path = self.root / "acp.toml"
         self.state_dir = self.root / ".acp"
@@ -8547,6 +8558,45 @@ class GitSupervisor:
             "command survived unexpected kernel monitor termination",
         )
 
+    def _containment_permits_fork(self) -> bool:
+        """Can a contained command spawn a subprocess on this platform?
+
+        Two canaries through the real `_run_process`, because the answer has to be a
+        measurement of this machine's containment and not a belief about its name:
+
+          control  `exit 7` must come back 7. If it does not, containment is broken
+                   rather than restrictive, and a False answer here would be a guess.
+          probe    a command that must fork.
+
+        A non-zero probe is NOT evidence on its own. Measured on Darwin: a missing
+        binary exits 127 with fork fully available, while a denied fork exits 128 with
+        `fork: Operation not permitted` on stderr. Only the second pair is a denial, so
+        both halves of the signature are required.
+        """
+
+        if self._fork_support is None:
+            control = self._run_process(
+                ["/bin/sh", "-c", "exit 7"], "fork canary control", self.root, self._child_env()
+            )
+            if control["exit_code"] != 7:
+                raise SupervisorError(
+                    "process_containment_unavailable",
+                    "the contained-process path cannot run a trivial command "
+                    f"(expected exit 7, got {control['exit_code']}); refusing to guess "
+                    "whether this platform allows a command to fork",
+                )
+            probe = self._run_process(
+                ["/bin/sh", "-c", "/usr/bin/true && /usr/bin/true"],
+                "fork canary probe",
+                self.root,
+                self._child_env(),
+            )
+            denied = probe["exit_code"] == FORK_DENIED_EXIT_CODE and (
+                FORK_DENIED_SIGNATURE in (probe["stderr"] or "")
+            )
+            self._fork_support = not denied
+        return self._fork_support
+
     @staticmethod
     def _process_state(pid: int) -> str | None:
         """The kernel's single-letter state for a PID, or None if it cannot be read."""
@@ -8661,13 +8711,50 @@ class GitSupervisor:
             if body:
                 sections.append(f"--- {stream} ---\n{body}")
         output = "\n".join(sections) or "(no output on either stream)"
+        evidence = f"exit={result['exit_code']}; {output}"
+
+        if GitSupervisor._is_fork_denial(result):
+            # The command never ran: this platform's containment refused it a
+            # subprocess. Saying "fix the failure and submit a new committed attempt"
+            # here would be a false attribution — durable, signed, and pointing at a
+            # worker who cannot do anything about the host. A verdict that is
+            # confidently wrong about WHOSE fault something is, is worse than one that
+            # says plainly that it could not run.
+            return {
+                "severity": "high",
+                "requirement": "the host can run the configured gate",
+                "finding": f"command could not run on this host: {command}",
+                "evidence": evidence,
+                "required_fix": (
+                    "not a defect in the submitted work: this platform's command "
+                    "containment denies fork, so the command was never executed. Run "
+                    "the gate where a contained command may spawn a subprocess "
+                    "(scripts/test-linux.sh, a Linux host, or CI), or configure a gate "
+                    "command that spawns nothing."
+                ),
+            }
         return {
             "severity": "high",
             "requirement": "deterministic QC command passes",
             "finding": f"command failed: {command}",
-            "evidence": f"exit={result['exit_code']}; {output}",
+            "evidence": evidence,
             "required_fix": "fix the failure and submit a new committed attempt",
         }
+
+    @staticmethod
+    def _is_fork_denial(result: dict[str, Any]) -> bool:
+        """Did the containment refuse this command a subprocess, rather than the command failing?
+
+        Both halves are required. Measured on Darwin under this repository's own
+        profile: a denied fork exits 128 with `fork: Operation not permitted`, while a
+        missing binary exits 127 with `No such file or directory` and fork fully
+        available — so the exit code alone would call an ordinary broken command a
+        platform problem, which is the same misattribution in the other direction.
+        """
+
+        return result.get("exit_code") == FORK_DENIED_EXIT_CODE and FORK_DENIED_SIGNATURE in (
+            result.get("stderr") or ""
+        )
 
     @staticmethod
     def _critic_payload(path: Path) -> dict[str, Any]:
