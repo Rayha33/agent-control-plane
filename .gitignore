@@ -13,3 +13,4 @@ __pycache__/
 *.db-shm
 *.db-wal
 docs/FOUNDER_BRIEF.md
+coverage.xml

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Mapping
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
@@ -58,6 +60,24 @@ from .side_effects import (
 bearer = HTTPBearer(auto_error=False)
 
 
+def _resolve_version() -> str:
+    """Report the installed distribution version.
+
+    The literal used to live in two places in this file and drifted from
+    pyproject (0.1.0 vs 0.2.0). Read the distribution metadata instead, and fall
+    back to the package attribute for a source checkout that was never installed.
+    """
+    try:
+        return _distribution_version("agent-control-plane")
+    except PackageNotFoundError:  # pragma: no cover - source checkout, not installed
+        from . import __version__
+
+        return __version__
+
+
+API_VERSION = _resolve_version()
+
+
 def create_app(
     settings: Settings | None = None,
     side_effect_drivers: Mapping[str, ProviderDriver] | None = None,
@@ -77,7 +97,7 @@ def create_app(
 
     app = FastAPI(
         title="Agent Control Plane",
-        version="0.1.0",
+        version=API_VERSION,
         description=(
             "Delegated mandates, collision-free task coordination, independent QC, "
             "kill switches, and tamper-evident evidence for AI agents."
@@ -113,7 +133,7 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "version": "0.1.0"}
+        return {"status": "ok", "version": API_VERSION}
 
     @app.post(
         "/v1/agents",
