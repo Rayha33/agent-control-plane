@@ -1376,12 +1376,27 @@ def test_merge_renames_setting_matches_porcelain_merge(repo: Path) -> None:
     git(repo, "mv", "alpha.txt", "renamed.txt")
     git(repo, "commit", "-m", "rename on main")
     current_base = git(repo, "rev-parse", "main")
-    reference, _ = reference_porcelain_merge(repo, current_base, candidate, "renames-off")
-    assert reference.returncode != 0
+    reference, reference_head = reference_porcelain_merge(
+        repo, current_base, candidate, "renames-off"
+    )
 
     integration = supervisor.integrate(created["id"])
 
-    assert integration["verdict"] == "conflict"
+    # Read the expectation off porcelain instead of hardcoding one. What `git merge`
+    # does to a rename/edit with merge.renames=false moved between Git versions — it
+    # conflicts on 2.50.1 and merges cleanly on 2.47.3 — and this test's name promises
+    # the two AGREE, not that either produces one particular answer. Hardcoding
+    # `!= 0` meant a green here read as "ACP matches porcelain" while actually saying
+    # "ACP matches what porcelain did on the maintainer's Git".
+    if reference.returncode:
+        assert integration["verdict"] == "conflict"
+    else:
+        # Not a weaker branch: when both merge, the merged CONTENT has to match too,
+        # which is a stronger claim than agreeing on a conflict.
+        assert integration["verdict"] == "pass"
+        assert reference_head is not None
+        reference_tree = git(repo, "rev-parse", f"{reference_head}^{{tree}}")
+        assert git(repo, "rev-parse", f"{integration['commit_sha']}^{{tree}}") == reference_tree
 
 
 def test_info_attributes_union_matches_porcelain_merge(repo: Path) -> None:
