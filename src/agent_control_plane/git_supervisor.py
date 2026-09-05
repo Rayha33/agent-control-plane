@@ -57,7 +57,13 @@ from .runtime_drivers import (
     run_trusted,
 )
 from .scheduling import Scheduler, normalize_artifact
-from .status import DEFAULT_LEASE_RISK_SECONDS, StatusView, _age_seconds
+from .status import (
+    ACTIVE_STATUSES,
+    DEFAULT_LEASE_RISK_SECONDS,
+    LIVE_ATTEMPT_STATUSES,
+    StatusView,
+    _age_seconds,
+)
 from .trust_bundles import (
     TrustBundleError,
     executable_from_pin,
@@ -114,6 +120,18 @@ class SupervisorError(RuntimeError):
 
 SCHEMA_VERSION = 1
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
+
+GC_RECLAIMABLE_TASK_STATUSES = frozenset(
+    {"done", "orphaned", "blocked", "conflicted", "changes_requested"}
+)
+"""Task states whose attempt worktree is no longer the working copy of anything.
+
+Keyed on the TASK, not the attempt. An attempt that was submitted and integrated stays
+at `submitted` forever — nothing ever moves it to a terminal state — so an attempt-keyed
+sweep would find nothing to reclaim on exactly the tasks that finished cleanly.
+"""
+
+DEFAULT_GC_RETENTION_SECONDS = 7 * 24 * 3600
 
 SCHEMA_VERSION_KEY = "schema_version"
 SCHEMA_WRITTEN_BY_KEY = "written_by"
@@ -1796,7 +1814,15 @@ class GitSupervisor:
         lease_risk_seconds: int = DEFAULT_LEASE_RISK_SECONDS,
     ) -> dict[str, Any]:
         """Operator snapshot: attention queue, phases, runtimes, blockers. Read-only."""
-        return StatusView(self).snapshot(limit, lease_risk_seconds)
+        snapshot = StatusView(self).snapshot(limit, lease_risk_seconds)
+        with self.connect() as connection:
+            reclaimable, _ = self._gc_survey(connection, time.time(), DEFAULT_GC_RETENTION_SECONDS)
+        snapshot["disk"] = {
+            "state_bytes": self._directory_bytes(self.state_dir),
+            "reclaimable_worktrees": len(reclaimable),
+            "reclaimable_bytes": sum(entry["bytes"] for entry in reclaimable),
+        }
+        return snapshot
 
     @staticmethod
     def render_status(snapshot: dict[str, Any]) -> str:
@@ -4351,6 +4377,187 @@ class GitSupervisor:
             if not row:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             return self._attempt_view(connection, row)
+
+    @staticmethod
+    def _directory_bytes(path: Path) -> int:
+        total = 0
+        for entry in path.rglob("*"):
+            if entry.is_file() and not entry.is_symlink():
+                try:
+                    total += entry.stat().st_size
+                except OSError:
+                    continue
+        return total
+
+    def _gc_survey(
+        self,
+        connection: sqlite3.Connection,
+        now: float,
+        older_than_seconds: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Classify every attempt worktree as reclaimable or retained. Reads only.
+
+        Returns (reclaimable, retained). `status()` calls this to report disk without
+        touching anything, and `gc()` calls it to decide what to remove, so the two can
+        never disagree about what is safe.
+        """
+
+        fenced_attempts = {
+            row["attempt_id"]
+            for row in connection.execute(
+                "SELECT attempt_id FROM resource_leases "
+                "WHERE attempt_id IS NOT NULL AND lease_expires_at > ?",
+                (now,),
+            )
+        }
+        allocated_attempts = {
+            row["attempt_id"]
+            for row in connection.execute("SELECT attempt_id FROM runtime_allocations")
+        }
+        rows = connection.execute(
+            """
+            SELECT attempt.id AS attempt_id, attempt.task_id, attempt.branch,
+                   attempt.worktree, attempt.status AS attempt_status,
+                   attempt.updated_at AS attempt_updated_at,
+                   task.status AS task_status, task.updated_at AS task_updated_at,
+                   task.cleanup_target_status, task.cleanup_error
+            FROM attempts AS attempt
+            JOIN tasks AS task ON task.id = attempt.task_id
+            ORDER BY attempt.created_at, attempt.id
+            """
+        ).fetchall()
+
+        reclaimable: list[dict[str, Any]] = []
+        retained: list[dict[str, Any]] = []
+        for row in rows:
+            worktree = Path(row["worktree"])
+            entry = {
+                "attempt_id": row["attempt_id"],
+                "task_id": row["task_id"],
+                "task_status": row["task_status"],
+                "attempt_status": row["attempt_status"],
+                "branch": row["branch"],
+                "worktree": str(worktree),
+            }
+            age = _age_seconds(row["task_updated_at"], now)
+            reason = self._gc_retain_reason(
+                row,
+                age=age,
+                older_than_seconds=older_than_seconds,
+                fenced=row["attempt_id"] in fenced_attempts,
+                allocated=row["attempt_id"] in allocated_attempts,
+                exists=worktree.exists(),
+            )
+            if reason is not None:
+                retained.append({**entry, "reason": reason})
+                continue
+            reclaimable.append(
+                {**entry, "age_seconds": age, "bytes": self._directory_bytes(worktree)}
+            )
+        return reclaimable, retained
+
+    @staticmethod
+    def _gc_retain_reason(
+        row: sqlite3.Row,
+        *,
+        age: int | None,
+        older_than_seconds: int,
+        fenced: bool,
+        allocated: bool,
+        exists: bool,
+    ) -> str | None:
+        """Why this worktree must survive, or None if it is safe to reclaim.
+
+        Ordered most-dangerous first so the reported reason is the one that matters. Any
+        doubt retains: an unparseable timestamp is treated as "too recent" rather than
+        as zero age, because guessing old on a clock we cannot read would delete a live
+        agent's working copy.
+        """
+
+        if not exists:
+            return "worktree_already_gone"
+        if row["task_status"] in ACTIVE_STATUSES or row["task_status"] in {
+            "integrating",
+            "qc_review",
+        }:
+            return "task_active"
+        if row["attempt_status"] in LIVE_ATTEMPT_STATUSES:
+            return "attempt_live"
+        if row["attempt_status"] == "quarantined":
+            return "attempt_quarantined"
+        if row["cleanup_target_status"] or row["cleanup_error"]:
+            return "cleanup_unproven"
+        if fenced:
+            # Covers CLEANUP_FENCE_EPOCH, which is a lease expiry far in the future
+            # precisely so that a fenced attempt is never treated as reclaimable.
+            return "resource_lease_held"
+        if allocated:
+            return "runtime_allocation_held"
+        if row["task_status"] not in GC_RECLAIMABLE_TASK_STATUSES:
+            return "task_not_terminal"
+        if age is None:
+            return "age_unknown"
+        if age < older_than_seconds:
+            return "within_retention"
+        return None
+
+    def gc(
+        self,
+        *,
+        dry_run: bool = False,
+        older_than_seconds: int = DEFAULT_GC_RETENTION_SECONDS,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Reclaim the worktrees and task branches of attempts nothing is using.
+
+        Integration branches are reported but never deleted: their commits are the
+        published evidence for an approved task, and reclaiming disk is not a good
+        enough reason to remove the record of what was merged.
+        """
+
+        moment = time.time() if now is None else now
+        with self.connect() as connection:
+            reclaimable, retained = self._gc_survey(connection, moment, older_than_seconds)
+            integration_branches = [
+                {"task_id": row["task_id"], "branch": row["branch"], "verdict": row["verdict"]}
+                for row in connection.execute(
+                    "SELECT task_id, branch, verdict FROM integrations ORDER BY created_at, id"
+                )
+            ]
+
+        removed: list[str] = []
+        if not dry_run and reclaimable:
+            # No outer _git_operation_guard here: _git() takes it per invocation, and the
+            # flock is not reentrant, so wrapping the loop deadlocks against the first
+            # `git worktree remove`. The other _remove_worktree call sites are unguarded
+            # for the same reason.
+            for entry in reclaimable:
+                self._remove_worktree(Path(entry["worktree"]), delete_branch=True)
+                removed.append(entry["attempt_id"])
+            with self.connect() as connection:
+                for entry in reclaimable:
+                    self._event(
+                        connection,
+                        "worktree.reclaimed",
+                        "supervisor",
+                        {
+                            "attempt_id": entry["attempt_id"],
+                            "task_id": entry["task_id"],
+                            "branch": entry["branch"],
+                            "bytes": entry["bytes"],
+                        },
+                    )
+
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "older_than_seconds": older_than_seconds,
+            "reclaimable": reclaimable,
+            "removed": removed,
+            "bytes": sum(entry["bytes"] for entry in reclaimable),
+            "retained": retained,
+            "integration_branches": integration_branches,
+        }
 
     def reap_expired(self, now: int | None = None) -> dict[str, Any]:
         epoch = int(time.time()) if now is None else now

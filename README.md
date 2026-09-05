@@ -714,6 +714,19 @@ ACP v0.2 is a local-first alpha, not a complete sandbox or distributed lock
 service.
 
 - SQLite assumes one trusted host and filesystem.
+- **Worktrees are kept until you reclaim them.** A claim creates
+  `.acp/worktrees/<attempt>` on a task branch, and nothing removes either when the
+  task finishes — a completed task leaves the worktree, its `git worktree`
+  registration, and its branch on disk indefinitely. That is deliberate (an
+  orphaned attempt's work must survive for inspection), but it is not free.
+  `acp gc` reclaims the worktree and task branch of attempts nothing is using;
+  `acp status` reports `disk.reclaimable_worktrees` so the cost is visible before
+  it matters. Retention defaults to seven days and gc refuses, in this order, a
+  worktree whose task is still active, whose attempt is live or quarantined, whose
+  cleanup is unproven, that holds a resource lease or runtime allocation, or that
+  is inside the retention window — `--dry-run` prints the decision for every
+  attempt with its reason. Integration branches are reported and never deleted:
+  their commits are the published evidence for an approved task.
 - Agents should be launched through ACP or another gateway; direct writes to the
   base checkout happen outside ACP's enforcement boundary.
 - Tests and critic commands execute candidate code. Linux uses a child subreaper

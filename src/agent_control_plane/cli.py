@@ -38,6 +38,25 @@ able to open one in order to say so.
 """
 
 
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(text: str) -> int:
+    """Seconds from a `30m` / `12h` / `7d` retention argument.
+
+    A bare number is rejected rather than assumed: `--older-than 7` meaning seconds
+    when the operator meant days would delete a week of worktrees on the spot.
+    """
+
+    value = text.strip().lower()
+    if len(value) < 2 or value[-1] not in DURATION_UNITS or not value[:-1].isdigit():
+        raise SupervisorError(
+            "invalid_duration",
+            f"--older-than must be a number followed by s, m, h or d (got {text!r})",
+        )
+    return int(value[:-1]) * DURATION_UNITS[value[-1]]
+
+
 def add_credential_source(command: argparse.ArgumentParser) -> None:
     source = command.add_mutually_exclusive_group()
     source.add_argument(
@@ -61,6 +80,17 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("init", help="initialize config and local state")
     commands.add_parser("doctor", help="check repository and state integrity")
     commands.add_parser("migrate", help="upgrade the control database schema in place")
+    gc = commands.add_parser(
+        "gc", help="reclaim worktrees and branches of attempts nothing is using"
+    )
+    gc.add_argument(
+        "--dry-run", action="store_true", help="report what would be reclaimed, remove nothing"
+    )
+    gc.add_argument(
+        "--older-than",
+        default="7d",
+        help="retain terminal attempts younger than this (e.g. 30m, 12h, 7d; default 7d)",
+    )
     commands.add_parser("list", help="list tasks")
     commands.add_parser("reap", help="orphan expired attempts without deleting work")
     commands.add_parser("verify-events", help="verify the hash-chained event log")
@@ -475,6 +505,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.doctor()
         elif args.action == "migrate":
             result = supervisor.migrate()
+        elif args.action == "gc":
+            result = supervisor.gc(
+                dry_run=args.dry_run,
+                older_than_seconds=parse_duration(args.older_than),
+            )
         elif args.action == "list":
             result = supervisor.list_tasks()
         elif args.action == "reap":
