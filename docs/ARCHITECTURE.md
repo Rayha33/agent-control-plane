@@ -89,6 +89,17 @@ change the state it was asked to report. Expired-but-unreaped attempts are
 reported as `awaiting_reap` instead. Expired leases are ignored when previewing
 a claim, so a preview and the claim that follows agree.
 
+That used to be true only of the queries. Constructing the supervisor created the
+state directories and ran `CREATE TABLE IF NOT EXISTS` plus every pending
+`ALTER TABLE` before the first `SELECT`, so `acp status` on a database written by
+an older acp rewrote its schema. These commands now open the database `mode=ro`,
+which makes the guarantee structural rather than a matter of discipline: a stray
+write raises instead of landing. They never migrate — a database behind the binary
+is reported as `schema_upgrade_required` and left byte-identical, and `acp migrate`
+is the command that upgrades it. `list` is excluded on purpose, because
+`list_tasks()` reaps; `doctor` is excluded because it is what an operator runs when
+the database needs upgrading, so it has to be able to open one to say so.
+
 The ready queue reserves each admitted task's scopes for the remainder of the
 pass. Its `ready` list is therefore a set of tasks that can run *concurrently*,
 not a list of tasks that could each run alone.

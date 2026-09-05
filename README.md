@@ -130,6 +130,26 @@ Initialize another repository:
 uv run --project /path/to/agent-control-plane acp --repo /path/to/your-repo init
 ~~~
 
+### Schema versions
+
+The control database records the schema version it is at and the acp that wrote it.
+Two rules follow, and both matter when more than one acp shares a repository — a
+pinned CI runner and a newer operator install, say:
+
+- **A newer database is refused.** An older binary opening it would not fail; it
+  would succeed and simply not see the newer columns, so a critic running an older
+  contract could approve work the newer contract rejects. It now stops with
+  `schema_newer_than_binary` and tells you to upgrade acp.
+- **Only commands that admit they mutate will upgrade one.** `plan`, `queue`,
+  `merge-plan`, `status`, `show`, `reviewers`, `bundle` and `verify-events` open
+  `mode=ro`. Against a database that is behind, they report
+  `schema_upgrade_required` and leave the file byte for byte as they found it.
+
+~~~bash
+uv run --extra dev acp migrate     # upgrade the control database in place
+uv run --extra dev acp doctor      # reports the schema version against the binary
+~~~
+
 Create and claim bounded work:
 
 ~~~bash

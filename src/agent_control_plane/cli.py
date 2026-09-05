@@ -16,6 +16,27 @@ from .runtime_drivers import DriverError, resolve_trusted_executable
 from .status import DEFAULT_LEASE_RISK_SECONDS
 from .trust_bundles import DEFAULT_HELPER, DEFAULT_TRUST_ROOT, TrustBundleError, list_bundles
 
+READ_ONLY_ACTIONS = frozenset(
+    {
+        "status",
+        "show",
+        "plan",
+        "queue",
+        "merge-plan",
+        "reviewers",
+        "bundle",
+        "verify-events",
+    }
+)
+"""Commands that only look. They open the database mode=ro and never migrate it.
+
+Two deliberate absences. `list` reaps: `list_tasks()` calls `reap_expired()`, which
+ARCHITECTURE.md 1b describes as the intended difference between it and `plan`/`queue`/
+`merge-plan`/`status` — so it is a mutating command that happens to print a listing.
+`doctor` is what an operator runs when the database needs upgrading, so it has to be
+able to open one in order to say so.
+"""
+
 
 def add_credential_source(command: argparse.ArgumentParser) -> None:
     source = command.add_mutually_exclusive_group()
@@ -39,6 +60,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="action", required=True)
     commands.add_parser("init", help="initialize config and local state")
     commands.add_parser("doctor", help="check repository and state integrity")
+    commands.add_parser("migrate", help="upgrade the control database schema in place")
     commands.add_parser("list", help="list tasks")
     commands.add_parser("reap", help="orphan expired attempts without deleting work")
     commands.add_parser("verify-events", help="verify the hash-chained event log")
@@ -444,9 +466,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = _run_trust_helper(args)
             emit(result)
             return 0
-        supervisor = GitSupervisor(args.repo, diagnostic=args.action == "doctor")
+        supervisor = GitSupervisor(
+            args.repo,
+            diagnostic=args.action == "doctor",
+            read_only=args.action in READ_ONLY_ACTIONS,
+        )
         if args.action == "doctor":
             result = supervisor.doctor()
+        elif args.action == "migrate":
+            result = supervisor.migrate()
         elif args.action == "list":
             result = supervisor.list_tasks()
         elif args.action == "reap":

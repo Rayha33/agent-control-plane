@@ -23,7 +23,13 @@ from agent_control_plane.config import (
 # These tests fail against that behaviour: with a clean environment the old code returned
 # Settings happily, so every "refuses" case below would not raise.
 
-ACP_ENV = ("ACP_ADMIN_KEY", "ACP_SIGNING_KEY", "ACP_INSECURE_DEV", "ACP_DATABASE_PATH", "ACP_ISSUER")
+ACP_ENV = (
+    "ACP_ADMIN_KEY",
+    "ACP_SIGNING_KEY",
+    "ACP_INSECURE_DEV",
+    "ACP_DATABASE_PATH",
+    "ACP_ISSUER",
+)
 
 
 @pytest.fixture

@@ -21,13 +21,14 @@ import time
 import tomllib
 import unicodedata
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import __version__
 from .assurance import REJECT_VERDICTS, Assurance, Reviewer, load_policy
 from .credential_providers import (
     CredentialDefinition,
@@ -109,6 +110,72 @@ class SupervisorError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+SCHEMA_VERSION = 1
+"""Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
+
+SCHEMA_VERSION_KEY = "schema_version"
+SCHEMA_WRITTEN_BY_KEY = "written_by"
+
+# Numbered upgrades from SCHEMA_VERSION - 1 to SCHEMA_VERSION, applied in order, each
+# inside one transaction. Version 1 is the baseline: the idempotent CREATE TABLE IF NOT
+# EXISTS script plus the column adds that predate stamping, so an unstamped database is
+# brought to 1 by the code that already existed rather than by a ledger entry. Anything
+# after 1 goes here — including index, rename, backfill and data transforms, which the
+# PRAGMA/ALTER pattern cannot express.
+MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = ()
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    """Column names of `table`, empty when the table does not exist yet."""
+
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def stored_schema_version(connection: sqlite3.Connection) -> int | None:
+    """Schema version recorded in the database, or None when it predates stamping.
+
+    None is "older than 1", not "unknown": a database written before versioning has
+    no meta row, and one written before `meta` existed has no table. A stamp that is
+    present but not an integer is a different thing entirely — that is corruption, and
+    guessing a version for it would migrate a database we cannot identify.
+    """
+
+    try:
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        raise SupervisorError(
+            "schema_version_unreadable",
+            f"meta.{SCHEMA_VERSION_KEY} is {row['value']!r}, which is not a version number; "
+            "the control database is corrupt or was not written by acp",
+        ) from None
+
+
+def assert_schema_not_newer(stored: int | None) -> None:
+    """Refuse a database written by a newer binary than this one.
+
+    Opening it anyway is the quiet failure: CREATE TABLE IF NOT EXISTS leaves the newer
+    tables alone and every PRAGMA check finds its column already present, so the open
+    succeeds and the newer columns simply stay invisible to this code. A critic running
+    an older contract would then approve work the newer contract rejects.
+    """
+
+    if stored is not None and stored > SCHEMA_VERSION:
+        raise SupervisorError(
+            "schema_newer_than_binary",
+            f"control database is at schema version {stored}; this acp ({__version__}) "
+            f"understands version {SCHEMA_VERSION}. Upgrade acp — an older binary cannot "
+            "see the newer columns and would operate on a partial view of the state.",
+        )
 
 
 def utc_now() -> str:
@@ -355,9 +422,17 @@ CREATE INDEX IF NOT EXISTS idx_runtime_allocations_attempt
 
 
 class GitSupervisor:
-    def __init__(self, repo: str | Path = ".", *, diagnostic: bool = False):
+    def __init__(
+        self,
+        repo: str | Path = ".",
+        *,
+        diagnostic: bool = False,
+        read_only: bool = False,
+    ):
         self.root = self._root(Path(repo).resolve())
         self._diagnostic = diagnostic
+        self.read_only = read_only
+        self.schema_version_on_open: int | None = None
         self._trust_config_error: str | None = None
         self.config_path = self.root / "acp.toml"
         self.state_dir = self.root / ".acp"
@@ -365,19 +440,58 @@ class GitSupervisor:
         if not self.config_path.exists():
             raise SupervisorError("not_initialized", "acp.toml is missing; run acp init")
         self.config = self._load_config()
+        if read_only:
+            self._open_read_only()
+        else:
+            self._open_read_write()
+        self._finish_open()
+
+    def _open_read_only(self) -> None:
+        """Attach to an existing database without creating, migrating or reconciling it.
+
+        docs/ARCHITECTURE.md promises planning is a preview and never a mutation. That
+        was only true of the queries: constructing the supervisor created directories and
+        ALTERed the schema before the first SELECT ran. A read-only open refuses instead
+        of upgrading, so `acp status` on a database that needs work says so rather than
+        silently doing it under an operator who asked to look.
+        """
+
+        if not self.db_path.exists():
+            raise SupervisorError("not_initialized", f"{self.db_path} is missing; run acp init")
+        with self.connect() as connection:
+            self.schema_version_on_open = stored_schema_version(connection)
+        assert_schema_not_newer(self.schema_version_on_open)
+        if self.schema_version_on_open is None or self.schema_version_on_open < SCHEMA_VERSION:
+            found = (
+                "unstamped (predates schema versioning)"
+                if self.schema_version_on_open is None
+                else str(self.schema_version_on_open)
+            )
+            raise SupervisorError(
+                "schema_upgrade_required",
+                f"control database is at schema version {found} and this acp "
+                f"({__version__}) expects {SCHEMA_VERSION}. Read-only commands do not "
+                "migrate; run `acp migrate` to upgrade it.",
+            )
+
+    def _open_read_write(self) -> None:
+        """Create state directories, bring the schema up to date, and stamp the version."""
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "worktrees").mkdir(exist_ok=True)
         (self.state_dir / "logs").mkdir(exist_ok=True)
         (self.state_dir / "runtime").mkdir(exist_ok=True)
         with self.connect() as connection:
+            # Read the stamp before the first CREATE/ALTER. Checking afterwards would be
+            # checking a database this binary had already written to.
+            self.schema_version_on_open = stored_schema_version(connection)
+            assert_schema_not_newer(self.schema_version_on_open)
             connection.executescript(SCHEMA)
             self._migrate(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('claim_counter', '0')"
             )
-            attempt_columns = {
-                row["name"] for row in connection.execute("PRAGMA table_info(attempts)")
-            }
+            attempt_columns = _columns(connection, "attempts")
             legacy_worker_identity_missing = "pid_identity" not in attempt_columns
             if "runner_credential_digest" not in attempt_columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN runner_credential_digest TEXT")
@@ -444,10 +558,7 @@ class GitSupervisor:
                         "supervisor",
                         {"attempt_id": worker["id"], "agent_id": worker["agent_id"]},
                     )
-            driver_columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(runtime_driver_resources)")
-            }
+            driver_columns = _columns(connection, "runtime_driver_resources")
             if "definition_json" not in driver_columns:
                 connection.execute(
                     "ALTER TABLE runtime_driver_resources "
@@ -458,9 +569,7 @@ class GitSupervisor:
                     "ALTER TABLE runtime_driver_resources "
                     "ADD COLUMN credential_handle_json TEXT NOT NULL DEFAULT '{}'"
                 )
-            runtime_columns = {
-                row["name"] for row in connection.execute("PRAGMA table_info(runtime_environments)")
-            }
+            runtime_columns = _columns(connection, "runtime_environments")
             if "restart_token" not in runtime_columns:
                 connection.execute(
                     "ALTER TABLE runtime_environments "
@@ -483,13 +592,82 @@ class GitSupervisor:
                 connection.execute(
                     "INSERT OR IGNORE INTO meta(key, value) VALUES('runner_auth_enabled', '1')"
                 )
+            self._apply_migration_ledger(connection, self.schema_version_on_open)
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (SCHEMA_WRITTEN_BY_KEY, __version__),
+            )
+
+    @staticmethod
+    def _apply_migration_ledger(connection: sqlite3.Connection, stored: int | None) -> None:
+        """Apply every numbered upgrade the database has not seen, in order.
+
+        `stored` is None for a database that predates stamping; the baseline above has
+        just brought it to version 1, so it starts here from 1 like any other.
+
+        The caller's `connect()` block is the transaction, and it is deliberately one
+        transaction for the whole ledger rather than one per entry: an upgrade that fails
+        halfway should leave the database at the version it arrived at, not at whichever
+        entry happened to be the last to succeed. Each stamp is written next to the
+        change it describes, so both roll back together.
+        """
+
+        current = 1 if stored is None else stored
+        for version, upgrade in MIGRATIONS:
+            if version <= current:
+                continue
+            upgrade(connection)
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (SCHEMA_VERSION_KEY, str(version)),
+            )
+            current = version
+
+    def _finish_open(self) -> None:
         common_value = self._git_text("rev-parse", "--path-format=absolute", "--git-common-dir")
         self._git_common_dir = Path(common_value)
         if not self._git_common_dir.is_absolute():
             self._git_common_dir = (self.root / self._git_common_dir).resolve()
         self._assert_no_git_grafts()
+        if self.read_only:
+            # Both of the calls below write. A read-only open leaves reconciliation to a
+            # command that admits it mutates, rather than doing it under `acp status`.
+            return
         self._invalidate_legacy_submissions()
         self._reconcile_pending_integrations()
+
+    def schema_state(self) -> dict[str, Any]:
+        """Schema version found when this supervisor opened, against what the binary expects."""
+
+        return {
+            "database": self.schema_version_on_open,
+            "binary": SCHEMA_VERSION,
+            "written_by": __version__,
+        }
+
+    def migrate(self) -> dict[str, Any]:
+        """Report the upgrade that opening this supervisor read-write already performed.
+
+        `version_changed` describes the stamp, not whether any SQL ran. The baseline
+        column adds are idempotent repairs of a database already at its recorded
+        version, so a legacy database can gain a column here and still report the same
+        version on both sides. A version number cannot detect that drift — which is the
+        reason changes after version 1 go through the ledger instead.
+        """
+
+        if self.read_only:
+            raise SupervisorError("read_only", "migrate needs a read-write supervisor")
+        previous = self.schema_version_on_open
+        return {
+            "ok": True,
+            "previous": previous,
+            "current": SCHEMA_VERSION,
+            "version_changed": previous != SCHEMA_VERSION,
+        }
 
     @staticmethod
     def _migrate(connection: sqlite3.Connection) -> None:
@@ -498,7 +676,7 @@ class GitSupervisor:
         CREATE TABLE IF NOT EXISTS silently leaves an older table alone, so new
         columns have to be added explicitly. Each step is idempotent.
         """
-        columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)").fetchall()}
+        columns = _columns(connection, "tasks")
         for column in ("produces_json", "consumes_json"):
             if column not in columns:
                 connection.execute(
@@ -512,16 +690,12 @@ class GitSupervisor:
             connection.execute(
                 "ALTER TABLE tasks ADD COLUMN cleanup_error TEXT NOT NULL DEFAULT ''"
             )
-        attempt_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(attempts)").fetchall()
-        }
+        attempt_columns = _columns(connection, "attempts")
         if "trust_bundle_json" not in attempt_columns:
             connection.execute(
                 "ALTER TABLE attempts ADD COLUMN trust_bundle_json TEXT NOT NULL DEFAULT '{}'"
             )
-        submission_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(submissions)").fetchall()
-        }
+        submission_columns = _columns(connection, "submissions")
         if "qc_resume_status" not in submission_columns:
             connection.execute(
                 "ALTER TABLE submissions ADD COLUMN qc_resume_status TEXT NOT NULL DEFAULT ''"
@@ -530,9 +704,7 @@ class GitSupervisor:
             connection.execute(
                 "ALTER TABLE submissions ADD COLUMN object_contract TEXT NOT NULL DEFAULT ''"
             )
-        qc_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(qc_runs)").fetchall()
-        }
+        qc_columns = _columns(connection, "qc_runs")
         for column, default in (
             ("reviewer_provenance_json", "'{}'"),
             ("reviewer_signature", "''"),
@@ -1028,6 +1200,20 @@ class GitSupervisor:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            # mode=ro makes the refusal structural rather than a matter of discipline:
+            # a stray INSERT raises instead of landing. journal_mode and secure_delete
+            # are omitted because setting them writes the database header — which is
+            # exactly how a "read-only" command used to leave fingerprints.
+            connection = sqlite3.connect(f"{self.db_path.as_uri()}?mode=ro", uri=True, timeout=30)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 30000")
+            try:
+                yield connection
+            finally:
+                connection.close()
+            return
         connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -6396,6 +6582,24 @@ class GitSupervisor:
             checks.append({"name": "sqlite", "ok": integrity == "ok", "detail": integrity})
         except sqlite3.Error as error:
             checks.append({"name": "sqlite", "ok": False, "detail": str(error)})
+        opened_at = self.schema_version_on_open
+        checks.append(
+            {
+                "name": "schema",
+                # A database newer than this binary never reaches doctor: the open
+                # refuses. A database older is upgraded by the same open. So by the time
+                # this runs the two agree, and the useful fact is what it was beforehand.
+                "ok": True,
+                "detail": (
+                    f"version {SCHEMA_VERSION}, binary {SCHEMA_VERSION} (acp {__version__}); "
+                    + (
+                        "stamped on this open — it predated schema versioning"
+                        if opened_at is None
+                        else f"was {opened_at} when opened"
+                    )
+                ),
+            }
+        )
         if self.config.trust_root is not None:
             try:
                 current_pin = load_current_bundle(

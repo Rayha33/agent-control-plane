@@ -64,8 +64,8 @@ class Settings:
                     "refusing to start the agent control plane with insecure credentials:\n"
                     + "\n".join(f"  - {problem}" for problem in problems)
                     + "\n\nExport real secrets, for example:\n"
-                    "  export ACP_ADMIN_KEY=\"$(openssl rand -hex 32)\"\n"
-                    "  export ACP_SIGNING_KEY=\"$(openssl rand -hex 32)\"\n"
+                    '  export ACP_ADMIN_KEY="$(openssl rand -hex 32)"\n'
+                    '  export ACP_SIGNING_KEY="$(openssl rand -hex 32)"\n'
                     f"or set {INSECURE_DEV_ENV}=1 to accept the published development keys."
                 )
 
@@ -85,16 +85,12 @@ def _credential_problems(admin_key: str, signing_key: str) -> list[str]:
     if not admin_key:
         problems.append("ACP_ADMIN_KEY is not set")
     elif admin_key == DEV_ADMIN_KEY:
-        problems.append(
-            "ACP_ADMIN_KEY is the published development key, which is not a secret"
-        )
+        problems.append("ACP_ADMIN_KEY is the published development key, which is not a secret")
 
     if not signing_key:
         problems.append("ACP_SIGNING_KEY is not set")
     elif signing_key == DEV_SIGNING_KEY:
-        problems.append(
-            "ACP_SIGNING_KEY is the published development key, which is not a secret"
-        )
+        problems.append("ACP_SIGNING_KEY is the published development key, which is not a secret")
     elif len(signing_key.encode("utf-8")) < MINIMUM_SIGNING_KEY_BYTES:
         problems.append(
             f"ACP_SIGNING_KEY is shorter than {MINIMUM_SIGNING_KEY_BYTES} bytes, "
