@@ -4378,6 +4378,136 @@ class GitSupervisor:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             return self._attempt_view(connection, row)
 
+    def guard(self, attempt_id: str, path: str, *, now: int | None = None) -> dict[str, Any]:
+        """Decide whether an agent holding `attempt_id` may write `path`.
+
+        This is the check an editor's pre-write hook asks before letting a tool call
+        through, and it is deliberately the SAME check `submit` applies to the diff:
+        both call `_path_matches` against the task's declared resources. An adapter
+        that reimplemented the matching would be a second enforcement implementation
+        that could disagree with the one that matters, which is worse than none.
+
+        Read-only, so it runs on a read-only supervisor and cannot itself become a
+        reason the state changed.
+        """
+
+        epoch = int(time.time()) if now is None else now
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt is None:
+                return self._guard_denial(
+                    attempt_id, path, "attempt_not_found", f"no attempt {attempt_id}"
+                )
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (attempt["task_id"],)
+            ).fetchone()
+            declared = json.loads(task["resources_json"]) if task else []
+
+        if attempt["status"] not in {"provisioning", "working"}:
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "attempt_not_live",
+                f"attempt is {attempt['status']}; only a live attempt may write",
+                declared=declared,
+            )
+        if attempt["lease_expires_at"] <= epoch:
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "lease_expired",
+                "the claim lease has expired; heartbeat or re-claim before writing",
+                declared=declared,
+            )
+
+        worktree = Path(attempt["worktree"]).resolve()
+        # resolve() follows symlinks, so a link planted inside the worktree that points
+        # outside it resolves outside and is refused here rather than at submit time.
+        target = Path(path)
+        if not target.is_absolute():
+            target = worktree / target
+        target = target.resolve()
+        if target != worktree and worktree not in target.parents:
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "outside_worktree",
+                f"{target} is outside the attempt worktree {worktree}",
+                declared=declared,
+            )
+
+        relative = target.relative_to(worktree).as_posix()
+        if not any(self._path_matches(relative, resource) for resource in declared):
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "undeclared_write",
+                f"{relative} is not in the task's declared write set",
+                declared=declared,
+                relative_path=relative,
+            )
+        return {
+            "ok": True,
+            "allow": True,
+            "attempt_id": attempt_id,
+            "path": str(target),
+            "relative_path": relative,
+            "worktree": str(worktree),
+            "declared": declared,
+        }
+
+    def guard_context(self, attempt_id: str) -> dict[str, Any]:
+        """What an agent needs to stay inside its claim: worktree and write set.
+
+        A SessionStart hook prints this into the model's context. An agent told which
+        paths it may write can plan inside them; one that finds out per-denial spends
+        turns discovering the boundary by hitting it.
+        """
+
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt is None:
+                raise SupervisorError("attempt_not_found", f"no attempt {attempt_id}")
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (attempt["task_id"],)
+            ).fetchone()
+        return {
+            "ok": True,
+            "attempt_id": attempt_id,
+            "task_id": attempt["task_id"],
+            "status": attempt["status"],
+            "worktree": attempt["worktree"],
+            "branch": attempt["branch"],
+            "lease_expires_at": attempt["lease_expires_at"],
+            "declared": json.loads(task["resources_json"]) if task else [],
+            "acceptance": json.loads(task["acceptance_json"]) if task else [],
+        }
+
+    @staticmethod
+    def _guard_denial(
+        attempt_id: str,
+        path: str,
+        reason: str,
+        detail: str,
+        *,
+        declared: list[str] | None = None,
+        relative_path: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "allow": False,
+            "reason": reason,
+            "detail": detail,
+            "attempt_id": attempt_id,
+            "path": path,
+            "relative_path": relative_path,
+            "declared": declared or [],
+        }
+
     @staticmethod
     def _directory_bytes(path: Path) -> int:
         total = 0

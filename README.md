@@ -728,7 +728,13 @@ service.
   attempt with its reason. Integration branches are reported and never deleted:
   their commits are the published evidence for an approved task.
 - Agents should be launched through ACP or another gateway; direct writes to the
-  base checkout happen outside ACP's enforcement boundary.
+  base checkout happen outside ACP's enforcement boundary. `acp hooks install
+  --claude-code` closes most of that gap for Claude Code by putting `acp guard` in
+  front of every file-editing tool call — it refuses a write outside the attempt's
+  worktree or outside the task's declared write set, using the same check `submit`
+  applies to the diff. `Bash` is deliberately not guarded: what a shell command writes
+  cannot be read off the command string, and a pattern that can be walked around by
+  rephrasing would read as coverage without being any. See docs/INTEGRATIONS.md.
 - Tests and critic commands execute candidate code. Linux uses a child subreaper
   to adopt and kill double-fork/`setsid` descendants on both success and timeout;
   Darwin denies process creation for these short commands and fails the gate if

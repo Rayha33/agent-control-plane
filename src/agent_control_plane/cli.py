@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from .editor_hooks import DENY_EXIT_CODE, install_claude_code_hooks, path_from_hook_payload
 from .git_supervisor import GitSupervisor, SupervisorError
 from .runtime_drivers import DriverError, resolve_trusted_executable
 from .status import DEFAULT_LEASE_RISK_SECONDS
@@ -26,6 +27,7 @@ READ_ONLY_ACTIONS = frozenset(
         "reviewers",
         "bundle",
         "verify-events",
+        "guard",
     }
 )
 """Commands that only look. They open the database mode=ro and never migrate it.
@@ -57,6 +59,33 @@ def parse_duration(text: str) -> int:
     return int(value[:-1]) * DURATION_UNITS[value[-1]]
 
 
+def _hook_target(raw: str) -> str | None:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return path_from_hook_payload(payload)
+
+
+def _deny(decision: dict[str, Any]) -> int:
+    """Emit the decision and block the tool call.
+
+    The JSON goes to stdout for logs; the sentence goes to stderr because that is what
+    Claude Code feeds back to the model, and an agent that is told which paths it may
+    write can correct itself instead of retrying the same denied edit.
+    """
+
+    emit(decision)
+    print(
+        f"acp guard denied this write: {decision.get('detail', decision.get('reason'))}",
+        file=sys.stderr,
+    )
+    declared = decision.get("declared") or []
+    if declared:
+        print(f"declared write set: {', '.join(declared)}", file=sys.stderr)
+    return DENY_EXIT_CODE
+
+
 def add_credential_source(command: argparse.ArgumentParser) -> None:
     source = command.add_mutually_exclusive_group()
     source.add_argument(
@@ -80,6 +109,33 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("init", help="initialize config and local state")
     commands.add_parser("doctor", help="check repository and state integrity")
     commands.add_parser("migrate", help="upgrade the control database schema in place")
+    guard = commands.add_parser(
+        "guard", help="may this attempt write this path? (editor pre-write hook)"
+    )
+    guard.add_argument("--attempt", dest="attempt_id", help="defaults to $ACP_ATTEMPT_ID")
+    guard.add_argument("--path", help="the path the tool is about to write")
+    guard_mode = guard.add_mutually_exclusive_group()
+    guard_mode.add_argument(
+        "--hook",
+        action="store_true",
+        help="read a Claude Code PreToolUse payload on stdin; exit 2 denies the tool call",
+    )
+    guard_mode.add_argument(
+        "--describe",
+        action="store_true",
+        help="print the attempt's worktree and declared write set (SessionStart hook)",
+    )
+
+    hooks = commands.add_parser("hooks", help="install editor adapters that call the kernel")
+    hooks_commands = hooks.add_subparsers(dest="hooks_action", required=True)
+    hooks_install = hooks_commands.add_parser("install", help="write the hook configuration")
+    hooks_install.add_argument(
+        "--claude-code", action="store_true", required=True, help="install Claude Code hooks"
+    )
+    hooks_install.add_argument(
+        "--command", default="acp", help="how the hook should invoke acp (default: acp)"
+    )
+
     gc = commands.add_parser(
         "gc", help="reclaim worktrees and branches of attempts nothing is using"
     )
@@ -489,6 +545,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
             return 0
+        if args.action == "hooks":
+            emit(install_claude_code_hooks(Path(args.repo).resolve(), args.command))
+            return 0
         if args.action == "trust":
             if args.trust_action == "list":
                 result = list_bundles(args.root, owner_uid=args.owner_uid)
@@ -505,6 +564,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.doctor()
         elif args.action == "migrate":
             result = supervisor.migrate()
+        elif args.action == "guard":
+            attempt_id = args.attempt_id or os.environ.get("ACP_ATTEMPT_ID", "")
+            if not attempt_id:
+                raise SupervisorError("missing_attempt", "pass --attempt or export ACP_ATTEMPT_ID")
+            if args.describe:
+                emit(supervisor.guard_context(attempt_id))
+                return 0
+            target = args.path
+            if args.hook:
+                target = _hook_target(sys.stdin.read())
+                if target is None:
+                    # Fail closed. Unable to read the request means unable to tell
+                    # whether it is in scope, and a guard that allows what it cannot
+                    # parse stops being a boundary the moment the payload changes.
+                    return _deny(
+                        {
+                            "ok": True,
+                            "allow": False,
+                            "reason": "unreadable_hook_payload",
+                            "detail": "no writable path found in the PreToolUse payload",
+                        }
+                    )
+            if not target:
+                raise SupervisorError("missing_path", "pass --path or use --hook")
+            decision = supervisor.guard(attempt_id, target)
+            if not decision["allow"]:
+                return _deny(decision)
+            emit(decision)
+            return 0
         elif args.action == "gc":
             result = supervisor.gc(
                 dry_run=args.dry_run,
