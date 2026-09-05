@@ -133,7 +133,15 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "version": API_VERSION}
+        # A control plane running on the published development credentials must not be
+        # indistinguishable from a secured one. Settings.from_env now refuses those keys
+        # unless ACP_INSECURE_DEV=1 is set explicitly; when it is, say so here so the
+        # deployment is visibly insecure rather than quietly so. Board #1624.
+        return {
+            "status": "ok",
+            "version": API_VERSION,
+            "auth": "insecure-dev" if active_settings.insecure_dev else "enforced",
+        }
 
     @app.post(
         "/v1/agents",

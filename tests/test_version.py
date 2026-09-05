@@ -27,7 +27,16 @@ def declared_version() -> str:
 def test_health_reports_the_declared_version(client):
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "version": declared_version()}
+    # Deliberately still EXACT equality rather than a subset check. /health gained an
+    # "auth" field in board #1624 (it reports insecure-dev when the published
+    # development credentials are in use), and the honest way to absorb that is to state
+    # the whole expected body — loosening this to `>=` or popping the new key would give
+    # up the whole-shape pin that makes this test worth having.
+    assert response.json() == {
+        "status": "ok",
+        "version": declared_version(),
+        "auth": "enforced",
+    }
 
 
 def test_openapi_reports_the_declared_version(app):

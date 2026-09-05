@@ -627,6 +627,28 @@ export ACP_DATABASE_PATH="agent_control_plane.db"
 uv run uvicorn agent_control_plane.app:create_app --factory
 ~~~
 
+Both keys are **required**, not merely advised. `Settings.from_env()` refuses to start
+when either is unset, when either is one of the development values published in this
+repository, or when the signing key is shorter than 32 bytes — the HS256 digest it
+protects. It reports every problem at once rather than one per run.
+
+Until v0.2 those were silent defaults, so the command above with nothing exported
+started a server whose admin key was a string in this README: full access to
+`/v1/agents`, `/v1/policies`, `/v1/audit`, `/v1/tasks`, reap and approvals, and the
+ability to mint valid mandates. A control plane whose premise is that it fails closed
+should not fail open on the most common mistake.
+
+For local work you can opt into the published development keys explicitly:
+
+~~~bash
+export ACP_INSECURE_DEV=1
+uv run uvicorn agent_control_plane.app:create_app --factory
+~~~
+
+`/health` then reports `"auth": "insecure-dev"` instead of `"enforced"`, so a server
+running this way cannot be mistaken for a secured one. Only the exact value `1` enables
+it — `true`, `yes` and `0` all still refuse.
+
 The Git supervisor is the primary v0.2 product path. The HTTP authority API is a
 separate reference layer and does not create Git worktrees.
 
