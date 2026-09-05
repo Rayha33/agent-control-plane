@@ -20,11 +20,10 @@ from agent_control_plane import __version__, git_supervisor
 from agent_control_plane.cli import READ_ONLY_ACTIONS, main
 from agent_control_plane.git_supervisor import (
     SCHEMA_VERSION,
-    SCHEMA_VERSION_KEY,
-    SCHEMA_WRITTEN_BY_KEY,
     GitSupervisor,
     SupervisorError,
 )
+from agent_control_plane.schema_version import SCHEMA_VERSION_KEY, SCHEMA_WRITTEN_BY_KEY
 
 
 @pytest.fixture

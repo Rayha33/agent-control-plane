@@ -10,8 +10,33 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+from .schema_version import (
+    META_TABLE,
+    Migration,
+    apply_migration_ledger,
+    assert_schema_not_newer,
+    stamp_schema_version,
+    stored_schema_version,
+)
+
 GENESIS_HASH = "0" * 64
 
+
+SERVICE_SCHEMA_VERSION = 1
+"""Schema this binary understands for the FastAPI service database.
+
+Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
+two lifecycles — the service database is created by `create_app`, the control database
+by `acp init` — and coupling their numbers would force a version bump on one whenever
+the other changed.
+"""
+
+# Numbered upgrades from SERVICE_SCHEMA_VERSION - 1 to SERVICE_SCHEMA_VERSION. Version 1
+# is the baseline: the CREATE TABLE IF NOT EXISTS script plus the column adds that
+# predate stamping. Anything after 1 goes here, including changes ALTER TABLE ADD COLUMN
+# cannot express.
+MIGRATIONS: tuple[Migration, ...] = ()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -192,6 +217,16 @@ class Database:
         if self.path != ":memory:":
             Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
+            # Read the stamp before the first CREATE or ALTER. Checking afterwards
+            # would be checking a database this binary had already written to.
+            connection.executescript(META_TABLE)
+            stored = stored_schema_version(connection)
+            assert_schema_not_newer(
+                stored,
+                binary_version=SERVICE_SCHEMA_VERSION,
+                component="service database",
+                package_version=__version__,
+            )
             connection.executescript(SCHEMA)
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(agents)").fetchall()
@@ -211,6 +246,12 @@ class Database:
                     ADD COLUMN resource_fencing_tokens_json TEXT NOT NULL DEFAULT '{}'
                     """
                 )
+            apply_migration_ledger(connection, stored, MIGRATIONS)
+            stamp_schema_version(
+                connection,
+                version=SERVICE_SCHEMA_VERSION,
+                package_version=__version__,
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

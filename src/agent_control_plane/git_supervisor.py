@@ -21,7 +21,7 @@ import time
 import tomllib
 import unicodedata
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -57,6 +57,14 @@ from .runtime_drivers import (
     run_trusted,
 )
 from .scheduling import Scheduler, normalize_artifact
+from .schema_version import (
+    Migration,
+    SchemaVersionError,
+)
+from .schema_version import apply_migration_ledger as _apply_ledger
+from .schema_version import assert_schema_not_newer as _assert_not_newer
+from .schema_version import stamp_schema_version as _stamp
+from .schema_version import stored_schema_version as _stored_version
 from .status import (
     ACTIVE_STATUSES,
     DEFAULT_LEASE_RISK_SECONDS,
@@ -140,16 +148,13 @@ Per stream, not in total: a run that fails loudly on both is exactly the one who
 evidence must not be half-truncated.
 """
 
-SCHEMA_VERSION_KEY = "schema_version"
-SCHEMA_WRITTEN_BY_KEY = "written_by"
-
 # Numbered upgrades from SCHEMA_VERSION - 1 to SCHEMA_VERSION, applied in order, each
 # inside one transaction. Version 1 is the baseline: the idempotent CREATE TABLE IF NOT
 # EXISTS script plus the column adds that predate stamping, so an unstamped database is
 # brought to 1 by the code that already existed rather than by a ledger entry. Anything
 # after 1 goes here — including index, rename, backfill and data transforms, which the
 # PRAGMA/ALTER pattern cannot express.
-MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = ()
+MIGRATIONS: tuple[Migration, ...] = ()
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -159,48 +164,29 @@ def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
 
 
 def stored_schema_version(connection: sqlite3.Connection) -> int | None:
-    """Schema version recorded in the database, or None when it predates stamping.
+    """Shared implementation, re-raised as a SupervisorError.
 
-    None is "older than 1", not "unknown": a database written before versioning has
-    no meta row, and one written before `meta` existed has no table. A stamp that is
-    present but not an integer is a different thing entirely — that is corruption, and
-    guessing a version for it would migrate a database we cannot identify.
+    The CLI's error path catches SupervisorError, so the translation keeps the exit
+    code and JSON shape while the check itself lives in one place with the service
+    database's copy.
     """
 
     try:
-        row = connection.execute(
-            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
-    if row is None:
-        return None
-    try:
-        return int(row["value"])
-    except (TypeError, ValueError):
-        raise SupervisorError(
-            "schema_version_unreadable",
-            f"meta.{SCHEMA_VERSION_KEY} is {row['value']!r}, which is not a version number; "
-            "the control database is corrupt or was not written by acp",
-        ) from None
+        return _stored_version(connection)
+    except SchemaVersionError as error:
+        raise SupervisorError(error.code, str(error)) from None
 
 
 def assert_schema_not_newer(stored: int | None) -> None:
-    """Refuse a database written by a newer binary than this one.
-
-    Opening it anyway is the quiet failure: CREATE TABLE IF NOT EXISTS leaves the newer
-    tables alone and every PRAGMA check finds its column already present, so the open
-    succeeds and the newer columns simply stay invisible to this code. A critic running
-    an older contract would then approve work the newer contract rejects.
-    """
-
-    if stored is not None and stored > SCHEMA_VERSION:
-        raise SupervisorError(
-            "schema_newer_than_binary",
-            f"control database is at schema version {stored}; this acp ({__version__}) "
-            f"understands version {SCHEMA_VERSION}. Upgrade acp — an older binary cannot "
-            "see the newer columns and would operate on a partial view of the state.",
+    try:
+        _assert_not_newer(
+            stored,
+            binary_version=SCHEMA_VERSION,
+            component="control database",
+            package_version=__version__,
         )
+    except SchemaVersionError as error:
+        raise SupervisorError(error.code, str(error)) from None
 
 
 def utc_now() -> str:
@@ -618,39 +604,11 @@ class GitSupervisor:
                     "INSERT OR IGNORE INTO meta(key, value) VALUES('runner_auth_enabled', '1')"
                 )
             self._apply_migration_ledger(connection, self.schema_version_on_open)
-            connection.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                (SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
-            )
-            connection.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                (SCHEMA_WRITTEN_BY_KEY, __version__),
-            )
+            _stamp(connection, version=SCHEMA_VERSION, package_version=__version__)
 
     @staticmethod
     def _apply_migration_ledger(connection: sqlite3.Connection, stored: int | None) -> None:
-        """Apply every numbered upgrade the database has not seen, in order.
-
-        `stored` is None for a database that predates stamping; the baseline above has
-        just brought it to version 1, so it starts here from 1 like any other.
-
-        The caller's `connect()` block is the transaction, and it is deliberately one
-        transaction for the whole ledger rather than one per entry: an upgrade that fails
-        halfway should leave the database at the version it arrived at, not at whichever
-        entry happened to be the last to succeed. Each stamp is written next to the
-        change it describes, so both roll back together.
-        """
-
-        current = 1 if stored is None else stored
-        for version, upgrade in MIGRATIONS:
-            if version <= current:
-                continue
-            upgrade(connection)
-            connection.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                (SCHEMA_VERSION_KEY, str(version)),
-            )
-            current = version
+        _apply_ledger(connection, stored, MIGRATIONS)
 
     def _finish_open(self) -> None:
         common_value = self._git_text("rev-parse", "--path-format=absolute", "--git-common-dir")
