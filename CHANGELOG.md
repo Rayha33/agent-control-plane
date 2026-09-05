@@ -11,6 +11,67 @@ adding one.
 
 ## [Unreleased]
 
+### Security
+- `Settings.from_env()` defaulted `admin_key` to the published `dev-admin-key` and
+  `signing_key` to a published development key, and `create_app()` calls it whenever
+  given no settings — so starting the server with nothing exported produced an API
+  administered by a string printed in the README. It now raises
+  `InsecureSettingsError` on unset, published-dev, or under-length signing keys,
+  reporting every problem at once. `ACP_INSECURE_DEV=1` opts back in explicitly and
+  `/health` then reports `"auth": "insecure-dev"` instead of `"enforced"`. (#1624)
+- `acp guard` refuses a write outside the attempt's worktree or outside the task's
+  declared write set, using the same `_path_matches` that `submit` applies to the
+  diff. `acp hooks install --claude-code` puts it in front of Claude Code's
+  file-editing tools, closing the gap *Honest boundaries* described: an agent editing
+  the base checkout defeated every claim and fence without ACP noticing. `Bash` is
+  deliberately not guarded — what a shell command writes cannot be read off the
+  command string, and a pattern that can be walked around by rephrasing would read as
+  coverage without being any. (#1627)
+
+### Added
+- `meta.schema_version` and `meta.written_by`. A control database newer than the
+  binary is refused with `schema_newer_than_binary` rather than opened — previously
+  an older acp opened it successfully and simply did not see the newer columns, so a
+  critic on an older contract could approve what the newer contract rejects. A
+  numbered `MIGRATIONS` ledger carries changes after version 1 and can express
+  indexes, renames and backfills, which the `ALTER TABLE ADD COLUMN` pattern could
+  not. `acp migrate` upgrades a database; `acp doctor` reports its version against
+  the binary's. (#1629)
+- `acp gc [--dry-run] [--older-than 7d]` reclaims the worktree and task branch of
+  attempts nothing is using. A completed task previously left its worktree, its
+  `git worktree` registration and its branch on disk indefinitely. It refuses, in
+  order, a worktree whose task is active, whose attempt is live or quarantined, whose
+  cleanup is unproven, that holds a resource lease or runtime allocation, or that is
+  inside the retention window; integration branches are reported and never deleted.
+  `acp status` gained a `disk` section computed by the same survey. (#1628)
+- `scripts/test-linux.sh` and `tests/linux/Dockerfile` run the suite on the Linux
+  worker path from any host with Docker — 16 tests covering `acp run` skip everywhere
+  else. `ACP_REQUIRE_LINUX_WORKER=1` turns a skipped `linux_worker` test into a
+  failure and CI sets it on the Linux jobs, so a runner image that lost `/proc` or
+  child-subreaper support fails loudly instead of going green having tested nothing.
+  pytest now also prints what it skipped and why on every run. (#1631)
+- `docs/INTEGRATIONS.md`. (#1627)
+
+### Changed
+- Read-only commands (`status`, `show`, `plan`, `queue`, `merge-plan`, `reviewers`,
+  `bundle`, `verify-events`, `guard`) open the database `mode=ro` and never migrate
+  it, making *Planning is a preview, never a mutation* structural rather than a matter
+  of discipline. Constructing the supervisor previously ran `CREATE TABLE IF NOT
+  EXISTS` and every pending `ALTER TABLE` before the first `SELECT`, so `acp status`
+  on a database written by an older acp rewrote its schema. `list` is excluded because
+  `list_tasks()` reaps, and `doctor` because it must be able to open a database that
+  needs upgrading in order to report it. (#1629)
+
+### Fixed
+- A failed QC command's finding built its evidence from `stderr or stdout`, so stdout
+  was read only when stderr was empty. Every mainstream test runner reports failures
+  on stdout while writing something incidental to stderr, so the finding routinely
+  kept the incidental half and discarded the diagnosis — one real run reported
+  "Creating virtual environment at: .venv / Installed 35 packages" as the entire
+  evidence for a suite that had named two failing tests. Evidence now carries both
+  streams, labelled, stdout first, truncated with both ends kept and the gap marked.
+  (#1706)
+
 ### Fixed
 - The HTTP app reported version `0.1.0` from two hardcoded literals in `app.py`
   while `pyproject.toml` declared `0.2.0`, so `/health` and the OpenAPI document
