@@ -109,6 +109,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("init", help="initialize config and local state")
     commands.add_parser("doctor", help="check repository and state integrity")
     commands.add_parser("migrate", help="upgrade the control database schema in place")
+    commands.add_parser(
+        "mcp-serve", help="read-only MCP server over stdio (no credential, no writes)"
+    )
     guard = commands.add_parser(
         "guard", help="may this attempt write this path? (editor pre-write hook)"
     )
@@ -545,6 +548,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
             return 0
+        if args.action == "mcp-serve":
+            from .mcp_server import serve
+
+            return serve(args.repo)
         if args.action == "hooks":
             emit(install_claude_code_hooks(Path(args.repo).resolve(), args.command))
             return 0

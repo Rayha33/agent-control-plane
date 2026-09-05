@@ -742,7 +742,9 @@ service.
   worktree or outside the task's declared write set, using the same check `submit`
   applies to the diff. `Bash` is deliberately not guarded: what a shell command writes
   cannot be read off the command string, and a pattern that can be walked around by
-  rephrasing would read as coverage without being any. See docs/INTEGRATIONS.md.
+  rephrasing would read as coverage without being any. `acp mcp-serve` additionally
+  exposes ten read-only tools over stdio MCP — no writes, no credential — so a session
+  can read the board without shelling out. See docs/INTEGRATIONS.md.
 - Tests and critic commands execute candidate code. Linux uses a child subreaper
   to adopt and kill double-fork/`setsid` descendants on both success and timeout;
   Darwin denies process creation for these short commands and fails the gate if

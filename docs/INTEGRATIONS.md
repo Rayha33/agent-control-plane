@@ -79,8 +79,41 @@ Confine a shell with the worktree and the OS instead — run the agent under an 
 that cannot write the base checkout, or use `acp run` on Linux, where the supervised
 worker path exists for exactly this reason.
 
+## `acp mcp-serve`
+
+A read-only MCP server over stdio, so a session can read the board it works under
+without shelling out:
+
+```json
+{"mcpServers": {"acp": {"command": "acp", "args": ["--repo", "/path/to/repo", "mcp-serve"]}}}
+```
+
+Ten tools, each a one-line delegation to a supervisor method: `acp_status`,
+`acp_queue`, `acp_merge_plan`, `acp_reviewers`, `acp_verify_events`, `acp_show`,
+`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`.
+
+**No writes and no credential, on purpose.** `claim`, `heartbeat`, `submit`, `qc` and
+`integrate` are authenticated, and `runner_identity.py` keeps worker, critic and
+integrator authority apart so nobody approves their own work. A server an editor spawns
+and holds open would have to keep a credential for the whole session; one holding more
+than one role's would erase that separation in a process nobody is watching. The CLI
+takes credentials only from a 0600 file or an open descriptor, never the environment —
+putting one in a server's environment would undo that care rather than reuse it.
+
+The server opens `GitSupervisor(read_only=True)` per call, so `mode=ro` makes a stray
+write raise rather than depend on discipline, and a database needing migration is
+reported instead of silently upgraded. Tests assert which bound method each tool
+reaches and that none of them takes a `credential` parameter — a tool-name check would
+stay green if `acp_status` were implemented as `claim`.
+
+There is no third-party dependency: the wire format is newline-delimited JSON-RPC 2.0,
+small enough to implement honestly and not worth an SDK in `acp`'s import graph for one
+subcommand.
+
 ### What this does not do yet
 
+- **No write tools.** Claiming and submitting through MCP needs the credential question
+  above answered first, and a narrower shipped thing beats a broad unshipped one.
 - **No heartbeat hook.** `acp heartbeat` is a write needing the claim token and the
   runner credential, so wiring it into a hook means deciding how a secret reaches a hook
   process. Until then an expired lease surfaces as a `lease_expired` denial — loud
