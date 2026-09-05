@@ -28,6 +28,7 @@ import platform
 import secrets
 import subprocess
 import tomllib
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -425,7 +426,19 @@ class Assurance:
     def read_bundle(self, qc_id: str) -> dict[str, Any]:
         from .git_supervisor import SupervisorError
 
-        path = self.supervisor.state_dir / "bundles" / f"{qc_id}.json"
+        # The caller's string used to be interpolated straight into the path, so
+        # `acp bundle '../../outside'` read and printed any .json file the operator
+        # could reach. QC ids are uuid4, so anything else is not an id that was ever
+        # issued — checked by shape AND by containment, because a shape check alone is
+        # a rule about strings and the thing that matters is which file is opened.
+        directory = (self.supervisor.state_dir / "bundles").resolve()
+        try:
+            uuid.UUID(qc_id)
+        except (AttributeError, TypeError, ValueError):
+            raise SupervisorError("invalid_qc_id", f"{qc_id!r} is not a QC identifier") from None
+        path = (directory / f"{qc_id}.json").resolve()
+        if path.parent != directory:
+            raise SupervisorError("invalid_qc_id", f"{qc_id!r} is not a QC identifier")
         if not path.is_file():
             raise SupervisorError("bundle_not_found", f"no reproduction bundle for {qc_id}")
         record = json.loads(path.read_text(encoding="utf-8"))
