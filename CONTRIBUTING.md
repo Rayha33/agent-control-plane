@@ -44,23 +44,28 @@ scripts/test-linux.sh -k monitor # extra arguments go to pytest
 ```
 
 It copies your working tree into the container, so uncommitted edits are tested. Two
-run flags were measured, not guessed, and both are load-bearing:
+run flags, one of which is load-bearing:
 
-- **`--init`.** Without a reaping PID 1, a process ACP `SIGKILL`s stays a zombie with
-  the same `/proc` start time, the identity check still matches, and the containment
-  tests fail with *"command survived unexpected kernel monitor termination"*.
+- **`--init`.** Ordinary hygiene for a container running process trees, so orphans get
+  reaped. Not required by any failure that reproduces: the containment tests pass
+  without it, 12 runs out of 12 in isolation and for the whole suite.
 - **A non-root user.** As root, `test_run_trusted_revalidates_immediately_before_exec`
   passes when it should fail — root satisfies ownership and permission questions the
   check exists to ask.
+
+Known: `test_command_cannot_escape_by_terminating_its_monitor` passes when you run the
+suite this way, and fails when the same suite runs *under* `acp qc` — nesting the
+supervisor inside itself, not a container flag. See board #1707 before chasing it.
 
 Set `ACP_REQUIRE_LINUX_WORKER=1` and a skipped `linux_worker` test becomes a failure.
 CI sets it on the Linux jobs, so a runner image that lost `/proc` or subreaper support
 fails loudly instead of going green having tested nothing. The script sets it for you.
 
-One test, `test_merge_renames_setting_matches_porcelain_merge`, compares ACP's merge
-against porcelain `git merge` and its expected outcome depends on the ambient Git
-version: it passes on Git 2.50.1 and fails on 2.47.3. If it is your only failure,
-check `git --version` before assuming you broke something.
+`test_merge_renames_setting_matches_porcelain_merge` reads its expectation off
+porcelain rather than hardcoding one, because what `git merge` does to a rename/edit
+with `merge.renames=false` differs between Git versions — it conflicts on 2.50.1 and
+merges cleanly on 2.47.3. Both branches are exercised: macOS takes the first, this
+container the second.
 
 ## Pull requests
 

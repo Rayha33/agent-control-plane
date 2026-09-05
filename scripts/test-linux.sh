@@ -27,12 +27,14 @@ fi
 
 docker build -t "$IMAGE" "$REPO/tests/linux" >/dev/null
 
-# --init is required, not optional. Without a reaping PID 1, a process ACP SIGKILLs
-# stays a zombie: its /proc entry keeps the same start time, so the identity check
-# still matches and the containment assertion fails with "command survived unexpected
-# kernel monitor termination". Measured — it is the difference between two failures
-# and none. tini does not conflict with the supervisor's own child-subreaper role;
-# it only reaps what re-parents all the way up to PID 1.
+# --init gives the container a reaping PID 1, which is ordinary hygiene for a container
+# that runs process trees. It is NOT load-bearing for any failure I can reproduce: the
+# containment tests pass without it, 12 runs out of 12 in isolation and twice for the
+# whole suite. An earlier version of this comment claimed --init was required and cited
+# two failures; those runs also had other tests failing, and the containment failures
+# went away when those were fixed rather than when --init was added. The real
+# distinguishing variable turned out to be running the suite UNDER acp qc, which still
+# fails these tests on an otherwise-green suite — see board #1707.
 exec docker run --rm --init \
     -v "$REPO:/src:ro" \
     -e ACP_REQUIRE_LINUX_WORKER=1 \
