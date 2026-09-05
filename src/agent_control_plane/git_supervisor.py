@@ -8531,7 +8531,7 @@ class GitSupervisor:
     def _terminate_unexpected_monitor_target(self, pid: int, identity: str) -> None:
         """Kill the exact command PID if its trusted monitor was terminated."""
 
-        if self._process_identity(pid) != identity:
+        if self._process_has_exited(pid, identity):
             return
         try:
             os.kill(pid, signal.SIGKILL)
@@ -8539,13 +8539,61 @@ class GitSupervisor:
             return
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            if self._process_identity(pid) != identity:
+            if self._process_has_exited(pid, identity):
                 return
             time.sleep(0.01)
         raise SupervisorError(
             "process_containment_failed",
             "command survived unexpected kernel monitor termination",
         )
+
+    @staticmethod
+    def _process_state(pid: int) -> str | None:
+        """The kernel's single-letter state for a PID, or None if it cannot be read."""
+
+        if sys.platform.startswith("linux"):
+            try:
+                raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+                # After the comm field the next token is the state; the identity check
+                # reads the start time from this same line and skips straight past it.
+                return raw.rsplit(")", 1)[1].split()[0]
+            except (FileNotFoundError, IndexError, OSError, ValueError):
+                return None
+        if sys.platform == "darwin":
+            try:
+                result = subprocess.run(
+                    ["/bin/ps", "-o", "state=", "-p", str(pid)],
+                    env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            state = result.stdout.strip()
+            return state[:1] if result.returncode == 0 and state else None
+        return None
+
+    @staticmethod
+    def _process_has_exited(pid: int, identity: str) -> bool:
+        """Whether this exact process has stopped running.
+
+        A zombie is not running. It has already exited and is only waiting for its
+        parent to collect the status, but its /proc entry and its start time both
+        survive that wait — so an identity check alone cannot tell a zombie from a live
+        process, and reports a successful kill as a survival.
+
+        Measured: running ACP's suite under ACP's own QC, the containment tests failed
+        with "command survived unexpected kernel monitor termination" on a PID whose
+        state was `Z` both before the SIGKILL and after the three-second wait. The
+        process had died; nothing in the nested arrangement reaped it, and "still in
+        /proc" was being read as "still running".
+        """
+
+        if GitSupervisor._process_identity(pid) != identity:
+            return True
+        return GitSupervisor._process_state(pid) == "Z"
 
     @staticmethod
     def _process_identity(pid: int) -> str | None:
