@@ -2,7 +2,7 @@
 
 Shell lifecycle hooks are flexible but they cannot *prove* that a database
 schema, Compose project or browser profile was actually deleted, and because
-they run as ``/bin/sh -lc`` with the candidate's worktree as the working
+they run as ``/bin/sh -c`` with the candidate's worktree as the working
 directory, a relative script name resolves to candidate-controlled code. A
 worker that is asked to clean up after itself therefore both supplies and
 grades its own cleanup.

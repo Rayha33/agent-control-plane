@@ -22,7 +22,7 @@ setup_commands = []
 teardown_commands = []
 
 # Trusted phase-scoped drivers. Unlike setup_commands/teardown_commands — which
-# run as `/bin/sh -lc` with the candidate's worktree as the working directory —
+# run as `/bin/sh -c` with the candidate's worktree as the working directory —
 # a driver is an absolute executable outside this repository, invoked as argv
 # with the runtime directory as cwd, and every teardown is followed by an
 # independent probe that must observe the resource absent. No proof means the

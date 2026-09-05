@@ -79,20 +79,29 @@ interpreter and which packages its own gate runs against.
 the same `uv cache dir` (`~/.cache/uv`) as you do, and installs into a fresh checkout
 by hardlinking out of it.
 
-**Do not add `UV_PROJECT_ENVIRONMENT` or a general env passthrough to make this
-faster.** Measured on this repository's own tree — 102 pinned packages, warm cache:
+**Do not point QC at a virtualenv shared across attempts** — that is, do not set an
+ABSOLUTE `UV_PROJECT_ENVIRONMENT`, and do not add a general env passthrough to make
+the rebuild faster. Measured on this repository's own tree, 102 pinned packages,
+warm cache:
 
 | | |
 |---|---|
-| fresh `uv sync --extra dev` in a QC-shaped checkout | 0.24 s steady state (1.08 s first) |
-| the venv it builds | 51 MB, deleted with the checkout |
-| the QC run that follows it | ~158 s |
+| `uv sync --extra dev` in a QC-shaped checkout | 0.24 s steady state (1.08 s first) |
+| the venv it builds | 51 MB |
+| the QC run that follows | ~158 s |
 
-So the per-attempt environment costs about 0.15% of a QC run, and it is not leaking —
-`_remove_worktree` takes the checkout and its `.venv` together when QC finishes.
-Pointing every attempt at one shared `UV_PROJECT_ENVIRONMENT` would trade that 0.24 s
-for concurrent QC runs mutating a single virtualenv, which is the isolation the fresh
-detached checkout exists to provide. (Board #1701.)
+Note the unit: this is **per command, not per attempt**. `run_qc` calls
+`_restore_candidate` before every QC command and again before the critic, and that is
+`git reset --hard` + `git clean -fdx`, so the `.venv` is wiped and rebuilt between
+commands. With this repo's two QC commands the real cost is roughly half a second
+against a ~158 s run — and nothing leaks, because `_remove_worktree` takes the whole
+checkout when QC finishes.
+
+A shared absolute path would trade that half second for concurrent QC runs mutating
+one virtualenv, which is the isolation the fresh detached checkout exists to provide.
+A path *inside* the worktree is a different matter and is fine — `tests/linux/Dockerfile`
+sets `UV_PROJECT_ENVIRONMENT=/opt/acp-venv` deliberately, to keep a host `.venv` built
+for another platform from being consulted inside the container. (Board #1701.)
 
 ## Pull requests
 
