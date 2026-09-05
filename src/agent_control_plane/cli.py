@@ -732,6 +732,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps({"ok": False, "error": error.code, "message": str(error)}),
             file=sys.stderr,
         )
+        if args.action == "guard" and getattr(args, "hook", False):
+            # A pre-write hook that errors must BLOCK. Claude Code blocks on exit 2 and
+            # treats every other non-zero exit as a hook problem it reports and moves
+            # past — so returning 1 here is an ALLOW, and the guard stops guarding for
+            # reasons that have nothing to do with the write: a missing ACP_ATTEMPT_ID,
+            # an unopenable repository, or `schema_upgrade_required`, which a single
+            # SCHEMA_VERSION bump would return for every hook on the fleet at once.
+            print(
+                "acp guard could not decide, so the write is blocked. "
+                "Fix the error above and retry.",
+                file=sys.stderr,
+            )
+            return DENY_EXIT_CODE
         return 1
 
 

@@ -265,3 +265,51 @@ def test_install_creates_settings_when_absent(tmp_path: Path) -> None:
     result = install_claude_code_hooks(tmp_path)
     written = json.loads(Path(result["settings"]).read_text(encoding="utf-8"))
     assert written["hooks"]["PreToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
+
+
+def test_hook_mode_fails_closed_when_the_supervisor_cannot_open(tmp_path, monkeypatch) -> None:
+    """A guard that errors must BLOCK, not wave the write through.
+
+    Claude Code blocks a PreToolUse tool call on exit 2 and treats any other non-zero
+    exit as a hook error it reports and moves past. So `return 1` — the CLI's generic
+    SupervisorError path — is an ALLOW. Every way the guard can fail before it reaches
+    a decision therefore has to exit 2: a missing ACP_ATTEMPT_ID, a repository it
+    cannot open, and `schema_upgrade_required`, which one `SCHEMA_VERSION` bump would
+    return for every hook invocation on the fleet at once.
+    """
+
+    monkeypatch.setenv("ACP_ATTEMPT_ID", "some-attempt")
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"tool_input": {"file_path": "a.py"}}'))
+    assert main(["--repo", str(tmp_path / "not-a-repo"), "guard", "--hook"]) == DENY_EXIT_CODE
+
+
+def test_hook_mode_fails_closed_without_an_attempt_id(repo: Path, monkeypatch) -> None:
+    monkeypatch.delenv("ACP_ATTEMPT_ID", raising=False)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"tool_input": {"file_path": "alpha.txt"}}'))
+    assert main(["--repo", str(repo), "guard", "--hook"]) == DENY_EXIT_CODE
+
+
+def test_hook_mode_fails_closed_on_a_stale_schema(claimed, repo: Path, monkeypatch) -> None:
+    """The bump that would have opened the gate fleet-wide."""
+
+    import sqlite3
+
+    connection = sqlite3.connect(repo / ".acp" / "control.db")
+    connection.execute("DELETE FROM meta WHERE key = 'schema_version'")
+    connection.commit()
+    connection.close()
+
+    worktree = Path(claimed[1]["worktree"])
+    monkeypatch.setenv("ACP_ATTEMPT_ID", claimed[1]["id"])
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"tool_input": {"file_path": str(worktree / "alpha.txt")}})),
+    )
+    assert main(["--repo", str(repo), "guard", "--hook"]) == DENY_EXIT_CODE
+
+
+def test_non_hook_guard_keeps_the_ordinary_error_exit_code(repo: Path, monkeypatch) -> None:
+    """Only the hook contract needs 2. A human at a terminal still gets the usual 1."""
+
+    monkeypatch.delenv("ACP_ATTEMPT_ID", raising=False)
+    assert main(["--repo", str(repo), "guard", "--path", "alpha.txt"]) == 1
