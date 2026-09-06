@@ -128,32 +128,78 @@ adding one.
   nothing at all. (#1633)
 - Coverage measurement on the Linux / Python 3.12 matrix cell, uploaded as a
   `coverage-xml` artifact. One cell only — the other cells would report the same
-  numbers. (#1633)
+  numbers. Local baseline at the time of writing: 80% overall,
+  `git_supervisor.py` 82%, with `critic.py` and `trust_helper.py` at 0% and
+  `worker_trampoline.py` at 13%. (#1633)
+- CI sets `ACP_REQUIRE_LINUX_WORKER` on the Linux cells. `tests/conftest.py`
+  has implemented this switch — a skipped `linux_worker` test becomes a failure —
+  since the worker work landed, but no workflow ever set it, so the mechanism
+  was inert and the Linux job would have stayed green with the whole `acp run`
+  path silently skipped. Measuring coverage over silently-skipped tests would
+  have put a number on the wrong object. (#1633)
+
+  🔴 **These three CI entries describe a workflow file that is NOT on this
+  branch and NOT what GitHub is running.** Pushing any file under
+  `.github/workflows/` from this machine is refused — `refusing to allow an
+  OAuth App to create or update workflow ... without 'workflow' scope`; the
+  token carries `gist`, `read:org`, `repo`. The change is therefore parked on
+  the local branch `ci/workflow-1633-needs-scope` (one commit on top of this
+  one, touching `ci.yml` only) rather than committed here, so that this branch
+  stays pushable — committing it here once left the branch permanently one
+  commit ahead and the next session had to rebuild the branch by cherry-pick to
+  land anything else. The remote still carries `push: branches: [main]`, no
+  `ACP_REQUIRE_LINUX_WORKER`, and no coverage step, and every CI run on this
+  branch to date has `event: pull_request`. To land it:
+
+  ```
+  gh auth refresh -s workflow
+  git cherry-pick ci/workflow-1633-needs-scope
+  git push origin agent/git-work-safety-kernel
+  ```
+
+  Do not read these entries as describing production CI until that is done.
 
 ## [0.2.0] — unreleased, current `pyproject` version
 
 Work landed on `agent/git-work-safety-kernel` (25 commits). Grouped by theme
-rather than by commit, since the branch was developed as one program:
+rather than by commit, since the branch was developed as one program. Board task
+ids are given so the single 40-commit pull request can be read against the work
+that was actually requested:
 
 ### Added
 - Git work safety kernel: worktree isolation, crash recovery and independent QC
-  for agent-authored changes.
+  for agent-authored changes. (#1043)
 - Runner identity is cryptographic, so reviewer independence is verifiable
-  rather than asserted; reviewer is auditable, ratified and calibrated.
-- Trusted phase-scoped runtime drivers with cleanup proofs; per-agent runtime
-  resource isolation; scoped, versioned credential handles; fenced side-effect
-  gateways.
-- Privileged trust-bundle rotation, hardened trust-bundle security checks, and
-  trusted-executable alias resolution before `O_NOFOLLOW` open.
-- Operator preview of overlap and merge order on one screen.
-- Continuous integration on Linux and macOS, with pinned (SHA-hashed) actions.
+  rather than asserted; reviewer is auditable, ratified and calibrated. (#569)
+- Trusted phase-scoped runtime drivers with cleanup proofs (#564); container and
+  network-namespace runtime backend with quotas (#567, disk quota descoped by
+  #863 — `io` is not a delegated cgroup controller); scoped, versioned
+  credential handles replacing environment secrets (#739); fenced side-effect
+  gateways for database, deploy and artifact operations (#741).
+- Privileged trust-bundle installer and atomic rotation (#738), hardened
+  trust-bundle security checks, and trusted-executable alias resolution before
+  `O_NOFOLLOW` open.
+- Quarantine explain, recovery and legacy migration workflow. (#740)
+- Operator status view for parallel-agent attention management (#565) and
+  operator preview of overlap and merge order on one screen (#566).
+- Continuous integration on Linux and macOS, with actions pinned to immutable
+  Node 24-compatible releases by SHA. (#1363)
 
 ### Fixed
-- Worker status is bound to process identity, and worker identity survives trust
-  quarantine.
+- Worker status is bound to process-start identity (#1436), and registered
+  worker identity is preserved and terminated correctly during trust
+  quarantine. (#1143)
+- The macOS Git integration subprocess trust gap. (#1144)
+- QC configs invoked bare `python`, which does not exist on macOS, so the suite
+  was red there for a purely environmental reason. The default config template
+  now derives the interpreter from `sys.executable` rather than hardcoding any
+  name. (#864)
 - Linux double-fork regression fixture; deterministic inode-replacement and Git
   integration tests.
-- `httpx2` pinned for the Starlette `TestClient` transport.
+- The Starlette `TestClient` deprecation warning, by pinning `httpx2` in the dev
+  extra so `TestClient` uses the supported transport, and promoting the warning
+  to an error so dropping that pin fails the suite instead of going quiet.
+  (#1592)
 
 ## [0.1.0]
 
@@ -161,10 +207,23 @@ rather than by commit, since the branch was developed as one program:
 
 ## Releases
 
-No git tag exists for any version (`git tag` is empty) and nothing publishes the
-wheels. `dist/` currently holds both `0.1.0` and `0.2.0` wheel+sdist pairs, built
-2026-08-12 and 2026-08-31, and is gitignored. Before cutting a first real
-release, decide deliberately: either wire `uv build` + `gh release create` on tag
-push, or delete `dist/` and state that releases are not a thing yet. Do not tag
-retroactively from this file — it was reconstructed from commit subjects, not
-from a release process. (#1633)
+**There are no releases, and that is the decision, not an omission.** No git tag
+exists for any version (`git tag` is empty), nothing publishes the wheels, and
+nothing will until the project has a consumer that is not this repository.
+
+`dist/` used to hold `0.1.0` and `0.2.0` wheel+sdist pairs side by side, built
+2026-08-12 and 2026-08-31. The stale `0.1.0` pair was deleted: it was pre-fix
+code — including the version drift this task is named for — sitting under a glob
+that `pip install dist/*.whl` resolves by sort order, so the older artifact was
+installable by accident. `dist/` is gitignored build output and `uv build`
+regenerates it in seconds, so nothing was lost.
+
+Publishing was considered and rejected for now. A release pipeline needs a
+registry credential or a trusted-publisher binding, which is a real supply-chain
+surface, and this is a `Development Status :: 3 - Alpha` local-first project with
+one open pull request and no downstream users. CI already runs `uv build` on
+every push, so the package is continuously proven buildable without a release
+process existing. When a first external consumer appears, wire `uv build` +
+`gh release create` on tag push then — and do not tag retroactively from this
+file, which was reconstructed from commit subjects rather than from releases.
+(#1633)

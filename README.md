@@ -7,6 +7,9 @@
 ACP is a provider-neutral safety kernel for teams running several coding agents
 against one Git repository.
 
+Change history is in [CHANGELOG.md](CHANGELOG.md). There are no tagged or
+published releases yet, and its *Releases* section says why.
+
 It sits below Claude Code, Codex, Cursor, custom runners, and CI. ACP gives each
 task an exclusive write set and dedicated worktree, rejects stale workers with
 monotonic fencing tokens, preserves committed work after crashes, derives
