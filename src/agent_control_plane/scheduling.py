@@ -26,6 +26,32 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 CLAIMABLE_STATUSES = frozenset({"open", "orphaned", "changes_requested"})
 
 
+def declared_resources(row: Any) -> list[str]:
+    """The write set as the operator typed it, falling back to the folded form.
+
+    Board #1708 made the guard match by the filesystem's own case rules and stored the
+    operator's capitalisation in `declared_resources_json`. #1764 is the other half: every
+    OPERATOR SURFACE was still printing the folded string, so on a case-sensitive checkout
+    `acp queue`, `acp status`, `acp plan` and the QC review packet named files that do not
+    exist. This lives here because scheduling.py imports nothing from the package, so
+    git_supervisor, status and coordination can all share one implementation with no cycle.
+
+    🔴 `resources` — the LEASE KEY — must stay folded everywhere. Overlap detection and
+    lease identity are keyed off it, so folding it is correct and load-bearing. This is
+    strictly an additional, display-only view of the same set, in the same order.
+
+    Rows written before the column existed carry an empty map and their raw form is not
+    recoverable from anywhere in the database, so the fallback is the folded string rather
+    than a guess at its capitalisation.
+    """
+    folded = json.loads(row["resources_json"])
+    try:
+        declared = json.loads(row["declared_resources_json"] or "{}")
+    except (KeyError, IndexError, TypeError, ValueError):
+        declared = {}
+    return [declared.get(item, item) for item in folded]
+
+
 def normalize_artifact(raw: str) -> str:
     """Artifacts are logical names, not paths; they are matched case-insensitively."""
     from .git_supervisor import SupervisorError
@@ -57,6 +83,8 @@ class Scheduler:
         for row in rows:
             record = dict(row)
             record["resources"] = json.loads(row["resources_json"])
+            # #1764: folded stays as the lease key; declared is what the operator typed.
+            record["declared_resources"] = declared_resources(row)
             record["dependencies"] = json.loads(row["dependencies_json"])
             record["produces"] = json.loads(row["produces_json"])
             record["consumes"] = json.loads(row["consumes_json"])

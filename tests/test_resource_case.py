@@ -41,6 +41,7 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
     probe_case_sensitive_paths,
 )
+from agent_control_plane.scheduling import declared_resources
 
 
 @pytest.fixture
@@ -317,3 +318,75 @@ def test_lease_identity_is_still_the_folded_string(declared_makefile) -> None:
         GitSupervisor.normalize_resource("Makefile"),
         GitSupervisor.normalize_resource("makefile"),
     )
+
+
+# ------------------------------------------------- #1764: the operator surfaces
+
+# #1708 fixed the GUARD. These cover the other half: every surface that PRINTS a resource
+# was still emitting the folded string, so on a case-sensitive checkout `acp queue`,
+# `acp status`, `acp plan` and the QC review packet named files that do not exist.
+# The invariant under test in every one of them: the LEASE KEY stays folded (overlap and
+# lease identity are keyed off it) while the DISPLAYED form keeps the operator's case.
+
+
+def test_the_shared_helper_returns_the_declared_case() -> None:
+    row = {
+        "resources_json": json.dumps(["makefile", "docs/readme.md"]),
+        "declared_resources_json": json.dumps(
+            {"makefile": "Makefile", "docs/readme.md": "docs/README.md"}
+        ),
+    }
+    assert declared_resources(row) == ["Makefile", "docs/README.md"]
+
+
+def test_a_row_predating_the_column_falls_back_to_the_folded_form() -> None:
+    """Not a guess at capitalisation — the raw form is unrecoverable for those rows."""
+
+    row = {"resources_json": json.dumps(["makefile"]), "declared_resources_json": "{}"}
+    assert declared_resources(row) == ["makefile"]
+
+
+def test_the_qc_review_packet_field_holds_what_its_name_says(repo: Path) -> None:
+    """Drives the REAL `_review_packet`, not the helper it calls.
+
+    The packet's field is named `declared_resources`; before #1764 it held the FOLDED set,
+    contradicting the same field name in `_task_view` — two fields, one name, opposite
+    meanings. Asserting on the helper would have tested my own new code and passed no
+    matter what the packet emitted, so this builds the packet itself with `_git_text`
+    stubbed (it only shells out for a diff and a stat, neither of which this is about).
+    """
+
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "Makefile")
+    with supervisor.connect() as connection:
+        task = connection.execute("SELECT * FROM tasks WHERE id = ?", (created["id"],)).fetchone()
+
+    class Stubbed(GitSupervisor):
+        def _git_text(self, *args: str) -> str:
+            return ""
+
+    stub = Stubbed(repo)
+    submission = {
+        "id": "sub-1",
+        "commit_sha": "0" * 40,
+        "tree_sha": "1" * 40,
+        "patch_sha256": "2" * 64,
+        "changed_paths_json": json.dumps(["Makefile"]),
+    }
+    packet = stub._review_packet(task, submission, repo)
+
+    # the field says "declared", so it must carry what the operator declared
+    assert packet["task"]["declared_resources"] == ["Makefile"]
+    # and the folded lease key is still exposed, under its own honest name
+    assert packet["task"]["resources"] == ["makefile"]
+
+
+def test_the_lease_key_is_still_folded(repo: Path) -> None:
+    """The load-bearing half. If this ever goes green while the key is unfolded, overlap
+    detection and lease identity have silently changed meaning."""
+
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "Makefile")
+    with supervisor.connect() as connection:
+        row = connection.execute("SELECT * FROM tasks WHERE id = ?", (created["id"],)).fetchone()
+    assert json.loads(row["resources_json"]) == ["makefile"]

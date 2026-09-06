@@ -14,6 +14,7 @@ from .coordination_schemas import (
 )
 from .database import Database, canonical_json, utc_now
 from .policy import scope_allows
+from .scheduling import declared_resources
 from .service import ControlPlaneError, ControlPlaneService
 
 QC_RESERVATION_SECONDS = 3600
@@ -816,6 +817,8 @@ class CoordinationService:
             "description": row["description"],
             "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
             "resources": json.loads(row["resources_json"]),
+            # #1764: folded above is the lease key; declared is the operator's capitalisation.
+            "declared_resources": declared_resources(row),
             "dependencies": [dependency["depends_on_task_id"] for dependency in dependencies],
             "priority": row["priority"],
             "status": row["status"],

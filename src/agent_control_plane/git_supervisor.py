@@ -56,7 +56,7 @@ from .runtime_drivers import (
     resolve_trusted_executable,
     run_trusted,
 )
-from .scheduling import Scheduler, normalize_artifact
+from .scheduling import Scheduler, declared_resources, normalize_artifact
 from .schema_version import (
     Migration,
     SchemaVersionError,
@@ -4533,12 +4533,7 @@ class GitSupervisor:
         rather than a guess at its capitalisation.
         """
 
-        folded = json.loads(task["resources_json"])
-        try:
-            declared = json.loads(task["declared_resources_json"] or "{}")
-        except (KeyError, IndexError, TypeError, ValueError):
-            declared = {}
-        return [declared.get(item, item) for item in folded]
+        return declared_resources(task)
 
     @staticmethod
     def _case_sensitive_paths(connection: sqlite3.Connection) -> bool:
@@ -7604,7 +7599,14 @@ class GitSupervisor:
                 "title": task["title"],
                 "description": task["description"],
                 "acceptance": json.loads(task["acceptance_json"]),
-                "declared_resources": json.loads(task["resources_json"]),
+                # 🔴 #1764: this field is NAMED declared_resources and held the FOLDED set
+                # (pre-existing, blame 8139c743). After #1708 the same name in _task_view
+                # carries the true declared case, so a reviewer reading a QC packet saw
+                # `declared_resources: ["makefile"]` for a task that declared `Makefile` —
+                # two fields, one name, opposite meanings. A wrong field NAME is worse than
+                # a missing one, so this now holds what it says it holds.
+                "declared_resources": declared_resources(task),
+                "resources": json.loads(task["resources_json"]),
                 "base_sha": task["base_sha"],
             },
             "submission": {

@@ -308,7 +308,12 @@ class StatusView:
                 task["status"] in CLEANUP_STATUSES
                 or (live and remaining is not None and remaining <= 0)
             ),
+            # #1764: claimed_paths is the folded LEASE KEY and stays folded — overlap and
+            # lease identity are keyed off it. declared_claimed_paths is the same set as the
+            # operator typed it, so `acp status` stops naming files that do not exist on a
+            # case-sensitive checkout.
             "claimed_paths": task["resources"],
+            "declared_claimed_paths": task.get("declared_resources", task["resources"]),
             "held_resources": held_resources,
             "cleanup_target_status": task.get("cleanup_target_status", ""),
             "cleanup_error": task.get("cleanup_error", ""),
