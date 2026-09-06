@@ -158,6 +158,41 @@ Per stream, not in total: a run that fails loudly on both is exactly the one who
 evidence must not be half-truncated.
 """
 
+META_CASE_SENSITIVE = "path_case_sensitive"
+"""`meta` key holding whether this repository's filesystem distinguishes `X` from `x`.
+
+Written once, from a measurement, the first time the database is opened for writing.
+Absent means "not measured yet", which reads as case-INSENSITIVE — the behaviour that
+was there before the key existed, so an old database keeps matching the way it did
+until a write command probes it.
+"""
+
+
+def probe_case_sensitive_paths(directory: Path) -> bool:
+    """Does this filesystem keep `X` and `x` apart? Measured, never guessed.
+
+    `sys.platform` is the wrong oracle in both directions: a case-sensitive APFS volume
+    on macOS and a case-insensitive volume on Linux both exist, and what matters is the
+    volume ACP's own state directory sits on, not the kernel's usual habit.
+
+    The probe writes one uniquely named file and asks whether the lowercased name finds
+    it. A random token in the name keeps a pre-existing file from answering for us. On
+    an unwritable directory the answer is "insensitive", which is the conservative one:
+    it keeps folded matching, which allows too much for the guard but never rewrites
+    lease identity on a filesystem we could not measure.
+    """
+
+    token = uuid.uuid4().hex
+    upper = directory / f".acpCaseProbe{token}"
+    try:
+        upper.write_text("", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        return not (directory / f".acpcaseprobe{token}").exists()
+    finally:
+        upper.unlink(missing_ok=True)
+
 
 # Numbered upgrades from SCHEMA_VERSION - 1 to SCHEMA_VERSION, applied in order, each
 # inside one transaction. Version 1 is the baseline: the idempotent CREATE TABLE IF NOT
@@ -533,6 +568,18 @@ class GitSupervisor:
             connection.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('claim_counter', '0')"
             )
+            # Probed rather than re-probed: the answer is a property of the volume, and
+            # running it on every open would create and delete two files per command.
+            if not connection.execute(
+                "SELECT 1 FROM meta WHERE key = ?", (META_CASE_SENSITIVE,)
+            ).fetchone():
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?)",
+                    (
+                        META_CASE_SENSITIVE,
+                        "1" if probe_case_sensitive_paths(self.state_dir) else "0",
+                    ),
+                )
             attempt_columns = _columns(connection, "attempts")
             legacy_worker_identity_missing = "pid_identity" not in attempt_columns
             if "runner_credential_digest" not in attempt_columns:
@@ -1284,7 +1331,17 @@ class GitSupervisor:
         )
 
     @staticmethod
-    def normalize_resource(raw: str, repo: Path | None = None) -> str:
+    def normalize_resource(raw: str, repo: Path | None = None, *, fold: bool = True) -> str:
+        """Canonical form of a declared resource.
+
+        `fold=True` is the storage form and the lease PRIMARY KEY, and it stays folded.
+        `fold=False` is the same canonicalisation — NFC, `\\` to `/`, the `/**` suffix on
+        a directory, the same refusals — with the operator's capitalisation intact, for
+        matching on a filesystem that distinguishes it. A `logical:` resource is an
+        identity rather than a path and stays folded either way, because folding is what
+        makes `logical:Deploy` and `logical:deploy` one lock.
+        """
+
         value = unicodedata.normalize("NFC", raw.strip().replace("\\", "/"))
         if not value:
             raise SupervisorError("invalid_resource", "resource cannot be empty")
@@ -1302,7 +1359,8 @@ class GitSupervisor:
         if lowered in {".git", ".acp"} or lowered.startswith((".git/", ".acp/")):
             raise SupervisorError("invalid_resource", f"internal resource forbidden: {raw}")
         directory = directory or bool(repo and (repo / value).is_dir())
-        return (value.rstrip("/") + "/**" if directory else value).casefold()
+        canonical = value.rstrip("/") + "/**" if directory else value
+        return canonical.casefold() if fold else canonical
 
     @staticmethod
     def resources_overlap(left: str, right: str) -> bool:
@@ -4385,9 +4443,10 @@ class GitSupervisor:
 
         This is the check an editor's pre-write hook asks before letting a tool call
         through, and it is deliberately the SAME check `submit` applies to the diff:
-        both call `_path_matches` against the task's declared resources. An adapter
-        that reimplemented the matching would be a second enforcement implementation
-        that could disagree with the one that matters, which is worse than none.
+        both run `_path_matches` over `_write_set_rules`, so the case sensitivity of the
+        filesystem is decided in one place for both. An adapter that reimplemented the
+        matching would be a second enforcement implementation that could disagree with
+        the one that matters, which is worse than none.
 
         Read-only, so it runs on a read-only supervisor and cannot itself become a
         reason the state changed.
@@ -4405,7 +4464,12 @@ class GitSupervisor:
             task = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (attempt["task_id"],)
             ).fetchone()
-            declared = json.loads(task["resources_json"]) if task else []
+            # Shown to the agent as the operator typed it: on a case-sensitive volume a
+            # denial that answered `makefile` would point at the path just refused.
+            declared = self._declared_resources(task) if task else []
+            rules = (
+                self._write_set_rules(task, self._case_sensitive_paths(connection)) if task else []
+            )
 
         if attempt["status"] not in {"provisioning", "working"}:
             return self._guard_denial(
@@ -4441,7 +4505,7 @@ class GitSupervisor:
             )
 
         relative = target.relative_to(worktree).as_posix()
-        if not any(self._path_matches(relative, resource) for resource in declared):
+        if not any(self._path_matches(relative, resource, fold=fold) for resource, fold in rules):
             return self._guard_denial(
                 attempt_id,
                 path,
@@ -4475,6 +4539,61 @@ class GitSupervisor:
         except (KeyError, IndexError, TypeError, ValueError):
             declared = {}
         return [declared.get(item, item) for item in folded]
+
+    @staticmethod
+    def _case_sensitive_paths(connection: sqlite3.Connection) -> bool:
+        """The recorded answer, or the pre-existing behaviour when nothing was recorded."""
+
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (META_CASE_SENSITIVE,)
+        ).fetchone()
+        return bool(row) and row["value"] == "1"
+
+    @classmethod
+    def _write_set_rules(cls, task: sqlite3.Row, case_sensitive: bool) -> list[tuple[str, bool]]:
+        """The write set as `(resource, fold)` pairs for `_path_matches`.
+
+        The stored resource is folded, and folded is what the lease is keyed on, so this
+        does not change what a task owns. It changes what counts as being INSIDE what the
+        task owns: on a case-sensitive volume `Makefile` and `makefile` are two files, and
+        a task that declared one must not be waved through to write the other.
+
+        The decision is per resource, not per repository, because the raw form is the
+        only thing that makes case-sensitive matching possible and it is not always
+        there. `declared_resources_json` arrived with schema 2; for a row written before
+        it, the operator's capitalisation is not recoverable from anywhere in the
+        database, and matching its folded string case-sensitively would deny the task its
+        own declared write. Such a row keeps folded matching — the behaviour it was
+        created under. Same fallback when the stored raw form does not fold back to its
+        own key, which means it is not the unfolded form of this resource and must not be
+        matched against as if it were.
+        """
+
+        folded = json.loads(task["resources_json"])
+        if not case_sensitive:
+            return [(item, True) for item in folded]
+        try:
+            declared = json.loads(task["declared_resources_json"] or "{}")
+        except (KeyError, IndexError, TypeError, ValueError):
+            declared = {}
+        rules: list[tuple[str, bool]] = []
+        for item in folded:
+            raw = declared.get(item)
+            if not isinstance(raw, str):
+                rules.append((item, True))
+                continue
+            try:
+                cased = cls.normalize_resource(raw, fold=False)
+            except SupervisorError:
+                rules.append((item, True))
+                continue
+            # The directory suffix came from a probe of the repository at task creation,
+            # which cannot be re-run reliably later; take it from the folded form, which
+            # recorded the answer.
+            if item.endswith("/**") and not cased.endswith("/**"):
+                cased = cased.rstrip("/") + "/**"
+            rules.append((item, True) if cased.casefold() != item else (cased, False))
+        return rules
 
     def guard_context(self, attempt_id: str) -> dict[str, Any]:
         """What an agent needs to stay inside its claim: worktree and write set.
@@ -5063,10 +5182,13 @@ class GitSupervisor:
             if not changed:
                 raise SupervisorError("empty_submission", "no changed paths")
             declared = json.loads(task["resources_json"])
+            rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
             undeclared = [
                 path
                 for path in changed
-                if not any(self._path_matches(path, resource) for resource in declared)
+                if not any(
+                    self._path_matches(path, resource, fold=fold) for resource, fold in rules
+                )
             ]
             if undeclared:
                 raise SupervisorError(
@@ -7090,7 +7212,12 @@ class GitSupervisor:
             "title": row["title"],
             "description": row["description"],
             "acceptance": json.loads(row["acceptance_json"]),
+            # `resources` is the folded lease key and stays that, because callers key
+            # overlap and lease identity off it. `declared_resources` is the same set as
+            # the operator typed it, so `acp show`, `queue` and `status` stop printing a
+            # path that does not exist in a case-sensitive checkout.
             "resources": json.loads(row["resources_json"]),
+            "declared_resources": self._declared_resources(row),
             "dependencies": json.loads(row["dependencies_json"]),
             "produces": json.loads(row["produces_json"]),
             "consumes": json.loads(row["consumes_json"]),
@@ -7387,8 +7514,17 @@ class GitSupervisor:
         return target
 
     @staticmethod
-    def _path_matches(path: str, resource: str) -> bool:
-        candidate = unicodedata.normalize("NFC", PurePosixPath(path).as_posix()).casefold()
+    def _path_matches(path: str, resource: str, *, fold: bool = True) -> bool:
+        """Is `path` inside `resource`?
+
+        `fold=False` compares capitalisation too, and the caller must then pass the
+        case-preserving form of the resource — `_write_set_rules` is what pairs the two,
+        so no call site has to remember the correspondence itself.
+        """
+
+        candidate = unicodedata.normalize("NFC", PurePosixPath(path).as_posix())
+        if fold:
+            candidate = candidate.casefold()
         if resource.startswith("logical:"):
             return False
         if resource.endswith("/**"):

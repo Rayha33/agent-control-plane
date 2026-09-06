@@ -27,6 +27,20 @@ adding one.
   deliberately not guarded — what a shell command writes cannot be read off the
   command string, and a pattern that can be walked around by rephrasing would read as
   coverage without being any. (#1627)
+- On a case-sensitive filesystem, a task declaring `Makefile` was ALLOWED by `acp
+  guard` to write `makefile`, and `submit` accepted a diff touching it: the declared
+  resource is stored casefolded and both checks casefolded the candidate to match, so
+  two distinct files answered to one declaration. That is an undeclared write passing
+  the exact check the guard and `submit` exist to enforce. Both now match by the
+  measured case sensitivity of the volume, against the declared capitalisation kept in
+  `declared_resources_json`. Case-INSENSITIVE volumes are unchanged and still match
+  either spelling, because there `README.md` and `readme.md` are one file and denying
+  the second would deny an agent the file it leased. Lease identity is deliberately
+  untouched and stays folded: making the two cases two leases would let two attempts
+  hold exclusive claims on one file wherever the filesystem does not distinguish them,
+  so overlap keeps over-blocking, which fails closed. A task predating
+  `declared_resources_json` has no recoverable capitalisation and keeps case-insensitive
+  matching rather than being denied its own declared write. (#1708)
 
 ### Added
 - `meta.schema_version` and `meta.written_by`. A control database newer than the
@@ -63,8 +77,13 @@ adding one.
 - `tasks.declared_resources_json` keeps the write set as the operator typed it.
   `normalize_resource` casefolds and that folded string is the `resource_leases`
   PRIMARY KEY, so the stored form cannot carry capitalisation without rewriting lease
-  identity; a separate column carries it for display only, and matching stays
-  case-insensitive. Schema version 2, the migration ledger's first entry. (#1708)
+  identity; a separate column carries it for display. Schema version 2, the migration
+  ledger's first entry. (#1708)
+- `meta.path_case_sensitive`, measured once against the volume `.acp` sits on rather
+  than guessed from `sys.platform` — a case-sensitive APFS volume on macOS and a
+  case-insensitive volume on Linux both exist. Absent means not yet measured and reads
+  as case-insensitive, so an existing database keeps its previous matching until the
+  next command that opens it for writing. (#1708)
 - `docs/INTEGRATIONS.md`. (#1627)
 
 ### Changed
