@@ -10,15 +10,20 @@ the guard and `submit` exist to enforce.
 The fix is not "stop casefolding" — that would regress the case-insensitive behaviour the
 folding was added for. It is to measure the filesystem and match by its rules.
 
-WHAT IS EXECUTED HERE AND WHAT IS NOT. The developer machine this was written on has a
-case-INSENSITIVE APFS volume, so `Makefile` and `makefile` cannot exist there as two
-files and the end-to-end filesystem case cannot be reproduced. Every test below therefore
-drives the recorded case-sensitivity answer directly, which is the layer the decision is
-actually made at: the probe is verified against the real filesystem separately
-(`test_the_case_probe_agrees_with_the_filesystem`), and the guard and submit gates are
-verified against both recorded answers. What is reasoned about rather than executed on
-macOS is only the final link — that a case-sensitive volume really does hold two such
-files at once — which is a property of the filesystem, not of this code.
+WHAT THESE TESTS EXECUTE, AND WHERE THE REST WAS EXECUTED. The tests below drive the
+recorded case-sensitivity answer directly, because a checkout's volume is whatever CI
+gives it and a gate that only fires on one kind of filesystem is a gate that usually
+does not run. `test_the_case_probe_agrees_with_the_filesystem` is the one that binds the
+recorded answer to reality, and it asserts agreement rather than any particular answer,
+so it is meaningful on either volume.
+
+The end-to-end case WAS reproduced, on a case-sensitive APFS volume created for it, and
+is not merely reasoned about. `hdiutil create -fs "Case-sensitive APFS"` mounts one on
+macOS; on it `Makefile` and `makefile` hold different bytes at once, `acp init` probed
+`meta.path_case_sensitive = 1` with nothing forced, `acp guard --path makefile` against a
+task declaring `Makefile` returned `undeclared_write`, and `acp submit` on a commit
+touching `makefile` returned `changed paths are not leased: makefile`. The same script
+run against the pre-fix source on the same volume allowed both.
 """
 
 from __future__ import annotations
