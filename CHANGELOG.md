@@ -50,6 +50,8 @@ adding one.
   failure and CI sets it on the Linux jobs, so a runner image that lost `/proc` or
   child-subreaper support fails loudly instead of going green having tested nothing.
   pytest now also prints what it skipped and why on every run. (#1631)
+  (The workflow half of that sentence is not live yet — see the CI note under
+  #1633 below: the workflow file cannot be pushed from this machine.)
 - `acp mcp-serve` — a read-only, credential-free, dependency-free MCP server over
   stdio exposing ten look-only tools. Writes are deliberately absent: authenticated
   operations need a runner credential, and a long-lived server holding one (let alone
