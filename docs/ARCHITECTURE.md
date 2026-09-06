@@ -1,144 +1,435 @@
 # Architecture
 
-Agent Control Plane separates authority, work ownership, evidence, and quality
-control. The separation matters: a worker that can silently expand its own
-authority, overwrite another worker, or approve its own output has no meaningful
-control boundary.
+ACP is a Git work-safety kernel, not an agent scheduler. Any planner or coding
+agent can sit above it. ACP owns the smaller set of decisions that must remain
+correct when several processes race or crash.
 
-## Planes
+## Lifecycle
 
-| Plane | Owns | Primary controls |
-|---|---|---|
-| Authority | Who may do what | mandates, delegation, policies, approvals, kill switches |
-| Coordination | Who owns which work | task DAG, atomic claim, leases, fencing, heartbeat |
-| Evidence | What was produced | immutable submissions, hashes, test evidence, checkpoints |
-| Quality | Whether it is acceptable | separate QC role, structured findings, completion gate |
-| Audit | What happened | append-only hash chain and verification |
+~~~text
+open
+  │ atomic claim + write-set reservation
+  ▼
+provisioning ── failure ──► open
+  │ branch + worktree + runtime environment created
+  ▼
+working ── lease expiry ──► orphaned ── replacement claim ──► working
+  │ clean committed Git evidence
+  ▼
+qc_review ── revise ──► changes_requested ── new claim ──► working
+  │ pass                       │
+  ▼                            └─ block/human ──► blocked
+approved
+  │ fresh merge + integration commands
+  ▼
+integrating ── conflict/failure ──► conflicted
+  │ pass
+  ▼
+done + preserved integration branch
+~~~
 
-The implementation is one FastAPI service backed by SQLite. These are logical
-boundaries; a production deployment can split them into independently scaled
-services.
+Source and runtime resources remain reserved from claim through QC and
+integration. A negative QC verdict releases them. An expired post-submission
+reservation makes the task conflicted and triggers teardown; ACP never treats
+the old approval as current.
 
-## Task state machine
+## Durable records
 
-```text
-                     ┌──────────────┐
-        dependencies │              │ claim
-        incomplete ──┤     open     ├──────────────┐
-                     └──────────────┘              ▼
-                                           ┌─────────────┐
-                          heartbeat ───────►│   working   │
-                                           └──────┬──────┘
-                             lease expiry         │ submit
-                                  │               ▼
-                                  ▼        ┌─────────────┐
-                           ┌──────────┐     │  qc_review  │
-                           │ orphaned │     └──┬───────┬──┘
-                           └────┬─────┘  revise│       │pass
-                                │ claim        ▼       ▼
-                                └──────► changes_   approved
-                                          requested      │
-                                             │ claim      │complete
-                                             └──────►     ▼
-                                                        done
-```
+| Record | Purpose |
+|---|---|
+| task | specification, acceptance criteria, dependencies, declared resources, base |
+| attempt | agent, bound credential digest, branch, worktree, claim token, checkpoint, PID, latest commit, pinned trust manifest and executable identities |
+| resource lease | normalized resource, owner, monotonic fencing token, expiry |
+| runtime environment | generated environment, setup/teardown evidence and lifecycle state |
+| runtime allocation | unique local port-pool value, attempt owner and expiry |
+| runtime driver resource | scoped resource, internal ownership capability, lifecycle state and cleanup proof |
+| credential handle | provider/name/version, exact internal source reference, and keyed target fingerprint—never plaintext |
+| runner identity | one role, credential digest, enrollment and revocation state |
+| submission | immutable commit/tree/patch hashes, changed paths, resource tokens |
+| QC run | reviewer, immutable commit, commands, outputs, structured findings, inherited attempt trust pin |
+| integration | merge result, integration commands, branch and commit |
+| event | same-transaction domain event in a hash chain |
 
-`blocked` records a QC rejection, while `conflicted` records a task whose
-post-submission resource reservation expired before safe completion. Both require
-operator or planner action.
+## Invariants
 
-## Coordination invariants
+### 1. Overlapping write scopes cannot be active together
 
-### 1. A task has one active owner
+Claims run under a SQLite immediate transaction. ACP normalizes path separators
+and case, rejects absolute/traversing/internal paths, converts directories to
+recursive scopes, and compares exact paths, globs, and directory prefixes.
 
-Claims execute inside `BEGIN IMMEDIATE`. The status check, dependency check,
-resource availability check, owner update, and lease assignment are one atomic
-transaction.
+Examples that collide:
 
-### 2. A declared resource has one active task
+~~~text
+src/auth/**
+src/auth/token.py
 
-Tasks declare exact resources before execution, for example:
+config/*.toml
+config/runtime.toml
 
-```text
-repo:payments:file:src/checkout.py
-database:billing:schema
-deployment:production:api
-```
+logical:deployment/production
+logical:deployment/production
+~~~
 
-A claim fails if any resource is reserved by another unexpired task. Resource
-names are currently exact strings; callers should use a canonical namespace.
+Logical resources collide only by exact normalized name. They model non-file
+side effects, but downstream gateways must enforce their fencing tokens.
 
-### 3. Time alone never establishes write authority
+Enforcement is fail-closed at claim time, but an operator should not have to
+launch an agent to discover a collision. `acp plan` and `acp queue` answer the
+same question in advance, classifying each collision as `exact` (identical
+normalized scopes) or `potential` (different scopes that can still match one
+path), and naming the owning task, attempt, and agent.
 
-Each successful claim increments a task fencing token. Each resource also has a
-persistent, monotonic fencing token. Heartbeats and submissions must present all
-current tokens. Therefore an old worker that wakes after a crash cannot renew or
-submit after a replacement has claimed the work.
+### 1b. Planning is a preview, never a mutation
 
-External systems must apply the same rule: a deployment gateway or artifact
-writer should reject any request carrying a fencing token below the latest token
-it has observed.
+`plan`, `queue`, `merge-plan`, and `status` are read-only. They deliberately do
+not call `reap_expired()`, unlike `claim` and `list`: a view that reaped would
+orphan an attempt merely because an operator looked at the dashboard, and would
+change the state it was asked to report. Expired-but-unreaped attempts are
+reported as `awaiting_reap` instead. Expired leases are ignored when previewing
+a claim, so a preview and the claim that follows agree.
 
-### 4. A submission freezes the review candidate
+That used to be true only of the queries. Constructing the supervisor created the
+state directories and ran `CREATE TABLE IF NOT EXISTS` plus every pending
+`ALTER TABLE` before the first `SELECT`, so `acp status` on a database written by
+an older acp rewrote its schema. These commands now open the database `mode=ro`,
+which makes the guarantee structural rather than a matter of discipline: a stray
+write raises instead of landing. They never migrate — a database behind the binary
+is reported as `schema_upgrade_required` and left byte-identical, and `acp migrate`
+is the command that upgrades it. `list` is excluded on purpose, because
+`list_tasks()` reaps; `doctor` is excluded because it is what an operator runs when
+the database needs upgrading, so it has to be able to open one to say so.
 
-Submissions are immutable records containing:
+The ready queue reserves each admitted task's scopes for the remainder of the
+pass. Its `ready` list is therefore a set of tasks that can run *concurrently*,
+not a list of tasks that could each run alone.
 
-- task version and claim fencing token;
-- every resource fencing token;
-- base revision and artifact URI;
-- SHA-256 artifact hash;
-- summary and evidence.
+### 1c. Artifact dependencies are derived, not declared twice
 
-On submission, the worker claim ends but the resources remain reserved. This
-prevents another worker from modifying the candidate while QC reviews it.
+A task may declare `--produces` and `--consumes` logical artifact names. A
+consumer depends on every non-`done` producer of an artifact it consumes; those
+edges are derived at read time and enforced at claim time alongside explicit
+`--depends-on` edges. Cycles — reachable once artifacts create edges the
+operator never wrote — are reported as a `dependency_cycle` blocker with the
+concrete cycle, never followed into an infinite walk.
 
-### 5. The author cannot approve the artifact
+### 2. Time is not authority
 
-Only an enabled agent with role `qc` and sufficient mandate scope can review.
-The reviewer agent ID must differ from the submission's worker agent ID.
+Each successful claim increments a global claim token. Each exact normalized
+resource independently increments its fencing token. An attempt must still own
+the task, have an unexpired lease, and present its current claim token.
 
-A `pass` moves the task to `approved`, but resources remain reserved until
-the administrator opens the completion gate. `revise`, `block`, and
-`human_required` release the reservation and preserve the findings for the next
-worker.
+Submissions persist the complete resource-token map. QC and integration compare
+that map with the live reservation. An expired or replaced reservation closes
+the gate even if the candidate previously passed.
 
-### 6. Recovery is explicit
+### 3. Git, not the worker, supplies evidence
 
-Workers heartbeat with a checkpoint and renewed TTL. The reaper:
+The submit interface accepts an attempt ID and claim token—no caller-provided
+artifact hash or changed-file list. ACP derives:
 
-- marks expired active work `orphaned`;
-- releases its resources;
-- rejects later writes using the old fencing tokens; and
-- marks expired review/completion reservations `conflicted` instead of silently
-  treating unreviewed work as safe.
+- current commit and tree SHA;
+- changed paths relative to the task base SHA;
+- SHA-256 of the binary Git diff; and
+- current resource fencing tokens.
 
-## Recommended runner topology
+The worktree must be clean and committed. Every changed path must match the
+declared write set. A changed symlink resolving outside the assigned worktree is
+rejected.
 
-```text
-planner
-  └── task claim
-       ├── isolated branch/worktree/container
-       ├── worker process
-       ├── heartbeat + checkpoint loop
-       └── immutable artifact submission
-             └── separate QC process
-                   ├── acceptance-criteria checks
-                   ├── tests/security review
-                   └── pass/revise/block/human_required
-```
+### 4. Runtime isolation follows the attempt
 
-The runner, not this service, should create the isolated workspace. A practical
-Git integration uses one branch and worktree per task, forbids direct writes to
-the integration branch, and lets a separate integration agent merge only an
-approved artifact.
+Worktree isolation stops direct file overwrites but does not isolate ports,
+database schemas, browser profiles, or service state. During the same claim
+transaction, ACP allocates one available value from every configured local port
+pool and persists the assignment against the attempt.
 
-## Threat model and non-goals
+After the worktree exists, ACP creates a private runtime directory and runs
+configured setup commands or trusted resource drivers with generated environment variables. The environment
+is then injected into the supervised worker, deterministic QC, the critic, and
+integration commands. This prevents a verifier from accidentally testing
+another attempt's localhost service or database configuration.
 
-The MVP protects coordination decisions inside one service process and database.
-It does not sandbox arbitrary code, store artifacts, authenticate humans through
-SSO, or guarantee that an external tool honors a lease. Production enforcement
-must be placed at the tool/API/deployment gateway so bypassing the control plane
-is not possible.
+Runtime teardown is triggered by negative QC, completed integration, or lease
+expiry. Port values are released only after every teardown command passes and
+the OS confirms that the ports can be rebound. Failed cleanup remains durable
+as <code>teardown_failed</code> and keeps the allocation quarantined for an
+operator retry.
 
-See [SECURITY.md](../SECURITY.md) for vulnerability reporting and supported
-versions.
+Port allocation is a local coordination guarantee, not a kernel reservation.
+An unrelated process can still bind after ACP's availability check. Drivers
+scope Compose projects, PostgreSQL schemas, and browser profiles by attempt and
+require a post-teardown absence observation. Executables are outside the repo
+with a root-owned, non-writable parent chain, opened and identity-checked
+immediately before execution, and run without a shell under a fixed PATH and
+allowlisted environment. Definitions and resource identities are immutable per
+attempt. Secret-bearing drivers resolve one named provider to an opaque version
+handle at setup. PostgreSQL receives the private libpq passfile through a sealed
+or unlinked descriptor; argv and environment values contain only the public
+connection target and descriptor path, and startup files/interactive password
+fallback are disabled. The handle and ownership capability are persisted as a
+<code>setup_pending</code> intent before the external action, so a crash cannot
+create an untracked target. The handle is persisted internally so
+teardown reopens the exact old version even after <code>current</code> rotates.
+Its keyed target/version fingerprint participates in the ownership capability,
+without disclosing a raw or guessable digest; the HMAC key is a separate
+<code>0600</code> state file rather than part of SQLite. Restart generations are
+exclusive and intent/evidence/final-state writes are token-fenced. Explicit
+recovery can replace only a stale generation after an inherited kernel
+lifetime lock proves that its prior supervisor and driver executors are dead.
+Restart must prove teardown on
+the old handle before resolving the new one; missing or modified versions and
+provider drift quarantine the allocation. Generic shell
+hooks remain operator-trusted and do not provide a cleanup proof.
+
+### 4b. Trust rotation is attempt-scoped
+
+The privileged helper stages each release under
+`trust/bundles/VERSION-MANIFEST_DIGEST`, fsyncs its files and manifest, removes
+write bits from the immutable version directory, and only then replaces the
+regular `trust/current` pointer with `rename(2)`. Source components and final
+files are opened with no-follow semantics; identity metadata before and after a
+copy exposes concurrent in-place mutation. A path replacement after open does
+not alter the bytes copied from that descriptor.
+
+Claim reads `current` exactly once and persists a complete pin in the attempt:
+bundle ID, canonical manifest SHA-256, and every executable's absolute path,
+device, inode, size, and SHA-256. Runtime phases and QC read only that stored
+pin and revalidate it immediately before privileged use. They never resolve
+`current` as fallback. Therefore rotation has two simultaneous truths: claims
+after the atomic pointer swap use the new bundle, while existing attempts keep
+the old directory until they drain. Missing or changed old evidence moves the
+attempt to `quarantined`, its task to `blocked`, and its runtime resources to
+quarantine.
+
+QC copies the attempt pin into its own durable row. Retirement/uninstall is a
+monotonic marker, not deletion. The helper has no physical-delete operation,
+so upgrades cannot erase an executable still referenced by either table.
+`doctor` audits the current pointer and every distinct durable pin and returns
+the full set of owner, mode, symlink, manifest, inode, size, and digest errors.
+
+### 4c. External mutations cross one fenced gateway
+
+Worktree and runtime isolation do not stop a delayed process from reaching a
+shared database schema, deploy namespace, or artifact tag. Every supported
+external mutation therefore carries its task ID, authenticated actor, claim
+fencing token, complete resource fencing-token map, target resource,
+idempotency key, and payload through one provider-neutral gate.
+
+The order is an invariant: authenticate and authorize the mandate, derive the
+actor and role from durable state, derive the target identity from the payload,
+prove it is an exact task resource, and re-run the coordination service's live
+claim predicate inside an immediate transaction. Only then may an adapter call
+its provider. Expired, superseded, incomplete, wrong-role, undeclared, and
+cross-task requests cannot reach provider code. A delayed zombie therefore
+loses even if its token was valid when its work began; the later owner's higher
+claim and resource generations are authoritative when the call lands.
+
+PostgreSQL schema/migration, deploy/preview namespace, and artifact/tag adapters
+only differ in their canonical resource derivation and injected driver. A
+driver receives a `ProviderCall` containing the request digest, idempotency key,
+identity, and both generations, with no transport credential. It must carry the
+idempotency key and resource generation to the remote provider's native
+transaction or compare-and-set boundary. The local transaction serializes
+concurrent retries and persists a single credential-free receipt binding the
+request, actor, target, operation, result digest, and generations. Remote
+idempotency closes the crash interval between the external effect and local
+receipt commit.
+
+MCP/A2A requests supply durable task and artifact identity. Their adapter maps
+that identity into the same canonical resource namespace and invokes the same
+authenticated service; protocol transport does not create an alternate
+authority path.
+
+### 5. A crash does not erase committed work
+
+Heartbeats persist the latest commit and arbitrary JSON checkpoint. The reaper
+also reads the old worktree's current HEAD when possible. It does not delete the
+old branch or worktree. It stops a registered supervised process group before
+tearing down and recycling runtime allocations. A replacement starts from the
+latest durable commit and receives new fencing tokens.
+
+Uncommitted editor state is deliberately not treated as recoverable evidence.
+Agent runners should commit checkpoints or use an external snapshot layer.
+
+### 6. QC observes an immutable candidate
+
+ACP checks out the submission commit into a fresh detached worktree. It runs
+trusted deterministic commands and then, if configured, starts the critic
+command itself. The review packet contains the original task and Git-derived
+facts, not the worker's claims about correctness.
+
+Deterministic command failure always blocks. Medium-or-higher critic findings
+prevent a pass. The reviewer identity must be a declared reviewer (or the
+configured critic identity) and differ from the worker identity.
+
+### 6b. The reviewer is itself evidence
+
+A verdict is only as trustworthy as the thing that issued it, so every QC row
+stores signed provenance — identity, provider, model, prompt policy, logical
+command-selector hash — plus the fingerprint of the evaluation policy in force and the
+hash of a deterministic reproduction bundle.
+
+The evaluation policy is fingerprinted as a whole. Swapping a model, editing a
+prompt policy, adding a reviewer, or relaxing a high-risk rule all change that
+fingerprint, and QC fails closed with <code>reviewer_policy_changed</code> until
+an operator ratifies it. The first policy is adopted automatically because there
+is nothing to compare it against; every later change is an explicit event. This
+is what stops a reviewer upgrade from silently replacing the policy that
+approved earlier work.
+
+Calibration closes the loop: golden cases seed known defects, run the real
+critic through the same entry point QC uses, and report false-pass and
+false-block rates separately with Wilson 95% intervals. Separately, because a
+critic that rejects everything has a perfect false-pass rate and no value.
+
+High-risk paths escalate rather than trust one opinion: a passing verdict parks
+the submission in <code>pending_second_review</code> until a second distinct
+reviewer — optionally from a different provider — also passes, or in
+<code>human_required</code> when policy demands a person.
+
+### 7. Integration cannot mutate the base branch or execute repository Git helpers
+
+ACP computes the merge against the current base in a private synthetic Git
+directory. It invokes the built-in `merge-tree --write-tree` and `commit-tree`
+plumbing commands, materializes their result with `read-tree` and
+`checkout-index`, reruns integration commands in that synthetic workspace, and
+creates the integration ref only after every gate passes. The merge commit has
+the current base as its first parent and the immutable candidate as its second;
+its tree is the tree returned by `merge-tree`. Merge conflict or command
+failure moves the task to <code>conflicted</code> and releases its reservation.
+
+The Git boundary is identical on Linux and macOS:
+
+- ACP resolves a root-owned, non-writable system Git binary and copies its
+  verified bytes to a random private directory before candidate code runs;
+- system/global/executable repository config is absent. A strict allowlist of
+  data-only ort settings and non-blocking, no-follow, 1 MiB-capped attribute
+  snapshots preserve safe merge semantics. A relative `core.attributesFile`
+  is read from the exact current-base tree, never from dirty or untracked live
+  worktree bytes. Exact bytes, provenance, hashes, Git identity, base/candidate
+  OIDs, and canonical semantic config are persisted as replayable integration
+  evidence. Hooks and
+  `GIT_EXEC_PATH` are empty, inherited secrets are removed, and signing,
+  maintenance, pagers, filesystem monitors, and recursive submodules are
+  disabled;
+- the Linux child-subreaper or Darwin no-fork sandbox contains every plumbing
+  invocation. Lifecycle lock descriptors stay in the trusted monitor and are
+  closed in the command child before `exec`. ACP identity-pins that child before
+  release and kills the exact target if its monitor terminates unexpectedly.
+  An unreadable Linux descendant snapshot retains the monitor and its locks;
+- ACP hashes and validates the private executable, config, HEAD, alternates,
+  refs, hooks, exec directory, and workspace `.git` pointer before using the
+  result. Candidate mutation fails the gate before another Git invocation.
+
+This uses Git's documented real-merge plumbing rather than reimplementing merge
+behavior: [`merge-tree --write-tree`](https://git-scm.com/docs/git-merge-tree)
+performs the same file-level merge as `git merge` without touching the working
+tree or index, while [`commit-tree`](https://git-scm.com/docs/git-commit-tree)
+turns that tree and the two parents into the integration commit. Repository
+attributes can still select Git's built-in merge behavior, but executable
+drivers have no configuration in the synthetic boundary.
+
+All Git-derived evidence uses `GIT_NO_REPLACE_OBJECTS=1` and
+`GIT_ATTR_NOSYSTEM=1`. ACP rejects legacy `.git/info/grafts`, stores an explicit
+`replacement-free-v1` contract with each new submission, and rechecks the
+commit type and exact tree before integration. A database upgraded from an
+older release gives existing submissions an empty contract, atomically
+invalidates pending/approved evidence, and fences runtime cleanup before moving
+the task to `changes_requested`. The next claim can then resubmit and rerun QC
+under the new evidence rules.
+
+Before creating a synthetic workspace or Git directory, ACP inserts a durable
+`running` integration row in the same transaction that moves the task to
+`integrating`. Already-integrated candidates preserve the current base commit, matching
+porcelain `git merge --no-ff`; divergent or descendant candidates produce an
+exactly verified two-parent commit. Ref publication is intent-first: ACP stores
+the branch, commit, command evidence, and `publish_pending` verdict in SQLite
+after final credential/trust/reservation validation, then atomically creates
+the ref and finalizes the verdict. Startup reconciliation idempotently finishes
+that intent or fails it closed, so a supervisor crash cannot leave an
+unrecorded integration branch. Ref publication and deletion themselves run in
+the trusted monitor, which retains both task and global Git locks. Failed
+publication keeps branch/commit evidence in `delete_pending` until a contained
+delete is followed by proof that the ref is absent. Under the per-task
+operation guard, recovery
+also sweeps deterministic synthetic workspace and Git-boundary paths for every
+recorded integration, including a terminal `pass` committed immediately before
+an ungraceful process or host failure.
+
+Promotion of that branch is left to the user's existing human review or merge
+queue.
+
+`acp merge-plan` previews that promotion order before anyone runs it. Approved
+submissions are ordered topologically by dependency and then deterministically
+by priority, creation time, and id. Each entry reports the paths it shares with
+earlier entries as `predicted_conflict_paths`, and is marked `stale` with an
+`upstream_commits` count once commits land on the base branch beneath it —
+approval is evidence about a base that may since have moved. Conflict prediction
+against the current base uses `git merge-tree --write-tree`, which computes the
+merge in memory: it writes only unreferenced objects and touches no worktree,
+index, or ref. Where the installed Git is too old, `base_conflicts` is `null`
+rather than a silently empty list.
+
+### 8. Events cannot be lost independently of state
+
+Every Git-supervisor state mutation and its event append occur in the same
+transaction. Events include the previous event hash. The verify-events command
+recomputes the chain.
+
+This is tamper-evident bookkeeping, not external non-repudiation. A future
+deployment can export or anchor event hashes.
+
+### 9. Names are not runner authority
+
+The first enrollment permanently enables local runner authentication. Worker,
+critic, and integrator identities have one role and store only a credential
+digest. Claims bind the exact worker credential digest into the attempt;
+heartbeat, run, terminate, and submit re-authenticate both the identity and that
+binding. A revoked-and-rotated secret cannot adopt an attempt claimed by its
+predecessor. QC authenticates the configured critic and integration
+authenticates its integrator. Credentials enter the CLI through environment,
+private files, or file descriptors—not argv or JSON output.
+
+## Process topology
+
+~~~text
+planner / issue tracker / user
+           │ task specification
+           ▼
+      ACP local kernel
+      ├── SQLite state + leases + event chain
+      ├── runtime allocator ── ports + setup/teardown hooks
+      ├── task worktree ── worker process + runtime env
+      ├── detached QC worktree ── commands + critic + runtime env
+      └── integration worktree ── merge + commands + runtime env
+                                   │
+                                   ▼
+                         integration branch / merge queue
+~~~
+
+ACP can supervise a worker command and heartbeat it. It can also hand the
+worktree and token to an external session. The latter must call heartbeat and
+submit explicitly.
+
+## Deployment evolution
+
+The data model is intentionally portable:
+
+1. Replace SQLite transactions with PostgreSQL serializable transactions and
+   advisory locks for multi-host use.
+2. Replace local bearer identities with asymmetric workload identity and remote
+   attestation where the threat model requires it.
+3. Put each worktree and QC command in a filesystem/network sandbox.
+4. Replace local version files with native secret-manager providers behind the
+   same opaque handle/materialize contract.
+5. Add container/network namespace drivers behind the runtime lifecycle
+   contract.
+6. Enforce logical-resource fencing in deployment, database, and artifact
+   gateways.
+7. Export lifecycle through MCP Tasks or A2A and telemetry through
+   OpenTelemetry.
+8. Anchor event-chain heads in an external append-only store.
+
+Those layers strengthen enforcement without changing the task, attempt, lease,
+submission, QC, or integration contracts.

@@ -35,9 +35,7 @@ class QCReviewCreate(BaseModel):
     @model_validator(mode="after")
     def validate_verdict(self) -> QCReviewCreate:
         serious = {"critical", "high", "medium"}
-        if self.verdict == "pass" and any(
-            finding.severity in serious for finding in self.findings
-        ):
+        if self.verdict == "pass" and any(finding.severity in serious for finding in self.findings):
             raise ValueError("pass reviews cannot contain medium-or-higher findings")
         if self.verdict in {"revise", "block"} and not self.findings:
             raise ValueError(f"{self.verdict} reviews require at least one finding")
@@ -68,6 +66,7 @@ class SubmissionView(BaseModel):
     worker_agent_id: str
     task_version: int
     claim_fencing_token: int
+    resource_fencing_tokens: dict[str, int]
     base_revision: str
     artifact_uri: str
     artifact_hash: str

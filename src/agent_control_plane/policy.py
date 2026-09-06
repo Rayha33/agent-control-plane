@@ -23,9 +23,7 @@ def pattern_is_delegable(child_pattern: str, parent_pattern: str) -> bool:
     return matches(parent_pattern, child_pattern)
 
 
-def scope_is_delegable(
-    child_scope: dict[str, str], parent_scopes: list[dict[str, str]]
-) -> bool:
+def scope_is_delegable(child_scope: dict[str, str], parent_scopes: list[dict[str, str]]) -> bool:
     return any(
         pattern_is_delegable(child_scope["action"], parent["action"])
         and pattern_is_delegable(child_scope["resource"], parent["resource"])

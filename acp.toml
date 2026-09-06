@@ -1,0 +1,54 @@
+[supervisor]
+lease_seconds = 300
+qc_timeout_seconds = 900
+critic_identity = "independent-qc"
+require_critic = true
+
+[qc]
+commands = [
+  "uv run --extra dev ruff check .",
+  "uv run --extra dev pytest -q",
+]
+critic_command = "builtin"
+
+[integration]
+commands = [
+  "uv run --extra dev ruff check .",
+  "uv run --extra dev pytest -q",
+]
+
+[runtime]
+setup_commands = []
+teardown_commands = []
+
+# Trusted phase-scoped drivers. Unlike setup_commands/teardown_commands — which
+# run as `/bin/sh -c` with the candidate's worktree as the working directory —
+# a driver is an absolute executable outside this repository, invoked as argv
+# with the runtime directory as cwd, and every teardown is followed by an
+# independent probe that must observe the resource absent. No proof means the
+# allocation is quarantined instead of recycled.
+#
+# [[runtime.drivers]]
+# name = "stack"
+# kind = "docker_compose"           # project name is derived per attempt
+# executable = "/usr/local/bin/docker"
+# compose_file = "/srv/acp/docker-compose.yml"
+#
+# [[credentials]]
+# name = "postgres-main"
+# provider = "versioned_file"
+# current = "/etc/acp/credentials/postgres-main/current"
+#
+# [[runtime.drivers]]
+# name = "db"
+# kind = "postgres_schema"          # schema is created and dropped per attempt
+# executable = "/usr/local/bin/psql"
+# credential = "postgres-main"      # current -> retained immutable 0600 pgpass
+# host = "database.internal"
+# port = "5432"
+# database = "app"
+# user = "acp"
+#
+# [[runtime.drivers]]
+# name = "browser"
+# kind = "browser_profile"          # filesystem only; declares no executable

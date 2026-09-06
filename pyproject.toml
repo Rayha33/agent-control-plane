@@ -1,7 +1,7 @@
 [project]
 name = "agent-control-plane"
-version = "0.1.0"
-description = "A reference control plane for delegated AI-agent authority."
+version = "0.2.0"
+description = "Git work safety, crash recovery, and independent QC for AI coding agents."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -27,10 +27,17 @@ Repository = "https://github.com/Rayha33/agent-control-plane"
 Issues = "https://github.com/Rayha33/agent-control-plane/issues"
 Security = "https://github.com/Rayha33/agent-control-plane/security/policy"
 
+[project.scripts]
+acp = "agent_control_plane.cli:main"
+acp-trust-helper = "agent_control_plane.trust_helper:main"
+
 [project.optional-dependencies]
 dev = [
+  "httpx2>=2.12,<3",
   "httpx>=0.28,<1",
+  "pytest-cov>=7,<8",
   "pytest>=9.0.3,<10",
+  "ruff>=0.12,<1",
 ]
 
 [build-system]
@@ -42,7 +49,27 @@ packages = ["src/agent_control_plane"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+markers = [
+  "linux_worker: needs the Linux child-subreaper/proc worker path; must run on a Linux CI job",
+]
 testpaths = ["tests"]
+# Starlette 1.6.0 deprecated the `httpx` transport for starlette.testclient and will
+# eventually drop it; the dev extra pins httpx2 so TestClient uses the supported
+# transport. Promoted to an error so a future regression (httpx2 dropped from the
+# environment, or a new Starlette deprecation ACP actually triggers) fails CI loudly
+# instead of scrolling past as one line of warning summary.
+#
+# NOTE: StarletteDeprecationWarning subclasses UserWarning, NOT DeprecationWarning
+# (starlette/exceptions.py:36), so `-W error::DeprecationWarning` does NOT catch it.
+# Measured 2026-09-03 with httpx2 uninstalled: `-o filterwarnings=error::Deprecation
+# Warning` still exited 0 with the warning merely reported, while this filter exited 4
+# at conftest import. The filter is therefore load-bearing, not decorative.
+filterwarnings = [
+  "error::starlette.exceptions.StarletteDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
 
 [tool.ruff.lint.per-file-ignores]
 "src/agent_control_plane/app.py" = ["B008"]

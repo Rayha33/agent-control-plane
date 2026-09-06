@@ -61,9 +61,7 @@ def claim_task(client, task_id, token):
 
 
 def resource_tokens(claim):
-    return {
-        lease["resource"]: lease["fencing_token"] for lease in claim["resource_leases"]
-    }
+    return {lease["resource"]: lease["fencing_token"] for lease in claim["resource_leases"]}
 
 
 def submit_task(client, task_id, token, claim, artifact_hash="a" * 64):
@@ -110,9 +108,7 @@ def test_simultaneous_claims_have_exactly_one_winner(client, app, admin_headers)
     assert losers == [("lost", 409, "task_unavailable")]
 
 
-def test_atomic_claim_resource_reservation_independent_qc_and_release_gate(
-    client, admin_headers
-):
+def test_atomic_claim_resource_reservation_independent_qc_and_release_gate(client, admin_headers):
     worker_a = create_agent(client, admin_headers, "worker-a", "worker")
     worker_b = create_agent(client, admin_headers, "worker-b", "worker")
     qc_agent = create_agent(client, admin_headers, "critical-qc", "qc")
@@ -193,9 +189,7 @@ def test_atomic_claim_resource_reservation_independent_qc_and_release_gate(
     assert review.status_code == 201, review.text
     assert review.json()["qc_agent_id"] == qc_agent["id"]
 
-    reserved_until_integration = claim_task(
-        client, colliding_task["id"], worker_b_token
-    )
+    reserved_until_integration = claim_task(client, colliding_task["id"], worker_b_token)
     assert reserved_until_integration.status_code == 409
 
     completed = client.post(
@@ -220,9 +214,7 @@ def test_qc_revision_requeues_work_with_new_fencing_tokens(client, admin_headers
     task = create_task(client, admin_headers, resources=["src/service.py"])
 
     first_claim = claim_task(client, task["id"], worker_a_token).json()
-    first_submission = submit_task(
-        client, task["id"], worker_a_token, first_claim
-    ).json()
+    first_submission = submit_task(client, task["id"], worker_a_token, first_claim).json()
     review = client.post(
         f"/v1/submissions/{first_submission['id']}/reviews",
         headers={"Authorization": f"Bearer {qc_token}"},
@@ -243,19 +235,14 @@ def test_qc_revision_requeues_work_with_new_fencing_tokens(client, admin_headers
     assert review.status_code == 201, review.text
     assert review.json()["verdict"] == "revise"
 
-    task_after_review = client.get(
-        f"/v1/tasks/{task['id']}", headers=admin_headers
-    ).json()
+    task_after_review = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
     assert task_after_review["status"] == "changes_requested"
     assert task_after_review["latest_review"]["findings"][0]["severity"] == "critical"
 
     second_claim_response = claim_task(client, task["id"], worker_b_token)
     assert second_claim_response.status_code == 200, second_claim_response.text
     second_claim = second_claim_response.json()
-    assert (
-        second_claim["task"]["claim_fencing_token"]
-        > first_claim["task"]["claim_fencing_token"]
-    )
+    assert second_claim["task"]["claim_fencing_token"] > first_claim["task"]["claim_fencing_token"]
     assert (
         resource_tokens(second_claim)["src/service.py"]
         > resource_tokens(first_claim)["src/service.py"]
@@ -272,9 +259,7 @@ def test_qc_revision_requeues_work_with_new_fencing_tokens(client, admin_headers
     )
     assert zombie_heartbeat.status_code == 409
 
-    repaired = submit_task(
-        client, task["id"], worker_b_token, second_claim, artifact_hash="b" * 64
-    )
+    repaired = submit_task(client, task["id"], worker_b_token, second_claim, artifact_hash="b" * 64)
     assert repaired.status_code == 201, repaired.text
     passed = client.post(
         f"/v1/submissions/{repaired.json()['id']}/reviews",
@@ -288,9 +273,7 @@ def test_qc_revision_requeues_work_with_new_fencing_tokens(client, admin_headers
     assert passed.status_code == 201, passed.text
 
 
-def test_expired_claim_is_reaped_and_zombie_writer_is_rejected(
-    client, app, admin_headers
-):
+def test_expired_claim_is_reaped_and_zombie_writer_is_rejected(client, app, admin_headers):
     worker_a = create_agent(client, admin_headers, "crashed-worker", "worker")
     worker_b = create_agent(client, admin_headers, "replacement-worker", "worker")
     token_a = issue_coordination_mandate(client, admin_headers, worker_a["id"])
@@ -299,9 +282,7 @@ def test_expired_claim_is_reaped_and_zombie_writer_is_rejected(
     first_claim = claim_task(client, task["id"], token_a).json()
 
     with app.state.database.connect() as connection:
-        connection.execute(
-            "UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (task["id"],)
-        )
+        connection.execute("UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (task["id"],))
         connection.execute(
             "UPDATE resource_leases SET expires_at = 0 WHERE task_id = ?",
             (task["id"],),
@@ -318,10 +299,41 @@ def test_expired_claim_is_reaped_and_zombie_writer_is_rejected(
         replacement_claim["task"]["claim_fencing_token"]
         > first_claim["task"]["claim_fencing_token"]
     )
-
     zombie_submission = submit_task(client, task["id"], token_a, first_claim)
     assert zombie_submission.status_code == 409
     assert zombie_submission.json()["error"] == "stale_claim_fencing_token"
+
+
+def test_expired_approved_reservation_cannot_complete(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "reservation-worker", "worker")
+    reviewer = create_agent(client, admin_headers, "reservation-qc", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    reviewer_token = issue_coordination_mandate(client, admin_headers, reviewer["id"])
+    task_spec = create_task(client, admin_headers, resources=["src/reserved.py"])
+    claim = claim_task(client, task_spec["id"], worker_token).json()
+    submission = submit_task(client, task_spec["id"], worker_token, claim).json()
+    review = client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {reviewer_token}"},
+        json={
+            "verdict": "pass",
+            "summary": "Evidence reproduced before the reservation expired.",
+            "findings": [],
+        },
+    )
+    assert review.status_code == 201, review.text
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE resource_leases SET expires_at = 0 WHERE task_id = ?",
+            (task_spec["id"],),
+        )
+    completed = client.post(
+        f"/v1/tasks/{task_spec['id']}/complete",
+        headers=admin_headers,
+        json={"reason": "must not bypass a lost reservation"},
+    )
+    assert completed.status_code == 409
+    assert completed.json()["error"] == "reservation_lost"
 
 
 def test_dependency_must_be_done_before_claim(client, app, admin_headers):
@@ -340,8 +352,6 @@ def test_dependency_must_be_done_before_claim(client, app, admin_headers):
     assert blocked.json()["error"] == "dependency_incomplete"
 
     with app.state.database.connect() as connection:
-        connection.execute(
-            "UPDATE tasks SET status = 'done' WHERE id = ?", (prerequisite["id"],)
-        )
+        connection.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (prerequisite["id"],))
     allowed = claim_task(client, dependent["id"], token)
     assert allowed.status_code == 200, allowed.text

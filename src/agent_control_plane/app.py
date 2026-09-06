@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Mapping
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
@@ -25,6 +28,7 @@ from .coordination_schemas import (
 )
 from .database import Database
 from .schemas import (
+    A2ASideEffectMutation,
     ActionRequestView,
     AgentCreate,
     AgentStateChange,
@@ -39,22 +43,61 @@ from .schemas import (
     PolicyCreate,
     PolicyView,
     RevokeMandate,
+    SideEffectMutation,
+    SideEffectReceiptView,
 )
 from .service import ControlPlaneError, ControlPlaneService
+from .side_effects import (
+    A2ASideEffectEnvelope,
+    AuthenticatedSideEffectService,
+    CoordinationClaimVerifier,
+    FencedGateway,
+    MCPA2ASideEffectAdapter,
+    ProviderDriver,
+    default_side_effect_adapters,
+)
 
 bearer = HTTPBearer(auto_error=False)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def _resolve_version() -> str:
+    """Report the installed distribution version.
+
+    The literal used to live in two places in this file and drifted from
+    pyproject (0.1.0 vs 0.2.0). Read the distribution metadata instead, and fall
+    back to the package attribute for a source checkout that was never installed.
+    """
+    try:
+        return _distribution_version("agent-control-plane")
+    except PackageNotFoundError:  # pragma: no cover - source checkout, not installed
+        from . import __version__
+
+        return __version__
+
+
+API_VERSION = _resolve_version()
+
+
+def create_app(
+    settings: Settings | None = None,
+    side_effect_drivers: Mapping[str, ProviderDriver] | None = None,
+) -> FastAPI:
     active_settings = settings or Settings.from_env()
     database = Database(active_settings.database_path)
     database.initialize()
     service = ControlPlaneService(database, active_settings)
     coordination = CoordinationService(database, service)
+    side_effect_gateway = FencedGateway(
+        database,
+        CoordinationClaimVerifier(coordination),
+        default_side_effect_adapters(side_effect_drivers),
+    )
+    side_effects = AuthenticatedSideEffectService(service, side_effect_gateway)
+    a2a_side_effects = MCPA2ASideEffectAdapter(side_effects)
 
     app = FastAPI(
         title="Agent Control Plane",
-        version="0.1.0",
+        version=API_VERSION,
         description=(
             "Delegated mandates, collision-free task coordination, independent QC, "
             "kill switches, and tamper-evident evidence for AI agents."
@@ -63,6 +106,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.service = service
     app.state.coordination = coordination
+    app.state.side_effect_gateway = side_effect_gateway
+    app.state.side_effects = side_effects
+    app.state.a2a_side_effects = a2a_side_effects
     app.state.settings = active_settings
 
     @app.exception_handler(ControlPlaneError)
@@ -76,22 +122,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def require_admin(x_control_plane_key: str = Header(default="")) -> None:
         if not secrets.compare_digest(x_control_plane_key, active_settings.admin_key):
-            raise ControlPlaneError(
-                401, "invalid_admin_key", "invalid control-plane key"
-            )
+            raise ControlPlaneError(401, "invalid_admin_key", "invalid control-plane key")
 
     def require_mandate(
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> str:
         if not credentials or credentials.scheme.lower() != "bearer":
-            raise ControlPlaneError(
-                401, "mandate_required", "bearer mandate is required"
-            )
+            raise ControlPlaneError(401, "mandate_required", "bearer mandate is required")
         return credentials.credentials
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "version": "0.1.0"}
+        # A control plane running on the published development credentials must not be
+        # indistinguishable from a secured one. Settings.from_env now refuses those keys
+        # unless ACP_INSECURE_DEV=1 is set explicitly; when it is, say so here so the
+        # deployment is visibly insecure rather than quietly so. Board #1624.
+        return {
+            "status": "ok",
+            "version": API_VERSION,
+            "auth": "insecure-dev" if active_settings.insecure_dev else "enforced",
+        }
 
     @app.post(
         "/v1/agents",
@@ -111,9 +161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.parent_mandate_id:
             delegator_token = credentials.credentials if credentials else None
         else:
-            if not secrets.compare_digest(
-                x_control_plane_key, active_settings.admin_key
-            ):
+            if not secrets.compare_digest(x_control_plane_key, active_settings.admin_key):
                 raise ControlPlaneError(
                     401,
                     "invalid_admin_key",
@@ -160,9 +208,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dependencies=[Depends(require_admin)],
     )
     def set_agent_state(agent_id: str, request: AgentStateChange) -> dict:
-        return service.set_agent_state(
-            agent_id, disabled=request.disabled, reason=request.reason
-        )
+        return service.set_agent_state(agent_id, disabled=request.disabled, reason=request.reason)
 
     @app.post(
         "/v1/mandates/{mandate_id}/revoke",
@@ -233,6 +279,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         token: str = Depends(require_mandate),
     ) -> dict:
         return coordination.heartbeat(task_id, token, request)
+
+    @app.post(
+        "/v1/side-effects/{operation}",
+        response_model=SideEffectReceiptView,
+        status_code=201,
+    )
+    def execute_side_effect(
+        operation: str,
+        request: SideEffectMutation,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return side_effects.execute(
+            token,
+            task_id=request.task_id,
+            operation=operation,
+            claim_fencing_token=request.claim_fencing_token,
+            resource_fencing_tokens=request.resource_fencing_tokens,
+            target_resource=request.target_resource,
+            idempotency_key=request.idempotency_key,
+            payload=request.payload,
+        ).to_dict()
+
+    @app.post(
+        "/v1/a2a/side-effects/{operation}",
+        response_model=SideEffectReceiptView,
+        status_code=201,
+    )
+    def execute_a2a_side_effect(
+        operation: str,
+        request: A2ASideEffectMutation,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return a2a_side_effects.execute(
+            token,
+            A2ASideEffectEnvelope(
+                task_id=request.task_id,
+                artifact_id=request.artifact_id,
+                kind=request.kind,
+                operation=operation,
+                claim_fencing_token=request.claim_fencing_token,
+                resource_fencing_tokens=request.resource_fencing_tokens,
+                idempotency_key=request.idempotency_key,
+                payload=request.payload,
+            ),
+        ).to_dict()
+
+    @app.get(
+        "/v1/tasks/{task_id}/side-effect-receipts",
+        response_model=list[SideEffectReceiptView],
+        dependencies=[Depends(require_admin)],
+    )
+    def side_effect_receipts(task_id: str) -> list[dict]:
+        return side_effect_gateway.receipts(task_id)
 
     @app.post(
         "/v1/tasks/{task_id}/submissions",

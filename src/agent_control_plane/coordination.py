@@ -14,6 +14,7 @@ from .coordination_schemas import (
 )
 from .database import Database, canonical_json, utc_now
 from .policy import scope_allows
+from .scheduling import declared_resources
 from .service import ControlPlaneError, ControlPlaneService
 
 QC_RESERVATION_SECONDS = 3600
@@ -97,9 +98,7 @@ class CoordinationService:
                 (status,),
             )
         else:
-            rows = self.database.all(
-                "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
-            )
+            rows = self.database.all("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC")
         return [self._task_view(row) for row in rows]
 
     def claim_task(self, task_id: str, token: str, ttl_seconds: int) -> dict[str, Any]:
@@ -238,9 +237,7 @@ class CoordinationService:
         )
         return {"task": self.task(task_id), "resource_leases": lease_views}
 
-    def heartbeat(
-        self, task_id: str, token: str, request: HeartbeatRequest
-    ) -> dict[str, Any]:
+    def heartbeat(self, task_id: str, token: str, request: HeartbeatRequest) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
             token, "coordination.heartbeat", f"task:{task_id}", {"worker"}
         )
@@ -327,9 +324,7 @@ class CoordinationService:
             "checkpoint": request.checkpoint,
         }
 
-    def submit(
-        self, task_id: str, token: str, request: SubmissionCreate
-    ) -> dict[str, Any]:
+    def submit(self, task_id: str, token: str, request: SubmissionCreate) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
             token, "coordination.submit", f"task:{task_id}", {"worker"}
         )
@@ -358,9 +353,10 @@ class CoordinationService:
                 """
                 INSERT INTO submissions
                     (id, task_id, worker_agent_id, task_version,
-                     claim_fencing_token, base_revision, artifact_uri,
+                     claim_fencing_token, resource_fencing_tokens_json,
+                     base_revision, artifact_uri,
                      artifact_hash, summary, evidence_json, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_qc', ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_qc', ?)
                 """,
                 (
                     submission_id,
@@ -368,6 +364,7 @@ class CoordinationService:
                     agent["id"],
                     request.task_version,
                     request.claim_fencing_token,
+                    canonical_json(request.resource_fencing_tokens),
                     request.base_revision,
                     request.artifact_uri,
                     request.artifact_hash.lower(),
@@ -420,9 +417,7 @@ class CoordinationService:
         )
         return self.submission(submission_id)
 
-    def review(
-        self, submission_id: str, token: str, request: QCReviewCreate
-    ) -> dict[str, Any]:
+    def review(self, submission_id: str, token: str, request: QCReviewCreate) -> dict[str, Any]:
         submission = self._submission_row(submission_id)
         task_id = submission["task_id"]
         claims, _mandate, agent = self._agent_for_action(
@@ -563,7 +558,8 @@ class CoordinationService:
                 )
             latest = connection.execute(
                 """
-                SELECT submission.id, submission.status, review.verdict
+                SELECT submission.id, submission.status, review.verdict,
+                       submission.resource_fencing_tokens_json
                 FROM submissions AS submission
                 LEFT JOIN reviews AS review ON review.submission_id = submission.id
                 WHERE submission.task_id = ?
@@ -572,15 +568,27 @@ class CoordinationService:
                 """,
                 (task_id,),
             ).fetchone()
-            if (
-                not latest
-                or latest["status"] != "approved"
-                or latest["verdict"] != "pass"
-            ):
+            if not latest or latest["status"] != "approved" or latest["verdict"] != "pass":
                 raise ControlPlaneError(
                     409,
                     "qc_evidence_missing",
                     "latest submission lacks a passing independent review",
+                )
+            expected_tokens = json.loads(latest["resource_fencing_tokens_json"])
+            reservations = connection.execute(
+                "SELECT * FROM resource_leases WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            actual_tokens = {
+                reservation["resource"]: reservation["fencing_token"]
+                for reservation in reservations
+                if reservation["expires_at"] > int(time.time())
+            }
+            if actual_tokens != expected_tokens:
+                raise ControlPlaneError(
+                    409,
+                    "reservation_lost",
+                    "approved work cannot complete after its fenced reservation expires",
                 )
             connection.execute(
                 """
@@ -645,9 +653,7 @@ class CoordinationService:
                     """,
                     (updated_at, task_id),
                 ).rowcount
-                connection.execute(
-                    "DELETE FROM agent_heartbeats WHERE task_id = ?", (task_id,)
-                )
+                connection.execute("DELETE FROM agent_heartbeats WHERE task_id = ?", (task_id,))
 
             rows = connection.execute(
                 """
@@ -730,17 +736,13 @@ class CoordinationService:
 
     @staticmethod
     def _task_row(connection: sqlite3.Connection, task_id: str) -> sqlite3.Row:
-        row = connection.execute(
-            "SELECT * FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
+        row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not row:
             raise ControlPlaneError(404, "task_not_found", "task not found")
         return row
 
     def _submission_row(self, submission_id: str) -> sqlite3.Row:
-        row = self.database.one(
-            "SELECT * FROM submissions WHERE id = ?", (submission_id,)
-        )
+        row = self.database.one("SELECT * FROM submissions WHERE id = ?", (submission_id,))
         if not row:
             raise ControlPlaneError(404, "submission_not_found", "submission not found")
         return row
@@ -783,9 +785,7 @@ class CoordinationService:
                 or lease["fencing_token"] != fencing_token
                 or lease["expires_at"] <= now
             ):
-                raise ControlPlaneError(
-                    409, "stale_fencing_token", f"stale lease for {resource}"
-                )
+                raise ControlPlaneError(409, "stale_fencing_token", f"stale lease for {resource}")
 
     def _task_view(self, row: sqlite3.Row) -> dict[str, Any]:
         dependencies = self.database.all(
@@ -817,9 +817,9 @@ class CoordinationService:
             "description": row["description"],
             "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
             "resources": json.loads(row["resources_json"]),
-            "dependencies": [
-                dependency["depends_on_task_id"] for dependency in dependencies
-            ],
+            # #1764: folded above is the lease key; declared is the operator's capitalisation.
+            "declared_resources": declared_resources(row),
+            "dependencies": [dependency["depends_on_task_id"] for dependency in dependencies],
             "priority": row["priority"],
             "status": row["status"],
             "owner_agent_id": row["owner_agent_id"],
@@ -831,9 +831,7 @@ class CoordinationService:
             "latest_submission": (
                 self._submission_view(latest_submission) if latest_submission else None
             ),
-            "latest_review": self._review_view(latest_review)
-            if latest_review
-            else None,
+            "latest_review": self._review_view(latest_review) if latest_review else None,
         }
 
     @staticmethod
@@ -844,6 +842,7 @@ class CoordinationService:
             "worker_agent_id": row["worker_agent_id"],
             "task_version": row["task_version"],
             "claim_fencing_token": row["claim_fencing_token"],
+            "resource_fencing_tokens": json.loads(row["resource_fencing_tokens_json"]),
             "base_revision": row["base_revision"],
             "artifact_uri": row["artifact_uri"],
             "artifact_hash": row["artifact_hash"],
