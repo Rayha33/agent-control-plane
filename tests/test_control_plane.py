@@ -257,3 +257,31 @@ def test_parent_revocation_and_kill_switch_invalidate_child(client, admin_header
     invalidated = client.post("/v1/authorize", headers=child_headers, json=action)
     assert invalidated.status_code == 401
     assert invalidated.json()["error"] == "ancestor_mandate_inactive"
+
+
+def test_disabled_parent_cannot_delegate_a_child_mandate(client, admin_headers):
+    parent = create_agent(client, admin_headers, "paused-parent")
+    child = create_agent(client, admin_headers, "paused-child", parent["id"])
+    parent_mandate = issue_root_mandate(client, admin_headers, parent["id"])
+
+    stopped = client.post(
+        f"/v1/agents/{parent['id']}/state",
+        headers=admin_headers,
+        json={"disabled": True, "reason": "Kill switch"},
+    )
+    assert stopped.status_code == 200
+
+    delegated = client.post(
+        "/v1/mandates",
+        headers={"Authorization": f"Bearer {parent_mandate['token']}"},
+        json={
+            "agent_id": child["id"],
+            "subject": "paused-parent",
+            "parent_mandate_id": parent_mandate["id"],
+            "scopes": [{"action": "payments.charge", "resource": "merchant:acme"}],
+            "ttl_seconds": 1800,
+            "max_amount_cents": 1_000,
+        },
+    )
+    assert delegated.status_code == 401
+    assert delegated.json()["error"] == "agent_lineage_disabled"

@@ -77,6 +77,16 @@ class Settings:
             insecure_dev=insecure_dev,
         )
 
+    @property
+    def insecure_defaults(self) -> list[str]:
+        """Environment variables still carrying their built-in development value."""
+        active = []
+        if self.admin_key == DEV_ADMIN_KEY:
+            active.append("ACP_ADMIN_KEY")
+        if self.signing_key == DEV_SIGNING_KEY:
+            active.append("ACP_SIGNING_KEY")
+        return active
+
 
 def _credential_problems(admin_key: str, signing_key: str) -> list[str]:
     """Every reason these credentials are unfit, so the operator sees them all at once."""

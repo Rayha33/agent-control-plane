@@ -8,8 +8,10 @@ is why nothing caught it — these tests give the claim an external referent.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import tomllib
+from importlib.metadata import version
 
 import pytest
 
@@ -21,7 +23,21 @@ PYPROJECT = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
 
 def declared_version() -> str:
     with PYPROJECT.open("rb") as handle:
-        return tomllib.load(handle)["project"]["version"]
+        config = tomllib.load(handle)
+    assert "version" in config["project"]["dynamic"]
+    assert "version" not in config["project"]
+    source = PYPROJECT.parent / config["tool"]["hatch"]["version"]["path"]
+    module = ast.parse(source.read_text(encoding="utf-8"))
+    declarations = [
+        ast.literal_eval(node.value)
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets
+        )
+    ]
+    assert len(declarations) == 1
+    return declarations[0]
 
 
 def test_health_reports_the_declared_version(client):
@@ -47,6 +63,10 @@ def test_resolver_itself_reports_the_declared_version():
     # Tests the resolver directly rather than only through the endpoints, so a
     # future caller that reads API_VERSION is covered too.
     assert API_VERSION == declared_version()
+
+
+def test_installed_metadata_matches_the_build_version():
+    assert version("agent-control-plane") == declared_version()
 
 
 def test_package_attribute_matches_pyproject():

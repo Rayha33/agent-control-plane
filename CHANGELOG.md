@@ -12,6 +12,8 @@ adding one.
 ## [Unreleased]
 
 ### Security
+- Integrated upstream disabled-parent/ancestor authorization checks: an agent
+  disabled by the kill switch cannot mint new delegated mandates. (#1831)
 - `Settings.from_env()` defaulted `admin_key` to the published `dev-admin-key` and
   `signing_key` to a published development key, and `create_app()` calls it whenever
   given no settings — so starting the server with nothing exported produced an API
@@ -97,6 +99,11 @@ adding one.
   needs upgrading in order to report it. (#1629)
 
 ### Fixed
+- Task reopening and its audit event now commit in one transaction. If the audit
+  write fails, task status, version, resource reservations and heartbeats all roll
+  back. The admin-only reopen route retains fresh fencing on the next claim.
+  Independent fault-injection tests cover both application and SQL insert failures.
+  Other older state/audit transaction boundaries remain tracked in #1832. (#1831)
 - `ACP_REQUIRE_LINUX_WORKER=1` could pass when required worker tests skipped during
   execution or teardown, xfailed, were deselected, or were only collected. The gate
   now requires a nonempty worker selection, no worker deselections or skips in any

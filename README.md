@@ -680,6 +680,12 @@ uv run uvicorn agent_control_plane.app:create_app --factory
 running this way cannot be mistaken for a secured one. Only the exact value `1` enables
 it — `true`, `yes` and `0` all still refuse.
 
+The reference HTTP service also exposes the administrator-only
+`POST /v1/tasks/{id}/reopen` endpoint. After operator action it returns a
+`conflicted` or `blocked` HTTP task to `open`, releases its reservation, clears
+heartbeats, and records the reason in a `task.reopened` audit event. The next
+claim receives fresh fencing tokens; old tokens do not regain authority.
+
 The Git supervisor is the primary v0.2 product path. The HTTP authority API is a
 separate reference layer and does not create Git worktrees.
 

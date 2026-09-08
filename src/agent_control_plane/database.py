@@ -5,7 +5,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -227,6 +227,10 @@ class Database:
                 component="service database",
                 package_version=__version__,
             )
+            if self.path != ":memory:":
+                # Validate the schema before changing the file's journal mode.
+                # WAL lets readers continue while another connection holds a claim.
+                connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(agents)").fetchall()
@@ -284,14 +288,31 @@ class Database:
             cursor = connection.execute(query, parameters)
             return cursor.rowcount
 
-    def append_audit(self, event_type: str, actor: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def append_audit(
+        self,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Append to the audit chain, optionally inside the caller's transaction.
+
+        A supplied connection must already hold a transaction. Its caller owns
+        commit and rollback, so domain state and its audit event cannot separate.
+        Existing callers still get the original self-contained transaction.
+        """
+        if connection is not None and not connection.in_transaction:
+            raise ValueError("audit connection must already hold a transaction")
         event_id = str(uuid.uuid4())
         created_at = utc_now()
         payload_json = canonical_json(payload)
 
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            previous = connection.execute(
+        context = self.connect() if connection is None else nullcontext(connection)
+        with context as audit_connection:
+            if connection is None:
+                audit_connection.execute("BEGIN IMMEDIATE")
+            previous = audit_connection.execute(
                 "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
             previous_hash = previous["event_hash"] if previous else GENESIS_HASH
@@ -303,7 +324,7 @@ class Database:
                 payload_json,
                 created_at,
             )
-            cursor = connection.execute(
+            cursor = audit_connection.execute(
                 """
                 INSERT INTO audit_events
                     (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
