@@ -292,14 +292,33 @@ def test_the_declared_write_set_is_shown_as_the_operator_typed_it(repo: Path) ->
     ]
 
 
-def test_matching_is_still_case_insensitive(repo: Path) -> None:
-    """The control: preserving the display must not tighten what the guard accepts."""
+@pytest.mark.parametrize("recorded_case, allow_lower", [("0", True), ("1", False)])
+def test_declared_display_preserves_filesystem_matching_policy(
+    repo: Path, recorded_case: str, allow_lower: bool
+) -> None:
+    """Drive both recorded policies; test_resource_case verifies the real volume probe.
+
+    Display preservation must not override the filesystem-aware matching added in
+    #1708. The old unconditional case-insensitive expectation allowed an undeclared
+    write on a case-sensitive volume and consequently failed Linux CI.
+    """
 
     supervisor = GitSupervisor(repo)
     created = make_task(supervisor, "CHANGELOG.md")
     attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        updated = connection.execute(
+            "UPDATE meta SET value = ? WHERE key = ?",
+            (recorded_case, git_supervisor.META_CASE_SENSITIVE),
+        )
+        assert updated.rowcount == 1
+    assert created["resources"] == ["changelog.md"]  # folded lease identity stays unchanged
+    assert supervisor.guard_context(attempt["id"])["declared"] == ["CHANGELOG.md"]
     assert supervisor.guard(attempt["id"], "CHANGELOG.md")["allow"] is True
-    assert supervisor.guard(attempt["id"], "changelog.md")["allow"] is True
+    lower = supervisor.guard(attempt["id"], "changelog.md")
+    assert lower["allow"] is allow_lower
+    if not allow_lower:
+        assert lower["reason"] == "undeclared_write"
 
 
 def test_a_task_created_before_the_column_still_displays(repo: Path) -> None:

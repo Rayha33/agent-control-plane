@@ -99,6 +99,10 @@ adding one.
   needs upgrading in order to report it. (#1629)
 
 ### Fixed
+- Replaced an obsolete schema test that expected case-insensitive matching on every
+  filesystem, contradicting #1708 and failing both Linux CI jobs. The test now pins
+  both recorded filesystem policies explicitly; production write guards are unchanged.
+  (#1831)
 - Task reopening and its audit event now commit in one transaction. If the audit
   write fails, task status, version, resource reservations and heartbeats all roll
   back. The admin-only reopen route retains fresh fencing on the next claim.
