@@ -345,3 +345,157 @@ def test_dependency_must_be_done_before_claim(client, app, admin_headers):
         )
     allowed = claim_task(client, dependent["id"], token)
     assert allowed.status_code == 200, allowed.text
+
+
+def heartbeat_rows(app, task_id):
+    with app.state.database.connect() as connection:
+        return connection.execute(
+            "SELECT COUNT(*) FROM agent_heartbeats WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+
+
+def test_conflicted_task_is_reopened_by_an_operator_and_reclaimed(
+    client, app, admin_headers
+):
+    worker = create_agent(client, admin_headers, "conflict-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(client, admin_headers, resources=["deploy:reopen-target"])
+    claim = claim_task(client, task["id"], token).json()
+    submitted = submit_task(client, task["id"], token, claim)
+    assert submitted.status_code == 201, submitted.text
+
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE resource_leases SET expires_at = 0 WHERE task_id = ?",
+            (task["id"],),
+        )
+    reaped = client.post("/v1/coordination/reap", headers=admin_headers).json()
+    assert task["id"] in reaped["conflicted_task_ids"]
+
+    stuck = claim_task(client, task["id"], token)
+    assert stuck.status_code == 409
+    assert stuck.json()["error"] == "task_unavailable"
+
+    reopened = client.post(
+        f"/v1/tasks/{task['id']}/reopen",
+        headers=admin_headers,
+        json={"reason": "Reservation lapsed during review; operator confirmed a redo"},
+    )
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["status"] == "open"
+    assert reopened.json()["owner_agent_id"] is None
+    assert reopened.json()["version"] > claim["task"]["version"]
+    assert heartbeat_rows(app, task["id"]) == 0
+
+    reclaimed = claim_task(client, task["id"], token)
+    assert reclaimed.status_code == 200, reclaimed.text
+    assert (
+        reclaimed.json()["task"]["claim_fencing_token"]
+        > claim["task"]["claim_fencing_token"]
+    )
+    assert (
+        resource_tokens(reclaimed.json())["deploy:reopen-target"]
+        > resource_tokens(claim)["deploy:reopen-target"]
+    )
+
+    verification = client.get("/v1/audit/verify", headers=admin_headers).json()
+    assert verification["valid"] is True
+    events = client.get("/v1/audit", headers=admin_headers).json()
+    reopen_events = [e for e in events if e["event_type"] == "task.reopened"]
+    assert reopen_events[0]["payload"]["previous_status"] == "conflicted"
+
+
+def test_blocked_task_is_reopened_after_human_action(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "blocked-worker", "worker")
+    qc_agent = create_agent(client, admin_headers, "blocking-qc", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    task = create_task(client, admin_headers, resources=["src/blocked.py"])
+    claim = claim_task(client, task["id"], worker_token).json()
+    submission = submit_task(client, task["id"], worker_token, claim).json()
+
+    blocked = client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={
+            "verdict": "block",
+            "summary": "The change needs a policy decision before it can proceed.",
+            "findings": [
+                {
+                    "severity": "high",
+                    "requirement": "Deployment targets are declared before execution",
+                    "finding": "The artifact touches an undeclared production target.",
+                    "evidence": "Diff writes deployment:production:api.",
+                    "required_fix": "Declare the target or split the change.",
+                }
+            ],
+        },
+    )
+    assert blocked.status_code == 201, blocked.text
+    assert (
+        client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()["status"]
+        == "blocked"
+    )
+    assert heartbeat_rows(app, task["id"]) == 0
+
+    reopened = client.post(
+        f"/v1/tasks/{task['id']}/reopen",
+        headers=admin_headers,
+        json={"reason": "Policy decision recorded; work may resume"},
+    )
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["status"] == "open"
+    assert reopened.json()["latest_review"]["verdict"] == "block"
+
+    reclaimed = claim_task(client, task["id"], worker_token)
+    assert reclaimed.status_code == 200, reclaimed.text
+
+
+def test_reopen_is_refused_outside_conflicted_and_blocked(client, admin_headers):
+    task = create_task(client, admin_headers, title="Still open")
+    refused = client.post(
+        f"/v1/tasks/{task['id']}/reopen",
+        headers=admin_headers,
+        json={"reason": "Nothing to reopen"},
+    )
+    assert refused.status_code == 409
+    assert refused.json()["error"] == "task_not_reopenable"
+
+
+def test_heartbeat_rows_end_with_the_claim(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "heartbeat-worker", "worker")
+    qc_agent = create_agent(client, admin_headers, "heartbeat-qc", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    task = create_task(client, admin_headers, resources=["src/heartbeat.py"])
+    claim = claim_task(client, task["id"], worker_token).json()
+    assert heartbeat_rows(app, task["id"]) == 1
+
+    beat = client.post(
+        f"/v1/tasks/{task['id']}/heartbeat",
+        headers={"Authorization": f"Bearer {worker_token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "resource_fencing_tokens": resource_tokens(claim),
+            "checkpoint": {"step": "tests"},
+        },
+    )
+    assert beat.status_code == 200, beat.text
+    assert heartbeat_rows(app, task["id"]) == 1
+
+    submission = submit_task(client, task["id"], worker_token, claim).json()
+    assert heartbeat_rows(app, task["id"]) == 0
+
+    passed = client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={"verdict": "pass", "summary": "Reproduced.", "findings": []},
+    )
+    assert passed.status_code == 201, passed.text
+    completed = client.post(
+        f"/v1/tasks/{task['id']}/complete",
+        headers=admin_headers,
+        json={"reason": "QC passed"},
+    )
+    assert completed.status_code == 200, completed.text
+    assert heartbeat_rows(app, task["id"]) == 0

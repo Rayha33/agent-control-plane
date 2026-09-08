@@ -22,6 +22,7 @@ from .coordination_schemas import (
     TaskClaimView,
     TaskCompleteRequest,
     TaskCreate,
+    TaskReopenRequest,
     TaskStatus,
     TaskView,
 )
@@ -282,6 +283,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def complete_task(task_id: str, request: TaskCompleteRequest) -> dict:
         return coordination.complete_task(task_id, request.reason)
+
+    @app.post(
+        "/v1/tasks/{task_id}/reopen",
+        response_model=TaskView,
+        dependencies=[Depends(require_admin)],
+    )
+    def reopen_task(task_id: str, request: TaskReopenRequest) -> dict:
+        return coordination.reopen_task(task_id, request.reason)
 
     @app.post(
         "/v1/coordination/reap",

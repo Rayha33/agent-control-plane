@@ -122,6 +122,7 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | `POST /v1/tasks/{id}/submissions` | Submit immutable artifact evidence |
 | `POST /v1/submissions/{id}/reviews` | Record independent structured QC |
 | `POST /v1/tasks/{id}/complete` | Open the completion gate after QC passes |
+| `POST /v1/tasks/{id}/reopen` | Return a `conflicted` or `blocked` task to `open` after operator action |
 | `POST /v1/coordination/reap` | Recover expired workers and reservations |
 | `POST /v1/authorize` | Evaluate an intended agent action |
 | `GET /v1/audit/verify` | Verify the audit hash chain |

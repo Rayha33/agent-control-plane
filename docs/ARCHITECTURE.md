@@ -45,7 +45,11 @@ services.
 
 `blocked` records a QC rejection, while `conflicted` records a task whose
 post-submission resource reservation expired before safe completion. Both require
-operator or planner action.
+operator or planner action, and that action is explicit: `POST /v1/tasks/{id}/reopen`
+returns either state to `open` with a new version, releases any remaining
+reservation, and appends a `task.reopened` audit event carrying the reason. The
+next claim then mints fresh fencing tokens, so nothing produced under the old claim
+can be written back.
 
 ## Coordination invariants
 
@@ -110,7 +114,9 @@ Workers heartbeat with a checkpoint and renewed TTL. The reaper:
 - releases its resources;
 - rejects later writes using the old fencing tokens; and
 - marks expired review/completion reservations `conflicted` instead of silently
-  treating unreviewed work as safe.
+  treating unreviewed work as safe; and
+- clears the task's heartbeat rows, as every other end of a claim does
+  (submission, review, completion, reopen).
 
 ## Recommended runner topology
 
