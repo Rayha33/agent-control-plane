@@ -193,6 +193,10 @@ class Database:
                 parents=True, exist_ok=True
             )
         with self.connect() as connection:
+            if self.path != ":memory:":
+                # Persistent once set: readers no longer block behind a claim's
+                # BEGIN IMMEDIATE, and writers no longer wait for readers.
+                connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
             columns = {
                 row["name"]

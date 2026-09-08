@@ -130,8 +130,8 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 
 ```bash
 uv sync --extra dev
-uvx ruff format --check src tests
-uvx ruff check src tests
+uv run ruff format --check src tests
+uv run ruff check src tests
 uv run pytest
 ```
 

@@ -21,13 +21,13 @@ uv sync --extra dev
 Run the same checks as CI:
 
 ```bash
-uvx ruff format --check src tests
-uvx ruff check src tests
+uv run ruff format --check src tests
+uv run ruff check src tests
 uv run pytest
 uv build
 ```
 
-Use `uvx ruff format src tests` to apply formatting.
+Use `uv run ruff format src tests` to apply formatting.
 
 ## Pull requests
 

@@ -1,6 +1,6 @@
 [project]
 name = "agent-control-plane"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A reference control plane for delegated AI-agent authority."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,11 +31,15 @@ Security = "https://github.com/Rayha33/agent-control-plane/security/policy"
 dev = [
   "httpx>=0.28,<1",
   "pytest>=9.0.3,<10",
+  "ruff>=0.15.8,<0.16",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/agent_control_plane/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_control_plane"]
@@ -44,5 +48,13 @@ packages = ["src/agent_control_plane"]
 addopts = "-q"
 testpaths = ["tests"]
 
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Default pyflakes/pycodestyle set plus bugbear, import order and pyupgrade.
+select = ["B", "E4", "E7", "E9", "F", "I", "UP"]
+
 [tool.ruff.lint.per-file-ignores]
+# FastAPI's Depends()/Header() in parameter defaults is the framework idiom.
 "src/agent_control_plane/app.py" = ["B008"]
