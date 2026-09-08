@@ -1,8 +1,9 @@
 #!/bin/sh
 # Run the suite on the production platform, from any machine with Docker.
 #
-#   scripts/test-linux.sh                 # whole suite
-#   scripts/test-linux.sh -k subreaper    # extra args go to pytest
+#   scripts/test-linux.sh                 # whole suite, required worker gate
+#   ACP_REQUIRE_LINUX_WORKER=0 scripts/test-linux.sh -k subreaper
+#                                        # focused diagnostics, NOT acceptance
 #
 # Why this exists: 16 tests skip on macOS because supervised workers need a Linux
 # child subreaper and /proc. Those 16 cover `acp run` — the path the README calls the
@@ -18,6 +19,12 @@ set -eu
 
 IMAGE=acp-linux-tests
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ACP_LINUX_GATE=${ACP_REQUIRE_LINUX_WORKER-1}
+case "$ACP_LINUX_GATE" in
+    1) ;;
+    0) echo "test-linux: diagnostic mode; NOT full Linux worker acceptance." >&2 ;;
+    *) echo "test-linux: ACP_REQUIRE_LINUX_WORKER must be 0 or 1." >&2; exit 2 ;;
+esac
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "test-linux: docker is required; this is the point of the script." >&2
@@ -37,7 +44,7 @@ docker build -t "$IMAGE" "$REPO/tests/linux" >/dev/null
 # fails these tests on an otherwise-green suite — see board #1707.
 exec docker run --rm --init \
     -v "$REPO:/src:ro" \
-    -e ACP_REQUIRE_LINUX_WORKER=1 \
+    -e "ACP_REQUIRE_LINUX_WORKER=$ACP_LINUX_GATE" \
     "$IMAGE" \
     sh -c '
         set -eu

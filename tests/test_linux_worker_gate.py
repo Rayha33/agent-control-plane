@@ -1,3 +1,5 @@
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -125,3 +127,59 @@ def test_previous_pytest_session_cannot_satisfy_worker_gate(worker_gate):
     result = worker_gate.run(sys.executable, str(script))
     assert result.ret == 0
     result.stdout.fnmatch_lines(["*no linux_worker tests were selected*"])
+
+
+@pytest.mark.parametrize("setting, expected", [(None, "1"), ("1", "1"), ("0", "0")])
+@pytest.mark.parametrize("docker_exit", [0, 23])
+def test_linux_script_threads_explicit_gate_into_docker(tmp_path, setting, expected, docker_exit):
+    """Verify shell argument wiring; this deliberately does not claim to run Docker."""
+    docker = tmp_path / "docker"
+    docker.write_text(
+        '#!/bin/sh\nif [ "$1" = run ]; then\n'
+        '    printf "%s\\n" "$@"\n    exit "$ACP_DOCKER_EXIT"\nfi\n'
+    )
+    docker.chmod(0o700)
+    environment = dict(os.environ, PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    environment.pop("ACP_REQUIRE_LINUX_WORKER", None)
+    if setting is not None:
+        environment["ACP_REQUIRE_LINUX_WORKER"] = setting
+    environment["ACP_DOCKER_EXIT"] = str(docker_exit)
+    script = Path(__file__).resolve().parents[1] / "scripts" / "test-linux.sh"
+    result = subprocess.run(
+        ["sh", str(script), "-k", "subreaper or duplicate_run"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == docker_exit
+    arguments = result.stdout.splitlines()
+    assert arguments[arguments.index("-e") + 1] == f"ACP_REQUIRE_LINUX_WORKER={expected}"
+    assert arguments[-2:] == ["-k", "subreaper or duplicate_run"]
+    assert "--init" in arguments
+    assert arguments[arguments.index("-v") + 1].endswith(":/src:ro")
+    assert ("NOT full Linux worker acceptance" in result.stderr) == (expected == "0")
+
+
+@pytest.mark.parametrize("setting", ["", "typo", "true", " 1"])
+def test_linux_script_rejects_invalid_gate_setting(tmp_path, setting):
+    marker = tmp_path / "docker-invoked"
+    docker = tmp_path / "docker"
+    docker.write_text('#!/bin/sh\nprintf called > "$ACP_DOCKER_PROBE"\n')
+    docker.chmod(0o700)
+    script = Path(__file__).resolve().parents[1] / "scripts" / "test-linux.sh"
+    result = subprocess.run(
+        ["sh", str(script)],
+        env=dict(
+            os.environ,
+            PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            ACP_REQUIRE_LINUX_WORKER=setting,
+            ACP_DOCKER_PROBE=str(marker),
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "ACP_REQUIRE_LINUX_WORKER must be 0 or 1" in result.stderr
+    assert not marker.exists()
