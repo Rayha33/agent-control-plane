@@ -97,6 +97,13 @@ adding one.
   needs upgrading in order to report it. (#1629)
 
 ### Fixed
+- `ACP_REQUIRE_LINUX_WORKER=1` could pass when required worker tests skipped during
+  execution or teardown, xfailed, were deselected, or were only collected. The gate
+  now requires a nonempty worker selection, no worker deselections or skips in any
+  phase, and a passing call phase for every selected worker test. Unrelated platform
+  skips remain allowed; existing pytest error exit codes are preserved. Real
+  subprocess regressions exercise the hooks. This strengthens the Linux test script;
+  activation in GitHub CI remains pending the workflow publication below. (#1633)
 - `acp guard --hook` failed OPEN. A PreToolUse hook blocks on exit 2 and any other
   non-zero exit is treated as a hook error and stepped past, so the CLI's generic
   `return 1` for `SupervisorError` was an ALLOW: a missing `ACP_ATTEMPT_ID`, an
@@ -144,41 +151,23 @@ adding one.
   `pyproject.toml`, and scans `src/` for any reintroduced hardcoded version
   literal. Verified to fail against the pre-fix source before being accepted.
   (#1633)
-- CI now runs on pushes to **every** branch. It previously triggered only on
-  `main` and on pull requests, so a push to a working branch with no open PR ran
-  nothing at all. (#1633)
-- Coverage measurement on the Linux / Python 3.12 matrix cell, uploaded as a
-  `coverage-xml` artifact. One cell only — the other cells would report the same
-  numbers. Local baseline at the time of writing: 80% overall,
-  `git_supervisor.py` 82%, with `critic.py` and `trust_helper.py` at 0% and
-  `worker_trampoline.py` at 13%. (#1633)
-- CI sets `ACP_REQUIRE_LINUX_WORKER` on the Linux cells. `tests/conftest.py`
-  has implemented this switch — a skipped `linux_worker` test becomes a failure —
-  since the worker work landed, but no workflow ever set it, so the mechanism
-  was inert and the Linux job would have stayed green with the whole `acp run`
-  path silently skipped. Measuring coverage over silently-skipped tests would
-  have put a number on the wrong object. (#1633)
 
-  🔴 **These three CI entries describe a workflow file that is NOT on this
-  branch and NOT what GitHub is running.** Pushing any file under
-  `.github/workflows/` from this machine is refused — `refusing to allow an
-  OAuth App to create or update workflow ... without 'workflow' scope`; the
-  token carries `gist`, `read:org`, `repo`. The change is therefore parked on
-  the local branch `ci/workflow-1633-needs-scope` (one commit on top of this
-  one, touching `ci.yml` only) rather than committed here, so that this branch
-  stays pushable — committing it here once left the branch permanently one
-  commit ahead and the next session had to rebuild the branch by cherry-pick to
-  land anything else. The remote still carries `push: branches: [main]`, no
-  `ACP_REQUIRE_LINUX_WORKER`, and no coverage step, and every CI run on this
-  branch to date has `event: pull_request`. To land it:
+### Pending CI integration (#1633)
 
-  ```
-  gh auth refresh -s workflow
-  git cherry-pick ci/workflow-1633-needs-scope
-  git push origin agent/git-work-safety-kernel
-  ```
+These improvements are **not active in GitHub CI**:
 
-  Do not read these entries as describing production CI until that is done.
+- Trigger checks on every branch push, including branches without an open PR.
+- Set `ACP_REQUIRE_LINUX_WORKER=1` on both Linux matrix cells.
+- Measure coverage on Linux / Python 3.12 and upload `coverage.xml` as
+  `coverage-xml`. This is one platform's measurement, not proof of identical
+  coverage across Python versions or operating systems.
+
+The CLI credential lacks GitHub's `workflow` scope, so workflow changes remain
+outside the pushable product branch. The older local candidate
+`ci/workflow-1633-needs-scope` is **not ready to cherry-pick**: its artifact action
+uses Node 20 and must be updated to a pinned Node 24-compatible release. Acceptance
+requires an observed branch-push run, both Linux worker gates executed, and a
+downloadable coverage artifact; a local green suite does not satisfy these gates.
 
 ## [0.2.0] — unreleased, current `pyproject` version
 
