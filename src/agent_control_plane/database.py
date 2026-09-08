@@ -5,13 +5,38 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
+from .schema_version import (
+    META_TABLE,
+    Migration,
+    apply_migration_ledger,
+    assert_schema_not_newer,
+    stamp_schema_version,
+    stored_schema_version,
+)
+
 GENESIS_HASH = "0" * 64
 
+
+SERVICE_SCHEMA_VERSION = 1
+"""Schema this binary understands for the FastAPI service database.
+
+Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
+two lifecycles — the service database is created by `create_app`, the control database
+by `acp init` — and coupling their numbers would force a version bump on one whenever
+the other changed.
+"""
+
+# Numbered upgrades from SERVICE_SCHEMA_VERSION - 1 to SERVICE_SCHEMA_VERSION. Version 1
+# is the baseline: the CREATE TABLE IF NOT EXISTS script plus the column adds that
+# predate stamping. Anything after 1 goes here, including changes ALTER TABLE ADD COLUMN
+# cannot express.
+MIGRATIONS: tuple[Migration, ...] = ()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -123,6 +148,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     worker_agent_id TEXT NOT NULL REFERENCES agents(id),
     task_version INTEGER NOT NULL,
     claim_fencing_token INTEGER NOT NULL,
+    resource_fencing_tokens_json TEXT NOT NULL DEFAULT '{}',
     base_revision TEXT NOT NULL,
     artifact_uri TEXT NOT NULL,
     artifact_hash TEXT NOT NULL,
@@ -189,23 +215,47 @@ class Database:
 
     def initialize(self) -> None:
         if self.path != ":memory:":
-            Path(self.path).expanduser().resolve().parent.mkdir(
-                parents=True, exist_ok=True
-            )
+            Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
+            # Read the stamp before the first CREATE or ALTER. Checking afterwards
+            # would be checking a database this binary had already written to.
+            connection.executescript(META_TABLE)
+            stored = stored_schema_version(connection)
+            assert_schema_not_newer(
+                stored,
+                binary_version=SERVICE_SCHEMA_VERSION,
+                component="service database",
+                package_version=__version__,
+            )
             if self.path != ":memory:":
-                # Persistent once set: readers no longer block behind a claim's
-                # BEGIN IMMEDIATE, and writers no longer wait for readers.
+                # Validate the schema before changing the file's journal mode.
+                # WAL lets readers continue while another connection holds a claim.
                 connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
             columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(agents)").fetchall()
+                row["name"] for row in connection.execute("PRAGMA table_info(agents)").fetchall()
             }
             if "role" not in columns:
                 connection.execute(
                     "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'"
                 )
+            submission_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(submissions)").fetchall()
+            }
+            if "resource_fencing_tokens_json" not in submission_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE submissions
+                    ADD COLUMN resource_fencing_tokens_json TEXT NOT NULL DEFAULT '{}'
+                    """
+                )
+            apply_migration_ledger(connection, stored, MIGRATIONS)
+            stamp_schema_version(
+                connection,
+                version=SERVICE_SCHEMA_VERSION,
+                package_version=__version__,
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -239,15 +289,30 @@ class Database:
             return cursor.rowcount
 
     def append_audit(
-        self, event_type: str, actor: str, payload: dict[str, Any]
+        self,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
+        """Append to the audit chain, optionally inside the caller's transaction.
+
+        A supplied connection must already hold a transaction. Its caller owns
+        commit and rollback, so domain state and its audit event cannot separate.
+        Existing callers still get the original self-contained transaction.
+        """
+        if connection is not None and not connection.in_transaction:
+            raise ValueError("audit connection must already hold a transaction")
         event_id = str(uuid.uuid4())
         created_at = utc_now()
         payload_json = canonical_json(payload)
 
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            previous = connection.execute(
+        context = self.connect() if connection is None else nullcontext(connection)
+        with context as audit_connection:
+            if connection is None:
+                audit_connection.execute("BEGIN IMMEDIATE")
+            previous = audit_connection.execute(
                 "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
             previous_hash = previous["event_hash"] if previous else GENESIS_HASH
@@ -259,7 +324,7 @@ class Database:
                 payload_json,
                 created_at,
             )
-            cursor = connection.execute(
+            cursor = audit_connection.execute(
                 """
                 INSERT INTO audit_events
                     (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
@@ -289,9 +354,7 @@ class Database:
         }
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self.all(
-            "SELECT * FROM audit_events ORDER BY sequence DESC LIMIT ?", (limit,)
-        )
+        rows = self.all("SELECT * FROM audit_events ORDER BY sequence DESC LIMIT ?", (limit,))
         return [
             {
                 "sequence": row["sequence"],
@@ -318,10 +381,7 @@ class Database:
                 row["payload_json"],
                 row["created_at"],
             )
-            if (
-                row["previous_hash"] != expected_previous
-                or row["event_hash"] != expected_hash
-            ):
+            if row["previous_hash"] != expected_previous or row["event_hash"] != expected_hash:
                 return False, len(rows), row["sequence"]
             expected_previous = row["event_hash"]
         return True, len(rows), None

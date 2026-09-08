@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Scope(BaseModel):
@@ -119,3 +119,60 @@ class AuditVerification(BaseModel):
     valid: bool
     events_checked: int
     broken_at_sequence: int | None = None
+
+
+class SideEffectMutation(BaseModel):
+    """HTTP mutation body; actor and role are always derived from the mandate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(min_length=1, max_length=200)
+    claim_fencing_token: int = Field(ge=1)
+    resource_fencing_tokens: dict[str, int] = Field(min_length=1, max_length=500)
+    target_resource: str = Field(min_length=1, max_length=500)
+    idempotency_key: str = Field(min_length=1, max_length=300)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("resource_fencing_tokens")
+    @classmethod
+    def positive_resource_tokens(cls, tokens: dict[str, int]) -> dict[str, int]:
+        if any(not resource or token < 1 for resource, token in tokens.items()):
+            raise ValueError("resource names must be nonempty and fencing tokens positive")
+        return tokens
+
+
+class A2ASideEffectMutation(BaseModel):
+    """MCP/A2A envelope using durable task and artifact identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(min_length=1, max_length=200)
+    artifact_id: str = Field(min_length=1, max_length=500)
+    kind: Literal["db", "deploy", "artifact"]
+    claim_fencing_token: int = Field(ge=1)
+    resource_fencing_tokens: dict[str, int] = Field(min_length=1, max_length=500)
+    idempotency_key: str = Field(min_length=1, max_length=300)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("resource_fencing_tokens")
+    @classmethod
+    def positive_resource_tokens(cls, tokens: dict[str, int]) -> dict[str, int]:
+        if any(not resource or token < 1 for resource, token in tokens.items()):
+            raise ValueError("resource names must be nonempty and fencing tokens positive")
+        return tokens
+
+
+class SideEffectReceiptView(BaseModel):
+    id: str
+    idempotency_key: str
+    task_id: str
+    actor_agent_id: str
+    target_resource: str
+    operation: str
+    status: str
+    request_digest: str
+    result_digest: str
+    claim_fencing_token: int
+    resource_fencing_token: int
+    created_at: str
+    replayed: bool

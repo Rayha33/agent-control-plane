@@ -10,7 +10,11 @@ from agent_control_plane.config import DEV_ADMIN_KEY, DEV_SIGNING_KEY, Settings
 def test_health_reports_the_package_version(client):
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "version": __version__}
+    assert response.json() == {
+        "status": "ok",
+        "version": __version__,
+        "auth": "enforced",
+    }
 
 
 def test_openapi_version_matches_the_package(client):
@@ -21,6 +25,7 @@ def test_from_env_reports_which_development_defaults_are_active(monkeypatch, tmp
     monkeypatch.delenv("ACP_ADMIN_KEY", raising=False)
     monkeypatch.delenv("ACP_SIGNING_KEY", raising=False)
     monkeypatch.setenv("ACP_DATABASE_PATH", str(tmp_path / "env.db"))
+    monkeypatch.setenv("ACP_INSECURE_DEV", "1")
     assert Settings.from_env().insecure_defaults == [
         "ACP_ADMIN_KEY",
         "ACP_SIGNING_KEY",

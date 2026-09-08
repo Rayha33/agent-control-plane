@@ -1,4 +1,6 @@
 .firecrawl/
+.acp/
+.firecrawl/
 .venv/
 .pytest_cache/
 .ruff_cache/
@@ -10,4 +12,9 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+# Deliberately untracked, unlike docs/ARCHITECTURE.md and docs/RESEARCH.md, which
+# ship. FOUNDER_BRIEF.md is commercial strategy, not documentation: pricing bands,
+# beachhead selection, moat, and kill criteria. It describes what to charge and when
+# to abandon the wedge, none of which belongs in a public repository. (#1633)
 docs/FOUNDER_BRIEF.md
+coverage.xml
