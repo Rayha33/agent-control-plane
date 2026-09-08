@@ -114,7 +114,10 @@ class ControlPlaneService:
                 raise ControlPlaneError(
                     401, "delegator_token_required", "parent mandate token is required"
                 )
-            parent_claims, parent = self.authenticate(delegator_token)
+            # authenticated_agent, not authenticate: a kill-switched parent (or
+            # any disabled ancestor) must not mint child mandates that would come
+            # alive the moment the switch is reset.
+            parent_claims, parent, _parent_agent = self.authenticated_agent(delegator_token)
             if parent["id"] != request.parent_mandate_id:
                 raise ControlPlaneError(
                     403,

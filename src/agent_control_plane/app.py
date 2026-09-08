@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import secrets
 from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError
@@ -23,6 +24,7 @@ from .coordination_schemas import (
     TaskClaimView,
     TaskCompleteRequest,
     TaskCreate,
+    TaskReopenRequest,
     TaskStatus,
     TaskView,
 )
@@ -58,6 +60,7 @@ from .side_effects import (
 )
 
 bearer = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 def _resolve_version() -> str:
@@ -83,6 +86,11 @@ def create_app(
     side_effect_drivers: Mapping[str, ProviderDriver] | None = None,
 ) -> FastAPI:
     active_settings = settings or Settings.from_env()
+    if active_settings.insecure_defaults:
+        logger.warning(
+            "development defaults are active for %s; set real values before exposing this service",
+            ", ".join(active_settings.insecure_defaults),
+        )
     database = Database(active_settings.database_path)
     database.initialize()
     service = ControlPlaneService(database, active_settings)
@@ -372,6 +380,14 @@ def create_app(
     )
     def complete_task(task_id: str, request: TaskCompleteRequest) -> dict:
         return coordination.complete_task(task_id, request.reason)
+
+    @app.post(
+        "/v1/tasks/{task_id}/reopen",
+        response_model=TaskView,
+        dependencies=[Depends(require_admin)],
+    )
+    def reopen_task(task_id: str, request: TaskReopenRequest) -> dict:
+        return coordination.reopen_task(task_id, request.reason)
 
     @app.post(
         "/v1/coordination/reap",

@@ -412,6 +412,20 @@ ACP can supervise a worker command and heartbeat it. It can also hand the
 worktree and token to an external session. The latter must call heartbeat and
 submit explicitly.
 
+## Reference HTTP task recovery
+
+The HTTP authority service is separate from the Git supervisor lifecycle above.
+Its administrator-only `POST /v1/tasks/{id}/reopen` endpoint returns only
+`conflicted` or `blocked` tasks to `open` after explicit operator action. It
+increments the task version, clears ownership and heartbeats, releases any
+remaining reservation, and records the previous state and reason in a
+`task.reopened` audit event. Existing submissions and reviews remain as history.
+
+The next claim mints fresh task and resource fencing tokens. Reopening does not
+authorize old workers or make old QC evidence current. Heartbeats are cleared
+when the HTTP claim ends through submission, review, completion, reaping or
+reopening.
+
 ## Deployment evolution
 
 The data model is intentionally portable:
