@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import secrets
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from . import __version__
 from .config import Settings
 from .coordination import CoordinationService
 from .coordination_schemas import (
@@ -20,6 +22,7 @@ from .coordination_schemas import (
     TaskClaimView,
     TaskCompleteRequest,
     TaskCreate,
+    TaskReopenRequest,
     TaskStatus,
     TaskView,
 )
@@ -43,10 +46,17 @@ from .schemas import (
 from .service import ControlPlaneError, ControlPlaneService
 
 bearer = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     active_settings = settings or Settings.from_env()
+    if active_settings.insecure_defaults:
+        logger.warning(
+            "development defaults are active for %s; set real values before "
+            "exposing this service",
+            ", ".join(active_settings.insecure_defaults),
+        )
     database = Database(active_settings.database_path)
     database.initialize()
     service = ControlPlaneService(database, active_settings)
@@ -54,7 +64,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Agent Control Plane",
-        version="0.1.0",
+        version=__version__,
         description=(
             "Delegated mandates, collision-free task coordination, independent QC, "
             "kill switches, and tamper-evident evidence for AI agents."
@@ -91,7 +101,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "version": "0.1.0"}
+        return {"status": "ok", "version": __version__}
 
     @app.post(
         "/v1/agents",
@@ -273,6 +283,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def complete_task(task_id: str, request: TaskCompleteRequest) -> dict:
         return coordination.complete_task(task_id, request.reason)
+
+    @app.post(
+        "/v1/tasks/{task_id}/reopen",
+        response_model=TaskView,
+        dependencies=[Depends(require_admin)],
+    )
+    def reopen_task(task_id: str, request: TaskReopenRequest) -> dict:
+        return coordination.reopen_task(task_id, request.reason)
 
     @app.post(
         "/v1/coordination/reap",

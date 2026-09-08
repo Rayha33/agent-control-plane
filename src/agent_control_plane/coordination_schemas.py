@@ -151,6 +151,10 @@ class TaskCompleteRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
 
 
+class TaskReopenRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 class ReapReport(BaseModel):
     orphaned_task_ids: list[str]
     conflicted_task_ids: list[str]

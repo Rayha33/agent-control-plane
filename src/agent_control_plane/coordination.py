@@ -402,10 +402,7 @@ class CoordinationService:
                         fencing_token,
                     ),
                 )
-            connection.execute(
-                "DELETE FROM agent_heartbeats WHERE agent_id = ? AND task_id = ?",
-                (agent["id"], task_id),
-            )
+            self._clear_heartbeats(connection, task_id)
 
         self.database.append_audit(
             "submission.created",
@@ -500,6 +497,7 @@ class CoordinationService:
                 """,
                 (task_status, created_at, task_id),
             )
+            self._clear_heartbeats(connection, task_id)
             if request.verdict == "pass":
                 resources = json.loads(task["resources_json"])
                 for resource in resources:
@@ -599,11 +597,63 @@ class CoordinationService:
                 """,
                 (completed_at, task_id),
             )
+            self._clear_heartbeats(connection, task_id)
 
         self.database.append_audit(
             "task.completed",
             "admin",
             {"reason": reason, "task_id": task_id},
+        )
+        return self.task(task_id)
+
+    def reopen_task(self, task_id: str, reason: str) -> dict[str, Any]:
+        """Return a task the service parked to the pool after operator action.
+
+        ``conflicted`` (the reaper found its post-submission reservation expired)
+        and ``blocked`` (QC blocked it or asked for a human) are the two states
+        nothing else leaves. Reopening is explicit and audited: the task goes
+        back to ``open`` with a new version, any remaining reservation is
+        released, and the next claim mints fresh fencing tokens.
+        """
+        reopened_at = utc_now()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._task_row(connection, task_id)
+            previous_status = task["status"]
+            if previous_status not in {"conflicted", "blocked"}:
+                raise ControlPlaneError(
+                    409,
+                    "task_not_reopenable",
+                    f"task cannot be reopened while status is {previous_status}",
+                )
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'open', owner_agent_id = NULL, claim_expires_at = NULL,
+                    version = version + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (reopened_at, task_id),
+            )
+            connection.execute(
+                """
+                UPDATE resource_leases
+                SET task_id = NULL, holder_agent_id = NULL,
+                    expires_at = 0, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (reopened_at, task_id),
+            )
+            self._clear_heartbeats(connection, task_id)
+
+        self.database.append_audit(
+            "task.reopened",
+            "admin",
+            {
+                "previous_status": previous_status,
+                "reason": reason,
+                "task_id": task_id,
+            },
         )
         return self.task(task_id)
 
@@ -645,9 +695,7 @@ class CoordinationService:
                     """,
                     (updated_at, task_id),
                 ).rowcount
-                connection.execute(
-                    "DELETE FROM agent_heartbeats WHERE task_id = ?", (task_id,)
-                )
+                self._clear_heartbeats(connection, task_id)
 
             rows = connection.execute(
                 """
@@ -727,6 +775,11 @@ class CoordinationService:
                 f"mandate does not allow {action} on {resource}",
             )
         return claims, mandate, agent
+
+    @staticmethod
+    def _clear_heartbeats(connection: sqlite3.Connection, task_id: str) -> None:
+        """Drop a task's heartbeat rows whenever its claim ends, whatever ended it."""
+        connection.execute("DELETE FROM agent_heartbeats WHERE task_id = ?", (task_id,))
 
     @staticmethod
     def _task_row(connection: sqlite3.Connection, task_id: str) -> sqlite3.Row:
