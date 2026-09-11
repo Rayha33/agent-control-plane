@@ -41,6 +41,20 @@ MODULES = [
     "agent_control_plane.coordination",
     "agent_control_plane.service",
     "agent_control_plane.assurance",
+    # The phase modules the split created. Pinned so a later move BETWEEN phases (not just
+    # out of git_supervisor) is acknowledged too.
+    "agent_control_plane.supervisor.common",
+    "agent_control_plane.supervisor.schema",
+    "agent_control_plane.supervisor.config",
+    "agent_control_plane.supervisor.identity",
+    "agent_control_plane.supervisor.views",
+    "agent_control_plane.supervisor.process",
+    "agent_control_plane.supervisor.workers",
+    "agent_control_plane.supervisor.runtime",
+    "agent_control_plane.supervisor.qc",
+    "agent_control_plane.supervisor.claims",
+    "agent_control_plane.supervisor.reaper",
+    "agent_control_plane.supervisor.integration",
 ]
 
 
