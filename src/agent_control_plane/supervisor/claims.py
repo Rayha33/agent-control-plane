@@ -96,10 +96,35 @@ class ClaimsMixin:
                         resource, lease["resource"]
                     ):
                         overlap = "exact" if resource == lease["resource"] else "potential"
+                        # Name BOTH sides as their tasks declared them (#1764, board #1630):
+                        # on a case-sensitive checkout the folded spelling names a file that
+                        # does not exist. Display only, and only on this refusal path — the
+                        # collision itself was decided above on the folded lease keys.
+                        # strict=False: declared_resources maps over the folded list, so the
+                        # lengths match by construction, and a refusal must never turn into a
+                        # ValueError the CLI does not catch.
+                        mine = dict(zip(requested, self._declared_resources(task), strict=False))
+                        holder = connection.execute(
+                            "SELECT resources_json, declared_resources_json FROM tasks "
+                            "WHERE id = ?",
+                            (lease["task_id"],),
+                        ).fetchone()
+                        theirs = (
+                            dict(
+                                zip(
+                                    json.loads(holder["resources_json"]),
+                                    declared_resources(holder),
+                                    strict=False,
+                                )
+                            )
+                            if holder
+                            else {}
+                        )
                         raise SupervisorError(
                             "resource_busy",
-                            f"{resource} has an {overlap} overlap with active lease "
-                            f"{lease['resource']} held by task {lease['task_id']} "
+                            f"{mine.get(resource, resource)} has an {overlap} overlap with "
+                            f"active lease {theirs.get(lease['resource'], lease['resource'])} "
+                            f"held by task {lease['task_id']} "
                             f"(agent {lease['agent_id'] or 'unknown'}, "
                             f"attempt {lease['attempt_id'] or 'unknown'})",
                         )

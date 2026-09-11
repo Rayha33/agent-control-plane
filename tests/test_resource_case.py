@@ -390,3 +390,60 @@ def test_the_lease_key_is_still_folded(repo: Path) -> None:
     with supervisor.connect() as connection:
         row = connection.execute("SELECT * FROM tasks WHERE id = ?", (created["id"],)).fetchone()
     assert json.loads(row["resources_json"]) == ["makefile"]
+
+
+# ------------------------------------------------------- the claim collision message
+
+
+def _busy_message(supervisor: GitSupervisor, *resources: str) -> str:
+    contender = make_task(supervisor, *resources)
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.claim(contender["id"], "worker-two")
+    assert captured.value.code == "resource_busy"
+    return str(captured.value)
+
+
+def test_the_resource_busy_message_names_both_sides_as_declared(declared_makefile) -> None:
+    """#1764 left one operator surface folded: the claim collision (board #1630, note 1).
+
+    On a case-sensitive checkout `makefile` is a different file, so a message saying
+    `makefile has an exact overlap with active lease makefile` sends whoever copies either
+    path at a file that does not exist. BOTH sides must be the declared spelling; one
+    declared and one folded would suggest two different resources when there is one.
+    """
+
+    supervisor, created, _attempt = declared_makefile
+    record_case_sensitivity(supervisor, True)
+
+    message = _busy_message(supervisor, "Makefile")
+
+    assert message.startswith("Makefile has an exact overlap with active lease Makefile ")
+    assert f"held by task {created['id']}" in message
+    assert "makefile" not in message
+
+
+def test_each_side_of_the_collision_keeps_its_own_spelling(declared_makefile) -> None:
+    """The lease key is folded, so `MAKEFILE` collides with a lease on `Makefile`. The
+    message says which spelling each task declared rather than inventing one."""
+
+    supervisor, _created, _attempt = declared_makefile
+    record_case_sensitivity(supervisor, True)
+
+    message = _busy_message(supervisor, "MAKEFILE")
+
+    assert message.startswith("MAKEFILE has an exact overlap with active lease Makefile ")
+
+
+def test_the_collision_is_still_decided_on_the_folded_key(declared_makefile) -> None:
+    """Display only. Which claims collide, and the lease row they collide on, must not
+    move: the folded key is lease identity (test_the_lease_key_is_still_folded)."""
+
+    supervisor, created, _attempt = declared_makefile
+    record_case_sensitivity(supervisor, True)
+
+    _busy_message(supervisor, "makefile")
+    with supervisor.connect() as connection:
+        leases = connection.execute(
+            "SELECT resource FROM resource_leases WHERE task_id = ?", (created["id"],)
+        ).fetchall()
+    assert [row["resource"] for row in leases] == ["makefile"]
