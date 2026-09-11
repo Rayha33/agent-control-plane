@@ -177,6 +177,17 @@
     ],
     "class:AttributeSnapshot": [],
     "class:Config": [],
+    "class:ConfigMixin": [
+      "_attempt_trust_pin",
+      "_current_trust_pin",
+      "_driver_definitions_for_pin",
+      "_load_config",
+      "_quarantine_trust_attempt",
+      "_quarantine_trust_attempt_in",
+      "_resolve_critic_command",
+      "_verify_attempt_trust",
+      "_verify_attempt_trust_in"
+    ],
     "class:CredentialDefinition": [
       "fingerprint",
       "option"
@@ -451,6 +462,7 @@
       "AttributeSnapshot",
       "CLEANUP_FENCE_EPOCH",
       "Config",
+      "ConfigMixin",
       "CredentialDefinition",
       "CredentialError",
       "CredentialHandle",
