@@ -1,6 +1,5 @@
 {
   "agent_control_plane.assurance": {
-    "class:Any": [],
     "class:Assurance": [
       "_git_version",
       "_record_fingerprint",
@@ -31,50 +30,6 @@
     "class:GoldenCase": [
       "description",
       "expects_rejection"
-    ],
-    "class:Path": [
-      "_make_child_relpath",
-      "_scandir",
-      "absolute",
-      "chmod",
-      "cwd",
-      "exists",
-      "expanduser",
-      "glob",
-      "group",
-      "hardlink_to",
-      "home",
-      "is_block_device",
-      "is_char_device",
-      "is_dir",
-      "is_fifo",
-      "is_file",
-      "is_junction",
-      "is_mount",
-      "is_socket",
-      "is_symlink",
-      "iterdir",
-      "lchmod",
-      "lstat",
-      "mkdir",
-      "open",
-      "owner",
-      "read_bytes",
-      "read_text",
-      "readlink",
-      "rename",
-      "replace",
-      "resolve",
-      "rglob",
-      "rmdir",
-      "samefile",
-      "stat",
-      "symlink_to",
-      "touch",
-      "unlink",
-      "walk",
-      "write_bytes",
-      "write_text"
     ],
     "class:Reviewer": [
       "fingerprint",
@@ -109,7 +64,6 @@
     ]
   },
   "agent_control_plane.coordination": {
-    "class:Any": [],
     "class:ControlPlaneError": [],
     "class:ControlPlaneService": [
       "_agent",
@@ -204,7 +158,6 @@
     ]
   },
   "agent_control_plane.git_supervisor": {
-    "class:Any": [],
     "class:Assurance": [
       "_git_version",
       "_record_fingerprint",
@@ -446,67 +399,10 @@
     ],
     "class:IdentityError": [],
     "class:IntegrationGitBoundary": [],
-    "class:Iterator": [
-      "_abc_impl"
-    ],
-    "class:Mapping": [
-      "_abc_impl",
-      "get",
-      "items",
-      "keys",
-      "values"
-    ],
-    "class:Path": [
-      "_make_child_relpath",
-      "_scandir",
-      "absolute",
-      "chmod",
-      "cwd",
-      "exists",
-      "expanduser",
-      "glob",
-      "group",
-      "hardlink_to",
-      "home",
-      "is_block_device",
-      "is_char_device",
-      "is_dir",
-      "is_fifo",
-      "is_file",
-      "is_junction",
-      "is_mount",
-      "is_socket",
-      "is_symlink",
-      "iterdir",
-      "lchmod",
-      "lstat",
-      "mkdir",
-      "open",
-      "owner",
-      "read_bytes",
-      "read_text",
-      "readlink",
-      "rename",
-      "replace",
-      "resolve",
-      "rglob",
-      "rmdir",
-      "samefile",
-      "stat",
-      "symlink_to",
-      "touch",
-      "unlink",
-      "walk",
-      "write_bytes",
-      "write_text"
-    ],
     "class:PhaseEvidence": [
       "as_dict",
       "credential_handle",
       "ok"
-    ],
-    "class:PurePosixPath": [
-      "_flavour"
     ],
     "class:Reviewer": [
       "fingerprint",
@@ -532,11 +428,6 @@
       "ready_queue"
     ],
     "class:SchemaVersionError": [],
-    "class:Sequence": [
-      "_abc_impl",
-      "count",
-      "index"
-    ],
     "class:StatusView": [
       "_allocations",
       "_attention_item",
@@ -553,37 +444,6 @@
     ],
     "class:SupervisorError": [],
     "class:TrustBundleError": [],
-    "class:datetime": [
-      "astimezone",
-      "combine",
-      "ctime",
-      "date",
-      "dst",
-      "fold",
-      "fromisoformat",
-      "fromtimestamp",
-      "hour",
-      "isoformat",
-      "max",
-      "microsecond",
-      "min",
-      "minute",
-      "now",
-      "replace",
-      "resolution",
-      "second",
-      "strptime",
-      "time",
-      "timestamp",
-      "timetuple",
-      "timetz",
-      "tzinfo",
-      "tzname",
-      "utcfromtimestamp",
-      "utcnow",
-      "utcoffset",
-      "utctimetuple"
-    ],
     "module": [
       "ACTIVE_STATUSES",
       "Any",
@@ -695,16 +555,17 @@
     ]
   },
   "agent_control_plane.runtime_drivers": {
-    "class:Any": [],
     "class:BrowserProfileDriver": [
+      "_env",
+      "credential_handle",
       "kind",
+      "ownership_identity",
+      "ownership_token",
       "probe",
       "resource_id",
+      "run_phase",
       "setup",
       "teardown"
-    ],
-    "class:Callable": [
-      "_abc_impl"
     ],
     "class:CredentialError": [],
     "class:CredentialHandle": [
@@ -718,10 +579,15 @@
     ],
     "class:DockerComposeDriver": [
       "_base",
+      "_env",
       "_timeout",
+      "credential_handle",
       "kind",
+      "ownership_identity",
+      "ownership_token",
       "probe",
       "resource_id",
+      "run_phase",
       "setup",
       "teardown"
     ],
@@ -733,18 +599,12 @@
       "option"
     ],
     "class:DriverError": [],
-    "class:Mapping": [
-      "_abc_impl",
-      "get",
-      "items",
-      "keys",
-      "values"
-    ],
     "class:NamespaceRuntimeDriver": [
       "_DEFAULT_DISK_MAX",
       "_QUOTA_PROPERTIES",
       "_chroot",
       "_egress_denied",
+      "_env",
       "_launch",
       "_mount",
       "_quota_finding",
@@ -757,55 +617,15 @@
       "_timeout",
       "_unit",
       "_unshare",
+      "credential_handle",
       "kind",
+      "ownership_identity",
+      "ownership_token",
       "probe",
       "resource_id",
+      "run_phase",
       "setup",
       "teardown"
-    ],
-    "class:Path": [
-      "_make_child_relpath",
-      "_scandir",
-      "absolute",
-      "chmod",
-      "cwd",
-      "exists",
-      "expanduser",
-      "glob",
-      "group",
-      "hardlink_to",
-      "home",
-      "is_block_device",
-      "is_char_device",
-      "is_dir",
-      "is_fifo",
-      "is_file",
-      "is_junction",
-      "is_mount",
-      "is_socket",
-      "is_symlink",
-      "iterdir",
-      "lchmod",
-      "lstat",
-      "mkdir",
-      "open",
-      "owner",
-      "read_bytes",
-      "read_text",
-      "readlink",
-      "rename",
-      "replace",
-      "resolve",
-      "rglob",
-      "rmdir",
-      "samefile",
-      "stat",
-      "symlink_to",
-      "touch",
-      "unlink",
-      "walk",
-      "write_bytes",
-      "write_text"
     ],
     "class:PhaseEvidence": [
       "as_dict",
@@ -814,11 +634,15 @@
     ],
     "class:PostgresSchemaDriver": [
       "_connection",
+      "_env",
       "_psql",
+      "credential_handle",
       "kind",
       "ownership_identity",
+      "ownership_token",
       "probe",
       "resource_id",
+      "run_phase",
       "setup",
       "teardown"
     ],
@@ -833,11 +657,6 @@
       "run_phase",
       "setup",
       "teardown"
-    ],
-    "class:Sequence": [
-      "_abc_impl",
-      "count",
-      "index"
     ],
     "module": [
       "Any",
@@ -890,7 +709,6 @@
     ]
   },
   "agent_control_plane.scheduling": {
-    "class:Any": [],
     "class:Scheduler": [
       "_active_leases",
       "_base_conflicts",
@@ -929,7 +747,6 @@
       "_abc_impl",
       "model_config"
     ],
-    "class:Any": [],
     "class:ApprovalResolve": [
       "_abc_impl",
       "model_config"
@@ -1015,13 +832,12 @@
   },
   "agent_control_plane.side_effects": {
     "class:A2ASideEffectEnvelope": [],
-    "class:Any": [],
-    "class:ArtifactPublicationAdapter": [],
+    "class:ArtifactPublicationAdapter": [
+      "apply",
+      "resource_for"
+    ],
     "class:AuthenticatedSideEffectService": [
       "execute"
-    ],
-    "class:Callable": [
-      "_abc_impl"
     ],
     "class:ClaimVerifier": [
       "_abc_impl",
@@ -1043,7 +859,10 @@
       "one",
       "verify_audit_chain"
     ],
-    "class:DeployNamespaceAdapter": [],
+    "class:DeployNamespaceAdapter": [
+      "apply",
+      "resource_for"
+    ],
     "class:FencedGateway": [
       "_ensure_schema",
       "execute",
@@ -1052,18 +871,9 @@
     "class:MCPA2ASideEffectAdapter": [
       "execute"
     ],
-    "class:Mapping": [
-      "_abc_impl",
-      "get",
-      "items",
-      "keys",
-      "values"
-    ],
-    "class:PostgresSchemaAdapter": [],
-    "class:Protocol": [
-      "_abc_impl",
-      "_is_protocol",
-      "_is_runtime_protocol"
+    "class:PostgresSchemaAdapter": [
+      "apply",
+      "resource_for"
     ],
     "class:ProviderAdapter": [
       "apply",
@@ -1132,10 +942,6 @@
     ]
   },
   "agent_control_plane.status": {
-    "class:Any": [],
-    "class:Callable": [
-      "_abc_impl"
-    ],
     "class:Scheduler": [
       "_active_leases",
       "_base_conflicts",
@@ -1168,37 +974,6 @@
       "render",
       "snapshot"
     ],
-    "class:datetime": [
-      "astimezone",
-      "combine",
-      "ctime",
-      "date",
-      "dst",
-      "fold",
-      "fromisoformat",
-      "fromtimestamp",
-      "hour",
-      "isoformat",
-      "max",
-      "microsecond",
-      "min",
-      "minute",
-      "now",
-      "replace",
-      "resolution",
-      "second",
-      "strptime",
-      "time",
-      "timestamp",
-      "timetuple",
-      "timetz",
-      "tzinfo",
-      "tzname",
-      "utcfromtimestamp",
-      "utcnow",
-      "utcoffset",
-      "utctimetuple"
-    ],
     "module": [
       "ACTIVE_STATUSES",
       "Any",
@@ -1223,61 +998,6 @@
     ]
   },
   "agent_control_plane.trust_bundles": {
-    "class:Any": [],
-    "class:Mapping": [
-      "_abc_impl",
-      "get",
-      "items",
-      "keys",
-      "values"
-    ],
-    "class:Path": [
-      "_make_child_relpath",
-      "_scandir",
-      "absolute",
-      "chmod",
-      "cwd",
-      "exists",
-      "expanduser",
-      "glob",
-      "group",
-      "hardlink_to",
-      "home",
-      "is_block_device",
-      "is_char_device",
-      "is_dir",
-      "is_fifo",
-      "is_file",
-      "is_junction",
-      "is_mount",
-      "is_socket",
-      "is_symlink",
-      "iterdir",
-      "lchmod",
-      "lstat",
-      "mkdir",
-      "open",
-      "owner",
-      "read_bytes",
-      "read_text",
-      "readlink",
-      "rename",
-      "replace",
-      "resolve",
-      "rglob",
-      "rmdir",
-      "samefile",
-      "stat",
-      "symlink_to",
-      "touch",
-      "unlink",
-      "walk",
-      "write_bytes",
-      "write_text"
-    ],
-    "class:PurePosixPath": [
-      "_flavour"
-    ],
     "class:TrustBundleError": [],
     "module": [
       "Any",

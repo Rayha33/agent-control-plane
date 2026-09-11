@@ -48,6 +48,24 @@ def _public(names) -> list[str]:
     return sorted(n for n in names if not n.startswith("__"))
 
 
+def _resolvable(cls: type) -> set[str]:
+    """Every member a caller can reach on `cls` that this package defines.
+
+    `vars(cls)` alone measures the wrong object once the split moves methods into mixin
+    classes: they leave `vars(GitSupervisor)` while staying exactly as callable as before,
+    so the old measure would report a correct move as REMOVED and would also stop noticing
+    a real removal from a mixin. Walking the MRO and keeping only classes defined in
+    agent_control_plane records what `supervisor.claim` actually resolves to, without the
+    `object`/`Exception` internals that differ between Python versions.
+    """
+
+    names: set[str] = set()
+    for klass in cls.__mro__:
+        if klass.__module__.startswith("agent_control_plane"):
+            names.update(vars(klass))
+    return names
+
+
 def surface() -> dict[str, dict[str, list[str]]]:
     result: dict[str, dict[str, list[str]]] = {}
     for name in MODULES:
@@ -55,11 +73,14 @@ def surface() -> dict[str, dict[str, list[str]]]:
         entry: dict[str, list[str]] = {"module": _public(vars(module))}
         for attr in _public(vars(module)):
             value = getattr(module, attr, None)
-            if isinstance(value, type):
+            # Only classes this package defines. An imported `Path` or `datetime` is still
+            # pinned by name in "module"; recording its members pinned the Python version
+            # instead (3.11 and 3.12 disagree about `Path._flavour`), not anything ACP owns.
+            if isinstance(value, type) and value.__module__.startswith("agent_control_plane"):
                 # Include private methods too. `_integrate_locked` and friends are
                 # private by name but are the actual subject of the split, and a
                 # rename during a move is exactly the mistake worth catching.
-                entry[f"class:{attr}"] = _public(vars(value))
+                entry[f"class:{attr}"] = _public(_resolvable(value))
         result[name] = entry
     return result
 
