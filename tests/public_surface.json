@@ -464,6 +464,15 @@
     ],
     "class:SupervisorError": [],
     "class:TrustBundleError": [],
+    "class:ViewsMixin": [
+      "_attempt_view",
+      "_qc_view",
+      "_runtime_view",
+      "_submission_row",
+      "_submission_view",
+      "_task_row",
+      "_task_view"
+    ],
     "module": [
       "ACTIVE_STATUSES",
       "Any",
@@ -518,6 +527,7 @@
       "SupervisorError",
       "TrustBundleError",
       "UTC",
+      "ViewsMixin",
       "_add_declared_resources",
       "_age_seconds",
       "_apply_ledger",
