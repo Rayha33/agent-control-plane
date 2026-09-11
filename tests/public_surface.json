@@ -424,6 +424,21 @@
       "credential_handle",
       "ok"
     ],
+    "class:ProcessMixin": [
+      "_containment_permits_fork",
+      "_git",
+      "_git_bytes",
+      "_git_operation_guard",
+      "_git_text",
+      "_process_identity",
+      "_process_state",
+      "_remove_worktree",
+      "_run_command",
+      "_run_process",
+      "_run_trusted_contained",
+      "_stop_kernel_monitor",
+      "_terminate_unexpected_monitor_target"
+    ],
     "class:Reviewer": [
       "fingerprint",
       "provenance"
@@ -512,6 +527,7 @@
       "PUBLIC_CHILD_ENV",
       "Path",
       "PhaseEvidence",
+      "ProcessMixin",
       "PurePosixPath",
       "REJECT_VERDICTS",
       "Reviewer",
