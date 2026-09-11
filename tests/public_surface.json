@@ -488,6 +488,16 @@
       "_task_row",
       "_task_view"
     ],
+    "class:WorkersMixin": [
+      "_clear_worker_registration",
+      "_finalize_registered_worker_cleanup",
+      "_prepare_terminated_attempt_cleanup",
+      "_record_registered_worker_termination",
+      "_record_worker_exit",
+      "_reserve_worker_launch",
+      "run_worker",
+      "terminate_worker"
+    ],
     "module": [
       "ACTIVE_STATUSES",
       "Any",
@@ -544,6 +554,7 @@
       "TrustBundleError",
       "UTC",
       "ViewsMixin",
+      "WorkersMixin",
       "_add_declared_resources",
       "_age_seconds",
       "_apply_ledger",
