@@ -1,7 +1,9 @@
-"""Pin the one way a pure move out of git_supervisor.py can change behaviour silently.
+"""Pin the two ways a pure move out of git_supervisor.py can change behaviour silently.
 
 Board #1630 splits git_supervisor.py into supervisor/*.py. A move is behaviour-preserving
-except in one respect the rest of the suite cannot see: a MODULE-LEVEL MONKEYPATCH.
+except where the text depends on WHICH MODULE it sits in. Two such cases are pinned here.
+
+The first is a MODULE-LEVEL MONKEYPATCH.
 
 `monkeypatch.setattr(git_supervisor, "SCHEMA_VERSION", ...)` rebinds the name in
 git_supervisor's namespace, and a function only sees that if it looks the name up in THAT
@@ -12,6 +14,9 @@ module 1: four such patch sites, and only one of them went red.
 
 So this test finds every name the suite patches on git_supervisor and asserts that every
 function reading one of those names still resolves its globals in git_supervisor.
+
+The second is `__file__`: a `Path(__file__)` expression moved verbatim names a different
+directory afterwards. test_file_relative_paths_still_name_files_that_exist pins that.
 """
 
 from __future__ import annotations
@@ -104,6 +109,44 @@ def unbound_readers(functions: list[Callable], names: set[str], home: dict) -> l
         for name in names
         if reads(function, name) and function.__globals__ is not home
     )
+
+
+FILE_RELATIVE = re.compile(
+    r"Path\(__file__\)(?:\.parent|\.parents\[\d+\]|\.resolve\(\))*"
+    r"(?:\.with_name\(\s*[\"'][\w./-]+[\"']\s*\)|\s*/\s*[\"'][\w./-]+[\"'])"
+)
+
+
+def file_relative_targets() -> list[tuple[str, Path]]:
+    """Every `Path(__file__)...` expression in the package that names a file, evaluated
+    against the file it is written in."""
+
+    package = Path(git_supervisor.__file__).resolve().parent
+    targets = []
+    for source in sorted(package.rglob("*.py")):
+        for match in FILE_RELATIVE.finditer(source.read_text(encoding="utf-8")):
+            # The regex admits only Path(__file__), .parent/.parents[n]/.resolve() and one
+            # string literal, so evaluating the matched text is evaluating that and no more.
+            target = eval(match.group(0), {"Path": Path, "__file__": str(source)})
+            targets.append((f"{source.relative_to(package)}: {match.group(0)}", target))
+    return targets
+
+
+def test_file_relative_paths_still_name_files_that_exist() -> None:
+    """The second way a byte-identical move changes behaviour: `__file__` moves with it.
+
+    Measured 2026-09-11 during #1630: `_run_process` and `run_worker` moved into
+    supervisor/process.py and supervisor/workers.py with their text unchanged, and
+    `Path(__file__).with_name("worker_trampoline.py")` quietly started naming
+    supervisor/worker_trampoline.py, which does not exist. 72 tests went red in the full
+    macOS suite, because every contained QC and integration run failed; the workers.py copy
+    sits on the Linux worker path, which only runs in Linux CI.
+    """
+
+    targets = file_relative_targets()
+    # Without this a regex that matched nothing would pass vacuously.
+    assert {"worker_trampoline.py", "critic.py"} <= {target.name for _where, target in targets}
+    assert [where for where, target in targets if not target.is_file()] == []
 
 
 def test_the_scan_finds_the_patches_the_suite_is_known_to_make() -> None:
