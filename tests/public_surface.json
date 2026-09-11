@@ -409,6 +409,15 @@
       "verify_event_chain"
     ],
     "class:IdentityError": [],
+    "class:IdentityMixin": [
+      "_authenticate",
+      "_authenticate_attempt",
+      "_identity_enforced",
+      "_reauthenticate_bound",
+      "enroll_runner",
+      "revoke_runner",
+      "runners"
+    ],
     "class:IntegrationGitBoundary": [],
     "class:PhaseEvidence": [
       "as_dict",
@@ -479,6 +488,7 @@
       "GENESIS_HASH",
       "GitSupervisor",
       "IdentityError",
+      "IdentityMixin",
       "IntegrationGitBoundary",
       "Iterator",
       "LIFECYCLE_FDS_PREFIX",
