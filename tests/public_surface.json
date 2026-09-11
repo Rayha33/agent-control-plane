@@ -439,6 +439,29 @@
       "_stop_kernel_monitor",
       "_terminate_unexpected_monitor_target"
     ],
+    "class:QcMixin": [
+      "_assert_submission_assurance",
+      "_assert_submission_object_contract",
+      "_calibration_reviewer",
+      "_critic_payload",
+      "_current_policy_passes",
+      "_evidence_window",
+      "_golden_packet",
+      "_invalidate_legacy_submission_in",
+      "_invalidate_legacy_submissions",
+      "_is_fork_denial",
+      "_policy_reviewer",
+      "_review_packet",
+      "_run_qc_locked",
+      "_submission_assurance",
+      "assurance",
+      "calibrate",
+      "qc_run",
+      "ratify_reviewers",
+      "reproduction_bundle",
+      "reviewers",
+      "run_qc"
+    ],
     "class:Reviewer": [
       "fingerprint",
       "provenance"
@@ -571,6 +594,7 @@
       "PhaseEvidence",
       "ProcessMixin",
       "PurePosixPath",
+      "QcMixin",
       "REJECT_VERDICTS",
       "Reviewer",
       "RuntimeMixin",
