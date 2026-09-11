@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import errno
 import fcntl
-import hashlib
+import hashlib as hashlib
 import hmac
 import json
 import os
@@ -24,7 +24,8 @@ import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC as UTC
+from datetime import datetime as datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -72,6 +73,27 @@ from .status import (
     StatusView,
     _age_seconds,
 )
+from .supervisor.common import (
+    CLEANUP_FENCE_EPOCH,
+    DEFAULT_GC_RETENTION_SECONDS,
+    EVIDENCE_STREAM_BUDGET,
+    FORK_DENIED_EXIT_CODE,
+    FORK_DENIED_SIGNATURE,
+    GC_RECLAIMABLE_TASK_STATUSES,
+    GENESIS_HASH,
+    MAX_ATTRIBUTE_BYTES,
+    MERGE_SEMANTIC_CONFIG,
+    PUBLIC_CHILD_ENV,
+    SUBMISSION_OBJECT_CONTRACT,
+    SUPERVISOR_SECRET_ENV,
+    AttributeSnapshot,
+    IntegrationGitBoundary,
+    RuntimePortPool,
+    SupervisorError,
+    canonical_json,
+    sha256,
+    utc_now,
+)
 
 # Board #1630: the table definitions, the idempotent column upgrade and the
 # case-sensitivity probe now live in `supervisor.schema`. They are imported back into this
@@ -92,83 +114,8 @@ from .trust_bundles import (
 )
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX, MONITOR_MODE
 
-GENESIS_HASH = "0" * 64
-CLEANUP_FENCE_EPOCH = 2**62
-SUBMISSION_OBJECT_CONTRACT = "replacement-free-v1"
-MAX_ATTRIBUTE_BYTES = 1024 * 1024
-SUPERVISOR_SECRET_ENV = {"ACP_RUNNER_CREDENTIAL"}
-PUBLIC_CHILD_ENV = {
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "LOGNAME",
-    "PATH",
-    "SHELL",
-    "TERM",
-    "TMPDIR",
-    "USER",
-}
-MERGE_SEMANTIC_CONFIG = (
-    "core.autocrlf",
-    "core.bigfilethreshold",
-    "core.checkroundtripencoding",
-    "core.eol",
-    "core.filemode",
-    "core.ignorecase",
-    "core.precomposeunicode",
-    "core.protecthfs",
-    "core.protectntfs",
-    "core.safecrlf",
-    "core.symlinks",
-    "diff.algorithm",
-    "diff.indentheuristic",
-    "diff.renamelimit",
-    "diff.renames",
-    "merge.conflictstyle",
-    "merge.directoryrenames",
-    "merge.renamelimit",
-    "merge.renames",
-    "merge.renormalize",
-)
-
-
-class SupervisorError(RuntimeError):
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-
-
 SCHEMA_VERSION = 2
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
-
-GC_RECLAIMABLE_TASK_STATUSES = frozenset(
-    {"done", "orphaned", "blocked", "conflicted", "changes_requested"}
-)
-"""Task states whose attempt worktree is no longer the working copy of anything.
-
-Keyed on the TASK, not the attempt. An attempt that was submitted and integrated stays
-at `submitted` forever — nothing ever moves it to a terminal state — so an attempt-keyed
-sweep would find nothing to reclaim on exactly the tasks that finished cleanly.
-"""
-
-DEFAULT_GC_RETENTION_SECONDS = 7 * 24 * 3600
-
-FORK_DENIED_EXIT_CODE = 128
-FORK_DENIED_SIGNATURE = "fork: Operation not permitted"
-"""The two halves of a denied fork, together.
-
-Measured on Darwin under this repository's own containment profile: a command that
-must fork exits 128 with `/bin/sh: fork: Operation not permitted`, while a missing
-binary exits 127 with `No such file or directory` and fork fully available. The exit
-code alone does not distinguish them.
-"""
-
-EVIDENCE_STREAM_BUDGET = 2000
-"""Characters kept per output stream in a QC finding's evidence.
-
-Per stream, not in total: a run that fails loudly on both is exactly the one whose
-evidence must not be half-truncated.
-"""
 
 
 # Numbered upgrades from SCHEMA_VERSION - 1 to SCHEMA_VERSION, applied in order, each
@@ -222,47 +169,6 @@ def assert_schema_not_newer(stored: int | None) -> None:
         )
     except SchemaVersionError as error:
         raise SupervisorError(error.code, str(error)) from None
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def sha256(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
-@dataclass(frozen=True)
-class RuntimePortPool:
-    env_name: str
-    start: int
-    end: int
-
-
-@dataclass(frozen=True)
-class IntegrationGitBoundary:
-    git: str
-    git_dir: Path
-    object_dir: Path
-    env: Mapping[str, str]
-    git_digest: str
-    git_size: int
-    config_digest: str
-    alternates_text: str
-    global_attributes: bytes | None
-    info_attributes: bytes | None
-    merge_input_evidence: Mapping[str, Any]
-    oid_length: int
-
-
-@dataclass(frozen=True)
-class AttributeSnapshot:
-    content: bytes | None
-    evidence: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
