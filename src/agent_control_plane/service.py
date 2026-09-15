@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
@@ -44,21 +45,6 @@ class ControlPlaneService:
             raise ControlPlaneError(404, "parent_not_found", "parent agent not found")
         agent_id = str(uuid.uuid4())
         created_at = utc_now()
-        self.database.execute(
-            """
-            INSERT INTO agents
-                (id, name, owner, parent_agent_id, role, disabled, created_at)
-            VALUES (?, ?, ?, ?, ?, 0, ?)
-            """,
-            (
-                agent_id,
-                request.name,
-                request.owner,
-                request.parent_agent_id,
-                request.role,
-                created_at,
-            ),
-        )
         agent = {
             "id": agent_id,
             "name": request.name,
@@ -68,7 +54,24 @@ class ControlPlaneService:
             "disabled": False,
             "created_at": created_at,
         }
-        self.database.append_audit("agent.created", request.owner, agent)
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO agents
+                    (id, name, owner, parent_agent_id, role, disabled, created_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    agent_id,
+                    request.name,
+                    request.owner,
+                    request.parent_agent_id,
+                    request.role,
+                    created_at,
+                ),
+            )
+            self.database.append_audit("agent.created", request.owner, agent, connection=connection)
         return agent
 
     def create_policy(self, request: PolicyCreate) -> dict[str, Any]:
@@ -76,26 +79,28 @@ class ControlPlaneService:
             raise ControlPlaneError(404, "agent_not_found", "agent not found")
         policy_id = str(uuid.uuid4())
         created_at = utc_now()
-        self.database.execute(
-            """
-            INSERT INTO policies
-                (id, agent_id, action_pattern, resource_pattern, effect,
-                 requires_approval, max_amount_cents, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                policy_id,
-                request.agent_id,
-                request.action_pattern,
-                request.resource_pattern,
-                request.effect,
-                int(request.requires_approval),
-                request.max_amount_cents,
-                created_at,
-            ),
-        )
         policy = request.model_dump() | {"id": policy_id, "created_at": created_at}
-        self.database.append_audit("policy.created", "admin", policy)
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO policies
+                    (id, agent_id, action_pattern, resource_pattern, effect,
+                     requires_approval, max_amount_cents, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    policy_id,
+                    request.agent_id,
+                    request.action_pattern,
+                    request.resource_pattern,
+                    request.effect,
+                    int(request.requires_approval),
+                    request.max_amount_cents,
+                    created_at,
+                ),
+            )
+            self.database.append_audit("policy.created", "admin", policy, connection=connection)
         return policy
 
     def issue_mandate(
@@ -153,24 +158,8 @@ class ControlPlaneService:
         mandate_id = str(uuid.uuid4())
         scopes = [scope.model_dump() for scope in request.scopes]
         created_at = utc_now()
-        self.database.execute(
-            """
-            INSERT INTO mandates
-                (id, agent_id, subject, parent_mandate_id, scopes_json,
-                 max_amount_cents, expires_at, revoked, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-            """,
-            (
-                mandate_id,
-                request.agent_id,
-                request.subject,
-                request.parent_mandate_id,
-                canonical_json(scopes),
-                request.max_amount_cents,
-                expires_at,
-                created_at,
-            ),
-        )
+        # Minted before the row exists: signing is pure, so a failure here must not
+        # leave a mandate behind that no token was ever issued against.
         token = issue_token(
             signing_key=self.settings.signing_key,
             issuer=self.settings.issuer,
@@ -180,18 +169,39 @@ class ControlPlaneService:
             scopes=scopes,
             expires_at=expires_at,
         )
-        self.database.append_audit(
-            "mandate.issued",
-            request.subject,
-            {
-                "agent_id": request.agent_id,
-                "expires_at": expires_at,
-                "mandate_id": mandate_id,
-                "max_amount_cents": request.max_amount_cents,
-                "parent_mandate_id": request.parent_mandate_id,
-                "scopes": scopes,
-            },
-        )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO mandates
+                    (id, agent_id, subject, parent_mandate_id, scopes_json,
+                     max_amount_cents, expires_at, revoked, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    mandate_id,
+                    request.agent_id,
+                    request.subject,
+                    request.parent_mandate_id,
+                    canonical_json(scopes),
+                    request.max_amount_cents,
+                    expires_at,
+                    created_at,
+                ),
+            )
+            self.database.append_audit(
+                "mandate.issued",
+                request.subject,
+                {
+                    "agent_id": request.agent_id,
+                    "expires_at": expires_at,
+                    "mandate_id": mandate_id,
+                    "max_amount_cents": request.max_amount_cents,
+                    "parent_mandate_id": request.parent_mandate_id,
+                    "scopes": scopes,
+                },
+                connection=connection,
+            )
         return {
             "id": mandate_id,
             "agent_id": request.agent_id,
@@ -295,14 +305,19 @@ class ControlPlaneService:
                 return self._consume_approval(
                     request.approval_id, mandate, claims["actor"], request, base
                 )
-            action_id = self._create_action_request(mandate, request)
-            return self._decision(
-                "approval_required",
-                "matching policy requires human approval",
-                claims["actor"],
-                request,
-                base | {"action_request_id": action_id},
-            )
+            # The pending action request and the decision that names it are one
+            # write: an approval queue entry no audit event points at is not evidence.
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                action_id = self._create_action_request(connection, mandate, request)
+                return self._decision(
+                    "approval_required",
+                    "matching policy requires human approval",
+                    claims["actor"],
+                    request,
+                    base | {"action_request_id": action_id},
+                    connection=connection,
+                )
 
         return self._decision("allowed", "authorized", claims["actor"], request, base)
 
@@ -316,19 +331,22 @@ class ControlPlaneService:
             )
         status = "approved" if request.approved else "denied"
         resolved_at = utc_now()
-        self.database.execute(
-            """
-            UPDATE action_requests
-            SET status = ?, resolution_reason = ?, resolved_at = ?
-            WHERE id = ?
-            """,
-            (status, request.reason, resolved_at, action_id),
-        )
-        self.database.append_audit(
-            f"approval.{status}",
-            "admin",
-            {"action_request_id": action_id, "reason": request.reason},
-        )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE action_requests
+                SET status = ?, resolution_reason = ?, resolved_at = ?
+                WHERE id = ?
+                """,
+                (status, request.reason, resolved_at, action_id),
+            )
+            self.database.append_audit(
+                f"approval.{status}",
+                "admin",
+                {"action_request_id": action_id, "reason": request.reason},
+                connection=connection,
+            )
         return self.action_request(action_id)
 
     def action_request(self, action_id: str) -> dict[str, Any]:
@@ -352,14 +370,18 @@ class ControlPlaneService:
         agent = self._agent(agent_id)
         if not agent:
             raise ControlPlaneError(404, "agent_not_found", "agent not found")
-        self.database.execute(
-            "UPDATE agents SET disabled = ? WHERE id = ?", (int(disabled), agent_id)
-        )
-        self.database.append_audit(
-            "agent.disabled" if disabled else "agent.enabled",
-            "admin",
-            {"agent_id": agent_id, "reason": reason},
-        )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE agents SET disabled = ? WHERE id = ?", (int(disabled), agent_id)
+            )
+            self.database.append_audit(
+                "agent.disabled" if disabled else "agent.enabled",
+                "admin",
+                {"agent_id": agent_id, "reason": reason},
+                connection=connection,
+            )
+        # Read back only after the commit: the kill switch is what the next caller sees.
         updated = self._agent(agent_id)
         return self._agent_view(updated)
 
@@ -369,12 +391,15 @@ class ControlPlaneService:
             raise ControlPlaneError(404, "mandate_not_found", "mandate not found")
         if row["revoked"]:
             raise ControlPlaneError(409, "mandate_revoked", "mandate is already revoked")
-        self.database.execute("UPDATE mandates SET revoked = 1 WHERE id = ?", (mandate_id,))
-        self.database.append_audit(
-            "mandate.revoked",
-            "admin",
-            {"mandate_id": mandate_id, "reason": reason},
-        )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("UPDATE mandates SET revoked = 1 WHERE id = ?", (mandate_id,))
+            self.database.append_audit(
+                "mandate.revoked",
+                "admin",
+                {"mandate_id": mandate_id, "reason": reason},
+                connection=connection,
+            )
 
     def _agent(self, agent_id: str) -> dict[str, Any] | None:
         row = self.database.one("SELECT * FROM agents WHERE id = ?", (agent_id,))
@@ -414,9 +439,14 @@ class ControlPlaneService:
     def _agent_view(agent: dict[str, Any]) -> dict[str, Any]:
         return agent | {"disabled": bool(agent["disabled"])}
 
-    def _create_action_request(self, mandate: dict[str, Any], request: AuthorizationRequest) -> str:
+    def _create_action_request(
+        self,
+        connection: sqlite3.Connection,
+        mandate: dict[str, Any],
+        request: AuthorizationRequest,
+    ) -> str:
         action_id = str(uuid.uuid4())
-        self.database.execute(
+        connection.execute(
             """
             INSERT INTO action_requests
                 (id, mandate_id, agent_id, action, resource, context_json,
@@ -460,22 +490,28 @@ class ControlPlaneService:
             return self._decision(
                 "denied", f"approval status is {row['status']}", actor, request, base
             )
-        updated = self.database.execute_count(
-            """
-            UPDATE action_requests SET status = 'consumed'
-            WHERE id = ? AND status = 'approved'
-            """,
-            (approval_id,),
-        )
-        if updated != 1:
-            return self._decision("denied", "approval was already consumed", actor, request, base)
-        return self._decision(
-            "allowed",
-            "authorized with one-time approval",
-            actor,
-            request,
-            base | {"action_request_id": approval_id},
-        )
+        # Burning the one-time approval and recording the decision that burned it share
+        # one transaction. A consumed approval with no decision behind it is
+        # indistinguishable from one that was never used.
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            consumed = connection.execute(
+                """
+                UPDATE action_requests SET status = 'consumed'
+                WHERE id = ? AND status = 'approved'
+                """,
+                (approval_id,),
+            ).rowcount
+            if consumed == 1:
+                return self._decision(
+                    "allowed",
+                    "authorized with one-time approval",
+                    actor,
+                    request,
+                    base | {"action_request_id": approval_id},
+                    connection=connection,
+                )
+        return self._decision("denied", "approval was already consumed", actor, request, base)
 
     def _decision(
         self,
@@ -484,7 +520,14 @@ class ControlPlaneService:
         actor: str,
         request: AuthorizationRequest,
         extra: dict[str, Any],
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
+        """Record a decision, inside the caller's transaction when it made one.
+
+        Most decisions change nothing, so they keep the self-contained audit write.
+        The two that DO mutate -- queueing an action request, consuming an approval --
+        pass their connection so the row and the event cannot separate.
+        """
         result = {"decision": decision, "reason": reason} | extra
         self.database.append_audit(
             "authorization.decided",
@@ -497,5 +540,6 @@ class ControlPlaneService:
                 "resource": request.resource,
                 **extra,
             },
+            connection=connection,
         )
         return result

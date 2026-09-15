@@ -533,18 +533,23 @@ class FencedGateway:
                 ),
             )
 
-        self.database.append_audit(
-            "side_effect.applied",
-            f"agent:{request.agent_id}",
-            {
-                "operation": receipt.operation,
-                "receipt_id": receipt.id,
-                "request_digest": receipt.request_digest,
-                "resource_fencing_token": receipt.resource_fencing_token,
-                "target_resource": receipt.target_resource,
-                "task_id": receipt.task_id,
-            },
-        )
+            # 7. The receipt and its audit event commit together. The provider is handed the
+            #    idempotency key precisely so a rolled-back retry is safe there; a receipt
+            #    with no chain entry would not be -- it is a mutation of an external system
+            #    that the tamper-evident log cannot account for.
+            self.database.append_audit(
+                "side_effect.applied",
+                f"agent:{request.agent_id}",
+                {
+                    "operation": receipt.operation,
+                    "receipt_id": receipt.id,
+                    "request_digest": receipt.request_digest,
+                    "resource_fencing_token": receipt.resource_fencing_token,
+                    "target_resource": receipt.target_resource,
+                    "task_id": receipt.task_id,
+                },
+                connection=connection,
+            )
         return receipt
 
     def receipts(self, task_id: str) -> list[dict[str, Any]]:

@@ -108,6 +108,26 @@ adding one.
   back. The admin-only reopen route retains fresh fencing on the next claim.
   Independent fault-injection tests cover both application and SQL insert failures.
   Other older state/audit transaction boundaries remain tracked in #1832. (#1831)
+- Every remaining state mutation now commits with its audit event or not at all. #1831
+  fixed reopen; the same split transaction was live in sixteen other paths — the seven
+  coordination writes (`create_task`, `claim_task`, `heartbeat`, `submit`, `review`,
+  `complete_task`, `reap_expired`), eight control-plane writes (`create_agent`,
+  `create_policy`, `issue_mandate`, `resolve_approval`, `set_agent_state`,
+  `revoke_mandate`, and the two authorization paths that queue and then consume an
+  approval), and the fenced side-effect receipt. Confirmed live, not inferred: injecting
+  a failure at the audit call left `agents.disabled` persisted with no event to explain
+  it. Each site now passes its own connection to the transaction-scoped
+  `Database.append_audit(connection=...)` inside the original `BEGIN IMMEDIATE`
+  boundary; no nested transactions, no new schema, and callers that append without a
+  connection are unchanged. `issue_mandate` also signs before it writes, so a signing
+  failure can no longer leave a mandate row no token was ever issued against.
+  `tests/test_atomic_audit.py` drives all seventeen entry points for real and fails each
+  one two ways — an exception raised inside `append_audit`, and a `BEFORE INSERT`
+  trigger aborting the real SQLite write — then asserts every table is byte-identical to
+  the pre-call snapshot. It carries its own controls: reopen (already atomic) must stay
+  green, each scenario must be shown to append exactly one event of its type on the
+  success path, and six threads racing one claim must still produce one winner, one
+  `task.claimed` event and a valid chain. (#1832)
 - `ACP_REQUIRE_LINUX_WORKER=1` could pass when required worker tests skipped during
   execution or teardown, xfailed, were deselected, or were only collected. The gate
   now requires a nonempty worker selection, no worker deselections or skips in any
