@@ -17,7 +17,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import time
+import time as time
 import tomllib as tomllib
 import unicodedata as unicodedata
 import uuid as uuid
@@ -87,7 +87,7 @@ from .runtime_drivers import (
 from .runtime_drivers import (
     resolve_trusted_executable as resolve_trusted_executable,
 )
-from .scheduling import Scheduler
+from .scheduling import Scheduler as Scheduler
 from .scheduling import declared_resources as declared_resources
 from .scheduling import normalize_artifact as normalize_artifact
 from .schema_version import (
@@ -102,11 +102,13 @@ from .status import (
     ACTIVE_STATUSES as ACTIVE_STATUSES,
 )
 from .status import (
-    DEFAULT_LEASE_RISK_SECONDS,
-    StatusView,
+    DEFAULT_LEASE_RISK_SECONDS as DEFAULT_LEASE_RISK_SECONDS,
 )
 from .status import (
     LIVE_ATTEMPT_STATUSES as LIVE_ATTEMPT_STATUSES,
+)
+from .status import (
+    StatusView as StatusView,
 )
 from .status import (
     _age_seconds as _age_seconds,
@@ -114,12 +116,14 @@ from .status import (
 from .supervisor.claims import ClaimsMixin
 from .supervisor.common import (
     CLEANUP_FENCE_EPOCH,
-    DEFAULT_GC_RETENTION_SECONDS,
     MAX_ATTRIBUTE_BYTES,
     PUBLIC_CHILD_ENV,
     AttributeSnapshot,
     SupervisorError,
     utc_now,
+)
+from .supervisor.common import (
+    DEFAULT_GC_RETENTION_SECONDS as DEFAULT_GC_RETENTION_SECONDS,
 )
 from .supervisor.common import (
     EVIDENCE_STREAM_BUDGET as EVIDENCE_STREAM_BUDGET,
@@ -587,52 +591,6 @@ class GitSupervisor(
                 or right_prefix.startswith(left_prefix + "/")
             )
         return False
-
-    def task(self, task_id: str) -> dict[str, Any]:
-        with self.connect() as connection:
-            return self._task_view(connection, self._task_row(connection, task_id))
-
-    def list_tasks(self) -> list[dict[str, Any]]:
-        self.reap_expired()
-        with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM tasks ORDER BY priority DESC, created_at"
-            ).fetchall()
-            return [self._task_view(connection, row) for row in rows]
-
-    def plan_claim(self, task_id: str) -> dict[str, Any]:
-        """Dry-run a claim. Read-only: it never reaps, claims, or provisions."""
-        return Scheduler(self).plan_claim(task_id)
-
-    def ready_queue(self) -> dict[str, Any]:
-        """Deterministic launch plan for every claimable task. Read-only."""
-        return Scheduler(self).ready_queue()
-
-    def merge_plan(self) -> dict[str, Any]:
-        """Integration ordering preview for approved submissions. Read-only."""
-        self._assert_no_git_grafts()
-        return Scheduler(self).merge_plan()
-
-    def status(
-        self,
-        limit: int | None = None,
-        lease_risk_seconds: int = DEFAULT_LEASE_RISK_SECONDS,
-    ) -> dict[str, Any]:
-        """Operator snapshot: attention queue, phases, runtimes, blockers. Read-only."""
-        snapshot = StatusView(self).snapshot(limit, lease_risk_seconds)
-        with self.connect() as connection:
-            reclaimable, _ = self._gc_survey(connection, time.time(), DEFAULT_GC_RETENTION_SECONDS)
-        snapshot["disk"] = {
-            "state_bytes": self._directory_bytes(self.state_dir),
-            "reclaimable_worktrees": len(reclaimable),
-            "reclaimable_bytes": sum(entry["bytes"] for entry in reclaimable),
-        }
-        return snapshot
-
-    @staticmethod
-    def render_status(snapshot: dict[str, Any]) -> str:
-        """Human-readable rendering of a `status()` snapshot; JSON stays canonical."""
-        return StatusView.render(snapshot)
 
     # -- authenticated runner identities -----------------------------------
 

@@ -626,7 +626,14 @@
       "_submission_row",
       "_submission_view",
       "_task_row",
-      "_task_view"
+      "_task_view",
+      "list_tasks",
+      "merge_plan",
+      "plan_claim",
+      "ready_queue",
+      "render_status",
+      "status",
+      "task"
     ],
     "class:WorkersMixin": [
       "_clear_worker_registration",
@@ -1728,6 +1735,38 @@
     ]
   },
   "agent_control_plane.supervisor.views": {
+    "class:Scheduler": [
+      "_active_leases",
+      "_base_conflicts",
+      "_base_state",
+      "_blocking_dependencies",
+      "_conflict_blockers",
+      "_dependency_blockers",
+      "_dependency_edges",
+      "_find_cycle",
+      "_merge_order",
+      "_preview",
+      "_producers",
+      "_task_records",
+      "merge_plan",
+      "plan_claim",
+      "plan_pass",
+      "ready_queue"
+    ],
+    "class:StatusView": [
+      "_allocations",
+      "_attention_item",
+      "_categorize",
+      "_held_resources",
+      "_latest_attempts",
+      "_latest_submissions",
+      "_quarantines",
+      "_runtimes",
+      "_task_entry",
+      "_worker",
+      "render",
+      "snapshot"
+    ],
     "class:SupervisorError": [],
     "class:ViewsMixin": [
       "_attempt_view",
@@ -1736,15 +1775,27 @@
       "_submission_row",
       "_submission_view",
       "_task_row",
-      "_task_view"
+      "_task_view",
+      "list_tasks",
+      "merge_plan",
+      "plan_claim",
+      "ready_queue",
+      "render_status",
+      "status",
+      "task"
     ],
     "module": [
       "Any",
+      "DEFAULT_GC_RETENTION_SECONDS",
+      "DEFAULT_LEASE_RISK_SECONDS",
+      "Scheduler",
+      "StatusView",
       "SupervisorError",
       "ViewsMixin",
       "annotations",
       "json",
-      "sqlite3"
+      "sqlite3",
+      "time"
     ]
   },
   "agent_control_plane.supervisor.workers": {

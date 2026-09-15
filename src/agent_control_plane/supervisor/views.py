@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from typing import Any
 
-from .common import SupervisorError
+from ..scheduling import Scheduler
+from ..status import DEFAULT_LEASE_RISK_SECONDS, StatusView
+from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError
 
 
 class ViewsMixin:
@@ -193,3 +196,49 @@ class ViewsMixin:
         if not row:
             raise SupervisorError("submission_not_found", f"submission {submission_id} not found")
         return row
+
+    def task(self, task_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            return self._task_view(connection, self._task_row(connection, task_id))
+
+    def list_tasks(self) -> list[dict[str, Any]]:
+        self.reap_expired()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tasks ORDER BY priority DESC, created_at"
+            ).fetchall()
+            return [self._task_view(connection, row) for row in rows]
+
+    def plan_claim(self, task_id: str) -> dict[str, Any]:
+        """Dry-run a claim. Read-only: it never reaps, claims, or provisions."""
+        return Scheduler(self).plan_claim(task_id)
+
+    def ready_queue(self) -> dict[str, Any]:
+        """Deterministic launch plan for every claimable task. Read-only."""
+        return Scheduler(self).ready_queue()
+
+    def merge_plan(self) -> dict[str, Any]:
+        """Integration ordering preview for approved submissions. Read-only."""
+        self._assert_no_git_grafts()
+        return Scheduler(self).merge_plan()
+
+    def status(
+        self,
+        limit: int | None = None,
+        lease_risk_seconds: int = DEFAULT_LEASE_RISK_SECONDS,
+    ) -> dict[str, Any]:
+        """Operator snapshot: attention queue, phases, runtimes, blockers. Read-only."""
+        snapshot = StatusView(self).snapshot(limit, lease_risk_seconds)
+        with self.connect() as connection:
+            reclaimable, _ = self._gc_survey(connection, time.time(), DEFAULT_GC_RETENTION_SECONDS)
+        snapshot["disk"] = {
+            "state_bytes": self._directory_bytes(self.state_dir),
+            "reclaimable_worktrees": len(reclaimable),
+            "reclaimable_bytes": sum(entry["bytes"] for entry in reclaimable),
+        }
+        return snapshot
+
+    @staticmethod
+    def render_status(snapshot: dict[str, Any]) -> str:
+        """Human-readable rendering of a `status()` snapshot; JSON stays canonical."""
+        return StatusView.render(snapshot)
