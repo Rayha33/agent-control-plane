@@ -55,6 +55,7 @@ MODULES = [
     "agent_control_plane.supervisor.claims",
     "agent_control_plane.supervisor.reaper",
     "agent_control_plane.supervisor.integration",
+    "agent_control_plane.supervisor.store",
 ]
 
 

@@ -21,9 +21,10 @@ import time
 import tomllib as tomllib
 import unicodedata
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator as Iterator
 from collections.abc import Mapping as Mapping
-from contextlib import contextmanager
+from collections.abc import Sequence
+from contextlib import contextmanager as contextmanager
 from dataclasses import dataclass as dataclass
 from datetime import UTC as UTC
 from datetime import datetime as datetime
@@ -112,13 +113,11 @@ from .supervisor.claims import ClaimsMixin
 from .supervisor.common import (
     CLEANUP_FENCE_EPOCH,
     DEFAULT_GC_RETENTION_SECONDS,
-    GENESIS_HASH,
     MAX_ATTRIBUTE_BYTES,
     PUBLIC_CHILD_ENV,
     AttributeSnapshot,
     SupervisorError,
     canonical_json,
-    sha256,
     utc_now,
 )
 from .supervisor.common import (
@@ -133,6 +132,7 @@ from .supervisor.common import (
 from .supervisor.common import (
     GC_RECLAIMABLE_TASK_STATUSES as GC_RECLAIMABLE_TASK_STATUSES,
 )
+from .supervisor.common import GENESIS_HASH as GENESIS_HASH
 from .supervisor.common import (
     MERGE_SEMANTIC_CONFIG as MERGE_SEMANTIC_CONFIG,
 )
@@ -148,6 +148,7 @@ from .supervisor.common import (
 from .supervisor.common import (
     RuntimePortPool as RuntimePortPool,
 )
+from .supervisor.common import sha256 as sha256
 from .supervisor.config import (
     Config as Config,
 )
@@ -172,6 +173,7 @@ from .supervisor.schema import (
     probe_case_sensitive_paths,
 )
 from .supervisor.schema import migrate as _schema_migrate
+from .supervisor.store import StoreMixin
 from .supervisor.views import ViewsMixin
 from .supervisor.workers import WorkersMixin
 from .trust_bundles import (
@@ -243,6 +245,7 @@ def assert_schema_not_newer(stored: int | None) -> None:
 
 
 class GitSupervisor(
+    StoreMixin,
     ConfigMixin,
     IdentityMixin,
     ViewsMixin,
@@ -559,77 +562,6 @@ class GitSupervisor(
                 "not_git_repository", result.stderr.strip() or "not a Git repository"
             )
         return Path(result.stdout.strip()).resolve()
-
-    @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        if self.read_only:
-            # mode=ro makes the refusal structural rather than a matter of discipline:
-            # a stray INSERT raises instead of landing. journal_mode and secure_delete
-            # are omitted because setting them writes the database header — which is
-            # exactly how a "read-only" command used to leave fingerprints.
-            connection = sqlite3.connect(f"{self.db_path.as_uri()}?mode=ro", uri=True, timeout=30)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA busy_timeout = 30000")
-            try:
-                yield connection
-            finally:
-                connection.close()
-            return
-        connection = sqlite3.connect(self.db_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA secure_delete = ON")
-        try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def _event(
-        self,
-        connection: sqlite3.Connection,
-        event_type: str,
-        actor: str,
-        payload: dict[str, Any],
-    ) -> None:
-        event_id = str(uuid.uuid4())
-        created = utc_now()
-        prior = connection.execute(
-            "SELECT event_hash FROM events ORDER BY sequence DESC LIMIT 1"
-        ).fetchone()
-        previous_hash = prior["event_hash"] if prior else GENESIS_HASH
-        material = canonical_json(
-            {
-                "actor": actor,
-                "created_at": created,
-                "event_id": event_id,
-                "event_type": event_type,
-                "payload": payload,
-                "previous_hash": previous_hash,
-            }
-        )
-        connection.execute(
-            """
-            INSERT INTO events
-              (id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_id,
-                event_type,
-                actor,
-                canonical_json(payload),
-                previous_hash,
-                sha256(material.encode()),
-                created,
-            ),
-        )
 
     @staticmethod
     def normalize_resource(raw: str, repo: Path | None = None, *, fold: bool = True) -> str:
@@ -1167,37 +1099,6 @@ class GitSupervisor(
         )
         checks.append({"name": "event_chain", **self.verify_event_chain()})
         return {"ok": all(check["ok"] for check in checks), "checks": checks}
-
-    def verify_event_chain(self) -> dict[str, Any]:
-        previous = GENESIS_HASH
-        with self.connect() as connection:
-            rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
-        for row in rows:
-            try:
-                payload = json.loads(row["payload_json"])
-            except (json.JSONDecodeError, TypeError, UnicodeError):
-                return {
-                    "ok": False,
-                    "detail": f"event payload is invalid at sequence {row['sequence']}",
-                }
-            material = canonical_json(
-                {
-                    "actor": row["actor"],
-                    "created_at": row["created_at"],
-                    "event_id": row["id"],
-                    "event_type": row["event_type"],
-                    "payload": payload,
-                    "previous_hash": previous,
-                }
-            )
-            expected = sha256(material.encode())
-            if row["previous_hash"] != previous or row["event_hash"] != expected:
-                return {
-                    "ok": False,
-                    "detail": f"event chain breaks at sequence {row['sequence']}",
-                }
-            previous = row["event_hash"]
-        return {"ok": True, "detail": f"{len(rows)} events verified"}
 
     @staticmethod
     def _read_integration_info_attributes(common_dir: Path) -> AttributeSnapshot:

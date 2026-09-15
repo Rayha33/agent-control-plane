@@ -609,6 +609,11 @@
       "render",
       "snapshot"
     ],
+    "class:StoreMixin": [
+      "_event",
+      "connect",
+      "verify_event_chain"
+    ],
     "class:SupervisorError": [],
     "class:TrustBundleError": [],
     "class:ViewsMixin": [
@@ -687,6 +692,7 @@
       "SchemaVersionError",
       "Sequence",
       "StatusView",
+      "StoreMixin",
       "SupervisorError",
       "TrustBundleError",
       "UTC",
@@ -1689,6 +1695,27 @@
       "migrate",
       "probe_case_sensitive_paths",
       "sqlite3",
+      "uuid"
+    ]
+  },
+  "agent_control_plane.supervisor.store": {
+    "class:StoreMixin": [
+      "_event",
+      "connect",
+      "verify_event_chain"
+    ],
+    "module": [
+      "Any",
+      "GENESIS_HASH",
+      "Iterator",
+      "StoreMixin",
+      "annotations",
+      "canonical_json",
+      "contextmanager",
+      "json",
+      "sha256",
+      "sqlite3",
+      "utc_now",
       "uuid"
     ]
   },

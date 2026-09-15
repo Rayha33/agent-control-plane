@@ -10,6 +10,7 @@ scripts/check_public_surface.py pins that.
 Where each phase lives:
 
     common       constants, SupervisorError, small value types
+    store        the database connection and the hash-chained audit event log
     schema       table DDL, the idempotent column upgrade, the case probe
     config       Config, .acp/config.toml loading, per-attempt trust pins
     identity     runner enrollment and authentication
