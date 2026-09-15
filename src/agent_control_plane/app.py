@@ -31,6 +31,12 @@ from .coordination_schemas import (
     TaskView,
 )
 from .database import Database, StorageBusyError
+from .protocol_adapters import (
+    A2A_AGENT_CARD_PATH,
+    A2A_VERSION_HEADER,
+    A2ATaskAdapter,
+    agent_card,
+)
 from .schemas import (
     A2ASideEffectMutation,
     ActionRequestView,
@@ -411,6 +417,24 @@ def create_app(
         # Board #568 termination: the claim ends now; its resources stay reserved until the
         # revoked runner's last attempt token expires, so no gate can see two live generations.
         return coordination.revoke_claim(task_id, request.reason)
+
+    # Board #568. A2A's read surface over the same authenticated service: the adapter holds no
+    # state of its own, and its SendMessage/CancelTask both refuse, so a protocol transport
+    # cannot become a second way to create or end fenced work (ARCHITECTURE invariant 4c).
+    a2a_tasks = A2ATaskAdapter(coordination, service)
+    app.state.a2a_tasks = a2a_tasks
+
+    @app.get(A2A_AGENT_CARD_PATH)
+    def a2a_agent_card(request: Request) -> dict:
+        return agent_card(url=str(request.url_for("a2a_rpc")), version=API_VERSION)
+
+    @app.post("/a2a", name="a2a_rpc")
+    def a2a_rpc(
+        payload: dict,
+        token: str = Depends(require_mandate),
+        a2a_version: str = Header(default="", alias=A2A_VERSION_HEADER),
+    ) -> dict:
+        return a2a_tasks.dispatch(payload, token=token, version=a2a_version)
 
     @app.post(
         "/v1/coordination/reap",
