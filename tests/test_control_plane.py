@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
+# Board #568: every test here also runs against PostgreSQL when ACP_TEST_POSTGRES_URL is set.
+pytestmark = pytest.mark.storage_portable
+
 
 def create_agent(client, admin_headers, name, parent_agent_id=None):
     response = client.post(

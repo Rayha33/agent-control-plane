@@ -28,7 +28,7 @@ from .coordination_schemas import (
     TaskStatus,
     TaskView,
 )
-from .database import Database
+from .database import Database, StorageBusyError
 from .schemas import (
     A2ASideEffectMutation,
     ActionRequestView,
@@ -126,6 +126,17 @@ def create_app(
         return JSONResponse(
             status_code=error.status_code,
             content={"error": error.code, "message": error.message},
+        )
+
+    @app.exception_handler(StorageBusyError)
+    async def storage_busy_handler(_request: Request, error: StorageBusyError) -> JSONResponse:
+        # The transaction rolled back, so nothing applied. Retrying the whole request is safe
+        # because every mutation re-validates its fencing tokens. The driver's message is not
+        # echoed: it can name hosts and roles.
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "1"},
+            content={"error": error.code, "message": "storage is busy; retry the request"},
         )
 
     def require_admin(x_control_plane_key: str = Header(default="")) -> None:

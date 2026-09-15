@@ -70,7 +70,10 @@ class Settings:
                 )
 
         return cls(
-            database_path=os.getenv("ACP_DATABASE_PATH", "agent_control_plane.db"),
+            # ACP_DATABASE_URL (postgresql://…) selects the multi-host backend; it wins over
+            # the SQLite path so a deployment cannot silently fall back to a local file.
+            database_path=os.getenv("ACP_DATABASE_URL")
+            or os.getenv("ACP_DATABASE_PATH", "agent_control_plane.db"),
             admin_key=admin_key,
             signing_key=signing_key,
             issuer=os.getenv("ACP_ISSUER", "agent-control-plane"),

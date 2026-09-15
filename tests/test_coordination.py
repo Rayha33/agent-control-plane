@@ -3,7 +3,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
+import pytest
+
 from agent_control_plane.service import ControlPlaneError
+
+# Board #568: every test here also runs against PostgreSQL when ACP_TEST_POSTGRES_URL is set.
+pytestmark = pytest.mark.storage_portable
 
 
 def create_agent(client, admin_headers, name, role):
