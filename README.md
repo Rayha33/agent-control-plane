@@ -689,6 +689,58 @@ claim receives fresh fencing tokens; old tokens do not regain authority.
 The Git supervisor is the primary v0.2 product path. The HTTP authority API is a
 separate reference layer and does not create Git worktrees.
 
+### More than one host
+
+SQLite gives the authority one property its invariants lean on: every write
+transaction runs alone. Point it at PostgreSQL and several hosts share one
+control plane without giving that up.
+
+~~~bash
+export ACP_DATABASE_URL="postgresql://acp@db.internal:5432/acp"
+uv sync --extra postgres
+~~~
+
+A write transaction takes a **session advisory lock before opening its
+SERIALIZABLE transaction**, in that order. Taking the lock as the first statement
+*inside* the transaction looks equivalent but is not: PostgreSQL fixes the
+snapshot at the start of that first statement, before it waits, so every queued
+writer would read a world its predecessor had already changed and abort with
+`40001`. Locking first means the snapshot is taken after the previous writer
+committed — contention waits instead of aborting — and SERIALIZABLE stays
+underneath as the net for any future write path that forgets the lock. A
+serialization failure, lock timeout or lost session is reported as `503` with
+`Retry-After`: the transaction rolled back, and every mutation re-validates its
+fencing tokens, so retrying the whole request is safe.
+
+Across hosts, fencing is *carried* rather than queried. A claim, and every
+heartbeat, returns an `attempt_token`: task, runner, claim generation, every
+resource generation and the lease expiry, signed with a key derived from
+`ACP_SIGNING_KEY` (so a mandate can never stand in for an attempt token, or the
+reverse). `ACP_REQUIRE_ATTEMPT_TOKENS=1` makes heartbeat and submit refuse
+requests that do not carry it.
+
+- A resource on another host runs a `FencingGate`, which admits only the newest
+  generation it has seen for each resource and refuses anything older — reading
+  that generation from the signed token, never from the caller. Provision it with
+  `derive_attempt_key(signing_key)`, which verifies tokens but cannot mint
+  mandates.
+- A runner runs a `LeaseKeeper`, which counts its lease from when a renewal was
+  *sent* rather than when the reply arrived, terminates at once when the authority
+  refuses it on fencing grounds, and terminates before the authority's own expiry
+  when it cannot reach the authority at all — so a partitioned runner has stopped
+  before its replacement starts.
+- An operator ends a claim with `POST /v1/tasks/{id}/revoke-claim`. The claim ends
+  immediately, but its resources stay reserved until the revoked runner's last
+  attempt token expires: the authority cannot recall a token it has issued, so it
+  refuses to create a second generation while a gate would still admit the first.
+
+Lease expiry decides liveness; fencing tokens decide safety. A replica whose
+clock runs fast can orphan a live claim early — the replaced runner is fenced out
+and loses work, but cannot corrupt state. Keep replica clocks disciplined.
+
+The task surface is also readable over MCP Tasks and A2A; both are read-only, and
+what they refuse is in docs/INTEGRATIONS.md.
+
 ### Fenced external side effects
 
 The authority API exposes a provider-neutral gate for mutations that worktrees
@@ -730,7 +782,12 @@ or credentials. Administrators can read them at
 ACP v0.2 is a local-first alpha, not a complete sandbox or distributed lock
 service.
 
-- SQLite assumes one trusted host and filesystem.
+- The Git supervisor is SQLite, and SQLite assumes one trusted host and filesystem:
+  worktrees, the trust bundle and the process-containment boundary are all local. Only
+  the HTTP authority runs on PostgreSQL, where several hosts share one control plane
+  (*More than one host*, above). Its lease EXPIRY still trusts the replicas' clocks —
+  expiry decides liveness, fencing tokens decide safety, so a fast clock can cost a
+  runner its work but cannot corrupt state.
 - **Worktrees are kept until you reclaim them.** A claim creates
   `.acp/worktrees/<attempt>` on a task branch, and nothing removes either when the
   task finishes — a completed task leaves the worktree, its `git worktree`

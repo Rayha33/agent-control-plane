@@ -110,6 +110,63 @@ There is no third-party dependency: the wire format is newline-delimited JSON-RP
 small enough to implement honestly and not worth an SDK in `acp`'s import graph for one
 subcommand.
 
+### MCP Tasks
+
+An ACP task already is the long-running unit MCP Tasks describes, so the server declares
+`tasks` for tool calls and exposes one task-augmented tool:
+
+```json
+{"capabilities": {"tasks": {"requests": {"tools": {"call": {}}}}}}
+```
+
+`acp_watch_task` carries `execution.taskSupport: "required"`. A task-augmented call
+returns a `CreateTaskResult` whose `taskId` is the ACP task id; the client then polls
+`tasks/get`, and `tasks/result` returns the finished task. Calling it without task
+augmentation — or augmenting a tool that does not support it — is `-32601`, as the
+specification requires. It dispatches to the same read-only `task` method `acp_show` uses,
+so the server is still credential-free.
+
+`tasks/list` and `tasks/cancel` are **not declared**, for two different reasons. A stdio
+server cannot bind tasks to an authorization context, and the specification says such a
+receiver SHOULD NOT declare `tasks.list`; listing would expose every task to anyone who can
+spawn the process. Cancelling would be a write, and ending a claim is fenced — resources
+must stay reserved until the revoked runner's last attempt token expires — so it belongs to
+the administrator's `POST /v1/tasks/{id}/revoke-claim`, not to a tool.
+
+Status mapping is deliberately conservative. Both protocols require terminal statuses never
+to transition, while most ACP statuses can: `blocked` and `conflicted` are reopened,
+`orphaned` is reclaimed. `done` is the only ACP status that never changes, so it is the only
+one reported as `completed`; anything waiting for a person is `input_required`, which is
+interrupted rather than terminal. A status with no classification raises rather than
+defaulting to `working`.
+
+`tasks/result` must block until the task is terminal. It polls at `pollInterval` and gives
+up after five minutes with `-32603` rather than blocking a single-threaded stdio server
+forever — a bounded deviation, in preference to a server that stops answering.
+
+## A2A
+
+The HTTP authority serves an agent card at `/.well-known/agent-card.json` and A2A 1.0
+JSON-RPC at `POST /a2a`, authenticated with the same bearer mandate as every other
+endpoint. Clients must send the `A2A-Version` header; an absent value means 0.3 by
+specification, which this interface does not speak, so it answers
+`VersionNotSupportedError` (`-32009`).
+
+| Method | Answer |
+| --- | --- |
+| `GetTask` | the task, with its fencing generations in `metadata` and its latest submission as an artifact |
+| `ListTasks` | only the tasks the caller's mandate scope allows |
+| `CancelTask` | `TaskNotCancelableError` (`-32002`) — ending a claim is fenced; see `revoke-claim` |
+| `SendMessage` | `UnsupportedOperationError` (`-32004`) — creating work is an operator action |
+
+A task outside the mandate's scope answers exactly as a missing task does (`-32001`), so
+scope cannot be used as an oracle for which tasks exist. Enum values are ProtoJSON names
+(`TASK_STATE_WORKING`), matching the 1.0 binding.
+
+Neither adapter re-implements a check. They map protocol identity onto the same
+authenticated service — the property `ARCHITECTURE.md` invariant 4c asks for: protocol
+transport must not create an alternate authority path.
+
 ### What this does not do yet
 
 - **No write tools.** Claiming and submitting through MCP needs the credential question

@@ -64,6 +64,13 @@
     ]
   },
   "agent_control_plane.coordination": {
+    "class:AttemptTokenError": [],
+    "class:AttemptTokenSigner": [
+      "from_attempt_key",
+      "from_signing_key",
+      "issue",
+      "verify"
+    ],
     "class:ControlPlaneError": [],
     "class:ControlPlaneService": [
       "_agent",
@@ -87,6 +94,7 @@
     "class:CoordinationService": [
       "_agent_for_action",
       "_assert_active_claim",
+      "_check_attempt_token",
       "_clear_heartbeats",
       "_review_view",
       "_submission_row",
@@ -102,15 +110,19 @@
       "reopen_task",
       "review",
       "review_view",
+      "revoke_claim",
       "submission",
       "submit",
       "task"
     ],
     "class:Database": [
+      "_initialize_postgres",
       "all",
       "append_audit",
       "audit_events",
       "connect",
+      "describe",
+      "dialect",
       "execute",
       "execute_count",
       "initialize",
@@ -137,6 +149,8 @@
     ],
     "module": [
       "Any",
+      "AttemptTokenError",
+      "AttemptTokenSigner",
       "ControlPlaneError",
       "ControlPlaneService",
       "CoordinationService",
@@ -988,10 +1002,13 @@
       "set_agent_state"
     ],
     "class:Database": [
+      "_initialize_postgres",
       "all",
       "append_audit",
       "audit_events",
       "connect",
+      "describe",
+      "dialect",
       "execute",
       "execute_count",
       "initialize",
@@ -1011,7 +1028,8 @@
       "from_env",
       "insecure_defaults",
       "insecure_dev",
-      "issuer"
+      "issuer",
+      "require_attempt_tokens"
     ],
     "class:TokenError": [],
     "module": [
@@ -1061,10 +1079,13 @@
       "verify"
     ],
     "class:Database": [
+      "_initialize_postgres",
       "all",
       "append_audit",
       "audit_events",
       "connect",
+      "describe",
+      "dialect",
       "execute",
       "execute_count",
       "initialize",

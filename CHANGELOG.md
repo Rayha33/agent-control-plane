@@ -45,6 +45,39 @@ adding one.
   matching rather than being denied its own declared write. (#1708)
 
 ### Added
+- A PostgreSQL backend for the HTTP authority, so more than one host can share one
+  control plane. `ACP_DATABASE_URL=postgresql://…` selects it and the optional
+  `postgres` extra installs psycopg; the SQLite default is untouched and needs nothing
+  beyond the standard library. A write transaction takes a session advisory lock
+  *before* opening its SERIALIZABLE transaction, which is what reproduces SQLite's
+  one-writer property across hosts: the snapshot is then taken after the previous
+  writer committed, so contention waits instead of aborting, and SERIALIZABLE stays
+  underneath as the net for any write path that forgets the lock. Measured with six
+  processes claiming overlapping write sets on one server: one winner per task,
+  disjoint winners, no lost updates, an unforked audit chain and zero aborts — and the
+  same run with the lock removed produces double winners, overlapping write sets, lost
+  updates and a forked chain. Sessions are pooled, because one connection per statement
+  exhausted the client's ephemeral ports within seconds of that run. A serialization
+  failure, lock timeout or lost session becomes a 503 with `Retry-After` and a message
+  that names no host, never a 500. (#568)
+- Signed attempt tokens. A claim, and every heartbeat, returns `attempt_token`: task,
+  runner, claim generation, every resource generation and the lease expiry, signed with
+  a key *derived* from the mandate signing key so neither kind of token can ever verify
+  as the other. Heartbeat and submit check it whenever it is present, and
+  `ACP_REQUIRE_ATTEMPT_TOKENS=1` refuses requests without one. (#568)
+- `FencingGate`, for a resource on a host that cannot query the authority: it admits
+  only the newest generation it has seen for each resource and refuses anything older,
+  taking that generation from the signed token rather than from the caller. Backed by
+  an in-memory store or a SQL store that runs on either backend. (#568)
+- `LeaseKeeper`, the runner half of the heartbeat/termination protocol. It counts its
+  lease from when a renewal was sent rather than when the reply arrived, terminates at
+  once when the authority refuses it on fencing grounds, and terminates before the
+  authority's own expiry when it cannot reach the authority at all — so a partitioned
+  runner has stopped before its replacement can start. (#568)
+- `POST /v1/tasks/{id}/revoke-claim` (administrator). The claim ends immediately and its
+  heartbeats are dropped, but its resources stay reserved until the revoked runner's
+  last attempt token expires: the authority cannot recall that token, so it refuses to
+  create a second generation while a gate would still admit the first. (#568)
 - `meta.schema_version` and `meta.written_by`. A control database newer than the
   binary is refused with `schema_newer_than_binary` rather than opened — previously
   an older acp opened it successfully and simply did not see the newer columns, so a
