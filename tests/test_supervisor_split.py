@@ -171,6 +171,58 @@ def test_every_patched_global_still_has_a_reader_the_patch_reaches() -> None:
     assert orphaned == []
 
 
+# The open path is what a facade is for: the constructor, the classmethod that writes acp.toml
+# and then constructs, the step that finishes opening, and the one-line delegate to
+# supervisor.schema. They stay by design, not because a move would rebind anything.
+FACADE_BY_DESIGN = frozenset({"__init__", "initialize", "_finish_open", "_migrate"})
+
+
+def facade_methods_without_a_reason(cls: type, names: set[str]) -> list[str]:
+    """Methods defined on `cls` itself that could move to a phase module unchanged.
+
+    A method has to stay in git_supervisor.py when moving it would change what it binds:
+    it reads a global the suite patches on git_supervisor, or it names `GitSupervisor`
+    (tests patch attributes on the class, and a mixin cannot name its subclass without a
+    text edit). Anything else left on the class is facade weight a verbatim move removes.
+    """
+
+    left = []
+    for name, member in vars(cls).items():
+        if name in FACADE_BY_DESIGN:
+            continue
+        if isinstance(member, (staticmethod, classmethod)):
+            member = member.__func__
+        if not isinstance(member, types.FunctionType):
+            continue
+        function = inspect.unwrap(member)
+        pinned = any(reads(function, patched) for patched in names)
+        if not pinned and not reads(function, "GitSupervisor"):
+            left.append(name)
+    return sorted(left)
+
+
+def test_the_facade_keeps_only_what_a_move_would_rebind() -> None:
+    """GitSupervisor stays a thin facade (#1630).
+
+    Measured before the facade moves (cd5b476): this listed 13 methods, among them connect,
+    create_task and status, all of which moved verbatim to store, claims and views.
+    """
+
+    assert facade_methods_without_a_reason(git_supervisor.GitSupervisor, patched_names()) == []
+
+
+def test_the_facade_check_flags_a_movable_method() -> None:
+    namespace: dict = {}
+    exec(
+        "class Facade:\n"
+        "    def movable(self):\n        return len('x')\n"
+        "    def pinned(self):\n        return run_trusted()\n"
+        "    def names_class(self):\n        return GitSupervisor.x\n",
+        namespace,
+    )
+    assert facade_methods_without_a_reason(namespace["Facade"], {"run_trusted"}) == ["movable"]
+
+
 def test_the_check_flags_a_reader_that_moved_out_of_git_supervisor() -> None:
     namespace: dict = {"run_trusted": None}
     exec("def moved():\n    return run_trusted()\n", namespace)

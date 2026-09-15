@@ -26,14 +26,17 @@ Where each phase lives:
 What stays in git_supervisor.py, and why. A function reads module globals from the module
 it was defined in, so moving a reader changes which binding it sees:
 
-  * SCHEMA_VERSION, MIGRATIONS and their readers (the open/migrate path, doctor) — tests
-    monkeypatch those names on git_supervisor.
+  * SCHEMA_VERSION, MIGRATIONS and their readers (_open_read_only, _open_read_write,
+    _apply_migration_ledger, schema_state, migrate, doctor) — tests monkeypatch those
+    names on git_supervisor.
   * _run_driver_phase and _run_critic — they call run_trusted, which tests monkeypatch on
     git_supervisor.
   * Methods that name `GitSupervisor.` explicitly (_root, resources_overlap,
     _open_registered_pidfd, _terminate_registered_group, _process_has_exited,
-    _command_finding, _read_integration_info_attributes, initialize) — tests monkeypatch
-    attributes on the GitSupervisor class itself.
+    _command_finding, _read_integration_info_attributes) — tests monkeypatch attributes on
+    the GitSupervisor class itself, and a mixin cannot name its subclass without a text edit.
+  * The open path, by design: __init__, initialize, _finish_open and the _migrate delegate.
 
-tests/test_supervisor_split.py fails if a reader of a patched global ever moves out.
+tests/test_supervisor_split.py fails if a reader of a patched global ever moves out, and
+also if anything else is left on GitSupervisor that a verbatim move could take away.
 """
