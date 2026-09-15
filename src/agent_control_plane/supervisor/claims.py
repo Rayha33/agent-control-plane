@@ -15,10 +15,11 @@ import subprocess
 import time
 import unicodedata
 import uuid
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..scheduling import declared_resources
+from ..scheduling import declared_resources, normalize_artifact
 from .common import SUBMISSION_OBJECT_CONTRACT, SupervisorError, canonical_json, sha256, utc_now
 from .schema import META_CASE_SENSITIVE
 
@@ -878,3 +879,127 @@ class ClaimsMixin:
             raise SupervisorError(
                 "symlink_escape", f"symlink {path} points outside its worktree"
             ) from error
+
+    @staticmethod
+    def normalize_resource(raw: str, repo: Path | None = None, *, fold: bool = True) -> str:
+        """Canonical form of a declared resource.
+
+        `fold=True` is the storage form and the lease PRIMARY KEY, and it stays folded.
+        `fold=False` is the same canonicalisation — NFC, `\\` to `/`, the `/**` suffix on
+        a directory, the same refusals — with the operator's capitalisation intact, for
+        matching on a filesystem that distinguishes it. A `logical:` resource is an
+        identity rather than a path and stays folded either way, because folding is what
+        makes `logical:Deploy` and `logical:deploy` one lock.
+        """
+
+        value = unicodedata.normalize("NFC", raw.strip().replace("\\", "/"))
+        if not value:
+            raise SupervisorError("invalid_resource", "resource cannot be empty")
+        if value.startswith("logical:"):
+            suffix = value.removeprefix("logical:").strip().casefold()
+            if not suffix or any(part in {"", ".", ".."} for part in suffix.split("/")):
+                raise SupervisorError("invalid_resource", f"invalid logical resource: {raw}")
+            return f"logical:{suffix}"
+        directory = value.endswith("/")
+        path = PurePosixPath(value)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise SupervisorError("invalid_resource", f"resource must be repo-relative: {raw}")
+        value = path.as_posix()
+        lowered = value.casefold()
+        if lowered in {".git", ".acp"} or lowered.startswith((".git/", ".acp/")):
+            raise SupervisorError("invalid_resource", f"internal resource forbidden: {raw}")
+        directory = directory or bool(repo and (repo / value).is_dir())
+        canonical = value.rstrip("/") + "/**" if directory else value
+        return canonical.casefold() if fold else canonical
+
+    @staticmethod
+    def _literal_prefix(resource: str) -> str:
+        wildcard = min(
+            (resource.find(character) for character in "*?[" if character in resource),
+            default=len(resource),
+        )
+        prefix = resource[:wildcard]
+        if wildcard < len(resource) and "/" in prefix:
+            prefix = prefix.rsplit("/", 1)[0]
+        elif wildcard < len(resource):
+            prefix = ""
+        return prefix.rstrip("/")
+
+    def create_task(
+        self,
+        title: str,
+        description: str,
+        acceptance: Sequence[str],
+        resources: Sequence[str],
+        dependencies: Sequence[str] = (),
+        priority: int = 50,
+        base_branch: str = "HEAD",
+        produces: Sequence[str] = (),
+        consumes: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        if not title.strip() or not acceptance:
+            raise SupervisorError("invalid_task", "title and acceptance criteria are required")
+        declared: dict[str, str] = {}
+        for item in resources:
+            folded = self.normalize_resource(item, self.root)
+            declared.setdefault(folded, item.strip())
+        normalized = sorted(declared)
+        if not normalized:
+            raise SupervisorError("invalid_task", "at least one write resource is required")
+        produced = sorted({normalize_artifact(item) for item in produces})
+        consumed = sorted({normalize_artifact(item) for item in consumes})
+        base_sha = self._git_text("rev-parse", base_branch)
+        resolved_branch = base_branch
+        if base_branch == "HEAD":
+            symbolic = self._git_text("symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+            resolved_branch = symbolic or base_sha
+        task_id = str(uuid.uuid4())
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for dependency in dependencies:
+                if not connection.execute(
+                    "SELECT 1 FROM tasks WHERE id = ?", (dependency,)
+                ).fetchone():
+                    raise SupervisorError(
+                        "dependency_not_found", f"task {dependency} does not exist"
+                    )
+            connection.execute(
+                """
+                INSERT INTO tasks
+                  (id, title, description, acceptance_json, resources_json,
+                   declared_resources_json,
+                   dependencies_json, produces_json, consumes_json, base_branch,
+                   base_sha, priority, status, current_attempt_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
+                """,
+                (
+                    task_id,
+                    title.strip(),
+                    description.strip(),
+                    canonical_json(list(acceptance)),
+                    canonical_json(normalized),
+                    canonical_json(declared),
+                    canonical_json(list(dependencies)),
+                    canonical_json(produced),
+                    canonical_json(consumed),
+                    resolved_branch,
+                    base_sha,
+                    priority,
+                    now,
+                    now,
+                ),
+            )
+            self._event(
+                connection,
+                "task.created",
+                "operator",
+                {
+                    "task_id": task_id,
+                    "resources": normalized,
+                    "produces": produced,
+                    "consumes": consumed,
+                    "base_sha": base_sha,
+                },
+            )
+        return self.task(task_id)
