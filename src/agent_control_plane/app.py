@@ -13,6 +13,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import Settings
 from .coordination import CoordinationService
 from .coordination_schemas import (
+    ClaimRevokeRequest,
+    ClaimRevokeView,
     HeartbeatRequest,
     HeartbeatView,
     QCReviewCreate,
@@ -399,6 +401,16 @@ def create_app(
     )
     def reopen_task(task_id: str, request: TaskReopenRequest) -> dict:
         return coordination.reopen_task(task_id, request.reason)
+
+    @app.post(
+        "/v1/tasks/{task_id}/revoke-claim",
+        response_model=ClaimRevokeView,
+        dependencies=[Depends(require_admin)],
+    )
+    def revoke_claim(task_id: str, request: ClaimRevokeRequest) -> dict:
+        # Board #568 termination: the claim ends now; its resources stay reserved until the
+        # revoked runner's last attempt token expires, so no gate can see two live generations.
+        return coordination.revoke_claim(task_id, request.reason)
 
     @app.post(
         "/v1/coordination/reap",

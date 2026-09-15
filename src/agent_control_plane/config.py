@@ -40,6 +40,10 @@ class Settings:
     # True only when the operator explicitly asked for the published dev credentials.
     # Surfaced on /health so a server running this way cannot look like a secure one.
     insecure_dev: bool = False
+    # Board #568: refuse heartbeats and submissions that do not carry the signed attempt token
+    # issued with the claim. Off by default so existing clients keep working; turn it on for
+    # multi-host deployments, where the same token is what remote fencing gates check.
+    require_attempt_tokens: bool = False
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -78,6 +82,7 @@ class Settings:
             signing_key=signing_key,
             issuer=os.getenv("ACP_ISSUER", "agent-control-plane"),
             insecure_dev=insecure_dev,
+            require_attempt_tokens=os.getenv("ACP_REQUIRE_ATTEMPT_TOKENS", "") == "1",
         )
 
     @property
