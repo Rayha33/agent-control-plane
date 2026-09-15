@@ -262,6 +262,11 @@ def test_chaos_history_keeps_every_lease_fenced(postgres_url, tmp_path):
     # event, so "none were accepted" is asserted from the committed chain as well as here.
     assert stats.get("submit_fail", 0) >= 3, stats
     assert stats.get("submit_ok", 0) == 0, stats
+    # At least one of those refusals must be the case acceptance 2 is actually about: a runner
+    # that submitted after ANOTHER agent had already replaced it. Asserting only "some late
+    # submit was refused" let this pass while the strong case never happened — race_run9's
+    # report is green with delayed_submits_after_replacement at 0.
+    assert stats["delayed_submits_after_replacement"] >= 1, stats
 
 
 def _claim_event(sequence, task, agent, token, expires, resources):

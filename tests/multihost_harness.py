@@ -29,6 +29,10 @@ from agent_control_plane.service import ControlPlaneError, ControlPlaneService
 SIGNING_KEY = "test-signing-key-with-enough-entropy"
 ISSUER = "test-control-plane"
 LEASE_TTL = 2
+# How long a delayed runner waits for somebody else to take its task over before submitting
+# anyway. Long enough for the reaper (which runs continuously) to orphan the claim and another
+# worker to pick it up; short enough that it cannot outlive the chaos run.
+REPLACEMENT_PATIENCE = 4.0
 
 _MUTATING = re.compile(r"^\s*(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 
@@ -233,6 +237,25 @@ def chaos_worker(url, token, agent_id, task_ids, deadline, seed, out_path) -> No
                 # A delayed runner: stall until its lease is certainly over, then try to submit
                 # the work it still believes it owns.
                 while time.time() <= expires_at + 0.25:
+                    time.sleep(0.05)
+                # Then wait for somebody else to actually take the task over, so this is a
+                # REPLACED runner's submit and not merely a late one. Leaving it to chance made
+                # the stronger case optional: race_run9 produced none of them and the run still
+                # passed. Bounded, and it submits anyway if no replacement arrives — the test's
+                # non-vacuity assertion is what notices that.
+                patience = time.time() + REPLACEMENT_PATIENCE
+                while time.time() < patience:
+                    try:
+                        current = coordination.task(task_id)
+                    except (ControlPlaneError, StorageBusyError):
+                        break
+                    if (current["claim_fencing_token"] or 0) > claim_token:
+                        # check_history counts this submit as post-replacement only if the
+                        # replacing claim FINISHED before the submit STARTED; the token is
+                        # visible from commit, a moment before that claim's client recorded
+                        # finishing, so leave a margin rather than race its own evidence.
+                        time.sleep(0.1)
+                        break
                     time.sleep(0.05)
                 started = time.time()
                 request = SubmissionCreate.model_construct(
