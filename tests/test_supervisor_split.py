@@ -33,29 +33,39 @@ import agent_control_plane.git_supervisor as git_supervisor
 import agent_control_plane.supervisor as supervisor_package
 
 TESTS = Path(__file__).resolve().parent
-ALIAS = re.compile(r"import\s+agent_control_plane\.git_supervisor\s+as\s+(\w+)")
+# Every spelling that binds the module to a local name: `import a.git_supervisor as X` and
+# `from agent_control_plane import git_supervisor as X`. The unaliased forms bind
+# `git_supervisor` or `agent_control_plane.git_supervisor`, which names_patched_in always tries.
+ALIAS = re.compile(
+    r"(?:import\s+agent_control_plane\.git_supervisor"
+    r"|from\s+agent_control_plane\s+import\s+git_supervisor)\s+as\s+(\w+)"
+)
 DOTTED = re.compile(r"[\"']agent_control_plane\.git_supervisor\.(\w+)[\"']")
 
 
-def patched_names() -> set[str]:
-    """Names some test rebinds on the git_supervisor module itself.
+def names_patched_in(text: str) -> set[str]:
+    """Names one test file rebinds on the git_supervisor module itself.
 
     `setattr(git_supervisor.shutil, "rmtree", ...)` is not one: it patches the shared
     `shutil` module, which every importer sees. Only `setattr(<the module>, "NAME")` and the
     one-component dotted-string form rebind a git_supervisor global.
     """
 
+    aliases = {"git_supervisor", "agent_control_plane.git_supervisor", *ALIAS.findall(text)}
+    pattern = re.compile(
+        r"setattr\(\s*(?:"
+        + "|".join(re.escape(alias) for alias in sorted(aliases))
+        + r")\s*,\s*[\"'](\w+)[\"']"
+    )
+    return set(pattern.findall(text)) | set(DOTTED.findall(text))
+
+
+def patched_names() -> set[str]:
     names: set[str] = set()
     for path in TESTS.rglob("*.py"):
         if path.resolve() == Path(__file__).resolve():
             continue
-        text = path.read_text(encoding="utf-8")
-        aliases = {"git_supervisor", *ALIAS.findall(text)}
-        pattern = re.compile(
-            r"setattr\(\s*(?:" + "|".join(sorted(aliases)) + r")\s*,\s*[\"'](\w+)[\"']"
-        )
-        names.update(pattern.findall(text))
-        names.update(DOTTED.findall(text))
+        names |= names_patched_in(path.read_text(encoding="utf-8"))
     return names
 
 
@@ -152,6 +162,31 @@ def test_file_relative_paths_still_name_files_that_exist() -> None:
 def test_the_scan_finds_the_patches_the_suite_is_known_to_make() -> None:
     # Without this, a scan that matched nothing would make the real check pass vacuously.
     assert {"SCHEMA_VERSION", "MIGRATIONS", "run_trusted"} <= patched_names()
+
+
+def test_the_scan_follows_every_spelling_of_the_module() -> None:
+    # Before 2026-09-16 only `import agent_control_plane.git_supervisor as X` was followed, so a
+    # patch through `from agent_control_plane import git_supervisor as X` pinned nothing.
+    text = (
+        "import agent_control_plane.git_supervisor\n"
+        "import agent_control_plane.git_supervisor as gs_a\n"
+        "from agent_control_plane import git_supervisor as gs_b\n"
+        "from agent_control_plane import git_supervisor\n"
+        "monkeypatch.setattr(gs_a, 'VIA_IMPORT_AS', 1)\n"
+        "monkeypatch.setattr(gs_b, 'VIA_FROM_IMPORT_AS', 1)\n"
+        "monkeypatch.setattr(git_supervisor, 'VIA_FROM_IMPORT', 1)\n"
+        "monkeypatch.setattr(agent_control_plane.git_supervisor, 'VIA_DOTTED_MODULE', 1)\n"
+        "monkeypatch.setattr('agent_control_plane.git_supervisor.VIA_STRING', 1)\n"
+        "monkeypatch.setattr(git_supervisor.shutil, 'rmtree', 1)\n"
+        "monkeypatch.setattr(unrelated, 'NOT_THE_MODULE', 1)\n"
+    )
+    assert names_patched_in(text) == {
+        "VIA_IMPORT_AS",
+        "VIA_FROM_IMPORT_AS",
+        "VIA_FROM_IMPORT",
+        "VIA_DOTTED_MODULE",
+        "VIA_STRING",
+    }
 
 
 def test_every_reader_of_a_patched_global_resolves_it_in_git_supervisor() -> None:
