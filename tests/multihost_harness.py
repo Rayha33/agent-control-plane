@@ -278,19 +278,27 @@ def nemesis(admin_url, url, deadline, seed, out_path) -> None:
         open(out_path, "w", encoding="utf-8") as out,
     ):
         while time.time() < deadline:
-            time.sleep(rng.uniform(0.1, 0.4))
-            pids = [
-                row[0]
-                for row in admin.execute(
-                    "SELECT pid FROM pg_stat_activity "
-                    "WHERE application_name = 'acp-race-worker' AND state <> 'idle'"
-                ).fetchall()
-            ]
-            if pids:
+            time.sleep(rng.uniform(0.05, 0.15))
+            # Two faults, not one. A session caught mid-request is a partition. An IDLE session
+            # is one sitting in the backend's pool, and killing it is the "died while pooled"
+            # case the backend recovers from by retrying a request's first statement — which
+            # became the common case once pooling landed, and left the partition case rare
+            # enough that a run could hit it only once.
+            for kind, predicate in (("busy", "state <> 'idle'"), ("pooled", "state = 'idle'")):
+                pids = [
+                    row[0]
+                    for row in admin.execute(
+                        "SELECT pid FROM pg_stat_activity WHERE "
+                        # The predicate is one of this module's own two constants above.
+                        f"application_name = 'acp-race-worker' AND {predicate}"
+                    ).fetchall()
+                ]
+                if not pids:
+                    continue
                 hit = admin.execute(
                     "SELECT pg_terminate_backend(%s)", (rng.choice(pids),)
                 ).fetchone()[0]
-                _record(out, kind="kill", hit=bool(hit), at=time.time())
+                _record(out, kind="kill", session_state=kind, hit=bool(hit), at=time.time())
             try:
                 report = reaper.reap_expired()
             except StorageBusyError as error:

@@ -36,8 +36,16 @@ def storage_backend(request) -> str:
 
 
 @pytest.fixture
-def postgres_url():
-    """A private schema on the test server, dropped afterwards. Skips without a server."""
+def postgres_url(request):
+    """A private schema on the test server, dropped afterwards. Skips without a server.
+
+    Reaching the `yield` is the ONLY true evidence that a test talked to a live PostgreSQL,
+    so that is where the execution gate's set is filled. Counting by marker or module name
+    instead measures the wrong object: every test in `test_postgres_backend.py` carries
+    `postgres_backend` among its keywords, including the translation tests that need no
+    server, so `ACP_REQUIRE_POSTGRES=1` passed on CI — which has no server at all — and the
+    summary line claimed "1 tests passed against a live server".
+    """
 
     base = os.getenv(POSTGRES_URL_ENV)
     if not base:
@@ -45,6 +53,7 @@ def postgres_url():
     from pg_support import postgres_schema
 
     with postgres_schema(base) as url:
+        _used_postgres.add(request.node.nodeid)
         yield url
 
 
@@ -81,16 +90,19 @@ _selected_linux_worker: set[str] = set()
 _deselected_linux_worker: set[str] = set()
 _passed_linux_worker: set[str] = set()
 _passed_postgres: set[str] = set()
+# Node ids that actually reached a live PostgreSQL, filled by the `postgres_url` fixture.
+_used_postgres: set[str] = set()
 
 
 def _exercises_postgres(report) -> bool:
-    return "[postgresql" in report.nodeid or "postgres_backend" in report.keywords
+    return report.nodeid in _used_postgres
 
 
 def pytest_sessionstart(session) -> None:
     # pytest.main() can run more than once in one process. Never let an earlier
     # run's passes satisfy this run's execution gate (or its skips fail it).
     _passed_postgres.clear()
+    _used_postgres.clear()
     _skipped.clear()
     _skipped_linux_worker.clear()
     _selected_linux_worker.clear()
