@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 GENESIS_HASH = "0" * 64
+# Rows hashed per fetch while verifying the chain, so memory stays flat however
+# long the audit log grows.
+AUDIT_VERIFY_BATCH = 500
 
 
 SCHEMA = """
@@ -306,22 +309,71 @@ class Database:
             for row in rows
         ]
 
-    def verify_audit_chain(self) -> tuple[bool, int, int | None]:
-        rows = self.all("SELECT * FROM audit_events ORDER BY sequence ASC")
-        expected_previous = GENESIS_HASH
-        for row in rows:
-            expected_hash = event_digest(
-                expected_previous,
-                row["event_id"],
-                row["event_type"],
-                row["actor"],
-                row["payload_json"],
-                row["created_at"],
+    def verify_audit_chain(
+        self, after_sequence: int = 0, anchor_hash: str = GENESIS_HASH
+    ) -> dict[str, Any]:
+        """Re-hash the chain in bounded batches on one read snapshot.
+
+        With the defaults the whole chain is checked from genesis. A caller that
+        kept ``last_sequence`` and ``last_event_hash`` from an earlier valid run
+        passes them back as ``after_sequence`` and ``anchor_hash`` to check only
+        what was appended since: the anchor row must still carry that hash and
+        the next row must chain from it. Rows up to the anchor are trusted as of
+        the run that produced it.
+
+        On a break, ``events_checked`` still counts every row in the range, as it
+        always has, and no new anchor is returned.
+        """
+        broken_at: int | None = None
+        checked = 0
+        last_sequence: int | None = after_sequence or None
+        expected_previous = anchor_hash
+        with self.connect() as connection:
+            # One transaction, so every batch reads the same snapshot.
+            connection.execute("BEGIN")
+            if after_sequence:
+                anchor = connection.execute(
+                    "SELECT event_hash FROM audit_events WHERE sequence = ?",
+                    (after_sequence,),
+                ).fetchone()
+                if not anchor or anchor["event_hash"] != anchor_hash:
+                    broken_at = after_sequence
+            cursor = connection.execute(
+                """
+                SELECT sequence, event_id, event_type, actor, payload_json,
+                    previous_hash, event_hash, created_at
+                FROM audit_events WHERE sequence > ? ORDER BY sequence ASC
+                """,
+                (after_sequence,),
             )
-            if (
-                row["previous_hash"] != expected_previous
-                or row["event_hash"] != expected_hash
-            ):
-                return False, len(rows), row["sequence"]
-            expected_previous = row["event_hash"]
-        return True, len(rows), None
+            while rows := cursor.fetchmany(AUDIT_VERIFY_BATCH):
+                checked += len(rows)
+                if broken_at is not None:
+                    continue
+                for row in rows:
+                    expected_hash = event_digest(
+                        expected_previous,
+                        row["event_id"],
+                        row["event_type"],
+                        row["actor"],
+                        row["payload_json"],
+                        row["created_at"],
+                    )
+                    if (
+                        row["previous_hash"] != expected_previous
+                        or row["event_hash"] != expected_hash
+                    ):
+                        broken_at = row["sequence"]
+                        break
+                    expected_previous = row["event_hash"]
+                    last_sequence = row["sequence"]
+        valid = broken_at is None
+        return {
+            "valid": valid,
+            "events_checked": checked,
+            "broken_at_sequence": broken_at,
+            "last_sequence": last_sequence if valid else None,
+            "last_event_hash": (
+                expected_previous if valid and last_sequence is not None else None
+            ),
+        }

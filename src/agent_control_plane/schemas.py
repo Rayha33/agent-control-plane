@@ -119,3 +119,5 @@ class AuditVerification(BaseModel):
     valid: bool
     events_checked: int
     broken_at_sequence: int | None = None
+    last_sequence: int | None = None
+    last_event_hash: str | None = None

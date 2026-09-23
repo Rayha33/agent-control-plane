@@ -118,6 +118,7 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/tasks` | Create a task with dependencies and resources |
+| `GET /v1/tasks` | List tasks a page at a time: `limit` (default 100, at most 500); when more remain, pass the `X-Next-Cursor` response header back as `after` |
 | `POST /v1/tasks/{id}/claim` | Atomically claim work and obtain fencing tokens |
 | `POST /v1/tasks/{id}/heartbeat` | Renew the claim and store a checkpoint |
 | `POST /v1/tasks/{id}/submissions` | Submit immutable artifact evidence |
@@ -126,7 +127,7 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | `POST /v1/tasks/{id}/reopen` | Return a `conflicted` or `blocked` task to `open` after operator action |
 | `POST /v1/coordination/reap` | Recover expired workers and reservations |
 | `POST /v1/authorize` | Evaluate an intended agent action |
-| `GET /v1/audit/verify` | Verify the audit hash chain |
+| `GET /v1/audit/verify` | Verify the audit hash chain; pass a valid run's `last_sequence` and `last_event_hash` back as `after_sequence` and `anchor_hash` to check only newer events |
 
 ## Development
 

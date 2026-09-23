@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from threading import Barrier
 
 import pytest
@@ -547,3 +548,122 @@ def test_merging_is_not_a_task_status(client, app, admin_headers):
             connection.execute(
                 "UPDATE tasks SET status = 'merging' WHERE id = ?", (task["id"],)
             )
+
+
+def test_task_list_is_paged_by_cursor_in_a_stable_order(client, admin_headers):
+    created = [create_task(client, admin_headers, title=f"Task {n}") for n in range(5)]
+    everything = client.get("/v1/tasks", headers=admin_headers)
+    assert everything.status_code == 200, everything.text
+    assert "x-next-cursor" not in everything.headers
+    expected = [task["id"] for task in everything.json()]
+    assert sorted(expected) == sorted(task["id"] for task in created)
+
+    seen, cursor, pages = [], None, 0
+    while True:
+        params = {"limit": 2} | ({"after": cursor} if cursor else {})
+        page = client.get("/v1/tasks", headers=admin_headers, params=params)
+        assert page.status_code == 200, page.text
+        assert len(page.json()) <= 2
+        seen += [task["id"] for task in page.json()]
+        pages += 1
+        cursor = page.headers.get("x-next-cursor")
+        if not cursor:
+            break
+    assert seen == expected
+    assert pages == 3
+
+
+def test_task_list_limit_is_clamped_and_cursor_must_name_a_task(client, admin_headers):
+    for n in range(3):
+        create_task(client, admin_headers, title=f"Task {n}")
+    smallest = client.get("/v1/tasks", headers=admin_headers, params={"limit": 0})
+    assert smallest.status_code == 200
+    assert len(smallest.json()) == 1
+    assert smallest.headers["x-next-cursor"] == smallest.json()[0]["id"]
+
+    unknown = client.get("/v1/tasks", headers=admin_headers, params={"after": "nope"})
+    assert unknown.status_code == 400
+    assert unknown.json()["error"] == "invalid_cursor"
+
+
+def test_task_list_cost_does_not_grow_with_the_page(client, app, admin_headers):
+    # Every task used to cost three more queries, each on its own connection.
+    database = app.state.database
+    original = database.connect
+    connections, statements = [], []
+
+    @contextmanager
+    def counting_connect():
+        with original() as connection:
+            connections.append(connection)
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    def cost():
+        connections.clear()
+        statements.clear()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(database, "connect", counting_connect)
+            response = client.get("/v1/tasks", headers=admin_headers)
+        assert response.status_code == 200, response.text
+        return len(response.json()), len(connections), len(statements)
+
+    worker = create_agent(client, admin_headers, "listed-worker", "worker")
+    qc_agent = create_agent(client, admin_headers, "listed-qc", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    first = create_task(client, admin_headers, resources=["src/listed.py"])
+    create_task(client, admin_headers, dependencies=[first["id"]])
+    claim = claim_task(client, first["id"], worker_token).json()
+    submission = submit_task(client, first["id"], worker_token, claim).json()
+    client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={"verdict": "pass", "summary": "Meets the criteria", "findings": []},
+    )
+    small = cost()
+    for n in range(6):
+        create_task(client, admin_headers, title=f"Filler {n}")
+    large = cost()
+
+    assert small[0] == 2 and large[0] == 8
+    assert small[1] == large[1] == 1
+    assert small[2] == large[2]
+
+
+def test_listed_and_single_task_views_agree(client, admin_headers):
+    worker = create_agent(client, admin_headers, "view-worker", "worker")
+    qc_agent = create_agent(client, admin_headers, "view-qc", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    prerequisite = create_task(client, admin_headers, title="Prerequisite")
+    task = create_task(client, admin_headers, resources=["src/view.py"])
+    create_task(client, admin_headers, dependencies=[prerequisite["id"]])
+    claim = claim_task(client, task["id"], worker_token).json()
+    first = submit_task(client, task["id"], worker_token, claim).json()
+    client.post(
+        f"/v1/submissions/{first['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={
+            "verdict": "revise",
+            "summary": "Needs a regression test",
+            "findings": [
+                {
+                    "severity": "medium",
+                    "requirement": "Tests pass",
+                    "finding": "No regression test",
+                    "evidence": "tests/ unchanged",
+                    "required_fix": "Add one",
+                }
+            ],
+        },
+    )
+    listed = {
+        item["id"]: item
+        for item in client.get("/v1/tasks", headers=admin_headers).json()
+    }
+    for task_id, item in listed.items():
+        single = client.get(f"/v1/tasks/{task_id}", headers=admin_headers).json()
+        assert single == item
+    assert listed[task["id"]]["latest_submission"]["id"] == first["id"]
+    assert listed[task["id"]]["latest_review"]["verdict"] == "revise"
