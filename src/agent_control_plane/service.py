@@ -154,6 +154,16 @@ class ControlPlaneService:
                     "amount_escalation",
                     "child amount limit exceeds parent authority",
                 )
+            if (
+                parent_max is not None
+                and parent["requires_amount"]
+                and not request.requires_amount
+            ):
+                raise ControlPlaneError(
+                    403,
+                    "amount_escalation",
+                    "child cannot waive the amount its parent requires",
+                )
 
         mandate_id = str(uuid.uuid4())
         scopes = [scope.model_dump() for scope in request.scopes]
@@ -162,8 +172,8 @@ class ControlPlaneService:
             """
             INSERT INTO mandates
                 (id, agent_id, subject, parent_mandate_id, scopes_json,
-                 max_amount_cents, expires_at, revoked, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                 max_amount_cents, requires_amount, expires_at, revoked, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
             """,
             (
                 mandate_id,
@@ -172,6 +182,7 @@ class ControlPlaneService:
                 request.parent_mandate_id,
                 canonical_json(scopes),
                 request.max_amount_cents,
+                int(request.requires_amount),
                 expires_at,
                 created_at,
             ),
@@ -194,6 +205,7 @@ class ControlPlaneService:
                 "mandate_id": mandate_id,
                 "max_amount_cents": request.max_amount_cents,
                 "parent_mandate_id": request.parent_mandate_id,
+                "requires_amount": request.requires_amount,
                 "scopes": scopes,
             },
         )
@@ -204,6 +216,7 @@ class ControlPlaneService:
             "scopes": scopes,
             "expires_at": expires_at,
             "max_amount_cents": request.max_amount_cents,
+            "requires_amount": request.requires_amount,
             "parent_mandate_id": request.parent_mandate_id,
         }
 
@@ -269,10 +282,23 @@ class ControlPlaneService:
         except ValueError as exc:
             raise ControlPlaneError(400, "invalid_context", str(exc)) from exc
         mandate_max = mandate["max_amount_cents"]
-        if mandate_max is not None and (amount is None or amount > mandate_max):
-            return self._decision(
-                "denied", "amount exceeds mandate limit", claims["actor"], request, base
-            )
+        if mandate_max is not None:
+            if amount is None and mandate["requires_amount"]:
+                return self._decision(
+                    "denied",
+                    "amount is required by the mandate limit",
+                    claims["actor"],
+                    request,
+                    base,
+                )
+            if amount is not None and amount > mandate_max:
+                return self._decision(
+                    "denied",
+                    "amount exceeds mandate limit",
+                    claims["actor"],
+                    request,
+                    base,
+                )
 
         policies = self.database.all(
             "SELECT * FROM policies WHERE agent_id IS NULL OR agent_id = ?",
@@ -293,7 +319,16 @@ class ControlPlaneService:
             for policy in matching
             if policy["max_amount_cents"] is not None
         ]
-        if limits and (amount is None or amount > min(limits)):
+        # A policy limit marks its actions as monetary, so they always need an amount.
+        if limits and amount is None:
+            return self._decision(
+                "denied",
+                "amount is required by a policy limit",
+                claims["actor"],
+                request,
+                base,
+            )
+        if limits and amount > min(limits):
             return self._decision(
                 "denied", "amount exceeds policy limit", claims["actor"], request, base
             )

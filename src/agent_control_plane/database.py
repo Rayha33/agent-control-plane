@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS mandates (
     parent_mandate_id TEXT REFERENCES mandates(id),
     scopes_json TEXT NOT NULL,
     max_amount_cents INTEGER,
+    requires_amount INTEGER NOT NULL DEFAULT 1,
     expires_at INTEGER NOT NULL,
     revoked INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
@@ -208,6 +209,16 @@ class Database:
             if "role" not in columns:
                 connection.execute(
                     "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'"
+                )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(mandates)").fetchall()
+            }
+            if "requires_amount" not in columns:
+                # 1 keeps every existing capped mandate denying amountless actions.
+                connection.execute(
+                    "ALTER TABLE mandates ADD COLUMN requires_amount INTEGER NOT NULL "
+                    "DEFAULT 1"
                 )
 
     @contextmanager

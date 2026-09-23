@@ -29,6 +29,9 @@ class MandateCreate(BaseModel):
     scopes: list[Scope] = Field(min_length=1, max_length=100)
     ttl_seconds: int = Field(default=3600, ge=60, le=86_400)
     max_amount_cents: int | None = Field(default=None, ge=0)
+    # With a cap, an action that declares no context.amount_cents is denied unless
+    # this is False. Only meaningful when max_amount_cents is set.
+    requires_amount: bool = True
     parent_mandate_id: str | None = None
 
 
@@ -39,6 +42,7 @@ class MandateIssued(BaseModel):
     scopes: list[Scope]
     expires_at: int
     max_amount_cents: int | None
+    requires_amount: bool
     parent_mandate_id: str | None
 
 

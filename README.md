@@ -129,6 +129,20 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | `POST /v1/authorize` | Evaluate an intended agent action |
 | `GET /v1/audit/verify` | Verify the audit hash chain; pass a valid run's `last_sequence` and `last_event_hash` back as `after_sequence` and `anchor_hash` to check only newer events |
 
+## Amount limits
+
+`POST /v1/authorize` reads an action's amount from `context.amount_cents`.
+
+- A mandate's `max_amount_cents` denies any declared amount above it. By default
+  it also denies an action that declares no amount, so a capped mandate cannot be
+  used for a spend by leaving the amount out. Issue the mandate with
+  `requires_amount: false` when it should also cover actions that have no amount
+  (for example `repo.write`); declared amounts stay capped. A child mandate cannot
+  waive an amount its parent requires.
+- A policy's `max_amount_cents` marks the actions it matches as monetary: they are
+  denied without an amount and above the lowest matching limit, whatever the
+  mandate says.
+
 ## Development
 
 ```bash
