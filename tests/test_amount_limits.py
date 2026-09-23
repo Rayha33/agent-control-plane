@@ -134,6 +134,7 @@ def test_a_child_cannot_waive_an_amount_its_parent_requires(client, admin_header
         parent_mandate_id=parent_mandate["id"],
         max_amount_cents=500,
         requires_amount=False,
+        ttl_seconds=600,  # well inside the parent's, so only the amount rule can refuse
     )
     assert delegated.status_code == 403, delegated.text
     assert delegated.json()["error"] == "amount_escalation"
@@ -158,6 +159,7 @@ def test_a_child_of_a_waived_parent_may_waive_or_require(client, admin_headers):
             parent_mandate_id=parent_mandate["id"],
             max_amount_cents=500,
             requires_amount=requires_amount,
+            ttl_seconds=600,
         )
         assert delegated.status_code == 201, delegated.text
         assert delegated.json()["requires_amount"] is requires_amount
