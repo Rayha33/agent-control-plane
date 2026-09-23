@@ -32,6 +32,9 @@ class CoordinationService:
         created_at = utc_now()
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # This check is what keeps the graph acyclic: the new task's id is
+            # minted here, its dependencies must already exist, and no endpoint
+            # adds edges later, so every edge points at an older task.
             for dependency_id in request.dependencies:
                 dependency = connection.execute(
                     "SELECT id FROM tasks WHERE id = ?", (dependency_id,)

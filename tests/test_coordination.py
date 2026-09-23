@@ -646,3 +646,23 @@ def test_task_list_page_size_is_capped(client, admin_headers, monkeypatch):
         create_task(client, admin_headers, title=title)
     listed = client.get("/v1/tasks?limit=1000", headers=admin_headers)
     assert len(listed.json()) == 2
+
+
+def test_tasks_can_only_depend_on_existing_tasks(client, admin_headers):
+    # Edges can only point at tasks that already exist, which is what rules out
+    # dependency cycles such as A -> B -> A.
+    existing = create_task(client, admin_headers, title="Existing")
+    response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Depends on the future",
+            "description": "Cannot reference a task that does not exist yet.",
+            "acceptance_criteria": ["Rejected"],
+            "dependencies": [existing["id"], "not-yet-created"],
+        },
+    )
+    assert response.status_code == 404
+    assert response.json()["error"] == "dependency_not_found"
+    listed = client.get("/v1/tasks", headers=admin_headers).json()
+    assert [task["id"] for task in listed] == [existing["id"]]
