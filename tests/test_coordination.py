@@ -499,3 +499,31 @@ def test_heartbeat_rows_end_with_the_claim(client, app, admin_headers):
     )
     assert completed.status_code == 200, completed.text
     assert heartbeat_rows(app, task["id"]) == 0
+
+
+def test_self_review_is_forbidden_even_for_a_qc_role(client, app, admin_headers):
+    # The guard at review() compares the reviewer to the submission's worker, but it
+    # sits behind the qc-only role check and submit() is worker-only, so no request
+    # could reach it and no test exercised it. This constructs the collision the
+    # guard exists for: a submission whose worker IS the reviewing qc agent.
+    worker = create_agent(client, admin_headers, "worker-self", "worker")
+    qc_agent = create_agent(client, admin_headers, "qc-self", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    task = create_task(client, admin_headers, resources=["src/self.py"])
+    claim = claim_task(client, task["id"], worker_token).json()
+    submission = submit_task(client, task["id"], worker_token, claim).json()
+
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE submissions SET worker_agent_id = ? WHERE id = ?",
+            (qc_agent["id"], submission["id"]),
+        )
+
+    review = client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={"verdict": "pass", "summary": "Self-approved", "findings": []},
+    )
+    assert review.status_code == 403, review.text
+    assert review.json()["error"] == "self_review_forbidden"

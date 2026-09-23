@@ -94,8 +94,9 @@ uv run uvicorn agent_control_plane.app:create_app --factory --reload
 ```
 
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive
-API. The built-in defaults are intentionally obvious and must only be used for
-local development.
+API. The built-in credentials are intentionally obvious and are refused at startup
+unless `ACP_DEV_MODE=1` is set; use that only for local development, never where the
+service is reachable by anyone else.
 
 ## Minimal coordinated-work flow
 
