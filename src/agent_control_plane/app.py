@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import secrets
+from collections.abc import AsyncIterator
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
 from .config import Settings
-from .coordination import CoordinationService
+from .coordination import TASK_PAGE_MAX, CoordinationService
 from .coordination_schemas import (
     HeartbeatRequest,
     HeartbeatView,
@@ -49,6 +52,16 @@ bearer = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
 
+async def reap_periodically(coordination: CoordinationService, interval: float) -> None:
+    """Run the same reap as POST /v1/coordination/reap every ``interval`` seconds."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(coordination.reap_expired)
+        except Exception:
+            logger.exception("scheduled reap failed; retrying in %ss", interval)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     active_settings = settings or Settings.from_env()
     if active_settings.insecure_defaults:
@@ -62,9 +75,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     service = ControlPlaneService(database, active_settings)
     coordination = CoordinationService(database, service)
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        interval = active_settings.reap_interval_seconds
+        if not interval:
+            yield
+            return
+        reaper = asyncio.create_task(reap_periodically(coordination, interval))
+        try:
+            yield
+        finally:
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper
+
     app = FastAPI(
         title="Agent Control Plane",
         version=__version__,
+        lifespan=lifespan,
         description=(
             "Delegated mandates, collision-free task coordination, independent QC, "
             "kill switches, and tamper-evident evidence for AI agents."
@@ -208,13 +236,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response_model=AuditVerification,
         dependencies=[Depends(require_admin)],
     )
-    def verify_audit() -> dict:
-        valid, checked, broken_at = database.verify_audit_chain()
-        return {
-            "valid": valid,
-            "events_checked": checked,
-            "broken_at_sequence": broken_at,
-        }
+    def verify_audit(
+        after_sequence: int = Query(default=0, ge=0),
+        anchor_hash: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
+    ) -> dict:
+        if bool(after_sequence) != (anchor_hash is not None):
+            raise ControlPlaneError(
+                400,
+                "invalid_anchor",
+                "after_sequence and anchor_hash must be given together",
+            )
+        if anchor_hash is None:
+            return database.verify_audit_chain()
+        return database.verify_audit_chain(after_sequence, anchor_hash)
 
     @app.post(
         "/v1/tasks",
@@ -230,8 +264,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response_model=list[TaskView],
         dependencies=[Depends(require_admin)],
     )
-    def list_tasks(status: TaskStatus | None = None) -> list[dict]:
-        return coordination.list_tasks(status)
+    def list_tasks(
+        response: Response,
+        status: TaskStatus | None = None,
+        limit: int = 100,
+        after: str | None = None,
+    ) -> list[dict]:
+        tasks, next_cursor = coordination.list_tasks(
+            status, limit=max(1, min(limit, TASK_PAGE_MAX)), after=after
+        )
+        if next_cursor:
+            response.headers["X-Next-Cursor"] = next_cursor
+        return tasks
 
     @app.get(
         "/v1/tasks/{task_id}",
