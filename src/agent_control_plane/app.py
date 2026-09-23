@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     active_settings = settings or Settings.from_env()
+    active_settings.validate()
     if active_settings.insecure_defaults:
         logger.warning(
             "development defaults are active for %s; set real values before "
