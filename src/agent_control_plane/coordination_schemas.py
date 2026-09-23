@@ -18,6 +18,9 @@ TaskStatus = Literal[
     "conflicted",
 ]
 
+# An attempt token is a compact JWT; the bound keeps a hostile client from posting megabytes.
+ATTEMPT_TOKEN_MAX_LENGTH = 4096
+
 
 class ReviewFinding(BaseModel):
     severity: Literal["critical", "high", "medium", "low", "info"]
@@ -58,6 +61,9 @@ class SubmissionCreate(BaseModel):
     artifact_hash: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
     summary: str = Field(min_length=1, max_length=4000)
     evidence: list[str] = Field(default_factory=list, max_length=200)
+    # Board #568: the signed token issued with the claim or last heartbeat. Required when the
+    # authority runs with require_attempt_tokens; checked whenever it is present.
+    attempt_token: str | None = Field(default=None, max_length=ATTEMPT_TOKEN_MAX_LENGTH)
 
 
 class SubmissionView(BaseModel):
@@ -129,6 +135,9 @@ class ResourceLeaseView(BaseModel):
 class TaskClaimView(BaseModel):
     task: TaskView
     resource_leases: list[ResourceLeaseView]
+    # Board #568: task, runner, claim generation, resource generations and lease expiry,
+    # signed. Present it to heartbeat, submit and any FencingGate.
+    attempt_token: str | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -136,6 +145,7 @@ class HeartbeatRequest(BaseModel):
     resource_fencing_tokens: dict[str, int]
     ttl_seconds: int = Field(default=300, ge=30, le=3600)
     checkpoint: dict[str, Any] = Field(default_factory=dict)
+    attempt_token: str | None = Field(default=None, max_length=ATTEMPT_TOKEN_MAX_LENGTH)
 
 
 class HeartbeatView(BaseModel):
@@ -144,6 +154,11 @@ class HeartbeatView(BaseModel):
     claim_fencing_token: int
     expires_at: int
     checkpoint: dict[str, Any]
+    # Board #568 runner protocol. A successful heartbeat says "continue" and carries the renewed
+    # attempt token; a refusal is an HTTP 409 whose error code tells the runner to terminate.
+    attempt_token: str | None = None
+    directive: Literal["continue"] = "continue"
+    renew_after_seconds: int | None = None
 
 
 class TaskCompleteRequest(BaseModel):
@@ -152,6 +167,17 @@ class TaskCompleteRequest(BaseModel):
 
 class TaskReopenRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
+
+
+class ClaimRevokeRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class ClaimRevokeView(BaseModel):
+    task: TaskView
+    revoked_agent_id: str | None
+    revoked_claim_fencing_token: int
+    resources_reserved_until: int | None
 
 
 class ReapReport(BaseModel):

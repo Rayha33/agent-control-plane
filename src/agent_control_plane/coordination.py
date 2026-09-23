@@ -6,6 +6,7 @@ import time
 import uuid
 from typing import Any
 
+from .attempt_tokens import AttemptTokenError, AttemptTokenSigner
 from .coordination_schemas import (
     HeartbeatRequest,
     QCReviewCreate,
@@ -21,9 +22,20 @@ QC_RESERVATION_SECONDS = 3600
 
 
 class CoordinationService:
-    def __init__(self, database: Database, control_plane: ControlPlaneService):
+    def __init__(
+        self,
+        database: Database,
+        control_plane: ControlPlaneService,
+        attempt_tokens: AttemptTokenSigner | None = None,
+    ):
         self.database = database
         self.control_plane = control_plane
+        settings = control_plane.settings
+        # Board #568: signed with a key derived from the mandate signing key, never the key itself.
+        self.attempt_tokens = attempt_tokens or AttemptTokenSigner.from_signing_key(
+            settings.signing_key, settings.issuer
+        )
+        self.require_attempt_tokens = bool(getattr(settings, "require_attempt_tokens", False))
 
     def create_task(self, request: TaskCreate) -> dict[str, Any]:
         task_id = str(uuid.uuid4())
@@ -237,13 +249,35 @@ class CoordinationService:
                 },
                 connection=connection,
             )
-        return {"task": self.task(task_id), "resource_leases": lease_views}
+        return {
+            "task": self.task(task_id),
+            "resource_leases": lease_views,
+            # Minted only after the claim committed, from the values it committed.
+            "attempt_token": self.attempt_tokens.issue(
+                task_id=task_id,
+                agent_id=agent["id"],
+                claim_fencing_token=claim_fencing_token,
+                resource_fencing_tokens={
+                    lease["resource"]: lease["fencing_token"] for lease in lease_views
+                },
+                expires_at=expires_at,
+                now=now,
+            ),
+        }
 
     def heartbeat(self, task_id: str, token: str, request: HeartbeatRequest) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
             token, "coordination.heartbeat", f"task:{task_id}", {"worker"}
         )
         now = int(time.time())
+        self._check_attempt_token(
+            getattr(request, "attempt_token", None),
+            task_id=task_id,
+            agent_id=agent["id"],
+            claim_fencing_token=request.claim_fencing_token,
+            resource_fencing_tokens=request.resource_fencing_tokens,
+            now=now,
+        )
         expires_at = now + request.ttl_seconds
         updated_at = utc_now()
         with self.database.connect() as connection:
@@ -325,6 +359,18 @@ class CoordinationService:
             "claim_fencing_token": request.claim_fencing_token,
             "expires_at": expires_at,
             "checkpoint": request.checkpoint,
+            # Board #568 runner protocol. The renewed token carries the new lease expiry, so a
+            # gate on another host keeps admitting this generation instead of timing it out.
+            "attempt_token": self.attempt_tokens.issue(
+                task_id=task_id,
+                agent_id=agent["id"],
+                claim_fencing_token=request.claim_fencing_token,
+                resource_fencing_tokens=dict(request.resource_fencing_tokens),
+                expires_at=expires_at,
+                now=now,
+            ),
+            "directive": "continue",
+            "renew_after_seconds": max(1, request.ttl_seconds // 3),
         }
 
     def submit(self, task_id: str, token: str, request: SubmissionCreate) -> dict[str, Any]:
@@ -332,6 +378,14 @@ class CoordinationService:
             token, "coordination.submit", f"task:{task_id}", {"worker"}
         )
         now = int(time.time())
+        self._check_attempt_token(
+            getattr(request, "attempt_token", None),
+            task_id=task_id,
+            agent_id=agent["id"],
+            claim_fencing_token=request.claim_fencing_token,
+            resource_fencing_tokens=request.resource_fencing_tokens,
+            now=now,
+        )
         submission_id = str(uuid.uuid4())
         created_at = utc_now()
         qc_reservation_expires_at = now + QC_RESERVATION_SECONDS
@@ -671,6 +725,111 @@ class CoordinationService:
                 connection=connection,
             )
         return self.task(task_id)
+
+    def revoke_claim(self, task_id: str, reason: str) -> dict[str, Any]:
+        """End an active claim now, without waiting for its lease to run out (board #568).
+
+        The claim is over at the authority immediately: the task is orphaned, its heartbeats
+        are dropped, and the runner's next heartbeat, submission or side effect is refused as
+        ``claim_inactive``. Its RESOURCES are a different question. A revoked runner may hold a
+        signed attempt token that a gate on another host will keep accepting until that token
+        expires, and the authority cannot recall it. So the leases stay reserved, holderless,
+        until exactly that moment — the lease expiry the last token was minted against. A
+        replacement therefore cannot exist while a gate would still admit its predecessor.
+        """
+
+        revoked_at = utc_now()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._task_row(connection, task_id)
+            if task["status"] not in {"claimed", "working"}:
+                raise ControlPlaneError(
+                    409,
+                    "claim_not_revocable",
+                    f"task has no active claim while status is {task['status']}",
+                )
+            revoked_agent_id = task["owner_agent_id"]
+            revoked_token = task["claim_fencing_token"]
+            reserved_until = task["claim_expires_at"]
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'orphaned', owner_agent_id = NULL, claim_expires_at = NULL,
+                    version = version + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (revoked_at, task_id),
+            )
+            connection.execute(
+                """
+                UPDATE resource_leases
+                SET holder_agent_id = NULL, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (revoked_at, task_id),
+            )
+            self._clear_heartbeats(connection, task_id)
+
+            self.database.append_audit(
+                "task.claim_revoked",
+                "admin",
+                {
+                    "agent_id": revoked_agent_id,
+                    "claim_fencing_token": revoked_token,
+                    "reason": reason,
+                    "resources_reserved_until": reserved_until,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
+        return {
+            "task": self.task(task_id),
+            "revoked_agent_id": revoked_agent_id,
+            "revoked_claim_fencing_token": revoked_token,
+            "resources_reserved_until": reserved_until,
+        }
+
+    def _check_attempt_token(
+        self,
+        attempt_token: str | None,
+        *,
+        task_id: str,
+        agent_id: str,
+        claim_fencing_token: int,
+        resource_fencing_tokens: dict[str, int],
+        now: int,
+    ) -> None:
+        """Board #568: the signed token must describe exactly the request being made.
+
+        The database check that follows is still the authority. This one adds the property a
+        database check cannot have off-host: the generations in the request were ISSUED by this
+        authority to this runner for this task, rather than asserted by the caller.
+        """
+
+        if attempt_token is None:
+            if self.require_attempt_tokens:
+                raise ControlPlaneError(
+                    401,
+                    "attempt_token_required",
+                    "this authority requires the attempt token issued with the claim",
+                )
+            return
+        try:
+            claims = self.attempt_tokens.verify(attempt_token, now=now)
+        except AttemptTokenError as error:
+            status = 409 if error.code == "attempt_token_expired" else 401
+            raise ControlPlaneError(status, error.code, error.message) from error
+        if (
+            claims.task_id != task_id
+            or claims.agent_id != agent_id
+            or claims.claim_fencing_token != claim_fencing_token
+            or claims.resource_fencing_tokens != dict(resource_fencing_tokens)
+        ):
+            raise ControlPlaneError(
+                409,
+                "attempt_token_mismatch",
+                "attempt token was issued for a different task, runner or generation",
+            )
 
     def reap_expired(self) -> dict[str, Any]:
         now = int(time.time())

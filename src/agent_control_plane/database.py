@@ -22,6 +22,27 @@ from .schema_version import (
 
 GENESIS_HASH = "0" * 64
 
+POSTGRES_URL_PREFIXES = ("postgresql://", "postgres://")
+
+
+def is_postgres_url(value: str) -> bool:
+    """A ``postgresql://`` URL selects the multi-host backend; anything else is a SQLite path."""
+
+    return value.startswith(POSTGRES_URL_PREFIXES)
+
+
+class StorageBusyError(RuntimeError):
+    """The backend could not serialise this request, so nothing was applied; retry it whole.
+
+    Raised by the PostgreSQL backend for serialization failures, deadlocks, lock timeouts and
+    lost sessions. The transaction rolled back, and every mutation re-validates its fencing
+    tokens when retried, so a retry cannot apply a stale request.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
 
 SERVICE_SCHEMA_VERSION = 1
 """Schema this binary understands for the FastAPI service database.
@@ -212,8 +233,25 @@ def event_digest(
 class Database:
     def __init__(self, path: str):
         self.path = path
+        self._backend: Any = None
+        if is_postgres_url(path):
+            from .postgres_backend import PostgresBackend
+
+            self._backend = PostgresBackend(path)
+
+    @property
+    def dialect(self) -> str:
+        return "sqlite" if self._backend is None else self._backend.dialect
+
+    def describe(self) -> str:
+        """Where the state lives, with any password removed."""
+
+        return self.path if self._backend is None else self._backend.describe()
 
     def initialize(self) -> None:
+        if self._backend is not None:
+            self._initialize_postgres()
+            return
         if self.path != ":memory:":
             Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
@@ -257,8 +295,36 @@ class Database:
                 package_version=__version__,
             )
 
+    def _initialize_postgres(self) -> None:
+        # Replicas that start together must not interleave CREATE TABLE IF NOT EXISTS, so
+        # initialisation runs under the same write lock that serialises claims.
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.executescript(META_TABLE)
+            stored = stored_schema_version(connection)
+            assert_schema_not_newer(
+                stored,
+                binary_version=SERVICE_SCHEMA_VERSION,
+                component="service database",
+                package_version=__version__,
+            )
+            # A PostgreSQL database is always created from the current SCHEMA, so the
+            # pre-stamping ALTER TABLE upgrades in initialize() are SQLite history it never had.
+            connection.executescript(SCHEMA)
+            apply_migration_ledger(connection, stored, MIGRATIONS)
+            stamp_schema_version(
+                connection,
+                version=SERVICE_SCHEMA_VERSION,
+                package_version=__version__,
+            )
+
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
+        if self._backend is not None:
+            # Same contract as below: commit on success, roll back on any exception.
+            with self._backend.connect() as backend_connection:
+                yield backend_connection
+            return
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -324,23 +390,27 @@ class Database:
                 payload_json,
                 created_at,
             )
-            cursor = audit_connection.execute(
-                """
+            insert = """
                 INSERT INTO audit_events
                     (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    event_type,
-                    actor,
-                    payload_json,
-                    previous_hash,
-                    digest,
-                    created_at,
-                ),
+                """
+            values = (
+                event_id,
+                event_type,
+                actor,
+                payload_json,
+                previous_hash,
+                digest,
+                created_at,
             )
-            sequence = cursor.lastrowid
+            if getattr(audit_connection, "dialect", "sqlite") == "sqlite":
+                sequence = audit_connection.execute(insert, values).lastrowid
+            else:
+                # PostgreSQL has no lastrowid; the identity column hands the value back.
+                sequence = audit_connection.execute(
+                    insert + " RETURNING sequence", values
+                ).fetchone()[0]
 
         return {
             "sequence": sequence,

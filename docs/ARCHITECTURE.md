@@ -123,6 +123,25 @@ Submissions persist the complete resource-token map. QC and integration compare
 that map with the live reservation. An expired or replaced reservation closes
 the gate even if the candidate previously passed.
 
+Across hosts the same comparison is carried rather than queried. Each claim and
+heartbeat mints an **attempt token**: task, runner, claim generation, every
+resource generation and the lease expiry, signed with a key derived from the
+deployment signing key (so a mandate can never stand in for an attempt token or
+the reverse). The authority checks it against the request before the database
+check it does not replace. A resource on another host, which cannot run that
+query, checks it alone through a fencing gate that remembers the newest
+generation it has admitted per resource and refuses anything older — the
+generation comes from the signed token, never from the caller.
+
+Termination follows the same rule. `POST /v1/tasks/{id}/revoke-claim` ends a
+claim at once, but its resources stay reserved, holderless, until the moment the
+revoked runner's last token expires. The authority cannot recall a token it has
+issued, so it instead refuses to create a second generation while a gate would
+still admit the first. On the runner's own side, a lease is counted from when a
+renewal was *sent*, never from when its reply arrived, so a runner that cannot
+reach the authority stops before the authority could hand its work to anyone
+else.
+
 ### 3. Git, not the worker, supplies evidence
 
 The submit interface accepts an attempt ID and claim token—no caller-provided

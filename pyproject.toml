@@ -32,9 +32,15 @@ acp = "agent_control_plane.cli:main"
 acp-trust-helper = "agent_control_plane.trust_helper:main"
 
 [project.optional-dependencies]
+# The multi-host PostgreSQL backend (board #568). Optional: the single-host SQLite default
+# needs nothing beyond the standard library.
+postgres = [
+  "psycopg[binary]>=3.2,<4",
+]
 dev = [
   "httpx2>=2.12,<3",
   "httpx>=0.28,<1",
+  "psycopg[binary]>=3.2,<4",
   "pytest-cov>=7,<8",
   "pytest>=9.0.3,<10",
   "ruff>=0.15.8,<0.16",
@@ -54,6 +60,8 @@ packages = ["src/agent_control_plane"]
 addopts = "-q"
 markers = [
   "linux_worker: needs the Linux child-subreaper/proc worker path; must run on a Linux CI job",
+  "storage_portable: runs once per storage backend when ACP_TEST_POSTGRES_URL is set",
+  "postgres_backend: needs a live PostgreSQL server (ACP_TEST_POSTGRES_URL)",
 ]
 testpaths = ["tests"]
 # Starlette 1.6.0 deprecated the `httpx` transport for starlette.testclient and will

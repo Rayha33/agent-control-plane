@@ -27,6 +27,9 @@ from agent_control_plane.side_effects import (
     postgres_schema_adapter,
 )
 
+# Board #568: every test here also runs against PostgreSQL when ACP_TEST_POSTGRES_URL is set.
+pytestmark = pytest.mark.storage_portable
+
 DB_RESOURCE = "db:orders/public"
 DEPLOY_RESOURCE = "deploy:preview/pr-42"
 ARTIFACT_RESOURCE = "artifact:acme%2Fapi/v1.2.3"

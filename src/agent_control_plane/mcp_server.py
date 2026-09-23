@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 from .git_supervisor import GitSupervisor, SupervisorError
+from .protocol_adapters import MCP_TASKS_CAPABILITY, McpTaskBridge, mcp_task
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "acp"
@@ -109,14 +110,38 @@ TOOLS: dict[str, tuple[str, str, dict[str, Any]]] = {
             "properties": {"attempt_id": {"type": "string"}, "path": {"type": "string"}},
         },
     ),
+    # Board #568. An ACP task IS the long-running unit MCP Tasks describes, so this tool is
+    # invoked task-augmented: the call returns a CreateTaskResult and the client then polls
+    # tasks/get. It reaches the same read-only `task` method as acp_show and takes no
+    # credential, so the read-only property the tests pin is unchanged.
+    "acp_watch_task": (
+        "task",
+        "Watch a task as an MCP task: returns a task handle to poll with tasks/get.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["task_id"],
+            "properties": {"task_id": {"type": "string"}},
+        },
+    ),
 }
+
+# Tools that MUST be invoked with task augmentation (MCP `execution.taskSupport`).
+TASK_TOOLS: frozenset[str] = frozenset({"acp_watch_task"})
 
 
 def tool_descriptors() -> list[dict[str, Any]]:
-    return [
-        {"name": name, "description": description, "inputSchema": schema}
-        for name, (_, description, schema) in sorted(TOOLS.items())
-    ]
+    descriptors = []
+    for name, (_, description, schema) in sorted(TOOLS.items()):
+        descriptor: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "inputSchema": schema,
+        }
+        if name in TASK_TOOLS:
+            descriptor["execution"] = {"taskSupport": "required"}
+        descriptors.append(descriptor)
+    return descriptors
 
 
 def dispatch(supervisor: GitSupervisor, tool: str, arguments: dict[str, Any]) -> Any:
@@ -164,7 +189,10 @@ def handle(request: dict[str, Any], open_supervisor: Callable[[], GitSupervisor]
                 "protocolVersion": (request.get("params") or {}).get(
                     "protocolVersion", PROTOCOL_VERSION
                 ),
-                "capabilities": {"tools": {}},
+                # Board #568: tasks/list and tasks/cancel are deliberately absent. A stdio
+                # server cannot bind tasks to an authorization context, and the specification
+                # says such a receiver SHOULD NOT declare list; cancel would be a write.
+                "capabilities": {"tools": {}, "tasks": MCP_TASKS_CAPABILITY},
                 "serverInfo": {
                     "name": SERVER_NAME,
                     "version": __import__("agent_control_plane").__version__,
@@ -175,10 +203,32 @@ def handle(request: dict[str, Any], open_supervisor: Callable[[], GitSupervisor]
         return None
     if method == "tools/list":
         return _response(request_id, {"tools": tool_descriptors()})
+    if method in {"tasks/get", "tasks/result"}:
+        # Board #568. Declared for tool calls only, so these two read an ACP task; tasks/list
+        # and tasks/cancel are not declared and fall through to "method not found" below.
+        params = request.get("params") or {}
+        task_id = params.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            return _error(request_id, -32602, "taskId is required")
+        bridge = McpTaskBridge(lambda identifier: open_supervisor().task(identifier))
+        try:
+            if method == "tasks/get":
+                return _response(request_id, bridge.get(task_id))
+            return _response(request_id, bridge.result(task_id))
+        except SupervisorError as error:
+            # The specification's answer for an invalid or unknown taskId.
+            return _error(request_id, -32602, f"{error.code}: {error}")
+        except TimeoutError as error:
+            return _error(request_id, -32603, str(error))
     if method == "tools/call":
         params = request.get("params") or {}
         name = params.get("name", "")
         arguments = params.get("arguments") or {}
+        augmented = "task" in params
+        if name in TASK_TOOLS and not augmented:
+            return _error(request_id, -32601, f"{name} must be invoked as a task")
+        if augmented and name not in TASK_TOOLS:
+            return _error(request_id, -32601, f"{name} does not support task augmentation")
         try:
             result = dispatch(open_supervisor(), name, arguments)
         except SupervisorError as error:
@@ -196,6 +246,10 @@ def handle(request: dict[str, Any], open_supervisor: Callable[[], GitSupervisor]
                     "isError": True,
                 },
             )
+        if name in TASK_TOOLS:
+            # A CreateTaskResult: the handle to poll, not the operation's result. The task view
+            # itself comes back later through tasks/get and tasks/result.
+            return _response(request_id, {"task": mcp_task(result)})
         return _response(
             request_id,
             {

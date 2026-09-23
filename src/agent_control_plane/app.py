@@ -13,6 +13,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import Settings
 from .coordination import CoordinationService
 from .coordination_schemas import (
+    ClaimRevokeRequest,
+    ClaimRevokeView,
     HeartbeatRequest,
     HeartbeatView,
     QCReviewCreate,
@@ -28,7 +30,13 @@ from .coordination_schemas import (
     TaskStatus,
     TaskView,
 )
-from .database import Database
+from .database import Database, StorageBusyError
+from .protocol_adapters import (
+    A2A_AGENT_CARD_PATH,
+    A2A_VERSION_HEADER,
+    A2ATaskAdapter,
+    agent_card,
+)
 from .schemas import (
     A2ASideEffectMutation,
     ActionRequestView,
@@ -126,6 +134,17 @@ def create_app(
         return JSONResponse(
             status_code=error.status_code,
             content={"error": error.code, "message": error.message},
+        )
+
+    @app.exception_handler(StorageBusyError)
+    async def storage_busy_handler(_request: Request, error: StorageBusyError) -> JSONResponse:
+        # The transaction rolled back, so nothing applied. Retrying the whole request is safe
+        # because every mutation re-validates its fencing tokens. The driver's message is not
+        # echoed: it can name hosts and roles.
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "1"},
+            content={"error": error.code, "message": "storage is busy; retry the request"},
         )
 
     def require_admin(x_control_plane_key: str = Header(default="")) -> None:
@@ -388,6 +407,34 @@ def create_app(
     )
     def reopen_task(task_id: str, request: TaskReopenRequest) -> dict:
         return coordination.reopen_task(task_id, request.reason)
+
+    @app.post(
+        "/v1/tasks/{task_id}/revoke-claim",
+        response_model=ClaimRevokeView,
+        dependencies=[Depends(require_admin)],
+    )
+    def revoke_claim(task_id: str, request: ClaimRevokeRequest) -> dict:
+        # Board #568 termination: the claim ends now; its resources stay reserved until the
+        # revoked runner's last attempt token expires, so no gate can see two live generations.
+        return coordination.revoke_claim(task_id, request.reason)
+
+    # Board #568. A2A's read surface over the same authenticated service: the adapter holds no
+    # state of its own, and its SendMessage/CancelTask both refuse, so a protocol transport
+    # cannot become a second way to create or end fenced work (ARCHITECTURE invariant 4c).
+    a2a_tasks = A2ATaskAdapter(coordination, service)
+    app.state.a2a_tasks = a2a_tasks
+
+    @app.get(A2A_AGENT_CARD_PATH)
+    def a2a_agent_card(request: Request) -> dict:
+        return agent_card(url=str(request.url_for("a2a_rpc")), version=API_VERSION)
+
+    @app.post("/a2a", name="a2a_rpc")
+    def a2a_rpc(
+        payload: dict,
+        token: str = Depends(require_mandate),
+        a2a_version: str = Header(default="", alias=A2A_VERSION_HEADER),
+    ) -> dict:
+        return a2a_tasks.dispatch(payload, token=token, version=a2a_version)
 
     @app.post(
         "/v1/coordination/reap",

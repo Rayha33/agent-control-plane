@@ -12,6 +12,11 @@ pytest_plugins = ["pytester"]
 def worker_gate(pytester, monkeypatch):
     """Exercise the real hooks in a fresh pytest process, not a hook simulation."""
     monkeypatch.setenv("ACP_REQUIRE_LINUX_WORKER", "1")
+    # These nested sessions run one synthetic test and are expected to exit OK, so no
+    # execution gate from the OUTER run may leak in through the environment. The linux
+    # worker gate is set explicitly above; the PostgreSQL gate (board #568) is cleared
+    # here for the same reason — inherited, it would fail every nested session.
+    monkeypatch.delenv("ACP_REQUIRE_POSTGRES", raising=False)
     pytester.makeconftest(Path(__file__).with_name("conftest.py").read_text())
     pytester.makeini("[pytest]\nmarkers = linux_worker: required worker test\n")
     return pytester
