@@ -536,3 +536,32 @@ def test_audit_failure_rolls_back_the_state_change(
     assert lease is None
     assert len(database.audit_events(limit=1000)) == events_before
     assert claim_task(client, task["id"], token).status_code == 200
+
+
+def test_author_cannot_review_own_submission_even_after_becoming_qc(
+    client, app, admin_headers
+):
+    # No endpoint changes a role, so the role split normally stops self-review
+    # first. This pins the second line of defence for an agent whose role is
+    # changed underneath it (or a future dual-role agent).
+    worker = create_agent(client, admin_headers, "role-changing-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(client, admin_headers, resources=["repo:self-review"])
+    claim = claim_task(client, task["id"], token).json()
+    submission = submit_task(client, task["id"], token, claim)
+    assert submission.status_code == 201, submission.text
+
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE agents SET role = 'qc' WHERE id = ?", (worker["id"],)
+        )
+
+    review = client.post(
+        f"/v1/submissions/{submission.json()['id']}/reviews",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"verdict": "pass", "summary": "Self-approved", "findings": []},
+    )
+    assert review.status_code == 403
+    assert review.json()["error"] == "self_review_forbidden"
+    status = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
+    assert status.json()["status"] == "qc_review"
