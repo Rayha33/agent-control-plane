@@ -93,6 +93,12 @@ export ACP_DATABASE_PATH="agent_control_plane.db"
 uv run uvicorn agent_control_plane.app:create_app --factory --reload
 ```
 
+Expired claims and reservations are recovered by the reap. It runs when an
+operator calls `POST /v1/coordination/reap`, or on a timer inside the service when
+`ACP_REAP_INTERVAL_SECONDS` is a positive number of seconds (unset or `0` keeps
+it manual). Run the timer in one instance only, or use an external scheduler that
+calls the endpoint.
+
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive
 API. The built-in credentials are intentionally obvious and are refused at startup
 unless `ACP_DEV_MODE=1` is set; use that only for local development, never where the
@@ -125,7 +131,7 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | `POST /v1/submissions/{id}/reviews` | Record independent structured QC |
 | `POST /v1/tasks/{id}/complete` | Open the completion gate after QC passes |
 | `POST /v1/tasks/{id}/reopen` | Return a `conflicted` or `blocked` task to `open` after operator action |
-| `POST /v1/coordination/reap` | Recover expired workers and reservations |
+| `POST /v1/coordination/reap` | Recover expired workers and reservations now (see `ACP_REAP_INTERVAL_SECONDS` to run it on a schedule) |
 | `POST /v1/authorize` | Evaluate an intended agent action |
 | `GET /v1/audit/verify` | Verify the audit hash chain; pass a valid run's `last_sequence` and `last_event_hash` back as `after_sequence` and `anchor_hash` to check only newer events |
 

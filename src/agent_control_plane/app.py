@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import secrets
+from collections.abc import AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -49,6 +52,16 @@ bearer = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
 
+async def reap_periodically(coordination: CoordinationService, interval: float) -> None:
+    """Run the same reap as POST /v1/coordination/reap every ``interval`` seconds."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(coordination.reap_expired)
+        except Exception:
+            logger.exception("scheduled reap failed; retrying in %ss", interval)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     active_settings = settings or Settings.from_env()
     if active_settings.insecure_defaults:
@@ -62,9 +75,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     service = ControlPlaneService(database, active_settings)
     coordination = CoordinationService(database, service)
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        interval = active_settings.reap_interval_seconds
+        if not interval:
+            yield
+            return
+        reaper = asyncio.create_task(reap_periodically(coordination, interval))
+        try:
+            yield
+        finally:
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper
+
     app = FastAPI(
         title="Agent Control Plane",
         version=__version__,
+        lifespan=lifespan,
         description=(
             "Delegated mandates, collision-free task coordination, independent QC, "
             "kill switches, and tamper-evident evidence for AI agents."

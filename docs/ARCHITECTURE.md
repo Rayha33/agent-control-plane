@@ -130,7 +130,10 @@ worker.
 
 ### 6. Recovery is explicit
 
-Workers heartbeat with a checkpoint and renewed TTL. The reaper:
+Workers heartbeat with a checkpoint and renewed TTL. The reaper runs on each
+`POST /v1/coordination/reap`, and also every `ACP_REAP_INTERVAL_SECONDS` inside the
+service when that is set (off by default; a failed run is logged and retried on
+the next tick). Each run:
 
 - marks expired active work `orphaned`;
 - releases its resources;

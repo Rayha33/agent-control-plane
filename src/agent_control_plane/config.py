@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -11,6 +12,22 @@ DEV_SIGNING_KEY = "dev-signing-key-change-before-production"
 
 def dev_mode_enabled() -> bool:
     return os.getenv("ACP_DEV_MODE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def reap_interval_from_env() -> float:
+    """Seconds between scheduled reaps; unset or 0 leaves reaping manual."""
+    raw = os.getenv("ACP_REAP_INTERVAL_SECONDS", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        interval = float(raw)
+    except ValueError:
+        interval = math.nan
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError(
+            f"ACP_REAP_INTERVAL_SECONDS must be a non-negative number, got {raw!r}"
+        )
+    return interval
 
 
 class InsecureDefaultsError(RuntimeError):
@@ -31,6 +48,7 @@ class Settings:
     admin_key: str
     signing_key: str
     issuer: str = "agent-control-plane"
+    reap_interval_seconds: float = 0.0
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -46,6 +64,7 @@ class Settings:
             admin_key=os.getenv("ACP_ADMIN_KEY", DEV_ADMIN_KEY),
             signing_key=os.getenv("ACP_SIGNING_KEY", DEV_SIGNING_KEY),
             issuer=os.getenv("ACP_ISSUER", "agent-control-plane"),
+            reap_interval_seconds=reap_interval_from_env(),
         )
         if settings.insecure_defaults and not dev_mode_enabled():
             raise InsecureDefaultsError(settings.insecure_defaults)
