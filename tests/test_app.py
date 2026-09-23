@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 import pytest
+from fastapi.testclient import TestClient
 
 from agent_control_plane import __version__
 from agent_control_plane.app import create_app
@@ -97,3 +98,25 @@ def test_file_backed_database_runs_in_wal_mode(app):
     with app.state.database.connect() as connection:
         mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
     assert mode == "wal"
+
+
+def test_non_ascii_admin_key_is_rejected_not_crashed(client):
+    # Starlette decodes header bytes as latin-1, so this arrives as non-ASCII str.
+    headers = {"X-Control-Plane-Key": "clé-invalide".encode()}
+    response = client.get("/v1/tasks", headers=headers)
+    assert response.status_code == 401
+    assert response.json()["error"] == "invalid_admin_key"
+
+
+def test_non_ascii_configured_admin_key_is_accepted(tmp_path):
+    settings = Settings(
+        database_path=str(tmp_path / "unicode.db"),
+        admin_key="clé-administrateur-longue",
+        signing_key="s" * 32,
+    )
+    with TestClient(create_app(settings)) as client:
+        response = client.get(
+            "/v1/tasks",
+            headers={"X-Control-Plane-Key": "clé-administrateur-longue".encode()},
+        )
+    assert response.status_code == 200
