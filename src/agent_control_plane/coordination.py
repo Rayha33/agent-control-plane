@@ -17,6 +17,9 @@ from .policy import scope_allows
 from .service import ControlPlaneError, ControlPlaneService
 
 QC_RESERVATION_SECONDS = 3600
+# Upper bound for one GET /v1/tasks page; also keeps the batched IN (...) lookups
+# below SQLite's historical 999-parameter limit.
+MAX_TASK_PAGE_SIZE = 500
 
 
 class CoordinationService:
@@ -83,25 +86,30 @@ class CoordinationService:
         return self.task(task_id)
 
     def task(self, task_id: str) -> dict[str, Any]:
-        row = self.database.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-        if not row:
-            raise ControlPlaneError(404, "task_not_found", "task not found")
-        return self._task_view(row)
+        with self.database.connect() as connection:
+            row = self._task_row(connection, task_id)
+            return self._task_views(connection, [row])[0]
 
-    def list_tasks(self, status: str | None = None) -> list[dict[str, Any]]:
-        if status:
-            rows = self.database.all(
-                """
-                SELECT * FROM tasks WHERE status = ?
-                ORDER BY priority DESC, created_at ASC
+    def list_tasks(
+        self, status: str | None = None, limit: int = 100, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """One page of tasks, highest priority first, oldest first within a priority.
+
+        ``limit`` is clamped to ``1..MAX_TASK_PAGE_SIZE`` and ``offset`` to ``>= 0``.
+        """
+        limit = max(1, min(limit, MAX_TASK_PAGE_SIZE))
+        offset = max(0, offset)
+        where = "WHERE status = ?" if status else ""
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM tasks {where}
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT ? OFFSET ?
                 """,
-                (status,),
-            )
-        else:
-            rows = self.database.all(
-                "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
-            )
-        return [self._task_view(row) for row in rows]
+                (*((status,) if status else ()), limit, offset),
+            ).fetchall()
+            return self._task_views(connection, rows)
 
     def claim_task(self, task_id: str, token: str, ttl_seconds: int) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
@@ -849,39 +857,80 @@ class CoordinationService:
                     409, "stale_fencing_token", f"stale lease for {resource}"
                 )
 
-    def _task_view(self, row: sqlite3.Row) -> dict[str, Any]:
-        dependencies = self.database.all(
-            """
-            SELECT depends_on_task_id FROM task_dependencies
-            WHERE task_id = ? ORDER BY depends_on_task_id
+    def _task_views(
+        self, connection: sqlite3.Connection, rows: list[sqlite3.Row]
+    ) -> list[dict[str, Any]]:
+        """Render tasks with three batched lookups instead of three per task."""
+        if not rows:
+            return []
+        task_ids = [row["id"] for row in rows]
+        placeholders = ", ".join("?" for _ in task_ids)
+        dependencies: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
+        for edge in connection.execute(
+            f"""
+            SELECT task_id, depends_on_task_id FROM task_dependencies
+            WHERE task_id IN ({placeholders}) ORDER BY depends_on_task_id
             """,
-            (row["id"],),
-        )
-        latest_submission = self.database.one(
-            """
-            SELECT * FROM submissions
-            WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
-            """,
-            (row["id"],),
-        )
-        latest_review = self.database.one(
-            """
-            SELECT review.* FROM reviews AS review
-            JOIN submissions AS submission ON submission.id = review.submission_id
-            WHERE submission.task_id = ?
-            ORDER BY review.created_at DESC, review.id DESC LIMIT 1
-            """,
-            (row["id"],),
-        )
+            task_ids,
+        ):
+            dependencies[edge["task_id"]].append(edge["depends_on_task_id"])
+        latest_submissions = {
+            submission["task_id"]: submission
+            for submission in connection.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY task_id ORDER BY created_at DESC, id DESC
+                    ) AS position
+                    FROM submissions WHERE task_id IN ({placeholders})
+                ) WHERE position = 1
+                """,
+                task_ids,
+            )
+        }
+        latest_reviews = {
+            review["task_id"]: review
+            for review in connection.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT review.*, submission.task_id AS task_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY submission.task_id
+                            ORDER BY review.created_at DESC, review.id DESC
+                        ) AS position
+                    FROM reviews AS review
+                    JOIN submissions AS submission
+                        ON submission.id = review.submission_id
+                    WHERE submission.task_id IN ({placeholders})
+                ) WHERE position = 1
+                """,
+                task_ids,
+            )
+        }
+        return [
+            self._task_view(
+                row,
+                dependencies[row["id"]],
+                latest_submissions.get(row["id"]),
+                latest_reviews.get(row["id"]),
+            )
+            for row in rows
+        ]
+
+    def _task_view(
+        self,
+        row: sqlite3.Row,
+        dependencies: list[str],
+        latest_submission: sqlite3.Row | None,
+        latest_review: sqlite3.Row | None,
+    ) -> dict[str, Any]:
         return {
             "id": row["id"],
             "title": row["title"],
             "description": row["description"],
             "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
             "resources": json.loads(row["resources_json"]),
-            "dependencies": [
-                dependency["depends_on_task_id"] for dependency in dependencies
-            ],
+            "dependencies": dependencies,
             "priority": row["priority"],
             "status": row["status"],
             "owner_agent_id": row["owner_agent_id"],

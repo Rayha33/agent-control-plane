@@ -5,6 +5,7 @@ from threading import Barrier
 
 import pytest
 
+from agent_control_plane import coordination as coordination_module
 from agent_control_plane.database import Database
 from agent_control_plane.service import ControlPlaneError
 
@@ -595,3 +596,53 @@ def test_claim_is_claimed_until_the_first_heartbeat(client, app, admin_headers):
         )
     reaped = client.post("/v1/coordination/reap", headers=admin_headers)
     assert silent_task["id"] in reaped.json()["orphaned_task_ids"]
+
+
+def test_task_list_is_paginated_and_matches_single_task_views(client, admin_headers):
+    worker = create_agent(client, admin_headers, "listed-worker", "worker")
+    qc_agent = create_agent(client, admin_headers, "listed-qc", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    first = create_task(client, admin_headers, resources=["repo:listed"], title="A")
+    second = create_task(client, admin_headers, dependencies=[first["id"]], title="B")
+    third = create_task(client, admin_headers, title="C")
+
+    claim = claim_task(client, first["id"], worker_token).json()
+    submission = submit_task(client, first["id"], worker_token, claim).json()
+    review = client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={"verdict": "pass", "summary": "Reproduced.", "findings": []},
+    )
+    assert review.status_code == 201, review.text
+
+    listed = client.get("/v1/tasks", headers=admin_headers)
+    assert listed.status_code == 200
+    assert [task["id"] for task in listed.json()] == [
+        first["id"],
+        second["id"],
+        third["id"],
+    ]
+    # The batched list renders exactly what the single-task endpoint does.
+    for task in listed.json():
+        single = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
+        assert task == single.json()
+    assert listed.json()[0]["latest_review"]["id"] == review.json()["id"]
+    assert listed.json()[1]["dependencies"] == [first["id"]]
+
+    page = client.get("/v1/tasks?limit=1&offset=1", headers=admin_headers).json()
+    assert [task["id"] for task in page] == [second["id"]]
+    clamped = client.get("/v1/tasks?limit=0&offset=-5", headers=admin_headers).json()
+    assert [task["id"] for task in clamped] == [first["id"]]
+    oversized = client.get("/v1/tasks?limit=100000", headers=admin_headers).json()
+    assert len(oversized) == 3
+    filtered = client.get("/v1/tasks?status=open&limit=1", headers=admin_headers)
+    assert [task["id"] for task in filtered.json()] == [second["id"]]
+
+
+def test_task_list_page_size_is_capped(client, admin_headers, monkeypatch):
+    monkeypatch.setattr(coordination_module, "MAX_TASK_PAGE_SIZE", 2)
+    for title in ("One", "Two", "Three"):
+        create_task(client, admin_headers, title=title)
+    listed = client.get("/v1/tasks?limit=1000", headers=admin_headers)
+    assert len(listed.json()) == 2

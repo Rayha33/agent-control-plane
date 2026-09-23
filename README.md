@@ -123,6 +123,7 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/tasks` | Create a task with dependencies and resources |
+| `GET /v1/tasks` | List tasks a page at a time (`limit` default 100, max 500; `offset`) |
 | `POST /v1/tasks/{id}/claim` | Atomically claim work and obtain fencing tokens |
 | `POST /v1/tasks/{id}/heartbeat` | Renew the claim and store a checkpoint |
 | `POST /v1/tasks/{id}/submissions` | Submit immutable artifact evidence |
