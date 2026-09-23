@@ -343,3 +343,58 @@ def test_approval_is_not_consumed_without_its_audit_event(
         json=action | {"approval_id": approval_id},
     )
     assert allowed.json()["decision"] == "allowed"
+
+
+def test_amount_limits_fail_closed_when_no_amount_is_given(client, admin_headers):
+    agent = create_agent(client, admin_headers, "capped-agent")
+    mandate = issue_root_mandate(client, admin_headers, agent["id"])
+    auth_headers = {"Authorization": f"Bearer {mandate['token']}"}
+    action = {"action": "payments.refund", "resource": "merchant:acme"}
+
+    amountless = client.post(
+        "/v1/authorize", headers=auth_headers, json=action | {"context": {}}
+    )
+    assert amountless.json()["decision"] == "denied"
+    assert amountless.json()["reason"] == "amount is required by mandate limit"
+    within = client.post(
+        "/v1/authorize",
+        headers=auth_headers,
+        json=action | {"context": {"amount_cents": 100}},
+    )
+    assert within.json()["decision"] == "allowed"
+
+    uncapped_agent = create_agent(client, admin_headers, "policy-capped-agent")
+    uncapped = client.post(
+        "/v1/mandates",
+        headers=admin_headers,
+        json={
+            "agent_id": uncapped_agent["id"],
+            "subject": "raymond",
+            "scopes": [{"action": "payments.*", "resource": "merchant:*"}],
+            "ttl_seconds": 3600,
+        },
+    )
+    assert uncapped.status_code == 201, uncapped.text
+    policy = client.post(
+        "/v1/policies",
+        headers=admin_headers,
+        json={
+            "agent_id": uncapped_agent["id"],
+            "action_pattern": "payments.refund",
+            "resource_pattern": "merchant:*",
+            "max_amount_cents": 1_000,
+        },
+    )
+    assert policy.status_code == 201, policy.text
+    uncapped_headers = {"Authorization": f"Bearer {uncapped.json()['token']}"}
+    policy_amountless = client.post(
+        "/v1/authorize", headers=uncapped_headers, json=action | {"context": {}}
+    )
+    assert policy_amountless.json()["reason"] == "amount is required by policy limit"
+    # Actions outside the capped policy need no amount.
+    unrelated = client.post(
+        "/v1/authorize",
+        headers=uncapped_headers,
+        json={"action": "payments.lookup", "resource": "merchant:acme", "context": {}},
+    )
+    assert unrelated.json()["decision"] == "allowed"

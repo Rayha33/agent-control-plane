@@ -280,8 +280,20 @@ class ControlPlaneService:
             amount = amount_from_context(request.context)
         except ValueError as exc:
             raise ControlPlaneError(400, "invalid_context", str(exc)) from exc
+        # A limit fails closed: an action without context.amount_cents is denied
+        # rather than waved through, since omitting the amount would otherwise
+        # bypass the cap. Keep non-monetary actions on an uncapped mandate, or
+        # put the limit on a policy scoped to the monetary actions instead.
         mandate_max = mandate["max_amount_cents"]
-        if mandate_max is not None and (amount is None or amount > mandate_max):
+        if mandate_max is not None and amount is None:
+            return self._decision(
+                "denied",
+                "amount is required by mandate limit",
+                claims["actor"],
+                request,
+                base,
+            )
+        if mandate_max is not None and amount > mandate_max:
             return self._decision(
                 "denied", "amount exceeds mandate limit", claims["actor"], request, base
             )
@@ -305,7 +317,15 @@ class ControlPlaneService:
             for policy in matching
             if policy["max_amount_cents"] is not None
         ]
-        if limits and (amount is None or amount > min(limits)):
+        if limits and amount is None:
+            return self._decision(
+                "denied",
+                "amount is required by policy limit",
+                claims["actor"],
+                request,
+                base,
+            )
+        if limits and amount > min(limits):
             return self._decision(
                 "denied", "amount exceeds policy limit", claims["actor"], request, base
             )

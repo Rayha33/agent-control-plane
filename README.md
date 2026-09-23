@@ -25,6 +25,9 @@ The service provides the coordination primitives needed to prevent both.
 - User → agent → child-agent delegation chains
 - Scope attenuation: a child cannot receive more authority than its parent
 - Deny-first policy overlays, transaction limits, and one-time approvals
+- Transaction limits fail closed: under a mandate or matching policy with
+  `max_amount_cents`, an action whose context carries no `amount_cents` is
+  denied, so omitting the amount cannot bypass the cap
 - Immediate agent kill switches and mandate revocation
 
 ### Collision-free coordination
