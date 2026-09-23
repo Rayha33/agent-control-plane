@@ -25,6 +25,9 @@ The service provides the coordination primitives needed to prevent both.
 - User → agent → child-agent delegation chains
 - Scope attenuation: a child cannot receive more authority than its parent
 - Deny-first policy overlays, transaction limits, and one-time approvals
+- Transaction limits fail closed: under a mandate or matching policy with
+  `max_amount_cents`, an action whose context carries no `amount_cents` is
+  denied, so omitting the amount cannot bypass the cap
 - Immediate agent kill switches and mandate revocation
 
 ### Collision-free coordination
@@ -48,7 +51,8 @@ The service provides the coordination primitives needed to prevent both.
 
 ### Evidence
 
-- Append-only, hash-chained audit events
+- Append-only, hash-chained audit events, each committed in the same
+  transaction as the state change it records
 - Audit-chain verification endpoint
 - Review and submission history attached to every task
 
@@ -96,7 +100,8 @@ uv run uvicorn agent_control_plane.app:create_app --factory --reload
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive
 API. The built-in credentials are intentionally obvious and are refused at startup
 unless `ACP_DEV_MODE=1` is set; use that only for local development, never where the
-service is reachable by anyone else.
+service is reachable by anyone else. Outside development mode the service also
+requires at least 32 bytes for `ACP_SIGNING_KEY` and 16 for `ACP_ADMIN_KEY`.
 
 ## Minimal coordinated-work flow
 
@@ -118,6 +123,7 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/tasks` | Create a task with dependencies and resources |
+| `GET /v1/tasks` | List tasks a page at a time (`limit` default 100, max 500; `offset`) |
 | `POST /v1/tasks/{id}/claim` | Atomically claim work and obtain fencing tokens |
 | `POST /v1/tasks/{id}/heartbeat` | Renew the claim and store a checkpoint |
 | `POST /v1/tasks/{id}/submissions` | Submit immutable artifact evidence |

@@ -230,8 +230,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response_model=list[TaskView],
         dependencies=[Depends(require_admin)],
     )
-    def list_tasks(status: TaskStatus | None = None) -> list[dict]:
-        return coordination.list_tasks(status)
+    def list_tasks(
+        status: TaskStatus | None = None, limit: int = 100, offset: int = 0
+    ) -> list[dict]:
+        return coordination.list_tasks(status, limit=limit, offset=offset)
 
     @app.get(
         "/v1/tasks/{task_id}",

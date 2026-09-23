@@ -3,6 +3,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
+import pytest
+
+from agent_control_plane import coordination as coordination_module
+from agent_control_plane.database import Database
 from agent_control_plane.service import ControlPlaneError
 
 
@@ -499,6 +503,140 @@ def test_heartbeat_rows_end_with_the_claim(client, app, admin_headers):
     )
     assert completed.status_code == 200, completed.text
     assert heartbeat_rows(app, task["id"]) == 0
+
+
+def test_audit_failure_rolls_back_the_state_change(
+    client, app, admin_headers, monkeypatch
+):
+    worker = create_agent(client, admin_headers, "atomic-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(client, admin_headers, resources=["repo:atomic"])
+    database = app.state.database
+    events_before = len(database.audit_events(limit=1000))
+
+    def failing_insert(*_args, **_kwargs):
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr(Database, "_insert_audit", staticmethod(failing_insert))
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        claim_task(client, task["id"], token)
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        create_task(client, admin_headers, title="Never created")
+    monkeypatch.undo()
+
+    # Neither the claim nor the second task survived without its audit event.
+    assert (
+        client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()["status"]
+        == "open"
+    )
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        lease = connection.execute(
+            "SELECT task_id FROM resource_leases WHERE resource = 'repo:atomic'"
+        ).fetchone()
+    assert lease is None
+    assert len(database.audit_events(limit=1000)) == events_before
+    assert claim_task(client, task["id"], token).status_code == 200
+
+
+def test_claim_is_claimed_until_the_first_heartbeat(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "silent-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(client, admin_headers, resources=["repo:state"])
+    claim = claim_task(client, task["id"], token).json()
+    assert claim["task"]["status"] == "claimed"
+
+    heartbeat = client.post(
+        f"/v1/tasks/{task['id']}/heartbeat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "resource_fencing_tokens": resource_tokens(claim),
+        },
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    status = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
+    assert status.json()["status"] == "working"
+
+    # A worker that never heartbeats is reaped straight from claimed.
+    silent_task = create_task(client, admin_headers, title="Never heartbeats")
+    assert claim_task(client, silent_task["id"], token).status_code == 200
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (silent_task["id"],)
+        )
+    reaped = client.post("/v1/coordination/reap", headers=admin_headers)
+    assert silent_task["id"] in reaped.json()["orphaned_task_ids"]
+
+
+def test_task_list_is_paginated_and_matches_single_task_views(client, admin_headers):
+    worker = create_agent(client, admin_headers, "listed-worker", "worker")
+    qc_agent = create_agent(client, admin_headers, "listed-qc", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    first = create_task(client, admin_headers, resources=["repo:listed"], title="A")
+    second = create_task(client, admin_headers, dependencies=[first["id"]], title="B")
+    third = create_task(client, admin_headers, title="C")
+
+    claim = claim_task(client, first["id"], worker_token).json()
+    submission = submit_task(client, first["id"], worker_token, claim).json()
+    review = client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={"verdict": "pass", "summary": "Reproduced.", "findings": []},
+    )
+    assert review.status_code == 201, review.text
+
+    listed = client.get("/v1/tasks", headers=admin_headers)
+    assert listed.status_code == 200
+    assert [task["id"] for task in listed.json()] == [
+        first["id"],
+        second["id"],
+        third["id"],
+    ]
+    # The batched list renders exactly what the single-task endpoint does.
+    for task in listed.json():
+        single = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
+        assert task == single.json()
+    assert listed.json()[0]["latest_review"]["id"] == review.json()["id"]
+    assert listed.json()[1]["dependencies"] == [first["id"]]
+
+    page = client.get("/v1/tasks?limit=1&offset=1", headers=admin_headers).json()
+    assert [task["id"] for task in page] == [second["id"]]
+    clamped = client.get("/v1/tasks?limit=0&offset=-5", headers=admin_headers).json()
+    assert [task["id"] for task in clamped] == [first["id"]]
+    oversized = client.get("/v1/tasks?limit=100000", headers=admin_headers).json()
+    assert len(oversized) == 3
+    filtered = client.get("/v1/tasks?status=open&limit=1", headers=admin_headers)
+    assert [task["id"] for task in filtered.json()] == [second["id"]]
+
+
+def test_task_list_page_size_is_capped(client, admin_headers, monkeypatch):
+    monkeypatch.setattr(coordination_module, "MAX_TASK_PAGE_SIZE", 2)
+    for title in ("One", "Two", "Three"):
+        create_task(client, admin_headers, title=title)
+    listed = client.get("/v1/tasks?limit=1000", headers=admin_headers)
+    assert len(listed.json()) == 2
+
+
+def test_tasks_can_only_depend_on_existing_tasks(client, admin_headers):
+    # Edges can only point at tasks that already exist, which is what rules out
+    # dependency cycles such as A -> B -> A.
+    existing = create_task(client, admin_headers, title="Existing")
+    response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Depends on the future",
+            "description": "Cannot reference a task that does not exist yet.",
+            "acceptance_criteria": ["Rejected"],
+            "dependencies": [existing["id"], "not-yet-created"],
+        },
+    )
+    assert response.status_code == 404
+    assert response.json()["error"] == "dependency_not_found"
+    listed = client.get("/v1/tasks", headers=admin_headers).json()
+    assert [task["id"] for task in listed] == [existing["id"]]
 
 
 def test_self_review_is_forbidden_even_for_a_qc_role(client, app, admin_headers):

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 GENESIS_HASH = "0" * 64
+# Rows fetched per step while verifying, so memory stays flat as the log grows.
+AUDIT_VERIFY_BATCH_SIZE = 500
 
 
 SCHEMA = """
@@ -229,56 +231,65 @@ class Database:
         with self.connect() as connection:
             return list(connection.execute(query, parameters).fetchall())
 
-    def execute(self, query: str, parameters: tuple[Any, ...] = ()) -> None:
-        with self.connect() as connection:
-            connection.execute(query, parameters)
-
-    def execute_count(self, query: str, parameters: tuple[Any, ...] = ()) -> int:
-        with self.connect() as connection:
-            cursor = connection.execute(query, parameters)
-            return cursor.rowcount
-
     def append_audit(
-        self, event_type: str, actor: str, payload: dict[str, Any]
+        self,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Append one event to the hash chain.
+
+        Pass the connection of an open ``BEGIN IMMEDIATE`` transaction to commit
+        the event atomically with the state change it records; the write lock
+        that transaction holds also serializes the read of the chain head.
+        """
+        if connection is not None:
+            return self._insert_audit(connection, event_type, actor, payload)
+        with self.connect() as own_connection:
+            own_connection.execute("BEGIN IMMEDIATE")
+            return self._insert_audit(own_connection, event_type, actor, payload)
+
+    @staticmethod
+    def _insert_audit(
+        connection: sqlite3.Connection,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
     ) -> dict[str, Any]:
         event_id = str(uuid.uuid4())
         created_at = utc_now()
         payload_json = canonical_json(payload)
-
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            previous = connection.execute(
-                "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-            previous_hash = previous["event_hash"] if previous else GENESIS_HASH
-            digest = event_digest(
-                previous_hash,
+        previous = connection.execute(
+            "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        previous_hash = previous["event_hash"] if previous else GENESIS_HASH
+        digest = event_digest(
+            previous_hash,
+            event_id,
+            event_type,
+            actor,
+            payload_json,
+            created_at,
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO audit_events
+                (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
                 event_id,
                 event_type,
                 actor,
                 payload_json,
+                previous_hash,
+                digest,
                 created_at,
-            )
-            cursor = connection.execute(
-                """
-                INSERT INTO audit_events
-                    (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    event_type,
-                    actor,
-                    payload_json,
-                    previous_hash,
-                    digest,
-                    created_at,
-                ),
-            )
-            sequence = cursor.lastrowid
-
+            ),
+        )
         return {
-            "sequence": sequence,
+            "sequence": cursor.lastrowid,
             "event_id": event_id,
             "event_type": event_type,
             "actor": actor,
@@ -307,21 +318,32 @@ class Database:
         ]
 
     def verify_audit_chain(self) -> tuple[bool, int, int | None]:
-        rows = self.all("SELECT * FROM audit_events ORDER BY sequence ASC")
+        """Re-hash the chain in order, holding one batch of events in memory.
+
+        Returns ``(valid, events_checked, broken_at_sequence)``; on a break,
+        ``events_checked`` counts the events examined up to and including it.
+        """
         expected_previous = GENESIS_HASH
-        for row in rows:
-            expected_hash = event_digest(
-                expected_previous,
-                row["event_id"],
-                row["event_type"],
-                row["actor"],
-                row["payload_json"],
-                row["created_at"],
+        checked = 0
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM audit_events ORDER BY sequence ASC"
             )
-            if (
-                row["previous_hash"] != expected_previous
-                or row["event_hash"] != expected_hash
-            ):
-                return False, len(rows), row["sequence"]
-            expected_previous = row["event_hash"]
-        return True, len(rows), None
+            while rows := cursor.fetchmany(AUDIT_VERIFY_BATCH_SIZE):
+                for row in rows:
+                    checked += 1
+                    expected_hash = event_digest(
+                        expected_previous,
+                        row["event_id"],
+                        row["event_type"],
+                        row["actor"],
+                        row["payload_json"],
+                        row["created_at"],
+                    )
+                    if (
+                        row["previous_hash"] != expected_previous
+                        or row["event_hash"] != expected_hash
+                    ):
+                        return False, checked, row["sequence"]
+                    expected_previous = row["event_hash"]
+        return True, checked, None

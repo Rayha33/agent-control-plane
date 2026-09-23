@@ -12,6 +12,7 @@ from agent_control_plane.config import (
     DEV_SIGNING_KEY,
     InsecureDefaultsError,
     Settings,
+    WeakKeyError,
 )
 
 
@@ -56,6 +57,30 @@ def test_from_env_refuses_development_defaults_unless_dev_mode(monkeypatch, tmp_
 
     monkeypatch.setenv("ACP_SIGNING_KEY", "a-real-signing-key-with-enough-entropy")
     assert Settings.from_env().insecure_defaults == []
+
+
+@pytest.mark.parametrize(
+    ("admin_key", "signing_key", "variables"),
+    [
+        ("a-real-admin-key", "too-short-signing-key", ["ACP_SIGNING_KEY"]),
+        ("short-admin", "s" * 32, ["ACP_ADMIN_KEY"]),
+        ("short-admin", "too-short-signing-key", ["ACP_SIGNING_KEY", "ACP_ADMIN_KEY"]),
+    ],
+)
+def test_from_env_refuses_short_keys_unless_dev_mode(
+    monkeypatch, tmp_path, admin_key, signing_key, variables
+):
+    monkeypatch.setenv("ACP_ADMIN_KEY", admin_key)
+    monkeypatch.setenv("ACP_SIGNING_KEY", signing_key)
+    monkeypatch.delenv("ACP_DEV_MODE", raising=False)
+    monkeypatch.setenv("ACP_DATABASE_PATH", str(tmp_path / "env.db"))
+    with pytest.raises(WeakKeyError) as refused:
+        Settings.from_env()
+    assert refused.value.variables == variables
+    assert "ACP_DEV_MODE=1" in str(refused.value)
+
+    monkeypatch.setenv("ACP_DEV_MODE", "1")
+    assert Settings.from_env().short_keys == variables
 
 
 def test_development_defaults_are_logged_at_startup(tmp_path, caplog):
