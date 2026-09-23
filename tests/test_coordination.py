@@ -539,35 +539,6 @@ def test_audit_failure_rolls_back_the_state_change(
     assert claim_task(client, task["id"], token).status_code == 200
 
 
-def test_author_cannot_review_own_submission_even_after_becoming_qc(
-    client, app, admin_headers
-):
-    # No endpoint changes a role, so the role split normally stops self-review
-    # first. This pins the second line of defence for an agent whose role is
-    # changed underneath it (or a future dual-role agent).
-    worker = create_agent(client, admin_headers, "role-changing-worker", "worker")
-    token = issue_coordination_mandate(client, admin_headers, worker["id"])
-    task = create_task(client, admin_headers, resources=["repo:self-review"])
-    claim = claim_task(client, task["id"], token).json()
-    submission = submit_task(client, task["id"], token, claim)
-    assert submission.status_code == 201, submission.text
-
-    with app.state.database.connect() as connection:
-        connection.execute(
-            "UPDATE agents SET role = 'qc' WHERE id = ?", (worker["id"],)
-        )
-
-    review = client.post(
-        f"/v1/submissions/{submission.json()['id']}/reviews",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"verdict": "pass", "summary": "Self-approved", "findings": []},
-    )
-    assert review.status_code == 403
-    assert review.json()["error"] == "self_review_forbidden"
-    status = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
-    assert status.json()["status"] == "qc_review"
-
-
 def test_claim_is_claimed_until_the_first_heartbeat(client, app, admin_headers):
     worker = create_agent(client, admin_headers, "silent-worker", "worker")
     token = issue_coordination_mandate(client, admin_headers, worker["id"])
@@ -666,3 +637,31 @@ def test_tasks_can_only_depend_on_existing_tasks(client, admin_headers):
     assert response.json()["error"] == "dependency_not_found"
     listed = client.get("/v1/tasks", headers=admin_headers).json()
     assert [task["id"] for task in listed] == [existing["id"]]
+
+
+def test_self_review_is_forbidden_even_for_a_qc_role(client, app, admin_headers):
+    # The guard at review() compares the reviewer to the submission's worker, but it
+    # sits behind the qc-only role check and submit() is worker-only, so no request
+    # could reach it and no test exercised it. This constructs the collision the
+    # guard exists for: a submission whose worker IS the reviewing qc agent.
+    worker = create_agent(client, admin_headers, "worker-self", "worker")
+    qc_agent = create_agent(client, admin_headers, "qc-self", "qc")
+    worker_token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    qc_token = issue_coordination_mandate(client, admin_headers, qc_agent["id"])
+    task = create_task(client, admin_headers, resources=["src/self.py"])
+    claim = claim_task(client, task["id"], worker_token).json()
+    submission = submit_task(client, task["id"], worker_token, claim).json()
+
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE submissions SET worker_agent_id = ? WHERE id = ?",
+            (qc_agent["id"], submission["id"]),
+        )
+
+    review = client.post(
+        f"/v1/submissions/{submission['id']}/reviews",
+        headers={"Authorization": f"Bearer {qc_token}"},
+        json={"verdict": "pass", "summary": "Self-approved", "findings": []},
+    )
+    assert review.status_code == 403, review.text
+    assert review.json()["error"] == "self_review_forbidden"

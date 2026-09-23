@@ -51,7 +51,6 @@ logger = logging.getLogger(__name__)
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     active_settings = settings or Settings.from_env()
-    active_settings.validate()
     if active_settings.insecure_defaults:
         logger.warning(
             "development defaults are active for %s; set real values before "
@@ -85,13 +84,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={"error": error.code, "message": error.message},
         )
 
+    expected_admin_key = active_settings.admin_key.encode("utf-8")
+
     def admin_key_matches(candidate: str) -> bool:
-        # compare_digest rejects non-ASCII str with TypeError, so compare bytes.
-        # Starlette decodes header bytes as latin-1; re-encoding recovers the raw
-        # bytes the client sent, which for a non-ASCII key are its UTF-8 encoding.
-        return secrets.compare_digest(
-            candidate.encode("latin-1"), active_settings.admin_key.encode("utf-8")
-        )
+        # Compared as bytes: secrets.compare_digest raises TypeError on a str with
+        # non-ASCII characters, which turned an accented passphrase, or any client
+        # sending one, into an unhandled 500 instead of a 401. Starlette decodes
+        # header bytes as latin-1, so re-encoding as latin-1 recovers exactly what
+        # the client sent; clients send UTF-8, which is what the configured key is
+        # compared as.
+        try:
+            wire = candidate.encode("latin-1")
+        except UnicodeEncodeError:
+            wire = candidate.encode("utf-8")
+        return secrets.compare_digest(wire, expected_admin_key)
 
     def require_admin(x_control_plane_key: str = Header(default="")) -> None:
         if not admin_key_matches(x_control_plane_key):

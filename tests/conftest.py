@@ -11,7 +11,7 @@ from agent_control_plane.config import Settings
 def app(tmp_path):
     settings = Settings(
         database_path=str(tmp_path / "test.db"),
-        admin_key="test-admin-key-long-enough",
+        admin_key="test-admin",
         signing_key="test-signing-key-with-enough-entropy",
         issuer="test-control-plane",
     )
@@ -26,4 +26,4 @@ def client(app):
 
 @pytest.fixture
 def admin_headers():
-    return {"X-Control-Plane-Key": "test-admin-key-long-enough"}
+    return {"X-Control-Plane-Key": "test-admin"}

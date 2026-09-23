@@ -10,8 +10,9 @@ from agent_control_plane.app import create_app
 from agent_control_plane.config import (
     DEV_ADMIN_KEY,
     DEV_SIGNING_KEY,
-    ConfigurationError,
+    InsecureDefaultsError,
     Settings,
+    WeakKeyError,
 )
 
 
@@ -28,6 +29,7 @@ def test_openapi_version_matches_the_package(client):
 def test_from_env_reports_which_development_defaults_are_active(monkeypatch, tmp_path):
     monkeypatch.delenv("ACP_ADMIN_KEY", raising=False)
     monkeypatch.delenv("ACP_SIGNING_KEY", raising=False)
+    monkeypatch.setenv("ACP_DEV_MODE", "1")
     monkeypatch.setenv("ACP_DATABASE_PATH", str(tmp_path / "env.db"))
     assert Settings.from_env().insecure_defaults == [
         "ACP_ADMIN_KEY",
@@ -37,56 +39,60 @@ def test_from_env_reports_which_development_defaults_are_active(monkeypatch, tmp
     assert Settings.from_env().insecure_defaults == ["ACP_SIGNING_KEY"]
 
 
-def test_development_defaults_are_logged_at_startup_in_dev_mode(tmp_path, caplog):
+def test_from_env_refuses_development_defaults_unless_dev_mode(monkeypatch, tmp_path):
+    monkeypatch.delenv("ACP_ADMIN_KEY", raising=False)
+    monkeypatch.delenv("ACP_SIGNING_KEY", raising=False)
+    monkeypatch.delenv("ACP_DEV_MODE", raising=False)
+    monkeypatch.setenv("ACP_DATABASE_PATH", str(tmp_path / "env.db"))
+    with pytest.raises(InsecureDefaultsError) as refused:
+        Settings.from_env()
+    assert refused.value.variables == ["ACP_ADMIN_KEY", "ACP_SIGNING_KEY"]
+    assert "ACP_DEV_MODE=1" in str(refused.value)
+
+    # One real value is not enough: the published signing key still forges mandates.
+    monkeypatch.setenv("ACP_ADMIN_KEY", "a-real-admin-key")
+    with pytest.raises(InsecureDefaultsError) as refused:
+        Settings.from_env()
+    assert refused.value.variables == ["ACP_SIGNING_KEY"]
+
+    monkeypatch.setenv("ACP_SIGNING_KEY", "a-real-signing-key-with-enough-entropy")
+    assert Settings.from_env().insecure_defaults == []
+
+
+@pytest.mark.parametrize(
+    ("admin_key", "signing_key", "variables"),
+    [
+        ("a-real-admin-key", "too-short-signing-key", ["ACP_SIGNING_KEY"]),
+        ("short-admin", "s" * 32, ["ACP_ADMIN_KEY"]),
+        ("short-admin", "too-short-signing-key", ["ACP_SIGNING_KEY", "ACP_ADMIN_KEY"]),
+    ],
+)
+def test_from_env_refuses_short_keys_unless_dev_mode(
+    monkeypatch, tmp_path, admin_key, signing_key, variables
+):
+    monkeypatch.setenv("ACP_ADMIN_KEY", admin_key)
+    monkeypatch.setenv("ACP_SIGNING_KEY", signing_key)
+    monkeypatch.delenv("ACP_DEV_MODE", raising=False)
+    monkeypatch.setenv("ACP_DATABASE_PATH", str(tmp_path / "env.db"))
+    with pytest.raises(WeakKeyError) as refused:
+        Settings.from_env()
+    assert refused.value.variables == variables
+    assert "ACP_DEV_MODE=1" in str(refused.value)
+
+    monkeypatch.setenv("ACP_DEV_MODE", "1")
+    assert Settings.from_env().short_keys == variables
+
+
+def test_development_defaults_are_logged_at_startup(tmp_path, caplog):
     settings = Settings(
         database_path=str(tmp_path / "dev.db"),
         admin_key=DEV_ADMIN_KEY,
         signing_key=DEV_SIGNING_KEY,
-        dev_mode=True,
     )
     with caplog.at_level(logging.WARNING, logger="agent_control_plane.app"):
         create_app(settings)
     assert "ACP_ADMIN_KEY" in caplog.text
     assert "ACP_SIGNING_KEY" in caplog.text
-
-
-def test_development_defaults_refuse_to_start_outside_dev_mode(tmp_path):
-    settings = Settings(
-        database_path=str(tmp_path / "prod.db"),
-        admin_key="a-real-admin-key-value",
-        signing_key=DEV_SIGNING_KEY,
-    )
-    with pytest.raises(ConfigurationError, match="ACP_SIGNING_KEY"):
-        create_app(settings)
-    assert not (tmp_path / "prod.db").exists()
-
-
-def test_from_env_refuses_unset_keys_unless_dev_mode_is_explicit(monkeypatch, tmp_path):
-    monkeypatch.delenv("ACP_ADMIN_KEY", raising=False)
-    monkeypatch.delenv("ACP_SIGNING_KEY", raising=False)
-    monkeypatch.delenv("ACP_DEV_MODE", raising=False)
-    monkeypatch.setenv("ACP_DATABASE_PATH", str(tmp_path / "env.db"))
-    with pytest.raises(ConfigurationError, match="ACP_ADMIN_KEY, ACP_SIGNING_KEY"):
-        create_app()
-    monkeypatch.setenv("ACP_DEV_MODE", "1")
-    assert create_app().state.settings.dev_mode is True
-
-
-@pytest.mark.parametrize(
-    ("admin_key", "signing_key", "variable"),
-    [
-        ("a-real-admin-key-value", "too-short-signing-key", "ACP_SIGNING_KEY"),
-        ("short-admin", "s" * 32, "ACP_ADMIN_KEY"),
-    ],
-)
-def test_short_keys_refuse_to_start(tmp_path, admin_key, signing_key, variable):
-    settings = Settings(
-        database_path=str(tmp_path / "short.db"),
-        admin_key=admin_key,
-        signing_key=signing_key,
-    )
-    with pytest.raises(ConfigurationError, match=variable):
-        create_app(settings)
 
 
 def test_explicit_credentials_are_not_flagged(app, caplog):
@@ -100,23 +106,29 @@ def test_file_backed_database_runs_in_wal_mode(app):
     assert mode == "wal"
 
 
-def test_non_ascii_admin_key_is_rejected_not_crashed(client):
-    # Starlette decodes header bytes as latin-1, so this arrives as non-ASCII str.
-    headers = {"X-Control-Plane-Key": "clé-invalide".encode()}
-    response = client.get("/v1/tasks", headers=headers)
+def test_non_ascii_admin_key_is_a_clean_401_not_a_500(client):
+    # secrets.compare_digest rejects str operands with non-ASCII characters; an
+    # accented header value used to escape as a TypeError and a 500 stack trace.
+    # Sent as UTF-8 bytes, which is what a real client puts on the wire.
+    response = client.post(
+        "/v1/agents",
+        headers={"X-Control-Plane-Key": "cl\u00e9-secr\u00e8te".encode()},
+        json={"name": "x", "owner": "ops@example.com", "role": "worker"},
+    )
     assert response.status_code == 401
     assert response.json()["error"] == "invalid_admin_key"
 
 
-def test_non_ascii_configured_admin_key_is_accepted(tmp_path):
+def test_non_ascii_configured_admin_key_still_authenticates(tmp_path):
     settings = Settings(
-        database_path=str(tmp_path / "unicode.db"),
-        admin_key="clé-administrateur-longue",
-        signing_key="s" * 32,
+        database_path=str(tmp_path / "accent.db"),
+        admin_key="cl\u00e9-secr\u00e8te",
+        signing_key="test-signing-key-with-enough-entropy",
     )
-    with TestClient(create_app(settings)) as client:
-        response = client.get(
-            "/v1/tasks",
-            headers={"X-Control-Plane-Key": "clé-administrateur-longue".encode()},
+    with TestClient(create_app(settings)) as accented_client:
+        response = accented_client.post(
+            "/v1/agents",
+            headers={"X-Control-Plane-Key": "cl\u00e9-secr\u00e8te".encode()},
+            json={"name": "x", "owner": "ops@example.com", "role": "worker"},
         )
-    assert response.status_code == 200
+    assert response.status_code == 201, response.text

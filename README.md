@@ -98,10 +98,10 @@ uv run uvicorn agent_control_plane.app:create_app --factory --reload
 ```
 
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive
-API. The service refuses to start while either key is unset or still carries its
-built-in development value, and requires at least 32 bytes for `ACP_SIGNING_KEY`
-and 16 for `ACP_ADMIN_KEY`. For a throwaway local run, `export ACP_DEV_MODE=1`
-accepts the obvious built-in defaults instead.
+API. The built-in credentials are intentionally obvious and are refused at startup
+unless `ACP_DEV_MODE=1` is set; use that only for local development, never where the
+service is reachable by anyone else. Outside development mode the service also
+requires at least 32 bytes for `ACP_SIGNING_KEY` and 16 for `ACP_ADMIN_KEY`.
 
 ## Minimal coordinated-work flow
 
