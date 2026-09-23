@@ -27,21 +27,43 @@ services.
         incomplete ──┤     open     ├──────────────┐
                      └──────────────┘              ▼
                                            ┌─────────────┐
-                          heartbeat ───────►│   working   │
-                                           └──────┬──────┘
-                             lease expiry         │ submit
-                                  │               ▼
-                                  ▼        ┌─────────────┐
-                           ┌──────────┐     │  qc_review  │
-                           │ orphaned │     └──┬───────┬──┘
-                           └────┬─────┘  revise│       │pass
-                                │ claim        ▼       ▼
-                                └──────► changes_   approved
-                                          requested      │
-                                             │ claim      │complete
-                                             └──────►     ▼
-                                                        done
+                                           │   claimed   ├──────┐
+                                           └──────┬──────┘      │
+                                        heartbeat │             │
+                                                  ▼             │
+                                           ┌─────────────┐      │
+                          heartbeat ──────►│   working   │      │
+                                           └──────┬──────┘      │
+                             claim expiry         │ submit      │ submit
+                                  │               ▼             │
+                                  ▼        ┌─────────────┐      │
+                           ┌──────────┐    │  qc_review  │◄─────┘
+                           │ orphaned │    └──┬───────┬──┘
+                           └──────────┘ revise│       │pass
+                             claim →          ▼       ▼
+                             claimed     changes_   approved
+                                         requested      │
+                                         claim →        │complete
+                                         claimed        ▼
+                                                       done
 ```
+
+A claim puts the task in `claimed`; only the first heartbeat promotes it to
+`working`. A worker that never heartbeats stays `claimed` until it submits or its
+claim expires, and both states accept a submission. Every transition:
+
+| From | Event | To |
+|---|---|---|
+| `open`, `orphaned`, `changes_requested` | claim (all dependencies `done`) | `claimed` |
+| `claimed`, `working` | heartbeat | `working` |
+| `claimed`, `working` | submit | `qc_review` |
+| `claimed`, `working` | claim expires, reaper runs | `orphaned` |
+| `qc_review` | review `pass` | `approved` |
+| `qc_review` | review `revise` | `changes_requested` |
+| `qc_review` | review `block` or `human_required` | `blocked` |
+| `qc_review`, `approved` | resource reservation expires, reaper runs | `conflicted` |
+| `approved` | complete | `done` |
+| `blocked`, `conflicted` | reopen | `open` |
 
 `blocked` records a QC rejection, while `conflicted` records a task whose
 post-submission resource reservation expired before safe completion. Both require

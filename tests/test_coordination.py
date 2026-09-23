@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+
+import pytest
 
 from agent_control_plane.service import ControlPlaneError
 
@@ -527,3 +530,20 @@ def test_self_review_is_forbidden_even_for_a_qc_role(client, app, admin_headers)
     )
     assert review.status_code == 403, review.text
     assert review.json()["error"] == "self_review_forbidden"
+
+
+def test_merging_is_not_a_task_status(client, app, admin_headers):
+    # Nothing ever moved a task into merging, so the status was only a way to make
+    # the schema disagree with the state machine. It is gone from both the API
+    # filter and the CHECK constraint of a fresh database.
+    listed = client.get(
+        "/v1/tasks", headers=admin_headers, params={"status": "merging"}
+    )
+    assert listed.status_code == 422, listed.text
+
+    task = create_task(client, admin_headers)
+    with pytest.raises(sqlite3.IntegrityError):
+        with app.state.database.connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET status = 'merging' WHERE id = ?", (task["id"],)
+            )

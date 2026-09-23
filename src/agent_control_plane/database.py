@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority INTEGER NOT NULL DEFAULT 50,
     status TEXT NOT NULL CHECK(status IN (
         'open', 'claimed', 'working', 'qc_review', 'changes_requested',
-        'approved', 'merging', 'done', 'blocked', 'orphaned', 'conflicted'
+        'approved', 'done', 'blocked', 'orphaned', 'conflicted'
     )),
     owner_agent_id TEXT REFERENCES agents(id),
     claim_expires_at INTEGER,
