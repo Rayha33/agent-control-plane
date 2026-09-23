@@ -67,18 +67,19 @@ class CoordinationService:
                     """,
                     (task_id, dependency_id),
                 )
+            self.database.append_audit(
+                "task.created",
+                "admin",
+                {
+                    "dependencies": request.dependencies,
+                    "priority": request.priority,
+                    "resources": request.resources,
+                    "task_id": task_id,
+                    "title": request.title,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.created",
-            "admin",
-            {
-                "dependencies": request.dependencies,
-                "priority": request.priority,
-                "resources": request.resources,
-                "task_id": task_id,
-                "title": request.title,
-            },
-        )
         return self.task(task_id)
 
     def task(self, task_id: str) -> dict[str, Any]:
@@ -222,20 +223,22 @@ class CoordinationService:
                     updated_at,
                 ),
             )
-
-        self.database.append_audit(
-            "task.claimed",
-            claims["actor"],
-            {
-                "agent_id": agent["id"],
-                "claim_fencing_token": claim_fencing_token,
-                "expires_at": expires_at,
-                "resource_fencing_tokens": {
-                    lease["resource"]: lease["fencing_token"] for lease in lease_views
+            self.database.append_audit(
+                "task.claimed",
+                claims["actor"],
+                {
+                    "agent_id": agent["id"],
+                    "claim_fencing_token": claim_fencing_token,
+                    "expires_at": expires_at,
+                    "resource_fencing_tokens": {
+                        lease["resource"]: lease["fencing_token"]
+                        for lease in lease_views
+                    },
+                    "task_id": task_id,
                 },
-                "task_id": task_id,
-            },
-        )
+                connection=connection,
+            )
+
         return {"task": self.task(task_id), "resource_leases": lease_views}
 
     def heartbeat(
@@ -308,17 +311,18 @@ class CoordinationService:
                     updated_at,
                 ),
             )
+            self.database.append_audit(
+                "task.heartbeat",
+                claims["actor"],
+                {
+                    "agent_id": agent["id"],
+                    "checkpoint_keys": sorted(request.checkpoint),
+                    "expires_at": expires_at,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.heartbeat",
-            claims["actor"],
-            {
-                "agent_id": agent["id"],
-                "checkpoint_keys": sorted(request.checkpoint),
-                "expires_at": expires_at,
-                "task_id": task_id,
-            },
-        )
         return {
             "task_id": task_id,
             "agent_id": agent["id"],
@@ -403,18 +407,19 @@ class CoordinationService:
                     ),
                 )
             self._clear_heartbeats(connection, task_id)
+            self.database.append_audit(
+                "submission.created",
+                claims["actor"],
+                {
+                    "artifact_hash": request.artifact_hash.lower(),
+                    "base_revision": request.base_revision,
+                    "submission_id": submission_id,
+                    "task_id": task_id,
+                    "worker_agent_id": agent["id"],
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "submission.created",
-            claims["actor"],
-            {
-                "artifact_hash": request.artifact_hash.lower(),
-                "base_revision": request.base_revision,
-                "submission_id": submission_id,
-                "task_id": task_id,
-                "worker_agent_id": agent["id"],
-            },
-        )
         return self.submission(submission_id)
 
     def review(
@@ -533,19 +538,20 @@ class CoordinationService:
                     """,
                     (created_at, task_id),
                 )
+            self.database.append_audit(
+                "review.completed",
+                claims["actor"],
+                {
+                    "finding_count": len(findings),
+                    "qc_agent_id": agent["id"],
+                    "review_id": review_id,
+                    "submission_id": submission_id,
+                    "task_id": task_id,
+                    "verdict": request.verdict,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "review.completed",
-            claims["actor"],
-            {
-                "finding_count": len(findings),
-                "qc_agent_id": agent["id"],
-                "review_id": review_id,
-                "submission_id": submission_id,
-                "task_id": task_id,
-                "verdict": request.verdict,
-            },
-        )
         return self.review_view(review_id)
 
     def complete_task(self, task_id: str, reason: str) -> dict[str, Any]:
@@ -598,12 +604,13 @@ class CoordinationService:
                 (completed_at, task_id),
             )
             self._clear_heartbeats(connection, task_id)
+            self.database.append_audit(
+                "task.completed",
+                "admin",
+                {"reason": reason, "task_id": task_id},
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.completed",
-            "admin",
-            {"reason": reason, "task_id": task_id},
-        )
         return self.task(task_id)
 
     def reopen_task(self, task_id: str, reason: str) -> dict[str, Any]:
@@ -645,16 +652,17 @@ class CoordinationService:
                 (reopened_at, task_id),
             )
             self._clear_heartbeats(connection, task_id)
+            self.database.append_audit(
+                "task.reopened",
+                "admin",
+                {
+                    "previous_status": previous_status,
+                    "reason": reason,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.reopened",
-            "admin",
-            {
-                "previous_status": previous_status,
-                "reason": reason,
-                "task_id": task_id,
-            },
-        )
         return self.task(task_id)
 
     def reap_expired(self) -> dict[str, Any]:
@@ -728,17 +736,18 @@ class CoordinationService:
                 """,
                 (updated_at, now),
             ).rowcount
+            if orphaned or conflicted or released:
+                self.database.append_audit(
+                    "coordination.reaped",
+                    "admin",
+                    {
+                        "conflicted_task_ids": conflicted,
+                        "orphaned_task_ids": orphaned,
+                        "released_resources": released,
+                    },
+                    connection=connection,
+                )
 
-        if orphaned or conflicted or released:
-            self.database.append_audit(
-                "coordination.reaped",
-                "admin",
-                {
-                    "conflicted_task_ids": conflicted,
-                    "orphaned_task_ids": orphaned,
-                    "released_resources": released,
-                },
-            )
         return {
             "conflicted_task_ids": conflicted,
             "orphaned_task_ids": orphaned,
