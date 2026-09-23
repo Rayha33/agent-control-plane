@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 GENESIS_HASH = "0" * 64
+# Rows fetched per step while verifying, so memory stays flat as the log grows.
+AUDIT_VERIFY_BATCH_SIZE = 500
 
 
 SCHEMA = """
@@ -316,21 +318,32 @@ class Database:
         ]
 
     def verify_audit_chain(self) -> tuple[bool, int, int | None]:
-        rows = self.all("SELECT * FROM audit_events ORDER BY sequence ASC")
+        """Re-hash the chain in order, holding one batch of events in memory.
+
+        Returns ``(valid, events_checked, broken_at_sequence)``; on a break,
+        ``events_checked`` counts the events examined up to and including it.
+        """
         expected_previous = GENESIS_HASH
-        for row in rows:
-            expected_hash = event_digest(
-                expected_previous,
-                row["event_id"],
-                row["event_type"],
-                row["actor"],
-                row["payload_json"],
-                row["created_at"],
+        checked = 0
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM audit_events ORDER BY sequence ASC"
             )
-            if (
-                row["previous_hash"] != expected_previous
-                or row["event_hash"] != expected_hash
-            ):
-                return False, len(rows), row["sequence"]
-            expected_previous = row["event_hash"]
-        return True, len(rows), None
+            while rows := cursor.fetchmany(AUDIT_VERIFY_BATCH_SIZE):
+                for row in rows:
+                    checked += 1
+                    expected_hash = event_digest(
+                        expected_previous,
+                        row["event_id"],
+                        row["event_type"],
+                        row["actor"],
+                        row["payload_json"],
+                        row["created_at"],
+                    )
+                    if (
+                        row["previous_hash"] != expected_previous
+                        or row["event_hash"] != expected_hash
+                    ):
+                        return False, checked, row["sequence"]
+                    expected_previous = row["event_hash"]
+        return True, checked, None

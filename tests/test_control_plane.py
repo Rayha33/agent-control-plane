@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_control_plane import database as database_module
 from agent_control_plane.database import Database
 
 
@@ -398,3 +399,32 @@ def test_amount_limits_fail_closed_when_no_amount_is_given(client, admin_headers
         json={"action": "payments.lookup", "resource": "merchant:acme", "context": {}},
     )
     assert unrelated.json()["decision"] == "allowed"
+
+
+def test_audit_verification_streams_across_batches(
+    client, app, admin_headers, monkeypatch
+):
+    monkeypatch.setattr(database_module, "AUDIT_VERIFY_BATCH_SIZE", 2)
+    for index in range(5):
+        create_agent(client, admin_headers, f"batched-{index}")
+    events = len(app.state.database.audit_events(limit=1000))
+    assert events == 5
+
+    verification = client.get("/v1/audit/verify", headers=admin_headers).json()
+    assert verification == {
+        "valid": True,
+        "events_checked": events,
+        "broken_at_sequence": None,
+    }
+
+    # Break the chain in a later batch: earlier batches pass, the break is found.
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE audit_events SET actor = 'forged' WHERE sequence = 4"
+        )
+    tampered = client.get("/v1/audit/verify", headers=admin_headers).json()
+    assert tampered == {
+        "valid": False,
+        "events_checked": 4,
+        "broken_at_sequence": 4,
+    }
