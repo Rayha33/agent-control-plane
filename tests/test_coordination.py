@@ -565,3 +565,33 @@ def test_author_cannot_review_own_submission_even_after_becoming_qc(
     assert review.json()["error"] == "self_review_forbidden"
     status = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
     assert status.json()["status"] == "qc_review"
+
+
+def test_claim_is_claimed_until_the_first_heartbeat(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "silent-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(client, admin_headers, resources=["repo:state"])
+    claim = claim_task(client, task["id"], token).json()
+    assert claim["task"]["status"] == "claimed"
+
+    heartbeat = client.post(
+        f"/v1/tasks/{task['id']}/heartbeat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "resource_fencing_tokens": resource_tokens(claim),
+        },
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    status = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
+    assert status.json()["status"] == "working"
+
+    # A worker that never heartbeats is reaped straight from claimed.
+    silent_task = create_task(client, admin_headers, title="Never heartbeats")
+    assert claim_task(client, silent_task["id"], token).status_code == 200
+    with app.state.database.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (silent_task["id"],)
+        )
+    reaped = client.post("/v1/coordination/reap", headers=admin_headers)
+    assert silent_task["id"] in reaped.json()["orphaned_task_ids"]

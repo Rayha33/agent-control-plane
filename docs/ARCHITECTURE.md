@@ -27,7 +27,12 @@ services.
         incomplete ──┤     open     ├──────────────┐
                      └──────────────┘              ▼
                                            ┌─────────────┐
-                          heartbeat ───────►│   working   │
+                                           │   claimed   │
+                                           └──────┬──────┘
+                                                  │ first heartbeat
+                                                  ▼
+                                           ┌─────────────┐
+                          heartbeat ──────►│   working   │
                                            └──────┬──────┘
                              lease expiry         │ submit
                                   │               ▼
@@ -42,6 +47,11 @@ services.
                                              └──────►     ▼
                                                         done
 ```
+
+A claim leaves the task `claimed`; only the first heartbeat promotes it to
+`working`. Both count as an active claim: a worker may submit straight from
+`claimed`, and the reaper orphans either once the claim expires, so a worker
+that never heartbeats is recovered the same way.
 
 `blocked` records a QC rejection, while `conflicted` records a task whose
 post-submission resource reservation expired before safe completion. Both require
