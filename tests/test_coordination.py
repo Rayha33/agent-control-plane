@@ -7,6 +7,7 @@ from threading import Barrier
 
 import pytest
 
+from agent_control_plane import coordination as coordination_module
 from agent_control_plane.database import Database
 from agent_control_plane.service import ControlPlaneError
 
@@ -585,6 +586,26 @@ def test_task_list_limit_is_clamped_and_cursor_must_name_a_task(client, admin_he
     unknown = client.get("/v1/tasks", headers=admin_headers, params={"after": "nope"})
     assert unknown.status_code == 400
     assert unknown.json()["error"] == "invalid_cursor"
+
+
+def test_task_list_limit_is_clamped_by_the_service_itself(
+    client, app, admin_headers, monkeypatch
+):
+    # Only the HTTP layer clamped, so a direct caller passing limit <= 0 hit
+    # page[-1] on an empty page (IndexError), even on an empty table when negative.
+    coordination = app.state.coordination
+    assert coordination.list_tasks(limit=-1) == ([], None)
+    for n in range(2):
+        create_task(client, admin_headers, title=f"Task {n}")
+    for limit in (0, -5):
+        page, cursor = coordination.list_tasks(limit=limit)
+        assert len(page) == 1
+        assert cursor == page[0]["id"]
+
+    monkeypatch.setattr(coordination_module, "TASK_PAGE_MAX", 1)
+    page, cursor = coordination.list_tasks(limit=100)
+    assert len(page) == 1
+    assert cursor == page[0]["id"]
 
 
 def test_task_list_cost_does_not_grow_with_the_page(client, app, admin_headers):

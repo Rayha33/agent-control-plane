@@ -102,8 +102,9 @@ class CoordinationService:
         Tasks are ordered by priority, then age, then id, so the order is total and
         a page boundary is stable. The cursor is the id of the page's last task;
         priority and created_at never change, so it stays valid while tasks are
-        added or change status.
+        added or change status. ``limit`` is clamped to 1..TASK_PAGE_MAX.
         """
+        limit = max(1, min(limit, TASK_PAGE_MAX))
         clauses: list[str] = []
         parameters: list[Any] = []
         if status:

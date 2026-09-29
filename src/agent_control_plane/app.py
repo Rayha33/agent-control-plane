@@ -12,7 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
 from .config import Settings
-from .coordination import TASK_PAGE_MAX, CoordinationService
+from .coordination import CoordinationService
 from .coordination_schemas import (
     HeartbeatRequest,
     HeartbeatView,
@@ -270,9 +270,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = 100,
         after: str | None = None,
     ) -> list[dict]:
-        tasks, next_cursor = coordination.list_tasks(
-            status, limit=max(1, min(limit, TASK_PAGE_MAX)), after=after
-        )
+        tasks, next_cursor = coordination.list_tasks(status, limit=limit, after=after)
         if next_cursor:
             response.headers["X-Next-Cursor"] = next_cursor
         return tasks
