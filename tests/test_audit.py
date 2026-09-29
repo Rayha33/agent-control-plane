@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 
 from agent_control_plane import database as database_module
@@ -18,21 +20,64 @@ def tamper(database, sequence):
         )
 
 
+class StreamingOnlyCursor:
+    """A cursor that refuses whole-result reads and records each batch it serves."""
+
+    def __init__(self, cursor, batches):
+        self._cursor = cursor
+        self._batches = batches
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchmany(self, size=None):
+        size = self._cursor.arraysize if size is None else size
+        rows = self._cursor.fetchmany(size)
+        self._batches.append((size, len(rows)))
+        return rows
+
+    def fetchall(self):
+        raise AssertionError("verification must not load the whole audit table")
+
+    def __iter__(self):
+        raise AssertionError("verification must read the audit table in batches")
+
+
+class StreamingOnlyConnection:
+    def __init__(self, connection, batches):
+        self._connection = connection
+        self._batches = batches
+
+    def execute(self, *args):
+        return StreamingOnlyCursor(self._connection.execute(*args), self._batches)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 def test_verification_streams_the_chain_in_bounded_batches(app, monkeypatch):
     database = app.state.database
     append_events(database, 10)
     monkeypatch.setattr(database_module, "AUDIT_VERIFY_BATCH", 3)
+    # Every read goes through cursors that only hand out bounded batches, so
+    # fetchall(), list(cursor) or an oversized fetchmany() fails here.
+    batches = []
+    real_connect = database.connect
 
-    def whole_table(*_args, **_kwargs):
-        raise AssertionError("verification must not load the whole audit table")
+    @contextmanager
+    def streaming_only_connect():
+        with real_connect() as connection:
+            yield StreamingOnlyConnection(connection, batches)
 
-    monkeypatch.setattr(database, "all", whole_table)
+    monkeypatch.setattr(database, "connect", streaming_only_connect)
 
     result = database.verify_audit_chain()
     assert result["valid"] is True
     assert result["events_checked"] == 10
     assert result["broken_at_sequence"] is None
     assert result["last_sequence"] == 10
+    assert all(size <= 3 for size, _rows in batches)
+    assert sum(rows for _size, rows in batches) == 10
 
     tamper(database, 8)
     broken = database.verify_audit_chain()
