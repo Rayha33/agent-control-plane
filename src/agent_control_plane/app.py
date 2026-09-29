@@ -237,7 +237,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dependencies=[Depends(require_admin)],
     )
     def verify_audit(
-        after_sequence: int = Query(default=0, ge=0),
+        # Bounded to SQLite's INTEGER range: a larger value cannot be bound.
+        after_sequence: int = Query(default=0, ge=0, le=2**63 - 1),
         anchor_hash: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
     ) -> dict:
         if bool(after_sequence) != (anchor_hash is not None):

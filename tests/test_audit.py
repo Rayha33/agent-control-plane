@@ -117,6 +117,25 @@ def test_an_anchor_needs_both_halves(client, admin_headers, params):
     assert response.json()["error"] == "invalid_anchor"
 
 
+def test_after_sequence_must_fit_a_sqlite_integer(client, admin_headers):
+    # One past SQLite's INTEGER range used to reach the query and raise
+    # OverflowError, a 500.
+    anchor = {"anchor_hash": "a" * 64}
+    too_big = client.get(
+        "/v1/audit/verify",
+        headers=admin_headers,
+        params=anchor | {"after_sequence": 2**63},
+    )
+    assert too_big.status_code == 422
+    largest = client.get(
+        "/v1/audit/verify",
+        headers=admin_headers,
+        params=anchor | {"after_sequence": 2**63 - 1},
+    )
+    assert largest.status_code == 200, largest.text
+    assert largest.json()["valid"] is False
+
+
 def test_anchor_hash_must_be_a_sha256_hex_digest(client, admin_headers):
     response = client.get(
         "/v1/audit/verify",
