@@ -78,7 +78,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         interval = active_settings.reap_interval_seconds
-        if not interval:
+        # Settings built in code skip from_env's check; a non-positive interval
+        # would make asyncio.sleep() return at once and the loop spin.
+        if not interval > 0:
             yield
             return
         reaper = asyncio.create_task(reap_periodically(coordination, interval))
