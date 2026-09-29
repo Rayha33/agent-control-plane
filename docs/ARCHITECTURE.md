@@ -13,7 +13,7 @@ control boundary.
 | Coordination | Who owns which work | task DAG, atomic claim, leases, fencing, heartbeat |
 | Evidence | What was produced | immutable submissions, hashes, test evidence, checkpoints |
 | Quality | Whether it is acceptable | separate QC role, structured findings, completion gate |
-| Audit | What happened | append-only hash chain and verification |
+| Audit | What happened | append-only hash chain, committed with each state change, and verification |
 
 The implementation is one FastAPI service backed by SQLite. These are logical
 boundaries; a production deployment can split them into independently scaled

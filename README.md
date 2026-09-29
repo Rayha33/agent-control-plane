@@ -48,7 +48,8 @@ The service provides the coordination primitives needed to prevent both.
 
 ### Evidence
 
-- Append-only, hash-chained audit events
+- Append-only, hash-chained audit events, each committed in the same
+  transaction as the state change it records
 - Audit-chain verification endpoint
 - Review and submission history attached to every task
 

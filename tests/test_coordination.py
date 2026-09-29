@@ -7,6 +7,7 @@ from threading import Barrier
 
 import pytest
 
+from agent_control_plane.database import Database
 from agent_control_plane.service import ControlPlaneError
 
 
@@ -667,3 +668,37 @@ def test_listed_and_single_task_views_agree(client, admin_headers):
         assert single == item
     assert listed[task["id"]]["latest_submission"]["id"] == first["id"]
     assert listed[task["id"]]["latest_review"]["verdict"] == "revise"
+
+
+def test_audit_failure_rolls_back_the_state_change(
+    client, app, admin_headers, monkeypatch
+):
+    worker = create_agent(client, admin_headers, "atomic-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(client, admin_headers, resources=["repo:atomic"])
+    database = app.state.database
+    events_before = len(database.audit_events(limit=1000))
+
+    def failing_insert(*_args, **_kwargs):
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr(Database, "_insert_audit", staticmethod(failing_insert))
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        claim_task(client, task["id"], token)
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        create_task(client, admin_headers, title="Never created")
+    monkeypatch.undo()
+
+    # Neither the claim nor the second task survived without its audit event.
+    assert (
+        client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()["status"]
+        == "open"
+    )
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        lease = connection.execute(
+            "SELECT task_id FROM resource_leases WHERE resource = 'repo:atomic'"
+        ).fetchone()
+    assert lease is None
+    assert len(database.audit_events(limit=1000)) == events_before
+    assert claim_task(client, task["id"], token).status_code == 200
