@@ -134,7 +134,7 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | `POST /v1/tasks/{id}/reopen` | Return a `conflicted` or `blocked` task to `open` after operator action |
 | `POST /v1/coordination/reap` | Recover expired workers and reservations now (see `ACP_REAP_INTERVAL_SECONDS` to run it on a schedule) |
 | `POST /v1/authorize` | Evaluate an intended agent action |
-| `GET /v1/audit/verify` | Verify the audit hash chain; pass a valid run's `last_sequence` and `last_event_hash` back as `after_sequence` and `anchor_hash` to check only newer events |
+| `GET /v1/audit/verify` | Verify the audit hash chain; pass a valid run's `last_sequence` and `last_event_hash` back as `after_sequence` and `anchor_hash` to check only the anchor event and newer ones |
 
 ## Amount limits
 

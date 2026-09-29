@@ -87,6 +87,23 @@ def test_verification_resumes_from_a_caller_held_anchor(client, app, admin_heade
     assert tampered.json()["broken_at_sequence"] == anchor["after_sequence"] + 2
 
 
+def test_an_anchored_verification_re_hashes_the_anchor_row(app):
+    # Comparing only the anchor row's stored event_hash let an edit to its payload
+    # pass, since that column was left alone.
+    database = app.state.database
+    append_events(database, 4)
+    full = database.verify_audit_chain()
+    append_events(database, 2)
+
+    tamper(database, full["last_sequence"])
+    resumed = database.verify_audit_chain(
+        after_sequence=full["last_sequence"], anchor_hash=full["last_event_hash"]
+    )
+    assert resumed["valid"] is False
+    assert resumed["broken_at_sequence"] == full["last_sequence"]
+    assert resumed["last_event_hash"] is None
+
+
 @pytest.mark.parametrize(
     "params",
     [
