@@ -7,7 +7,6 @@ from threading import Barrier
 
 import pytest
 
-from agent_control_plane import coordination as coordination_module
 from agent_control_plane.database import Database
 from agent_control_plane.service import ControlPlaneError
 
@@ -602,7 +601,7 @@ def test_task_list_limit_is_clamped_by_the_service_itself(
         assert len(page) == 1
         assert cursor == page[0]["id"]
 
-    monkeypatch.setattr(coordination_module, "TASK_PAGE_MAX", 1)
+    monkeypatch.setattr("agent_control_plane.coordination.TASK_PAGE_MAX", 1)
     page, cursor = coordination.list_tasks(limit=100)
     assert len(page) == 1
     assert cursor == page[0]["id"]
