@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 GENESIS_HASH = "0" * 64
+# Rows hashed per fetch while verifying the chain, so memory stays flat however
+# long the audit log grows.
+AUDIT_VERIFY_BATCH = 500
 
 
 SCHEMA = """
@@ -32,6 +35,7 @@ CREATE TABLE IF NOT EXISTS mandates (
     parent_mandate_id TEXT REFERENCES mandates(id),
     scopes_json TEXT NOT NULL,
     max_amount_cents INTEGER,
+    requires_amount INTEGER NOT NULL DEFAULT 1,
     expires_at INTEGER NOT NULL,
     revoked INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
@@ -81,7 +85,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority INTEGER NOT NULL DEFAULT 50,
     status TEXT NOT NULL CHECK(status IN (
         'open', 'claimed', 'working', 'qc_review', 'changes_requested',
-        'approved', 'merging', 'done', 'blocked', 'orphaned', 'conflicted'
+        'approved', 'done', 'blocked', 'orphaned', 'conflicted'
     )),
     owner_agent_id TEXT REFERENCES agents(id),
     claim_expires_at INTEGER,
@@ -206,6 +210,16 @@ class Database:
                 connection.execute(
                     "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'worker'"
                 )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(mandates)").fetchall()
+            }
+            if "requires_amount" not in columns:
+                # 1 keeps every existing capped mandate denying amountless actions.
+                connection.execute(
+                    "ALTER TABLE mandates ADD COLUMN requires_amount INTEGER NOT NULL "
+                    "DEFAULT 1"
+                )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -229,56 +243,69 @@ class Database:
         with self.connect() as connection:
             return list(connection.execute(query, parameters).fetchall())
 
-    def execute(self, query: str, parameters: tuple[Any, ...] = ()) -> None:
-        with self.connect() as connection:
-            connection.execute(query, parameters)
-
-    def execute_count(self, query: str, parameters: tuple[Any, ...] = ()) -> int:
-        with self.connect() as connection:
-            cursor = connection.execute(query, parameters)
-            return cursor.rowcount
-
     def append_audit(
-        self, event_type: str, actor: str, payload: dict[str, Any]
+        self,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Append one event to the hash chain.
+
+        Pass the connection of an open ``BEGIN IMMEDIATE`` transaction to commit
+        the event atomically with the state change it records; the write lock
+        that transaction holds also serializes the read of the chain head.
+        """
+        if connection is not None:
+            # Outside a transaction the chain head would be read without the
+            # write lock, and two callers could both chain from it.
+            if not connection.in_transaction:
+                raise ValueError("audit connection must already hold a transaction")
+            return self._insert_audit(connection, event_type, actor, payload)
+        with self.connect() as own_connection:
+            own_connection.execute("BEGIN IMMEDIATE")
+            return self._insert_audit(own_connection, event_type, actor, payload)
+
+    @staticmethod
+    def _insert_audit(
+        connection: sqlite3.Connection,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
     ) -> dict[str, Any]:
         event_id = str(uuid.uuid4())
         created_at = utc_now()
         payload_json = canonical_json(payload)
-
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            previous = connection.execute(
-                "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-            previous_hash = previous["event_hash"] if previous else GENESIS_HASH
-            digest = event_digest(
-                previous_hash,
+        previous = connection.execute(
+            "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        previous_hash = previous["event_hash"] if previous else GENESIS_HASH
+        digest = event_digest(
+            previous_hash,
+            event_id,
+            event_type,
+            actor,
+            payload_json,
+            created_at,
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO audit_events
+                (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
                 event_id,
                 event_type,
                 actor,
                 payload_json,
+                previous_hash,
+                digest,
                 created_at,
-            )
-            cursor = connection.execute(
-                """
-                INSERT INTO audit_events
-                    (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    event_type,
-                    actor,
-                    payload_json,
-                    previous_hash,
-                    digest,
-                    created_at,
-                ),
-            )
-            sequence = cursor.lastrowid
-
+            ),
+        )
         return {
-            "sequence": sequence,
+            "sequence": cursor.lastrowid,
             "event_id": event_id,
             "event_type": event_type,
             "actor": actor,
@@ -306,22 +333,89 @@ class Database:
             for row in rows
         ]
 
-    def verify_audit_chain(self) -> tuple[bool, int, int | None]:
-        rows = self.all("SELECT * FROM audit_events ORDER BY sequence ASC")
-        expected_previous = GENESIS_HASH
-        for row in rows:
-            expected_hash = event_digest(
-                expected_previous,
-                row["event_id"],
-                row["event_type"],
-                row["actor"],
-                row["payload_json"],
-                row["created_at"],
+    def verify_audit_chain(
+        self, after_sequence: int = 0, anchor_hash: str = GENESIS_HASH
+    ) -> dict[str, Any]:
+        """Re-hash the chain in bounded batches on one read snapshot.
+
+        With the defaults the whole chain is checked from genesis. A caller that
+        kept ``last_sequence`` and ``last_event_hash`` from an earlier valid run
+        passes them back as ``after_sequence`` and ``anchor_hash`` to check only
+        what was appended since: the anchor row must still carry that hash and
+        the next row must chain from it. Rows before the anchor are trusted as of
+        the run that produced it; the anchor row itself is re-hashed.
+
+        On a break, ``events_checked`` still counts every row in the range, as it
+        always has, and no new anchor is returned.
+        """
+        broken_at: int | None = None
+        checked = 0
+        last_sequence: int | None = after_sequence or None
+        expected_previous = anchor_hash
+        with self.connect() as connection:
+            # One transaction, so every batch reads the same snapshot.
+            connection.execute("BEGIN")
+            if after_sequence:
+                anchor = connection.execute(
+                    """
+                    SELECT event_id, event_type, actor, payload_json,
+                        previous_hash, event_hash, created_at
+                    FROM audit_events WHERE sequence = ?
+                    """,
+                    (after_sequence,),
+                ).fetchone()
+                # Re-hash the anchor row too: its stored event_hash alone still
+                # matches after an edit to the fields it was computed from.
+                if (
+                    not anchor
+                    or anchor["event_hash"] != anchor_hash
+                    or event_digest(
+                        anchor["previous_hash"],
+                        anchor["event_id"],
+                        anchor["event_type"],
+                        anchor["actor"],
+                        anchor["payload_json"],
+                        anchor["created_at"],
+                    )
+                    != anchor_hash
+                ):
+                    broken_at = after_sequence
+            cursor = connection.execute(
+                """
+                SELECT sequence, event_id, event_type, actor, payload_json,
+                    previous_hash, event_hash, created_at
+                FROM audit_events WHERE sequence > ? ORDER BY sequence ASC
+                """,
+                (after_sequence,),
             )
-            if (
-                row["previous_hash"] != expected_previous
-                or row["event_hash"] != expected_hash
-            ):
-                return False, len(rows), row["sequence"]
-            expected_previous = row["event_hash"]
-        return True, len(rows), None
+            while rows := cursor.fetchmany(AUDIT_VERIFY_BATCH):
+                checked += len(rows)
+                if broken_at is not None:
+                    continue
+                for row in rows:
+                    expected_hash = event_digest(
+                        expected_previous,
+                        row["event_id"],
+                        row["event_type"],
+                        row["actor"],
+                        row["payload_json"],
+                        row["created_at"],
+                    )
+                    if (
+                        row["previous_hash"] != expected_previous
+                        or row["event_hash"] != expected_hash
+                    ):
+                        broken_at = row["sequence"]
+                        break
+                    expected_previous = row["event_hash"]
+                    last_sequence = row["sequence"]
+        valid = broken_at is None
+        return {
+            "valid": valid,
+            "events_checked": checked,
+            "broken_at_sequence": broken_at,
+            "last_sequence": last_sequence if valid else None,
+            "last_event_hash": (
+                expected_previous if valid and last_sequence is not None else None
+            ),
+        }

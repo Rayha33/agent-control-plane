@@ -11,7 +11,6 @@ TaskStatus = Literal[
     "qc_review",
     "changes_requested",
     "approved",
-    "merging",
     "done",
     "blocked",
     "orphaned",

@@ -7,6 +7,7 @@ name = "agent-control-plane"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "pydantic" },
     { name = "pyjwt" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -22,6 +23,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28,<1" },
+    { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pyjwt", specifier = ">=2.10,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3,<10" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.8,<0.16" },

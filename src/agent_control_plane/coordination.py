@@ -17,6 +17,9 @@ from .policy import scope_allows
 from .service import ControlPlaneError, ControlPlaneService
 
 QC_RESERVATION_SECONDS = 3600
+# Largest page GET /v1/tasks serves. It also bounds the IN (...) lists that load a
+# page's relations, well under SQLite's oldest default of 999 bound variables.
+TASK_PAGE_MAX = 500
 
 
 class CoordinationService:
@@ -67,40 +70,80 @@ class CoordinationService:
                     """,
                     (task_id, dependency_id),
                 )
+            self.database.append_audit(
+                "task.created",
+                "admin",
+                {
+                    "dependencies": request.dependencies,
+                    "priority": request.priority,
+                    "resources": request.resources,
+                    "task_id": task_id,
+                    "title": request.title,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.created",
-            "admin",
-            {
-                "dependencies": request.dependencies,
-                "priority": request.priority,
-                "resources": request.resources,
-                "task_id": task_id,
-                "title": request.title,
-            },
-        )
         return self.task(task_id)
 
     def task(self, task_id: str) -> dict[str, Any]:
-        row = self.database.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
-        if not row:
-            raise ControlPlaneError(404, "task_not_found", "task not found")
-        return self._task_view(row)
+        with self.database.connect() as connection:
+            row = self._task_row(connection, task_id)
+            return self._task_views(connection, [row])[0]
 
-    def list_tasks(self, status: str | None = None) -> list[dict[str, Any]]:
+    def list_tasks(
+        self,
+        status: str | None = None,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Return one page of tasks and the cursor for the next page, if any.
+
+        Tasks are ordered by priority, then age, then id, so the order is total and
+        a page boundary is stable. The cursor is the id of the page's last task;
+        priority and created_at never change, so it stays valid while tasks are
+        added or change status. ``limit`` is clamped to 1..TASK_PAGE_MAX.
+        """
+        limit = max(1, min(limit, TASK_PAGE_MAX))
+        clauses: list[str] = []
+        parameters: list[Any] = []
         if status:
-            rows = self.database.all(
-                """
-                SELECT * FROM tasks WHERE status = ?
-                ORDER BY priority DESC, created_at ASC
+            clauses.append("status = ?")
+            parameters.append(status)
+        with self.database.connect() as connection:
+            if after:
+                anchor = connection.execute(
+                    "SELECT priority, created_at, id FROM tasks WHERE id = ?",
+                    (after,),
+                ).fetchone()
+                if not anchor:
+                    raise ControlPlaneError(
+                        400, "invalid_cursor", "cursor does not name a task"
+                    )
+                clauses.append(
+                    "(priority < ? OR (priority = ? AND (created_at > ?"
+                    " OR (created_at = ? AND id > ?))))"
+                )
+                parameters += [
+                    anchor["priority"],
+                    anchor["priority"],
+                    anchor["created_at"],
+                    anchor["created_at"],
+                    anchor["id"],
+                ]
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = connection.execute(
+                f"""
+                SELECT * FROM tasks {where}
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT ?
                 """,
-                (status,),
-            )
-        else:
-            rows = self.database.all(
-                "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
-            )
-        return [self._task_view(row) for row in rows]
+                (*parameters, limit + 1),
+            ).fetchall()
+            page = rows[:limit]
+            views = self._task_views(connection, page)
+        next_cursor = page[-1]["id"] if len(rows) > limit else None
+        return views, next_cursor
 
     def claim_task(self, task_id: str, token: str, ttl_seconds: int) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
@@ -222,20 +265,22 @@ class CoordinationService:
                     updated_at,
                 ),
             )
-
-        self.database.append_audit(
-            "task.claimed",
-            claims["actor"],
-            {
-                "agent_id": agent["id"],
-                "claim_fencing_token": claim_fencing_token,
-                "expires_at": expires_at,
-                "resource_fencing_tokens": {
-                    lease["resource"]: lease["fencing_token"] for lease in lease_views
+            self.database.append_audit(
+                "task.claimed",
+                claims["actor"],
+                {
+                    "agent_id": agent["id"],
+                    "claim_fencing_token": claim_fencing_token,
+                    "expires_at": expires_at,
+                    "resource_fencing_tokens": {
+                        lease["resource"]: lease["fencing_token"]
+                        for lease in lease_views
+                    },
+                    "task_id": task_id,
                 },
-                "task_id": task_id,
-            },
-        )
+                connection=connection,
+            )
+
         return {"task": self.task(task_id), "resource_leases": lease_views}
 
     def heartbeat(
@@ -308,17 +353,18 @@ class CoordinationService:
                     updated_at,
                 ),
             )
+            self.database.append_audit(
+                "task.heartbeat",
+                claims["actor"],
+                {
+                    "agent_id": agent["id"],
+                    "checkpoint_keys": sorted(request.checkpoint),
+                    "expires_at": expires_at,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.heartbeat",
-            claims["actor"],
-            {
-                "agent_id": agent["id"],
-                "checkpoint_keys": sorted(request.checkpoint),
-                "expires_at": expires_at,
-                "task_id": task_id,
-            },
-        )
         return {
             "task_id": task_id,
             "agent_id": agent["id"],
@@ -403,18 +449,19 @@ class CoordinationService:
                     ),
                 )
             self._clear_heartbeats(connection, task_id)
+            self.database.append_audit(
+                "submission.created",
+                claims["actor"],
+                {
+                    "artifact_hash": request.artifact_hash.lower(),
+                    "base_revision": request.base_revision,
+                    "submission_id": submission_id,
+                    "task_id": task_id,
+                    "worker_agent_id": agent["id"],
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "submission.created",
-            claims["actor"],
-            {
-                "artifact_hash": request.artifact_hash.lower(),
-                "base_revision": request.base_revision,
-                "submission_id": submission_id,
-                "task_id": task_id,
-                "worker_agent_id": agent["id"],
-            },
-        )
         return self.submission(submission_id)
 
     def review(
@@ -533,19 +580,20 @@ class CoordinationService:
                     """,
                     (created_at, task_id),
                 )
+            self.database.append_audit(
+                "review.completed",
+                claims["actor"],
+                {
+                    "finding_count": len(findings),
+                    "qc_agent_id": agent["id"],
+                    "review_id": review_id,
+                    "submission_id": submission_id,
+                    "task_id": task_id,
+                    "verdict": request.verdict,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "review.completed",
-            claims["actor"],
-            {
-                "finding_count": len(findings),
-                "qc_agent_id": agent["id"],
-                "review_id": review_id,
-                "submission_id": submission_id,
-                "task_id": task_id,
-                "verdict": request.verdict,
-            },
-        )
         return self.review_view(review_id)
 
     def complete_task(self, task_id: str, reason: str) -> dict[str, Any]:
@@ -598,12 +646,13 @@ class CoordinationService:
                 (completed_at, task_id),
             )
             self._clear_heartbeats(connection, task_id)
+            self.database.append_audit(
+                "task.completed",
+                "admin",
+                {"reason": reason, "task_id": task_id},
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.completed",
-            "admin",
-            {"reason": reason, "task_id": task_id},
-        )
         return self.task(task_id)
 
     def reopen_task(self, task_id: str, reason: str) -> dict[str, Any]:
@@ -645,16 +694,17 @@ class CoordinationService:
                 (reopened_at, task_id),
             )
             self._clear_heartbeats(connection, task_id)
+            self.database.append_audit(
+                "task.reopened",
+                "admin",
+                {
+                    "previous_status": previous_status,
+                    "reason": reason,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
 
-        self.database.append_audit(
-            "task.reopened",
-            "admin",
-            {
-                "previous_status": previous_status,
-                "reason": reason,
-                "task_id": task_id,
-            },
-        )
         return self.task(task_id)
 
     def reap_expired(self) -> dict[str, Any]:
@@ -728,17 +778,18 @@ class CoordinationService:
                 """,
                 (updated_at, now),
             ).rowcount
+            if orphaned or conflicted or released:
+                self.database.append_audit(
+                    "coordination.reaped",
+                    "admin",
+                    {
+                        "conflicted_task_ids": conflicted,
+                        "orphaned_task_ids": orphaned,
+                        "released_resources": released,
+                    },
+                    connection=connection,
+                )
 
-        if orphaned or conflicted or released:
-            self.database.append_audit(
-                "coordination.reaped",
-                "admin",
-                {
-                    "conflicted_task_ids": conflicted,
-                    "orphaned_task_ids": orphaned,
-                    "released_resources": released,
-                },
-            )
         return {
             "conflicted_task_ids": conflicted,
             "orphaned_task_ids": orphaned,
@@ -840,39 +891,82 @@ class CoordinationService:
                     409, "stale_fencing_token", f"stale lease for {resource}"
                 )
 
-    def _task_view(self, row: sqlite3.Row) -> dict[str, Any]:
-        dependencies = self.database.all(
-            """
-            SELECT depends_on_task_id FROM task_dependencies
-            WHERE task_id = ? ORDER BY depends_on_task_id
+    def _task_views(
+        self, connection: sqlite3.Connection, rows: list[sqlite3.Row]
+    ) -> list[dict[str, Any]]:
+        """Build task views with each relation loaded once for the whole page."""
+        if not rows:
+            return []
+        task_ids = [row["id"] for row in rows]
+        marks = ", ".join("?" * len(task_ids))
+        dependencies: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
+        for edge in connection.execute(
+            f"""
+            SELECT task_id, depends_on_task_id FROM task_dependencies
+            WHERE task_id IN ({marks}) ORDER BY task_id, depends_on_task_id
             """,
-            (row["id"],),
-        )
-        latest_submission = self.database.one(
-            """
-            SELECT * FROM submissions
-            WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
-            """,
-            (row["id"],),
-        )
-        latest_review = self.database.one(
-            """
-            SELECT review.* FROM reviews AS review
-            JOIN submissions AS submission ON submission.id = review.submission_id
-            WHERE submission.task_id = ?
-            ORDER BY review.created_at DESC, review.id DESC LIMIT 1
-            """,
-            (row["id"],),
-        )
+            task_ids,
+        ):
+            dependencies[edge["task_id"]].append(edge["depends_on_task_id"])
+        latest_submissions = {
+            submission["task_id"]: submission
+            for submission in connection.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT submission.*, ROW_NUMBER() OVER (
+                        PARTITION BY submission.task_id
+                        ORDER BY submission.created_at DESC, submission.id DESC
+                    ) AS position
+                    FROM submissions AS submission
+                    WHERE submission.task_id IN ({marks})
+                ) WHERE position = 1
+                """,
+                task_ids,
+            )
+        }
+        latest_reviews = {
+            review["for_task_id"]: review
+            for review in connection.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT review.*, submission.task_id AS for_task_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY submission.task_id
+                            ORDER BY review.created_at DESC, review.id DESC
+                        ) AS position
+                    FROM reviews AS review
+                    JOIN submissions AS submission
+                        ON submission.id = review.submission_id
+                    WHERE submission.task_id IN ({marks})
+                ) WHERE position = 1
+                """,
+                task_ids,
+            )
+        }
+        return [
+            self._task_view(
+                row,
+                dependencies[row["id"]],
+                latest_submissions.get(row["id"]),
+                latest_reviews.get(row["id"]),
+            )
+            for row in rows
+        ]
+
+    def _task_view(
+        self,
+        row: sqlite3.Row,
+        dependencies: list[str],
+        latest_submission: sqlite3.Row | None,
+        latest_review: sqlite3.Row | None,
+    ) -> dict[str, Any]:
         return {
             "id": row["id"],
             "title": row["title"],
             "description": row["description"],
             "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
             "resources": json.loads(row["resources_json"]),
-            "dependencies": [
-                dependency["depends_on_task_id"] for dependency in dependencies
-            ],
+            "dependencies": dependencies,
             "priority": row["priority"],
             "status": row["status"],
             "owner_agent_id": row["owner_agent_id"],

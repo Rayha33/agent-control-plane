@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+from agent_control_plane.database import Database
+
 
 def create_agent(client, admin_headers, name, parent_agent_id=None):
     response = client.post(
@@ -285,3 +289,57 @@ def test_disabled_parent_cannot_delegate_a_child_mandate(client, admin_headers):
     )
     assert delegated.status_code == 401
     assert delegated.json()["error"] == "agent_lineage_disabled"
+
+
+def test_approval_is_not_consumed_without_its_audit_event(
+    client, app, admin_headers, monkeypatch
+):
+    agent = create_agent(client, admin_headers, "atomic-approver")
+    mandate = issue_root_mandate(client, admin_headers, agent["id"])
+    policy = client.post(
+        "/v1/policies",
+        headers=admin_headers,
+        json={
+            "action_pattern": "payments.*",
+            "resource_pattern": "merchant:*",
+            "effect": "allow",
+            "requires_approval": True,
+        },
+    )
+    assert policy.status_code == 201, policy.text
+    auth_headers = {"Authorization": f"Bearer {mandate['token']}"}
+    action = {
+        "action": "payments.charge",
+        "resource": "merchant:acme",
+        "context": {"amount_cents": 500},
+    }
+    pending = client.post("/v1/authorize", headers=auth_headers, json=action).json()
+    approval_id = pending["action_request_id"]
+    resolved = client.post(
+        f"/v1/approvals/{approval_id}",
+        headers=admin_headers,
+        json={"approved": True, "reason": "Expected charge"},
+    )
+    assert resolved.status_code == 200, resolved.text
+
+    def failing_insert(*_args, **_kwargs):
+        raise RuntimeError("audit write failed")
+
+    monkeypatch.setattr(Database, "_insert_audit", staticmethod(failing_insert))
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        client.post(
+            "/v1/authorize",
+            headers=auth_headers,
+            json=action | {"approval_id": approval_id},
+        )
+    monkeypatch.undo()
+
+    # The one-time approval is still usable because nothing recorded its use.
+    status = client.get(f"/v1/actions/{approval_id}", headers=admin_headers)
+    assert status.json()["status"] == "approved"
+    allowed = client.post(
+        "/v1/authorize",
+        headers=auth_headers,
+        json=action | {"approval_id": approval_id},
+    )
+    assert allowed.json()["decision"] == "allowed"

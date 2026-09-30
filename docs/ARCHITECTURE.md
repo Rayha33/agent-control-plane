@@ -13,7 +13,7 @@ control boundary.
 | Coordination | Who owns which work | task DAG, atomic claim, leases, fencing, heartbeat |
 | Evidence | What was produced | immutable submissions, hashes, test evidence, checkpoints |
 | Quality | Whether it is acceptable | separate QC role, structured findings, completion gate |
-| Audit | What happened | append-only hash chain and verification |
+| Audit | What happened | append-only hash chain, committed with each state change, and verification |
 
 The implementation is one FastAPI service backed by SQLite. These are logical
 boundaries; a production deployment can split them into independently scaled
@@ -27,21 +27,43 @@ services.
         incomplete ──┤     open     ├──────────────┐
                      └──────────────┘              ▼
                                            ┌─────────────┐
-                          heartbeat ───────►│   working   │
-                                           └──────┬──────┘
-                             lease expiry         │ submit
-                                  │               ▼
-                                  ▼        ┌─────────────┐
-                           ┌──────────┐     │  qc_review  │
-                           │ orphaned │     └──┬───────┬──┘
-                           └────┬─────┘  revise│       │pass
-                                │ claim        ▼       ▼
-                                └──────► changes_   approved
-                                          requested      │
-                                             │ claim      │complete
-                                             └──────►     ▼
-                                                        done
+                                           │   claimed   ├──────┐
+                                           └──────┬──────┘      │
+                                        heartbeat │             │
+                                                  ▼             │
+                                           ┌─────────────┐      │
+                          heartbeat ──────►│   working   │      │
+                                           └──────┬──────┘      │
+                             claim expiry         │ submit      │ submit
+                                  │               ▼             │
+                                  ▼        ┌─────────────┐      │
+                           ┌──────────┐    │  qc_review  │◄─────┘
+                           │ orphaned │    └──┬───────┬──┘
+                           └──────────┘ revise│       │pass
+                             claim →          ▼       ▼
+                             claimed     changes_   approved
+                                         requested      │
+                                         claim →        │complete
+                                         claimed        ▼
+                                                       done
 ```
+
+A claim puts the task in `claimed`; only the first heartbeat promotes it to
+`working`. A worker that never heartbeats stays `claimed` until it submits or its
+claim expires, and both states accept a submission. Every transition:
+
+| From | Event | To |
+|---|---|---|
+| `open`, `orphaned`, `changes_requested` | claim (all dependencies `done`) | `claimed` |
+| `claimed`, `working` | heartbeat | `working` |
+| `claimed`, `working` | submit | `qc_review` |
+| `claimed`, `working` | claim expires, reaper runs | `orphaned` |
+| `qc_review` | review `pass` | `approved` |
+| `qc_review` | review `revise` | `changes_requested` |
+| `qc_review` | review `block` or `human_required` | `blocked` |
+| `qc_review`, `approved` | resource reservation expires, reaper runs | `conflicted` |
+| `approved` | complete | `done` |
+| `blocked`, `conflicted` | reopen | `open` |
 
 `blocked` records a QC rejection, while `conflicted` records a task whose
 post-submission resource reservation expired before safe completion. Both require
@@ -108,7 +130,10 @@ worker.
 
 ### 6. Recovery is explicit
 
-Workers heartbeat with a checkpoint and renewed TTL. The reaper:
+Workers heartbeat with a checkpoint and renewed TTL. The reaper runs on each
+`POST /v1/coordination/reap`, and also every `ACP_REAP_INTERVAL_SECONDS` inside the
+service when that is set (off by default; a failed run is logged and retried on
+the next tick). Each run:
 
 - marks expired active work `orphaned`;
 - releases its resources;

@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
   "fastapi>=0.116,<1",
+  "pydantic>=2.7,<3",
   "pyjwt>=2.10,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
