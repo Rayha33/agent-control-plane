@@ -342,7 +342,7 @@ class Database:
         kept ``last_sequence`` and ``last_event_hash`` from an earlier valid run
         passes them back as ``after_sequence`` and ``anchor_hash`` to check only
         what was appended since: the anchor row must still carry that hash and
-        the next row must chain from it. Rows up to the anchor are trusted as of
+        the next row must chain from it. Rows before the anchor are trusted as of
         the run that produced it; the anchor row itself is re-hashed.
 
         On a break, ``events_checked`` still counts every row in the range, as it

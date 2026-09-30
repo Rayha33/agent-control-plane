@@ -12,11 +12,11 @@ def append_events(database, count):
         database.append_audit("test.event", "tester", {"n": n})
 
 
-def tamper(database, sequence):
+def tamper(database, sequence, column="payload_json", value='{"tampered":true}'):
     with database.connect() as connection:
         connection.execute(
-            "UPDATE audit_events SET payload_json = ? WHERE sequence = ?",
-            ('{"tampered":true}', sequence),
+            f"UPDATE audit_events SET {column} = ? WHERE sequence = ?",
+            (value, sequence),
         )
 
 
@@ -132,15 +132,25 @@ def test_verification_resumes_from_a_caller_held_anchor(client, app, admin_heade
     assert tampered.json()["broken_at_sequence"] == anchor["after_sequence"] + 2
 
 
-def test_an_anchored_verification_re_hashes_the_anchor_row(app):
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        # The fields the hash covers change and the stored event_hash does not.
+        ("payload_json", '{"tampered":true}'),
+        # The stored event_hash changes and the fields it covers do not.
+        ("event_hash", "0" * 64),
+    ],
+)
+def test_an_anchored_verification_re_hashes_the_anchor_row(app, column, value):
     # Comparing only the anchor row's stored event_hash let an edit to its payload
-    # pass, since that column was left alone.
+    # pass, since that column was left alone. Re-hashing alone would miss the
+    # reverse, so both the stored and the recomputed hash must match the anchor.
     database = app.state.database
     append_events(database, 4)
     full = database.verify_audit_chain()
     append_events(database, 2)
 
-    tamper(database, full["last_sequence"])
+    tamper(database, full["last_sequence"], column, value)
     resumed = database.verify_audit_chain(
         after_sequence=full["last_sequence"], anchor_hash=full["last_event_hash"]
     )
