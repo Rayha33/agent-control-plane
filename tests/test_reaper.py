@@ -87,10 +87,11 @@ def test_reaper_is_off_by_default(tmp_path):
         assert status_after(client, task_id, "orphaned", seconds=0.3) == "claimed"
 
 
-@pytest.mark.parametrize("interval", [-1.0, -0.05])
-def test_a_negative_interval_leaves_the_reaper_off(tmp_path, interval):
+@pytest.mark.parametrize("interval", [-1.0, -0.05, float("nan")])
+def test_a_negative_or_nan_interval_leaves_the_reaper_off(tmp_path, interval):
     # from_env refuses a negative interval, but Settings built in code skip it, and
-    # asyncio.sleep() returns at once for a negative delay, so the loop spun.
+    # asyncio.sleep() returns at once for a negative delay, so the loop spun. A NaN
+    # passes `interval <= 0` unnoticed.
     app = create_app(settings(tmp_path, reap_interval_seconds=interval))
     calls = []
     app.state.coordination.reap_expired = lambda: calls.append(1)
