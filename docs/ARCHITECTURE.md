@@ -305,10 +305,20 @@ deterministic integration commands and before ref publication. Configure
 trusted absolute executable; set `[integration].require_critic = true` to fail
 closed when it is absent. The reviewer receives `ACP_REVIEW_PACKET` and
 `ACP_REVIEW_RESULT`; the packet binds the current base, merge commit/tree,
-submission, task, and deterministic results. `revise`, `block`,
+submission, task, deterministic results, reviewer identity, command selector,
+submission-QC policy fingerprint, and a digest of that reviewer policy. The
+reviewer identity must differ from both the submission worker and integrator.
+That identity is an operator-configured principal label, not cryptographic proof
+of a distinct model/provider; independence here means a distinct configured
+review role running through ACP's trusted critic boundary. Executable content
+and, for trust-bundle commands, the pinned bundle/manifest are recorded.
+`revise`, `block`,
 `human_required`, malformed output, timeout, or candidate mutation prevents
 publication. Without a configured reviewer the result is explicitly recorded
 as `UNREVIEWED`; deterministic gates remain mandatory and authoritative.
+The owning task's `latest_integration.critic_review` view exposes stored
+findings to the agent so it can revise and resubmit; it is not limited to the
+integrator's one-time command output.
 
 The Git boundary is identical on Linux and macOS:
 

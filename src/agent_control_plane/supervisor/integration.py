@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..runner_identity import IdentityError, assert_distinct
 from .common import (
     MAX_ATTRIBUTE_BYTES,
     MERGE_SEMANTIC_CONFIG,
@@ -239,6 +240,53 @@ class IntegrationMixin:
                             "required independent integration critic is not configured",
                         )
                 else:
+                    try:
+                        assert_distinct(
+                            submission["worker_agent_id"],
+                            self.config.integration_critic_identity,
+                        )
+                        assert_distinct(integrator_id, self.config.integration_critic_identity)
+                    except IdentityError as error:
+                        raise SupervisorError(error.code, error.message) from error
+                    reviewer_trust_pin = (
+                        self._verify_attempt_trust(submission["attempt_id"])
+                        if critic_command.startswith("trusted:")
+                        else None
+                    )
+                    reviewer_executable = (
+                        Path(__file__).resolve().parents[1] / "critic.py"
+                        if critic_command == "builtin"
+                        else Path(self._resolve_critic_command(critic_command, reviewer_trust_pin))
+                    )
+                    reviewer_provenance = {
+                        "identity": self.config.integration_critic_identity,
+                        "command_selector": critic_command,
+                        "executable_sha256": sha256(reviewer_executable.read_bytes()),
+                        "trust_bundle_id": (
+                            reviewer_trust_pin.get("bundle_id")
+                            if reviewer_trust_pin is not None
+                            else None
+                        ),
+                        "trust_manifest_sha256": (
+                            reviewer_trust_pin.get("manifest_sha256")
+                            if reviewer_trust_pin is not None
+                            else None
+                        ),
+                        "submission_qc_policy_fingerprint": self.assurance_policy.fingerprint,
+                    }
+                    review_policy = {
+                        "version": "integration-review-policy.v1",
+                        "review_integrated_candidate": True,
+                        "worker_conclusions_excluded": True,
+                        "deterministic_gates_remain_authoritative": True,
+                        "critic_required": self.config.require_integration_critic,
+                        "integration_commands": list(self.config.integration_commands),
+                    }
+                    reviewer_policy_sha256 = sha256(
+                        canonical_json(
+                            {"reviewer": reviewer_provenance, "policy": review_policy}
+                        ).encode("utf-8")
+                    )
                     packet_path = (
                         self.state_dir / "logs" / f"integration-review-{integration_id}.json"
                     )
@@ -273,9 +321,9 @@ class IntegrationMixin:
                         },
                         "deterministic_results": deterministic_integration_results,
                         "policy": {
-                            "review_integrated_candidate": True,
-                            "worker_conclusions_excluded": True,
-                            "deterministic_gates_remain_authoritative": True,
+                            **review_policy,
+                            "reviewer": reviewer_provenance,
+                            "reviewer_policy_sha256": reviewer_policy_sha256,
                         },
                     }
                     packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
@@ -287,9 +335,7 @@ class IntegrationMixin:
                             "ACP_REVIEW_PACKET": str(packet_path),
                             "ACP_REVIEW_RESULT": str(result_path),
                         },
-                        self._verify_attempt_trust(submission["attempt_id"])
-                        if critic_command.startswith("trusted:")
-                        else None,
+                        reviewer_trust_pin,
                         pass_fds=(operation_guard_fd,),
                     )
                     results.append(critic)
@@ -302,7 +348,14 @@ class IntegrationMixin:
                         )
                     payload = self._critic_payload(result_path)
                     result_path.unlink(missing_ok=True)
-                    results.append({"phase": "integration-critic-result", **payload})
+                    results.append(
+                        {
+                            "phase": "integration-critic-result",
+                            "reviewer": reviewer_provenance,
+                            "reviewer_policy_sha256": reviewer_policy_sha256,
+                            **payload,
+                        }
+                    )
                     if payload["verdict"] != "pass":
                         raise SupervisorError(
                             "integration_critic_blocked",

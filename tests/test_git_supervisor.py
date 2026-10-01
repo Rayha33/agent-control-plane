@@ -21,6 +21,7 @@ from agent_control_plane.git_supervisor import (
     GitSupervisor,
     SupervisorError,
 )
+from agent_control_plane.supervisor.common import canonical_json, sha256
 from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
 
 
@@ -41,6 +42,7 @@ def write_config(
     critic_command: str = "",
     require_critic: bool = False,
     integration_critic_command: str = "",
+    integration_critic_identity: str = "independent-integration-qc",
     require_integration_critic: bool = False,
     timeout_seconds: int = 30,
     runtime_setup_commands: list[str] | None = None,
@@ -55,6 +57,7 @@ def write_config(
         "critic": json.dumps(critic_command),
         "required": str(require_critic).lower(),
         "integration_critic": json.dumps(integration_critic_command),
+        "integration_critic_identity": json.dumps(integration_critic_identity),
         "integration_critic_required": str(require_integration_critic).lower(),
         "runtime_setup": json.dumps(runtime_setup_commands or []),
         "runtime_teardown": json.dumps(runtime_teardown_commands or []),
@@ -75,6 +78,7 @@ def write_config(
         "[integration]\n"
         f"commands = {content['integration']}\n"
         f"critic_command = {content['integration_critic']}\n"
+        f"critic_identity = {content['integration_critic_identity']}\n"
         f"require_critic = {content['integration_critic_required']}\n\n"
         "[runtime]\n"
         f"setup_commands = {content['runtime_setup']}\n"
@@ -391,6 +395,19 @@ def test_required_integration_critic_reviews_exact_candidate(
     assert integration["verdict"] == expected
     assert reviewed["schema"] == "acp.integration-review.v1"
     assert reviewed["candidate"]["tree_sha"]
+    reviewer = reviewed["policy"]["reviewer"]
+    assert reviewer["identity"] == "independent-integration-qc"
+    assert reviewer["executable_sha256"] == sha256(
+        (Path(__file__).parents[1] / "src/agent_control_plane/critic.py").read_bytes()
+    )
+    review_policy = {
+        key: value
+        for key, value in reviewed["policy"].items()
+        if key not in {"reviewer", "reviewer_policy_sha256"}
+    }
+    assert reviewed["policy"]["reviewer_policy_sha256"] == sha256(
+        canonical_json({"reviewer": reviewer, "policy": review_policy}).encode("utf-8")
+    )
     if expected == "pass":
         assert any(
             item.get("phase") == "integration-critic-result"
@@ -398,6 +415,98 @@ def test_required_integration_critic_reviews_exact_candidate(
         )
     else:
         assert "verdict: revise" in integration["error"]
+        latest_task = supervisor.task(attempt["task_id"])
+        assert latest_task["latest_integration"]["verdict"] == "failed"
+        assert (
+            latest_task["latest_integration"]["critic_review"]["findings"][0]["finding"]
+            == "synthetic interaction defect"
+        )
+
+
+@pytest.mark.parametrize(
+    ("reviewer_identity", "worker_id", "integrator_id"),
+    [
+        ("worker", "worker", "integration"),
+        ("integration", "worker", "integration"),
+    ],
+)
+def test_integration_critic_identity_must_differ_from_worker_and_integrator(
+    repo: Path, reviewer_identity: str, worker_id: str, integrator_id: str
+) -> None:
+    write_config(
+        repo,
+        integration_critic_command="builtin",
+        integration_critic_identity=reviewer_identity,
+        require_integration_critic=True,
+    )
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], worker_id)
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    integration = supervisor.integrate(attempt["task_id"], integrator_id=integrator_id)
+
+    assert integration["verdict"] == "failed"
+    assert "worker cannot review its own submission" in integration["error"]
+    latest_task = supervisor.task(attempt["task_id"])
+    assert latest_task["latest_integration"]["verdict"] == "failed"
+
+
+def test_missing_trusted_reviewer_from_attempt_pin_fails_integration_durably(repo: Path) -> None:
+    trust_root = repo.parent / "integration-reviewer-trust"
+    old_source = repo.parent / "integration-reviewer-v1"
+    old_bundle = install_test_bundle(old_source, trust_root, "v1", "old integration critic")
+    write_config(
+        repo,
+        integration_critic_command="trusted:critic",
+        require_integration_critic=True,
+    )
+    configure_trust(repo, trust_root)
+    first_supervisor = GitSupervisor(repo)
+    attempt = first_supervisor.claim(task(first_supervisor, "alpha.txt")["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = first_supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert first_supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    new_source = repo.parent / "integration-reviewer-v2"
+    new_source.mkdir()
+    new_critic = new_source / "critic-v2"
+    new_critic.write_text(
+        '#!/bin/sh\nprintf \'{\\"verdict\\":\\"pass\\",\\"findings\\":[]}\' > "$ACP_REVIEW_RESULT"\n',
+        encoding="utf-8",
+    )
+    new_critic.chmod(0o755)
+    install_bundle(
+        new_source,
+        trust_root,
+        "v2",
+        {"newcritic": "critic-v2"},
+        owner_uid=os.geteuid(),
+        require_privilege=False,
+    )
+    config = (repo / "acp.toml").read_text(encoding="utf-8")
+    (repo / "acp.toml").write_text(
+        config.replace('critic_command = "trusted:critic"', 'critic_command = "trusted:newcritic"'),
+        encoding="utf-8",
+    )
+    second_supervisor = GitSupervisor(repo)
+
+    integration = second_supervisor.integrate(attempt["task_id"])
+
+    assert integration["verdict"] == "failed"
+    assert "has no executable 'newcritic'" in integration["error"]
+    assert old_bundle["bundle_id"] in integration["error"]
+    with second_supervisor.connect() as connection:
+        record = connection.execute(
+            "SELECT verdict, error FROM integrations WHERE id = ?", (integration["id"],)
+        ).fetchone()
+        task_row = connection.execute(
+            "SELECT status FROM tasks WHERE id = ?", (attempt["task_id"],)
+        ).fetchone()
+    assert record["verdict"] == "failed"
+    assert "has no executable 'newcritic'" in record["error"]
+    assert task_row["status"] != "integrating"
 
 
 def test_builtin_integration_critic_accepts_review_packet(repo: Path) -> None:

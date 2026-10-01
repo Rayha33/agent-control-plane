@@ -43,6 +43,7 @@ class Config:
     qc_commands: tuple[str, ...]
     integration_commands: tuple[str, ...]
     integration_critic_command: str
+    integration_critic_identity: str
     require_integration_critic: bool
     critic_command: str
     critic_identity: str
@@ -138,6 +139,9 @@ class ConfigMixin:
         qc_commands = tuple(map(str, qc.get("commands", [])))
         integration_commands = tuple(map(str, integration.get("commands", qc.get("commands", []))))
         integration_critic_selector = str(integration.get("critic_command", "")).strip()
+        integration_critic_identity = str(
+            integration.get("critic_identity", "independent-integration-qc")
+        ).strip()
         require_integration_critic = bool(integration.get("require_critic", False))
         critic_selector = str(qc.get("critic_command", "")).strip()
         require_critic = bool(supervisor.get("require_critic", False))
@@ -152,6 +156,8 @@ class ConfigMixin:
             raise SupervisorError(
                 "invalid_config", "integration.require_critic needs critic_command"
             )
+        if integration_critic_selector and not integration_critic_identity:
+            raise SupervisorError("invalid_config", "integration.critic_identity must not be empty")
         if integration_critic_selector and not (
             self._diagnostic
             and trust_pin is None
@@ -293,6 +299,7 @@ class ConfigMixin:
             qc_commands=qc_commands,
             integration_commands=integration_commands,
             integration_critic_command=integration_critic_selector,
+            integration_critic_identity=integration_critic_identity,
             require_integration_critic=require_integration_critic,
             critic_command=critic_command,
             critic_identity=str(supervisor.get("critic_identity", "independent-qc")),
