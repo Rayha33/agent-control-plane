@@ -130,15 +130,13 @@ subcommand.
 
 ### What this does not do yet
 
-- **No write tools.** Claiming and submitting through MCP needs the credential question
-  above answered first, and a narrower shipped thing beats a broad unshipped one.
+- **The MCP server is read-only today.** `acp mcp-serve` is shipped and exposes
+  ten read-only tools, including `acp_plan` and `acp_guard`; it does not expose the
+  authenticated lifecycle mutations (`claim`, `heartbeat`, `submit`, `qc`, or
+  `integrate`). Adding those requires resolving the credential boundary above first.
 - **No heartbeat hook.** `acp heartbeat` is a write needing the claim token and the
   runner credential, so wiring it into a hook means deciding how a secret reaches a hook
   process. Until then an expired lease surfaces as a `lease_expired` denial — loud
   rather than silent.
-- **No MCP server.** `acp_plan` / `acp_claim` / `acp_submit` as callable tools would let
-  an agent drive the lifecycle itself rather than being placed in a worktree by a human.
-  Guarding writes was the part that closes a hole; that part adds a capability.
-- **No Codex or Cursor adapter.** The `guard` command is runner-agnostic — `--path` with
-  an exit code is all an adapter needs — but nobody has written and tested those hook
-  configurations.
+- **No Codex or Cursor native hook adapter.** The `guard` command remains runner-agnostic,
+  but only the Claude Code hook configuration is implemented and tested today.

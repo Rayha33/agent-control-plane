@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-08-31.
+Research updated: 2026-10-01.
 
 ## Verdict
 
@@ -26,8 +26,8 @@ threads rather than product positioning. Nine themes recur:
 | 1 | Runtime and test-data collisions | In the [Parallel agents in Zed discussion](https://news.ycombinator.com/item?id=47866750), users describe port conflicts, copied secrets, separate services, shared migrations, and abandoning parallel agents because test-data isolation became too costly. [Trigger.dev's account](https://trigger.dev/blog/parallel-agents-gitbutler) reports the same PostgreSQL, Redis, ClickHouse, port, dependency, and disk duplication problems in a production monorepo. | Allocate per-attempt runtime resources and carry them through verification |
 | 2 | Missing setup and teardown lifecycle | The same Zed thread asks for VM-like create/destroy hooks and automatic cleanup. [Claude Code issue #26725](https://github.com/anthropics/claude-code/issues/26725) reports stale worktrees after interrupted sessions. | Durable idempotent setup/teardown with reaper-triggered cleanup |
 | 3 | Verification is still manual or correlated | A practitioner in the Zed thread says manual verification is the largest remaining burden and that agents can encode the bug into their own tests. [Anthropic's evaluation guidance](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) recommends combining deterministic, rubric-based, and state-based evaluation. | Immutable evidence, deterministic gates, independent critic, no self-approval |
-| 4 | Operator attention becomes the bottleneck | A [multi-agent terminal discussion](https://news.ycombinator.com/item?id=47268777) describes 3–6 agents spread across terminals and asks how overlapping changes, merge timing, accountability, and traceability should work. | One durable task/attempt state model and machine-readable status |
-| 5 | Cross-session coordination remains fragile | [Claude Code issue #24798](https://github.com/anthropics/claude-code/issues/24798) asks for inter-session coordination and describes readers seeing partial files after a writer crashes. [Codex issue #23515](https://github.com/openai/codex/issues/23515) reports one worktree session being interrupted by another. | Atomic write scopes, checkpoints, fencing, and one worktree per attempt |
+| 4 | Operator attention becomes the bottleneck | A [multi-agent terminal discussion](https://news.ycombinator.com/item?id=47268777) describes 3–6 agents spread across terminals and asks how overlapping changes, merge timing, accountability, and traceability should work. In a separate [Claude Code discussion](https://www.reddit.com/r/ClaudeAI/comments/1wnanuq/has_running_multiple_coding_agents_in_parallel/), one participant says integrating worktrees felt more error-prone than same-branch parallel work. | One durable task/attempt state model and machine-readable status; isolate writes, but make reconciliation predictable rather than assuming worktrees remove integration cost |
+| 5 | Cross-session coordination remains fragile | [Claude Code issue #24798](https://github.com/anthropics/claude-code/issues/24798) asks for inter-session coordination and describes readers seeing partial files after a writer crashes. [Codex issue #23515](https://github.com/openai/codex/issues/23515) reports one worktree session being interrupted by another. Practitioner threads recommend [a branch and commit per agent for traceability](https://www.reddit.com/r/ClaudeCode/comments/1st213z/how_are_you_managing_multiple_coding_agents_in/) and describe [one worktree/branch per agent to prevent direct file overlap](https://www.reddit.com/r/ClaudeAI/comments/1uldb2g/how_i_stopped_my_parallel_claude_code_agents_from/). A [GitHub Copilot community example](https://github.com/orgs/community/discussions/179403) encodes separate worktrees, branches, and a rule not to edit the default checkout into its agent instructions. | Atomic write scopes, checkpoints, fencing, and one worktree per attempt, with explicit review/integration evidence |
 | 6 | Parallelism can erase its own economics | User reports include [202 GB of unreaped run copies](https://github.com/openai/codex/issues/35383) and [128 GB memory exhaustion](https://github.com/openai/codex/issues/23749). Trigger.dev also reports duplicated dependencies and service stacks. | Bounded pools, explicit cleanup state, quotas and telemetry next |
 | 7 | Credentials cross the candidate boundary | A [Claude Code issue](https://github.com/anthropics/claude-code/issues/58173) reports a shell hook dumping GitHub, Vercel, Slack, Supabase, Anthropic, and search credentials into a transcript despite explicit prompt rules. An [MCP implementer](https://github.com/orgs/modelcontextprotocol/discussions/561) asks how a remote multi-API proxy can safely retain per-user keys without token passthrough. | Hard tool-boundary controls: minimal candidate env, scoped version handles, descriptor-only delivery, and literal-secret absence tests |
 | 8 | The reviewer can be correlated, stale, or silently changed | [Self-preference research](https://arxiv.org/abs/2410.21819) finds that model judges can favor outputs from the same model family; production guidance recommends calibration and multiple evaluation modes. | Signed reviewer provenance, policy fingerprints, explicit ratification, golden cases, provider diversity, and rejection of old-policy passes |
@@ -56,6 +56,11 @@ cannot prove that a resource is free.
 The pattern is consistent: products are improving how agents are launched and
 observed. The weakest common layer is the correctness protocol between task
 assignment and merge.
+
+The added forum and community examples are a small, self-selected qualitative
+sample, not a prevalence estimate or a controlled comparison. They sharpen the
+tradeoff: worktree-per-agent can reduce direct overwrites and improve attribution,
+while merge and coordination work remains a separate source of failure and cost.
 
 ## User reports that sharpened the threat model
 
