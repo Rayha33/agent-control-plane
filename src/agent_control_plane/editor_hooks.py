@@ -103,6 +103,10 @@ def parse_codex_patch_paths(command: str) -> list[str]:
         raise ValueError("apply_patch command must be text")
     if len(command) > CODEX_MAX_PATCH_CHARS:
         raise ValueError("apply_patch command exceeds the 2,000,000 character safety limit")
+    if any(character in "\x1c\x1d\x1e\x1f" for character in command):
+        raise ValueError(
+            "apply_patch command contains unsupported U+001C..U+001F control characters"
+        )
     # Codex's Rust parser splits on LF (accepting CRLF), not every Unicode line
     # separator. Python splitlines() would reinterpret U+2028 inside a filename as
     # a new patch line and could make the guard authorize a different path.
@@ -191,7 +195,7 @@ def parse_codex_patch_paths(command: str) -> list[str]:
                 index += 1
                 continue
             if marker_line == "*** End of File":
-                if operation != "update" or not has_current_hunk_content:
+                if operation != "update" or (has_hunk and not has_current_hunk_content):
                     raise ValueError("End of File requires existing Update File content")
                 after_end_of_file = True
                 index += 1

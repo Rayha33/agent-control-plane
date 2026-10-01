@@ -254,6 +254,10 @@ def test_path_from_hook_payload_reads_the_editing_tools() -> None:
             "*** Update File: alpha.txt\n@@\n-old\n+new\n*** End of File\n   \n",
             ["alpha.txt"],
         ),
+        (
+            "*** Update File: alpha.txt\n*** End of File\n@@\n+new line\n",
+            ["alpha.txt"],
+        ),
         ("*** Delete File: old.py\n", ["old.py"]),
         (
             "*** Update File: old.py\n*** Move to: nested/new.py\n@@\n-old\n+new\n",
@@ -293,6 +297,24 @@ def test_parse_codex_patch_paths(patch: str, expected: list[str]) -> None:
 )
 def test_parse_codex_patch_paths_rejects_unrecognized_or_malformed_input(patch: str) -> None:
     with pytest.raises(ValueError):
+        parse_codex_patch_paths(patch)
+
+
+@pytest.mark.parametrize("control", ["\x1c", "\x1d", "\x1e", "\x1f"])
+@pytest.mark.parametrize(
+    "operation_patch",
+    [
+        "*** Add File: safe.txt{control}\n+content\n",
+        "*** Update File: safe.txt{control}\n@@\n+content\n",
+        "*** Delete File: safe.txt{control}\n",
+        "*** Update File: old.txt\n*** Move to: safe.txt{control}\n@@\n+content\n",
+    ],
+)
+def test_parse_codex_patch_paths_rejects_python_rust_trim_mismatch_controls(
+    control: str, operation_patch: str
+) -> None:
+    patch = f"*** Begin Patch\n{operation_patch.format(control=control)}*** End Patch"
+    with pytest.raises(ValueError, match="control characters"):
         parse_codex_patch_paths(patch)
 
 

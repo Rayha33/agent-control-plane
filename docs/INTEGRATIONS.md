@@ -95,6 +95,9 @@ request, extracts every Add/Delete/Update path and an optional Move to destinati
 then asks the same guard used at submission for each path. One denied path blocks the
 entire patch; unknown or malformed syntax, missing context, no paths, patches over
 2,000,000 characters, or more than 128 paths are denied.
+Patch input containing U+001C through U+001F is also denied because Python and Codex's
+Rust parser trim these control characters differently, which could otherwise make
+their interpreted filenames disagree.
 Patches carrying Codex's `*** Environment ID:` marker are also denied: ACP does not
 yet bind a Codex-selected environment identity to the attempt worktree.
 
