@@ -100,6 +100,232 @@ def test_gc_honours_the_retention_window(repo: Path) -> None:
     assert Path(attempt["worktree"]).exists()
 
 
+@pytest.mark.parametrize("change", ["untracked", "staged", "unstaged"])
+def test_gc_preserves_terminal_worktrees_with_uncommitted_changes(repo: Path, change: str) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    if change == "unstaged":
+        (worktree / "alpha.txt").write_text("uncommitted edit\n", encoding="utf-8")
+    else:
+        lost = worktree / "recovered-after-crash.txt"
+        lost.write_text("uncommitted recovery data\n", encoding="utf-8")
+        if change == "staged":
+            git(worktree, "add", "recovered-after-crash.txt")
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "uncommitted_changes"
+    assert worktree.exists()
+    assert attempt["branch"] in git(repo, "branch", "--list", "--format=%(refname:short)")
+    assert str(worktree) in git(repo, "worktree", "list")
+    if change != "unstaged":
+        assert (worktree / "recovered-after-crash.txt").read_text(encoding="utf-8") == (
+            "uncommitted recovery data\n"
+        )
+
+
+def test_gc_preserves_ignored_recovery_files(repo: Path) -> None:
+    (repo / ".gitignore").write_text("*.checkpoint\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "ignore recovery checkpoint files")
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    checkpoint = worktree / "lost.checkpoint"
+    checkpoint.write_text("recovered state\n", encoding="utf-8")
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "uncommitted_changes"
+    assert checkpoint.read_text(encoding="utf-8") == "recovered state\n"
+    assert attempt["branch"] in git(repo, "branch", "--list", "--format=%(refname:short)")
+
+
+@pytest.mark.parametrize("index_flag", ["skip-worktree", "assume-unchanged"])
+def test_gc_preserves_tracked_edits_hidden_by_index_flags(repo: Path, index_flag: str) -> None:
+    tracked = repo / "tracked.txt"
+    tracked.write_text("committed baseline\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "add tracked file")
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    git(worktree, "update-index", f"--{index_flag}", "tracked.txt")
+    (worktree / "tracked.txt").write_text("recovery edit\n", encoding="utf-8")
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "uncommitted_changes"
+    assert (worktree / "tracked.txt").read_text(encoding="utf-8") == "recovery edit\n"
+    assert str(worktree) in git(repo, "worktree", "list")
+    assert attempt["branch"] in git(repo, "branch", "--list", "--format=%(refname:short)")
+
+
+def test_gc_preserves_worktree_when_safe_git_config_probe_rejects_config(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    git(repo, "config", "--local", "core.fsmonitor", "printf unsafe")
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_state_unknown"
+    assert worktree.exists()
+
+
+def test_gc_rejects_executable_per_worktree_git_config(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    git(repo, "config", "--local", "extensions.worktreeConfig", "true")
+    git(worktree, "config", "--worktree", "filter.demo.clean", "cat")
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_state_unknown"
+    assert worktree.exists()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "nonzero"])
+def test_gc_fails_closed_when_worktree_status_is_unavailable(
+    repo: Path, monkeypatch, failure: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    original_run = subprocess.run
+    observed: list[float | None] = []
+
+    def timeout_status(command, *args, **kwargs):
+        if "status" in command and "--porcelain=v1" in command:
+            observed.append(kwargs.get("timeout"))
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+            return subprocess.CompletedProcess(command, 128, b"", b"broken worktree")
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", timeout_status)
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert observed == [10]
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_state_unknown"
+    assert worktree.exists()
+    assert attempt["branch"] in git(repo, "branch", "--list", "--format=%(refname:short)")
+
+
+def test_gc_fails_closed_when_trusted_git_cannot_be_resolved(repo: Path, monkeypatch) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+
+    def no_trusted_git(_root: Path) -> Path:
+        raise SupervisorError("untrusted_git_executable", "Git unavailable")
+
+    monkeypatch.setattr(supervisor, "_system_git_executable", no_trusted_git)
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_state_unknown"
+    assert worktree.exists()
+    assert attempt["branch"] in git(repo, "branch", "--list", "--format=%(refname:short)")
+
+
+def test_gc_rechecks_worktree_immediately_before_removal(repo: Path, monkeypatch) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    original_state_check = supervisor._gc_worktree_state_reason
+    checks = 0
+
+    def change_after_survey(path: Path) -> str | None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            (path / "late-recovery-data.txt").write_text("raced with gc\n", encoding="utf-8")
+        return original_state_check(path)
+
+    monkeypatch.setattr(supervisor, "_gc_worktree_state_reason", change_after_survey)
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert checks == 2
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "uncommitted_changes"
+    assert (worktree / "late-recovery-data.txt").read_text(encoding="utf-8") == "raced with gc\n"
+
+
+def test_gc_final_probe_catches_ignored_file_added_after_outer_recheck(
+    repo: Path, monkeypatch
+) -> None:
+    (repo / ".gitignore").write_text("*.checkpoint\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "ignore checkpoint files")
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    original_git_text = supervisor._git_text
+    wrote_late_file = False
+
+    def add_after_outer_probe(*arguments: str, check: bool = True):
+        nonlocal wrote_late_file
+        if (
+            not wrote_late_file
+            and len(arguments) >= 4
+            and arguments[0] == "-C"
+            and arguments[1] == str(worktree)
+            and arguments[2:4] == ("branch", "--show-current")
+        ):
+            wrote_late_file = True
+            (worktree / "late.checkpoint").write_text("late recovery data\n", encoding="utf-8")
+        return original_git_text(*arguments, check=check)
+
+    monkeypatch.setattr(supervisor, "_git_text", add_after_outer_probe)
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert wrote_late_file
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "uncommitted_changes"
+    assert (worktree / "late.checkpoint").read_text(encoding="utf-8") == "late recovery data\n"
+    assert str(worktree) in git(repo, "worktree", "list")
+
+
+def test_gc_does_not_force_or_rmtree_after_git_refuses_removal(repo: Path, monkeypatch) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    original_git = supervisor._git
+    remove_calls = 0
+
+    def refuse_remove(*arguments: str, check: bool = True):
+        nonlocal remove_calls
+        if arguments[:2] == ("worktree", "remove"):
+            remove_calls += 1
+            assert "--force" not in arguments
+            return subprocess.CompletedProcess(arguments, 1, b"", b"worktree changed")
+        return original_git(*arguments, check=check)
+
+    monkeypatch.setattr(supervisor, "_git", refuse_remove)
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert remove_calls == 1
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_remove_failed"
+    assert worktree.exists()
+    assert str(worktree) in git(repo, "worktree", "list")
+    assert attempt["branch"] in git(repo, "branch", "--list", "--format=%(refname:short)")
+
+
 def test_dry_run_reports_without_removing(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = finish_a_task(supervisor)

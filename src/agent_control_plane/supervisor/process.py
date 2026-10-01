@@ -332,14 +332,35 @@ class ProcessMixin:
             return f"darwin:{pid}:{started}" if result.returncode == 0 and started else None
         return None
 
-    def _remove_worktree(self, path: Path, delete_branch: bool) -> None:
+    def _remove_worktree(
+        self, path: Path, delete_branch: bool, force: bool = True, verify_clean: bool = False
+    ) -> None:
         branch = (
             self._git_text("-C", str(path), "branch", "--show-current", check=False)
             if path.exists()
             else ""
         )
-        self._git("worktree", "remove", "--force", str(path), check=False)
+        if verify_clean:
+            reason = self._gc_worktree_state_reason(path)
+            if reason is not None:
+                raise SupervisorError(
+                    reason, "worktree changed or became uninspectable before removal"
+                )
+        result = self._git(
+            "worktree", "remove", *(("--force",) if force else ()), str(path), check=False
+        )
+        if result.returncode != 0 and not force:
+            raise SupervisorError(
+                "worktree_remove_failed",
+                result.stderr.decode(errors="replace").strip()
+                or "Git refused to remove the worktree",
+            )
         if path.exists():
+            if not force:
+                raise SupervisorError(
+                    "worktree_remove_incomplete",
+                    "Git left the worktree in place; preserving it for inspection",
+                )
             shutil.rmtree(path)
         self._git("worktree", "prune", check=False)
         if delete_branch and branch:

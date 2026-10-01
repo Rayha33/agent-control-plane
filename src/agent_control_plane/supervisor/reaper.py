@@ -32,6 +32,14 @@ from .common import (
 class ReaperMixin:
     """Lease expiry, two-phase cleanup, worktree GC and quarantine recovery."""
 
+    _GC_WORKTREE_STATUS_TIMEOUT_SECONDS = 10
+    _GC_EXECUTABLE_GIT_CONFIG = (
+        r"^(filter\..*\.(clean|smudge|process|required)|merge\..*\.driver|"
+        r"core\.(fsmonitor|sshcommand)|diff\.external|difftool\..*\.cmd|"
+        r"mergetool\..*\.cmd|gpg(\..*)?\.program|credential(\..*)?\.helper|"
+        r"include\.path|includeif\..*\.path)$"
+    )
+
     # ------------------------------------------------------------------ #
     # Quarantine explain / recover (#740)
     #
@@ -841,6 +849,8 @@ class ReaperMixin:
                 allocated=row["attempt_id"] in allocated_attempts,
                 exists=worktree.exists(),
             )
+            if reason is None:
+                reason = self._gc_worktree_state_reason(worktree)
             if reason is not None:
                 retained.append({**entry, "reason": reason})
                 continue
@@ -848,6 +858,95 @@ class ReaperMixin:
                 {**entry, "age_seconds": age, "bytes": self._directory_bytes(worktree)}
             )
         return reclaimable, retained
+
+    def _gc_worktree_state_reason(self, worktree: Path) -> str | None:
+        """Retain changed or uninspectable worktrees instead of deleting recovery data.
+
+        Porcelain output is machine-readable, ignored files are included, and
+        `--no-optional-locks` keeps this inspection from refreshing the index.
+        Any execution or status failure is uncertainty, never permission to reclaim.
+        """
+
+        try:
+            # Refuse execution-capable repository and per-worktree config before
+            # status: filters and fsmonitor can launch user-defined programs.
+            self._assert_safe_git_execution_config()
+            git = str(self._system_git_executable(self.root))
+            prefix = [
+                *self._supervisor_git_prefix(git, self._disabled_git_hooks_dir()),
+                "--no-optional-locks",
+                "-C",
+                str(worktree),
+            ]
+            worktree_config = subprocess.run(
+                [*prefix, "config", "--local", "--bool", "--get", "extensions.worktreeConfig"],
+                env=self._supervisor_git_env(),
+                capture_output=True,
+                timeout=self._GC_WORKTREE_STATUS_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if worktree_config.returncode not in {0, 1}:
+                return "worktree_state_unknown"
+            scopes = ["--local"]
+            if worktree_config.stdout.strip().lower() in {b"true", b"yes", b"on", b"1"}:
+                scopes.append("--worktree")
+            for scope in scopes:
+                executable_config = subprocess.run(
+                    [
+                        *prefix,
+                        "config",
+                        scope,
+                        "--name-only",
+                        "--get-regexp",
+                        self._GC_EXECUTABLE_GIT_CONFIG,
+                    ],
+                    env=self._supervisor_git_env(),
+                    capture_output=True,
+                    timeout=self._GC_WORKTREE_STATUS_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                if executable_config.returncode not in {0, 1}:
+                    return "worktree_state_unknown"
+                if executable_config.stdout.strip():
+                    return "worktree_state_unknown"
+            index_state = subprocess.run(
+                [*prefix, "ls-files", "-v", "-z"],
+                env=self._supervisor_git_env(),
+                capture_output=True,
+                timeout=self._GC_WORKTREE_STATUS_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if index_state.returncode != 0:
+                return "worktree_state_unknown"
+            # `git status` trusts these index bits and may hide changed bytes.
+            # ls-files -v emits lowercase tags for assume-unchanged and `S` for
+            # skip-worktree, so retain rather than risk deleting hidden edits.
+            if any(
+                record[:1].islower() or record.startswith(b"S ")
+                for record in index_state.stdout.split(b"\0")
+                if record
+            ):
+                return "uncommitted_changes"
+            command = [
+                *prefix,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ]
+            result = subprocess.run(
+                command,
+                env=self._supervisor_git_env(),
+                capture_output=True,
+                timeout=self._GC_WORKTREE_STATUS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError, SupervisorError):
+            return "worktree_state_unknown"
+        if result.returncode != 0:
+            return "worktree_state_unknown"
+        return "uncommitted_changes" if result.stdout else None
 
     @staticmethod
     def _gc_retain_reason(
@@ -924,9 +1023,30 @@ class ReaperMixin:
             # flock is not reentrant, so wrapping the loop deadlocks against the first
             # `git worktree remove`. The other _remove_worktree call sites are unguarded
             # for the same reason.
+            still_reclaimable: list[dict[str, Any]] = []
             for entry in reclaimable:
-                self._remove_worktree(Path(entry["worktree"]), delete_branch=True)
+                worktree = Path(entry["worktree"])
+                reason = self._gc_worktree_state_reason(worktree)
+                if reason is not None:
+                    retained.append({**entry, "reason": reason})
+                    continue
+                try:
+                    # Non-forcing removal refuses normal dirty/untracked races;
+                    # the helper runs the final ignored/index-bit probe after branch
+                    # discovery and immediately before invoking Git. There is no
+                    # shutil.rmtree fallback.
+                    self._remove_worktree(
+                        worktree, delete_branch=True, force=False, verify_clean=True
+                    )
+                except SupervisorError as error:
+                    retained.append({**entry, "reason": error.code})
+                    continue
+                except OSError:
+                    retained.append({**entry, "reason": "worktree_remove_failed"})
+                    continue
                 removed.append(entry["attempt_id"])
+                still_reclaimable.append(entry)
+            reclaimable = still_reclaimable
             with self.connect() as connection:
                 for entry in reclaimable:
                     self._event(
