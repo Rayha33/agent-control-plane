@@ -125,8 +125,7 @@ def parse_codex_patch_paths(command: str) -> list[str]:
     while index < end:
         line = lines[index]
         if not line:
-            index += 1
-            continue
+            raise ValueError("apply_patch command contains an empty line outside a file operation")
 
         # Codex trims top-level hunk headers before interpreting them. Match that
         # behavior when extracting a target: checking a filename with trailing
@@ -153,10 +152,19 @@ def parse_codex_patch_paths(command: str) -> list[str]:
         paths.append(source)
         index += 1
         has_hunk = False
+        has_hunk_content = False
         has_move = False
+        after_end_of_file = False
         while index < end:
             line = lines[index]
             if not line:
+                if operation != "update":
+                    raise ValueError(
+                        f"{operation.title()} File content must use its required prefix"
+                    )
+                if not after_end_of_file:
+                    has_hunk = True
+                    has_hunk_content = True
                 index += 1
                 continue
             # In Codex's update state, trailing whitespace is ignored but leading
@@ -166,6 +174,11 @@ def parse_codex_patch_paths(command: str) -> list[str]:
             marker_line = line.rstrip() if operation == "update" else line.strip()
             if marker_line.startswith(("*** Add File: ", "*** Delete File: ", "*** Update File: ")):
                 break
+            is_change_context = marker_line == "@@" or marker_line.startswith("@@ ")
+            if after_end_of_file and not is_change_context:
+                raise ValueError(
+                    "End of File must be followed only by blank lines or a @@ context marker"
+                )
             if marker_line.startswith("*** Move to: "):
                 if operation != "update" or has_move or has_hunk:
                     raise ValueError("Move to is supported once, before Update File content")
@@ -176,11 +189,16 @@ def parse_codex_patch_paths(command: str) -> list[str]:
                 has_move = True
                 index += 1
                 continue
-            if marker_line == "*** End of File" and (
-                operation != "update" or line.rstrip() == "*** End of File"
-            ):
-                if operation == "update" and not has_hunk:
-                    raise ValueError("End of File cannot replace an Update File hunk")
+            if marker_line == "*** End of File":
+                if operation != "update" or not has_hunk_content:
+                    raise ValueError("End of File requires existing Update File content")
+                after_end_of_file = True
+                index += 1
+                continue
+            if after_end_of_file:
+                after_end_of_file = False
+            if is_change_context:
+                has_hunk = True
                 index += 1
                 continue
             if line.startswith("*** "):
@@ -191,16 +209,17 @@ def parse_codex_patch_paths(command: str) -> list[str]:
                     raise ValueError("Add File content must use + lines")
             elif operation == "delete":
                 raise ValueError("Delete File must not contain patch content")
-            elif line.rstrip().startswith("@@"):
+            elif line.startswith((" ", "+", "-")):
                 has_hunk = True
+                has_hunk_content = True
             else:
-                # Codex's lenient update parser accepts unprefixed context lines.
-                # They carry no additional target path, but count as update content.
-                has_hunk = True
+                raise ValueError(
+                    "Update File content must be blank or start with a space, +, -, or @@"
+                )
             index += 1
 
-        if operation == "update" and not (has_hunk or has_move):
-            raise ValueError("Update File must contain a hunk or Move to destination")
+        if operation == "update" and not has_hunk_content:
+            raise ValueError("Update File must contain content; Move to alone is not a patch")
         if len(paths) > CODEX_MAX_PATCH_PATHS:
             raise ValueError("apply_patch command exceeds the 128-path safety limit")
 
