@@ -152,7 +152,7 @@ def parse_codex_patch_paths(command: str) -> list[str]:
         paths.append(source)
         index += 1
         has_hunk = False
-        has_hunk_content = False
+        has_current_hunk_content = False
         has_move = False
         after_end_of_file = False
         while index < end:
@@ -164,7 +164,7 @@ def parse_codex_patch_paths(command: str) -> list[str]:
                     )
                 if not after_end_of_file:
                     has_hunk = True
-                    has_hunk_content = True
+                    has_current_hunk_content = True
                 index += 1
                 continue
             # In Codex's update state, trailing whitespace is ignored but leading
@@ -175,7 +175,8 @@ def parse_codex_patch_paths(command: str) -> list[str]:
             if marker_line.startswith(("*** Add File: ", "*** Delete File: ", "*** Update File: ")):
                 break
             is_change_context = marker_line == "@@" or marker_line.startswith("@@ ")
-            if after_end_of_file and not is_change_context:
+            is_blank_after_end_of_file = after_end_of_file and not marker_line
+            if after_end_of_file and not (is_change_context or is_blank_after_end_of_file):
                 raise ValueError(
                     "End of File must be followed only by blank lines or a @@ context marker"
                 )
@@ -190,15 +191,21 @@ def parse_codex_patch_paths(command: str) -> list[str]:
                 index += 1
                 continue
             if marker_line == "*** End of File":
-                if operation != "update" or not has_hunk_content:
+                if operation != "update" or not has_current_hunk_content:
                     raise ValueError("End of File requires existing Update File content")
                 after_end_of_file = True
+                index += 1
+                continue
+            if is_blank_after_end_of_file:
                 index += 1
                 continue
             if after_end_of_file:
                 after_end_of_file = False
             if is_change_context:
+                if has_hunk and not has_current_hunk_content:
+                    raise ValueError("Update File cannot contain an empty hunk")
                 has_hunk = True
+                has_current_hunk_content = False
                 index += 1
                 continue
             if line.startswith("*** "):
@@ -211,15 +218,17 @@ def parse_codex_patch_paths(command: str) -> list[str]:
                 raise ValueError("Delete File must not contain patch content")
             elif line.startswith((" ", "+", "-")):
                 has_hunk = True
-                has_hunk_content = True
+                has_current_hunk_content = True
             else:
                 raise ValueError(
                     "Update File content must be blank or start with a space, +, -, or @@"
                 )
             index += 1
 
-        if operation == "update" and not has_hunk_content:
-            raise ValueError("Update File must contain content; Move to alone is not a patch")
+        if operation == "update" and (not has_hunk or not has_current_hunk_content):
+            raise ValueError(
+                "Update File must contain content; Move to alone or an empty hunk is not a patch"
+            )
         if len(paths) > CODEX_MAX_PATCH_PATHS:
             raise ValueError("apply_patch command exceeds the 128-path safety limit")
 

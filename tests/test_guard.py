@@ -250,6 +250,10 @@ def test_path_from_hook_payload_reads_the_editing_tools() -> None:
         ("*** Add File: nested/new.py\n+new\n", ["nested/new.py"]),
         ("*** Update File: alpha.txt\n@@\n-old\n+new\n", ["alpha.txt"]),
         ("*** Update File: alpha.txt\n@@\n context line\n+new line\n", ["alpha.txt"]),
+        (
+            "*** Update File: alpha.txt\n@@\n-old\n+new\n*** End of File\n   \n",
+            ["alpha.txt"],
+        ),
         ("*** Delete File: old.py\n", ["old.py"]),
         (
             "*** Update File: old.py\n*** Move to: nested/new.py\n@@\n-old\n+new\n",
@@ -278,6 +282,8 @@ def test_parse_codex_patch_paths(patch: str, expected: list[str]) -> None:
         "*** Begin Patch\n*** Update File: alpha.txt\nraw context line\n*** End Patch",
         "*** Begin Patch\n*** Update File: alpha.txt\n@@\n*** End Patch",
         "*** Begin Patch\n*** Update File: old.py\n*** Move to: new.py\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n@@\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n@@\n*** End of File\n*** End Patch",
         "*** Begin Patch\n*** Environment ID: \n*** Add File: alpha.txt\n+x\n*** End Patch",
         "*** Begin Patch\n*** Environment ID: remote-env\n*** Add File: alpha.txt\n+x\n*** End Patch",
         "*** Begin Patch\n*** Add File: alpha.txt\n+x\n*** Environment ID: too-late\n*** End Patch",
