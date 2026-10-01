@@ -42,6 +42,7 @@ _PACK_INDEX_NAME = re.compile(r"pack-([0-9a-f]{40}|[0-9a-f]{64})\.(?:pack|idx)\Z
 _EXEC_GIT_FROM_DIR_FD = """
 import hashlib
 import os
+import resource
 import stat
 import sys
 
@@ -103,6 +104,12 @@ try:
     if os.listdir(info_fd) != ["attributes"]:
         fail_closed()
     if read_file(info_fd, "attributes", 4096) != b"* -filter\\n":
+        fail_closed()
+    if os.getuid() == 0 or os.geteuid() == 0:
+        fail_closed()
+    _soft_process_limit, hard_process_limit = resource.getrlimit(resource.RLIMIT_NPROC)
+    resource.setrlimit(resource.RLIMIT_NPROC, (0, hard_process_limit))
+    if resource.getrlimit(resource.RLIMIT_NPROC)[0] != 0:
         fail_closed()
     os.fchdir(worktree_fd)
     os.execve(executable, [executable, *sys.argv[8:]], os.environ)
@@ -920,7 +927,6 @@ class ChangePreviewMixin:
         finally:
             os.close(directory_fd)
 
-    @classmethod
     @classmethod
     def _scan_object_database(
         cls,

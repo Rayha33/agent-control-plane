@@ -689,6 +689,47 @@ def test_preview_does_not_execute_filter_from_raced_scratch_metadata(
     assert not marker.exists(), "untrusted filter executed before scratch config was rejected"
 
 
+def test_preview_blocks_filter_spawn_after_final_scratch_check(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    tracked = worktree / "alpha.txt"
+    marker = repo.parent / f"post-check-filter-executed-{attempt['id']}"
+    race_marker = repo.parent / f"post-check-race-injected-{attempt['id']}"
+    original_metadata = tracked.stat()
+    tracked.write_bytes(b"x" * len(tracked.read_bytes()))
+    os.utime(tracked, ns=(original_metadata.st_atime_ns, original_metadata.st_mtime_ns))
+
+    original_launcher = change_preview_module._EXEC_GIT_FROM_DIR_FD
+    injected_filter_config = (
+        f'\n[filter "raced"]\n\tclean = touch {marker}\n\trequired = true\n'.encode()
+    )
+    injected_attributes = b"alpha.txt filter=raced\n"
+    inject_after_final_check = f"""\
+    if "status" in sys.argv[8:]:
+        with open({str(race_marker)!r}, "w", encoding="utf-8") as marker_file:
+            marker_file.write("injected")
+        with open(os.path.join(scratch_path, "git", "config"), "ab") as config_file:
+            config_file.write({injected_filter_config!r})
+        with open(os.path.join(scratch_path, "git", "info", "attributes"), "wb") as attributes_file:
+            attributes_file.write({injected_attributes!r})
+"""
+    exec_line = "    os.execve(executable, [executable, *sys.argv[8:]], os.environ)"
+    assert original_launcher.count(exec_line) == 1
+    monkeypatch.setattr(
+        change_preview_module,
+        "_EXEC_GIT_FROM_DIR_FD",
+        original_launcher.replace(exec_line, inject_after_final_check + exec_line, 1),
+    )
+
+    with pytest.raises(SupervisorError, match="Git could not read attempt metadata"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert race_marker.read_text(encoding="utf-8") == "injected"
+    assert not marker.exists(), "post-check filter escaped the child-process ceiling"
+
+
 def test_preview_fails_closed_if_scratch_object_is_injected_during_git(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

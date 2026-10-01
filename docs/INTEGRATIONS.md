@@ -262,14 +262,14 @@ available only through an external alternate therefore fail closed. A snapshot w
 250,000 object-store directory entries or over 1 GiB of object data fails closed. Git index
 directories are incrementally capped at 1,024 entries. It does not load
 repository/worktree/global/system Git config,
-configured filters, external excludes files, `.git/info/exclude`, or external attribute
+configured worker filters, external excludes files, `.git/info/exclude`, or external attribute
 files. Attribute lookup is pinned to a generated empty tree using Git's
 `--attr-source=<tree-ish>` option, and the isolated Git metadata contains a guarded
 `info/attributes` file that unsets `filter`. Git versions without `--attr-source` fail
 closed. Consequently, a path excluded only through those settings can appear in the
 preview, and paths marked with a filter attribute may be conservatively reported as
-modified. This intentionally favors a bounded, non-executing inventory over exact parity
-with a user's normal `git status` configuration.
+modified. This intentionally favors a bounded inventory over exact parity with a user's
+normal `git status` configuration.
 
 Live worktrees can change during inspection. `stable: false` means HEAD, index, or the
 path/status inventory changed between observations; even `stable: true` is best-effort,
@@ -292,11 +292,16 @@ unstable or fails closed.
 The isolated Git config, HEAD, guarded `info/attributes`, copied index, scratch-parent
 identity/signature, and empty alternates/ref directories are fingerprinted around every
 Git invocation. Immediately before exec, the pinned-worktree launcher rechecks the scratch
-parent and Git-directory identities, config digest, and filter guard, so a scratch-config
-or attribute change in the launch window is rejected before Git runs. The copied object
-store is checked against its copy-time file inventory; file bytes are compared while
-copying, the trusted empty-tree attribute source is added to that inventory, and the
-complete object-file signature inventory is rechecked before returning. Unexpected
+parent and Git-directory identities, config digest, and filter guard. Those checks are not
+atomic with Git opening its metadata paths, so the isolated child also receives a verified
+zero process-creation limit before Git runs. If the platform cannot enforce that limit or
+the process runs as root, the launcher fails closed. A hostile same-UID process can still
+cause denial of service by racing scratch files, but Git cannot start a clean filter or
+other helper from that race, and the post-invocation metadata fingerprints reject observed
+changes. This is not isolation from arbitrary code already running as the same OS user.
+The copied object store is checked against its copy-time file inventory; file bytes are
+compared while copying, the trusted empty-tree attribute source is added to that inventory,
+and the complete object-file signature inventory is rechecked before returning. Observed
 scratch-parent swaps, injected objects, or other metadata changes fail closed.
 An active index lock or index snapshot beyond the bounded per-file/aggregate size limits
 fails closed. The temporary metadata is removed at the end. The preview does not create
