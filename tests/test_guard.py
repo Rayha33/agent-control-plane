@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -318,6 +319,155 @@ def test_install_creates_settings_when_absent(tmp_path: Path) -> None:
     result = install_claude_code_hooks(tmp_path)
     written = json.loads(Path(result["settings"]).read_text(encoding="utf-8"))
     assert written["hooks"]["PreToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
+
+
+@pytest.mark.parametrize("contents", ["[]", "null", '"settings"'])
+def test_install_refuses_non_object_settings_without_mutation(
+    tmp_path: Path, contents: str
+) -> None:
+    settings = tmp_path / ".claude" / "settings.local.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must contain a JSON object"):
+        install_claude_code_hooks(tmp_path, local=True)
+
+    assert settings.read_text(encoding="utf-8") == contents
+    exclude = tmp_path / ".git" / "info" / "exclude"
+    assert not exclude.exists()
+
+
+def test_attempt_install_refuses_symlinked_claude_directory(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    init_repo(root)
+    exclude = root / ".git" / "info" / "exclude"
+    exclude_before = exclude.read_bytes() if exclude.exists() else None
+    external = tmp_path / "external"
+    external.mkdir()
+    (root / ".claude").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlinked settings directory"):
+        install_claude_code_hooks(root, local=True)
+
+    assert list(external.iterdir()) == []
+    assert (exclude.read_bytes() if exclude.exists() else None) == exclude_before
+
+
+def test_attempt_install_refuses_symlinked_local_settings_file(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    init_repo(root)
+    external = tmp_path / "external-settings.json"
+    external.write_text('{"model":"private"}\n', encoding="utf-8")
+    settings = root / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.symlink_to(external)
+    exclude = root / ".git" / "info" / "exclude"
+    exclude_before = exclude.read_bytes() if exclude.exists() else None
+
+    with pytest.raises(ValueError, match="symlinked local settings"):
+        install_claude_code_hooks(root, local=True)
+
+    assert external.read_text(encoding="utf-8") == '{"model":"private"}\n'
+    assert settings.is_symlink()
+    assert (exclude.read_bytes() if exclude.exists() else None) == exclude_before
+
+
+def test_attempt_hooks_use_local_ignored_settings_and_canonical_state_root(
+    claimed, repo: Path, monkeypatch
+) -> None:
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    local_settings = worktree / ".claude" / "settings.local.json"
+    local_settings.parent.mkdir(parents=True)
+    local_settings.write_text(
+        json.dumps({"model": "sonnet", "hooks": {"PreToolUse": []}}), encoding="utf-8"
+    )
+    local_settings.chmod(0o600)
+
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "hooks",
+                "install",
+                "--claude-code",
+                "--attempt",
+                attempt["id"],
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "hooks",
+                "install",
+                "--claude-code",
+                "--attempt",
+                attempt["id"],
+            ]
+        )
+        == 0
+    )
+
+    written = json.loads(local_settings.read_text(encoding="utf-8"))
+    assert written["model"] == "sonnet"
+    assert local_settings.stat().st_mode & 0o777 == 0o600
+    hook = written["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
+    assert f"--repo {repo}" in hook
+    assert not (repo / ".claude" / "settings.local.json").exists()
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(worktree),
+                "check-ignore",
+                "--no-index",
+                "-q",
+                ".claude/settings.local.json",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == ""
+    )
+
+    monkeypatch.setenv("ACP_ATTEMPT_ID", attempt["id"])
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(worktree), "tool_input": {"file_path": "alpha.txt"}})),
+    )
+    monkeypatch.chdir(worktree)
+    assert main(shlex.split(hook)[1:]) == 0
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"cwd": str(worktree), "tool_input": {"file_path": "beta.txt"}})),
+    )
+    assert main(shlex.split(hook)[1:]) == DENY_EXIT_CODE
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps({"cwd": str(repo), "tool_input": {"file_path": str(worktree / "alpha.txt")}})
+        ),
+    )
+    assert main(shlex.split(hook)[1:]) == DENY_EXIT_CODE
 
 
 def test_hook_mode_fails_closed_when_the_supervisor_cannot_open(tmp_path, monkeypatch) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -141,6 +142,11 @@ def parser() -> argparse.ArgumentParser:
     )
     hooks_install.add_argument(
         "--command", default="acp", help="how the hook should invoke acp (default: acp)"
+    )
+    hooks_install.add_argument(
+        "--attempt",
+        dest="attempt_id",
+        help="install personal Claude settings into this attempt worktree",
     )
 
     gc = commands.add_parser(
@@ -557,7 +563,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return serve(args.repo)
         if args.action == "hooks":
-            emit(install_claude_code_hooks(Path(args.repo).resolve(), args.command))
+            if args.attempt_id:
+                supervisor = GitSupervisor(args.repo, read_only=True)
+                attempt = supervisor.attempt(args.attempt_id)
+                worktree = Path(attempt["worktree"]).resolve()
+                if not worktree.is_dir():
+                    raise SupervisorError(
+                        "worktree_not_found", f"attempt worktree does not exist: {worktree}"
+                    )
+                command = f"{args.command} --repo {shlex.quote(str(supervisor.root))}"
+                try:
+                    result = install_claude_code_hooks(worktree, command, local=True)
+                except (OSError, ValueError) as error:
+                    raise SupervisorError("hook_install_failed", str(error)) from error
+            else:
+                try:
+                    result = install_claude_code_hooks(Path(args.repo).resolve(), args.command)
+                except (OSError, ValueError) as error:
+                    raise SupervisorError("hook_install_failed", str(error)) from error
+            emit(result)
             return 0
         if args.action == "trust":
             if args.trust_action == "list":

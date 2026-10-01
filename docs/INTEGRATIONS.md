@@ -52,11 +52,26 @@ launder a write out of it.
 
 ## Claude Code
 
+For an ACP attempt, install the hook into that attempt's personal local settings. This
+keeps the settings out of the submitted task diff and points every invocation at the
+base checkout's canonical control database:
+
 ```bash
-acp hooks install --claude-code
+BASE=$(git rev-parse --show-toplevel)
+ATTEMPT=$(acp --repo "$BASE" claim "$TASK" --agent me | jq -r .id)
+export ACP_ATTEMPT_ID=$ATTEMPT
+WORKTREE=$(acp --repo "$BASE" guard --describe | jq -r .worktree)
+acp --repo "$BASE" hooks install --claude-code --attempt "$ATTEMPT"
+cd "$WORKTREE"
 ```
 
-Writes `.claude/settings.json` in the repository:
+`--attempt` writes `.claude/settings.local.json` inside the attempt worktree, merges
+existing personal settings, and adds that local settings path to this repository's
+`.git/info/exclude`. The generated hook command pins `--repo` to `BASE`; this is
+necessary because each attempt is its own Git root while `.acp/control.db` belongs to
+the base checkout. Re-running the installer is idempotent. The no-`--attempt` form
+continues to write shared project settings at `.claude/settings.json` for use in the
+checkout where it is installed.
 
 - **PreToolUse** on `Edit|Write|MultiEdit|NotebookEdit` → `acp guard --hook`. Exit 2
   blocks the tool call and returns the reason to the model.
@@ -68,13 +83,7 @@ entries — are preserved, previous ACP entries are replaced rather than duplica
 a `settings.json` that is not valid JSON is left untouched with an error instead of
 being overwritten.
 
-Export the attempt id from the claim before starting the session:
-
-```bash
-ATTEMPT=$(acp claim "$TASK" --agent me | jq -r .id)
-export ACP_ATTEMPT_ID=$ATTEMPT
-cd "$(acp guard --describe | jq -r .worktree)"
-```
+Start Claude Code from the displayed worktree after installing the attempt-scoped hook.
 
 ### Bash is not guarded, deliberately
 
