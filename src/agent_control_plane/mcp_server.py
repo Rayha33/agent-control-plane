@@ -1,14 +1,13 @@
 """A read-only MCP server over stdio for the board and untrusted message inbox.
 
 Deliberately READ-ONLY and CREDENTIAL-FREE. `acp claim`, `heartbeat`, `submit`, `qc`
-and `integrate` are all authenticated by a runner credential, and `runner_identity.py`
-exists to keep worker, critic and integrator authority apart so nobody approves their
-own work. A long-lived stdio server that an editor spawns and holds open would have to
-keep such a credential for the life of the session; if it held more than one role's, it
-would erase that separation in a process whose lifetime nobody is watching. The CLI is
-careful about this — `_read_credential` takes a 0600 file or an already-open descriptor
-and never an environment variable — so putting one in a server's environment would undo
-the care rather than reuse it.
+and `integrate` are authenticated by a runner credential, and `runner_identity.py`
+keeps worker, critic and integrator authority apart so nobody approves their own work.
+The CLI accepts credentials from a private file, an open descriptor, or the
+`ACP_RUNNER_CREDENTIAL` compatibility fallback. This stdio server never calls
+`_read_credential`, and none of its tools accepts a credential. Like any child process
+it inherits its launch environment, so launch it with a sanitized environment and
+leave `ACP_RUNNER_CREDENTIAL` unset; the server has no reason to hold runner secrets.
 
 Every tool here therefore calls a method that takes no credential, against a supervisor
 opened `read_only=True`. That is not a promise in a docstring: `mode=ro` makes a stray

@@ -222,11 +222,11 @@ Eleven tools, each a one-line delegation to a supervisor method: `acp_status`,
 
 **No writes and no credential, on purpose.** `claim`, `heartbeat`, `submit`, `qc` and
 `integrate` are authenticated, and `runner_identity.py` keeps worker, critic and
-integrator authority apart so nobody approves their own work. A server an editor spawns
-and holds open would have to keep a credential for the whole session; one holding more
-than one role's would erase that separation in a process nobody is watching. The CLI
-takes credentials only from a 0600 file or an open descriptor, never the environment —
-putting one in a server's environment would undo that care rather than reuse it.
+integrator authority apart so nobody approves their own work. The CLI accepts credentials
+from a 0600 file, an open descriptor, or the `ACP_RUNNER_CREDENTIAL` compatibility
+fallback. The MCP server never reads that variable or calls credential-taking methods;
+because it inherits its launch environment like any child process, launch it with a
+sanitized environment and leave `ACP_RUNNER_CREDENTIAL` unset.
 
 The server opens `GitSupervisor(read_only=True)` per call, so `mode=ro` makes a stray
 write raise rather than depend on discipline, and a database needing migration is
