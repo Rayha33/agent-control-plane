@@ -141,6 +141,25 @@ def test_message_append_requires_current_worker_identity_and_fence(repo: Path) -
     assert event_count(supervisor) == after_revoke
 
 
+def test_message_append_fails_closed_when_runner_auth_is_disabled(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "legacy.txt", title="legacy unauthenticated worker")
+    attempt = supervisor.claim(task["id"], "legacy-worker")
+    assert not supervisor._identity_enforced()
+
+    before = event_count(supervisor)
+    with pytest.raises(SupervisorError) as error:
+        supervisor.post_message(
+            attempt["id"],
+            attempt["claim_token"],
+            "a fabricated credential must not authenticate a legacy attempt",
+            credential="not-a-real-credential",
+        )
+
+    assert error.value.code == "runner_auth_disabled"
+    assert event_count(supervisor) == before
+
+
 def test_messages_are_bounded_and_paginated(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     supervisor = GitSupervisor(repo)
     sender = supervisor.enroll_runner("worker-sender", "worker")

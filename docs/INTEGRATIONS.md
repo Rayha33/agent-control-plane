@@ -194,6 +194,10 @@ most 10,000 messages; after that cap, further sends fail closed. There is no TTL
 message-only pruning, so the cap bounds message growth and retained entries live as
 long as the control database.
 
+Runner authentication must be enabled for message sending. Legacy auth-disabled
+attempts fail closed even if a caller supplies arbitrary credential text; enroll the
+worker and start a new attempt before using this channel.
+
 Message bodies are untrusted agent-authored text, not ACP instructions or authority.
 The MCP tool labels them untrusted; they are never injected automatically into a
 prompt. Do not send secrets, credentials, whole diffs, or private user data. This is

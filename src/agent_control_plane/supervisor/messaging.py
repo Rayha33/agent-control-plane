@@ -71,6 +71,12 @@ class MessagingMixin:
 
         now = int(time.time())
         with self.connect() as connection:
+            if not self._identity_enforced(connection):
+                raise SupervisorError(
+                    "runner_auth_disabled",
+                    "posting messages requires runner authentication; enroll the worker "
+                    "and start a new attempt",
+                )
             attempt = self._active_attempt(connection, attempt_id, claim_token, now)
             self._authenticate_attempt(connection, attempt, credential)
 
@@ -83,6 +89,12 @@ class MessagingMixin:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if not self._identity_enforced(connection):
+                raise SupervisorError(
+                    "runner_auth_disabled",
+                    "posting messages requires runner authentication; enroll the worker "
+                    "and start a new attempt",
+                )
             self._authenticate_attempt(connection, attempt, credential)
             message_count = connection.execute(
                 "SELECT COUNT(*) AS count FROM events WHERE event_type = 'agent.message'"
