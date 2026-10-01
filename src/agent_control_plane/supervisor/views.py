@@ -34,6 +34,30 @@ class ViewsMixin:
             """,
             (row["id"],),
         ).fetchone()
+        integration = connection.execute(
+            "SELECT * FROM integrations WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        integration_view = None
+        if integration:
+            results = json.loads(integration["results_json"] or "[]")
+            review = next(
+                (
+                    item
+                    for item in reversed(results)
+                    if item.get("phase") == "integration-critic-result"
+                ),
+                None,
+            )
+            integration_view = {
+                "id": integration["id"],
+                "batch_id": integration["batch_id"],
+                "verdict": integration["verdict"],
+                "error": integration["error"],
+                "commit_sha": integration["commit_sha"],
+                "critic_review": review,
+                "created_at": integration["created_at"],
+            }
         return {
             "id": row["id"],
             "title": row["title"],
@@ -59,6 +83,7 @@ class ViewsMixin:
             "latest_submission": self._submission_view(connection, submission)
             if submission
             else None,
+            "latest_integration": integration_view,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

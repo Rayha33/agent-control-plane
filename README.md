@@ -74,10 +74,28 @@ wedge.
 | Structured critic | An optional external critic returns evidence-based findings |
 | Process lifecycle boundary | Linux subreaper monitors retain descendants and lifecycle locks; Darwin bounded commands run in a no-fork kernel sandbox |
 | Integration gate | Candidate-inert Git plumbing creates a real merge commit, tests a synthetic workspace, and publishes only a passing branch |
+| Cumulative integration critique | An opt-in ordered batch reviews one exact multi-submission tree and routes findings to implicated task owners before publishing |
 | Audit | Git-supervisor mutations and hash-chained events share a transaction |
 
 ACP never pushes or updates the base branch. A passing integration leaves a
 named integration branch for a human or existing merge queue.
+
+When multiple approved submissions should land together, `acp integrate-batch`
+builds one cumulative candidate in the relative order shown by `acp merge-plan`.
+All members must target the same base branch; dependencies outside the batch
+must already be done. ACP reruns deterministic integration commands for each
+member runtime against the same candidate, then gives a configured integration
+critic an immutable packet containing the exact base/commit/tree OIDs, task and
+dependency order, and Git-derived diffs for every submission and the cumulative
+tree. The critic must attach every finding to one or more included task IDs.
+Only that reviewed commit can be published, and a failed/stale review leaves no
+passing branch. Findings appear in each implicated task's
+`latest_integration.critic_review`; implicated tasks return to
+`changes_requested`, while unimplicated approved tasks remain available for a
+later batch. Without a configured critic the result says `UNREVIEWED`; required
+critic mode fails closed. This is an optional semantic-review layer, not proof
+that all cross-file defects can be found; configured deterministic gates remain
+mandatory.
 
 ## Quick start
 
@@ -311,6 +329,7 @@ answers it from state it already holds, without launching anything:
 uv run --extra dev acp plan TASK_ID     # would this claim succeed, and if not, who is in the way?
 uv run --extra dev acp queue            # ordered set of tasks that can run concurrently
 uv run --extra dev acp merge-plan       # integration order for approved work
+uv run --extra dev acp integrate-batch TASK_A TASK_B --integrator release-integrator --credential-file ../release-integrator.credential
 ~~~
 
 `plan` classifies every collision as <code>exact</code> (identical normalized

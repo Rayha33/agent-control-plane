@@ -940,8 +940,14 @@ class QcMixin:
                 "invalid_critic_output",
                 "critic did not create its unique result file",
             )
-        raw = path.read_text(encoding="utf-8")
-        payload = json.loads(raw)
+        try:
+            raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SupervisorError(
+                "invalid_critic_output",
+                "critic result is unreadable or is not valid JSON",
+            ) from error
         verdicts = {"pass", "revise", "block", "human_required"}
         if not isinstance(payload, dict) or payload.get("verdict") not in verdicts:
             raise SupervisorError("invalid_critic_output", "critic verdict is invalid")

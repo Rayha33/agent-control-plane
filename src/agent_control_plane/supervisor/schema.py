@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS integrations (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id),
   submission_id TEXT NOT NULL REFERENCES submissions(id),
+  batch_id TEXT NOT NULL DEFAULT '',
   branch TEXT,
   commit_sha TEXT,
   verdict TEXT NOT NULL,
@@ -286,3 +287,6 @@ def migrate(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE qc_runs ADD COLUMN {column} TEXT NOT NULL DEFAULT {default}"
             )
+    integration_columns = _columns(connection, "integrations")
+    if "batch_id" not in integration_columns:
+        connection.execute("ALTER TABLE integrations ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''")

@@ -47,6 +47,8 @@ def finding(
 
 
 def review(packet: dict[str, Any], root: Path) -> dict[str, Any]:
+    if packet.get("schema") == "acp.integration-review.v2":
+        return review_cumulative(packet, root)
     findings: list[dict[str, str]] = []
     task = packet.get("task", {})
     submission = packet.get("submission", {})
@@ -147,6 +149,155 @@ def review(packet: dict[str, Any], root: Path) -> dict[str, Any]:
                 "one or more deterministic commands failed",
                 ", ".join(f"{item.get('command')}={item.get('exit_code')}" for item in failed),
                 "fix the deterministic failures before approval",
+            )
+        )
+
+    serious = {"critical", "high", "medium"}
+    verdict = "revise" if any(item["severity"] in serious for item in findings) else "pass"
+    return {"verdict": verdict, "findings": findings}
+
+
+def review_cumulative(packet: dict[str, Any], root: Path) -> dict[str, Any]:
+    """Apply deterministic structural checks to every member of a cumulative candidate."""
+
+    findings: list[dict[str, Any]] = []
+    task_specs = packet.get("task_specs", [])
+    task_ids = [item.get("task_id") for item in task_specs if isinstance(item, dict)]
+    path_owners: dict[str, list[str]] = {}
+
+    def scoped(item: dict[str, str], owners: list[str]) -> dict[str, Any]:
+        return {**item, "task_ids": owners}
+
+    for spec in task_specs:
+        if not isinstance(spec, dict) or not isinstance(spec.get("task"), dict):
+            continue
+        task_id = spec.get("task_id")
+        if not isinstance(task_id, str):
+            continue
+        task = spec["task"]
+        submission = spec.get("submission", {})
+        changed_paths = submission.get("changed_paths", [])
+        if not isinstance(changed_paths, list):
+            changed_paths = []
+        changed = [Path(value) for value in changed_paths if isinstance(value, str)]
+        for path in changed:
+            path_owners.setdefault(path.as_posix(), []).append(task_id)
+        if not task.get("acceptance"):
+            findings.append(
+                scoped(
+                    finding(
+                        "high",
+                        "the task has objective acceptance criteria",
+                        "the review packet has no acceptance criteria",
+                        f"task_specs[{task_id}].task.acceptance is empty",
+                        "add measurable acceptance criteria and resubmit",
+                    ),
+                    [task_id],
+                )
+            )
+        if not changed:
+            findings.append(
+                scoped(
+                    finding(
+                        "high",
+                        "the candidate contains a bounded change",
+                        "the submission has no changed paths",
+                        f"task_specs[{task_id}].submission.changed_paths is empty",
+                        "submit a non-empty committed change",
+                    ),
+                    [task_id],
+                )
+            )
+        if len(changed) > 100:
+            findings.append(
+                scoped(
+                    finding(
+                        "medium",
+                        "the change remains reviewable",
+                        "the submission changes more than 100 paths",
+                        f"task_id={task_id}; changed_path_count={len(changed)}",
+                        "split the task or require explicit human review",
+                    ),
+                    [task_id],
+                )
+            )
+        source_changed = any(path.suffix.casefold() in SOURCE_SUFFIXES for path in changed)
+        test_changed = any(
+            "test" in {part.casefold() for part in path.parts}
+            or path.name.casefold().startswith(("test_", "spec_"))
+            for path in changed
+        )
+        if source_changed and not test_changed:
+            findings.append(
+                scoped(
+                    finding(
+                        "low",
+                        "behavioral changes have regression evidence",
+                        "source changed without a changed test file",
+                        ", ".join(str(path) for path in changed[:20]),
+                        "confirm existing tests cover the change or add a focused regression test",
+                    ),
+                    [task_id],
+                )
+            )
+        sensitive = sorted(
+            str(path)
+            for path in changed
+            if SENSITIVE_PARTS.intersection(part.casefold() for part in path.parts)
+        )
+        if sensitive:
+            findings.append(
+                scoped(
+                    finding(
+                        "low",
+                        "security-sensitive changes receive extra scrutiny",
+                        "the submission touches security-sensitive paths",
+                        ", ".join(sensitive[:20]),
+                        "consider a specialist or human security review",
+                    ),
+                    [task_id],
+                )
+            )
+
+    for raw_path, owners in sorted(path_owners.items()):
+        candidate = root / Path(raw_path)
+        if not candidate.is_file() or candidate.stat().st_size > 1_000_000:
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if "<<<<<<<" in text and "=======" in text and ">>>>>>>" in text:
+            findings.append(
+                scoped(
+                    finding(
+                        "high",
+                        "the cumulative candidate contains no unresolved merge conflict",
+                        f"conflict markers remain in {raw_path}",
+                        raw_path,
+                        "resolve the conflict markers and resubmit the affected task",
+                    ),
+                    sorted(set(owners)),
+                )
+            )
+
+    failed = [
+        result for result in packet.get("deterministic_results", []) if result.get("exit_code") != 0
+    ]
+    if failed:
+        findings.append(
+            scoped(
+                finding(
+                    "high",
+                    "all deterministic integration gates pass",
+                    "one or more deterministic commands failed",
+                    ", ".join(
+                        f"{item.get('task_id')}:{item.get('command')}={item.get('exit_code')}"
+                        for item in failed
+                    ),
+                    "fix the deterministic failures before approval",
+                ),
+                task_ids,
             )
         )
 

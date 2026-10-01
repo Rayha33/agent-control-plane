@@ -299,6 +299,55 @@ the current base as its first parent and the immutable candidate as its second;
 its tree is the tree returned by `merge-tree`. Merge conflict or command
 failure moves the task to <code>conflicted</code> and releases its reservation.
 
+An optional integration-stage critic reviews the exact merged candidate after
+deterministic integration commands and before ref publication. Configure
+`[integration].critic_command` with `builtin`, a trusted-bundle selector, or a
+trusted absolute executable; set `[integration].require_critic = true` to fail
+closed when it is absent. The reviewer receives `ACP_REVIEW_PACKET` and
+`ACP_REVIEW_RESULT`; the packet binds the current base, merge commit/tree,
+submission, task, deterministic results, reviewer identity, command selector,
+submission-QC policy fingerprint, and a digest of that reviewer policy. The
+reviewer identity must differ from both the submission worker and integrator.
+That identity is an operator-configured principal label, not cryptographic proof
+of a distinct model/provider; independence here means a distinct configured
+review role running through ACP's trusted critic boundary. Executable content
+and, for trust-bundle commands, the pinned bundle/manifest are recorded.
+`revise`, `block`,
+`human_required`, malformed output, timeout, or candidate mutation prevents
+publication. Without a configured reviewer the result is explicitly recorded
+as `UNREVIEWED`; deterministic gates remain mandatory and authoritative.
+The owning task's `latest_integration.critic_review` view exposes stored
+findings to the agent so it can revise and resubmit; it is not limited to the
+integrator's one-time command output.
+
+`acp integrate-batch TASK_A TASK_B ...` is an explicit, opt-in cumulative
+promotion path. It accepts 2-16 unique approved tasks in the relative order of
+the current merge plan, rejects dependency cycles or incomplete dependencies,
+and currently requires one shared target base branch. ACP holds every task
+operation fence in sorted lock order, folds submissions into the cumulative
+synthetic candidate in plan order, and runs the configured deterministic integration
+commands once per member runtime against the final cumulative tree. Its v2
+review packet binds the base branch/OID, final commit/tree OIDs, task
+specifications, dependency/order context, per-submission Git diffs, cumulative
+Git diff, reviewer executable/trust provenance, and policy fingerprint. The
+packet bytes are hashed and rechecked after the critic returns; the base ref,
+task state, reviewer trust, assurance policy, and resource reservations are
+revalidated before publication.
+
+Every finding must contain a nonempty `task_ids` list limited to the batch.
+ACP stores only findings implicated in a given task's
+`latest_integration.critic_review`, so the next worker can act on them. A
+negative critique moves implicated tasks to `changes_requested`; other approved
+members remain approved and retain their runtime for another batch. A timeout,
+malformed or unattributed finding, packet mutation, stale base, deterministic
+gate failure, or publication failure cannot create a passing branch. Critical,
+high, or medium findings block even if a critic incorrectly labels the packet
+`pass`; low/info notes can accompany a passing verdict. Batch publication and
+crash recovery group all member records under one batch ID, preventing recovery
+from finalizing only one task. Omitting the optional critic records
+`UNREVIEWED`, and required mode fails closed. This layer is an optional second
+opinion, not a claim that semantic review is complete or calibrated.
+
 The Git boundary is identical on Linux and macOS:
 
 - ACP resolves a root-owned, non-writable system Git binary and copies its

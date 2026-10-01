@@ -279,6 +279,13 @@ def parser() -> argparse.ArgumentParser:
     integrate.add_argument("task_id")
     integrate.add_argument("--integrator", default="integration")
     add_credential_source(integrate)
+    integrate_batch = commands.add_parser(
+        "integrate-batch",
+        help="critique and promote an explicitly ordered cumulative integration candidate",
+    )
+    integrate_batch.add_argument("task_ids", nargs="+", help="ordered approved task IDs")
+    integrate_batch.add_argument("--integrator", default="integration")
+    add_credential_source(integrate_batch)
     run = commands.add_parser("run", help="run an agent command in its worktree")
     run.add_argument("attempt_id")
     run.add_argument("--token", type=int, required=True, dest="claim_token")
@@ -702,6 +709,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.run_qc(args.submission_id, reviewer, _read_credential(args))
         elif args.action == "integrate":
             result = supervisor.integrate(args.task_id, args.integrator, _read_credential(args))
+        elif args.action == "integrate-batch":
+            result = supervisor.integrate_batch(
+                args.task_ids, args.integrator, _read_credential(args)
+            )
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             result = supervisor.run_worker(
