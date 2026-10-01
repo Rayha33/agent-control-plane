@@ -255,14 +255,6 @@ def test_path_from_hook_payload_reads_the_editing_tools() -> None:
             "*** Update File: old.py\n*** Move to: nested/new.py\n@@\n-old\n+new\n",
             ["old.py", "nested/new.py"],
         ),
-        (
-            "*** Environment ID: apply-patch-v1\n*** Add File: nested/new.py\n+new\n",
-            ["nested/new.py"],
-        ),
-        (
-            "  *** Environment ID: apply-patch-v1  \n*** Add File: nested/new.py\n+new\n",
-            ["nested/new.py"],
-        ),
         ("*** Add File: /tmp/outside.py\n", ["/tmp/outside.py"]),
         ("*** Add File:  leading-space.py\n", [" leading-space.py"]),
         ("*** Add File: trailing-space.py \n", ["trailing-space.py"]),
@@ -284,7 +276,7 @@ def test_parse_codex_patch_paths(patch: str, expected: list[str]) -> None:
         "*** Begin Patch\n*** Add File: \n*** End Patch",
         "*** Begin Patch\n*** Update File: alpha.txt\n*** End Patch",
         "*** Begin Patch\n*** Environment ID: \n*** Add File: alpha.txt\n+x\n*** End Patch",
-        "*** Begin Patch\n*** Environment ID: one\n*** Environment ID: two\n*** Add File: alpha.txt\n+x\n*** End Patch",
+        "*** Begin Patch\n*** Environment ID: remote-env\n*** Add File: alpha.txt\n+x\n*** End Patch",
         "*** Begin Patch\n*** Add File: alpha.txt\n+x\n*** Environment ID: too-late\n*** End Patch",
         "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n*** Move to: moved.txt\n*** End Patch",
         "*** Begin Patch\n*** Delete File: alpha.txt\nunexpected\n*** End Patch",
@@ -305,6 +297,12 @@ def test_parse_codex_patch_paths_bounds_input_size_and_file_count() -> None:
     patch = f"*** Begin Patch\n{operations}\n*** End Patch"
     with pytest.raises(ValueError, match="128-path"):
         parse_codex_patch_paths(patch)
+
+
+def test_parse_codex_patch_paths_keeps_unicode_line_separator_inside_filename() -> None:
+    path = "safe/\u2028+../../../../outside.txt"
+    patch = f"*** Begin Patch\n*** Add File: {path}\n+escaped\n*** End Patch"
+    assert parse_codex_patch_paths(patch) == [path]
 
 
 def test_codex_hook_checks_every_path_and_denies_entire_mixed_patch(
@@ -375,6 +373,64 @@ def test_codex_hook_allows_a_declared_patch_without_output_or_side_effects(
     with sqlite3.connect(repo / ".acp" / "control.db") as connection:
         after_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     assert after_events == before_events
+
+
+def test_codex_hook_denies_environment_scoped_patch(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    attempt = claimed[1]
+    worktree = Path(attempt["worktree"])
+    patch = (
+        "*** Begin Patch\n"
+        "*** Environment ID: another-environment\n"
+        "*** Update File: alpha.txt\n@@\n-old\n+new\n"
+        "*** End Patch"
+    )
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+
+    assert run_codex_hook(repo, attempt["id"], payload, monkeypatch) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "environment-scoped" in response["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_codex_hook_denies_unicode_line_separator_traversal(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "safe/**")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    path = "safe/\u2028+../../../../outside.txt"
+    patch = f"*** Begin Patch\n*** Add File: {path}\n+escaped\n*** End Patch"
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+    calls: list[str] = []
+    original_guard = GitSupervisor.guard
+
+    def record_guard(self, attempt_id, target_path, *, caller_cwd=None, now=None):
+        calls.append(target_path)
+        return original_guard(self, attempt_id, target_path, caller_cwd=caller_cwd, now=now)
+
+    monkeypatch.setattr(GitSupervisor, "guard", record_guard)
+
+    assert run_codex_hook(repo, attempt["id"], payload, monkeypatch) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert calls == [path]
 
 
 @pytest.mark.parametrize("path", ["../escape.py", "/tmp/escape.py"])
@@ -570,7 +626,22 @@ def test_codex_install_preserves_user_hooks_and_replaces_its_own_entry(tmp_path:
                         },
                         {
                             "matcher": "^apply_patch$",
-                            "hooks": [{"type": "command", "command": "acp guard --codex-hook"}],
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "acp --repo /path with spaces guard --codex-hook",
+                                },
+                                {"type": "command", "command": "notify-policy"},
+                            ],
+                        },
+                        {
+                            "matcher": "^apply_patch$",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 /hooks/policy.py guard --codex-hook",
+                                }
+                            ],
                         },
                     ],
                 },
@@ -589,6 +660,11 @@ def test_codex_install_preserves_user_hooks_and_replaces_its_own_entry(tmp_path:
     pre = written["hooks"]["PreToolUse"]
     assert any(entry["hooks"][0]["command"] == "mine" for entry in pre)
     assert any(entry["hooks"][0]["command"] == "custom guard --codex-hook" for entry in pre)
+    assert any(
+        entry["hooks"][0]["command"] == "python3 /hooks/policy.py guard --codex-hook"
+        for entry in pre
+    )
+    assert any(hook["command"] == "notify-policy" for entry in pre for hook in entry["hooks"])
     acp_entries = [
         hook
         for entry in pre

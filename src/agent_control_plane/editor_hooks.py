@@ -103,14 +103,25 @@ def parse_codex_patch_paths(command: str) -> list[str]:
         raise ValueError("apply_patch command must be text")
     if len(command) > CODEX_MAX_PATCH_CHARS:
         raise ValueError("apply_patch command exceeds the 2,000,000 character safety limit")
-    lines = command.splitlines()
+    # Codex's Rust parser splits on LF (accepting CRLF), not every Unicode line
+    # separator. Python splitlines() would reinterpret U+2028 inside a filename as
+    # a new patch line and could make the guard authorize a different path.
+    if not command:
+        lines: list[str] = []
+    else:
+        lines = command.split("\n")
+        has_final_lf = command.endswith("\n")
+        if has_final_lf:
+            lines.pop()
+        for line_index, line in enumerate(lines):
+            if (line_index < len(lines) - 1 or has_final_lf) and line.endswith("\r"):
+                lines[line_index] = line[:-1]
     if len(lines) < 3 or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
         raise ValueError("apply_patch command must have Begin Patch and End Patch markers")
 
     paths: list[str] = []
     index = 1
     end = len(lines) - 1
-    seen_environment_id = False
     while index < end:
         line = lines[index]
         if not line:
@@ -122,16 +133,10 @@ def parse_codex_patch_paths(command: str) -> list[str]:
         # whitespace while apply_patch writes the trimmed filename would authorize
         # a different path from the one we actually inspected.
         header = line.strip()
-        environment_prefix = "*** Environment ID: "
-        if not paths and header.startswith("*** Environment ID:"):
-            if seen_environment_id or not header.startswith(environment_prefix):
-                raise ValueError("malformed or duplicate apply_patch environment id")
-            environment_id = header[len(environment_prefix) :].strip()
-            if not environment_id or "\x00" in environment_id:
-                raise ValueError("apply_patch environment id must be non-empty text")
-            seen_environment_id = True
-            index += 1
-            continue
+        if header.startswith("*** Environment ID:"):
+            raise ValueError(
+                "environment-scoped apply_patch requests are unsupported by this attempt guard"
+            )
 
         operation: str | None = None
         for candidate in ("Add", "Delete", "Update"):
@@ -386,6 +391,13 @@ def install_codex_hooks(
 ) -> dict[str, Any]:
     """Write Codex hooks, preserving unrelated project hooks and metadata."""
 
+    try:
+        command_prefix = shlex.split(command)
+    except ValueError as error:
+        raise ValueError("hook command must be valid shell text") from error
+    if not command_prefix:
+        raise ValueError("hook command cannot be empty")
+
     root = root.resolve()
     hooks_path = root / CODEX_HOOKS_RELATIVE_PATH
     hooks_parent = hooks_path.parent
@@ -420,7 +432,22 @@ def install_codex_hooks(
     existing_pre = merged_hooks.get("PreToolUse", [])
     if not isinstance(existing_pre, list):
         raise ValueError(f"{hooks_path} PreToolUse field must be a list; refusing to replace it")
-    kept = [entry for entry in existing_pre if not _is_codex_acp_entry(entry)]
+    kept = []
+    for entry in existing_pre:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("matcher") != "^apply_patch$"
+            or not isinstance(entry.get("hooks"), list)
+        ):
+            kept.append(entry)
+            continue
+        remaining_handlers = [
+            hook for hook in entry["hooks"] if not _is_codex_acp_hook(entry, hook, command_prefix)
+        ]
+        if remaining_handlers:
+            preserved_entry = dict(entry)
+            preserved_entry["hooks"] = remaining_handlers
+            kept.append(preserved_entry)
     merged_hooks["PreToolUse"] = kept + codex_hooks(command, attempt_id)["PreToolUse"]
     settings["hooks"] = merged_hooks
 
@@ -455,25 +482,25 @@ def install_codex_hooks(
     }
 
 
-def _is_codex_acp_entry(entry: Any) -> bool:
-    if not isinstance(entry, dict) or entry.get("matcher") != "^apply_patch$":
+def _is_codex_acp_hook(entry: Any, hook: Any, command_prefix: list[str]) -> bool:
+    if (
+        not isinstance(entry, dict)
+        or entry.get("matcher") != "^apply_patch$"
+        or not isinstance(hook, dict)
+        or not isinstance(hook.get("command"), str)
+    ):
         return False
-    handlers = entry.get("hooks")
-    if not isinstance(handlers, list):
+    try:
+        tokens = shlex.split(hook["command"])
+    except ValueError:
         return False
-    for hook in handlers:
-        if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
-            continue
-        try:
-            tokens = shlex.split(hook["command"])
-        except ValueError:
-            continue
-        if len(tokens) >= 2 and tokens[-1] == "--codex-hook":
-            for index, token in enumerate(tokens[:-1]):
-                remainder = tokens[index + 1 :]
-                if token == "guard" and (
-                    remainder == ["--codex-hook"]
-                    or (len(remainder) == 3 and remainder[0] == "--attempt")
-                ):
-                    return True
-    return False
+    if tokens[: len(command_prefix)] != command_prefix:
+        return False
+    tail = tokens[len(command_prefix) :]
+    return tail == ["guard", "--codex-hook"] or (
+        len(tail) == 4
+        and tail[0] == "guard"
+        and tail[1] == "--attempt"
+        and bool(tail[2])
+        and tail[3] == "--codex-hook"
+    )

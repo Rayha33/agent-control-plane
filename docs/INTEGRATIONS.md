@@ -95,6 +95,8 @@ request, extracts every Add/Delete/Update path and an optional Move to destinati
 then asks the same guard used at submission for each path. One denied path blocks the
 entire patch; unknown or malformed syntax, missing context, no paths, patches over
 2,000,000 characters, or more than 128 paths are denied.
+Patches carrying Codex's `*** Environment ID:` marker are also denied: ACP does not
+yet bind a Codex-selected environment identity to the attempt worktree.
 
 Install into the live attempt worktree, not the base checkout:
 
@@ -106,8 +108,9 @@ Install into the live attempt worktree, not the base checkout:
 
 The attempt form writes .codex/hooks.json inside the worktree, pins both the base
 checkout where .acp/control.db lives and the attempt id, merges existing hook entries,
-replaces an earlier ACP Codex entry idempotently, and adds this local config file to
-the shared Git exclude file so it does not enter the candidate diff. Tracked config,
+replaces an earlier ACP Codex entry only when its command prefix still matches, and
+adds this local config file to the shared Git exclude file so it does not enter the
+candidate diff. Tracked config,
 invalid JSON, invalid top-level hook structure, and symlinked config paths are rejected
 without replacing the existing config. The project-wide form is acp --repo PATH hooks
 install --codex-code; it relies on ACP_ATTEMPT_ID being set in the Codex process
