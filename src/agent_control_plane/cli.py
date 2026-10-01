@@ -45,7 +45,8 @@ Two deliberate absences. `list` reaps: `list_tasks()` calls `reap_expired()`, wh
 ARCHITECTURE.md 1b describes as the intended difference between it and `plan`/`queue`/
 `merge-plan`/`status` — so it is a mutating command that happens to print a listing.
 `doctor` is what an operator runs when the database needs upgrading, so it has to be
-able to open one in order to say so.
+able to open one in order to say so. `message list` is read-only even though the
+sibling `message send` action writes.
 """
 
 
@@ -649,10 +650,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = _run_trust_helper(args)
             emit(result)
             return 0
+        read_only = args.action in READ_ONLY_ACTIONS or (
+            args.action == "message" and args.message_action == "list"
+        )
         supervisor = GitSupervisor(
             args.repo,
             diagnostic=args.action == "doctor",
-            read_only=args.action in READ_ONLY_ACTIONS,
+            read_only=read_only,
         )
         if args.action == "doctor":
             result = supervisor.doctor()

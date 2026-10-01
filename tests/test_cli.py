@@ -436,3 +436,19 @@ def test_cli_message_send_uses_private_credential_file_and_lists_inbox(tmp_path:
     inbox = json.loads(listed.stdout)
     assert inbox["messages"] == [posted]
     assert inbox["messages"][0]["body"] == "serializer path is the next check"
+
+
+def test_cli_message_list_opens_supervisor_read_only(tmp_path: Path, monkeypatch) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "read-only inbox", "owned.txt")
+    attempt = GitSupervisor(repo).claim(task["id"], "inbox-reader")
+    original_supervisor = cli.GitSupervisor
+    read_only_modes: list[bool] = []
+
+    def recording_supervisor(*args, **kwargs):
+        read_only_modes.append(kwargs.get("read_only", False))
+        return original_supervisor(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "GitSupervisor", recording_supervisor)
+    assert cli.main(["--repo", str(repo), "message", "list", "--attempt", attempt["id"]]) == 0
+    assert read_only_modes == [True]

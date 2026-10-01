@@ -166,8 +166,9 @@ disappear when an attempt worktree is removed. Messages are append-only, hash-ch
 events; each is attributed to the sender's active attempt and current worker identity.
 
 Use the base checkout for both commands. The numeric claim token fences the attempt;
-the credential is read from a private 0600 file or an open descriptor, never from an
-argument or environment variable:
+prefer a private 0600 file or an open descriptor for the credential, never a command
+argument. For compatibility, the CLI also accepts `ACP_RUNNER_CREDENTIAL`; avoid that
+fallback in shared or inherited process environments:
 
 ```bash
 BASE=/path/to/repo
