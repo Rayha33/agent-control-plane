@@ -43,13 +43,30 @@ class RuntimeMixin:
 
     @staticmethod
     def _port_available(port: int) -> bool:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            probe.bind(("127.0.0.1", port))
-        except OSError:
-            return False
-        finally:
-            probe.close()
+        probes = [(socket.AF_INET, ("127.0.0.1", port))]
+        if socket.has_ipv6:
+            # Probe the wildcard so an IPv6 listener is detected even on a host
+            # where IPv6 is active but ::1 is not configured.
+            probes.append((socket.AF_INET6, ("::", port, 0, 0)))
+
+        unsupported_ipv6_errors = {
+            getattr(errno, "EAFNOSUPPORT", -1),
+            getattr(errno, "EPFNOSUPPORT", -1),
+            getattr(errno, "EPROTONOSUPPORT", -1),
+            getattr(errno, "EADDRNOTAVAIL", -1),
+        }
+        for family, address in probes:
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as probe:
+                    probe.bind(address)
+            except OSError as error:
+                # ``has_ipv6`` is a build-time capability flag. Some hosts disable
+                # IPv6 at runtime, so those hosts must still be able to allocate
+                # IPv4 ports. A real conflict (for example EADDRINUSE) is never
+                # ignored.
+                if family == socket.AF_INET6 and error.errno in unsupported_ipv6_errors:
+                    continue
+                return False
         return True
 
     def _allocate_runtime(
