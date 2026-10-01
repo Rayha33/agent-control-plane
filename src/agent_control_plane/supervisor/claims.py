@@ -380,7 +380,14 @@ class ClaimsMixin:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             return self._attempt_view(connection, row)
 
-    def guard(self, attempt_id: str, path: str, *, now: int | None = None) -> dict[str, Any]:
+    def guard(
+        self,
+        attempt_id: str,
+        path: str,
+        *,
+        caller_cwd: str | Path | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
         """Decide whether an agent holding `attempt_id` may write `path`.
 
         This is the check an editor's pre-write hook asks before letting a tool call
@@ -431,11 +438,45 @@ class ClaimsMixin:
             )
 
         worktree = Path(attempt["worktree"]).resolve()
+        if not isinstance(caller_cwd, (str, Path)) or not str(caller_cwd).strip():
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "caller_context_missing",
+                "the caller's working directory is required to authorize a write",
+                declared=declared,
+            )
+        try:
+            actual_cwd = Path(caller_cwd).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "invalid_caller_cwd",
+                "the caller's working directory must resolve to an existing directory",
+                declared=declared,
+            )
+        if not actual_cwd.is_dir():
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "invalid_caller_cwd",
+                "the caller's working directory must be a directory",
+                declared=declared,
+            )
+        if actual_cwd != worktree and worktree not in actual_cwd.parents:
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "caller_outside_worktree",
+                f"caller directory {actual_cwd} is outside the attempt worktree {worktree}",
+                declared=declared,
+            )
         # resolve() follows symlinks, so a link planted inside the worktree that points
         # outside it resolves outside and is refused here rather than at submit time.
         target = Path(path)
         if not target.is_absolute():
-            target = worktree / target
+            target = actual_cwd / target
         target = target.resolve()
         if target != worktree and worktree not in target.parents:
             return self._guard_denial(
@@ -462,6 +503,7 @@ class ClaimsMixin:
             "attempt_id": attempt_id,
             "path": str(target),
             "relative_path": relative,
+            "caller_cwd": str(actual_cwd),
             "worktree": str(worktree),
             "declared": declared,
         }

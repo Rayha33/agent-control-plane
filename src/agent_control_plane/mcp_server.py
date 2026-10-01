@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 from .git_supervisor import GitSupervisor, SupervisorError
@@ -105,8 +106,12 @@ TOOLS: dict[str, tuple[str, str, dict[str, Any]]] = {
         {
             "type": "object",
             "additionalProperties": False,
-            "required": ["attempt_id", "path"],
-            "properties": {"attempt_id": {"type": "string"}, "path": {"type": "string"}},
+            "required": ["attempt_id", "path", "caller_cwd"],
+            "properties": {
+                "attempt_id": {"type": "string"},
+                "path": {"type": "string"},
+                "caller_cwd": {"type": "string"},
+            },
         },
     ),
 }
@@ -133,6 +138,13 @@ def dispatch(supervisor: GitSupervisor, tool: str, arguments: dict[str, Any]) ->
     missing = [key for key in required if key not in arguments]
     if missing:
         raise SupervisorError("invalid_arguments", f"{tool} needs {', '.join(missing)}")
+    if tool == "acp_guard" and (
+        not isinstance(arguments["path"], str) or not Path(arguments["path"]).is_absolute()
+    ):
+        raise SupervisorError(
+            "invalid_arguments",
+            "acp_guard requires an absolute path; MCP caller_cwd is context, not attestation",
+        )
     allowed = set(schema.get("properties", {}))
     extra = set(arguments) - allowed
     if extra:

@@ -746,10 +746,10 @@ service.
   their commits are the published evidence for an approved task.
 - Agents should be launched through ACP or another gateway; direct writes to the
   base checkout happen outside ACP's enforcement boundary. `acp hooks install
-  --claude-code` closes most of that gap for Claude Code by putting `acp guard` in
-  front of every file-editing tool call — it refuses a write outside the attempt's
-  worktree or outside the task's declared write set, using the same check `submit`
-  applies to the diff. `Bash` is deliberately not guarded: what a shell command writes
+  --claude-code --attempt ATTEMPT_ID` installs personal local settings into the
+  attempt worktree and binds the hook to the base checkout's control database. The hook
+  refuses writes outside that worktree or outside the task's declared write set, using
+  the same check `submit` applies to the diff. `Bash` is deliberately not guarded: what a shell command writes
   cannot be read off the command string, and a pattern that can be walked around by
   rephrasing would read as coverage without being any. `acp mcp-serve` additionally
   exposes ten read-only tools over stdio MCP — no writes, no credential — so a session

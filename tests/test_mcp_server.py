@@ -26,7 +26,7 @@ import pytest
 from support import init_repo, make_task
 
 from agent_control_plane import mcp_server
-from agent_control_plane.git_supervisor import GitSupervisor
+from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
 
 WRITE_METHODS = {
     "claim",
@@ -176,6 +176,36 @@ def test_undeclared_arguments_are_refused(repo: Path) -> None:
 
     assert body(call(repo, "acp_status", {"limit": 1}))["error"] == "invalid_arguments"
     assert body(call(repo, "acp_show", {}))["error"] == "invalid_arguments"
+
+
+def test_guard_mcp_requires_caller_context_and_forwards_it(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(task["id"], "worker")
+    with pytest.raises(SupervisorError, match="needs caller_cwd"):
+        mcp_server.dispatch(
+            supervisor, "acp_guard", {"attempt_id": attempt["id"], "path": "alpha.txt"}
+        )
+    with pytest.raises(SupervisorError, match="requires an absolute path"):
+        mcp_server.dispatch(
+            supervisor,
+            "acp_guard",
+            {
+                "attempt_id": attempt["id"],
+                "path": "alpha.txt",
+                "caller_cwd": attempt["worktree"],
+            },
+        )
+    allowed = mcp_server.dispatch(
+        supervisor,
+        "acp_guard",
+        {
+            "attempt_id": attempt["id"],
+            "path": str(Path(attempt["worktree"]) / "alpha.txt"),
+            "caller_cwd": attempt["worktree"],
+        },
+    )
+    assert allowed["allow"] is True
 
 
 def test_a_malformed_line_does_not_kill_the_session(repo: Path) -> None:

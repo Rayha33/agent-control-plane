@@ -10,6 +10,10 @@ check `submit` applies to the diff — the adapter asks, the supervisor answers.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +30,7 @@ OS, not with a pattern match — see docs/INTEGRATIONS.md.
 
 HOOK_TOOL_MATCHER = "|".join(GUARDED_TOOLS)
 SETTINGS_RELATIVE_PATH = Path(".claude") / "settings.json"
+SETTINGS_LOCAL_RELATIVE_PATH = Path(".claude") / "settings.local.json"
 DENY_EXIT_CODE = 2
 """Claude Code blocks a PreToolUse hook's tool call on exit 2 and shows it stderr."""
 
@@ -49,6 +54,15 @@ def path_from_hook_payload(payload: Any) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def cwd_from_hook_payload(payload: Any) -> str | None:
+    """The editor's actual working directory, or None when the payload omits it."""
+
+    if not isinstance(payload, dict):
+        return None
+    cwd = payload.get("cwd")
+    return cwd if isinstance(cwd, str) and cwd.strip() else None
 
 
 def claude_code_hooks(command: str) -> dict[str, Any]:
@@ -102,18 +116,85 @@ def _is_acp_entry(entry: Any, command: str) -> bool:
     )
 
 
-def install_claude_code_hooks(root: Path, command: str = "acp") -> dict[str, Any]:
-    """Write ACP's hooks into `<root>/.claude/settings.json`, preserving the rest."""
+def _ensure_local_settings_ignored(root: Path) -> None:
+    """Keep attempt-local Claude settings out of the candidate diff."""
 
-    settings_path = root / SETTINGS_RELATIVE_PATH
+    relative_path = SETTINGS_LOCAL_RELATIVE_PATH.as_posix()
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", relative_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if tracked.returncode == 0:
+        raise ValueError(f"refusing to modify tracked local settings: {relative_path}")
+
+    common = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if common.returncode != 0 or not common.stdout.strip():
+        raise ValueError(f"cannot locate Git's shared exclude file from {root}")
+
+    exclude_path = Path(common.stdout.strip()) / "info" / "exclude"
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    patterns = (f"/{relative_path}", "/.claude/.settings.local.json.*.tmp")
+    current = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    current_lines = current.splitlines()
+    missing = [pattern for pattern in patterns if pattern not in current_lines]
+    if missing:
+        with exclude_path.open("a", encoding="utf-8") as exclude:
+            if current and not current.endswith("\n"):
+                exclude.write("\n")
+            exclude.write("".join(f"{pattern}\n" for pattern in missing))
+
+    for path in (relative_path, ".claude/.settings.local.json.check.tmp"):
+        ignored = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--no-index", "-q", "--", path],
+            capture_output=True,
+            check=False,
+        )
+        if ignored.returncode != 0:
+            raise ValueError(f"Git does not ignore local hook settings at {path}")
+
+
+def install_claude_code_hooks(
+    root: Path, command: str = "acp", *, local: bool = False
+) -> dict[str, Any]:
+    """Write ACP hooks into project or personal-local settings, preserving the rest."""
+
+    root = root.resolve()
+    settings_path = root / (SETTINGS_LOCAL_RELATIVE_PATH if local else SETTINGS_RELATIVE_PATH)
+    if local:
+        settings_parent = settings_path.parent
+        if settings_parent.is_symlink():
+            raise ValueError(
+                f"refusing to install through symlinked settings directory: {settings_parent}"
+            )
+        if settings_path.is_symlink():
+            raise ValueError(f"refusing to read symlinked local settings: {settings_path}")
+        try:
+            settings_parent.resolve(strict=False).relative_to(root)
+        except ValueError as error:
+            raise ValueError(
+                f"settings directory escapes the attempt worktree: {settings_parent}"
+            ) from error
     settings: dict[str, Any] = {}
+    previous_mode: int | None = None
     if settings_path.exists():
         try:
             loaded = json.loads(settings_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as error:
             raise ValueError(f"{settings_path} is not valid JSON: {error}") from error
-        if isinstance(loaded, dict):
-            settings = loaded
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{settings_path} must contain a JSON object; refusing to replace it")
+        settings = loaded
+        previous_mode = stat.S_IMODE(settings_path.stat().st_mode)
+
+    if local:
+        _ensure_local_settings_ignored(root)
 
     settings["hooks"] = _merge_hook_events(
         settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {},
@@ -121,10 +202,24 @@ def install_claude_code_hooks(root: Path, command: str = "acp") -> dict[str, Any
         command,
     )
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    temporary_path = settings_path.with_name(f".settings.local.json.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(
+            temporary_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(json.dumps(settings, indent=2) + "\n")
+        if previous_mode is not None:
+            temporary_path.chmod(previous_mode)
+        os.replace(temporary_path, settings_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return {
         "ok": True,
         "settings": str(settings_path),
+        "scope": "project-local" if local else "project",
         "guarded_tools": list(GUARDED_TOOLS),
         "unguarded": ["Bash"],
         "note": (
