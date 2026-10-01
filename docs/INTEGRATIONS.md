@@ -253,8 +253,13 @@ untracked path names. It reports the attempt's start SHA, the HEAD observed befo
 after the scan, and per-status path counts. Output is path metadata only: no file contents,
 line-level diff, credential, or claim token. Lists are capped at 1,000 paths per section;
 counts still cover all paths and `paths_truncated` identifies a capped list. Git reads the
-captured index in a disposable metadata directory whose only object source is the ACP
-repository's object store. It does not load repository/worktree/global/system Git config,
+captured index in disposable metadata and an isolated object directory containing copies of
+regular loose objects and paired pack/index files in the ACP repository's local object store.
+The preview does not copy or follow `objects/info/alternates` (including transitive
+alternates), and the temporary object database has no alternate path of its own; commits
+available only through an external alternate therefore fail closed. A snapshot with more than
+250,000 object-store directory entries or over 1 GiB of object data fails closed. It does not
+load repository/worktree/global/system Git config,
 configured filters, external excludes files, `.git/info/exclude`, or external attribute
 files. Consequently, a path excluded only through those settings can appear in the preview,
 and paths marked with a filter attribute may be conservatively reported as modified. This
@@ -271,6 +276,9 @@ or merge.
 The CLI and `acp_changes` MCP tool call the same supervisor method on a `mode=ro` database.
 Git is invoked with optional index writes disabled, external diff/textconv/pager and
 fsmonitor disabled, external attribute files ignored, and submodule traversal suppressed.
+The scratch repository is created under `/tmp` rather than honoring `TMPDIR`, `TMP`, or
+`TEMP`, so caller-controlled temporary-directory settings cannot write metadata into the
+attempt being inspected.
 Repository and worktree Git config are not loaded, so a concurrent filter/config update
 cannot introduce a clean/process/smudge command during inspection. The index is copied via
 no-follow reads into temporary metadata and checked again afterward; a changing HEAD,

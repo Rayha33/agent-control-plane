@@ -115,6 +115,21 @@ def test_preview_separates_committed_changes_from_working_tree_without_contents(
     assert "another secret payload" not in encoded
 
 
+def test_preview_reads_packed_objects_from_its_isolated_database(repo: Path) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    git(repo, "gc", "--prune=now")
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = repo / common
+    assert list((common / "objects" / "pack").glob("*.pack"))
+
+    preview = GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert preview["stable"] is True
+    assert preview["start_sha"] == attempt["start_sha"]
+    assert preview["committed"]["path_count"] == 0
+
+
 def test_preview_uses_nul_framing_and_caps_only_the_returned_path_list(repo: Path) -> None:
     supervisor, attempt = make_attempt(repo)
     worktree = Path(attempt["worktree"])
@@ -148,6 +163,7 @@ def test_preview_is_structurally_read_only_for_db_events_refs_index_and_worktree
         "state": state_fingerprint(observer),
         "events": event_count(observer),
         "event_chain": observer.verify_event_chain(),
+        "objects": _tree_snapshot(repo / ".git" / "objects"),
         "refs": git(worktree, "for-each-ref", "--format=%(refname) %(objectname)"),
         "index": _file_snapshot(index),
         "worktree": _tree_snapshot(worktree),
@@ -158,6 +174,7 @@ def test_preview_is_structurally_read_only_for_db_events_refs_index_and_worktree
     after = {
         "db": _db_snapshot(writable),
         "state_children": sorted(path.name for path in writable.state_dir.iterdir()),
+        "objects": _tree_snapshot(repo / ".git" / "objects"),
         "refs": git(worktree, "for-each-ref", "--format=%(refname) %(objectname)"),
         "index": _file_snapshot(index),
         "worktree": _tree_snapshot(worktree),
@@ -371,6 +388,71 @@ def test_preview_ignores_external_git_config_includes(repo: Path) -> None:
     assert not marker.exists()
     assert preview["git_config_isolated"] is True
     assert "alpha.txt" in {item["path"] for item in preview["working_tree"]["paths"]}
+
+
+@pytest.mark.parametrize("alternate_source", ["repository", "environment"])
+def test_preview_never_resolves_commits_from_external_object_alternates(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, alternate_source: str
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    external = repo.parent / f"external-objects-{alternate_source}-{attempt['id']}"
+    external.mkdir()
+    git(external, "init")
+    git(external, "config", "user.name", "External Repository")
+    git(external, "config", "user.email", "external@example.invalid")
+    secret_file = external / "outside-private-project" / "external-only.txt"
+    secret_file.parent.mkdir()
+    secret_file.write_text("external object payload\n", encoding="utf-8")
+    git(external, "add", ".")
+    git(external, "commit", "-m", "external-only object")
+    external_head = git(external, "rev-parse", "HEAD")
+    external_objects = external / ".git" / "objects"
+
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = repo / common
+    admin = common / "worktrees" / attempt["id"]
+    if alternate_source == "repository":
+        info = common / "objects" / "info"
+        info.mkdir(exist_ok=True)
+        (info / "alternates").write_text(f"{external_objects}\n", encoding="utf-8")
+    else:
+        monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(external_objects))
+        original_env_builder = GitSupervisor._supervisor_git_env
+
+        def add_external_alternate(self: GitSupervisor) -> dict[str, str]:
+            environment = original_env_builder(self)
+            environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(external_objects)
+            return environment
+
+        monkeypatch.setattr(GitSupervisor, "_supervisor_git_env", add_external_alternate)
+    (admin / "HEAD").write_text(f"{external_head}\n", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="Git could not read attempt metadata") as error:
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert "outside-private-project" not in str(error.value)
+    assert "external-only.txt" not in str(error.value)
+
+
+def test_preview_ignores_temporary_directory_environment_inside_attempt(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    before = _tree_snapshot(worktree)
+    for variable in ("TMPDIR", "TMP", "TEMP"):
+        monkeypatch.setenv(variable, str(worktree))
+
+    preview = GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert preview["stable"] is True
+    assert _tree_snapshot(worktree) == before
+    assert all(
+        not item["path"].startswith("acp-change-preview-")
+        for section in (preview["committed"], preview["working_tree"])
+        for item in section["paths"]
+    )
 
 
 def test_preview_marks_racing_worktree_unstable(

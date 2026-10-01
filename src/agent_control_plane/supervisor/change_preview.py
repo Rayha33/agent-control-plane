@@ -26,7 +26,11 @@ _MAX_INDEX_FILE_BYTES = 64 * 1024 * 1024
 _MAX_INDEX_TOTAL_BYTES = 128 * 1024 * 1024
 _MAX_INDEX_FILES = 128
 _MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024
+_MAX_OBJECT_FILES = 250_000
+_MAX_OBJECT_SNAPSHOT_BYTES = 1024 * 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 30
+_LOOSE_OBJECT_NAME = re.compile(r"(?:[0-9a-f]{38}|[0-9a-f]{62})\Z")
+_PACK_INDEX_NAME = re.compile(r"pack-([0-9a-f]{40}|[0-9a-f]{64})\.(?:pack|idx)\Z")
 _EXEC_GIT_FROM_DIR_FD = (
     "import os,sys; fd=int(sys.argv[1]); executable=sys.argv[2]; "
     "os.fchdir(fd); os.execve(executable, [executable, *sys.argv[3:]], os.environ)"
@@ -231,21 +235,7 @@ class ChangePreviewMixin:
     def _git_environment(self) -> dict[str, str]:
         environment = self._supervisor_git_env()
         for key in tuple(environment):
-            if key.startswith("GIT_CONFIG_") or key in {
-                "GIT_CONFIG",
-                "GIT_TRACE",
-                "GIT_TRACE_SETUP",
-                "GIT_TRACE_PACKET",
-                "GIT_TRACE_PERFORMANCE",
-                "GIT_TRACE_PACK_ACCESS",
-                "GIT_TRACE_PACKFILE",
-                "GIT_TRACE_REFS",
-                "GIT_TRACE_CURL",
-                "GIT_TRACE_CURL_NO_DATA",
-                "GIT_TRACE2",
-                "GIT_TRACE2_EVENT",
-                "GIT_TRACE2_PERF",
-            }:
+            if key.startswith("GIT_"):
                 environment.pop(key, None)
         environment.update(
             {
@@ -613,23 +603,206 @@ class ChangePreviewMixin:
     def _attempt_index_digest(self, attempt_id: str, common: Path) -> str:
         return self._index_snapshot(attempt_id, common)
 
+    @classmethod
+    def _copy_object_file(
+        cls,
+        source_fd: int,
+        destination_fd: int,
+        name: str,
+        copied_bytes: list[int],
+    ) -> bool:
+        """Copy one bounded object file without following a replaced path."""
+
+        try:
+            source_file_fd = os.open(
+                name,
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=source_fd,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # An unreadable or unsafe object is omitted. Git will fail closed if it
+            # is needed to resolve the selected commits.
+            return False
+        try:
+            before = os.fstat(source_file_fd)
+            if not stat.S_ISREG(before.st_mode):
+                return False
+            if before.st_size > _MAX_OBJECT_SNAPSHOT_BYTES - copied_bytes[0]:
+                raise OSError("Git object snapshot exceeds the safe byte limit")
+            destination_file_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                copied = 0
+                while True:
+                    chunk = os.read(source_file_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied_bytes[0] + copied > _MAX_OBJECT_SNAPSHOT_BYTES:
+                        raise OSError("Git object snapshot exceeds the safe byte limit")
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_file_fd, view)
+                        view = view[written:]
+                copied_metadata = os.fstat(destination_file_fd)
+                after = os.fstat(source_file_fd)
+                if (
+                    copied != before.st_size
+                    or not stat.S_ISREG(copied_metadata.st_mode)
+                    or copied_metadata.st_size != copied
+                    or cls._git_file_signature(before) != cls._git_file_signature(after)
+                ):
+                    raise OSError("Git object changed while taking a safe snapshot")
+                copied_bytes[0] += copied
+                return True
+            except Exception:
+                try:
+                    os.unlink(name, dir_fd=destination_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            finally:
+                os.close(destination_file_fd)
+        finally:
+            os.close(source_file_fd)
+
+    @classmethod
+    def _snapshot_object_database(
+        cls, common: Path, destination: Path, object_id_length: int
+    ) -> None:
+        """Copy the local loose/packed object namespace without Git alternates.
+
+        The temporary object database contains bounded copies of regular files
+        found directly under the repository's pack directory and loose-object
+        fanout directories. In particular, it does not copy or read objects/info,
+        where Git can configure recursive external alternates.
+        """
+
+        if object_id_length not in {40, 64}:
+            raise OSError("unsupported Git object format")
+        objects_fd = cls._open_git_directory(common, "objects")
+        pack_fd: int | None = None
+        destination_pack_fd: int | None = None
+        file_count = 0
+        scanned_entries = 0
+        copied_bytes = [0]
+        try:
+            destination_pack_fd = os.open(
+                destination / "pack", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                pack_fd = os.open(
+                    "pack",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=objects_fd,
+                )
+            except FileNotFoundError:
+                pack_fd = None
+            if pack_fd is not None:
+                pack_names = os.listdir(pack_fd)
+                if len(pack_names) > _MAX_OBJECT_FILES:
+                    raise OSError("Git object database exceeds the safe snapshot limit")
+                scanned_entries += len(pack_names)
+                paired: set[str] = set()
+                for name in pack_names:
+                    match = _PACK_INDEX_NAME.fullmatch(name)
+                    if match is not None:
+                        paired.add(match.group(1))
+                for pack_hash in sorted(paired):
+                    if len(pack_hash) != object_id_length:
+                        continue
+                    pack_name = f"pack-{pack_hash}.pack"
+                    index_name = f"pack-{pack_hash}.idx"
+                    if pack_name not in pack_names or index_name not in pack_names:
+                        continue
+                    if not cls._copy_object_file(
+                        pack_fd, destination_pack_fd, pack_name, copied_bytes
+                    ):
+                        continue
+                    if not cls._copy_object_file(
+                        pack_fd, destination_pack_fd, index_name, copied_bytes
+                    ):
+                        os.unlink(pack_name, dir_fd=destination_pack_fd)
+                        continue
+                    file_count += 2
+                    if file_count > _MAX_OBJECT_FILES:
+                        raise OSError("Git object database exceeds the safe snapshot limit")
+
+            for prefix_value in range(256):
+                prefix = f"{prefix_value:02x}"
+                try:
+                    shard_fd = os.open(
+                        prefix,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=objects_fd,
+                    )
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                try:
+                    shard_names = os.listdir(shard_fd)
+                    scanned_entries += len(shard_names)
+                    if scanned_entries > _MAX_OBJECT_FILES:
+                        raise OSError("Git object database exceeds the safe snapshot limit")
+                    candidates = [
+                        name
+                        for name in shard_names
+                        if len(name) == object_id_length - 2 and _LOOSE_OBJECT_NAME.fullmatch(name)
+                    ]
+                    if not candidates:
+                        continue
+                    destination_shard = destination / prefix
+                    destination_shard.mkdir(mode=0o700)
+                    shard_destination_fd = os.open(
+                        destination_shard,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    )
+                    try:
+                        for name in candidates:
+                            if not cls._copy_object_file(
+                                shard_fd, shard_destination_fd, name, copied_bytes
+                            ):
+                                continue
+                            file_count += 1
+                            if file_count > _MAX_OBJECT_FILES:
+                                raise OSError("Git object database exceeds the safe snapshot limit")
+                    finally:
+                        os.close(shard_destination_fd)
+                finally:
+                    os.close(shard_fd)
+        finally:
+            if destination_pack_fd is not None:
+                os.close(destination_pack_fd)
+            if pack_fd is not None:
+                os.close(pack_fd)
+            os.close(objects_fd)
+
     @contextmanager
     def _isolated_git_metadata(
         self, attempt_id: str, common: Path, head: str
     ) -> Iterator[tuple[Path, str]]:
-        """Create disposable Git metadata with no attempt/repository config or excludes."""
+        """Create disposable Git metadata with no inherited paths or config."""
 
         try:
             objects = common / "objects"
             objects_stat = objects.lstat()
             if not stat.S_ISDIR(objects_stat.st_mode) or stat.S_ISLNK(objects_stat.st_mode):
                 raise OSError("repository object store is unsafe")
-            object_path = os.fsencode(objects)
-            if b"\n" in object_path or b"\r" in object_path:
-                raise OSError("repository object path cannot be represented safely")
-            with tempfile.TemporaryDirectory(prefix="acp-change-preview-") as scratch:
+            # Do not honor TMPDIR/TMP/TEMP: a caller could otherwise place the
+            # temporary repository inside the live attempt worktree being scanned.
+            with tempfile.TemporaryDirectory(prefix="acp-change-preview-", dir="/tmp") as scratch:
                 git_directory = Path(scratch) / "git"
-                (git_directory / "objects" / "info").mkdir(parents=True, mode=0o700)
+                object_directory = git_directory / "objects"
+                (object_directory / "info").mkdir(parents=True, mode=0o700)
+                (object_directory / "pack").mkdir(mode=0o700)
                 (git_directory / "refs" / "heads").mkdir(parents=True, mode=0o700)
                 (git_directory / "refs" / "tags").mkdir(parents=True, mode=0o700)
                 object_format = "sha256" if len(head) == 64 else "sha1"
@@ -644,7 +817,7 @@ class ChangePreviewMixin:
                     config += f"[extensions]\n\tobjectformat = {object_format}\n"
                 (git_directory / "config").write_text(config, encoding="ascii")
                 (git_directory / "HEAD").write_text(f"{head}\n", encoding="ascii")
-                (git_directory / "objects" / "info" / "alternates").write_bytes(object_path + b"\n")
+                self._snapshot_object_database(common, object_directory, len(head))
                 index_digest = self._index_snapshot(attempt_id, common, git_directory)
                 yield git_directory, index_digest
         except SupervisorError:
