@@ -40,6 +40,7 @@ _ISOLATED_GIT_GUARD_EXIT = 125
 _LOOSE_OBJECT_NAME = re.compile(r"(?:[0-9a-f]{38}|[0-9a-f]{62})\Z")
 _PACK_INDEX_NAME = re.compile(r"pack-([0-9a-f]{40}|[0-9a-f]{64})\.(?:pack|idx)\Z")
 _EXEC_GIT_FROM_DIR_FD = """
+import errno
 import hashlib
 import os
 import resource
@@ -107,9 +108,30 @@ try:
         fail_closed()
     if os.getuid() == 0 or os.geteuid() == 0:
         fail_closed()
-    _soft_process_limit, hard_process_limit = resource.getrlimit(resource.RLIMIT_NPROC)
-    resource.setrlimit(resource.RLIMIT_NPROC, (0, hard_process_limit))
-    if resource.getrlimit(resource.RLIMIT_NPROC)[0] != 0:
+    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+    if resource.getrlimit(resource.RLIMIT_NPROC) != (0, 0):
+        fail_closed()
+    if sys.platform.startswith("linux"):
+        with open("/proc/self/status", "r", encoding="ascii") as status_file:
+            capability_line = next(
+                (line for line in status_file if line.startswith("CapEff:")), ""
+            )
+        if not capability_line:
+            fail_closed()
+        effective_capabilities = int(capability_line.split()[1], 16)
+        if effective_capabilities & ((1 << 21) | (1 << 24)):
+            fail_closed()
+    try:
+        process_probe = os.fork()
+    except OSError as error:
+        if error.errno != errno.EAGAIN:
+            fail_closed()
+    else:
+        if process_probe == 0:
+            os._exit(0)
+        _, probe_status = os.waitpid(process_probe, 0)
+        if not os.WIFEXITED(probe_status) or os.WEXITSTATUS(probe_status) != 0:
+            fail_closed()
         fail_closed()
     os.fchdir(worktree_fd)
     os.execve(executable, [executable, *sys.argv[8:]], os.environ)

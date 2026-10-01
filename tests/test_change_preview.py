@@ -710,6 +710,8 @@ def test_preview_blocks_filter_spawn_after_final_scratch_check(
     if "status" in sys.argv[8:]:
         with open({str(race_marker)!r}, "w", encoding="utf-8") as marker_file:
             marker_file.write("injected")
+        _soft_process_limit, hard_process_limit = resource.getrlimit(resource.RLIMIT_NPROC)
+        resource.setrlimit(resource.RLIMIT_NPROC, (hard_process_limit, hard_process_limit))
         with open(os.path.join(scratch_path, "git", "config"), "ab") as config_file:
             config_file.write({injected_filter_config!r})
         with open(os.path.join(scratch_path, "git", "info", "attributes"), "wb") as attributes_file:
@@ -728,6 +730,33 @@ def test_preview_blocks_filter_spawn_after_final_scratch_check(
 
     assert race_marker.read_text(encoding="utf-8") == "injected"
     assert not marker.exists(), "post-check filter escaped the child-process ceiling"
+
+
+def test_preview_fails_closed_when_linux_capability_bypasses_process_limit(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    original_launcher = change_preview_module._EXEC_GIT_FROM_DIR_FD
+    synthetic_linux_capability = 1 << 21  # CAP_SYS_ADMIN
+    capability_setup = f"""\
+import io
+sys.platform = "linux"
+_trusted_open = open
+def open(path, *args, **kwargs):
+    if path == "/proc/self/status":
+        return io.StringIO("CapEff:\\t{synthetic_linux_capability:016x}\\n")
+    return _trusted_open(path, *args, **kwargs)
+"""
+    try_line = "try:\n    worktree_fd = int(sys.argv[1])"
+    assert original_launcher.count(try_line) == 1
+    monkeypatch.setattr(
+        change_preview_module,
+        "_EXEC_GIT_FROM_DIR_FD",
+        original_launcher.replace(try_line, capability_setup + try_line, 1),
+    )
+
+    with pytest.raises(SupervisorError, match="isolated Git metadata changed or became unsafe"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
 
 
 def test_preview_fails_closed_if_scratch_object_is_injected_during_git(

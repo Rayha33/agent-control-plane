@@ -294,11 +294,13 @@ identity/signature, and empty alternates/ref directories are fingerprinted aroun
 Git invocation. Immediately before exec, the pinned-worktree launcher rechecks the scratch
 parent and Git-directory identities, config digest, and filter guard. Those checks are not
 atomic with Git opening its metadata paths, so the isolated child also receives a verified
-zero process-creation limit before Git runs. If the platform cannot enforce that limit or
-the process runs as root, the launcher fails closed. A hostile same-UID process can still
-cause denial of service by racing scratch files, but Git cannot start a clean filter or
-other helper from that race, and the post-invocation metadata fingerprints reject observed
-changes. This is not isolation from arbitrary code already running as the same OS user.
+zero soft and hard process-creation limits before Git runs. If the platform cannot enforce
+those limits, the process runs as root, or it has Linux `CAP_SYS_ADMIN`/`CAP_SYS_RESOURCE`,
+the launcher fails closed; it also probes that a fork is actually denied. A hostile same-UID
+process can still cause denial of service by racing scratch files, but Git cannot start a
+clean filter or other helper from that race, and the post-invocation metadata fingerprints
+reject observed changes. This is not isolation from arbitrary code already running as the
+same OS user.
 The copied object store is checked against its copy-time file inventory; file bytes are
 compared while copying, the trusted empty-tree attribute source is added to that inventory,
 and the complete object-file signature inventory is rechecked before returning. Observed
