@@ -314,8 +314,11 @@ def test_declared_display_preserves_filesystem_matching_policy(
         assert updated.rowcount == 1
     assert created["resources"] == ["changelog.md"]  # folded lease identity stays unchanged
     assert supervisor.guard_context(attempt["id"])["declared"] == ["CHANGELOG.md"]
-    assert supervisor.guard(attempt["id"], "CHANGELOG.md")["allow"] is True
-    lower = supervisor.guard(attempt["id"], "changelog.md")
+    assert (
+        supervisor.guard(attempt["id"], "CHANGELOG.md", caller_cwd=attempt["worktree"])["allow"]
+        is True
+    )
+    lower = supervisor.guard(attempt["id"], "changelog.md", caller_cwd=attempt["worktree"])
     assert lower["allow"] is allow_lower
     if not allow_lower:
         assert lower["reason"] == "undeclared_write"

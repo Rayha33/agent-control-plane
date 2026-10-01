@@ -161,8 +161,8 @@ def test_guard_denies_the_other_case_on_a_case_sensitive_filesystem(declared_mak
     supervisor, _created, attempt = declared_makefile
     record_case_sensitivity(supervisor, True)
 
-    allowed = supervisor.guard(attempt["id"], "Makefile")
-    denied = supervisor.guard(attempt["id"], "makefile")
+    allowed = supervisor.guard(attempt["id"], "Makefile", caller_cwd=attempt["worktree"])
+    denied = supervisor.guard(attempt["id"], "makefile", caller_cwd=attempt["worktree"])
 
     assert allowed["allow"] is True
     assert denied["allow"] is False
@@ -181,8 +181,12 @@ def test_guard_still_allows_the_other_case_on_a_case_insensitive_filesystem(
     supervisor, _created, attempt = declared_makefile
     record_case_sensitivity(supervisor, False)
 
-    assert supervisor.guard(attempt["id"], "Makefile")["allow"] is True
-    assert supervisor.guard(attempt["id"], "makefile")["allow"] is True
+    assert (
+        supervisor.guard(attempt["id"], "Makefile", caller_cwd=attempt["worktree"])["allow"] is True
+    )
+    assert (
+        supervisor.guard(attempt["id"], "makefile", caller_cwd=attempt["worktree"])["allow"] is True
+    )
 
 
 def test_a_task_predating_the_declared_map_keeps_case_insensitive_matching(
@@ -202,7 +206,9 @@ def test_a_task_predating_the_declared_map_keeps_case_insensitive_matching(
         )
     record_case_sensitivity(supervisor, True)
 
-    assert supervisor.guard(attempt["id"], "makefile")["allow"] is True
+    assert (
+        supervisor.guard(attempt["id"], "makefile", caller_cwd=attempt["worktree"])["allow"] is True
+    )
 
 
 def test_a_declared_map_that_does_not_fold_to_its_key_is_not_trusted(
@@ -223,9 +229,11 @@ def test_a_declared_map_that_does_not_fold_to_its_key_is_not_trusted(
         )
     record_case_sensitivity(supervisor, True)
 
-    decision = supervisor.guard(attempt["id"], "Cargo.toml")
+    decision = supervisor.guard(attempt["id"], "Cargo.toml", caller_cwd=attempt["worktree"])
     assert decision["allow"] is False
-    assert supervisor.guard(attempt["id"], "makefile")["allow"] is True
+    assert (
+        supervisor.guard(attempt["id"], "makefile", caller_cwd=attempt["worktree"])["allow"] is True
+    )
 
 
 # ------------------------------------------------------ THE GATE: submit, both ways
@@ -287,7 +295,9 @@ def test_the_guard_denial_names_the_path_that_exists(declared_makefile) -> None:
     supervisor, _created, attempt = declared_makefile
     record_case_sensitivity(supervisor, True)
 
-    assert supervisor.guard(attempt["id"], "makefile")["declared"] == ["Makefile"]
+    assert supervisor.guard(attempt["id"], "makefile", caller_cwd=attempt["worktree"])[
+        "declared"
+    ] == ["Makefile"]
 
 
 # ------------------------------------------------------------------ lease identity

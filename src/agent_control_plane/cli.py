@@ -11,7 +11,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .editor_hooks import DENY_EXIT_CODE, install_claude_code_hooks, path_from_hook_payload
+from .editor_hooks import (
+    DENY_EXIT_CODE,
+    cwd_from_hook_payload,
+    install_claude_code_hooks,
+    path_from_hook_payload,
+)
 from .git_supervisor import GitSupervisor, SupervisorError
 from .runtime_drivers import DriverError, resolve_trusted_executable
 from .status import DEFAULT_LEASE_RISK_SECONDS
@@ -59,12 +64,11 @@ def parse_duration(text: str) -> int:
     return int(value[:-1]) * DURATION_UNITS[value[-1]]
 
 
-def _hook_target(raw: str) -> str | None:
+def _hook_payload(raw: str) -> Any:
     try:
-        payload = json.loads(raw)
+        return json.loads(raw)
     except json.JSONDecodeError:
         return None
-    return path_from_hook_payload(payload)
 
 
 def _deny(decision: dict[str, Any]) -> int:
@@ -579,9 +583,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 emit(supervisor.guard_context(attempt_id))
                 return 0
             target = args.path
+            caller_cwd = os.getcwd()
             if args.hook:
-                target = _hook_target(sys.stdin.read())
-                if target is None:
+                payload = _hook_payload(sys.stdin.read())
+                target = path_from_hook_payload(payload)
+                caller_cwd = cwd_from_hook_payload(payload)
+                if target is None or caller_cwd is None:
                     # Fail closed. Unable to read the request means unable to tell
                     # whether it is in scope, and a guard that allows what it cannot
                     # parse stops being a boundary the moment the payload changes.
@@ -590,12 +597,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "ok": True,
                             "allow": False,
                             "reason": "unreadable_hook_payload",
-                            "detail": "no writable path found in the PreToolUse payload",
+                            "detail": "the PreToolUse payload must include a writable path and caller cwd",
                         }
                     )
             if not target:
                 raise SupervisorError("missing_path", "pass --path or use --hook")
-            decision = supervisor.guard(attempt_id, target)
+            decision = supervisor.guard(attempt_id, target, caller_cwd=caller_cwd)
             if not decision["allow"]:
                 return _deny(decision)
             emit(decision)

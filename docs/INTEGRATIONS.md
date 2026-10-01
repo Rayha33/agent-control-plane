@@ -24,6 +24,15 @@ An agent told *"beta.txt is not in the task's declared write set; declared: alph
 corrects itself in one turn. Guard is read-only — a pre-write check must never itself
 become a reason the state changed.
 
+The `--hook` payload must include the editor's `cwd` as well as the target path. Missing,
+malformed, nonexistent, or out-of-attempt working directories deny before the editor
+call. Relative paths are resolved against that caller cwd; nested directories inside the
+attempt worktree are allowed. The direct `--path` form uses the CLI process's actual
+working directory. MCP `acp_guard` callers must provide `caller_cwd` for the same check
+and an absolute target path. MCP's `caller_cwd` is caller-supplied context, not an
+attestation of the client process's directory; clients must write the exact absolute
+path ACP approved, never reinterpret it relative to another cwd.
+
 Denials, in the order they are checked:
 
 | reason | meaning |

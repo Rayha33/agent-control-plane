@@ -51,6 +51,15 @@ def path_from_hook_payload(payload: Any) -> str | None:
     return None
 
 
+def cwd_from_hook_payload(payload: Any) -> str | None:
+    """The editor's actual working directory, or None when the payload omits it."""
+
+    if not isinstance(payload, dict):
+        return None
+    cwd = payload.get("cwd")
+    return cwd if isinstance(cwd, str) and cwd.strip() else None
+
+
 def claude_code_hooks(command: str) -> dict[str, Any]:
     """The hook block ACP owns, keyed so an update can replace it in place."""
 

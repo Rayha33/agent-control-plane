@@ -44,8 +44,8 @@ def test_a_declared_path_is_allowed(claimed) -> None:
     supervisor, attempt = claimed
     worktree = Path(attempt["worktree"])
 
-    absolute = supervisor.guard(attempt["id"], str(worktree / "alpha.txt"))
-    relative = supervisor.guard(attempt["id"], "alpha.txt")
+    absolute = supervisor.guard(attempt["id"], str(worktree / "alpha.txt"), caller_cwd=worktree)
+    relative = supervisor.guard(attempt["id"], "alpha.txt", caller_cwd=worktree)
 
     assert absolute["allow"] is True
     assert relative["allow"] is True
@@ -54,7 +54,9 @@ def test_a_declared_path_is_allowed(claimed) -> None:
 
 def test_an_undeclared_path_in_the_worktree_is_denied(claimed) -> None:
     supervisor, attempt = claimed
-    decision = supervisor.guard(attempt["id"], str(Path(attempt["worktree"]) / "beta.txt"))
+    decision = supervisor.guard(
+        attempt["id"], str(Path(attempt["worktree"]) / "beta.txt"), caller_cwd=attempt["worktree"]
+    )
 
     assert decision["allow"] is False
     assert decision["reason"] == "undeclared_write"
@@ -70,7 +72,9 @@ def test_the_base_checkout_is_denied_even_for_a_declared_file(claimed, repo: Pat
     fence without ACP noticing.
     """
 
-    decision = claimed[0].guard(claimed[1]["id"], str(repo / "alpha.txt"))
+    decision = claimed[0].guard(
+        claimed[1]["id"], str(repo / "alpha.txt"), caller_cwd=claimed[1]["worktree"]
+    )
 
     assert decision["allow"] is False
     assert decision["reason"] == "outside_worktree"
@@ -78,7 +82,7 @@ def test_the_base_checkout_is_denied_even_for_a_declared_file(claimed, repo: Pat
 
 @pytest.mark.parametrize("escape", ["../../../etc/passwd", "/etc/passwd"])
 def test_paths_outside_the_worktree_are_denied(claimed, escape: str) -> None:
-    decision = claimed[0].guard(claimed[1]["id"], escape)
+    decision = claimed[0].guard(claimed[1]["id"], escape, caller_cwd=claimed[1]["worktree"])
     assert decision["allow"] is False
     assert decision["reason"] == "outside_worktree"
 
@@ -91,7 +95,7 @@ def test_a_symlink_out_of_the_worktree_is_denied(claimed) -> None:
     link.unlink()
     link.symlink_to("/etc/passwd")
 
-    decision = supervisor.guard(attempt["id"], str(link))
+    decision = supervisor.guard(attempt["id"], str(link), caller_cwd=attempt["worktree"])
 
     assert decision["allow"] is False
     assert decision["reason"] == "outside_worktree"
@@ -102,8 +106,16 @@ def test_a_glob_write_set_is_matched_the_same_way_submit_matches_it(repo: Path) 
     created = make_task(supervisor, "src/**")
     attempt = supervisor.claim(created["id"], "worker")
 
-    assert supervisor.guard(attempt["id"], "src/deep/module.py")["allow"] is True
-    assert supervisor.guard(attempt["id"], "alpha.txt")["allow"] is False
+    assert (
+        supervisor.guard(attempt["id"], "src/deep/module.py", caller_cwd=attempt["worktree"])[
+            "allow"
+        ]
+        is True
+    )
+    assert (
+        supervisor.guard(attempt["id"], "alpha.txt", caller_cwd=attempt["worktree"])["allow"]
+        is False
+    )
 
 
 def test_guard_and_submit_agree(claimed) -> None:
@@ -115,7 +127,10 @@ def test_guard_and_submit_agree(claimed) -> None:
 
     supervisor, attempt = claimed
     worktree = Path(attempt["worktree"])
-    assert supervisor.guard(attempt["id"], str(worktree / "beta.txt"))["allow"] is False
+    assert (
+        supervisor.guard(attempt["id"], str(worktree / "beta.txt"), caller_cwd=worktree)["allow"]
+        is False
+    )
 
     (worktree / "beta.txt").write_text("undeclared\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True, capture_output=True)
@@ -136,7 +151,7 @@ def test_a_stale_lease_is_denied(claimed) -> None:
             "UPDATE attempts SET lease_expires_at = 0 WHERE id = ?", (attempt["id"],)
         )
 
-    decision = supervisor.guard(attempt["id"], "alpha.txt")
+    decision = supervisor.guard(attempt["id"], "alpha.txt", caller_cwd=attempt["worktree"])
 
     assert decision["allow"] is False
     assert decision["reason"] == "lease_expired"
@@ -147,14 +162,14 @@ def test_an_attempt_that_is_not_live_is_denied(claimed) -> None:
     with supervisor.connect() as connection:
         connection.execute("UPDATE attempts SET status = 'orphaned' WHERE id = ?", (attempt["id"],))
 
-    decision = supervisor.guard(attempt["id"], "alpha.txt")
+    decision = supervisor.guard(attempt["id"], "alpha.txt", caller_cwd=attempt["worktree"])
 
     assert decision["allow"] is False
     assert decision["reason"] == "attempt_not_live"
 
 
 def test_an_unknown_attempt_is_denied(repo: Path) -> None:
-    decision = GitSupervisor(repo).guard("no-such-attempt", "alpha.txt")
+    decision = GitSupervisor(repo).guard("no-such-attempt", "alpha.txt", caller_cwd=repo)
     assert decision["allow"] is False
     assert decision["reason"] == "attempt_not_found"
 
@@ -163,7 +178,10 @@ def test_guard_runs_on_a_read_only_supervisor(claimed, repo: Path) -> None:
     """A pre-write check must never itself be a reason the state changed."""
 
     viewer = GitSupervisor(repo, read_only=True)
-    assert viewer.guard(claimed[1]["id"], "alpha.txt")["allow"] is True
+    assert (
+        viewer.guard(claimed[1]["id"], "alpha.txt", caller_cwd=claimed[1]["worktree"])["allow"]
+        is True
+    )
 
 
 def test_guard_context_reports_the_boundary(claimed) -> None:
@@ -185,10 +203,18 @@ def test_hook_mode_exit_codes(claimed, repo: Path, monkeypatch) -> None:
     worktree = Path(attempt["worktree"])
 
     allowed = json.dumps(
-        {"tool_name": "Edit", "tool_input": {"file_path": str(worktree / "alpha.txt")}}
+        {
+            "cwd": str(worktree),
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(worktree / "alpha.txt")},
+        }
     )
     denied = json.dumps(
-        {"tool_name": "Edit", "tool_input": {"file_path": str(worktree / "beta.txt")}}
+        {
+            "cwd": str(worktree),
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(worktree / "beta.txt")},
+        }
     )
 
     assert run_hook(repo, attempt["id"], allowed, monkeypatch) == 0
@@ -207,6 +233,33 @@ def test_path_from_hook_payload_reads_the_editing_tools() -> None:
     assert path_from_hook_payload({"tool_input": {"notebook_path": "n.ipynb"}}) == "n.ipynb"
     assert path_from_hook_payload({"tool_input": {"command": "rm -rf /"}}) is None
     assert path_from_hook_payload("nonsense") is None
+
+
+def test_guard_requires_caller_context_and_resolves_relative_paths_from_it(claimed) -> None:
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    nested = worktree / "nested"
+    nested.mkdir()
+    assert supervisor.guard(attempt["id"], "alpha.txt")["reason"] == "caller_context_missing"
+    assert supervisor.guard(attempt["id"], "../alpha.txt", caller_cwd=nested)["allow"] is True
+
+
+def test_guard_denies_caller_in_base_or_sibling_worktree(
+    claimed, repo: Path, tmp_path: Path
+) -> None:
+    supervisor, attempt = claimed
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    for cwd in (repo, sibling):
+        decision = supervisor.guard(attempt["id"], "alpha.txt", caller_cwd=cwd)
+        assert decision["allow"] is False
+        assert decision["reason"] == "caller_outside_worktree"
+
+
+def test_hook_payload_requires_cwd(claimed, repo: Path, monkeypatch) -> None:
+    _, attempt = claimed
+    payload = json.dumps({"tool_name": "Edit", "tool_input": {"file_path": "alpha.txt"}})
+    assert run_hook(repo, attempt["id"], payload, monkeypatch) == DENY_EXIT_CODE
 
 
 def test_bash_is_not_claimed_to_be_guarded() -> None:
