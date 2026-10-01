@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import signal
@@ -184,6 +185,68 @@ def free_port_range(count: int) -> tuple[int, int]:
 
 def two_free_ports() -> tuple[int, int]:
     return free_port_range(2)
+
+
+def test_runtime_port_availability_rejects_ipv4_listener() -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        assert not GitSupervisor._port_available(port)
+    finally:
+        listener.close()
+
+
+@pytest.mark.skipif(not socket.has_ipv6, reason="Python was built without IPv6 support")
+def test_runtime_port_availability_rejects_ipv6_only_listener() -> None:
+    listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        listener.bind(("::", 0))
+        listener.listen(1)
+    except OSError as error:
+        listener.close()
+        pytest.skip(f"IPv6 wildcard binding is unavailable: {error}")
+
+    port = listener.getsockname()[1]
+    ipv4_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Prove this is the IPv6-only case the previous implementation missed.
+        ipv4_probe.bind(("127.0.0.1", port))
+    except OSError as error:
+        listener.close()
+        ipv4_probe.close()
+        pytest.skip(f"IPv4 and IPv6 cannot use this port independently: {error}")
+    finally:
+        ipv4_probe.close()
+
+    try:
+        assert not GitSupervisor._port_available(port)
+    finally:
+        listener.close()
+
+
+def test_runtime_port_availability_handles_ipv6_unsupported(monkeypatch) -> None:
+    monkeypatch.setattr(socket, "has_ipv6", False)
+    port, _ = free_port_range(1)
+
+    assert GitSupervisor._port_available(port)
+
+
+def test_runtime_port_availability_handles_ipv6_runtime_disabled(monkeypatch) -> None:
+    port, _ = free_port_range(1)
+    real_socket = socket.socket
+
+    def socket_without_ipv6(family, *args, **kwargs):
+        if family == socket.AF_INET6:
+            raise OSError(errno.EADDRNOTAVAIL, "IPv6 is disabled at runtime")
+        return real_socket(family, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "has_ipv6", True)
+    monkeypatch.setattr(socket, "socket", socket_without_ipv6)
+
+    assert GitSupervisor._port_available(port)
 
 
 def install_test_bundle(
