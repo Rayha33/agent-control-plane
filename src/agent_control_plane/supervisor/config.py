@@ -42,6 +42,8 @@ class Config:
     timeout_seconds: int
     qc_commands: tuple[str, ...]
     integration_commands: tuple[str, ...]
+    integration_critic_command: str
+    require_integration_critic: bool
     critic_command: str
     critic_identity: str
     require_critic: bool
@@ -135,6 +137,8 @@ class ConfigMixin:
             raise SupervisorError("invalid_config", "lease must be >= 10 and timeout >= 1")
         qc_commands = tuple(map(str, qc.get("commands", [])))
         integration_commands = tuple(map(str, integration.get("commands", qc.get("commands", []))))
+        integration_critic_selector = str(integration.get("critic_command", "")).strip()
+        require_integration_critic = bool(integration.get("require_critic", False))
         critic_selector = str(qc.get("critic_command", "")).strip()
         require_critic = bool(supervisor.get("require_critic", False))
         if not qc_commands or any(not command.strip() for command in qc_commands):
@@ -144,6 +148,16 @@ class ConfigMixin:
             )
         if not integration_commands or any(not command.strip() for command in integration_commands):
             raise SupervisorError("invalid_config", "every integration gate must contain a command")
+        if require_integration_critic and not integration_critic_selector:
+            raise SupervisorError(
+                "invalid_config", "integration.require_critic needs critic_command"
+            )
+        if integration_critic_selector and not (
+            self._diagnostic
+            and trust_pin is None
+            and integration_critic_selector.startswith("trusted:")
+        ):
+            self._resolve_critic_command(integration_critic_selector, trust_pin)
         if require_critic and not critic_selector:
             raise SupervisorError(
                 "invalid_config", "require_critic needs a non-empty critic_command"
@@ -278,6 +292,8 @@ class ConfigMixin:
             timeout_seconds=timeout,
             qc_commands=qc_commands,
             integration_commands=integration_commands,
+            integration_critic_command=integration_critic_selector,
+            require_integration_critic=require_integration_critic,
             critic_command=critic_command,
             critic_identity=str(supervisor.get("critic_identity", "independent-qc")),
             require_critic=require_critic,

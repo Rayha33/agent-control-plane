@@ -299,6 +299,17 @@ the current base as its first parent and the immutable candidate as its second;
 its tree is the tree returned by `merge-tree`. Merge conflict or command
 failure moves the task to <code>conflicted</code> and releases its reservation.
 
+An optional integration-stage critic reviews the exact merged candidate after
+deterministic integration commands and before ref publication. Configure
+`[integration].critic_command` with `builtin`, a trusted-bundle selector, or a
+trusted absolute executable; set `[integration].require_critic = true` to fail
+closed when it is absent. The reviewer receives `ACP_REVIEW_PACKET` and
+`ACP_REVIEW_RESULT`; the packet binds the current base, merge commit/tree,
+submission, task, and deterministic results. `revise`, `block`,
+`human_required`, malformed output, timeout, or candidate mutation prevents
+publication. Without a configured reviewer the result is explicitly recorded
+as `UNREVIEWED`; deterministic gates remain mandatory and authoritative.
+
 The Git boundary is identical on Linux and macOS:
 
 - ACP resolves a root-owned, non-writable system Git binary and copies its

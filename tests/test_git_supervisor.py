@@ -40,6 +40,8 @@ def write_config(
     integration_commands: list[str] | None = None,
     critic_command: str = "",
     require_critic: bool = False,
+    integration_critic_command: str = "",
+    require_integration_critic: bool = False,
     timeout_seconds: int = 30,
     runtime_setup_commands: list[str] | None = None,
     runtime_teardown_commands: list[str] | None = None,
@@ -52,6 +54,8 @@ def write_config(
         "integration": json.dumps(integration),
         "critic": json.dumps(critic_command),
         "required": str(require_critic).lower(),
+        "integration_critic": json.dumps(integration_critic_command),
+        "integration_critic_required": str(require_integration_critic).lower(),
         "runtime_setup": json.dumps(runtime_setup_commands or []),
         "runtime_teardown": json.dumps(runtime_teardown_commands or []),
     }
@@ -69,7 +73,9 @@ def write_config(
         f"commands = {content['qc']}\n"
         f"critic_command = {content['critic']}\n\n"
         "[integration]\n"
-        f"commands = {content['integration']}\n\n"
+        f"commands = {content['integration']}\n"
+        f"critic_command = {content['integration_critic']}\n"
+        f"require_critic = {content['integration_critic_required']}\n\n"
         "[runtime]\n"
         f"setup_commands = {content['runtime_setup']}\n"
         f"teardown_commands = {content['runtime_teardown']}\n\n"
@@ -333,9 +339,126 @@ def test_runtime_lifecycle_is_shared_with_qc_and_integration(repo: Path) -> None
     integration = supervisor.integrate(attempt["task_id"])
 
     assert integration["verdict"] == "pass"
+    assert any(
+        item.get("phase") == "integration-critic" and item.get("status") == "UNREVIEWED"
+        for item in integration["command_results"]
+    )
     assert integration["runtime_cleanup"]["state"] == "released"
     assert not runtime_dir.exists()
     assert (repo / ".acp" / f"teardown-{attempt['id']}").read_text() == "done"
+
+
+@pytest.mark.parametrize(("critic_verdict", "expected"), [("pass", "pass"), ("revise", "failed")])
+def test_required_integration_critic_reviews_exact_candidate(
+    repo: Path, monkeypatch, critic_verdict: str, expected: str
+) -> None:
+    write_config(repo, integration_critic_command="builtin", require_integration_critic=True)
+    supervisor = GitSupervisor(repo)
+    reviewed: dict[str, object] = {}
+
+    def critic(command, cwd, env, trust_pin=None, pass_fds=()):
+        packet = json.loads(Path(env["ACP_REVIEW_PACKET"]).read_text())
+        reviewed.update(packet)
+        Path(env["ACP_REVIEW_RESULT"]).write_text(
+            json.dumps(
+                {
+                    "verdict": critic_verdict,
+                    "findings": []
+                    if critic_verdict == "pass"
+                    else [
+                        {
+                            "severity": "high",
+                            "requirement": "candidate correctness",
+                            "finding": "synthetic interaction defect",
+                            "evidence": "test fixture",
+                            "required_fix": "repair candidate",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"command": "test-critic", "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(supervisor, "_run_critic", critic)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    integration = supervisor.integrate(attempt["task_id"])
+
+    assert integration["verdict"] == expected
+    assert reviewed["schema"] == "acp.integration-review.v1"
+    assert reviewed["candidate"]["tree_sha"]
+    if expected == "pass":
+        assert any(
+            item.get("phase") == "integration-critic-result"
+            for item in integration["command_results"]
+        )
+    else:
+        assert "verdict: revise" in integration["error"]
+
+
+def test_builtin_integration_critic_accepts_review_packet(repo: Path) -> None:
+    write_config(repo, integration_critic_command="builtin", require_integration_critic=True)
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    integration = supervisor.integrate(attempt["task_id"])
+
+    assert integration["verdict"] == "pass", (
+        integration["error"],
+        [
+            (finding["finding"], finding["evidence"])
+            for finding in integration["command_results"][-1]["findings"]
+        ],
+    )
+    result = next(
+        item
+        for item in integration["command_results"]
+        if item.get("command") == "builtin:structural-critic"
+    )
+    assert result["exit_code"] == 0
+    critic_result = next(
+        item
+        for item in integration["command_results"]
+        if item.get("phase") == "integration-critic-result"
+    )
+    assert critic_result["verdict"] == "pass"
+
+
+@pytest.mark.parametrize("invalid_result", [b"{not json", b"\xff"])
+def test_malformed_integration_critic_output_is_recorded_failed(
+    repo: Path, monkeypatch, invalid_result: bytes
+) -> None:
+    write_config(repo, integration_critic_command="builtin", require_integration_critic=True)
+    supervisor = GitSupervisor(repo)
+
+    def critic(command, cwd, env, trust_pin=None, pass_fds=()):
+        Path(env["ACP_REVIEW_RESULT"]).write_bytes(invalid_result)
+        return {"command": "test-critic", "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(supervisor, "_run_critic", critic)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    integration = supervisor.integrate(attempt["task_id"])
+
+    assert integration["verdict"] == "failed"
+    assert "critic result is unreadable" in integration["error"]
+    with supervisor.connect() as connection:
+        record = connection.execute(
+            "SELECT verdict FROM integrations WHERE id = ?", (integration["id"],)
+        ).fetchone()
+        task_row = supervisor._task_row(connection, attempt["task_id"])
+    assert record["verdict"] == "failed"
+    assert task_row["status"] != "integrating"
 
 
 def test_occupied_runtime_port_is_quarantined_until_cleanup(repo: Path) -> None:

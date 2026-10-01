@@ -151,6 +151,7 @@ class IntegrationMixin:
             )
 
         results: list[dict[str, Any]] = []
+        deterministic_integration_results: list[dict[str, Any]] = []
         verdict = "failed"
         commit: str | None = None
         error_message = ""
@@ -207,6 +208,7 @@ class IntegrationMixin:
                         pass_fds=(operation_guard_fd,),
                     )
                     results.append(result)
+                    deterministic_integration_results.append(result)
                     if result["exit_code"]:
                         raise SupervisorError(
                             "integration_gate_failed",
@@ -221,6 +223,90 @@ class IntegrationMixin:
                         raise SupervisorError(
                             "integration_gate_mutated_source",
                             f"integration command mutated tracked source or Git controls: {command}",
+                        )
+                critic_command = self.config.integration_critic_command
+                if not critic_command:
+                    results.append(
+                        {
+                            "phase": "integration-critic",
+                            "status": "UNREVIEWED",
+                            "required": self.config.require_integration_critic,
+                        }
+                    )
+                    if self.config.require_integration_critic:
+                        raise SupervisorError(
+                            "integration_critic_missing",
+                            "required independent integration critic is not configured",
+                        )
+                else:
+                    packet_path = (
+                        self.state_dir / "logs" / f"integration-review-{integration_id}.json"
+                    )
+                    result_path = (
+                        self.state_dir / "logs" / f"integration-critic-{integration_id}.json"
+                    )
+                    packet = {
+                        "schema": "acp.integration-review.v1",
+                        "task": {
+                            "id": task["id"],
+                            "title": task["title"],
+                            "description": task["description"],
+                            "acceptance": json.loads(task["acceptance_json"]),
+                            "resources": json.loads(task["resources_json"]),
+                        },
+                        "submission": {
+                            "id": submission["id"],
+                            "commit_sha": submission["commit_sha"],
+                            "tree_sha": submission["tree_sha"],
+                            "changed_paths": json.loads(submission["changed_paths_json"]),
+                        },
+                        "candidate": {
+                            "base_sha": current_base,
+                            "commit_sha": integration_commit,
+                            "tree_sha": self._git_text(
+                                "-C", str(worktree), "rev-parse", "HEAD^{tree}"
+                            ),
+                            "task_id": task_id,
+                            "submission_id": submission["id"],
+                            "submission_commit_sha": submission["commit_sha"],
+                            "changed_paths": json.loads(submission["changed_paths_json"]),
+                        },
+                        "deterministic_results": deterministic_integration_results,
+                        "policy": {
+                            "review_integrated_candidate": True,
+                            "worker_conclusions_excluded": True,
+                            "deterministic_gates_remain_authoritative": True,
+                        },
+                    }
+                    packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+                    critic = self._run_critic(
+                        critic_command,
+                        worktree,
+                        self._phase_runtime_env(runtime_env, "integration-critic", worktree)
+                        | {
+                            "ACP_REVIEW_PACKET": str(packet_path),
+                            "ACP_REVIEW_RESULT": str(result_path),
+                        },
+                        self._verify_attempt_trust(submission["attempt_id"])
+                        if critic_command.startswith("trusted:")
+                        else None,
+                        pass_fds=(operation_guard_fd,),
+                    )
+                    results.append(critic)
+                    if critic["exit_code"] or not self._integration_workspace_matches(
+                        worktree, integration_commit, operation_guard_fd, git_boundary
+                    ):
+                        raise SupervisorError(
+                            "integration_critic_failed",
+                            "integration critic failed or mutated candidate",
+                        )
+                    payload = self._critic_payload(result_path)
+                    result_path.unlink(missing_ok=True)
+                    results.append({"phase": "integration-critic-result", **payload})
+                    if payload["verdict"] != "pass":
+                        raise SupervisorError(
+                            "integration_critic_blocked",
+                            f"independent integration critic verdict: {payload['verdict']}",
                         )
                 self._assert_integration_git_boundary(
                     worktree,
