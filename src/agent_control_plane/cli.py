@@ -13,9 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from .editor_hooks import (
+    CODEX_MAX_HOOK_INPUT_CHARS,
     DENY_EXIT_CODE,
     cwd_from_hook_payload,
     install_claude_code_hooks,
+    install_codex_hooks,
+    parse_codex_patch_paths,
     path_from_hook_payload,
 )
 from .git_supervisor import GitSupervisor, SupervisorError
@@ -91,6 +94,21 @@ def _deny(decision: dict[str, Any]) -> int:
     return DENY_EXIT_CODE
 
 
+def _codex_deny(reason: str) -> int:
+    """Return Codex's documented explicit PreToolUse denial shape."""
+
+    emit(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason[:2000],
+            }
+        }
+    )
+    return 0
+
+
 def add_credential_source(command: argparse.ArgumentParser) -> None:
     source = command.add_mutually_exclusive_group()
     source.add_argument(
@@ -129,6 +147,11 @@ def parser() -> argparse.ArgumentParser:
         help="read a Claude Code PreToolUse payload on stdin; exit 2 denies the tool call",
     )
     guard_mode.add_argument(
+        "--codex-hook",
+        action="store_true",
+        help="read a Codex apply_patch PreToolUse payload on stdin",
+    )
+    guard_mode.add_argument(
         "--describe",
         action="store_true",
         help="print the attempt's worktree and declared write set (SessionStart hook)",
@@ -137,9 +160,9 @@ def parser() -> argparse.ArgumentParser:
     hooks = commands.add_parser("hooks", help="install editor adapters that call the kernel")
     hooks_commands = hooks.add_subparsers(dest="hooks_action", required=True)
     hooks_install = hooks_commands.add_parser("install", help="write the hook configuration")
-    hooks_install.add_argument(
-        "--claude-code", action="store_true", required=True, help="install Claude Code hooks"
-    )
+    hook_editor = hooks_install.add_mutually_exclusive_group(required=True)
+    hook_editor.add_argument("--claude-code", action="store_true", help="install Claude Code hooks")
+    hook_editor.add_argument("--codex-code", action="store_true", help="install Codex hooks")
     hooks_install.add_argument(
         "--command", default="acp", help="how the hook should invoke acp (default: acp)"
     )
@@ -580,12 +603,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 command = f"{args.command} --repo {shlex.quote(str(supervisor.root))}"
                 try:
-                    result = install_claude_code_hooks(worktree, command, local=True)
+                    if args.codex_code:
+                        result = install_codex_hooks(
+                            worktree, command, local=True, attempt_id=args.attempt_id
+                        )
+                    else:
+                        result = install_claude_code_hooks(worktree, command, local=True)
                 except (OSError, ValueError) as error:
                     raise SupervisorError("hook_install_failed", str(error)) from error
             else:
                 try:
-                    result = install_claude_code_hooks(Path(args.repo).resolve(), args.command)
+                    if args.codex_code:
+                        root_path = Path(args.repo).resolve()
+                        command = f"{args.command} --repo {shlex.quote(str(root_path))}"
+                        result = install_codex_hooks(root_path, command)
+                    else:
+                        result = install_claude_code_hooks(Path(args.repo).resolve(), args.command)
                 except (OSError, ValueError) as error:
                     raise SupervisorError("hook_install_failed", str(error)) from error
             emit(result)
@@ -612,6 +645,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise SupervisorError("missing_attempt", "pass --attempt or export ACP_ATTEMPT_ID")
             if args.describe:
                 emit(supervisor.guard_context(attempt_id))
+                return 0
+            if args.codex_hook:
+                raw_payload = sys.stdin.read(CODEX_MAX_HOOK_INPUT_CHARS + 1)
+                if len(raw_payload) > CODEX_MAX_HOOK_INPUT_CHARS:
+                    return _codex_deny(
+                        "Codex hook input exceeds the 2,250,000 character safety limit"
+                    )
+                payload = _hook_payload(raw_payload)
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("hook_event_name") != "PreToolUse"
+                    or payload.get("tool_name") != "apply_patch"
+                ):
+                    return _codex_deny(
+                        "Codex payload must identify the PreToolUse event and apply_patch tool"
+                    )
+                caller_cwd = cwd_from_hook_payload(payload)
+                tool_input = payload.get("tool_input")
+                command = tool_input.get("command") if isinstance(tool_input, dict) else None
+                if caller_cwd is None or not isinstance(command, str):
+                    return _codex_deny(
+                        "Codex PreToolUse payload must include cwd and tool_input.command"
+                    )
+                try:
+                    targets = parse_codex_patch_paths(command)
+                except ValueError as error:
+                    return _codex_deny(f"ACP could not parse the pending patch: {error}")
+                decisions = [
+                    supervisor.guard(attempt_id, path, caller_cwd=caller_cwd) for path in targets
+                ]
+                denied = [decision for decision in decisions if not decision["allow"]]
+                if denied:
+                    first = denied[0]
+                    detail = str(first.get("detail", first.get("reason", "write denied")))
+                    return _codex_deny(
+                        "ACP denied the entire patch because at least one path is outside "
+                        f"the attempt write scope: {detail}"
+                    )
                 return 0
             target = args.path
             caller_cwd = os.getcwd()
@@ -777,6 +848,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
     except (SupervisorError, TrustBundleError) as error:
+        if args.action == "guard" and getattr(args, "codex_hook", False):
+            return _codex_deny(f"ACP could not decide whether the write is in scope: {error}")
         print(
             json.dumps({"ok": False, "error": error.code, "message": str(error)}),
             file=sys.stderr,
@@ -795,6 +868,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return DENY_EXIT_CODE
         return 1
+    except Exception as error:
+        if args.action == "guard" and getattr(args, "codex_hook", False):
+            return _codex_deny(f"ACP could not decide whether the write is in scope: {error}")
+        if args.action == "guard" and getattr(args, "hook", False):
+            print(
+                "acp guard could not decide, so the write is blocked. "
+                "Fix the error above and retry.",
+                file=sys.stderr,
+            )
+            return DENY_EXIT_CODE
+        raise
 
 
 if __name__ == "__main__":
