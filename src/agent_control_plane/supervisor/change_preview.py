@@ -12,6 +12,7 @@ import sys as _sys
 import tempfile
 import time
 import uuid
+import zlib
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -35,12 +36,86 @@ _MAX_INVENTORY_RECORDS = 10_000
 _MAX_OBJECT_FILES = 250_000
 _MAX_OBJECT_SNAPSHOT_BYTES = 1024 * 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 30
+_ISOLATED_GIT_GUARD_EXIT = 125
 _LOOSE_OBJECT_NAME = re.compile(r"(?:[0-9a-f]{38}|[0-9a-f]{62})\Z")
 _PACK_INDEX_NAME = re.compile(r"pack-([0-9a-f]{40}|[0-9a-f]{64})\.(?:pack|idx)\Z")
-_EXEC_GIT_FROM_DIR_FD = (
-    "import os,sys; fd=int(sys.argv[1]); executable=sys.argv[2]; "
-    "os.fchdir(fd); os.execve(executable, [executable, *sys.argv[3:]], os.environ)"
-)
+_EXEC_GIT_FROM_DIR_FD = """
+import hashlib
+import os
+import stat
+import sys
+
+def fail_closed():
+    os._exit(125)
+
+def signature(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+def read_file(directory_fd, name, limit):
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            fail_closed()
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > limit or signature(before) != signature(os.fstat(descriptor)):
+            fail_closed()
+        return content
+    finally:
+        os.close(descriptor)
+
+try:
+    worktree_fd = int(sys.argv[1])
+    executable = sys.argv[2]
+    scratch_path = sys.argv[3]
+    expected_scratch_identity = tuple(map(int, sys.argv[4].split(",")))
+    expected_git_identity = tuple(map(int, sys.argv[5].split(",")))
+    expected_scratch_signature = tuple(map(int, sys.argv[6].split(",")))
+    expected_config_digest = sys.argv[7]
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    scratch_fd = os.open(scratch_path, directory_flags)
+    if (os.fstat(scratch_fd).st_dev, os.fstat(scratch_fd).st_ino) != expected_scratch_identity:
+        fail_closed()
+    if signature(os.fstat(scratch_fd)) != expected_scratch_signature:
+        fail_closed()
+    git_fd = os.open("git", directory_flags, dir_fd=scratch_fd)
+    git_metadata = os.fstat(git_fd)
+    if (git_metadata.st_dev, git_metadata.st_ino) != expected_git_identity:
+        fail_closed()
+    expected_git_path = os.path.normpath(os.path.join(scratch_path, "git"))
+    if os.path.normpath(os.environ.get("GIT_DIR", "")) != expected_git_path:
+        fail_closed()
+    if os.path.normpath(os.environ.get("GIT_COMMON_DIR", "")) != expected_git_path:
+        fail_closed()
+    config = read_file(git_fd, "config", 4096)
+    if hashlib.sha256(config).hexdigest() != expected_config_digest:
+        fail_closed()
+    info_fd = os.open("info", directory_flags, dir_fd=git_fd)
+    if os.listdir(info_fd) != ["attributes"]:
+        fail_closed()
+    if read_file(info_fd, "attributes", 4096) != b"* -filter\\n":
+        fail_closed()
+    os.fchdir(worktree_fd)
+    os.execve(executable, [executable, *sys.argv[8:]], os.environ)
+except (OSError, ValueError, IndexError):
+    fail_closed()
+"""
+
+
+@dataclass(frozen=True)
+class _ObjectDatabaseSnapshot:
+    files: dict[str, tuple[int, int, int, int, int, int]]
+    directories: dict[str, tuple[int, int, int, int, int, int]]
+    object_id_length: int
 
 
 @dataclass(frozen=True)
@@ -48,10 +123,16 @@ class _IsolatedGitContext:
     git_directory: Path
     common_directory: Path
     directory_identity: tuple[int, int]
+    scratch_directory: Path
+    scratch_directory_identity: tuple[int, int]
+    scratch_directory_signature: tuple[int, int, int, int, int, int]
     metadata_fingerprint: str
     config_content: bytes
     head_content: bytes
+    attributes_content: bytes
     index_digest: str
+    attribute_source: str
+    object_database: _ObjectDatabaseSnapshot
 
 
 class ChangePreviewMixin:
@@ -137,6 +218,7 @@ class ChangePreviewMixin:
             )
             head_after = self._resolve_attempt_head(attempt_id, attempt_common)
             final_index_digest = self._attempt_index_digest(attempt_id, attempt_common)
+            self._assert_isolated_git_metadata(git_context, verify_object_files=True)
 
             stable = (
                 head_before == head_after
@@ -275,6 +357,10 @@ class ChangePreviewMixin:
         expected_identity: tuple[int, int] | None = None,
         git_context: _IsolatedGitContext | None = None,
     ) -> bytes:
+        if git_context is not None and expected_identity is None:
+            raise SupervisorError(
+                "change_preview_incomplete", "attempt worktree cannot be pinned safely"
+            )
         git = str(self._system_git_executable(self.root))
         command = [
             git,
@@ -294,6 +380,7 @@ class ChangePreviewMixin:
         ]
         environment = self._git_environment()
         if git_context is not None:
+            command.insert(1, f"--attr-source={git_context.attribute_source}")
             environment.update(
                 {
                     "GIT_DIR": str(git_context.git_directory),
@@ -353,6 +440,11 @@ class ChangePreviewMixin:
                     _EXEC_GIT_FROM_DIR_FD,
                     str(worktree_fd),
                     git,
+                    str(git_context.scratch_directory),
+                    ",".join(map(str, git_context.scratch_directory_identity)),
+                    ",".join(map(str, git_context.directory_identity)),
+                    ",".join(map(str, git_context.scratch_directory_signature)),
+                    hashlib.sha256(git_context.config_content).hexdigest(),
                     *command[1:],
                     *arguments,
                 ]
@@ -415,6 +507,11 @@ class ChangePreviewMixin:
                 "change_preview_incomplete", "attempt worktree changed during inspection"
             )
         if return_code:
+            if return_code == _ISOLATED_GIT_GUARD_EXIT:
+                raise SupervisorError(
+                    "change_preview_incomplete",
+                    "isolated Git metadata changed or became unsafe",
+                )
             raise SupervisorError(
                 "change_preview_incomplete",
                 f"Git could not read attempt metadata (command {arguments[0]} failed)",
@@ -663,10 +760,28 @@ class ChangePreviewMixin:
         git_directory: Path,
         config_content: bytes,
         head_content: bytes,
+        attributes_content: bytes,
         index_digest: str,
+        scratch_directory: Path,
+        expected_scratch_directory_identity: tuple[int, int],
+        expected_scratch_directory_signature: tuple[int, int, int, int, int, int] | None = None,
         expected_directory_identity: tuple[int, int] | None = None,
-    ) -> tuple[str, tuple[int, int]]:
+    ) -> tuple[str, tuple[int, int], tuple[int, int, int, int, int, int]]:
         """Fingerprint and validate mutable scratch metadata used by Git commands."""
+
+        try:
+            scratch_stat = scratch_directory.lstat()
+        except OSError:
+            raise OSError("isolated Git scratch parent changed") from None
+        if not stat.S_ISDIR(scratch_stat.st_mode) or stat.S_ISLNK(scratch_stat.st_mode):
+            raise OSError("isolated Git scratch parent is unsafe")
+        scratch_identity = (scratch_stat.st_dev, scratch_stat.st_ino)
+        scratch_signature = cls._git_file_signature(scratch_stat)
+        if scratch_identity != expected_scratch_directory_identity or (
+            expected_scratch_directory_signature is not None
+            and scratch_signature != expected_scratch_directory_signature
+        ):
+            raise OSError("isolated Git scratch parent changed")
 
         directory_fd = cls._open_git_directory(git_directory)
         try:
@@ -680,10 +795,15 @@ class ChangePreviewMixin:
             names = cls._list_git_directory(directory_fd, _MAX_INDEX_DIRECTORY_ENTRIES)
             shared = sorted(name for name in names if _SHARED_INDEX.fullmatch(name))
             selected = ["config", "HEAD", "index", *shared]
-            if any(name not in names for name in selected[:3]):
+            if any(name not in names for name in selected[:3]) or set(names) != set(selected) | {
+                "info",
+                "objects",
+                "refs",
+            }:
                 raise OSError("isolated Git metadata is incomplete")
 
             digest = hashlib.sha256()
+            digest.update(repr(scratch_signature).encode("ascii"))
             digest.update(repr(cls._git_file_signature(directory_stat)).encode("ascii"))
             total_bytes = 0
             actual_index_digest = hashlib.sha256()
@@ -735,6 +855,58 @@ class ChangePreviewMixin:
             if actual_index_digest.hexdigest() != index_digest:
                 raise OSError("isolated Git index changed")
 
+            info_fd = cls._open_git_directory(git_directory, "info")
+            try:
+                info_before = os.fstat(info_fd)
+                info_signature = cls._git_file_signature(info_before)
+                if not stat.S_ISDIR(info_before.st_mode):
+                    raise OSError("isolated Git info path is not a directory")
+                if cls._list_git_directory(info_fd, 1) != ["attributes"]:
+                    raise OSError("isolated Git attributes inventory changed")
+                try:
+                    attributes_fd = os.open(
+                        "attributes",
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=info_fd,
+                    )
+                except OSError:
+                    raise OSError("isolated Git attributes file is unsafe") from None
+                try:
+                    attributes_before = os.fstat(attributes_fd)
+                    if (
+                        not stat.S_ISREG(attributes_before.st_mode)
+                        or attributes_before.st_size > 4096
+                    ):
+                        raise OSError("isolated Git attributes file exceeds safe limits")
+                    chunks: list[bytes] = []
+                    remaining = 4097
+                    while remaining:
+                        chunk = os.read(attributes_fd, min(1024, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    content = b"".join(chunks)
+                    attributes_after = os.fstat(attributes_fd)
+                    attributes_signature = cls._git_file_signature(attributes_before)
+                    if (
+                        len(content) > 4096
+                        or content != attributes_content
+                        or attributes_signature != cls._git_file_signature(attributes_after)
+                    ):
+                        raise OSError("isolated Git attributes file changed")
+                finally:
+                    os.close(attributes_fd)
+                info_after = os.fstat(info_fd)
+                if info_signature != cls._git_file_signature(info_after):
+                    raise OSError("isolated Git info directory changed")
+                digest.update(b"info/attributes\0")
+                digest.update(repr(info_signature).encode("ascii"))
+                digest.update(repr(attributes_signature).encode("ascii"))
+                digest.update(hashlib.sha256(content).digest())
+            finally:
+                os.close(info_fd)
+
             for relative in ("objects/info", "refs/heads", "refs/tags"):
                 child_fd = cls._open_git_directory(git_directory, relative)
                 try:
@@ -744,19 +916,173 @@ class ChangePreviewMixin:
                     digest.update(repr(cls._git_file_signature(child_stat)).encode("ascii"))
                 finally:
                     os.close(child_fd)
-            return digest.hexdigest(), directory_identity
+            return digest.hexdigest(), directory_identity, scratch_signature
         finally:
             os.close(directory_fd)
 
     @classmethod
-    def _assert_isolated_git_metadata(cls, context: _IsolatedGitContext) -> None:
+    @classmethod
+    def _scan_object_database(
+        cls,
+        root: Path,
+        object_id_length: int,
+        *,
+        expected_files: dict[str, tuple[int, int, int, int, int, int]] | None = None,
+        expected_directories: dict[str, tuple[int, int, int, int, int, int]] | None = None,
+        verify_files: bool,
+    ) -> _ObjectDatabaseSnapshot:
+        """Validate the isolated object namespace and optionally every copied file."""
+
+        root_fd = cls._open_git_directory(root)
+        files: dict[str, tuple[int, int, int, int, int, int]] = {}
+        directories: dict[str, tuple[int, int, int, int, int, int]] = {}
+        total_files = 0
         try:
-            fingerprint, _identity = cls._isolated_git_fingerprint(
+            root_before = os.fstat(root_fd)
+            root_signature = cls._git_file_signature(root_before)
+            directories[""] = root_signature
+            if expected_directories is not None and root_signature != expected_directories.get(""):
+                raise OSError("isolated Git object directory changed")
+            top_names = cls._list_git_directory(root_fd, 300)
+            expected_top_names = (
+                {"info", "pack"} | {path.split("/", 1)[0] for path in (expected_files or {})}
+                if expected_directories is None
+                else {path for path in expected_directories if path and "/" not in path}
+            )
+            if set(top_names) != expected_top_names:
+                raise OSError("isolated Git object directories changed")
+
+            for directory_name in top_names:
+                if directory_name not in {"info", "pack"} and not re.fullmatch(
+                    r"[0-9a-f]{2}", directory_name
+                ):
+                    raise OSError("isolated Git object directory name is unsafe")
+                try:
+                    child_fd = os.open(
+                        directory_name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=root_fd,
+                    )
+                except OSError:
+                    raise OSError("isolated Git object directory is unsafe") from None
+                try:
+                    child_before = os.fstat(child_fd)
+                except OSError:
+                    os.close(child_fd)
+                    raise
+                try:
+                    if not stat.S_ISDIR(child_before.st_mode):
+                        raise OSError("isolated Git object path is not a directory")
+                    child_signature = cls._git_file_signature(child_before)
+                    directories[directory_name] = child_signature
+                    if (
+                        expected_directories is not None
+                        and child_signature != expected_directories.get(directory_name)
+                    ):
+                        raise OSError("isolated Git object directory changed")
+                    if directory_name == "info":
+                        cls._list_git_directory(child_fd, 0)
+                        continue
+                    if not verify_files:
+                        continue
+
+                    entries = cls._list_git_directory(child_fd, _MAX_OBJECT_FILES - total_files)
+                    total_files += len(entries)
+                    if total_files > _MAX_OBJECT_FILES:
+                        raise OSError("isolated Git object database exceeds the safe file limit")
+                    for name in entries:
+                        if directory_name == "pack":
+                            if not _PACK_INDEX_NAME.fullmatch(name):
+                                raise OSError("isolated Git pack inventory is unsafe")
+                        elif len(name) != object_id_length - 2 or not _LOOSE_OBJECT_NAME.fullmatch(
+                            name
+                        ):
+                            raise OSError("isolated Git loose-object inventory is unsafe")
+                        relative = f"{directory_name}/{name}"
+                        try:
+                            file_fd = os.open(
+                                name,
+                                os.O_RDONLY
+                                | os.O_NOFOLLOW
+                                | getattr(os, "O_CLOEXEC", 0)
+                                | getattr(os, "O_NONBLOCK", 0),
+                                dir_fd=child_fd,
+                            )
+                        except OSError:
+                            raise OSError("isolated Git object file is unsafe") from None
+                        try:
+                            file_before = os.fstat(file_fd)
+                            if not stat.S_ISREG(file_before.st_mode):
+                                raise OSError("isolated Git object path is not a regular file")
+                            file_signature = cls._git_file_signature(file_before)
+                            if expected_files is not None and (
+                                expected_files.get(relative) != file_signature
+                            ):
+                                raise OSError("isolated Git object file changed")
+                            if expected_files is not None:
+                                files[relative] = file_signature
+                            file_after = os.fstat(file_fd)
+                            if file_signature != cls._git_file_signature(file_after):
+                                raise OSError("isolated Git object file changed during inspection")
+                        finally:
+                            os.close(file_fd)
+                finally:
+                    try:
+                        child_after = os.fstat(child_fd)
+                        if cls._git_file_signature(child_before) != cls._git_file_signature(
+                            child_after
+                        ):
+                            raise OSError("isolated Git object directory changed during inspection")
+                    finally:
+                        os.close(child_fd)
+
+            root_after = os.fstat(root_fd)
+            if root_signature != cls._git_file_signature(root_after):
+                raise OSError("isolated Git object directory changed during inspection")
+            if verify_files and expected_files is not None and len(files) != len(expected_files):
+                raise OSError("isolated Git object inventory changed")
+            return _ObjectDatabaseSnapshot(files, directories, object_id_length)
+        finally:
+            os.close(root_fd)
+
+    @classmethod
+    def _assert_object_database(
+        cls,
+        root: Path,
+        expected: _ObjectDatabaseSnapshot,
+        *,
+        verify_files: bool,
+    ) -> None:
+        actual = cls._scan_object_database(
+            root,
+            expected.object_id_length,
+            expected_files=expected.files if verify_files else None,
+            expected_directories=expected.directories,
+            verify_files=verify_files,
+        )
+        if verify_files and actual.files != expected.files:
+            raise OSError("isolated Git object inventory changed")
+
+    @classmethod
+    def _assert_isolated_git_metadata(
+        cls, context: _IsolatedGitContext, *, verify_object_files: bool = False
+    ) -> None:
+        try:
+            fingerprint, _identity, _scratch_signature = cls._isolated_git_fingerprint(
                 context.git_directory,
                 context.config_content,
                 context.head_content,
+                context.attributes_content,
                 context.index_digest,
+                context.scratch_directory,
+                context.scratch_directory_identity,
+                context.scratch_directory_signature,
                 context.directory_identity,
+            )
+            cls._assert_object_database(
+                context.git_directory / "objects",
+                context.object_database,
+                verify_files=verify_object_files,
             )
         except OSError:
             raise SupervisorError(
@@ -789,7 +1115,7 @@ class ChangePreviewMixin:
         destination_fd: int,
         name: str,
         copied_bytes: list[int],
-    ) -> bool:
+    ) -> tuple[int, int, int, int, int, int] | None:
         """Copy one bounded object file without following a replaced path."""
 
         try:
@@ -802,30 +1128,32 @@ class ChangePreviewMixin:
                 dir_fd=source_fd,
             )
         except FileNotFoundError:
-            return False
+            return None
         except OSError:
             # An unreadable or unsafe object is omitted. Git will fail closed if it
             # is needed to resolve the selected commits.
-            return False
+            return None
         try:
             before = os.fstat(source_file_fd)
             if not stat.S_ISREG(before.st_mode):
-                return False
+                return None
             if before.st_size > _MAX_OBJECT_SNAPSHOT_BYTES - copied_bytes[0]:
                 raise OSError("Git object snapshot exceeds the safe byte limit")
             destination_file_fd = os.open(
                 name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                 0o600,
                 dir_fd=destination_fd,
             )
             try:
                 copied = 0
+                source_digest = hashlib.sha256()
                 while True:
                     chunk = os.read(source_file_fd, 1024 * 1024)
                     if not chunk:
                         break
                     copied += len(chunk)
+                    source_digest.update(chunk)
                     if copied_bytes[0] + copied > _MAX_OBJECT_SNAPSHOT_BYTES:
                         raise OSError("Git object snapshot exceeds the safe byte limit")
                     view = memoryview(chunk)
@@ -841,8 +1169,20 @@ class ChangePreviewMixin:
                     or cls._git_file_signature(before) != cls._git_file_signature(after)
                 ):
                     raise OSError("Git object changed while taking a safe snapshot")
+                os.lseek(destination_file_fd, 0, os.SEEK_SET)
+                destination_digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(destination_file_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    destination_digest.update(chunk)
+                verified_destination_metadata = os.fstat(destination_file_fd)
+                if destination_digest.digest() != source_digest.digest() or cls._git_file_signature(
+                    copied_metadata
+                ) != cls._git_file_signature(verified_destination_metadata):
+                    raise OSError("Git object changed while taking a safe snapshot")
                 copied_bytes[0] += copied
-                return True
+                return cls._git_file_signature(verified_destination_metadata)
             except Exception:
                 try:
                     os.unlink(name, dir_fd=destination_fd)
@@ -855,9 +1195,144 @@ class ChangePreviewMixin:
             os.close(source_file_fd)
 
     @classmethod
+    def _add_empty_tree_object(
+        cls, destination: Path, snapshot: _ObjectDatabaseSnapshot
+    ) -> tuple[_ObjectDatabaseSnapshot, str]:
+        """Add a verified empty tree used to disable worktree attribute sources."""
+
+        if snapshot.object_id_length not in {40, 64}:
+            raise OSError("unsupported Git object format")
+        object_data = b"tree 0\0"
+        algorithm = "sha1" if snapshot.object_id_length == 40 else "sha256"
+        object_id = hashlib.new(algorithm, object_data).hexdigest()
+        compressed = zlib.compress(object_data)
+        relative = f"{object_id[:2]}/{object_id[2:]}"
+        cls._assert_object_database(destination, snapshot, verify_files=True)
+
+        root_fd = cls._open_git_directory(destination)
+        try:
+            root_before = os.fstat(root_fd)
+            if cls._git_file_signature(root_before) != snapshot.directories.get(""):
+                raise OSError("isolated Git object directory changed")
+            prefix = object_id[:2]
+            try:
+                os.mkdir(prefix, mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                if prefix not in snapshot.directories:
+                    raise OSError("isolated Git object directory changed") from None
+            shard_fd = os.open(
+                prefix,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=root_fd,
+            )
+            try:
+                if relative in snapshot.files:
+                    object_fd = os.open(
+                        object_id[2:],
+                        os.O_RDONLY
+                        | os.O_NOFOLLOW
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NONBLOCK", 0),
+                        dir_fd=shard_fd,
+                    )
+                    try:
+                        before = os.fstat(object_fd)
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or cls._git_file_signature(before) != snapshot.files[relative]
+                            or before.st_size > 1024
+                        ):
+                            raise OSError("isolated empty-tree object is unsafe")
+                        compressed_existing = os.read(object_fd, 1025)
+                        after = os.fstat(object_fd)
+                        if len(compressed_existing) > 1024 or cls._git_file_signature(
+                            before
+                        ) != cls._git_file_signature(after):
+                            raise OSError("isolated empty-tree object changed")
+                        try:
+                            decompressor = zlib.decompressobj()
+                            decoded = decompressor.decompress(
+                                compressed_existing, len(object_data) + 1
+                            )
+                        except zlib.error:
+                            raise OSError("isolated empty-tree object is corrupt") from None
+                        if (
+                            decoded != object_data
+                            or not decompressor.eof
+                            or decompressor.unused_data
+                            or decompressor.unconsumed_tail
+                        ):
+                            raise OSError("isolated empty-tree object is corrupt")
+                    finally:
+                        os.close(object_fd)
+                else:
+                    if (
+                        len(snapshot.files) >= _MAX_OBJECT_FILES
+                        or sum(signature[3] for signature in snapshot.files.values())
+                        + len(compressed)
+                        > _MAX_OBJECT_SNAPSHOT_BYTES
+                    ):
+                        raise OSError(
+                            "isolated Git object database exceeds the safe snapshot limit"
+                        )
+                    object_fd = os.open(
+                        object_id[2:],
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_NOFOLLOW
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                        dir_fd=shard_fd,
+                    )
+                    try:
+                        view = memoryview(compressed)
+                        while view:
+                            written = os.write(object_fd, view)
+                            if written <= 0:
+                                raise OSError("isolated empty-tree object write was incomplete")
+                            view = view[written:]
+                        written_metadata = os.fstat(object_fd)
+                        if not stat.S_ISREG(
+                            written_metadata.st_mode
+                        ) or written_metadata.st_size != len(compressed):
+                            raise OSError("isolated empty-tree object write was incomplete")
+                        os.lseek(object_fd, 0, os.SEEK_SET)
+                        if os.read(object_fd, len(compressed) + 1) != compressed:
+                            raise OSError("isolated empty-tree object copy could not be verified")
+                        object_signature = cls._git_file_signature(os.fstat(object_fd))
+                    except Exception:
+                        try:
+                            os.unlink(object_id[2:], dir_fd=shard_fd)
+                        except FileNotFoundError:
+                            pass
+                        raise
+                    finally:
+                        os.close(object_fd)
+                    files = dict(snapshot.files)
+                    files[relative] = object_signature
+                    snapshot = _ObjectDatabaseSnapshot(
+                        files, snapshot.directories, snapshot.object_id_length
+                    )
+            finally:
+                os.close(shard_fd)
+        finally:
+            os.close(root_fd)
+
+        return (
+            cls._scan_object_database(
+                destination,
+                snapshot.object_id_length,
+                expected_files=snapshot.files,
+                verify_files=True,
+            ),
+            object_id,
+        )
+
+    @classmethod
     def _snapshot_object_database(
         cls, common: Path, destination: Path, object_id_length: int
-    ) -> None:
+    ) -> _ObjectDatabaseSnapshot:
         """Copy the local loose/packed object namespace without Git alternates.
 
         The temporary object database contains bounded copies of regular files
@@ -874,6 +1349,7 @@ class ChangePreviewMixin:
         file_count = 0
         scanned_entries = 0
         copied_bytes = [0]
+        copied_files: dict[str, tuple[int, int, int, int, int, int]] = {}
         try:
             destination_pack_fd = os.open(
                 destination / "pack", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -901,15 +1377,20 @@ class ChangePreviewMixin:
                     index_name = f"pack-{pack_hash}.idx"
                     if pack_name not in pack_names or index_name not in pack_names:
                         continue
-                    if not cls._copy_object_file(
+                    pack_signature = cls._copy_object_file(
                         pack_fd, destination_pack_fd, pack_name, copied_bytes
-                    ):
+                    )
+                    if pack_signature is None:
                         continue
-                    if not cls._copy_object_file(
+                    copied_files[f"pack/{pack_name}"] = pack_signature
+                    index_signature = cls._copy_object_file(
                         pack_fd, destination_pack_fd, index_name, copied_bytes
-                    ):
+                    )
+                    if index_signature is None:
                         os.unlink(pack_name, dir_fd=destination_pack_fd)
+                        copied_files.pop(f"pack/{pack_name}", None)
                         continue
+                    copied_files[f"pack/{index_name}"] = index_signature
                     file_count += 2
                     if file_count > _MAX_OBJECT_FILES:
                         raise OSError("Git object database exceeds the safe snapshot limit")
@@ -944,10 +1425,12 @@ class ChangePreviewMixin:
                     )
                     try:
                         for name in candidates:
-                            if not cls._copy_object_file(
+                            signature = cls._copy_object_file(
                                 shard_fd, shard_destination_fd, name, copied_bytes
-                            ):
+                            )
+                            if signature is None:
                                 continue
+                            copied_files[f"{prefix}/{name}"] = signature
                             file_count += 1
                             if file_count > _MAX_OBJECT_FILES:
                                 raise OSError("Git object database exceeds the safe snapshot limit")
@@ -961,6 +1444,12 @@ class ChangePreviewMixin:
             if pack_fd is not None:
                 os.close(pack_fd)
             os.close(objects_fd)
+        return cls._scan_object_database(
+            destination,
+            object_id_length,
+            expected_files=copied_files,
+            verify_files=True,
+        )
 
     @contextmanager
     def _isolated_git_metadata(
@@ -976,10 +1465,17 @@ class ChangePreviewMixin:
             # Do not honor TMPDIR/TMP/TEMP: a caller could otherwise place the
             # temporary repository inside the live attempt worktree being scanned.
             with tempfile.TemporaryDirectory(prefix="acp-change-preview-", dir="/tmp") as scratch:
-                git_directory = Path(scratch) / "git"
+                scratch_directory = Path(scratch)
+                scratch_stat = scratch_directory.lstat()
+                if not stat.S_ISDIR(scratch_stat.st_mode) or stat.S_ISLNK(scratch_stat.st_mode):
+                    raise OSError("isolated Git scratch directory is unsafe")
+                scratch_identity = (scratch_stat.st_dev, scratch_stat.st_ino)
+                git_directory = scratch_directory / "git"
                 object_directory = git_directory / "objects"
                 (object_directory / "info").mkdir(parents=True, mode=0o700)
                 (object_directory / "pack").mkdir(mode=0o700)
+                info_directory = git_directory / "info"
+                info_directory.mkdir(mode=0o700)
                 (git_directory / "refs" / "heads").mkdir(parents=True, mode=0o700)
                 (git_directory / "refs" / "tags").mkdir(parents=True, mode=0o700)
                 object_format = "sha256" if len(head) == 64 else "sha1"
@@ -995,22 +1491,41 @@ class ChangePreviewMixin:
                         "ascii"
                     )
                 head_content = f"{head}\n".encode("ascii")
+                attributes_content = b"* -filter\n"
                 (git_directory / "config").write_bytes(config_content)
                 (git_directory / "HEAD").write_bytes(head_content)
-                self._snapshot_object_database(common, object_directory, len(head))
+                (info_directory / "attributes").write_bytes(attributes_content)
+                object_database = self._snapshot_object_database(
+                    common, object_directory, len(head)
+                )
+                object_database, attribute_source = self._add_empty_tree_object(
+                    object_directory, object_database
+                )
                 index_digest = self._index_snapshot(attempt_id, common, git_directory)
-                fingerprint, directory_identity = self._isolated_git_fingerprint(
-                    git_directory, config_content, head_content, index_digest
+                fingerprint, directory_identity, scratch_signature = self._isolated_git_fingerprint(
+                    git_directory,
+                    config_content,
+                    head_content,
+                    attributes_content,
+                    index_digest,
+                    scratch_directory,
+                    scratch_identity,
                 )
                 yield (
                     _IsolatedGitContext(
                         git_directory=git_directory,
                         common_directory=git_directory,
                         directory_identity=directory_identity,
+                        scratch_directory=scratch_directory,
+                        scratch_directory_identity=scratch_identity,
+                        scratch_directory_signature=scratch_signature,
                         metadata_fingerprint=fingerprint,
                         config_content=config_content,
                         head_content=head_content,
+                        attributes_content=attributes_content,
                         index_digest=index_digest,
+                        attribute_source=attribute_source,
+                        object_database=object_database,
                     ),
                     index_digest,
                 )

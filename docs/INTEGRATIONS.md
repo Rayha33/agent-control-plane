@@ -263,10 +263,13 @@ available only through an external alternate therefore fail closed. A snapshot w
 directories are incrementally capped at 1,024 entries. It does not load
 repository/worktree/global/system Git config,
 configured filters, external excludes files, `.git/info/exclude`, or external attribute
-files. Consequently, a path excluded only through those settings can appear in the preview,
-and paths marked with a filter attribute may be conservatively reported as modified. This
-intentionally favors a bounded, non-executing inventory over exact parity with a user's
-normal `git status` configuration.
+files. Attribute lookup is pinned to a generated empty tree using Git's
+`--attr-source=<tree-ish>` option, and the isolated Git metadata contains a guarded
+`info/attributes` file that unsets `filter`. Git versions without `--attr-source` fail
+closed. Consequently, a path excluded only through those settings can appear in the
+preview, and paths marked with a filter attribute may be conservatively reported as
+modified. This intentionally favors a bounded, non-executing inventory over exact parity
+with a user's normal `git status` configuration.
 
 Live worktrees can change during inspection. `stable: false` means HEAD, index, or the
 path/status inventory changed between observations; even `stable: true` is best-effort,
@@ -281,12 +284,20 @@ fsmonitor disabled, external attribute files ignored, and submodule traversal su
 The scratch repository is created under `/tmp` rather than honoring `TMPDIR`, `TMP`, or
 `TEMP`, so caller-controlled temporary-directory settings cannot write metadata into the
 attempt being inspected.
-Repository and worktree Git config are not loaded, so a concurrent filter/config update
-cannot introduce a clean/process/smudge command during inspection. The index is copied via
-no-follow reads into temporary metadata and checked again afterward; a changing HEAD,
-index, status inventory, or allocated worktree makes the result unstable or fails closed.
-The isolated Git config, HEAD, copied index, and empty alternates/ref directories are
-fingerprinted around every Git invocation; unexpected scratch-metadata mutation fails closed.
+Repository and worktree Git config are not loaded, so changes there cannot supply preview
+settings or filter executables. Git uses fixed command-line overrides and isolated scratch
+metadata. The index is copied via no-follow reads into temporary metadata and checked again
+afterward; a changing HEAD, index, status inventory, or allocated worktree makes the result
+unstable or fails closed.
+The isolated Git config, HEAD, guarded `info/attributes`, copied index, scratch-parent
+identity/signature, and empty alternates/ref directories are fingerprinted around every
+Git invocation. Immediately before exec, the pinned-worktree launcher rechecks the scratch
+parent and Git-directory identities, config digest, and filter guard, so a scratch-config
+or attribute change in the launch window is rejected before Git runs. The copied object
+store is checked against its copy-time file inventory; file bytes are compared while
+copying, the trusted empty-tree attribute source is added to that inventory, and the
+complete object-file signature inventory is rechecked before returning. Unexpected
+scratch-parent swaps, injected objects, or other metadata changes fail closed.
 An active index lock or index snapshot beyond the bounded per-file/aggregate size limits
 fails closed. The temporary metadata is removed at the end. The preview does not create
 Git locks or touch refs, index entries, worktree files, ACP rows, or audit events.

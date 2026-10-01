@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -649,6 +650,134 @@ def test_preview_fails_closed_if_scratch_git_config_changes_during_status(
         GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
 
     assert injected
+
+
+def test_preview_does_not_execute_filter_from_raced_scratch_metadata(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    marker = repo.parent / f"raced-filter-executed-{attempt['id']}"
+    (worktree / ".gitattributes").write_text("alpha.txt filter=raced\n", encoding="utf-8")
+    git(worktree, "add", ".gitattributes")
+    tracked = worktree / "alpha.txt"
+    metadata = tracked.stat()
+    tracked.write_bytes(b"x" * len(tracked.read_bytes()))
+    os.utime(tracked, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    original_popen = change_preview_module.subprocess.Popen
+    injected = False
+
+    def inject_filter_before_git(command: list[str], *args, **kwargs):
+        nonlocal injected
+        if not injected and "status" in command:
+            injected = True
+            git_directory = Path(kwargs["env"]["GIT_DIR"])
+            with (git_directory / "config").open("ab") as config_file:
+                config_file.write(
+                    f'\n[filter "raced"]\n\tclean = touch {marker}\n\trequired = true\n'.encode()
+                )
+            (git_directory / "info" / "attributes").write_bytes(b"alpha.txt filter=raced\n")
+            assert any(argument.startswith("--attr-source=") for argument in command)
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(change_preview_module.subprocess, "Popen", inject_filter_before_git)
+
+    with pytest.raises(SupervisorError, match="isolated Git metadata changed"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert injected
+    assert not marker.exists(), "untrusted filter executed before scratch config was rejected"
+
+
+def test_preview_fails_closed_if_scratch_object_is_injected_during_git(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    original_popen = change_preview_module.subprocess.Popen
+    injected = False
+
+    def inject_loose_object(command: list[str], *args, **kwargs):
+        nonlocal injected
+        if not injected and "status" in command:
+            injected = True
+            object_directory = Path(kwargs["env"]["GIT_DIR"]) / "objects"
+            prefix = next(
+                f"{value:02x}"
+                for value in range(256)
+                if not (object_directory / f"{value:02x}").exists()
+            )
+            shard = object_directory / prefix
+            shard.mkdir()
+            (shard / ("0" * 38)).write_bytes(b"injected unreferenced object")
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(change_preview_module.subprocess, "Popen", inject_loose_object)
+
+    with pytest.raises(SupervisorError, match="isolated Git"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert injected
+
+
+def test_preview_fails_closed_if_scratch_parent_is_swapped_around_git(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    original_popen = change_preview_module.subprocess.Popen
+    swapped = False
+
+    class FinishedProcess:
+        def __init__(self, process, restore) -> None:
+            self._process = process
+            self._restore = restore
+            self.stdout = process.stdout
+
+        @property
+        def returncode(self) -> int | None:
+            return self._process.returncode
+
+        def poll(self) -> int | None:
+            return self._process.poll()
+
+        def wait(self, timeout: float | None = None) -> int:
+            result = self._process.wait(timeout)
+            self._restore()
+            return result
+
+        def kill(self) -> None:
+            self._process.kill()
+
+    def swap_parent_during_status(command: list[str], *args, **kwargs):
+        nonlocal swapped
+        if not swapped and "status" in command:
+            swapped = True
+            scratch_parent = Path(kwargs["env"]["GIT_DIR"]).parent
+            saved_parent = scratch_parent.with_name(f"{scratch_parent.name}-saved")
+            replacement_parent = scratch_parent.with_name(f"{scratch_parent.name}-replacement")
+            shutil.copytree(scratch_parent, replacement_parent)
+            os.rename(scratch_parent, saved_parent)
+            os.rename(replacement_parent, scratch_parent)
+
+            def restore() -> None:
+                if scratch_parent.exists():
+                    os.rename(scratch_parent, replacement_parent)
+                os.rename(saved_parent, scratch_parent)
+                shutil.rmtree(replacement_parent, ignore_errors=True)
+
+            try:
+                child = original_popen(command, *args, **kwargs)
+            except Exception:
+                restore()
+                raise
+            return FinishedProcess(child, restore)
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(change_preview_module.subprocess, "Popen", swap_parent_during_status)
+
+    with pytest.raises(SupervisorError, match="isolated Git"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert swapped
 
 
 def test_preview_fails_closed_for_missing_worktree_and_invalid_start_ref(repo: Path) -> None:
