@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from support import init_repo, make_task
+from support import init_repo, make_task, state_fingerprint
 
 from agent_control_plane import mcp_server
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
@@ -31,6 +31,7 @@ from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
 WRITE_METHODS = {
     "claim",
     "heartbeat",
+    "post_message",
     "submit",
     "run_qc",
     "integrate",
@@ -124,7 +125,14 @@ def test_no_tool_reaches_a_method_that_takes_a_credential() -> None:
 
 
 def test_no_write_tool_is_exposed(repo: Path) -> None:
-    for name in ("acp_claim", "acp_submit", "acp_heartbeat", "acp_integrate", "acp_gc"):
+    for name in (
+        "acp_claim",
+        "acp_submit",
+        "acp_heartbeat",
+        "acp_message_send",
+        "acp_integrate",
+        "acp_gc",
+    ):
         assert body(call(repo, name))["error"] == "unknown_tool"
 
 
@@ -160,6 +168,33 @@ def test_a_real_query_returns_real_data(repo: Path) -> None:
 
     assert result["isError"] is False
     assert body(result)["id"] == created["id"]
+
+
+def test_inbox_is_read_only_and_labels_agent_text_untrusted(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    sender = supervisor.enroll_runner("sender", "worker")
+    recipient = supervisor.enroll_runner("recipient", "worker")
+    source_task = make_task(supervisor, "alpha.txt", title="source task")
+    target_task = make_task(supervisor, "beta.txt", title="target task")
+    source = supervisor.claim(source_task["id"], "sender", credential=sender["credential"])
+    target = supervisor.claim(target_task["id"], "recipient", credential=recipient["credential"])
+    posted = supervisor.post_message(
+        source["id"],
+        source["claim_token"],
+        "Review the serializer change in this commit.",
+        kind="handoff",
+        recipient_attempt_id=target["id"],
+        credential=sender["credential"],
+    )
+    before = state_fingerprint(supervisor)
+
+    result = call(repo, "acp_inbox", {"attempt_id": target["id"], "limit": 5})
+
+    assert result["isError"] is False
+    inbox = body(result)
+    assert inbox["messages"] == [posted]
+    assert inbox["content_trust"] == "untrusted_agent_content"
+    assert state_fingerprint(supervisor) == before
 
 
 def test_the_bundle_tool_cannot_be_used_to_read_other_files(repo: Path) -> None:

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_control_plane import cli
+from agent_control_plane.git_supervisor import GitSupervisor
 from agent_control_plane.trust_bundles import install_bundle
 
 
@@ -401,3 +402,53 @@ def test_cli_reviewers_ratify_and_bundle(tmp_path: Path) -> None:
     bundle = json.loads(run_cli(repo, "bundle", review["id"]).stdout)
     assert bundle["signature_valid"] is True
     assert bundle["bundle"]["commit_sha"] == submission["commit_sha"]
+
+
+def test_cli_message_send_uses_private_credential_file_and_lists_inbox(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    supervisor = GitSupervisor(repo)
+    runner = supervisor.enroll_runner("message-worker", "worker")
+    task = _add(repo, "message task", "owned.txt")
+    attempt = supervisor.claim(task["id"], "message-worker", credential=runner["credential"])
+    credential_file = tmp_path / "runner-credential"
+    credential_file.write_text(runner["credential"], encoding="utf-8")
+    credential_file.chmod(0o600)
+
+    sent = run_cli(
+        repo,
+        "message",
+        "send",
+        attempt["id"],
+        "--token",
+        str(attempt["claim_token"]),
+        "--kind",
+        "checkpoint",
+        "--text",
+        "serializer path is the next check",
+        "--credential-file",
+        str(credential_file),
+    )
+    assert sent.returncode == 0, sent.stderr
+    posted = json.loads(sent.stdout)
+
+    listed = run_cli(repo, "message", "list", "--attempt", attempt["id"])
+    assert listed.returncode == 0, listed.stderr
+    inbox = json.loads(listed.stdout)
+    assert inbox["messages"] == [posted]
+    assert inbox["messages"][0]["body"] == "serializer path is the next check"
+
+
+def test_cli_message_list_opens_supervisor_read_only(tmp_path: Path, monkeypatch) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "read-only inbox", "owned.txt")
+    attempt = GitSupervisor(repo).claim(task["id"], "inbox-reader")
+    original_supervisor = cli.GitSupervisor
+    read_only_modes: list[bool] = []
+
+    def recording_supervisor(*args, **kwargs):
+        read_only_modes.append(kwargs.get("read_only", False))
+        return original_supervisor(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "GitSupervisor", recording_supervisor)
+    assert cli.main(["--repo", str(repo), "message", "list", "--attempt", attempt["id"]]) == 0
+    assert read_only_modes == [True]

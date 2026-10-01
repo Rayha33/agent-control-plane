@@ -45,7 +45,8 @@ Two deliberate absences. `list` reaps: `list_tasks()` calls `reap_expired()`, wh
 ARCHITECTURE.md 1b describes as the intended difference between it and `plan`/`queue`/
 `merge-plan`/`status` — so it is a mutating command that happens to print a listing.
 `doctor` is what an operator runs when the database needs upgrading, so it has to be
-able to open one in order to say so.
+able to open one in order to say so. `message list` is read-only even though the
+sibling `message send` action writes.
 """
 
 
@@ -290,6 +291,25 @@ def parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--checkpoint", default="{}")
     heartbeat.add_argument("--lease-seconds", type=int)
     add_credential_source(heartbeat)
+    message = commands.add_parser("message", help="send or read durable cross-worktree messages")
+    message_actions = message.add_subparsers(dest="message_action", required=True)
+    message_send = message_actions.add_parser("send", help="append an authenticated message")
+    message_send.add_argument("attempt_id")
+    message_send.add_argument("--token", type=int, required=True, dest="claim_token")
+    message_send.add_argument("--text", required=True)
+    message_send.add_argument(
+        "--kind",
+        choices=("finding", "blocker", "handoff", "question", "checkpoint"),
+        default="checkpoint",
+    )
+    message_send.add_argument("--to", dest="recipient_attempt_id")
+    add_credential_source(message_send)
+    message_list = message_actions.add_parser(
+        "list", help="read broadcasts and messages for an attempt"
+    )
+    message_list.add_argument("--attempt", required=True, dest="attempt_id")
+    message_list.add_argument("--after", type=int, default=0, dest="after_sequence")
+    message_list.add_argument("--limit", type=int, default=50)
     submit = commands.add_parser("submit", help="submit committed Git evidence")
     submit.add_argument("attempt_id")
     submit.add_argument("--token", type=int, required=True, dest="claim_token")
@@ -630,10 +650,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = _run_trust_helper(args)
             emit(result)
             return 0
+        read_only = args.action in READ_ONLY_ACTIONS or (
+            args.action == "message" and args.message_action == "list"
+        )
         supervisor = GitSupervisor(
             args.repo,
             diagnostic=args.action == "doctor",
-            read_only=args.action in READ_ONLY_ACTIONS,
+            read_only=read_only,
         )
         if args.action == "doctor":
             result = supervisor.doctor()
@@ -773,6 +796,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.lease_seconds,
                 _read_credential(args),
             )
+        elif args.action == "message":
+            if args.message_action == "send":
+                result = supervisor.post_message(
+                    args.attempt_id,
+                    args.claim_token,
+                    args.text,
+                    kind=args.kind,
+                    recipient_attempt_id=args.recipient_attempt_id,
+                    credential=_read_credential(args),
+                )
+            else:
+                result = supervisor.list_messages(
+                    args.attempt_id,
+                    after_sequence=args.after_sequence,
+                    limit=args.limit,
+                )
         elif args.action == "submit":
             result = supervisor.submit(args.attempt_id, args.claim_token, _read_credential(args))
         elif args.action == "qc":

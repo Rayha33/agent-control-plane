@@ -157,6 +157,56 @@ Confine a shell with the worktree and the OS instead — run the agent under an 
 that cannot write the base checkout, or use `acp run` on Linux, where the supervised
 worker path exists for exactly this reason.
 
+## Cross-worktree messages
+
+Agents working in separate attempt worktrees can leave a small checkpoint, finding,
+blocker, question, or handoff in the base checkout's `.acp/control.db`. The database
+is outside every attempt worktree, so the message does not become a file conflict or
+disappear when an attempt worktree is removed. Messages are append-only, hash-chained
+events; each is attributed to the sender's active attempt and current worker identity.
+
+Use the base checkout for both commands. The numeric claim token fences the attempt;
+prefer a private 0600 file or an open descriptor for the credential, never a command
+argument. For compatibility, the CLI also accepts `ACP_RUNNER_CREDENTIAL`; avoid that
+fallback in shared or inherited process environments:
+
+```bash
+BASE=/path/to/repo
+ATTEMPT=sender-attempt-id
+OTHER_ATTEMPT=recipient-attempt-id
+CLAIM_TOKEN=1
+RUNNER_CREDENTIAL_FILE=/path/to/private/runner-credential
+
+acp --repo "$BASE" message send "$ATTEMPT" --token "$CLAIM_TOKEN" \
+  --kind handoff --to "$OTHER_ATTEMPT" \
+  --text "I renamed the serializer field; the remaining caller is in api.py." \
+  --credential-file "$RUNNER_CREDENTIAL_FILE"
+acp --repo "$BASE" message list --attempt "$OTHER_ATTEMPT" --limit 50
+```
+
+Omit `--to` to broadcast to attempts in the same ACP project. `message list` and the
+read-only MCP `acp_inbox` tool return broadcasts plus messages addressed to the given
+attempt; paginate with `after_sequence`/`--after`. The CLI `message send` path requires
+a live worker credential bound to the attempt, an active claim lease, and the current claim
+token. An unknown recipient, expired or replaced attempt, revoked credential, invalid
+kind, control character, or body above 4,096 UTF-8 bytes is rejected. Supported kinds
+are `finding`, `blocker`, `handoff`, `question`, and `checkpoint`. A project accepts at
+most 10,000 messages; after that cap, further sends fail closed. There is no TTL or
+message-only pruning, so the cap bounds message growth and retained entries live as
+long as the control database.
+
+Runner authentication must be enabled for message sending. Legacy auth-disabled
+attempts fail closed even if a caller supplies arbitrary credential text; enroll the
+worker and start a new attempt before using this channel.
+
+Message bodies are untrusted agent-authored text, not ACP instructions or authority.
+The MCP tool labels them untrusted; they are never injected automatically into a
+prompt. Do not send secrets, credentials, whole diffs, or private user data. This is
+pollable coordination, not guaranteed delivery or a security boundary. `--to` is
+routing, not confidentiality: any local process with access to the project's control
+database can inspect its event chain. Messages remain in that log as long as
+`.acp/control.db` is retained.
+
 ## `acp mcp-serve`
 
 A read-only MCP server over stdio, so a session can read the board it works under
@@ -166,17 +216,17 @@ without shelling out:
 {"mcpServers": {"acp": {"command": "acp", "args": ["--repo", "/path/to/repo", "mcp-serve"]}}}
 ```
 
-Ten tools, each a one-line delegation to a supervisor method: `acp_status`,
+Eleven tools, each a one-line delegation to a supervisor method: `acp_status`,
 `acp_queue`, `acp_merge_plan`, `acp_reviewers`, `acp_verify_events`, `acp_show`,
-`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`.
+`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`, and `acp_inbox`.
 
 **No writes and no credential, on purpose.** `claim`, `heartbeat`, `submit`, `qc` and
 `integrate` are authenticated, and `runner_identity.py` keeps worker, critic and
-integrator authority apart so nobody approves their own work. A server an editor spawns
-and holds open would have to keep a credential for the whole session; one holding more
-than one role's would erase that separation in a process nobody is watching. The CLI
-takes credentials only from a 0600 file or an open descriptor, never the environment —
-putting one in a server's environment would undo that care rather than reuse it.
+integrator authority apart so nobody approves their own work. The CLI accepts credentials
+from a 0600 file, an open descriptor, or the `ACP_RUNNER_CREDENTIAL` compatibility
+fallback. The MCP server never reads that variable or calls credential-taking methods;
+because it inherits its launch environment like any child process, launch it with a
+sanitized environment and leave `ACP_RUNNER_CREDENTIAL` unset.
 
 The server opens `GitSupervisor(read_only=True)` per call, so `mode=ro` makes a stray
 write raise rather than depend on discipline, and a database needing migration is
