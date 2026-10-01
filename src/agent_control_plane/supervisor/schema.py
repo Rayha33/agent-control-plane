@@ -242,6 +242,8 @@ CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, number DESC);
 CREATE INDEX IF NOT EXISTS idx_submissions_task ON submissions(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runtime_allocations_attempt
   ON runtime_allocations(attempt_id);
+CREATE INDEX IF NOT EXISTS idx_events_type_sequence
+  ON events(event_type, sequence);
 """
 
 

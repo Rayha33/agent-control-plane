@@ -290,6 +290,25 @@ def parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--checkpoint", default="{}")
     heartbeat.add_argument("--lease-seconds", type=int)
     add_credential_source(heartbeat)
+    message = commands.add_parser("message", help="send or read durable cross-worktree messages")
+    message_actions = message.add_subparsers(dest="message_action", required=True)
+    message_send = message_actions.add_parser("send", help="append an authenticated message")
+    message_send.add_argument("attempt_id")
+    message_send.add_argument("--token", type=int, required=True, dest="claim_token")
+    message_send.add_argument("--text", required=True)
+    message_send.add_argument(
+        "--kind",
+        choices=("finding", "blocker", "handoff", "question", "checkpoint"),
+        default="checkpoint",
+    )
+    message_send.add_argument("--to", dest="recipient_attempt_id")
+    add_credential_source(message_send)
+    message_list = message_actions.add_parser(
+        "list", help="read broadcasts and messages for an attempt"
+    )
+    message_list.add_argument("--attempt", required=True, dest="attempt_id")
+    message_list.add_argument("--after", type=int, default=0, dest="after_sequence")
+    message_list.add_argument("--limit", type=int, default=50)
     submit = commands.add_parser("submit", help="submit committed Git evidence")
     submit.add_argument("attempt_id")
     submit.add_argument("--token", type=int, required=True, dest="claim_token")
@@ -773,6 +792,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.lease_seconds,
                 _read_credential(args),
             )
+        elif args.action == "message":
+            if args.message_action == "send":
+                result = supervisor.post_message(
+                    args.attempt_id,
+                    args.claim_token,
+                    args.text,
+                    kind=args.kind,
+                    recipient_attempt_id=args.recipient_attempt_id,
+                    credential=_read_credential(args),
+                )
+            else:
+                result = supervisor.list_messages(
+                    args.attempt_id,
+                    after_sequence=args.after_sequence,
+                    limit=args.limit,
+                )
         elif args.action == "submit":
             result = supervisor.submit(args.attempt_id, args.claim_token, _read_credential(args))
         elif args.action == "qc":

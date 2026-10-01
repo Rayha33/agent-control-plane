@@ -163,6 +163,7 @@ from .supervisor.config import (
 )
 from .supervisor.identity import IdentityMixin
 from .supervisor.integration import IntegrationMixin
+from .supervisor.messaging import MessagingMixin
 from .supervisor.process import ProcessMixin
 from .supervisor.qc import QcMixin
 from .supervisor.reaper import ReaperMixin
@@ -260,6 +261,7 @@ class GitSupervisor(
     RuntimeMixin,
     QcMixin,
     ClaimsMixin,
+    MessagingMixin,
     ReaperMixin,
     IntegrationMixin,
 ):

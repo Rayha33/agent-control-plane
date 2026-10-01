@@ -93,9 +93,15 @@ class StoreMixin:
         )
 
     def verify_event_chain(self) -> dict[str, Any]:
-        previous = GENESIS_HASH
         with self.connect() as connection:
-            rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
+            return self._verify_event_chain_in(connection)
+
+    @staticmethod
+    def _verify_event_chain_in(connection: sqlite3.Connection) -> dict[str, Any]:
+        """Verify one already-open database snapshot without changing its boundary."""
+
+        previous = GENESIS_HASH
+        rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
         for row in rows:
             try:
                 payload = json.loads(row["payload_json"])
