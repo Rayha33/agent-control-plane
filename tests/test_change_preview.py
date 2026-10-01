@@ -207,6 +207,97 @@ def test_preview_disables_external_diff_textconv_pager_and_fsmonitor_commands(re
     assert not worktree_filter_marker.exists()
 
 
+def test_preview_isolates_late_filter_config_added_before_status(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    marker = repo.parent / f"late-filter-ran-{attempt['id']}"
+    excluded_path = "late-external-exclude.txt"
+    external_excludes = repo.parent / f"late-excludes-{attempt['id']}"
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    original = GitSupervisor._working_tree_status
+    injected = False
+
+    def add_filter_then_status(self, path: Path, **kwargs) -> list[dict[str, str]]:
+        nonlocal injected
+        if not injected:
+            injected = True
+            (worktree / ".gitattributes").write_text(
+                "alpha.txt filter=late-race\n", encoding="utf-8"
+            )
+            (worktree / "alpha.txt").write_text("changed while preview starts\n", encoding="utf-8")
+            git(
+                worktree,
+                "config",
+                "--worktree",
+                "filter.late-race.clean",
+                f"touch {marker}",
+            )
+            git(worktree, "config", "--worktree", "filter.late-race.required", "true")
+            external_excludes.write_text(f"/{excluded_path}\n", encoding="utf-8")
+            git(
+                worktree,
+                "config",
+                "--worktree",
+                "core.excludesFile",
+                str(external_excludes),
+            )
+            (worktree / excluded_path).write_text("must stay visible\n", encoding="utf-8")
+        return original(self, path, **kwargs)
+
+    monkeypatch.setattr(GitSupervisor, "_working_tree_status", add_filter_then_status)
+
+    preview = GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert injected
+    assert not marker.exists()
+    assert preview["git_config_isolated"] is True
+    assert {item["path"] for item in preview["working_tree"]["paths"]} >= {
+        "alpha.txt",
+        ".gitattributes",
+        excluded_path,
+    }
+
+
+def test_preview_does_not_apply_external_excludes_file(repo: Path) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    excluded_path = "listed-despite-external-exclude.txt"
+    external_excludes = repo.parent / f"external-excludes-{attempt['id']}"
+    external_excludes.write_text(f"/{excluded_path}\n", encoding="utf-8")
+    git(repo, "config", "core.excludesFile", str(external_excludes))
+    info_excluded_path = "listed-despite-repository-info-exclude.txt"
+    info_exclude = repo / ".git" / "info" / "exclude"
+    info_exclude.write_text(f"/{info_excluded_path}\n", encoding="utf-8")
+    (worktree / excluded_path).write_text("path name only\n", encoding="utf-8")
+    (worktree / info_excluded_path).write_text("path name only\n", encoding="utf-8")
+
+    preview = GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    paths = {item["path"] for item in preview["working_tree"]["paths"]}
+    assert excluded_path in paths
+    assert info_excluded_path in paths
+
+
+def test_preview_does_not_apply_default_home_excludes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    fake_home = repo.parent / f"home-{attempt['id']}"
+    global_ignore = fake_home / ".config" / "git" / "ignore"
+    global_ignore.parent.mkdir(parents=True)
+    excluded_path = "listed-despite-home-ignore.txt"
+    global_ignore.write_text(f"/{excluded_path}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(fake_home))
+    (worktree / excluded_path).write_text("path name only\n", encoding="utf-8")
+
+    preview = GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert excluded_path in {item["path"] for item in preview["working_tree"]["paths"]}
+
+
 def test_preview_lists_symlinks_without_traversing_their_targets(repo: Path) -> None:
     _supervisor, attempt = make_attempt(repo)
     worktree = Path(attempt["worktree"])
@@ -262,7 +353,7 @@ def test_preview_rejects_git_marker_escape_before_invoking_git_on_attempt(
         GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
 
 
-def test_preview_refuses_external_git_config_includes(repo: Path) -> None:
+def test_preview_ignores_external_git_config_includes(repo: Path) -> None:
     _supervisor, attempt = make_attempt(repo)
     worktree = Path(attempt["worktree"])
     marker = repo.parent / f"included-config-command-{attempt['id']}"
@@ -275,10 +366,11 @@ def test_preview_refuses_external_git_config_includes(repo: Path) -> None:
     (worktree / "alpha.txt").write_text("changed\n", encoding="utf-8")
     git(repo, "config", "include.path", str(included_config))
 
-    with pytest.raises(SupervisorError, match="config includes are not supported"):
-        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+    preview = GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
 
     assert not marker.exists()
+    assert preview["git_config_isolated"] is True
+    assert "alpha.txt" in {item["path"] for item in preview["working_tree"]["paths"]}
 
 
 def test_preview_marks_racing_worktree_unstable(
@@ -293,14 +385,12 @@ def test_preview_marks_racing_worktree_unstable(
         worktree: Path,
         *,
         expected_identity: tuple[int, int] | None = None,
-        config_overrides: list[str] | tuple[str, ...] = (),
         git_context: tuple[Path, Path] | None = None,
     ) -> list[dict[str, str]]:
         nonlocal calls
         result = original(
             worktree,
             expected_identity=expected_identity,
-            config_overrides=config_overrides,
             git_context=git_context,
         )
         calls += 1
@@ -309,6 +399,40 @@ def test_preview_marks_racing_worktree_unstable(
         return result
 
     monkeypatch.setattr(read_only, "_working_tree_status", change_after_first_snapshot)
+
+    preview = read_only.change_preview(attempt["id"])
+
+    assert preview["stable"] is False
+    assert preview["stability"] == "unstable"
+
+
+def test_preview_marks_index_only_change_unstable(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    read_only = GitSupervisor(repo, read_only=True)
+    original = read_only._working_tree_status
+    calls = 0
+
+    def change_index_after_first_snapshot(
+        path: Path,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+        git_context: tuple[Path, Path] | None = None,
+    ) -> list[dict[str, str]]:
+        nonlocal calls
+        result = original(
+            path,
+            expected_identity=expected_identity,
+            git_context=git_context,
+        )
+        calls += 1
+        if calls == 1:
+            git(worktree, "update-index", "--assume-unchanged", "alpha.txt")
+        return result
+
+    monkeypatch.setattr(read_only, "_working_tree_status", change_index_after_first_snapshot)
 
     preview = read_only.change_preview(attempt["id"])
 

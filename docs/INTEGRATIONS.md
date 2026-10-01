@@ -252,23 +252,32 @@ The preview separates committed path/status changes from the current index/workt
 untracked path names. It reports the attempt's start SHA, the HEAD observed before and
 after the scan, and per-status path counts. Output is path metadata only: no file contents,
 line-level diff, credential, or claim token. Lists are capped at 1,000 paths per section;
-counts still cover all paths and `paths_truncated` identifies a capped list. The result's
-`filter_drivers_disabled` count shows how many configured Git filter drivers were disabled;
-filtered paths may therefore be conservatively marked modified, so this is not guaranteed
-to match normal `git status` semantics.
+counts still cover all paths and `paths_truncated` identifies a capped list. Git reads the
+captured index in a disposable metadata directory whose only object source is the ACP
+repository's object store. It does not load repository/worktree/global/system Git config,
+configured filters, external excludes files, `.git/info/exclude`, or external attribute
+files. Consequently, a path excluded only through those settings can appear in the preview,
+and paths marked with a filter attribute may be conservatively reported as modified. This
+intentionally favors a bounded, non-executing inventory over exact parity with a user's
+normal `git status` configuration.
 
-Live worktrees can change during inspection. `stable: false` means HEAD or the path/status
-inventory changed between observations; even `stable: true` is best-effort, not a snapshot
-guarantee (content can change without changing the observed path/status set). Treat the
-displayed file and directory names as potentially sensitive. This view does not make an
-uncommitted file safe to reuse and does not authorize checkout, cherry-pick, copy, or merge.
+Live worktrees can change during inspection. `stable: false` means HEAD, index, or the
+path/status inventory changed between observations; even `stable: true` is best-effort,
+not a snapshot guarantee (content can change without changing the observed path/status set).
+Treat the displayed file and directory names as potentially sensitive. This view does not
+make an uncommitted file safe to reuse and does not authorize checkout, cherry-pick, copy,
+or merge.
 
 The CLI and `acp_changes` MCP tool call the same supervisor method on a `mode=ro` database.
 Git is invoked with optional index writes disabled, external diff/textconv/pager and
-repository filter commands disabled, external attribute files ignored, and submodule
-traversal suppressed. Repositories with local Git config includes fail closed rather than
-loading external configuration. The preview does not create Git locks or
-touch refs, index entries, worktree files, ACP rows, or audit events.
+fsmonitor disabled, external attribute files ignored, and submodule traversal suppressed.
+Repository and worktree Git config are not loaded, so a concurrent filter/config update
+cannot introduce a clean/process/smudge command during inspection. The index is copied via
+no-follow reads into temporary metadata and checked again afterward; a changing HEAD,
+index, status inventory, or allocated worktree makes the result unstable or fails closed.
+An active index lock or index snapshot beyond the bounded per-file/aggregate size limits
+fails closed. The temporary metadata is removed at the end. The preview does not create
+Git locks or touch refs, index entries, worktree files, ACP rows, or audit events.
 
 ### What this does not do yet
 
