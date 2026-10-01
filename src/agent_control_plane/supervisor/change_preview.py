@@ -5,14 +5,17 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import selectors
 import stat
 import subprocess
 import sys as _sys
 import tempfile
+import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +28,10 @@ _MAX_RETURNED_PATHS = 1000
 _MAX_INDEX_FILE_BYTES = 64 * 1024 * 1024
 _MAX_INDEX_TOTAL_BYTES = 128 * 1024 * 1024
 _MAX_INDEX_FILES = 128
+_MAX_INDEX_DIRECTORY_ENTRIES = 1024
 _MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024
+_MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
+_MAX_INVENTORY_RECORDS = 10_000
 _MAX_OBJECT_FILES = 250_000
 _MAX_OBJECT_SNAPSHOT_BYTES = 1024 * 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 30
@@ -35,6 +41,17 @@ _EXEC_GIT_FROM_DIR_FD = (
     "import os,sys; fd=int(sys.argv[1]); executable=sys.argv[2]; "
     "os.fchdir(fd); os.execve(executable, [executable, *sys.argv[3:]], os.environ)"
 )
+
+
+@dataclass(frozen=True)
+class _IsolatedGitContext:
+    git_directory: Path
+    common_directory: Path
+    directory_identity: tuple[int, int]
+    metadata_fingerprint: str
+    config_content: bytes
+    head_content: bytes
+    index_digest: str
 
 
 class ChangePreviewMixin:
@@ -86,10 +103,9 @@ class ChangePreviewMixin:
             raise SupervisorError("change_preview_incomplete", "attempt start revision is invalid")
 
         with self._isolated_git_metadata(attempt_id, attempt_common, head_before) as (
-            git_directory,
+            git_context,
             initial_index_digest,
         ):
-            git_context = (git_directory, git_directory)
             start_sha = self._resolve_preview_commit(
                 worktree,
                 start_sha,
@@ -257,7 +273,7 @@ class ChangePreviewMixin:
         worktree: Path,
         *arguments: str,
         expected_identity: tuple[int, int] | None = None,
-        git_context: tuple[Path, Path] | None = None,
+        git_context: _IsolatedGitContext | None = None,
     ) -> bytes:
         git = str(self._system_git_executable(self.root))
         command = [
@@ -278,11 +294,10 @@ class ChangePreviewMixin:
         ]
         environment = self._git_environment()
         if git_context is not None:
-            admin_directory, common_directory = git_context
             environment.update(
                 {
-                    "GIT_DIR": str(admin_directory),
-                    "GIT_COMMON_DIR": str(common_directory),
+                    "GIT_DIR": str(git_context.git_directory),
+                    "GIT_COMMON_DIR": str(git_context.common_directory),
                     "GIT_WORK_TREE": str(worktree),
                 }
             )
@@ -319,6 +334,10 @@ class ChangePreviewMixin:
                     "change_preview_incomplete", "attempt worktree changed or became unsafe"
                 )
             environment["GIT_WORK_TREE"] = "."
+        if git_context is not None:
+            self._assert_isolated_git_metadata(git_context)
+        process: subprocess.Popen[bytes] | None = None
+        selector: selectors.BaseSelector | None = None
         try:
             if worktree_fd is None:
                 command.extend(["-C", str(worktree), *arguments])
@@ -337,20 +356,56 @@ class ChangePreviewMixin:
                     *command[1:],
                     *arguments,
                 ]
-            result = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=self.root,
                 env=environment,
-                capture_output=True,
-                timeout=_GIT_TIMEOUT_SECONDS,
-                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 pass_fds=(worktree_fd,) if worktree_fd is not None else (),
             )
+            if process.stdout is None:
+                raise OSError("Git stdout pipe was not created")
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+            output = bytearray()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise subprocess.TimeoutExpired(command, _GIT_TIMEOUT_SECONDS)
+                chunk = os.read(
+                    process.stdout.fileno(),
+                    min(1024 * 1024, _MAX_GIT_OUTPUT_BYTES + 1 - len(output)),
+                )
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > _MAX_GIT_OUTPUT_BYTES:
+                    raise SupervisorError(
+                        "change_preview_incomplete", "Git output exceeds the safe byte limit"
+                    )
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            return_code = process.returncode
+        except SupervisorError:
+            raise
         except (OSError, subprocess.TimeoutExpired):
             raise SupervisorError(
                 "change_preview_incomplete", "Git could not read attempt metadata safely"
             ) from None
         finally:
+            if selector is not None:
+                selector.close()
+            if process is not None:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                if process.stdout is not None:
+                    process.stdout.close()
             if worktree_fd is not None:
                 os.close(worktree_fd)
         if expected_identity is not None and not self._preview_path_still_matches(
@@ -359,12 +414,14 @@ class ChangePreviewMixin:
             raise SupervisorError(
                 "change_preview_incomplete", "attempt worktree changed during inspection"
             )
-        if result.returncode:
+        if return_code:
             raise SupervisorError(
                 "change_preview_incomplete",
                 f"Git could not read attempt metadata (command {arguments[0]} failed)",
             )
-        return result.stdout
+        if git_context is not None:
+            self._assert_isolated_git_metadata(git_context)
+        return bytes(output)
 
     @staticmethod
     def _git_file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -533,7 +590,7 @@ class ChangePreviewMixin:
         digest = hashlib.sha256()
         total_bytes = 0
         try:
-            names = os.listdir(directory_fd)
+            names = cls._list_git_directory(directory_fd, _MAX_INDEX_DIRECTORY_ENTRIES)
             shared = sorted(name for name in names if _SHARED_INDEX.fullmatch(name))
             selected = ["index", *shared]
             if len(selected) > _MAX_INDEX_FILES or "index.lock" in names:
@@ -600,8 +657,130 @@ class ChangePreviewMixin:
         finally:
             os.close(directory_fd)
 
+    @classmethod
+    def _isolated_git_fingerprint(
+        cls,
+        git_directory: Path,
+        config_content: bytes,
+        head_content: bytes,
+        index_digest: str,
+        expected_directory_identity: tuple[int, int] | None = None,
+    ) -> tuple[str, tuple[int, int]]:
+        """Fingerprint and validate mutable scratch metadata used by Git commands."""
+
+        directory_fd = cls._open_git_directory(git_directory)
+        try:
+            directory_stat = os.fstat(directory_fd)
+            directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
+            if (
+                expected_directory_identity is not None
+                and directory_identity != expected_directory_identity
+            ):
+                raise OSError("isolated Git directory changed")
+            names = cls._list_git_directory(directory_fd, _MAX_INDEX_DIRECTORY_ENTRIES)
+            shared = sorted(name for name in names if _SHARED_INDEX.fullmatch(name))
+            selected = ["config", "HEAD", "index", *shared]
+            if any(name not in names for name in selected[:3]):
+                raise OSError("isolated Git metadata is incomplete")
+
+            digest = hashlib.sha256()
+            digest.update(repr(cls._git_file_signature(directory_stat)).encode("ascii"))
+            total_bytes = 0
+            actual_index_digest = hashlib.sha256()
+            for name in selected:
+                try:
+                    file_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=directory_fd,
+                    )
+                except OSError:
+                    raise OSError("isolated Git metadata is unsafe") from None
+                try:
+                    before = os.fstat(file_fd)
+                    max_bytes = 4096 if name in {"config", "HEAD"} else _MAX_INDEX_FILE_BYTES
+                    if (
+                        not stat.S_ISREG(before.st_mode)
+                        or before.st_size > max_bytes
+                        or total_bytes + before.st_size > _MAX_INDEX_TOTAL_BYTES + 8192
+                    ):
+                        raise OSError("isolated Git metadata exceeds safe limits")
+                    chunks: list[bytes] = []
+                    remaining = max_bytes + 1
+                    while remaining:
+                        chunk = os.read(file_fd, min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    content = b"".join(chunks)
+                    after = os.fstat(file_fd)
+                    signature = cls._git_file_signature(before)
+                    if len(content) > max_bytes or signature != cls._git_file_signature(after):
+                        raise OSError("isolated Git metadata changed during inspection")
+                finally:
+                    os.close(file_fd)
+                total_bytes += len(content)
+                if name == "config" and content != config_content:
+                    raise OSError("isolated Git config changed")
+                if name == "HEAD" and content != head_content:
+                    raise OSError("isolated Git HEAD changed")
+                if name == "index" or _SHARED_INDEX.fullmatch(name):
+                    actual_index_digest.update(name.encode("ascii") + b"\0")
+                    actual_index_digest.update(len(content).to_bytes(8, "big"))
+                    actual_index_digest.update(hashlib.sha256(content).digest())
+                digest.update(name.encode("ascii") + b"\0")
+                digest.update(repr(signature).encode("ascii"))
+                digest.update(hashlib.sha256(content).digest())
+            if actual_index_digest.hexdigest() != index_digest:
+                raise OSError("isolated Git index changed")
+
+            for relative in ("objects/info", "refs/heads", "refs/tags"):
+                child_fd = cls._open_git_directory(git_directory, relative)
+                try:
+                    child_stat = os.fstat(child_fd)
+                    cls._list_git_directory(child_fd, 0)
+                    digest.update(relative.encode("ascii") + b"\0")
+                    digest.update(repr(cls._git_file_signature(child_stat)).encode("ascii"))
+                finally:
+                    os.close(child_fd)
+            return digest.hexdigest(), directory_identity
+        finally:
+            os.close(directory_fd)
+
+    @classmethod
+    def _assert_isolated_git_metadata(cls, context: _IsolatedGitContext) -> None:
+        try:
+            fingerprint, _identity = cls._isolated_git_fingerprint(
+                context.git_directory,
+                context.config_content,
+                context.head_content,
+                context.index_digest,
+                context.directory_identity,
+            )
+        except OSError:
+            raise SupervisorError(
+                "change_preview_incomplete", "isolated Git metadata changed or became unsafe"
+            ) from None
+        if fingerprint != context.metadata_fingerprint:
+            raise SupervisorError(
+                "change_preview_incomplete", "isolated Git metadata changed during inspection"
+            )
+
     def _attempt_index_digest(self, attempt_id: str, common: Path) -> str:
         return self._index_snapshot(attempt_id, common)
+
+    @staticmethod
+    def _list_git_directory(directory_fd: int, max_entries: int) -> list[str]:
+        """Enumerate a Git directory incrementally and stop at its safe bound."""
+
+        names: list[str] = []
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > max_entries:
+                    raise OSError("Git metadata directory exceeds the safe entry limit")
+        return names
 
     @classmethod
     def _copy_object_file(
@@ -708,9 +887,7 @@ class ChangePreviewMixin:
             except FileNotFoundError:
                 pack_fd = None
             if pack_fd is not None:
-                pack_names = os.listdir(pack_fd)
-                if len(pack_names) > _MAX_OBJECT_FILES:
-                    raise OSError("Git object database exceeds the safe snapshot limit")
+                pack_names = cls._list_git_directory(pack_fd, _MAX_OBJECT_FILES)
                 scanned_entries += len(pack_names)
                 paired: set[str] = set()
                 for name in pack_names:
@@ -748,10 +925,10 @@ class ChangePreviewMixin:
                 except (FileNotFoundError, NotADirectoryError):
                     continue
                 try:
-                    shard_names = os.listdir(shard_fd)
+                    shard_names = cls._list_git_directory(
+                        shard_fd, _MAX_OBJECT_FILES - scanned_entries
+                    )
                     scanned_entries += len(shard_names)
-                    if scanned_entries > _MAX_OBJECT_FILES:
-                        raise OSError("Git object database exceeds the safe snapshot limit")
                     candidates = [
                         name
                         for name in shard_names
@@ -788,7 +965,7 @@ class ChangePreviewMixin:
     @contextmanager
     def _isolated_git_metadata(
         self, attempt_id: str, common: Path, head: str
-    ) -> Iterator[tuple[Path, str]]:
+    ) -> Iterator[tuple[_IsolatedGitContext, str]]:
         """Create disposable Git metadata with no inherited paths or config."""
 
         try:
@@ -807,19 +984,36 @@ class ChangePreviewMixin:
                 (git_directory / "refs" / "tags").mkdir(parents=True, mode=0o700)
                 object_format = "sha256" if len(head) == 64 else "sha1"
                 format_version = "1" if object_format == "sha256" else "0"
-                config = (
+                config_content = (
                     "[core]\n"
                     f"\trepositoryformatversion = {format_version}\n"
                     "\tbare = false\n"
                     "\tfilemode = true\n"
-                )
+                ).encode("ascii")
                 if object_format == "sha256":
-                    config += f"[extensions]\n\tobjectformat = {object_format}\n"
-                (git_directory / "config").write_text(config, encoding="ascii")
-                (git_directory / "HEAD").write_text(f"{head}\n", encoding="ascii")
+                    config_content += f"[extensions]\n\tobjectformat = {object_format}\n".encode(
+                        "ascii"
+                    )
+                head_content = f"{head}\n".encode("ascii")
+                (git_directory / "config").write_bytes(config_content)
+                (git_directory / "HEAD").write_bytes(head_content)
                 self._snapshot_object_database(common, object_directory, len(head))
                 index_digest = self._index_snapshot(attempt_id, common, git_directory)
-                yield git_directory, index_digest
+                fingerprint, directory_identity = self._isolated_git_fingerprint(
+                    git_directory, config_content, head_content, index_digest
+                )
+                yield (
+                    _IsolatedGitContext(
+                        git_directory=git_directory,
+                        common_directory=git_directory,
+                        directory_identity=directory_identity,
+                        metadata_fingerprint=fingerprint,
+                        config_content=config_content,
+                        head_content=head_content,
+                        index_digest=index_digest,
+                    ),
+                    index_digest,
+                )
         except SupervisorError:
             raise
         except (OSError, ValueError):
@@ -833,7 +1027,7 @@ class ChangePreviewMixin:
         revision: str | None,
         *,
         expected_identity: tuple[int, int] | None = None,
-        git_context: tuple[Path, Path] | None = None,
+        git_context: _IsolatedGitContext | None = None,
     ) -> str:
         if revision != "HEAD" and (
             not isinstance(revision, str) or not _OBJECT_ID.fullmatch(revision)
@@ -861,7 +1055,7 @@ class ChangePreviewMixin:
         worktree: Path,
         *,
         expected_identity: tuple[int, int] | None = None,
-        git_context: tuple[Path, Path] | None = None,
+        git_context: _IsolatedGitContext | None = None,
     ) -> list[dict[str, str]]:
         raw = self._git_output(
             worktree,
@@ -875,10 +1069,18 @@ class ChangePreviewMixin:
             git_context=git_context,
         )
         records: list[dict[str, str]] = []
-        fields = raw.split(b"\0")
+        fields = raw.split(b"\0", _MAX_INVENTORY_RECORDS + 1)
+        if len(fields) > _MAX_INVENTORY_RECORDS + 1:
+            raise SupervisorError(
+                "change_preview_incomplete", "working-tree path inventory exceeds safe limits"
+            )
         if fields and fields[-1] == b"":
             fields.pop()
         for field in fields:
+            if len(records) >= _MAX_INVENTORY_RECORDS:
+                raise SupervisorError(
+                    "change_preview_incomplete", "working-tree path inventory exceeds safe limits"
+                )
             if len(field) < 4 or field[2:3] != b" ":
                 raise SupervisorError(
                     "change_preview_incomplete", "Git returned malformed path metadata"
@@ -902,7 +1104,7 @@ class ChangePreviewMixin:
         head_sha: str,
         *,
         expected_identity: tuple[int, int] | None = None,
-        git_context: tuple[Path, Path] | None = None,
+        git_context: _IsolatedGitContext | None = None,
     ) -> list[dict[str, str]]:
         raw = self._git_output(
             worktree,
@@ -920,7 +1122,11 @@ class ChangePreviewMixin:
             expected_identity=expected_identity,
             git_context=git_context,
         )
-        fields = raw.split(b"\0")
+        fields = raw.split(b"\0", 3 * _MAX_INVENTORY_RECORDS + 1)
+        if len(fields) > 3 * _MAX_INVENTORY_RECORDS + 1:
+            raise SupervisorError(
+                "change_preview_incomplete", "committed path inventory exceeds safe limits"
+            )
         if fields and fields[-1] == b"":
             fields.pop()
         records: list[dict[str, str]] = []
@@ -945,10 +1151,18 @@ class ChangePreviewMixin:
                 previous = os.fsdecode(fields[index])
                 path = os.fsdecode(fields[index + 1])
                 index += 2
+                if len(records) >= _MAX_INVENTORY_RECORDS:
+                    raise SupervisorError(
+                        "change_preview_incomplete", "committed path inventory exceeds safe limits"
+                    )
                 records.append({"status": status, "path": path, "previous_path": previous})
             else:
                 path = os.fsdecode(fields[index])
                 index += 1
+                if len(records) >= _MAX_INVENTORY_RECORDS:
+                    raise SupervisorError(
+                        "change_preview_incomplete", "committed path inventory exceeds safe limits"
+                    )
                 records.append({"status": status, "path": path})
         return records
 

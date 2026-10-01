@@ -252,14 +252,16 @@ The preview separates committed path/status changes from the current index/workt
 untracked path names. It reports the attempt's start SHA, the HEAD observed before and
 after the scan, and per-status path counts. Output is path metadata only: no file contents,
 line-level diff, credential, or claim token. Lists are capped at 1,000 paths per section;
-counts still cover all paths and `paths_truncated` identifies a capped list. Git reads the
+counts cover inventories up to 10,000 records per section and `paths_truncated` identifies a
+capped list. Larger inventories or Git output over 16 MiB fail closed. Git reads the
 captured index in disposable metadata and an isolated object directory containing copies of
 regular loose objects and paired pack/index files in the ACP repository's local object store.
 The preview does not copy or follow `objects/info/alternates` (including transitive
 alternates), and the temporary object database has no alternate path of its own; commits
 available only through an external alternate therefore fail closed. A snapshot with more than
-250,000 object-store directory entries or over 1 GiB of object data fails closed. It does not
-load repository/worktree/global/system Git config,
+250,000 object-store directory entries or over 1 GiB of object data fails closed. Git index
+directories are incrementally capped at 1,024 entries. It does not load
+repository/worktree/global/system Git config,
 configured filters, external excludes files, `.git/info/exclude`, or external attribute
 files. Consequently, a path excluded only through those settings can appear in the preview,
 and paths marked with a filter attribute may be conservatively reported as modified. This
@@ -283,6 +285,8 @@ Repository and worktree Git config are not loaded, so a concurrent filter/config
 cannot introduce a clean/process/smudge command during inspection. The index is copied via
 no-follow reads into temporary metadata and checked again afterward; a changing HEAD,
 index, status inventory, or allocated worktree makes the result unstable or fails closed.
+The isolated Git config, HEAD, copied index, and empty alternates/ref directories are
+fingerprinted around every Git invocation; unexpected scratch-metadata mutation fails closed.
 An active index lock or index snapshot beyond the bounded per-file/aggregate size limits
 fails closed. The temporary metadata is removed at the end. The preview does not create
 Git locks or touch refs, index entries, worktree files, ACP rows, or audit events.

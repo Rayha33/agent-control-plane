@@ -467,7 +467,7 @@ def test_preview_marks_racing_worktree_unstable(
         worktree: Path,
         *,
         expected_identity: tuple[int, int] | None = None,
-        git_context: tuple[Path, Path] | None = None,
+        git_context: change_preview_module._IsolatedGitContext | None = None,
     ) -> list[dict[str, str]]:
         nonlocal calls
         result = original(
@@ -501,7 +501,7 @@ def test_preview_marks_index_only_change_unstable(
         path: Path,
         *,
         expected_identity: tuple[int, int] | None = None,
-        git_context: tuple[Path, Path] | None = None,
+        git_context: change_preview_module._IsolatedGitContext | None = None,
     ) -> list[dict[str, str]]:
         nonlocal calls
         result = original(
@@ -531,22 +531,31 @@ def test_preview_pins_directory_and_fails_closed_during_worktree_symlink_swap(
     outside = repo.parent / f"outside-attempt-{attempt['id']}"
     outside.mkdir()
     (outside / "outside-only.txt").write_text("outside\n", encoding="utf-8")
-    original_run = change_preview_module.subprocess.run
-    captured_status: list[bytes] = []
+    original_popen = change_preview_module.subprocess.Popen
+    original_read = change_preview_module.os.read
+    status_fds: set[int] = set()
+    captured_status = bytearray()
     swapped = False
 
-    def swap_while_running_git(command: list[str], *args, **kwargs):
+    def swap_before_git_starts(command: list[str], *args, **kwargs):
         nonlocal swapped
         if not swapped and "status" in command:
             swapped = True
             worktree.rename(moved)
             worktree.symlink_to(outside, target_is_directory=True)
-            result = original_run(command, *args, **kwargs)
-            captured_status.append(result.stdout)
-            return result
-        return original_run(command, *args, **kwargs)
+        process = original_popen(command, *args, **kwargs)
+        if swapped and "status" in command and process.stdout is not None:
+            status_fds.add(process.stdout.fileno())
+        return process
 
-    monkeypatch.setattr(change_preview_module.subprocess, "run", swap_while_running_git)
+    def capture_status_output(fd: int, size: int) -> bytes:
+        chunk = original_read(fd, size)
+        if fd in status_fds:
+            captured_status.extend(chunk)
+        return chunk
+
+    monkeypatch.setattr(change_preview_module.subprocess, "Popen", swap_before_git_starts)
+    monkeypatch.setattr(change_preview_module.os, "read", capture_status_output)
     try:
         with pytest.raises(SupervisorError, match="changed during inspection"):
             GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
@@ -557,8 +566,89 @@ def test_preview_pins_directory_and_fails_closed_during_worktree_symlink_swap(
             moved.rename(worktree)
 
     assert swapped
-    assert captured_status
-    assert b"outside-only.txt" not in captured_status[0]
+    assert status_fds
+    assert b"outside-only.txt" not in captured_status
+
+
+def test_preview_rejects_oversized_working_tree_path_inventory(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo, read_only=True)
+    output = b"?? file\0" * (change_preview_module._MAX_INVENTORY_RECORDS + 1)
+    monkeypatch.setattr(supervisor, "_git_output", lambda *_args, **_kwargs: output)
+
+    with pytest.raises(SupervisorError, match="working-tree path inventory exceeds safe limits"):
+        supervisor._working_tree_status(repo)
+
+
+def test_preview_rejects_oversized_committed_path_inventory(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo, read_only=True)
+    output = b"M\0file\0" * (change_preview_module._MAX_INVENTORY_RECORDS + 1)
+    monkeypatch.setattr(supervisor, "_git_output", lambda *_args, **_kwargs: output)
+
+    with pytest.raises(SupervisorError, match="committed path inventory exceeds safe limits"):
+        supervisor._committed_paths(repo, "0" * 40, "1" * 40)
+
+
+def test_preview_stops_directory_inventory_when_its_bound_is_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Entry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class Entries:
+        yielded = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> Entry:
+            self.yielded += 1
+            return Entry(f"entry-{self.yielded}")
+
+    entries = Entries()
+    monkeypatch.setattr(change_preview_module.os, "scandir", lambda _fd: entries)
+
+    with pytest.raises(OSError, match="safe entry limit"):
+        change_preview_module.ChangePreviewMixin._list_git_directory(123, 2)
+
+    assert entries.yielded == 3
+
+
+def test_preview_fails_closed_if_scratch_git_config_changes_during_status(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    tracked = worktree / "alpha.txt"
+    tracked.chmod(tracked.stat().st_mode | 0o100)
+    original_popen = change_preview_module.subprocess.Popen
+    injected = False
+
+    def inject_status_config(command: list[str], *args, **kwargs):
+        nonlocal injected
+        if not injected and "status" in command:
+            injected = True
+            git_directory = Path(kwargs["env"]["GIT_DIR"])
+            with (git_directory / "config").open("ab") as config_file:
+                config_file.write(b"\n[core]\n\tfilemode = false\n")
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(change_preview_module.subprocess, "Popen", inject_status_config)
+
+    with pytest.raises(SupervisorError, match="isolated Git metadata changed"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+    assert injected
 
 
 def test_preview_fails_closed_for_missing_worktree_and_invalid_start_ref(repo: Path) -> None:
