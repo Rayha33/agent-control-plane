@@ -742,7 +742,17 @@ service.
   worktree whose task is still active, whose attempt is live or quarantined, whose
   cleanup is unproven, that holds a resource lease or runtime allocation, or that
   is inside the retention window — `--dry-run` prints the decision for every
-  attempt with its reason. Integration branches are reported and never deleted:
+  attempt with its reason. Before reclaiming, GC also checks the worktree with a
+  bounded Git probe, including ignored files and index flags that can hide tracked
+  edits (`assume-unchanged` / `skip-worktree`). Staged, unstaged, untracked, ignored,
+  or specially flagged content is retained as `uncommitted_changes`; if inspection
+  fails, times out, or executable local/per-worktree Git config is present, the
+  worktree is retained as `worktree_state_unknown`. The final check runs after
+  branch discovery; removal
+  is non-forcing and has no recursive filesystem fallback. If Git refuses it, the
+  worktree and branch are retained as `worktree_remove_failed`. This preserves
+  crash-recovery data rather than assuming an old terminal attempt is disposable.
+  Integration branches are reported and never deleted:
   their commits are the published evidence for an approved task.
 - Agents should be launched through ACP or another gateway; direct writes to the
   base checkout happen outside ACP's enforcement boundary. `acp hooks install
