@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import subprocess
+import sys as _sys
 import uuid
 from collections import Counter
 from collections.abc import Sequence
@@ -21,6 +22,10 @@ _FILTER_KEY = re.compile(
 _MAX_RETURNED_PATHS = 1000
 _MAX_FILTER_DRIVERS = 64
 _GIT_TIMEOUT_SECONDS = 30
+_EXEC_GIT_FROM_DIR_FD = (
+    "import os,sys; fd=int(sys.argv[1]); executable=sys.argv[2]; "
+    "os.fchdir(fd); os.execve(executable, [executable, *sys.argv[3:]], os.environ)"
+)
 
 
 class ChangePreviewMixin:
@@ -270,12 +275,6 @@ class ChangePreviewMixin:
         config_overrides: Sequence[str] = (),
         git_context: tuple[Path, Path] | None = None,
     ) -> bytes:
-        if expected_identity is not None and not self._preview_path_still_matches(
-            worktree, expected_identity
-        ):
-            raise SupervisorError(
-                "change_preview_incomplete", "attempt worktree changed or became unsafe"
-            )
         git = str(self._system_git_executable(self.root))
         command = [
             git,
@@ -293,13 +292,6 @@ class ChangePreviewMixin:
         ]
         for setting in config_overrides:
             command.extend(["-c", setting])
-        command.extend(
-            [
-                "-C",
-                str(worktree),
-                *arguments,
-            ]
-        )
         environment = self._git_environment()
         if git_context is not None:
             admin_directory, common_directory = git_context
@@ -310,7 +302,57 @@ class ChangePreviewMixin:
                     "GIT_WORK_TREE": str(worktree),
                 }
             )
+        worktree_fd: int | None = None
+        if expected_identity is not None:
+            if (
+                git_context is None
+                or not hasattr(os, "O_DIRECTORY")
+                or not hasattr(os, "O_NOFOLLOW")
+            ):
+                raise SupervisorError(
+                    "change_preview_incomplete", "attempt worktree cannot be pinned safely"
+                )
+            if not self._preview_path_still_matches(worktree, expected_identity):
+                raise SupervisorError(
+                    "change_preview_incomplete", "attempt worktree changed or became unsafe"
+                )
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            try:
+                worktree_fd = os.open(worktree, flags)
+                metadata = os.fstat(worktree_fd)
+            except OSError:
+                if worktree_fd is not None:
+                    os.close(worktree_fd)
+                raise SupervisorError(
+                    "change_preview_incomplete", "attempt worktree could not be pinned safely"
+                ) from None
+            if not stat.S_ISDIR(metadata.st_mode) or expected_identity != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                os.close(worktree_fd)
+                raise SupervisorError(
+                    "change_preview_incomplete", "attempt worktree changed or became unsafe"
+                )
+            environment["GIT_WORK_TREE"] = "."
         try:
+            if worktree_fd is None:
+                command.extend(["-C", str(worktree), *arguments])
+            else:
+                # On macOS subprocess cwd cannot be an fd. A tiny isolated interpreter
+                # changes directory through the inherited fd, then execs trusted Git;
+                # using the worktree pathname here would permit a rename/symlink TOCTOU.
+                command = [
+                    _sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    _EXEC_GIT_FROM_DIR_FD,
+                    str(worktree_fd),
+                    git,
+                    *command[1:],
+                    *arguments,
+                ]
             result = subprocess.run(
                 command,
                 cwd=self.root,
@@ -318,11 +360,21 @@ class ChangePreviewMixin:
                 capture_output=True,
                 timeout=_GIT_TIMEOUT_SECONDS,
                 check=False,
+                pass_fds=(worktree_fd,) if worktree_fd is not None else (),
             )
         except (OSError, subprocess.TimeoutExpired):
             raise SupervisorError(
                 "change_preview_incomplete", "Git could not read attempt metadata safely"
             ) from None
+        finally:
+            if worktree_fd is not None:
+                os.close(worktree_fd)
+        if expected_identity is not None and not self._preview_path_still_matches(
+            worktree, expected_identity
+        ):
+            raise SupervisorError(
+                "change_preview_incomplete", "attempt worktree changed during inspection"
+            )
         if result.returncode:
             raise SupervisorError(
                 "change_preview_incomplete",

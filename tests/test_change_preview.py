@@ -10,6 +10,7 @@ import pytest
 from support import commit_change, event_count, init_repo, make_task, state_fingerprint
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.supervisor import change_preview as change_preview_module
 
 
 @pytest.fixture
@@ -313,6 +314,45 @@ def test_preview_marks_racing_worktree_unstable(
 
     assert preview["stable"] is False
     assert preview["stability"] == "unstable"
+
+
+def test_preview_pins_directory_and_fails_closed_during_worktree_symlink_swap(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    worktree = Path(attempt["worktree"])
+    moved = worktree.with_name(f"{worktree.name}-displaced")
+    outside = repo.parent / f"outside-attempt-{attempt['id']}"
+    outside.mkdir()
+    (outside / "outside-only.txt").write_text("outside\n", encoding="utf-8")
+    original_run = change_preview_module.subprocess.run
+    captured_status: list[bytes] = []
+    swapped = False
+
+    def swap_while_running_git(command: list[str], *args, **kwargs):
+        nonlocal swapped
+        if not swapped and "status" in command:
+            swapped = True
+            worktree.rename(moved)
+            worktree.symlink_to(outside, target_is_directory=True)
+            result = original_run(command, *args, **kwargs)
+            captured_status.append(result.stdout)
+            return result
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(change_preview_module.subprocess, "run", swap_while_running_git)
+    try:
+        with pytest.raises(SupervisorError, match="changed during inspection"):
+            GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+    finally:
+        if worktree.is_symlink():
+            worktree.unlink()
+        if moved.exists():
+            moved.rename(worktree)
+
+    assert swapped
+    assert captured_status
+    assert b"outside-only.txt" not in captured_status[0]
 
 
 def test_preview_fails_closed_for_missing_worktree_and_invalid_start_ref(repo: Path) -> None:
