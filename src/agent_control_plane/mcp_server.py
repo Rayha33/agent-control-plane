@@ -84,6 +84,16 @@ TOOLS: dict[str, tuple[str, str, dict[str, Any]]] = {
             },
         },
     ),
+    "acp_changes": (
+        "change_preview",
+        "Metadata-only committed and working-tree path preview for one attempt; no file contents.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["attempt_id"],
+            "properties": {"attempt_id": {"type": "string"}},
+        },
+    ),
     "acp_plan": (
         "plan_claim",
         "Dry-run a claim and report what would block it. Changes nothing.",

@@ -113,6 +113,7 @@ from .status import (
 from .status import (
     _age_seconds as _age_seconds,
 )
+from .supervisor.change_preview import ChangePreviewMixin
 from .supervisor.claims import ClaimsMixin
 from .supervisor.common import (
     CLEANUP_FENCE_EPOCH,
@@ -256,6 +257,7 @@ class GitSupervisor(
     ConfigMixin,
     IdentityMixin,
     ViewsMixin,
+    ChangePreviewMixin,
     ProcessMixin,
     WorkersMixin,
     RuntimeMixin,

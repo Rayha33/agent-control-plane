@@ -216,9 +216,10 @@ without shelling out:
 {"mcpServers": {"acp": {"command": "acp", "args": ["--repo", "/path/to/repo", "mcp-serve"]}}}
 ```
 
-Eleven tools, each a one-line delegation to a supervisor method: `acp_status`,
+Twelve tools, each a one-line delegation to a supervisor method: `acp_status`,
 `acp_queue`, `acp_merge_plan`, `acp_reviewers`, `acp_verify_events`, `acp_show`,
-`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`, and `acp_inbox`.
+`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`, `acp_inbox`, and
+`acp_changes`.
 
 **No writes and no credential, on purpose.** `claim`, `heartbeat`, `submit`, `qc` and
 `integrate` are authenticated, and `runner_identity.py` keeps worker, critic and
@@ -238,10 +239,41 @@ There is no third-party dependency: the wire format is newline-delimited JSON-RP
 small enough to implement honestly and not worth an SDK in `acp`'s import graph for one
 subcommand.
 
+### Read-only change previews
+
+Use the base checkout to inspect one known attempt; the command does not change or
+reconcile its worktree:
+
+```bash
+acp --repo "$BASE" changes "$ATTEMPT"
+```
+
+The preview separates committed path/status changes from the current index/worktree and
+untracked path names. It reports the attempt's start SHA, the HEAD observed before and
+after the scan, and per-status path counts. Output is path metadata only: no file contents,
+line-level diff, credential, or claim token. Lists are capped at 1,000 paths per section;
+counts still cover all paths and `paths_truncated` identifies a capped list. The result's
+`filter_drivers_disabled` count shows how many configured Git filter drivers were disabled;
+filtered paths may therefore be conservatively marked modified, so this is not guaranteed
+to match normal `git status` semantics.
+
+Live worktrees can change during inspection. `stable: false` means HEAD or the path/status
+inventory changed between observations; even `stable: true` is best-effort, not a snapshot
+guarantee (content can change without changing the observed path/status set). Treat the
+displayed file and directory names as potentially sensitive. This view does not make an
+uncommitted file safe to reuse and does not authorize checkout, cherry-pick, copy, or merge.
+
+The CLI and `acp_changes` MCP tool call the same supervisor method on a `mode=ro` database.
+Git is invoked with optional index writes disabled, external diff/textconv/pager and
+repository filter commands disabled, external attribute files ignored, and submodule
+traversal suppressed. Repositories with local Git config includes fail closed rather than
+loading external configuration. The preview does not create Git locks or
+touch refs, index entries, worktree files, ACP rows, or audit events.
+
 ### What this does not do yet
 
 - **The MCP server is read-only today.** `acp mcp-serve` is shipped and exposes
-  ten read-only tools, including `acp_plan` and `acp_guard`; it does not expose the
+  twelve read-only tools, including `acp_plan`, `acp_guard`, and `acp_changes`; it does not expose the
   authenticated lifecycle mutations (`claim`, `heartbeat`, `submit`, `qc`, or
   `integrate`). Adding those requires resolving the credential boundary above first.
 - **No heartbeat hook.** `acp heartbeat` is a write needing the claim token and the

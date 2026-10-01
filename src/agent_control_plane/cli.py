@@ -30,6 +30,7 @@ READ_ONLY_ACTIONS = frozenset(
     {
         "status",
         "show",
+        "changes",
         "plan",
         "queue",
         "merge-plan",
@@ -247,6 +248,10 @@ def parser() -> argparse.ArgumentParser:
 
     show = commands.add_parser("show", help="show a task")
     show.add_argument("task_id")
+    changes = commands.add_parser(
+        "changes", help="read-only path/status preview for an attempt worktree"
+    )
+    changes.add_argument("attempt_id")
     plan = commands.add_parser("plan", help="dry-run a claim and report what would block it")
     plan.add_argument("task_id")
     commands.add_parser("queue", help="ordered ready queue with overlap and dependency blockers")
@@ -757,6 +762,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.action == "show":
             result = supervisor.task(args.task_id)
+        elif args.action == "changes":
+            result = supervisor.change_preview(args.attempt_id)
         elif args.action == "plan":
             result = supervisor.plan_claim(args.task_id)
         elif args.action == "queue":

@@ -452,3 +452,21 @@ def test_cli_message_list_opens_supervisor_read_only(tmp_path: Path, monkeypatch
     monkeypatch.setattr(cli, "GitSupervisor", recording_supervisor)
     assert cli.main(["--repo", str(repo), "message", "list", "--attempt", attempt["id"]]) == 0
     assert read_only_modes == [True]
+
+
+def test_cli_changes_returns_attempt_path_metadata_read_only(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "preview", "alpha.txt")
+    claimed = run_cli(repo, "claim", task["id"], "--agent", "preview-worker")
+    assert claimed.returncode == 0, claimed.stderr
+    attempt = json.loads(claimed.stdout)
+
+    result = run_cli(repo, "changes", attempt["id"])
+
+    assert result.returncode == 0, result.stderr
+    preview = json.loads(result.stdout)
+    assert preview["attempt_id"] == attempt["id"]
+    assert preview["start_sha"] == attempt["start_sha"]
+    assert preview["stable"] is True
+    assert preview["working_tree"]["path_count"] == 0
+    assert "claim_token" not in result.stdout
