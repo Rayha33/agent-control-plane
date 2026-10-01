@@ -22,7 +22,7 @@ import sys
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -606,6 +606,1084 @@ class IntegrationMixin:
             "runtime_cleanup": runtime_cleanup,
         }
 
+    def integrate_batch(
+        self,
+        task_ids: Sequence[str],
+        integrator_id: str = "integration",
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Review and publish one explicitly ordered, cumulative candidate for several tasks."""
+
+        if isinstance(task_ids, (str, bytes)):
+            raise SupervisorError(
+                "integration_batch_invalid",
+                "pass an ordered sequence of task IDs, not one string",
+            )
+        ordered_ids = list(task_ids)
+        if (
+            not 2 <= len(ordered_ids) <= 16
+            or any(not isinstance(task_id, str) or not task_id for task_id in ordered_ids)
+            or len(set(ordered_ids)) != len(ordered_ids)
+        ):
+            raise SupervisorError(
+                "integration_batch_invalid",
+                "batch must contain 2-16 unique task IDs",
+            )
+        self._authenticate(integrator_id, "integrator", credential)
+        self._assert_no_git_grafts()
+        with ExitStack() as operation_guards:
+            guard_by_task = {
+                task_id: operation_guards.enter_context(self._task_operation_guard(task_id))
+                for task_id in sorted(ordered_ids)
+            }
+            guard_fds = tuple(guard_by_task[task_id] for task_id in sorted(guard_by_task))
+            return self._integrate_batch_locked(ordered_ids, integrator_id, credential, guard_fds)
+
+    def _integrate_batch_locked(
+        self,
+        ordered_ids: list[str],
+        integrator_id: str,
+        credential: str | None,
+        operation_guard_fds: Sequence[int],
+    ) -> dict[str, Any]:
+        integrator_identity = self._authenticate(integrator_id, "integrator", credential)
+        integrator_digest = (
+            integrator_identity["credential_digest"] if integrator_identity else None
+        )
+        batch_id = str(uuid.uuid4())
+        branch = f"acp/integrate-batch-{batch_id[:12]}"
+        worktree = self.state_dir / "worktrees" / f"integrate-{batch_id}"
+        created = utc_now()
+        from ..scheduling import Scheduler
+
+        scheduler = Scheduler(self)
+        members: list[dict[str, Any]] = []
+        integration_ids: dict[str, str] = {}
+        cleanup_targets: dict[str, str] = {}
+        current_base: str | None = None
+        base_branch = ""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authenticate(integrator_id, "integrator", credential, connection)
+            task_records = scheduler._task_records(connection)
+            tasks_by_id = {task["id"]: task for task in task_records}
+            selected = [self._task_row(connection, task_id) for task_id in ordered_ids]
+            if any(task["status"] != "approved" for task in selected):
+                raise SupervisorError("qc_gate_not_passed", "every batch task must be approved")
+
+            plan_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            approved_submissions: dict[str, sqlite3.Row] = {}
+            for plan_task in task_records:
+                if plan_task["status"] != "approved":
+                    continue
+                approved = connection.execute(
+                    "SELECT * FROM submissions WHERE task_id = ? AND status = 'approved' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (plan_task["id"],),
+                ).fetchone()
+                if not approved:
+                    continue
+                if self._submission_assurance(connection, approved)["ready"]:
+                    plan_candidates.append((plan_task, dict(approved)))
+                    approved_submissions[plan_task["id"]] = approved
+            planned = scheduler._merge_order(plan_candidates)
+            planned_selected = [
+                task["id"] for task, _submission in planned if task["id"] in set(ordered_ids)
+            ]
+            if planned_selected != ordered_ids:
+                raise SupervisorError(
+                    "integration_batch_order_invalid",
+                    "task IDs must follow their relative order in the current merge plan",
+                )
+
+            positions = {task_id: index for index, task_id in enumerate(ordered_ids)}
+            edges = scheduler._dependency_edges(task_records)
+            producers = scheduler._producers(task_records)
+            for task_id in ordered_ids:
+                task_record = tasks_by_id[task_id]
+                if scheduler._find_cycle(edges, task_id):
+                    raise SupervisorError(
+                        "integration_batch_dependency_cycle",
+                        f"task {task_id} participates in a dependency cycle",
+                    )
+                for dependency in task_record["dependencies"]:
+                    dependency_task = tasks_by_id.get(dependency)
+                    if dependency_task is None:
+                        raise SupervisorError(
+                            "integration_batch_dependency_missing",
+                            f"task {task_id} has missing dependency {dependency}",
+                        )
+                    if dependency in positions:
+                        if positions[dependency] >= positions[task_id]:
+                            raise SupervisorError(
+                                "integration_batch_order_invalid",
+                                f"dependency {dependency} must precede task {task_id}",
+                            )
+                    elif dependency_task["status"] != "done":
+                        raise SupervisorError(
+                            "integration_batch_dependency_incomplete",
+                            f"dependency {dependency} for task {task_id} is not done or in this batch",
+                        )
+                for artifact in task_record["consumes"]:
+                    for producer in producers.get(artifact, []):
+                        producer_id = producer["id"]
+                        if producer_id == task_id:
+                            continue
+                        if producer_id in positions:
+                            if positions[producer_id] >= positions[task_id]:
+                                raise SupervisorError(
+                                    "integration_batch_order_invalid",
+                                    f"producer {producer_id} must precede consumer {task_id}",
+                                )
+                        elif producer["status"] != "done":
+                            raise SupervisorError(
+                                "integration_batch_dependency_incomplete",
+                                f"producer {producer_id} for artifact {artifact} is not done or in this batch",
+                            )
+
+            base_branches = {task["base_branch"] for task in selected}
+            if len(base_branches) != 1:
+                raise SupervisorError(
+                    "integration_batch_base_mismatch",
+                    "all tasks in a cumulative batch must target the same base branch",
+                )
+            base_branch = next(iter(base_branches))
+
+            for task in selected:
+                submission = approved_submissions.get(task["id"])
+                if not submission:
+                    raise SupervisorError(
+                        "qc_evidence_missing",
+                        f"approved submission is missing for task {task['id']}",
+                    )
+                try:
+                    self._assert_submission_object_contract(submission)
+                except SupervisorError:
+                    self._invalidate_legacy_submission_in(connection, submission, integrator_id)
+                    connection.commit()
+                    raise
+                try:
+                    self._verify_attempt_trust_in(connection, submission["attempt_id"])
+                except SupervisorError:
+                    connection.commit()
+                    raise
+                self._assert_submission_assurance(connection, submission)
+                self._assert_reservations(connection, task, submission)
+                runtime = connection.execute(
+                    "SELECT * FROM runtime_environments WHERE attempt_id = ?",
+                    (submission["attempt_id"],),
+                ).fetchone()
+                if not runtime or runtime["state"] != "ready":
+                    raise SupervisorError(
+                        "runtime_not_ready",
+                        f"task {task['id']} runtime state is "
+                        f"{runtime['state'] if runtime else 'missing'}",
+                    )
+                member = {
+                    "task": dict(task),
+                    "submission": dict(submission),
+                    "runtime_env": json.loads(runtime["env_json"]),
+                    "position": positions[task["id"]] + 1,
+                }
+                members.append(member)
+                integration_id = str(uuid.uuid4())
+                integration_ids[task["id"]] = integration_id
+
+            operation_until = int(time.time()) + max(
+                3600,
+                self.config.timeout_seconds
+                * (len(self.config.integration_commands) * len(members) + 3)
+                * 2,
+            )
+            for member in members:
+                task_id = member["task"]["id"]
+                submission = member["submission"]
+                connection.execute(
+                    "UPDATE tasks SET status = 'integrating', updated_at = ? WHERE id = ?",
+                    (utc_now(), task_id),
+                )
+                connection.execute(
+                    "UPDATE resource_leases SET lease_expires_at = ?, updated_at = ? "
+                    "WHERE task_id = ?",
+                    (operation_until, utc_now(), task_id),
+                )
+                connection.execute(
+                    "UPDATE runtime_allocations SET lease_expires_at = ?, updated_at = ? "
+                    "WHERE attempt_id = ?",
+                    (operation_until, utc_now(), submission["attempt_id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO integrations
+                      (id, task_id, submission_id, batch_id, branch, commit_sha, verdict,
+                       results_json, error, created_at)
+                    VALUES (?, ?, ?, ?, NULL, NULL, 'running', '[]', '', ?)
+                    """,
+                    (
+                        integration_ids[task_id],
+                        task_id,
+                        submission["id"],
+                        batch_id,
+                        created,
+                    ),
+                )
+            self._event(
+                connection,
+                "integration.batch_started",
+                integrator_id,
+                {
+                    "batch_id": batch_id,
+                    "integration_ids": integration_ids,
+                    "ordered_task_ids": ordered_ids,
+                    "submission_ids": [member["submission"]["id"] for member in members],
+                    "base_branch": base_branch,
+                },
+            )
+
+        results: list[dict[str, Any]] = []
+        deterministic_results: list[dict[str, Any]] = []
+        integration_commit: str | None = None
+        candidate_tree: str | None = None
+        verdict = "failed"
+        error_message = ""
+        critic_blocked = False
+        critic_findings: list[dict[str, Any]] = []
+        publication_pending = False
+        try:
+            current_base = self._git_text("rev-parse", base_branch)
+            with self._isolated_integration_git(worktree, current_base) as git_boundary:
+                candidate_base = current_base
+                for member in members:
+                    task_id = member["task"]["id"]
+                    submission = member["submission"]
+                    if (
+                        self._git_text("cat-file", "-t", submission["commit_sha"]) != "commit"
+                        or self._git_text("rev-parse", f"{submission['commit_sha']}^{{tree}}")
+                        != submission["tree_sha"]
+                    ):
+                        raise SupervisorError(
+                            "submission_evidence_mismatch",
+                            f"submission object changed for task {task_id}",
+                        )
+                    merge_results, merged_commit = self._run_integration_merge(
+                        candidate_base,
+                        submission["commit_sha"],
+                        operation_guard_fds,
+                        git_boundary,
+                    )
+                    for result in merge_results:
+                        results.append(
+                            {
+                                **result,
+                                "task_id": task_id,
+                                "submission_id": submission["id"],
+                                "position": member["position"],
+                            }
+                        )
+                    results.append(
+                        {
+                            **self._integration_merge_input_result(
+                                candidate_base, submission["commit_sha"], git_boundary
+                            ),
+                            "task_id": task_id,
+                            "submission_id": submission["id"],
+                            "position": member["position"],
+                        }
+                    )
+                    if merged_commit is None:
+                        merge = merge_results[-1]
+                        code = (
+                            "merge_conflict"
+                            if merge.get("phase") == "merge-tree" and merge["exit_code"] == 1
+                            else "integration_merge_failed"
+                        )
+                        raise SupervisorError(
+                            code,
+                            merge["stderr"].strip()
+                            or merge["stdout"].strip()
+                            or f"isolated merge failed for task {task_id}",
+                        )
+                    candidate_base = merged_commit
+                integration_commit = candidate_base
+                self._restore_integration_workspace(
+                    worktree,
+                    integration_commit,
+                    operation_guard_fds,
+                    git_boundary,
+                )
+                candidate_tree = self._git_text("-C", str(worktree), "rev-parse", "HEAD^{tree}")
+                results.append(
+                    {
+                        "phase": "cumulative-candidate",
+                        "batch_id": batch_id,
+                        "ordered_task_ids": ordered_ids,
+                        "base_branch": base_branch,
+                        "base_sha": current_base,
+                        "commit_sha": integration_commit,
+                        "tree_sha": candidate_tree,
+                    }
+                )
+
+                for member in members:
+                    task_id = member["task"]["id"]
+                    for command in self.config.integration_commands:
+                        self._restore_integration_workspace(
+                            worktree,
+                            integration_commit,
+                            operation_guard_fds,
+                            git_boundary,
+                        )
+                        result = self._run_command(
+                            command,
+                            worktree,
+                            self._phase_runtime_env(member["runtime_env"], "integration", worktree),
+                            pass_fds=operation_guard_fds,
+                        )
+                        result.update(
+                            {
+                                "task_id": task_id,
+                                "attempt_id": member["submission"]["attempt_id"],
+                            }
+                        )
+                        results.append(result)
+                        deterministic_results.append(result)
+                        if result["exit_code"]:
+                            raise SupervisorError(
+                                "integration_gate_failed",
+                                f"integration command failed for task {task_id}: {command}",
+                            )
+                        if not self._integration_workspace_matches(
+                            worktree,
+                            integration_commit,
+                            operation_guard_fds,
+                            git_boundary,
+                        ):
+                            raise SupervisorError(
+                                "integration_gate_mutated_source",
+                                f"integration command mutated candidate for task {task_id}: {command}",
+                            )
+
+                critic_command = self.config.integration_critic_command
+                if not critic_command:
+                    results.append(
+                        {
+                            "phase": "integration-critic",
+                            "status": "UNREVIEWED",
+                            "required": self.config.require_integration_critic,
+                            "batch_id": batch_id,
+                        }
+                    )
+                    if self.config.require_integration_critic:
+                        raise SupervisorError(
+                            "integration_critic_missing",
+                            "required independent integration critic is not configured",
+                        )
+                else:
+                    for member in members:
+                        try:
+                            assert_distinct(
+                                member["submission"]["worker_agent_id"],
+                                self.config.integration_critic_identity,
+                            )
+                            assert_distinct(integrator_id, self.config.integration_critic_identity)
+                        except IdentityError as identity_error:
+                            raise SupervisorError(
+                                identity_error.code, identity_error.message
+                            ) from identity_error
+
+                    reviewer_trust_pin = None
+                    if critic_command.startswith("trusted:"):
+                        trust_pins = [
+                            self._verify_attempt_trust(member["submission"]["attempt_id"])
+                            for member in members
+                        ]
+                        if any(
+                            canonical_json(pin) != canonical_json(trust_pins[0])
+                            for pin in trust_pins[1:]
+                        ):
+                            raise SupervisorError(
+                                "integration_critic_provenance_mismatch",
+                                "batch submissions do not share the same pinned critic bundle",
+                            )
+                        reviewer_trust_pin = trust_pins[0]
+                    reviewer_executable = (
+                        Path(__file__).resolve().parents[1] / "critic.py"
+                        if critic_command == "builtin"
+                        else Path(self._resolve_critic_command(critic_command, reviewer_trust_pin))
+                    )
+                    reviewer_provenance = {
+                        "identity": self.config.integration_critic_identity,
+                        "command_selector": critic_command,
+                        "executable_sha256": sha256(reviewer_executable.read_bytes()),
+                        "trust_bundle_id": (
+                            reviewer_trust_pin.get("bundle_id")
+                            if reviewer_trust_pin is not None
+                            else None
+                        ),
+                        "trust_manifest_sha256": (
+                            reviewer_trust_pin.get("manifest_sha256")
+                            if reviewer_trust_pin is not None
+                            else None
+                        ),
+                        "submission_qc_policy_fingerprint": self.assurance_policy.fingerprint,
+                    }
+                    review_policy = {
+                        "version": "cumulative-integration-review-policy.v1",
+                        "review_cumulative_candidate": True,
+                        "worker_conclusions_excluded": True,
+                        "finding_task_ids_required": True,
+                        "deterministic_gates_remain_authoritative": True,
+                        "critic_required": self.config.require_integration_critic,
+                        "integration_commands": list(self.config.integration_commands),
+                    }
+                    reviewer_policy_sha256 = sha256(
+                        canonical_json(
+                            {"reviewer": reviewer_provenance, "policy": review_policy}
+                        ).encode("utf-8")
+                    )
+                    task_specs = []
+                    total_diff_bytes = 0
+                    for member in members:
+                        task = member["task"]
+                        submission = member["submission"]
+                        base_sha = task["base_sha"]
+                        derived_paths_raw = self._git_bytes(
+                            "diff",
+                            "--name-only",
+                            "-z",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--no-renames",
+                            base_sha,
+                            submission["commit_sha"],
+                        )
+                        try:
+                            derived_paths = sorted(
+                                path.decode("utf-8", errors="strict")
+                                for path in derived_paths_raw.split(b"\0")
+                                if path
+                            )
+                        except UnicodeDecodeError as path_error:
+                            raise SupervisorError(
+                                "integration_review_diff_invalid",
+                                f"Git returned a non-UTF-8 path for task {task['id']}",
+                            ) from path_error
+                        recorded_paths = sorted(json.loads(submission["changed_paths_json"]))
+                        if derived_paths != recorded_paths:
+                            raise SupervisorError(
+                                "submission_evidence_mismatch",
+                                f"Git-derived changed paths differ for task {task['id']}",
+                            )
+                        diff_bytes = self._git_bytes(
+                            "diff",
+                            "--binary",
+                            "--full-index",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--no-renames",
+                            base_sha,
+                            submission["commit_sha"],
+                        )
+                        total_diff_bytes += len(diff_bytes)
+                        if total_diff_bytes > 4_000_000:
+                            raise SupervisorError(
+                                "integration_review_diff_too_large",
+                                "cumulative review diffs exceed the configured safety limit",
+                            )
+                        diff_text = diff_bytes.decode("utf-8", errors="replace")
+                        submission_packet = {
+                            "id": submission["id"],
+                            "attempt_id": submission["attempt_id"],
+                            "worker_agent_id": submission["worker_agent_id"],
+                            "commit_sha": submission["commit_sha"],
+                            "tree_sha": submission["tree_sha"],
+                            "changed_paths": derived_paths,
+                            "diff_sha256": sha256(diff_bytes),
+                            "diff_bytes": len(diff_bytes),
+                            "diff": diff_text,
+                        }
+                        if diff_text.encode("utf-8") != diff_bytes:
+                            submission_packet["diff_base64"] = base64.b64encode(diff_bytes).decode(
+                                "ascii"
+                            )
+                        task_specs.append(
+                            {
+                                "task_id": task["id"],
+                                "position": member["position"],
+                                "task": {
+                                    "title": task["title"],
+                                    "description": task["description"],
+                                    "acceptance": json.loads(task["acceptance_json"]),
+                                    "resources": json.loads(task["resources_json"]),
+                                    "dependencies": json.loads(task["dependencies_json"]),
+                                    "produces": json.loads(task["produces_json"]),
+                                    "consumes": json.loads(task["consumes_json"]),
+                                    "base_branch": task["base_branch"],
+                                    "base_sha": task["base_sha"],
+                                },
+                                "submission": submission_packet,
+                            }
+                        )
+                    cumulative_diff = self._git_bytes(
+                        "diff",
+                        "--binary",
+                        "--full-index",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--no-renames",
+                        current_base,
+                        integration_commit,
+                    )
+                    total_diff_bytes += len(cumulative_diff)
+                    if total_diff_bytes > 4_000_000:
+                        raise SupervisorError(
+                            "integration_review_diff_too_large",
+                            "cumulative review diffs exceed the configured safety limit",
+                        )
+                    cumulative_diff_text = cumulative_diff.decode("utf-8", errors="replace")
+                    cumulative_diff_packet: dict[str, Any] = {
+                        "sha256": sha256(cumulative_diff),
+                        "bytes": len(cumulative_diff),
+                        "diff": cumulative_diff_text,
+                    }
+                    if cumulative_diff_text.encode("utf-8") != cumulative_diff:
+                        cumulative_diff_packet["diff_base64"] = base64.b64encode(
+                            cumulative_diff
+                        ).decode("ascii")
+                    selected_ids = set(ordered_ids)
+                    dependency_context = [
+                        {
+                            "task_id": task_id,
+                            "position": positions[task_id] + 1,
+                            "depends_on_in_batch": [
+                                dependency
+                                for dependency in edges.get(task_id, [])
+                                if dependency in selected_ids
+                            ],
+                            "depends_on_completed": [
+                                dependency
+                                for dependency in edges.get(task_id, [])
+                                if dependency not in selected_ids
+                            ],
+                        }
+                        for task_id in ordered_ids
+                    ]
+                    packet = {
+                        "schema": "acp.integration-review.v2",
+                        "batch_id": batch_id,
+                        "ordering": {
+                            "source": "current ACP merge plan, validated against dependency graph",
+                            "ordered_task_ids": ordered_ids,
+                            "dependencies": dependency_context,
+                        },
+                        "candidate": {
+                            "base_branch": base_branch,
+                            "base_sha": current_base,
+                            "commit_sha": integration_commit,
+                            "tree_sha": candidate_tree,
+                            "cumulative_diff": cumulative_diff_packet,
+                        },
+                        "task_specs": task_specs,
+                        "deterministic_results": deterministic_results,
+                        "policy": {
+                            **review_policy,
+                            "reviewer": reviewer_provenance,
+                            "reviewer_policy_sha256": reviewer_policy_sha256,
+                        },
+                    }
+                    packet_bytes = canonical_json(packet).encode("utf-8")
+                    packet_sha256 = sha256(packet_bytes)
+                    packet_path = self.state_dir / "logs" / f"integration-review-{batch_id}.json"
+                    result_path = self.state_dir / "logs" / f"integration-critic-{batch_id}.json"
+                    packet_path.write_bytes(packet_bytes)
+                    packet_path.chmod(0o400)
+                    self._restore_integration_workspace(
+                        worktree,
+                        integration_commit,
+                        operation_guard_fds,
+                        git_boundary,
+                    )
+                    critic = self._run_critic(
+                        critic_command,
+                        worktree,
+                        self._phase_runtime_env(
+                            members[0]["runtime_env"], "integration-critic", worktree
+                        )
+                        | {
+                            "ACP_REVIEW_PACKET": str(packet_path),
+                            "ACP_REVIEW_RESULT": str(result_path),
+                        },
+                        reviewer_trust_pin,
+                        pass_fds=operation_guard_fds,
+                    )
+                    results.append(critic)
+                    if critic["exit_code"] or not self._integration_workspace_matches(
+                        worktree, integration_commit, operation_guard_fds, git_boundary
+                    ):
+                        raise SupervisorError(
+                            "integration_critic_failed",
+                            "integration critic failed or mutated candidate",
+                        )
+                    if packet_path.read_bytes() != packet_bytes:
+                        raise SupervisorError(
+                            "integration_review_packet_changed",
+                            "critic input packet changed while review was running",
+                        )
+                    payload = self._critic_payload(result_path)
+                    result_path.unlink(missing_ok=True)
+                    member_ids = set(ordered_ids)
+                    for finding in payload["findings"]:
+                        implicated = finding.get("task_ids")
+                        if (
+                            not isinstance(implicated, list)
+                            or not implicated
+                            or any(not isinstance(item, str) for item in implicated)
+                            or len(set(implicated)) != len(implicated)
+                            or not set(implicated).issubset(member_ids)
+                        ):
+                            raise SupervisorError(
+                                "integration_critic_feedback_invalid",
+                                "every cumulative critic finding must name valid implicated task IDs",
+                            )
+                        finding["task_ids"] = [
+                            task_id for task_id in ordered_ids if task_id in set(implicated)
+                        ]
+                    critic_findings = payload["findings"]
+                    review_result = {
+                        "phase": "integration-critic-result",
+                        "batch_id": batch_id,
+                        "reviewer": reviewer_provenance,
+                        "reviewer_policy_sha256": reviewer_policy_sha256,
+                        "review_packet_sha256": packet_sha256,
+                        "candidate": {
+                            "base_sha": current_base,
+                            "commit_sha": integration_commit,
+                            "tree_sha": candidate_tree,
+                        },
+                        **payload,
+                    }
+                    results.append(review_result)
+                    critic_blocked = payload["verdict"] != "pass" or any(
+                        finding["severity"] in {"critical", "high", "medium"}
+                        for finding in critic_findings
+                    )
+                    if critic_blocked:
+                        raise SupervisorError(
+                            "integration_critic_blocked",
+                            f"independent cumulative critic verdict: {payload['verdict']}",
+                        )
+
+                if self._git_text("rev-parse", base_branch) != current_base:
+                    raise SupervisorError(
+                        "integration_base_moved",
+                        "target base branch moved while the cumulative candidate was under review",
+                    )
+                self._assert_integration_git_boundary(worktree, integration_commit, git_boundary)
+            verdict = "ready_to_publish"
+        except Exception as error:
+            error_message = str(error)
+            code = error.code if isinstance(error, SupervisorError) else ""
+            verdict = (
+                "conflict"
+                if code == "merge_conflict"
+                else "stale"
+                if code in {"integration_base_moved", "integration_review_packet_changed"}
+                else "failed"
+            )
+
+        results_by_task: dict[str, list[dict[str, Any]]] = {}
+        for task_id in ordered_ids:
+            member_results = []
+            for item in results:
+                if item.get("phase") == "integration-critic-result":
+                    member_results.append(
+                        {
+                            **item,
+                            "member_task_id": task_id,
+                            "findings": [
+                                finding
+                                for finding in item.get("findings", [])
+                                if task_id in finding.get("task_ids", [])
+                            ],
+                        }
+                    )
+                else:
+                    member_results.append(item)
+            results_by_task[task_id] = member_results
+
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._reauthenticate_bound(
+                        connection,
+                        integrator_id,
+                        "integrator",
+                        credential,
+                        integrator_digest,
+                    )
+                except SupervisorError as auth_error:
+                    verdict = "stale"
+                    error_message = f"{auth_error.code}: {auth_error}"
+                trust_valid = True
+                for member in members:
+                    try:
+                        self._verify_attempt_trust_in(
+                            connection, member["submission"]["attempt_id"]
+                        )
+                    except SupervisorError as trust_error:
+                        trust_valid = False
+                        error_message = f"{trust_error.code}: {trust_error}"
+                        break
+                reservation_valid = trust_valid
+                if reservation_valid:
+                    for member in members:
+                        task_id = member["task"]["id"]
+                        current_task = self._task_row(connection, task_id)
+                        submission = member["submission"]
+                        if current_task["status"] != "integrating":
+                            reservation_valid = False
+                            error_message = (
+                                "a batch task changed status while integration was running"
+                            )
+                            break
+                        try:
+                            self._assert_submission_assurance(connection, submission)
+                            self._assert_reservations(connection, current_task, submission)
+                        except SupervisorError as reservation_error:
+                            reservation_valid = False
+                            error_message = f"{reservation_error.code}: {reservation_error}"
+                            break
+                if (
+                    reservation_valid
+                    and current_base
+                    and (self._git_text("rev-parse", base_branch, check=False) != current_base)
+                ):
+                    reservation_valid = False
+                    verdict = "stale"
+                    error_message = "target base branch moved before publication intent"
+                if not reservation_valid:
+                    verdict = "stale"
+                publication_pending = verdict == "ready_to_publish" and reservation_valid
+                if publication_pending:
+                    for task_id in ordered_ids:
+                        connection.execute(
+                            "UPDATE integrations SET branch = ?, commit_sha = ?, "
+                            "verdict = 'publish_pending', results_json = ?, error = '' "
+                            "WHERE id = ? AND batch_id = ? AND verdict = 'running'",
+                            (
+                                branch,
+                                integration_commit,
+                                canonical_json(results_by_task[task_id]),
+                                integration_ids[task_id],
+                                batch_id,
+                            ),
+                        )
+                else:
+                    for task_id in ordered_ids:
+                        connection.execute(
+                            "UPDATE integrations SET branch = NULL, commit_sha = ?, "
+                            "verdict = ?, results_json = ?, error = ? "
+                            "WHERE id = ? AND batch_id = ? AND verdict = 'running'",
+                            (
+                                integration_commit,
+                                verdict,
+                                canonical_json(results_by_task[task_id]),
+                                error_message,
+                                integration_ids[task_id],
+                                batch_id,
+                            ),
+                        )
+                    implicated_tasks = {
+                        task_id
+                        for finding in critic_findings
+                        for task_id in finding.get("task_ids", [])
+                    }
+                    for member in members:
+                        task_id = member["task"]["id"]
+                        submission = member["submission"]
+                        current_task = self._task_row(connection, task_id)
+                        if current_task["status"] != "integrating":
+                            continue
+                        if critic_blocked and task_id not in implicated_tasks:
+                            stamp = utc_now()
+                            lease_until = int(time.time()) + self.config.lease_seconds
+                            connection.execute(
+                                "UPDATE tasks SET status = 'approved', updated_at = ? "
+                                "WHERE id = ? AND status = 'integrating'",
+                                (stamp, task_id),
+                            )
+                            connection.execute(
+                                "UPDATE resource_leases SET lease_expires_at = ?, updated_at = ? "
+                                "WHERE task_id = ?",
+                                (lease_until, stamp, task_id),
+                            )
+                            connection.execute(
+                                "UPDATE runtime_allocations SET lease_expires_at = ?, "
+                                "updated_at = ? WHERE attempt_id = ?",
+                                (lease_until, stamp, submission["attempt_id"]),
+                            )
+                            continue
+                        target_status = (
+                            "changes_requested"
+                            if critic_blocked or verdict == "stale"
+                            else "conflicted"
+                        )
+                        self._fence_task_cleanup(
+                            connection,
+                            task_id,
+                            submission["attempt_id"],
+                            target_status,
+                            integrator_id,
+                            "cumulative_integration_completed",
+                        )
+                        cleanup_targets[task_id] = target_status
+                self._event(
+                    connection,
+                    "integration.batch.publish_pending"
+                    if publication_pending
+                    else "integration.batch.completed",
+                    integrator_id,
+                    {
+                        "batch_id": batch_id,
+                        "integration_ids": integration_ids,
+                        "ordered_task_ids": ordered_ids,
+                        "verdict": "publish_pending" if publication_pending else verdict,
+                        "commit_sha": integration_commit,
+                        "error": error_message,
+                    },
+                )
+
+            if publication_pending:
+                try:
+                    assert integration_commit is not None and current_base is not None
+                    self._publish_integration_ref(
+                        branch, integration_commit, operation_guard_fds[0]
+                    )
+                    if self._git_text("rev-parse", base_branch, check=False) != current_base:
+                        raise SupervisorError(
+                            "integration_base_moved",
+                            "target base branch moved during publication",
+                        )
+                    with self.connect() as connection:
+                        connection.execute("BEGIN IMMEDIATE")
+                        pending_rows = connection.execute(
+                            "SELECT id, task_id, submission_id, verdict FROM integrations "
+                            "WHERE batch_id = ? ORDER BY created_at, id",
+                            (batch_id,),
+                        ).fetchall()
+                        if len(pending_rows) != len(members) or any(
+                            row["verdict"] != "publish_pending" for row in pending_rows
+                        ):
+                            raise SupervisorError(
+                                "integration_publication_state_changed",
+                                "cumulative batch publication intent changed",
+                            )
+                        for member in members:
+                            task_id = member["task"]["id"]
+                            submission = member["submission"]
+                            current_task = self._task_row(connection, task_id)
+                            if current_task["status"] != "integrating":
+                                raise SupervisorError(
+                                    "integration_publication_state_changed",
+                                    f"task {task_id} changed after publication intent",
+                                )
+                            self._verify_attempt_trust_in(connection, submission["attempt_id"])
+                            self._assert_submission_assurance(connection, submission)
+                            self._assert_reservations(connection, current_task, submission)
+                        connection.execute(
+                            "UPDATE integrations SET verdict = 'pass', error = '' "
+                            "WHERE batch_id = ? AND verdict = 'publish_pending'",
+                            (batch_id,),
+                        )
+                        for member in members:
+                            task_id = member["task"]["id"]
+                            self._fence_task_cleanup(
+                                connection,
+                                task_id,
+                                member["submission"]["attempt_id"],
+                                "done",
+                                integrator_id,
+                                "integration_batch_published",
+                            )
+                            cleanup_targets[task_id] = "done"
+                        self._event(
+                            connection,
+                            "integration.batch.completed",
+                            integrator_id,
+                            {
+                                "batch_id": batch_id,
+                                "integration_ids": integration_ids,
+                                "ordered_task_ids": ordered_ids,
+                                "verdict": "pass",
+                                "commit_sha": integration_commit,
+                                "error": "",
+                            },
+                        )
+                    verdict = "pass"
+                    publication_pending = False
+                except (OSError, subprocess.SubprocessError, SupervisorError) as publish_error:
+                    error_message = f"cumulative integration publication failed: {publish_error}"
+                    verdict = (
+                        "stale"
+                        if isinstance(publish_error, SupervisorError)
+                        and publish_error.code == "integration_base_moved"
+                        else "failed"
+                    )
+                    try:
+                        cleanup_targets = self._mark_integration_batch_for_deletion(
+                            batch_id,
+                            members,
+                            integration_ids,
+                            integrator_id,
+                            error_message,
+                            "changes_requested" if verdict == "stale" else "conflicted",
+                        )
+                        self._finalize_integration_batch_ref_deletion(
+                            batch_id, branch, integration_commit, operation_guard_fds[0]
+                        )
+                        publication_pending = False
+                    except (OSError, subprocess.SubprocessError, SupervisorError) as delete_error:
+                        publication_pending = True
+                        error_message += f"; ref cleanup pending: {delete_error}"
+                except Exception as final_error:
+                    # Leave the intent and ref durable for startup reconciliation.
+                    error_message = (
+                        f"cumulative integration finalization pending recovery: {final_error}"
+                    )
+                    publication_pending = True
+        finally:
+            if worktree.is_symlink():
+                worktree.unlink()
+            elif worktree.exists():
+                shutil.rmtree(worktree)
+            if not publication_pending and verdict != "pass":
+                try:
+                    self._delete_integration_ref(branch, integration_commit, operation_guard_fds[0])
+                except (OSError, subprocess.SubprocessError, SupervisorError):
+                    pass
+
+        cleanup_results: list[dict[str, Any]] = []
+        for member in members:
+            task_id = member["task"]["id"]
+            target_status = cleanup_targets.get(task_id)
+            if target_status is None:
+                cleanup_results.append(
+                    {
+                        "task_id": task_id,
+                        "attempt_id": member["submission"]["attempt_id"],
+                        "state": "retained",
+                    }
+                )
+                continue
+            attempt_id = member["submission"]["attempt_id"]
+            try:
+                runtime_cleanup = self.runtime_down(attempt_id)
+            except (OSError, subprocess.SubprocessError, SupervisorError) as cleanup_error:
+                runtime_cleanup = {
+                    "attempt_id": attempt_id,
+                    "state": "cleanup_error",
+                    "error": str(cleanup_error),
+                }
+                with self.connect() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET cleanup_error = ?, updated_at = ? "
+                        "WHERE id = ? AND status = 'cleanup_pending'",
+                        (str(cleanup_error), utc_now(), task_id),
+                    )
+            if runtime_cleanup["state"] == "released":
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._complete_task_cleanup(connection, task_id, attempt_id, integrator_id)
+            cleanup_results.append({"task_id": task_id, **runtime_cleanup})
+
+        return {
+            "id": batch_id,
+            "batch_id": batch_id,
+            "task_ids": ordered_ids,
+            "integrations": [
+                {
+                    "id": integration_ids[member["task"]["id"]],
+                    "task_id": member["task"]["id"],
+                    "submission_id": member["submission"]["id"],
+                    "position": member["position"],
+                }
+                for member in members
+            ],
+            "branch": branch if verdict == "pass" else None,
+            "commit_sha": integration_commit,
+            "tree_sha": candidate_tree,
+            "verdict": verdict,
+            "error": error_message,
+            "command_results": results,
+            "runtime_cleanup": cleanup_results,
+            "publication_pending": publication_pending,
+        }
+
+    def _mark_integration_batch_for_deletion(
+        self,
+        batch_id: str,
+        members: list[dict[str, Any]],
+        integration_ids: dict[str, str],
+        actor: str,
+        error_message: str,
+        target_status: str,
+    ) -> dict[str, str]:
+        cleanup_targets: dict[str, str] = {}
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE integrations SET verdict = 'delete_pending', error = ? "
+                "WHERE batch_id = ? AND verdict = 'publish_pending'",
+                (error_message, batch_id),
+            )
+            for member in members:
+                task_id = member["task"]["id"]
+                current_task = self._task_row(connection, task_id)
+                if current_task["status"] == "integrating":
+                    self._fence_task_cleanup(
+                        connection,
+                        task_id,
+                        member["submission"]["attempt_id"],
+                        target_status,
+                        actor,
+                        "integration_batch_publication_failed",
+                    )
+                    cleanup_targets[task_id] = target_status
+            self._event(
+                connection,
+                "integration.batch.deletion_pending",
+                actor,
+                {
+                    "batch_id": batch_id,
+                    "integration_ids": integration_ids,
+                    "error": error_message,
+                },
+            )
+        return cleanup_targets
+
+    def _finalize_integration_batch_ref_deletion(
+        self,
+        batch_id: str,
+        branch: str,
+        commit_sha: str | None,
+        operation_guard_fd: int,
+    ) -> None:
+        if not commit_sha:
+            raise SupervisorError(
+                "integration_ref_cleanup_invalid",
+                "cumulative batch ref cleanup has no candidate commit",
+            )
+        self._delete_integration_ref(branch, commit_sha, operation_guard_fd)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE integrations SET branch = NULL, verdict = 'failed' "
+                "WHERE batch_id = ? AND verdict = 'delete_pending'",
+                (batch_id,),
+            )
+
     @staticmethod
     def _integration_merge_input_result(
         base_sha: str,
@@ -721,14 +1799,22 @@ class IntegrationMixin:
         with self.connect() as connection:
             pending_rows = connection.execute(
                 """
-                SELECT integration.id, integration.task_id, integration.branch,
-                  integration.commit_sha, integration.verdict, submission.attempt_id
+                SELECT integration.id, integration.task_id, integration.batch_id, integration.branch,
+                  integration.commit_sha, integration.verdict, integration.results_json,
+                  submission.attempt_id
                 FROM integrations AS integration
                 JOIN submissions AS submission ON submission.id = integration.submission_id
                 ORDER BY integration.created_at, integration.id
                 """
             ).fetchall()
+        batch_rows: dict[str, list[sqlite3.Row]] = {}
+        single_rows: list[sqlite3.Row] = []
         for pending in pending_rows:
+            if pending["batch_id"]:
+                batch_rows.setdefault(pending["batch_id"], []).append(pending)
+            else:
+                single_rows.append(pending)
+        for pending in single_rows:
             try:
                 with self._task_operation_guard(
                     pending["task_id"], recover=True
@@ -737,6 +1823,275 @@ class IntegrationMixin:
             except SupervisorError as error:
                 if error.code != "task_operation_executor_alive":
                     raise
+        for batch_id, rows in batch_rows.items():
+            try:
+                with ExitStack() as guards:
+                    task_ids = sorted({row["task_id"] for row in rows})
+                    guard_fds = tuple(
+                        guards.enter_context(self._task_operation_guard(task_id, recover=True))
+                        for task_id in task_ids
+                    )
+                    self._reconcile_pending_integration_batch_locked(batch_id, rows, guard_fds)
+            except SupervisorError as error:
+                if error.code != "task_operation_executor_alive":
+                    raise
+
+    def _reconcile_pending_integration_batch_locked(
+        self,
+        batch_id: str,
+        pending_rows: list[sqlite3.Row],
+        operation_guard_fds: Sequence[int],
+    ) -> None:
+        """Reconcile one multi-task publication as a group, never one member at a time."""
+
+        try:
+            verdicts = {row["verdict"] for row in pending_rows}
+            branches = {row["branch"] for row in pending_rows}
+            commits = {row["commit_sha"] for row in pending_rows}
+            if len(verdicts) != 1 or len(branches) != 1 or len(commits) != 1:
+                raise SupervisorError(
+                    "integration_batch_state_mismatch",
+                    "durable cumulative integration members disagree on publication state",
+                )
+            verdict = next(iter(verdicts))
+            if verdict == "running":
+                self._reconcile_interrupted_integration_batch(batch_id, pending_rows)
+            elif verdict == "publish_pending":
+                self._reconcile_pending_integration_batch_state(
+                    batch_id, pending_rows, operation_guard_fds[0]
+                )
+            elif verdict == "delete_pending":
+                self._reconcile_pending_integration_batch_deletion(
+                    batch_id, pending_rows, operation_guard_fds[0]
+                )
+        finally:
+            self._remove_integration_residue(batch_id)
+
+    def _reconcile_interrupted_integration_batch(
+        self, batch_id: str, pending_rows: list[sqlite3.Row]
+    ) -> None:
+        error_message = "cumulative integration process stopped before recording a terminal result"
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT integration.id, integration.task_id, integration.verdict,
+                       submission.attempt_id
+                FROM integrations AS integration
+                JOIN submissions AS submission ON submission.id = integration.submission_id
+                WHERE integration.batch_id = ? ORDER BY integration.created_at, integration.id
+                """,
+                (batch_id,),
+            ).fetchall()
+            if not rows or any(row["verdict"] != "running" for row in rows):
+                return
+            for row in rows:
+                task = self._task_row(connection, row["task_id"])
+                recovered_verdict = "failed" if task["status"] == "integrating" else "stale"
+                connection.execute(
+                    "UPDATE integrations SET verdict = ?, error = ? "
+                    "WHERE id = ? AND verdict = 'running'",
+                    (recovered_verdict, error_message, row["id"]),
+                )
+                if task["status"] == "integrating":
+                    self._fence_task_cleanup(
+                        connection,
+                        row["task_id"],
+                        row["attempt_id"],
+                        "conflicted",
+                        "recovery",
+                        "integration_batch_execution_interrupted",
+                    )
+            self._event(
+                connection,
+                "integration.batch.execution_recovered",
+                "recovery",
+                {
+                    "batch_id": batch_id,
+                    "verdict": "failed",
+                    "error": error_message,
+                    "task_ids": [row["task_id"] for row in rows],
+                },
+            )
+
+    def _reconcile_pending_integration_batch_deletion(
+        self,
+        batch_id: str,
+        pending_rows: list[sqlite3.Row],
+        operation_guard_fd: int,
+    ) -> None:
+        branch = pending_rows[0]["branch"]
+        commit_sha = pending_rows[0]["commit_sha"]
+        if not branch or not commit_sha:
+            raise SupervisorError(
+                "integration_ref_cleanup_invalid",
+                "durable cumulative ref cleanup intent is incomplete",
+            )
+        self._delete_integration_ref(branch, commit_sha, operation_guard_fd)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE integrations SET branch = NULL, verdict = 'failed' "
+                "WHERE batch_id = ? AND verdict = 'delete_pending'",
+                (batch_id,),
+            )
+
+    def _reconcile_pending_integration_batch_state(
+        self,
+        batch_id: str,
+        pending_rows: list[sqlite3.Row],
+        operation_guard_fd: int,
+    ) -> None:
+        branch = pending_rows[0]["branch"]
+        commit_sha = pending_rows[0]["commit_sha"]
+        if not branch or not commit_sha:
+            raise SupervisorError(
+                "integration_publication_invalid",
+                "durable cumulative publication intent is incomplete",
+            )
+        base_branch = ""
+        base_sha = ""
+        try:
+            stored_results = json.loads(pending_rows[0]["results_json"])
+            candidate = next(
+                item for item in stored_results if item.get("phase") == "cumulative-candidate"
+            )
+            base_branch = candidate["base_branch"]
+            base_sha = candidate["base_sha"]
+            self._publish_integration_ref(branch, commit_sha, operation_guard_fd)
+            if self._git_text("rev-parse", base_branch, check=False) != base_sha:
+                raise SupervisorError(
+                    "integration_base_moved",
+                    "target base branch moved before cumulative publication recovery",
+                )
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            SupervisorError,
+            KeyError,
+            StopIteration,
+        ) as error:
+            error_message = f"restart cumulative publication failed: {error}"
+            target_status = (
+                "changes_requested"
+                if isinstance(error, SupervisorError) and error.code == "integration_base_moved"
+                else "conflicted"
+            )
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(
+                    """
+                    SELECT integration.id, integration.task_id, integration.verdict,
+                           submission.attempt_id
+                    FROM integrations AS integration
+                    JOIN submissions AS submission ON submission.id = integration.submission_id
+                    WHERE integration.batch_id = ? ORDER BY integration.created_at, integration.id
+                    """,
+                    (batch_id,),
+                ).fetchall()
+                for row in rows:
+                    connection.execute(
+                        "UPDATE integrations SET verdict = 'delete_pending', error = ? "
+                        "WHERE id = ? AND verdict = 'publish_pending'",
+                        (error_message, row["id"]),
+                    )
+                    task = self._task_row(connection, row["task_id"])
+                    if task["status"] == "integrating":
+                        self._fence_task_cleanup(
+                            connection,
+                            row["task_id"],
+                            row["attempt_id"],
+                            target_status,
+                            "recovery",
+                            "integration_batch_publication_failed",
+                        )
+                self._event(
+                    connection,
+                    "integration.batch.publication_recovered",
+                    "recovery",
+                    {
+                        "batch_id": batch_id,
+                        "verdict": "failed",
+                        "error": error_message,
+                    },
+                )
+            self._reconcile_pending_integration_batch_deletion(
+                batch_id, pending_rows, operation_guard_fd
+            )
+            return
+
+        delete_ref = False
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT integration.id, integration.task_id, integration.verdict,
+                       submission.attempt_id
+                FROM integrations AS integration
+                JOIN submissions AS submission ON submission.id = integration.submission_id
+                WHERE integration.batch_id = ? ORDER BY integration.created_at, integration.id
+                """,
+                (batch_id,),
+            ).fetchall()
+            if not rows or any(row["verdict"] != "publish_pending" for row in rows):
+                return
+            tasks = [self._task_row(connection, row["task_id"]) for row in rows]
+            acceptable = all(
+                task["status"] == "integrating"
+                or task["status"] == "done"
+                or (task["status"] == "cleanup_pending" and task["cleanup_target_status"] == "done")
+                for task in tasks
+            )
+            if acceptable:
+                connection.execute(
+                    "UPDATE integrations SET verdict = 'pass', error = '' "
+                    "WHERE batch_id = ? AND verdict = 'publish_pending'",
+                    (batch_id,),
+                )
+                for row, task in zip(rows, tasks, strict=True):
+                    if task["status"] == "integrating":
+                        self._fence_task_cleanup(
+                            connection,
+                            row["task_id"],
+                            row["attempt_id"],
+                            "done",
+                            "recovery",
+                            "integration_batch_publication_recovered",
+                        )
+                recovered_verdict = "pass"
+            else:
+                error_message = "a batch task changed before publication recovery"
+                connection.execute(
+                    "UPDATE integrations SET verdict = 'delete_pending', error = ? "
+                    "WHERE batch_id = ? AND verdict = 'publish_pending'",
+                    (error_message, batch_id),
+                )
+                for row, task in zip(rows, tasks, strict=True):
+                    if task["status"] == "integrating":
+                        self._fence_task_cleanup(
+                            connection,
+                            row["task_id"],
+                            row["attempt_id"],
+                            "conflicted",
+                            "recovery",
+                            "integration_batch_publication_invalidated",
+                        )
+                recovered_verdict = "failed"
+                delete_ref = True
+            self._event(
+                connection,
+                "integration.batch.publication_recovered",
+                "recovery",
+                {
+                    "batch_id": batch_id,
+                    "verdict": recovered_verdict,
+                    "task_ids": [row["task_id"] for row in rows],
+                },
+            )
+        if delete_ref:
+            self._reconcile_pending_integration_batch_deletion(
+                batch_id, pending_rows, operation_guard_fd
+            )
 
     def _reconcile_pending_integration_locked(
         self, pending: sqlite3.Row, operation_guard_fd: int
@@ -922,7 +2277,7 @@ class IntegrationMixin:
         self,
         base_sha: str,
         commit_sha: str,
-        operation_guard_fd: int,
+        operation_guard_fd: int | Sequence[int],
         boundary: IntegrationGitBoundary,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Create one real merge commit through candidate-inert Git plumbing.
@@ -933,7 +2288,13 @@ class IntegrationMixin:
         every other bounded command instead of exempting porcelain `git merge`.
         """
 
-        self._assert_integration_git_boundary(None, None, boundary)
+        head_bytes = (boundary.git_dir / "HEAD").read_bytes()
+        if head_bytes == b"ref: refs/heads/acp-isolated\n":
+            self._assert_integration_git_boundary(None, None, boundary)
+        else:
+            # A cumulative batch enters with HEAD pinned to the previous
+            # synthetic merge. Only the requested base commit is accepted.
+            self._assert_integration_git_boundary(None, base_sha, boundary)
         ancestry = self._run_isolated_git(
             boundary,
             ["merge-base", "--is-ancestor", commit_sha, base_sha],
@@ -1419,8 +2780,13 @@ class IntegrationMixin:
         boundary: IntegrationGitBoundary,
         arguments: Sequence[str],
         label: str,
-        operation_guard_fd: int,
+        operation_guard_fd: int | Sequence[int],
     ) -> dict[str, Any]:
+        guard_fds = (
+            (operation_guard_fd,)
+            if isinstance(operation_guard_fd, int)
+            else tuple(operation_guard_fd)
+        )
         with self._git_operation_guard() as git_guard_fd:
             result = self._run_process(
                 [
@@ -1432,7 +2798,7 @@ class IntegrationMixin:
                 label,
                 self.root,
                 dict(boundary.env),
-                lifecycle_fds=(operation_guard_fd, git_guard_fd),
+                lifecycle_fds=(*guard_fds, git_guard_fd),
             )
         result["security_boundary"] = "synthetic-config+empty-exec-path+contained"
         return result
@@ -1441,7 +2807,7 @@ class IntegrationMixin:
         self,
         worktree: Path,
         commit_sha: str,
-        operation_guard_fd: int,
+        operation_guard_fd: int | Sequence[int],
         boundary: IntegrationGitBoundary,
     ) -> None:
         if worktree.exists():
@@ -1487,7 +2853,7 @@ class IntegrationMixin:
         self,
         worktree: Path,
         commit_sha: str,
-        operation_guard_fd: int,
+        operation_guard_fd: int | Sequence[int],
         boundary: IntegrationGitBoundary,
     ) -> bool:
         self._assert_no_git_grafts()

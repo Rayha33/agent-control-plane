@@ -1013,7 +1013,9 @@ class ReaperMixin:
             integration_branches = [
                 {"task_id": row["task_id"], "branch": row["branch"], "verdict": row["verdict"]}
                 for row in connection.execute(
-                    "SELECT task_id, branch, verdict FROM integrations ORDER BY created_at, id"
+                    "SELECT MIN(task_id) AS task_id, branch, verdict FROM integrations "
+                    "GROUP BY CASE WHEN batch_id = '' THEN id ELSE batch_id END, branch, verdict "
+                    "ORDER BY MIN(created_at), MIN(id)"
                 )
             ]
 

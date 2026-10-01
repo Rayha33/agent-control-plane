@@ -51,6 +51,7 @@ class ViewsMixin:
             )
             integration_view = {
                 "id": integration["id"],
+                "batch_id": integration["batch_id"],
                 "verdict": integration["verdict"],
                 "error": integration["error"],
                 "commit_sha": integration["commit_sha"],
