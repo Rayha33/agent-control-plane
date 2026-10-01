@@ -85,6 +85,66 @@ being overwritten.
 
 Start Claude Code from the displayed worktree after installing the attempt-scoped hook.
 
+## Codex
+
+Codex's supported PreToolUse hook can match apply_patch, and its payload includes
+the session cwd plus the patch in tool_input.command. Following the
+[upstream apply_patch grammar](https://github.com/openai/codex/blob/main/codex-rs/apply-patch/src/parser.rs),
+ACP parses the structured <code>*** Begin Patch</code> / <code>*** End Patch</code>
+request, extracts every Add/Delete/Update path and an optional Move to destination,
+then asks the same guard used at submission for each path. One denied path blocks the
+entire patch; unknown or malformed syntax, missing context, no paths, patches over
+2,000,000 characters, or more than 128 paths are denied.
+Patch input containing U+001C through U+001F is also denied because Python and Codex's
+Rust parser trim these control characters differently, which could otherwise make
+their interpreted filenames disagree.
+Patches carrying Codex's `*** Environment ID:` marker are also denied: ACP does not
+yet bind a Codex-selected environment identity to the attempt worktree.
+
+Install into the live attempt worktree, not the base checkout:
+
+    BASE=$(git rev-parse --show-toplevel)
+    ATTEMPT=$(acp --repo "$BASE" claim "$TASK" --agent me | jq -r .id)
+    WORKTREE=$(acp --repo "$BASE" guard --attempt "$ATTEMPT" --describe | jq -r .worktree)
+    acp --repo "$BASE" hooks install --codex-code --attempt "$ATTEMPT"
+    cd "$WORKTREE"
+
+The attempt form writes .codex/hooks.json inside the worktree, pins both the base
+checkout where .acp/control.db lives and the attempt id, merges existing hook entries,
+replaces an earlier ACP Codex entry only when its command prefix still matches, and
+adds this local config file to the shared Git exclude file so it does not enter the
+candidate diff. Tracked config,
+invalid JSON, invalid top-level hook structure, and symlinked config paths are rejected
+without replacing the existing config. The project-wide form is acp --repo PATH hooks
+install --codex-code; it relies on ACP_ATTEMPT_ID being set in the Codex process
+environment at launch.
+
+Codex requires project-local config to be trusted and each non-managed hook definition
+to be reviewed before it runs. Review and trust the exact entry in Codex's /hooks
+interface. Codex loads matching hooks from all active sources; higher-precedence
+settings do not replace lower-precedence hook sources. See the
+[Codex hooks documentation](https://learn.chatgpt.com/docs/hooks) for current config,
+trust, and hook-response behavior. Hooks are enabled by default, but a local
+features.hooks=false setting disables them; verify the hook is active before relying
+on it.
+
+An allowed guard returns success without changing stdout. A denied guard emits
+Codex's explicit PreToolUse permissionDecision: deny response. ACP-side parsing
+or guard exceptions also produce that explicit denial. However, Codex documents that
+a hook timeout, failed launch, malformed hook response, or other hook error may be
+reported without blocking the tool call. Treat this adapter as a useful guardrail, not
+a complete security boundary.
+
+### What the Codex hook does not guard
+
+The matcher is only apply_patch. Codex also supports separate hooks for Bash and MCP
+tools, but this adapter does not configure them: shell redirections, editors launched
+from a shell, MCP tools, specialized tool paths that opt out of hooks, and other write
+paths are outside its coverage. A project hook may also be untrusted or disabled until
+reviewed. For enforcement against those bypasses, use an OS identity/sandbox that
+cannot write outside the attempt worktree (or the supported supervised Linux worker
+path), not a pattern-matching shell hook.
+
 ### Bash is not guarded, deliberately
 
 `Bash` is absent from the matcher. Deciding what an arbitrary shell command writes means
@@ -138,5 +198,5 @@ subcommand.
   runner credential, so wiring it into a hook means deciding how a secret reaches a hook
   process. Until then an expired lease surfaces as a `lease_expired` denial — loud
   rather than silent.
-- **No Codex or Cursor native hook adapter.** The `guard` command remains runner-agnostic,
-  but only the Claude Code hook configuration is implemented and tested today.
+- **No Cursor native hook adapter.** The guard command remains runner-agnostic, but only
+  Claude Code and Codex apply_patch hook configurations are implemented and tested.

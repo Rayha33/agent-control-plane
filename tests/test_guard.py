@@ -23,6 +23,8 @@ from agent_control_plane.editor_hooks import (
     DENY_EXIT_CODE,
     GUARDED_TOOLS,
     install_claude_code_hooks,
+    install_codex_hooks,
+    parse_codex_patch_paths,
     path_from_hook_payload,
 )
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
@@ -199,6 +201,12 @@ def run_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
     return main(["--repo", str(repo), "guard", "--hook"])
 
 
+def run_codex_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
+    monkeypatch.setenv("ACP_ATTEMPT_ID", attempt_id)
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    return main(["--repo", str(repo), "guard", "--codex-hook"])
+
+
 def test_hook_mode_exit_codes(claimed, repo: Path, monkeypatch) -> None:
     _, attempt = claimed
     worktree = Path(attempt["worktree"])
@@ -234,6 +242,316 @@ def test_path_from_hook_payload_reads_the_editing_tools() -> None:
     assert path_from_hook_payload({"tool_input": {"notebook_path": "n.ipynb"}}) == "n.ipynb"
     assert path_from_hook_payload({"tool_input": {"command": "rm -rf /"}}) is None
     assert path_from_hook_payload("nonsense") is None
+
+
+@pytest.mark.parametrize(
+    ("patch", "expected"),
+    [
+        ("*** Add File: nested/new.py\n+new\n", ["nested/new.py"]),
+        ("*** Update File: alpha.txt\n@@\n-old\n+new\n", ["alpha.txt"]),
+        ("*** Update File: alpha.txt\n@@\n context line\n+new line\n", ["alpha.txt"]),
+        (
+            "*** Update File: alpha.txt\n@@\n-old\n+new\n*** End of File\n   \n",
+            ["alpha.txt"],
+        ),
+        (
+            "*** Update File: alpha.txt\n*** End of File\n@@\n+new line\n",
+            ["alpha.txt"],
+        ),
+        ("*** Delete File: old.py\n", ["old.py"]),
+        (
+            "*** Update File: old.py\n*** Move to: nested/new.py\n@@\n-old\n+new\n",
+            ["old.py", "nested/new.py"],
+        ),
+        ("*** Add File: /tmp/outside.py\n", ["/tmp/outside.py"]),
+        ("*** Add File:  leading-space.py\n", [" leading-space.py"]),
+        ("*** Add File: trailing-space.py \n", ["trailing-space.py"]),
+        ("*** Add File: trailing-space.py   \n", ["trailing-space.py"]),
+    ],
+)
+def test_parse_codex_patch_paths(patch: str, expected: list[str]) -> None:
+    wrapped = f"*** Begin Patch\n{patch}*** End Patch"
+    assert parse_codex_patch_paths(wrapped) == expected
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        "",
+        "*** Add File: alpha.txt\n+no envelope\n",
+        "*** Begin Patch\n*** End Patch",
+        "*** Begin Patch\n*** Copy File: alpha.txt\n*** End Patch",
+        "*** Begin Patch\n*** Add File: \n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\nraw context line\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\n@@\n*** End Patch",
+        "*** Begin Patch\n*** Update File: old.py\n*** Move to: new.py\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n@@\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n@@\n*** End of File\n*** End Patch",
+        "*** Begin Patch\n*** Environment ID: \n*** Add File: alpha.txt\n+x\n*** End Patch",
+        "*** Begin Patch\n*** Environment ID: remote-env\n*** Add File: alpha.txt\n+x\n*** End Patch",
+        "*** Begin Patch\n*** Add File: alpha.txt\n+x\n*** Environment ID: too-late\n*** End Patch",
+        "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n*** Move to: moved.txt\n*** End Patch",
+        "*** Begin Patch\n*** Delete File: alpha.txt\nunexpected\n*** End Patch",
+    ],
+)
+def test_parse_codex_patch_paths_rejects_unrecognized_or_malformed_input(patch: str) -> None:
+    with pytest.raises(ValueError):
+        parse_codex_patch_paths(patch)
+
+
+@pytest.mark.parametrize("control", ["\x1c", "\x1d", "\x1e", "\x1f"])
+@pytest.mark.parametrize(
+    "operation_patch",
+    [
+        "*** Add File: safe.txt{control}\n+content\n",
+        "*** Update File: safe.txt{control}\n@@\n+content\n",
+        "*** Delete File: safe.txt{control}\n",
+        "*** Update File: old.txt\n*** Move to: safe.txt{control}\n@@\n+content\n",
+    ],
+)
+def test_parse_codex_patch_paths_rejects_python_rust_trim_mismatch_controls(
+    control: str, operation_patch: str
+) -> None:
+    patch = f"*** Begin Patch\n{operation_patch.format(control=control)}*** End Patch"
+    with pytest.raises(ValueError, match="control characters"):
+        parse_codex_patch_paths(patch)
+
+
+def test_parse_codex_patch_paths_bounds_input_size_and_file_count() -> None:
+    from agent_control_plane.editor_hooks import CODEX_MAX_PATCH_CHARS
+
+    with pytest.raises(ValueError, match="character safety limit"):
+        parse_codex_patch_paths("x" * (CODEX_MAX_PATCH_CHARS + 1))
+
+    operations = "\n".join(f"*** Add File: file-{index}.txt" for index in range(129))
+    patch = f"*** Begin Patch\n{operations}\n*** End Patch"
+    with pytest.raises(ValueError, match="128-path"):
+        parse_codex_patch_paths(patch)
+
+
+def test_parse_codex_patch_paths_keeps_unicode_line_separator_inside_filename() -> None:
+    path = "safe/\u2028+../../../../outside.txt"
+    patch = f"*** Begin Patch\n*** Add File: {path}\n+escaped\n*** End Patch"
+    assert parse_codex_patch_paths(patch) == [path]
+
+
+def test_codex_hook_checks_every_path_and_denies_entire_mixed_patch(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    import sqlite3
+
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: alpha.txt\n@@\n-old\n+new\n"
+        "*** Add File: beta.txt\n+new\n"
+        "*** End Patch"
+    )
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+    calls: list[str] = []
+    original_guard = GitSupervisor.guard
+
+    def record_guard(self, attempt_id, path, *, caller_cwd=None, now=None):
+        calls.append(path)
+        return original_guard(self, attempt_id, path, caller_cwd=caller_cwd, now=now)
+
+    monkeypatch.setattr(GitSupervisor, "guard", record_guard)
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        before_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    assert run_codex_hook(repo, attempt["id"], payload, monkeypatch) == 0
+    assert calls == ["alpha.txt", "beta.txt"]
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        after_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert after_events == before_events
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+
+
+def test_codex_hook_allows_a_declared_patch_without_output_or_side_effects(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    import sqlite3
+
+    _, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    patch = "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n*** End Patch"
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        before_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    assert run_codex_hook(repo, attempt["id"], payload, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        after_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert after_events == before_events
+
+
+def test_codex_hook_denies_environment_scoped_patch(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    attempt = claimed[1]
+    worktree = Path(attempt["worktree"])
+    patch = (
+        "*** Begin Patch\n"
+        "*** Environment ID: another-environment\n"
+        "*** Update File: alpha.txt\n@@\n-old\n+new\n"
+        "*** End Patch"
+    )
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+
+    assert run_codex_hook(repo, attempt["id"], payload, monkeypatch) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "environment-scoped" in response["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_codex_hook_denies_unicode_line_separator_traversal(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "safe/**")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    path = "safe/\u2028+../../../../outside.txt"
+    patch = f"*** Begin Patch\n*** Add File: {path}\n+escaped\n*** End Patch"
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+    calls: list[str] = []
+    original_guard = GitSupervisor.guard
+
+    def record_guard(self, attempt_id, target_path, *, caller_cwd=None, now=None):
+        calls.append(target_path)
+        return original_guard(self, attempt_id, target_path, caller_cwd=caller_cwd, now=now)
+
+    monkeypatch.setattr(GitSupervisor, "guard", record_guard)
+
+    assert run_codex_hook(repo, attempt["id"], payload, monkeypatch) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert calls == [path]
+
+
+@pytest.mark.parametrize("path", ["../escape.py", "/tmp/escape.py"])
+def test_codex_hook_denies_paths_outside_attempt_worktree(
+    claimed, repo: Path, monkeypatch, capsys, path: str
+) -> None:
+    worktree = Path(claimed[1]["worktree"])
+    patch = f"*** Begin Patch\n*** Add File: {path}\n+outside\n*** End Patch"
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+    assert run_codex_hook(repo, claimed[1]["id"], payload, monkeypatch) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json",
+        "{}",
+        json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "cwd": "/tmp",
+                "tool_input": {"command": "echo hi"},
+            }
+        ),
+        json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "apply_patch",
+                "cwd": "/tmp",
+                "tool_input": {},
+            }
+        ),
+        json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "apply_patch",
+                "cwd": "/tmp",
+                "tool_input": {
+                    "command": "*** Begin Patch\n*** Add File: alpha.txt\n+x\n*** End Patch"
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "tool_name": "apply_patch",
+                "cwd": "/tmp",
+                "tool_input": {
+                    "command": "*** Begin Patch\n*** Add File: alpha.txt\n+x\n*** End Patch"
+                },
+            }
+        ),
+    ],
+)
+def test_codex_hook_denies_missing_context_and_malformed_payload(
+    claimed, repo: Path, monkeypatch, capsys, payload: str
+) -> None:
+    assert run_codex_hook(repo, claimed[1]["id"], payload, monkeypatch) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_codex_hook_denies_guard_exceptions(claimed, repo: Path, monkeypatch, capsys) -> None:
+    def fail_guard(*args, **kwargs):
+        raise RuntimeError("simulated unreadable control state")
+
+    monkeypatch.setattr(GitSupervisor, "guard", fail_guard)
+    worktree = Path(claimed[1]["worktree"])
+    patch = "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n*** End Patch"
+    payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch},
+        }
+    )
+    assert run_codex_hook(repo, claimed[1]["id"], payload, monkeypatch) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "could not decide" in response["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 def test_guard_requires_caller_context_and_resolves_relative_paths_from_it(claimed) -> None:
@@ -319,6 +637,155 @@ def test_install_creates_settings_when_absent(tmp_path: Path) -> None:
     result = install_claude_code_hooks(tmp_path)
     written = json.loads(Path(result["settings"]).read_text(encoding="utf-8"))
     assert written["hooks"]["PreToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
+
+
+def test_codex_install_preserves_user_hooks_and_replaces_its_own_entry(tmp_path: Path) -> None:
+    root = init_repo(tmp_path)
+    hooks_path = root / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True)
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "description": "user hooks",
+                "hooks": {
+                    "SessionStart": [{"hooks": [{"type": "command", "command": "mine-start"}]}],
+                    "PreToolUse": [
+                        {"matcher": "^Bash$", "hooks": [{"type": "command", "command": "mine"}]},
+                        {
+                            "matcher": "^Bash$",
+                            "hooks": [{"type": "command", "command": "custom guard --codex-hook"}],
+                        },
+                        {
+                            "matcher": "^apply_patch$",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "acp --repo /path with spaces guard --codex-hook",
+                                },
+                                {"type": "command", "command": "notify-policy"},
+                            ],
+                        },
+                        {
+                            "matcher": "^apply_patch$",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 /hooks/policy.py guard --codex-hook",
+                                }
+                            ],
+                        },
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = install_codex_hooks(root, "acp --repo /path with spaces")
+    install_codex_hooks(root, "acp --repo /path with spaces")
+
+    written = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert result["guarded_tools"] == ["apply_patch"]
+    assert written["description"] == "user hooks"
+    assert written["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "mine-start"
+    pre = written["hooks"]["PreToolUse"]
+    assert any(entry["hooks"][0]["command"] == "mine" for entry in pre)
+    assert any(entry["hooks"][0]["command"] == "custom guard --codex-hook" for entry in pre)
+    assert any(
+        entry["hooks"][0]["command"] == "python3 /hooks/policy.py guard --codex-hook"
+        for entry in pre
+    )
+    assert any(hook["command"] == "notify-policy" for entry in pre for hook in entry["hooks"])
+    acp_entries = [
+        hook
+        for entry in pre
+        for hook in entry["hooks"]
+        if hook.get("statusMessage") == "Checking ACP write scope"
+    ]
+    assert len(acp_entries) == 1
+    assert acp_entries[0]["timeout"] == 15
+
+
+def test_attempt_codex_hook_install_is_private_and_pins_base_repo(
+    claimed, repo: Path, monkeypatch
+) -> None:
+    attempt = claimed[1]
+    worktree = Path(attempt["worktree"])
+    existing = worktree / ".codex" / "hooks.json"
+    existing.parent.mkdir(parents=True)
+    existing.write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": []}]}}),
+        encoding="utf-8",
+    )
+    existing.chmod(0o600)
+
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "hooks",
+                "install",
+                "--codex-code",
+                "--attempt",
+                attempt["id"],
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "hooks",
+                "install",
+                "--codex-code",
+                "--attempt",
+                attempt["id"],
+            ]
+        )
+        == 0
+    )
+    written = json.loads(existing.read_text(encoding="utf-8"))
+    hook = written["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
+    assert f"--repo {repo}" in hook
+    assert f"--attempt {attempt['id']}" in hook
+    assert len(written["hooks"]["PreToolUse"]) == 2
+    assert existing.stat().st_mode & 0o777 == 0o600
+    assert (
+        subprocess.run(
+            ["git", "-C", str(worktree), "check-ignore", "--no-index", "-q", ".codex/hooks.json"],
+            check=False,
+        ).returncode
+        == 0
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        == ""
+    )
+
+    monkeypatch.setenv("ACP_ATTEMPT_ID", attempt["id"])
+    patch = "*** Begin Patch\n*** Update File: alpha.txt\n@@\n-old\n+new\n*** End Patch"
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "cwd": str(worktree),
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "apply_patch",
+                    "tool_input": {"command": patch},
+                }
+            )
+        ),
+    )
+    assert main(shlex.split(hook)[1:]) == 0
 
 
 @pytest.mark.parametrize("contents", ["[]", "null", '"settings"'])
