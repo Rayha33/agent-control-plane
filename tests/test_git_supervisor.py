@@ -380,6 +380,8 @@ def test_concurrent_process_claims_get_independent_registered_worktrees(repo: Pa
 def test_worktree_add_failure_after_creation_rolls_back_partial_claim(
     repo: Path, monkeypatch
 ) -> None:
+    port, _ = free_port_range(1)
+    write_config(repo, runtime_ports={"APP_PORT": (port, port)})
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "injected provisioning failure")
     original_git = supervisor._git
@@ -407,14 +409,20 @@ def test_worktree_add_failure_after_creation_rolls_back_partial_claim(
             (attempt["id"],),
         ).fetchone()
         lease = connection.execute(
-            "SELECT attempt_id, lease_expires_at FROM resource_leases WHERE resource = ?",
+            "SELECT task_id, attempt_id, lease_expires_at FROM resource_leases WHERE resource = ?",
             ("alpha.txt",),
         ).fetchone()
+        allocations = connection.execute(
+            "SELECT pool_name, value, attempt_id FROM runtime_allocations WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchall()
 
     assert attempt["status"] == "failed"
     assert runtime["state"] == "released"
+    assert lease["task_id"] is None
     assert lease["attempt_id"] is None
     assert lease["lease_expires_at"] == 0
+    assert allocations == []
     assert not Path(attempt["worktree"]).exists()
     assert git(repo, "branch", "--list", attempt["branch"]) == ""
     registered = {
