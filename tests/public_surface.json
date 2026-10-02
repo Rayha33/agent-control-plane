@@ -246,7 +246,8 @@
     ],
     "class:DriverContext": [
       "credential_handles",
-      "credential_registry"
+      "credential_registry",
+      "phase"
     ],
     "class:DriverDefinition": [
       "option"
@@ -842,6 +843,31 @@
       "setup",
       "teardown"
     ],
+    "class:CoreSimulatorDriver": [
+      "_UDID",
+      "_argv",
+      "_base_device",
+      "_base_udid",
+      "_env",
+      "_expected_identity",
+      "_failure",
+      "_inventory",
+      "_prefix",
+      "_prior_proof",
+      "_prior_provision_uncertain",
+      "_prior_record",
+      "_setup_failure",
+      "_timeout",
+      "credential_handle",
+      "kind",
+      "ownership_identity",
+      "ownership_token",
+      "probe",
+      "resource_id",
+      "run_phase",
+      "setup",
+      "teardown"
+    ],
     "class:CredentialError": [],
     "class:CredentialHandle": [
       "as_internal_dict",
@@ -868,7 +894,8 @@
     ],
     "class:DriverContext": [
       "credential_handles",
-      "credential_registry"
+      "credential_registry",
+      "phase"
     ],
     "class:DriverDefinition": [
       "option"
@@ -939,6 +966,7 @@
       "Callable",
       "CommandRunner",
       "ContainedProcessRunner",
+      "CoreSimulatorDriver",
       "CredentialError",
       "CredentialHandle",
       "CredentialMaterial",
@@ -966,6 +994,7 @@
       "build_driver",
       "contextmanager",
       "dataclass",
+      "field",
       "hmac",
       "json",
       "os",
@@ -1735,7 +1764,8 @@
     ],
     "class:DriverContext": [
       "credential_handles",
-      "credential_registry"
+      "credential_registry",
+      "phase"
     ],
     "class:DriverDefinition": [
       "option"

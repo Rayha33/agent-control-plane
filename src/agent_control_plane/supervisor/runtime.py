@@ -350,6 +350,9 @@ class RuntimeMixin:
         environment: dict[str, str],
         registry: CredentialRegistry | None = None,
         handles: dict[str, CredentialHandle] | None = None,
+        phase: str = "",
+        prior_driver_states: dict[str, str] | None = None,
+        prior_driver_evidence: dict[str, dict[str, Any]] | None = None,
     ) -> DriverContext:
         attempt = self.attempt(attempt_id)
         runtime_dir = Path(environment["ACP_RUNTIME_DIR"])
@@ -362,6 +365,9 @@ class RuntimeMixin:
             environment=environment,
             credential_registry=registry,
             credential_handles=handles or {},
+            phase=phase,
+            prior_driver_states=prior_driver_states or {},
+            prior_driver_evidence=prior_driver_evidence or {},
         )
 
     @staticmethod
@@ -523,10 +529,59 @@ class RuntimeMixin:
         phase: str,
         evidence: Sequence[PhaseEvidence],
         definitions: dict[str, DriverDefinition],
+        environment: dict[str, str] | None = None,
         restart_token: str | None = None,
     ) -> None:
         if not evidence:
             return
+        allowed_exports = {"core_simulator": {"ACP_SIMULATOR_UDID"}}
+        exports: dict[str, str] = {}
+        removals: set[str] = set()
+        for item in evidence:
+            item_exports = dict(item.environment_exports)
+            allowed = allowed_exports.get(item.kind, set())
+            if item_exports and (phase != "setup" or not item.ok or set(item_exports) - allowed):
+                raise SupervisorError(
+                    "runtime_driver_environment_invalid",
+                    f"driver {item.driver} returned an unsupported runtime environment export",
+                )
+            for key, value in item_exports.items():
+                if not isinstance(value, str):
+                    raise SupervisorError(
+                        "runtime_driver_environment_invalid",
+                        f"driver {item.driver} returned a non-text simulator UDID",
+                    )
+                try:
+                    parsed = str(uuid.UUID(value))
+                except (TypeError, ValueError) as error:
+                    raise SupervisorError(
+                        "runtime_driver_environment_invalid",
+                        f"driver {item.driver} returned an invalid simulator UDID",
+                    ) from error
+                if key != "ACP_SIMULATOR_UDID" or parsed.upper() != value.upper():
+                    raise SupervisorError(
+                        "runtime_driver_environment_invalid",
+                        f"driver {item.driver} returned an invalid simulator environment value",
+                    )
+                if key in exports and exports[key] != value:
+                    raise SupervisorError(
+                        "runtime_driver_environment_invalid",
+                        f"multiple runtime drivers exported conflicting values for {key}",
+                    )
+                exports[key] = value.upper()
+            if phase == "teardown" and item.proof.get("cleanup_proved"):
+                removals.update(allowed)
+        if environment is not None:
+            for key, value in exports.items():
+                existing = environment.get(key)
+                if existing is not None and existing != value:
+                    raise SupervisorError(
+                        "runtime_driver_environment_invalid",
+                        f"runtime environment already contains a different value for {key}",
+                    )
+                environment[key] = value
+            for key in removals:
+                environment.pop(key, None)
         stamp = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -536,8 +591,12 @@ class RuntimeMixin:
                     state = "released" if item.proof.get("cleanup_proved") else "quarantined"
                 elif phase == "setup":
                     state = "active" if item.ok else "setup_failed"
+                elif item.ok and item.present is True:
+                    state = "active"
+                elif item.ok and item.present is False:
+                    state = "absent"
                 else:
-                    state = "active" if item.present else "absent"
+                    state = "quarantined"
                 connection.execute(
                     """
                     INSERT INTO runtime_driver_resources
@@ -589,7 +648,17 @@ class RuntimeMixin:
                         "exit_code": item.exit_code,
                         "present": item.present,
                         "cleanup_proved": item.proof.get("cleanup_proved"),
+                        "environment_exports": dict(item.environment_exports),
+                        "environment_removed": sorted(allowed_exports.get(item.kind, set()))
+                        if phase == "teardown" and item.proof.get("cleanup_proved")
+                        else [],
                     },
+                )
+            if environment is not None and (exports or removals):
+                connection.execute(
+                    "UPDATE runtime_environments SET env_json = ?, updated_at = ? "
+                    "WHERE attempt_id = ?",
+                    (canonical_json(environment), stamp, attempt_id),
                 )
 
     def driver_resources(self, attempt_id: str) -> list[dict[str, Any]]:
