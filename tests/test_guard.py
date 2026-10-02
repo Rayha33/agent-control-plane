@@ -294,12 +294,13 @@ def test_hook_cwd_must_be_a_directory(claimed, repo: Path) -> None:
     assert decision["reason"] == "invalid_working_directory"
 
 
-def test_hook_mode_fails_closed_without_a_cwd(claimed, repo: Path, monkeypatch) -> None:
+def test_hook_mode_fails_closed_without_a_cwd(claimed, repo: Path, monkeypatch, capsys) -> None:
     _, attempt = claimed
     worktree = Path(attempt["worktree"])
     payload = json.dumps({"tool_input": {"file_path": str(worktree / "alpha.txt")}})
 
     assert run_hook(repo, attempt["id"], payload, monkeypatch) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "unreadable_hook_payload"
 
 
 def test_hook_mode_fails_closed_on_cwd_drift(claimed, repo: Path, monkeypatch) -> None:

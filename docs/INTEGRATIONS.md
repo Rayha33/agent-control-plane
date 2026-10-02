@@ -26,20 +26,21 @@ An agent told *"beta.txt is not in the task's declared write set; declared: alph
 corrects itself in one turn. Guard is read-only — a pre-write check must never itself
 become a reason the state changed.
 
-Denials, in the order they are checked:
+For hook calls, the adapter first validates the payload. If it cannot extract both a
+supported writable path and a non-empty string `cwd`, it denies with
+`unreadable_hook_payload` before looking up the attempt or checking its lease. The
+supervisor denials below are then checked in this order:
 
 | reason | meaning |
 | --- | --- |
 | `attempt_not_found` | no such attempt |
 | `attempt_not_live` | the attempt is orphaned, submitted or quarantined |
 | `lease_expired` | the claim lease has run out; heartbeat or re-claim |
-| `invalid_working_directory` | hook cwd is missing, invalid, or cannot be resolved |
+| `invalid_working_directory` | hook cwd is not absolute, an existing directory, or resolvable |
 | `cwd_outside_worktree` | hook cwd is outside this attempt's worktree |
 | `invalid_path` | the target path cannot be resolved |
 | `outside_worktree` | the path resolves outside the allocated worktree |
 | `undeclared_write` | inside the worktree, but not in the task's write set |
-| `unreadable_hook_payload` | the request could not be parsed, so it is refused |
-
 `outside_worktree` covers three things worth stating plainly: `../` traversal, absolute
 paths elsewhere on the machine, and **the base checkout** — even for a file that IS in
 the write set, because the copy in the base checkout is not the one the attempt leased.
