@@ -289,7 +289,7 @@ def test_runtime_ports_are_unique_and_reach_supervised_worker(repo: Path) -> Non
 def test_supervised_worker_heartbeat_does_not_replace_explicit_checkpoint(repo: Path) -> None:
     config = repo / "acp.toml"
     config.write_text(
-        config.read_text(encoding="utf-8").replace("lease_seconds = 60", "lease_seconds = 6"),
+        config.read_text(encoding="utf-8").replace("lease_seconds = 60", "lease_seconds = 15"),
         encoding="utf-8",
     )
     supervisor = GitSupervisor(repo)
@@ -299,7 +299,7 @@ def test_supervised_worker_heartbeat_does_not_replace_explicit_checkpoint(repo: 
         "pathlib.Path('alpha.txt').write_text('worker\\n'); "
         "subprocess.run(['git','add','alpha.txt'],check=True); "
         "subprocess.run(['git','commit','-m','slow worker'],check=True); "
-        "time.sleep(4)"
+        "time.sleep(7)"
     )
 
     submission = supervisor.run_worker(
