@@ -411,7 +411,14 @@ class ClaimsMixin:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             return self._attempt_view(connection, row)
 
-    def guard(self, attempt_id: str, path: str, *, now: int | None = None) -> dict[str, Any]:
+    def guard(
+        self,
+        attempt_id: str,
+        path: str,
+        *,
+        cwd: str | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
         """Decide whether an agent holding `attempt_id` may write `path`.
 
         This is the check an editor's pre-write hook asks before letting a tool call
@@ -420,6 +427,11 @@ class ClaimsMixin:
         filesystem is decided in one place for both. An adapter that reimplemented the
         matching would be a second enforcement implementation that could disagree with
         the one that matters, which is worse than none.
+
+        `cwd` binds an editor hook's relative target to the directory the host says the
+        tool is running in. If supplied, it must resolve to the attempt worktree or one
+        of its subdirectories. Omit it for the CLI/MCP contract, where relative paths
+        are rooted at the attempt worktree.
 
         Read-only, so it runs on a read-only supervisor and cannot itself become a
         reason the state changed.
@@ -462,12 +474,59 @@ class ClaimsMixin:
             )
 
         worktree = Path(attempt["worktree"]).resolve()
+        working_directory = worktree
+        if cwd is not None:
+            supplied_cwd = Path(cwd)
+            if not supplied_cwd.is_absolute():
+                return self._guard_denial(
+                    attempt_id,
+                    path,
+                    "invalid_working_directory",
+                    "the hook working directory must be an absolute existing directory",
+                    declared=declared,
+                )
+            try:
+                working_directory = supplied_cwd.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                return self._guard_denial(
+                    attempt_id,
+                    path,
+                    "invalid_working_directory",
+                    "the hook working directory could not be resolved",
+                    declared=declared,
+                )
+            if not working_directory.is_dir():
+                return self._guard_denial(
+                    attempt_id,
+                    path,
+                    "invalid_working_directory",
+                    "the hook working directory is not an existing directory",
+                    declared=declared,
+                )
+            if working_directory != worktree and worktree not in working_directory.parents:
+                return self._guard_denial(
+                    attempt_id,
+                    path,
+                    "cwd_outside_worktree",
+                    f"hook working directory {working_directory} is outside the attempt worktree {worktree}",
+                    declared=declared,
+                )
+
         # resolve() follows symlinks, so a link planted inside the worktree that points
         # outside it resolves outside and is refused here rather than at submit time.
-        target = Path(path)
-        if not target.is_absolute():
-            target = worktree / target
-        target = target.resolve()
+        try:
+            target = Path(path)
+            if not target.is_absolute():
+                target = working_directory / target
+            target = target.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "invalid_path",
+                "the target path could not be resolved",
+                declared=declared,
+            )
         if target != worktree and worktree not in target.parents:
             return self._guard_denial(
                 attempt_id,

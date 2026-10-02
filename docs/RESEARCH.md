@@ -119,6 +119,25 @@ remains checkout/process management, not a general filesystem sandbox; keep Code
 workspace sandbox enabled and constrain its effective writable roots to the attempt
 checkout. Codex Desktop and non-Linux supervised launch remain open integration gaps.
 
+### Hook cwd drift and target identity (2026-10-02)
+
+The open [Claude Code issue #76250](https://github.com/anthropics/claude-code/issues/76250)
+reports parent/sibling sessions unexpectedly sharing or changing working-directory
+context across worktrees; [issue #42282](https://github.com/anthropics/claude-code/issues/42282)
+describes parent cwd drift after worktree-isolated subagents. These are individual
+reports, not prevalence estimates or independently confirmed vendor root causes. The
+official [Claude Code hook input contract](https://github.com/anthropics/claude-code/blob/main/plugins/plugin-dev/skills/hook-development/SKILL.md)
+includes the current working directory (`cwd`) alongside `tool_name` and `tool_input`.
+
+Code inspection found that ACP's Claude adapter previously authorized a relative
+structured edit by resolving it from the attempt root while Claude resolves that same
+string from its active hook/session cwd. A drifted cwd could therefore make the checked
+path differ from the path the editor uses. ACP now requires a valid hook cwd inside the
+claimed attempt worktree and resolves relative paths from it. Direct CLI/MCP path calls
+retain attempt-root semantics. This narrows a path-identity mismatch at the structured
+hook boundary; it does not guard Bash, bypassed hooks, or the race between authorization
+and the actual write, and it is not an OS sandbox.
+
 The product response is not to special-case those tools. It is to make the
 candidate commit, ownership token, checkout, and review evidence explicit and
 verifiable.

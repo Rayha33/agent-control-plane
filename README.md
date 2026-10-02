@@ -821,9 +821,11 @@ service.
   --claude-code` closes most of that gap for Claude Code by putting `acp guard` in
   front of every file-editing tool call — it refuses a write outside the attempt's
   worktree or outside the task's declared write set, using the same check `submit`
-  applies to the diff. `Bash` is deliberately not guarded: what a shell command writes
-  cannot be read off the command string, and a pattern that can be walked around by
-  rephrasing would read as coverage without being any. `acp mcp-serve` additionally
+  applies to the diff. It also requires Claude's hook-reported `cwd` to resolve inside
+  the attempt worktree and resolves relative edit paths from that directory. `Bash`
+  is deliberately not guarded: what a shell command writes cannot be read off the
+  command string, and a pattern that can be walked around by rephrasing would read as
+  coverage without being any. `acp mcp-serve` additionally
   exposes ten read-only tools over stdio MCP — no writes, no credential — so a session
   can read the board without shelling out. See docs/INTEGRATIONS.md.
 - Tests and critic commands execute candidate code. Linux uses a child subreaper
