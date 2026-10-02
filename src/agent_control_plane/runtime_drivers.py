@@ -42,7 +42,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -59,6 +59,7 @@ DRIVER_KINDS: tuple[str, ...] = (
     "docker_compose",
     "postgres_schema",
     "browser_profile",
+    "core_simulator",
     "namespace_runtime",
 )
 
@@ -206,6 +207,9 @@ class DriverContext:
     environment: Mapping[str, str]
     credential_registry: CredentialRegistry | None = None
     credential_handles: Mapping[str, CredentialHandle] | None = None
+    phase: str = ""
+    prior_driver_states: Mapping[str, str] = field(default_factory=dict)
+    prior_driver_evidence: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -220,6 +224,7 @@ class PhaseEvidence:
     present: bool | None
     proof: dict[str, Any]
     credential_handle: CredentialHandle | None = None
+    environment_exports: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -236,6 +241,7 @@ class PhaseEvidence:
             "exit_code": self.exit_code,
             "present": self.present,
             "proof": self.proof,
+            "environment_exports": dict(self.environment_exports),
         }
 
 
@@ -524,10 +530,16 @@ class ResourceDriver:
                 present=present,
                 proof=proof,
                 credential_handle=credential_handle,
+                environment_exports=(
+                    dict(result.get("environment_exports", {}))
+                    if result.get("exit_code", 0) == 0 and present
+                    else {}
+                ),
             )
 
         if phase == "verify":
             present, observation = self.probe(context, runner)
+            verified = present is not None and observation.get("exit_code", 0) == 0
             return PhaseEvidence(
                 driver=self.definition.name,
                 kind=self.kind,
@@ -535,7 +547,7 @@ class ResourceDriver:
                 resource_id=resource,
                 ownership_token=token,
                 expires_at=context.expires_at,
-                exit_code=0 if observation.get("exit_code", 0) == 0 else 1,
+                exit_code=0 if verified else 1,
                 present=present,
                 proof={"observation": observation},
                 credential_handle=credential_handle,
@@ -546,7 +558,7 @@ class ResourceDriver:
         proof: dict[str, Any] = {
             "action": result,
             "observation": observation,
-            "cleanup_proved": (not present) and observation.get("exit_code", 0) == 0,
+            "cleanup_proved": present is False and observation.get("exit_code", 0) == 0,
         }
         # THE central rule: exit code 0 is not cleanup. Absence is cleanup.
         if present:
@@ -794,6 +806,525 @@ class BrowserProfileDriver(ResourceDriver):
             "exit_code": 0,
             "stdout": "",
             "stderr": "",
+        }
+
+
+class CoreSimulatorDriver(ResourceDriver):
+    """Clone one preinstalled simulator for an attempt and prove its removal.
+
+    A clone is identified by a supervisor-secret-derived name and by the exact
+    UDID captured immediately after ``simctl clone``. A name alone is not
+    cleanup authority: if the durable UDID proof is missing or no longer
+    matches, teardown refuses to signal or delete anything.
+    """
+
+    kind = "core_simulator"
+    _UDID = re.compile(r"^[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$")
+
+    def __init__(self, definition: DriverDefinition) -> None:
+        super().__init__(definition)
+        self._created_udid: str | None = None
+        self._created_base_runtime: str | None = None
+        self._created_base_device_type: str | None = None
+        self._provision_uncertain = False
+
+    def _base_udid(self) -> str:
+        value = (self.definition.option("base_udid") or "").strip()
+        if not self._UDID.fullmatch(value):
+            raise DriverError("invalid_config", "core_simulator base_udid must be a UUID")
+        return value.upper()
+
+    def _prefix(self) -> str:
+        prefix = (self.definition.option("name_prefix", "ACP") or "ACP").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,15}", prefix):
+            raise DriverError(
+                "invalid_config",
+                "core_simulator name_prefix must be 1..16 safe ASCII characters",
+            )
+        return prefix
+
+    def _timeout(self) -> int:
+        try:
+            value = int(self.definition.option("timeout_seconds", "300") or "300")
+        except ValueError as error:
+            raise DriverError(
+                "invalid_config", "core_simulator timeout_seconds must be an integer"
+            ) from error
+        if not 1 <= value <= 900:
+            raise DriverError(
+                "invalid_config", "core_simulator timeout_seconds must be between 1 and 900"
+            )
+        return value
+
+    def resource_id(self, context: DriverContext) -> str:
+        if sys.platform != "darwin":
+            raise DriverError(
+                "unsupported_platform", "core_simulator runtime resources require macOS"
+            )
+        base_udid = self._base_udid()
+        digest = hmac.new(
+            context.secret,
+            f"{context.attempt_id}\x00{base_udid}".encode(),
+            sha256,
+        ).hexdigest()[:24]
+        return f"{self._prefix()}-{digest}"
+
+    def ownership_identity(self, context: DriverContext) -> str:
+        return f"{self._base_udid()}\x00{self.resource_id(context)}"
+
+    def _argv(self, *arguments: str) -> list[str]:
+        if self.definition.executable is None:
+            raise DriverError("invalid_config", "core_simulator xcrun executable is missing")
+        return [str(self.definition.executable), "simctl", *arguments]
+
+    @staticmethod
+    def _failure(argv: Sequence[str], message: str) -> dict[str, Any]:
+        return {"argv": list(argv), "exit_code": 1, "stdout": "", "stderr": message}
+
+    def _inventory(
+        self, context: DriverContext, runner: CommandRunner
+    ) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+        argv = self._argv("list", "devices", "--json")
+        result = runner(argv, context.runtime_dir, self._env(context), self._timeout(), None)
+        if result.get("exit_code") != 0:
+            return None, self._failure(argv, "simulator inventory is unavailable")
+        try:
+            payload = json.loads(str(result.get("stdout", "")))
+            runtime_devices = payload["devices"]
+            if not isinstance(runtime_devices, dict):
+                raise ValueError("devices is not an object")
+            devices: list[dict[str, Any]] = []
+            for runtime_id, entries in runtime_devices.items():
+                if not isinstance(runtime_id, str) or not isinstance(entries, list):
+                    raise ValueError("runtime device list is malformed")
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        raise ValueError("device entry is malformed")
+                    name = entry.get("name")
+                    udid = entry.get("udid")
+                    device_type = entry.get("deviceTypeIdentifier")
+                    if not all(isinstance(value, str) and value for value in (name, udid)):
+                        raise ValueError("device identity is incomplete")
+                    devices.append(
+                        {
+                            "name": name,
+                            "udid": udid.upper(),
+                            "runtime_id": runtime_id,
+                            "device_type": device_type if isinstance(device_type, str) else "",
+                            "available": entry.get("isAvailable"),
+                            "state": entry.get("state", ""),
+                        }
+                    )
+            udids = [device["udid"] for device in devices]
+            if any(not self._UDID.fullmatch(udid) for udid in udids) or len(set(udids)) != len(
+                udids
+            ):
+                raise ValueError("device identifiers are malformed or duplicated")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None, self._failure(argv, "simulator inventory has an unknown format")
+        # Do not persist simctl's raw JSON: it includes host-specific data/log paths.
+        return devices, {
+            "argv": argv,
+            "exit_code": 0,
+            "stdout": f"{len(devices)} simulator devices",
+            "stderr": "",
+        }
+
+    def _prior_record(self, context: DriverContext) -> Mapping[str, Any]:
+        record = context.prior_driver_evidence.get(self.definition.name, {})
+        if record.get("kind") != self.kind or record.get("resource_id") != self.resource_id(
+            context
+        ):
+            return {}
+        return record
+
+    def _prior_proof(self, context: DriverContext) -> Mapping[str, Any]:
+        record = self._prior_record(context)
+        proof = record.get("proof", {})
+        if not isinstance(proof, Mapping):
+            return {}
+        for key in ("observation", "action"):
+            nested = proof.get(key)
+            if isinstance(nested, Mapping) and isinstance(nested.get("device_udid"), str):
+                return nested
+        return proof if isinstance(proof.get("device_udid"), str) else {}
+
+    def _prior_provision_uncertain(self, context: DriverContext) -> bool:
+        state = context.prior_driver_states.get(self.definition.name)
+        if state == "setup_pending":
+            # The supervisor persisted intent before calling simctl. A crash in
+            # that window cannot prove whether the external command started.
+            return True
+        proof = self._prior_record(context).get("proof", {})
+        action = proof.get("action", {}) if isinstance(proof, Mapping) else {}
+        if isinstance(action, Mapping) and isinstance(action.get("provision_uncertain"), bool):
+            return bool(action["provision_uncertain"])
+        known_udid, _runtime_id, _device_type = self._expected_identity(context)
+        return state in {"setup_failed", "quarantined"} and known_udid is None
+
+    def _setup_failure(
+        self, context: DriverContext, argv: Sequence[str], message: str
+    ) -> dict[str, Any]:
+        result = self._failure(argv, message)
+        result["provision_uncertain"] = self._provision_uncertain
+        known_udid, runtime_id, device_type = self._expected_identity(context)
+        if known_udid:
+            result.update(
+                {
+                    "device_udid": known_udid,
+                    "base_runtime_id": runtime_id,
+                    "base_device_type": device_type,
+                }
+            )
+        return result
+
+    def _expected_identity(self, context: DriverContext) -> tuple[str | None, str, str]:
+        if self._created_udid:
+            return (
+                self._created_udid,
+                self._created_base_runtime or "",
+                self._created_base_device_type or "",
+            )
+        proof = self._prior_proof(context)
+        udid = proof.get("device_udid")
+        runtime_id = proof.get("base_runtime_id")
+        device_type = proof.get("base_device_type")
+        valid_udid = udid.upper() if isinstance(udid, str) and self._UDID.fullmatch(udid) else None
+        return (
+            valid_udid,
+            runtime_id if isinstance(runtime_id, str) else "",
+            device_type if isinstance(device_type, str) else "",
+        )
+
+    def _base_device(
+        self, context: DriverContext, devices: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any] | None:
+        matches = [device for device in devices if device["udid"] == self._base_udid()]
+        if (
+            len(matches) != 1
+            or matches[0].get("available") is not True
+            or matches[0].get("state") != "Shutdown"
+            or not matches[0].get("runtime_id")
+            or not matches[0].get("device_type")
+        ):
+            return None
+        return dict(matches[0])
+
+    def setup(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
+        if sys.platform != "darwin":
+            raise DriverError(
+                "unsupported_platform", "core_simulator runtime resources require macOS"
+            )
+        name = self.resource_id(context)
+        clone_argv = self._argv("clone", self._base_udid(), name)
+        if self._prior_provision_uncertain(context):
+            self._provision_uncertain = True
+            return self._setup_failure(
+                context,
+                clone_argv,
+                "a prior simulator provisioning attempt has no durable identity proof",
+            )
+
+        before, inventory = self._inventory(context, runner)
+        if before is None:
+            return self._setup_failure(
+                context, inventory["argv"], "simulator inventory is unavailable before setup"
+            )
+        base = self._base_device(context, before)
+        if base is None:
+            return self._setup_failure(
+                context,
+                clone_argv,
+                "configured base simulator must be one available, shut-down simulator",
+            )
+        existing = [device for device in before if device["name"] == name]
+        known_udid, base_runtime, base_type = self._expected_identity(context)
+        if known_udid:
+            owned_matches = [device for device in before if device["udid"] == known_udid]
+            if (
+                context.prior_driver_states.get(self.definition.name) == "active"
+                and len(owned_matches) == 1
+            ):
+                # A durable UDID is authoritative only while its full identity
+                # (including the attempt-derived name) still agrees.
+                if (
+                    owned_matches[0]["name"] == name
+                    and len(existing) == 1
+                    and existing[0]["udid"] == known_udid
+                    and base_runtime == base["runtime_id"]
+                    and base_type == base["device_type"]
+                    and owned_matches[0]["runtime_id"] == base["runtime_id"]
+                    and owned_matches[0]["device_type"] == base["device_type"]
+                    and owned_matches[0]["available"] is True
+                ):
+                    self._created_udid = known_udid
+                    self._created_base_runtime = base["runtime_id"]
+                    self._created_base_device_type = base["device_type"]
+                    self._provision_uncertain = False
+                    return {
+                        "argv": clone_argv,
+                        "exit_code": 0,
+                        "stdout": "reused the exact previously proved clone",
+                        "stderr": "",
+                        "device_udid": known_udid,
+                        "base_runtime_id": base["runtime_id"],
+                        "base_device_type": base["device_type"],
+                        "provision_uncertain": False,
+                        "environment_exports": {"ACP_SIMULATOR_UDID": known_udid},
+                    }
+            if owned_matches or existing:
+                self._provision_uncertain = True
+                return self._setup_failure(
+                    context,
+                    clone_argv,
+                    "attempt simulator identity changed or is ambiguous; refusing reprovisioning",
+                )
+            if context.prior_driver_states.get(self.definition.name) == "active":
+                # The exact old clone is now absent. Let teardown record that
+                # proof and clear the old exported UDID before a fresh attempt.
+                result = self._setup_failure(
+                    context,
+                    clone_argv,
+                    "the previously owned simulator is absent; release it before reprovisioning",
+                )
+                result.update(
+                    {
+                        "device_udid": known_udid,
+                        "base_runtime_id": base_runtime,
+                        "base_device_type": base_type,
+                    }
+                )
+                return result
+        elif existing:
+            self._provision_uncertain = True
+            return self._setup_failure(
+                context,
+                clone_argv,
+                "attempt-named simulator already exists without matching active ownership proof",
+            )
+
+        # A nonzero/timeout result does not prove simctl made no external
+        # change. Keep this flag until an exact UDID is captured and persisted.
+        self._provision_uncertain = True
+        cloned = runner(clone_argv, context.runtime_dir, self._env(context), self._timeout(), None)
+        if cloned.get("exit_code") != 0:
+            return self._setup_failure(
+                context, clone_argv, "simctl clone failed; cleanup is unproven"
+            )
+
+        after, after_inventory = self._inventory(context, runner)
+        if after is None:
+            # The clone may exist, but without a durable identity it is deliberately
+            # left for operator recovery rather than guessed at during teardown.
+            return self._setup_failure(
+                context, clone_argv, "clone completed but its identity could not be verified"
+            )
+        matches = [device for device in after if device["name"] == name]
+        previous_udids = {device["udid"] for device in before}
+        new_matches = [device for device in matches if device["udid"] not in previous_udids]
+        if (
+            len(matches) != 1
+            or len(new_matches) != 1
+            or not self._UDID.fullmatch(new_matches[0]["udid"])
+            or new_matches[0]["udid"] == self._base_udid()
+            or new_matches[0]["runtime_id"] != base["runtime_id"]
+            or new_matches[0]["device_type"] != base["device_type"]
+            or new_matches[0]["available"] is not True
+        ):
+            return self._setup_failure(
+                context, clone_argv, "clone did not produce one verifiable attempt-owned simulator"
+            )
+
+        clone = new_matches[0]
+        self._created_udid = clone["udid"]
+        self._created_base_runtime = base["runtime_id"]
+        self._created_base_device_type = base["device_type"]
+        self._provision_uncertain = False
+        return {
+            "argv": clone_argv,
+            "exit_code": 0,
+            "stdout": "created and verified one attempt-owned simulator clone",
+            "stderr": "",
+            "device_udid": clone["udid"],
+            "base_runtime_id": base["runtime_id"],
+            "base_device_type": base["device_type"],
+            "inventory": after_inventory["stdout"],
+            "provision_uncertain": False,
+            "environment_exports": {"ACP_SIMULATOR_UDID": clone["udid"]},
+        }
+
+    def probe(
+        self, context: DriverContext, runner: CommandRunner
+    ) -> tuple[bool | None, dict[str, Any]]:
+        devices, inventory = self._inventory(context, runner)
+        if devices is None:
+            return None, inventory
+        name = self.resource_id(context)
+        name_matches = [device for device in devices if device["name"] == name]
+        known_udid, base_runtime, base_type = self._expected_identity(context)
+        uncertain = self._provision_uncertain or self._prior_provision_uncertain(context)
+        observation: dict[str, Any] = {
+            "argv": inventory["argv"],
+            "exit_code": 0,
+            "stdout": inventory["stdout"],
+            "stderr": "",
+            "device_udid": known_udid,
+            "base_runtime_id": base_runtime,
+            "base_device_type": base_type,
+        }
+        owned_matches = [
+            device for device in devices if known_udid and device["udid"] == known_udid
+        ]
+        if known_udid:
+            if not owned_matches:
+                if name_matches:
+                    observation["observed_udid"] = name_matches[0]["udid"]
+                    observation["exit_code"] = 1
+                    observation["stderr"] = "attempt name now refers to a different simulator UDID"
+                    return None, observation
+                if uncertain:
+                    observation["exit_code"] = 1
+                    observation["stderr"] = (
+                        "simulator provisioning may still complete without a proved UDID"
+                    )
+                    return None, observation
+                observation["stdout"] = "exact previously owned simulator UDID absent"
+                return False, observation
+            device = owned_matches[0]
+            observation["observed_udid"] = device["udid"]
+            if (
+                len(name_matches) != 1
+                or device["name"] != name
+                or name_matches[0]["udid"] != known_udid
+                or device["udid"] == self._base_udid()
+                or not base_runtime
+                or not base_type
+                or device["available"] is not True
+                or device["runtime_id"] != base_runtime
+                or device["device_type"] != base_type
+            ):
+                observation["exit_code"] = 1
+                observation["stderr"] = (
+                    "attempt simulator identity does not match durable ownership proof"
+                )
+                return None, observation
+            observation["stdout"] = "exact attempt-owned simulator present"
+            return True, observation
+
+        if name_matches:
+            observation["observed_udid"] = name_matches[0]["udid"]
+            observation["exit_code"] = 1
+            observation["stderr"] = "attempt-named simulator has no durable UDID ownership proof"
+            return None, observation
+        if uncertain:
+            observation["exit_code"] = 1
+            observation["stderr"] = "simulator provisioning outcome is uncertain"
+            return None, observation
+        observation["stdout"] = "no attempt-owned simulator is present"
+        return False, observation
+
+    def teardown(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
+        if sys.platform != "darwin":
+            raise DriverError(
+                "unsupported_platform", "core_simulator runtime resources require macOS"
+            )
+        devices, inventory = self._inventory(context, runner)
+        if devices is None:
+            return inventory
+        name = self.resource_id(context)
+        name_matches = [device for device in devices if device["name"] == name]
+        known_udid, base_runtime, base_type = self._expected_identity(context)
+        uncertain = self._provision_uncertain or self._prior_provision_uncertain(context)
+        if known_udid is None:
+            if name_matches or uncertain:
+                return self._failure(
+                    self._argv("delete", name),
+                    "simulator cleanup is unproven without an exact UDID and resolved provisioning",
+                )
+            return {
+                "argv": self._argv("delete", "<proved-absent>"),
+                "exit_code": 0,
+                "stdout": "no attempt-owned simulator exists and provisioning was resolved",
+                "stderr": "",
+                "provision_uncertain": False,
+            }
+
+        owned_matches = [device for device in devices if device["udid"] == known_udid]
+        if not owned_matches:
+            if name_matches or uncertain:
+                return self._failure(
+                    self._argv("delete", known_udid),
+                    "simulator cleanup is unproven because the attempt identity changed or provisioning is unresolved",
+                )
+            return {
+                "argv": self._argv("delete", known_udid),
+                "exit_code": 0,
+                "stdout": "exact previously owned simulator UDID is absent",
+                "stderr": "",
+                "device_udid": known_udid,
+                "provision_uncertain": False,
+            }
+        device = owned_matches[0]
+        if (
+            len(name_matches) != 1
+            or device["name"] != name
+            or name_matches[0]["udid"] != known_udid
+            or known_udid == self._base_udid()
+            or device["available"] is not True
+            or device["runtime_id"] != base_runtime
+            or device["device_type"] != base_type
+        ):
+            return self._failure(
+                self._argv("delete", known_udid),
+                "simulator cleanup refused because the exact owned identity changed",
+            )
+
+        if device.get("state") != "Shutdown":
+            shutdown_argv = self._argv("shutdown", known_udid)
+            shutdown = runner(
+                shutdown_argv, context.runtime_dir, self._env(context), self._timeout(), None
+            )
+            if shutdown.get("exit_code") != 0:
+                return self._failure(shutdown_argv, "owned simulator shutdown was not proved")
+
+        # Re-read identity after shutdown before issuing the destructive delete.
+        # A matching UDID alone is not enough if the device was renamed or its
+        # runtime/type/availability changed while the command was running.
+        after_shutdown, shutdown_inventory = self._inventory(context, runner)
+        if after_shutdown is None:
+            return self._failure(
+                shutdown_inventory["argv"], "simulator identity is unavailable after shutdown"
+            )
+        post_name_matches = [device for device in after_shutdown if device["name"] == name]
+        post_owned_matches = [device for device in after_shutdown if device["udid"] == known_udid]
+        if (
+            len(post_name_matches) != 1
+            or len(post_owned_matches) != 1
+            or post_name_matches[0]["udid"] != known_udid
+            or post_owned_matches[0]["name"] != name
+            or post_owned_matches[0]["available"] is not True
+            or post_owned_matches[0]["runtime_id"] != base_runtime
+            or post_owned_matches[0]["device_type"] != base_type
+            or post_owned_matches[0].get("state") != "Shutdown"
+        ):
+            return self._failure(
+                self._argv("delete", known_udid),
+                "simulator identity changed after shutdown; deletion was refused",
+            )
+
+        delete_argv = self._argv("delete", known_udid)
+        deleted = runner(
+            delete_argv, context.runtime_dir, self._env(context), self._timeout(), None
+        )
+        if deleted.get("exit_code") != 0:
+            return self._failure(delete_argv, "owned simulator deletion failed")
+        return {
+            "argv": delete_argv,
+            "exit_code": 0,
+            "stdout": "deleted the exact attempt-owned simulator",
+            "stderr": "",
+            "device_udid": known_udid,
+            "provision_uncertain": False,
         }
 
 
@@ -1185,6 +1716,7 @@ _ADAPTERS: dict[str, type[ResourceDriver]] = {
     DockerComposeDriver.kind: DockerComposeDriver,
     PostgresSchemaDriver.kind: PostgresSchemaDriver,
     BrowserProfileDriver.kind: BrowserProfileDriver,
+    CoreSimulatorDriver.kind: CoreSimulatorDriver,
     NamespaceRuntimeDriver.kind: NamespaceRuntimeDriver,
 }
 
@@ -1214,6 +1746,7 @@ def parse_driver_definitions(
 
     definitions: list[DriverDefinition] = []
     seen: set[str] = set()
+    seen_kinds: set[str] = set()
     for index, entry in enumerate(entries):
         name = str(entry.get("name") or "").strip()
         if not name:
@@ -1227,6 +1760,40 @@ def parse_driver_definitions(
                 "invalid_config",
                 f"runtime driver {name!r} has unknown kind {kind!r}",
             )
+        if kind == CoreSimulatorDriver.kind:
+            if sys.platform != "darwin":
+                raise DriverError(
+                    "unsupported_platform",
+                    "core_simulator runtime resources are supported only on macOS",
+                )
+            if kind in seen_kinds:
+                raise DriverError(
+                    "invalid_config",
+                    "only one core_simulator driver may export ACP_SIMULATOR_UDID",
+                )
+            base_udid = str(entry.get("base_udid") or "").strip()
+            if not CoreSimulatorDriver._UDID.fullmatch(base_udid):
+                raise DriverError(
+                    "invalid_config", "core_simulator driver requires a UUID base_udid"
+                )
+            prefix = str(entry.get("name_prefix") or "ACP").strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,15}", prefix):
+                raise DriverError(
+                    "invalid_config",
+                    "core_simulator name_prefix must be 1..16 safe ASCII characters",
+                )
+            timeout = str(entry.get("timeout_seconds") or "300").strip()
+            if not timeout.isdigit() or not 1 <= int(timeout) <= 900:
+                raise DriverError(
+                    "invalid_config",
+                    "core_simulator timeout_seconds must be between 1 and 900",
+                )
+            raw_simulator_executable = str(entry.get("executable") or "").strip()
+            if Path(raw_simulator_executable).name != "xcrun":
+                raise DriverError(
+                    "invalid_config", "core_simulator executable must be the trusted xcrun binary"
+                )
+            seen_kinds.add(kind)
         raw_executable = entry.get("executable")
         executable: Path | None = None
         if kind != BrowserProfileDriver.kind:
@@ -1243,6 +1810,10 @@ def parse_driver_definitions(
             for key, value in entry.items()
             if key not in {"name", "kind", "executable"}
         }
+        if kind == CoreSimulatorDriver.kind:
+            options["base_udid"] = str(options["base_udid"]).upper()
+            options["name_prefix"] = str(options.get("name_prefix") or "ACP").strip()
+            options["timeout_seconds"] = str(options.get("timeout_seconds") or "300").strip()
         if kind == NamespaceRuntimeDriver.kind:
             if not options.get("payload", "").strip():
                 raise DriverError(

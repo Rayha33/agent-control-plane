@@ -55,7 +55,7 @@ wedge.
 | Worktree ownership | Every successful claim provisions a dedicated branch and worktree |
 | Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
 | Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
-| Trusted resource drivers | Compose projects, PostgreSQL schemas, and browser profiles have scoped setup/probe/teardown proofs |
+| Trusted resource drivers | Compose projects, PostgreSQL schemas, browser profiles, and CoreSimulator clones have scoped setup/probe/teardown proofs |
 | Scoped credential handles | Drivers receive one immutable credential version over a private descriptor; plaintext never enters argv, inherited env values, state, or evidence |
 | Privileged trust bundles | Versioned critic/driver executables are installed by a narrow helper and pinned per attempt/QC by manifest, inode, and content digest |
 | Fenced side effects | Database schema/migration, deploy namespace, and artifact/tag mutations require the live task and resource fencing tokens and emit durable, credential-free receipts |
@@ -565,6 +565,76 @@ Restart is single-owner and generation-fenced. A second call fails while one is
 live; <code>--recover</code> works only after the prior restart lease is stale and
 only after a kernel lifetime lock proves no old supervisor or inherited driver
 executor remains alive.
+
+### Opt-in CoreSimulator clones
+
+On macOS, an optional <code>core_simulator</code> driver clones one explicitly
+configured, preinstalled simulator for each ACP attempt. The configured base
+must be available and shut down. ACP never downloads Xcode or simulator
+runtimes, boots/erases the base, or deletes a physical or unowned device. A
+verified clone UDID is exported as <code>ACP_SIMULATOR_UDID</code> to the worker,
+QC, critic, and integration phases. For example:
+
+~~~toml
+[[runtime.drivers]]
+name = "ios-simulator"
+kind = "core_simulator"
+executable = "/usr/bin/xcrun"
+base_udid = "11111111-1111-4111-8111-111111111111"
+name_prefix = "ACP"
+timeout_seconds = 300
+~~~
+
+Point Xcode at the leased clone, and disable Xcode's nested parallel simulator
+clones when ACP is providing one device per attempt:
+
+~~~bash
+xcodebuild test -scheme MyApp \
+  -destination "platform=iOS Simulator,id=$ACP_SIMULATOR_UDID" \
+  -parallel-testing-enabled NO
+~~~
+
+The clone name is derived from the supervisor's protected ownership key. ACP
+persists the exact UDID before it can be used by later phases and only shuts down
+or deletes that exact device after checking its identity. If identity or
+inventory is missing/ambiguous, cleanup remains unproven and the resource is
+quarantined; ACP does not guess from a name or run broad <code>simctl delete</code>
+commands. Configure a disposable base rather than a device containing valuable
+state. This lifecycle lease cleans ACP-owned clones; it is not a RAM/disk quota,
+does not delete Xcode runtimes or global caches, and does not bound the number of
+simultaneous attempts.
+
+#### Manual smoke on a disposable macOS host
+
+The unit tests use a fake <code>xcrun</code> runner. Before enabling this driver
+for real work, run this end-to-end check only on a dedicated macOS host with a
+disposable simulator pool and no user-owned simulator state:
+
+1. Record a read-only baseline with <code>xcrun simctl list devices --json</code>.
+   Select one already-installed base UDID and verify it is available and shut
+   down. Keep the baseline outside the ACP candidate worktree.
+2. Configure the driver above, then start two independent test attempts
+   concurrently through ACP. In each worker, record only the value of
+   <code>ACP_SIMULATOR_UDID</code> and run a small deterministic Xcode test with
+   <code>-parallel-testing-enabled NO</code>. Do not invoke <code>simctl
+   clone</code> directly; the point is to exercise ACP's ownership and evidence
+   path.
+3. While both attempts are active, inspect each with
+   <code>uv run --extra dev acp runtime-resources ATTEMPT_ID</code>. Require two
+   distinct exported UDIDs, each matching its attempt's setup evidence; verify
+   the configured base and every other baseline device are unchanged.
+4. Run <code>uv run --extra dev acp runtime-down ATTEMPT_ID</code> for both
+   attempts. Require each resource to report <code>released</code> with
+   <code>cleanup_proved: true</code>, then take a second read-only simulator
+   inventory. Both owned UDIDs must be absent, and the base plus all other
+   baseline devices must remain unchanged.
+5. Retain the two attempt IDs, the redacted runtime-resource evidence, and the
+   before/after inventory comparison with the macOS host's test record. Never
+   include runner credentials or unrelated environment values.
+
+Do not run this smoke against a developer's normal Xcode device set. The smoke
+is intentionally not a unit-test substitute and must not be claimed complete
+until it has actually run on the disposable host.
 
 ## Independent critic contract
 

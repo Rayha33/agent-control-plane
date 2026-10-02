@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-10-02.
+Research updated: 2026-10-03.
 
 ## Verdict
 
@@ -389,3 +389,26 @@ tracked paths at claim, then expose changed paths and before/after object ids in
 status and integration preview. The signal is advisory only. It neither infers actual reads
 nor proves a semantic break; missing scopes or Git state stay visibly unknown, and no
 automatic blocking or requeue follows.
+
+### CoreSimulator devices are shared runtime state (2026-10-03)
+
+Two first-person reports describe macOS coding-agent work leaving Xcode Simulator
+resources behind: [Codex issue #34606](https://github.com/openai/codex/issues/34606)
+reports simulator processes and Xcode artifacts accumulating RAM and disk across
+repeated build/test/debug cycles; [Claude Code issue #88234](https://github.com/anthropics/claude-code/issues/88234)
+reports an 8.5 GB simulator-runtime download followed by 11 generated devices and
+persistent caches. These are individual reports, not prevalence estimates or
+independently reproduced vendor root causes. Apple's
+[Xcode release notes](https://developer.apple.com/documentation/xcode-release-notes/xcode-10-release-notes)
+document that parallel simulator test runners use separate simulator clones, so
+CoreSimulator already has a platform-native isolation primitive.
+
+ACP's generic runtime hooks, Compose/PostgreSQL/browser-profile drivers, and
+worktree-filesystem headroom checks did not manage CoreSimulator ownership or
+prove cleanup of a device. The opt-in macOS driver clones only an explicitly
+configured, preinstalled, shut-down base device, exposes the verified clone UDID
+to every attempt phase, and deletes only a clone whose durable UDID proof matches
+the attempt. If identity is absent or ambiguous it quarantines rather than
+guessing. This reduces leaked ACP-owned clones; it does not download runtimes,
+delete global Xcode caches, cap RAM/disk, or limit concurrent attempts. The
+reports motivate an adjacent platform-specific adapter, not a prevalence claim.

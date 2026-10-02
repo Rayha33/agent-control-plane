@@ -820,7 +820,26 @@ class GitSupervisor(
                         "credential_handle_invalid",
                         "stored credential handle is invalid",
                     )
-        context = self._driver_context(attempt_id, environment, registry=registry, handles=handles)
+        prior_driver_states: dict[str, str] = {}
+        prior_driver_evidence: dict[str, dict[str, Any]] = {}
+        for name, row in stored_by_name.items():
+            prior_driver_states[name] = str(row["state"])
+            try:
+                prior = json.loads(row["evidence_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(prior, dict):
+                prior.pop("ownership_token", None)
+                prior_driver_evidence[name] = prior
+        context = self._driver_context(
+            attempt_id,
+            environment,
+            registry=registry,
+            handles=handles,
+            phase=phase,
+            prior_driver_states=prior_driver_states,
+            prior_driver_evidence=prior_driver_evidence,
+        )
         evidence: list[PhaseEvidence] = []
         definitions_by_name = {definition.name: definition for definition in definitions}
         trusted_owners = {0, self.config.trust_owner_uid} if pin else None
@@ -912,6 +931,7 @@ class GitSupervisor(
             phase,
             evidence,
             definitions_by_name,
+            environment=environment,
             restart_token=restart_token,
         )
         return evidence

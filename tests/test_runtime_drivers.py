@@ -7,11 +7,13 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from support import python_command, requires_linux_worker
 
 import agent_control_plane.git_supervisor as supervisor_module
+import agent_control_plane.runtime_drivers as runtime_driver_module
 from agent_control_plane.credential_providers import (
     CredentialDefinition,
     CredentialHandle,
@@ -20,18 +22,51 @@ from agent_control_plane.credential_providers import (
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
 from agent_control_plane.runtime_drivers import (
     BrowserProfileDriver,
+    CoreSimulatorDriver,
     DockerComposeDriver,
     DriverContext,
     DriverDefinition,
     DriverError,
     NamespaceRuntimeDriver,
     PostgresSchemaDriver,
+    ResourceDriver,
     build_driver,
     ownership_token,
     parse_driver_definitions,
     resolve_trusted_executable,
     run_trusted,
 )
+
+BASE_SIMULATOR_UDID = "11111111-1111-4111-8111-111111111111"
+CLONE_SIMULATOR_UDID = "22222222-2222-4222-8222-222222222222"
+REPLACEMENT_SIMULATOR_UDID = "33333333-3333-4333-8333-333333333333"
+SIMULATOR_RUNTIME_ID = "com.apple.CoreSimulator.SimRuntime.iOS-26-0"
+SIMULATOR_DEVICE_TYPE = "com.apple.CoreSimulator.SimDeviceType.iPhone-17"
+
+
+def simulator_device(
+    name: str, udid: str, *, state: str = "Shutdown", available: bool = True
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "udid": udid,
+        "deviceTypeIdentifier": SIMULATOR_DEVICE_TYPE,
+        "state": state,
+        "isAvailable": available,
+    }
+
+
+def simulator_inventory(devices: list[dict[str, object]]) -> str:
+    return json.dumps({"devices": {SIMULATOR_RUNTIME_ID: devices}})
+
+
+def simulator_definition(base_udid: str = BASE_SIMULATOR_UDID) -> DriverDefinition:
+    return DriverDefinition(
+        name="ios",
+        kind="core_simulator",
+        executable=Path("/usr/bin/xcrun"),
+        options={"base_udid": base_udid, "name_prefix": "ACP", "timeout_seconds": "300"},
+    )
 
 
 def make_executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
@@ -486,6 +521,466 @@ def test_compose_project_name_is_deterministic_and_scoped(tmp_path: Path) -> Non
     assert driver.resource_id(context(tmp_path, "Attempt-XYZ")) == "acp-attempt-xyz"
 
 
+def _fake_simulator_runner(clone_udids: tuple[str, ...] = (CLONE_SIMULATOR_UDID,)):
+    devices = [simulator_device("ACP disposable base", BASE_SIMULATOR_UDID)]
+    commands: list[list[str]] = []
+    lock = threading.RLock()
+    next_clone = iter(clone_udids)
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        del cwd, env, timeout, credential
+        with lock:
+            command = list(argv)
+            commands.append(command)
+            operation = command[2]
+            if operation == "list":
+                return {
+                    "argv": command,
+                    "exit_code": 0,
+                    "stdout": simulator_inventory([dict(device) for device in devices]),
+                    "stderr": "",
+                }
+            if operation == "clone":
+                base_udid, name = command[3:5]
+                if base_udid != BASE_SIMULATOR_UDID or any(
+                    device["name"] == name for device in devices
+                ):
+                    return {"argv": command, "exit_code": 1, "stdout": "", "stderr": "occupied"}
+                devices.append(simulator_device(name, next(next_clone)))
+                return {"argv": command, "exit_code": 0, "stdout": "", "stderr": ""}
+            if operation == "shutdown":
+                target = command[3].upper()
+                device = next((item for item in devices if item["udid"] == target), None)
+                if device is None or target == BASE_SIMULATOR_UDID:
+                    return {"argv": command, "exit_code": 1, "stdout": "", "stderr": "unknown"}
+                device["state"] = "Shutdown"
+                return {"argv": command, "exit_code": 0, "stdout": "", "stderr": ""}
+            if operation == "delete":
+                target = command[3].upper()
+                if target in {BASE_SIMULATOR_UDID, "ALL", "UNAVAILABLE"}:
+                    return {"argv": command, "exit_code": 1, "stdout": "", "stderr": "refused"}
+                before = len(devices)
+                devices[:] = [device for device in devices if device["udid"] != target]
+                return {
+                    "argv": command,
+                    "exit_code": 0 if len(devices) == before - 1 else 1,
+                    "stdout": "",
+                    "stderr": "",
+                }
+            return {"argv": command, "exit_code": 1, "stdout": "", "stderr": "unsupported"}
+
+    return runner, devices, commands
+
+
+def _enable_simulator_platform(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(runtime_driver_module, "sys", SimpleNamespace(platform="darwin"))
+
+
+def test_core_simulator_attempt_clone_is_idempotent_and_teardown_is_exact(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+    definition = simulator_definition()
+    attempt_context = context(tmp_path, "attempt-simulator")
+    driver = CoreSimulatorDriver(definition)
+
+    setup = driver.run_phase("setup", attempt_context, runner)
+    assert setup.ok
+    assert setup.environment_exports == {"ACP_SIMULATOR_UDID": CLONE_SIMULATOR_UDID}
+    assert setup.proof["observation"]["device_udid"] == CLONE_SIMULATOR_UDID
+    resource_name = setup.resource_id
+    assert devices[0]["udid"] == BASE_SIMULATOR_UDID
+    assert len(devices) == 2
+
+    # A retry may reuse only the exact clone proved by the active durable evidence.
+    retry_context = context(tmp_path, "attempt-simulator")
+    retry_context = DriverContext(
+        **{
+            **retry_context.__dict__,
+            "phase": "setup",
+            "prior_driver_states": {"ios": "active"},
+            "prior_driver_evidence": {"ios": setup.as_dict()},
+        }
+    )
+    retry = CoreSimulatorDriver(definition).run_phase("setup", retry_context, runner)
+    assert retry.ok
+    assert len(devices) == 2
+    assert sum(command[2] == "clone" for command in commands) == 1
+
+    # Simulate a worker booting its own clone. Teardown may stop/delete the clone,
+    # but the configured base remains untouched.
+    devices[1]["state"] = "Booted"
+    teardown_context = context(tmp_path, "attempt-simulator")
+    teardown_context = DriverContext(
+        **{
+            **teardown_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "active"},
+            "prior_driver_evidence": {"ios": retry.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", teardown_context, runner)
+    assert teardown.proof["cleanup_proved"] is True
+    assert [device["udid"] for device in devices] == [BASE_SIMULATOR_UDID]
+    destructive = [command for command in commands if command[2] in {"shutdown", "delete"}]
+    assert [command[3] for command in destructive] == [CLONE_SIMULATOR_UDID] * 2
+    assert all(resource_name not in command for command in destructive)
+    assert not any(command[-1].lower() in {"all", "unavailable"} for command in destructive)
+
+
+def test_core_simulator_never_deletes_a_same_name_device_without_matching_udid_proof(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+    definition = simulator_definition()
+    initial = CoreSimulatorDriver(definition).run_phase("setup", context(tmp_path), runner)
+    assert initial.ok
+    name = initial.resource_id
+    devices[1]["udid"] = REPLACEMENT_SIMULATOR_UDID
+
+    teardown_context = context(tmp_path)
+    teardown_context = DriverContext(
+        **{
+            **teardown_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "active"},
+            "prior_driver_evidence": {"ios": initial.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", teardown_context, runner)
+    assert teardown.proof["cleanup_proved"] is False
+    assert len(devices) == 2
+    assert devices[1]["name"] == name
+    assert devices[1]["udid"] == REPLACEMENT_SIMULATOR_UDID
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+
+
+def test_core_simulator_missing_identity_proof_quarantines_without_deletion(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+    definition = simulator_definition()
+    name = CoreSimulatorDriver(definition).resource_id(context(tmp_path))
+    devices.append(simulator_device(name, CLONE_SIMULATOR_UDID))
+
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", context(tmp_path), runner)
+    assert teardown.proof["cleanup_proved"] is False
+    assert len(devices) == 2
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+
+
+def test_core_simulator_renamed_owned_udid_is_not_reported_cleaned(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+    definition = simulator_definition()
+    setup = CoreSimulatorDriver(definition).run_phase("setup", context(tmp_path), runner)
+    assert setup.ok
+    devices[1]["name"] = "Human renamed simulator"
+
+    teardown_context = context(tmp_path)
+    teardown_context = DriverContext(
+        **{
+            **teardown_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "active"},
+            "prior_driver_evidence": {"ios": setup.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", teardown_context, runner)
+
+    assert teardown.proof["cleanup_proved"] is False
+    assert teardown.present is None
+    assert devices[1]["udid"] == CLONE_SIMULATOR_UDID
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+
+
+def test_core_simulator_duplicate_attempt_name_is_not_cleaned(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+    definition = simulator_definition()
+    setup = CoreSimulatorDriver(definition).run_phase("setup", context(tmp_path), runner)
+    assert setup.ok
+    devices.append(simulator_device(setup.resource_id, REPLACEMENT_SIMULATOR_UDID))
+
+    teardown_context = context(tmp_path)
+    teardown_context = DriverContext(
+        **{
+            **teardown_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "active"},
+            "prior_driver_evidence": {"ios": setup.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", teardown_context, runner)
+
+    assert teardown.proof["cleanup_proved"] is False
+    assert teardown.present is None
+    assert len(devices) == 3
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+
+
+def test_core_simulator_partial_clone_failure_remains_quarantined(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+
+    def partially_failing_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        result = runner(argv, cwd, env, timeout, credential)
+        if argv[2] == "clone":
+            result = {**result, "exit_code": 1, "stderr": "simctl timed out after creating device"}
+        return result
+
+    definition = simulator_definition()
+    attempt_context = context(tmp_path, "partial-clone")
+    setup = CoreSimulatorDriver(definition).run_phase(
+        "setup", attempt_context, partially_failing_runner
+    )
+    assert not setup.ok
+    assert setup.present is None
+    assert setup.proof["action"]["provision_uncertain"] is True
+    assert len(devices) == 2
+
+    teardown_context = DriverContext(
+        **{
+            **attempt_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "setup_failed"},
+            "prior_driver_evidence": {"ios": setup.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", teardown_context, runner)
+    assert teardown.proof["cleanup_proved"] is False
+    assert teardown.present is None
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+
+
+def test_core_simulator_delayed_clone_after_timeout_cannot_be_released_as_absent(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+
+    def timed_out_without_visible_clone(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        if argv[2] == "clone":
+            commands.append(list(argv))
+            return {"argv": list(argv), "exit_code": 124, "stdout": "", "stderr": "timeout"}
+        return runner(argv, cwd, env, timeout, credential)
+
+    definition = simulator_definition()
+    attempt_context = context(tmp_path, "delayed-clone")
+    setup = CoreSimulatorDriver(definition).run_phase(
+        "setup", attempt_context, timed_out_without_visible_clone
+    )
+    assert not setup.ok
+    assert setup.present is None
+    assert setup.proof["action"]["provision_uncertain"] is True
+
+    # A timed-out xcrun may finish asynchronously after ACP's initial probe.
+    devices.append(simulator_device(setup.resource_id, CLONE_SIMULATOR_UDID))
+    teardown_context = DriverContext(
+        **{
+            **attempt_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "setup_failed"},
+            "prior_driver_evidence": {"ios": setup.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", teardown_context, runner)
+    assert teardown.proof["cleanup_proved"] is False
+    assert teardown.present is None
+    assert len(devices) == 2
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+
+
+def test_core_simulator_post_clone_inventory_failure_keeps_identity_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+    inventory_calls = 0
+
+    def unavailable_after_clone(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        nonlocal inventory_calls
+        if argv[2] == "list":
+            inventory_calls += 1
+            if inventory_calls == 2:
+                commands.append(list(argv))
+                return {"argv": list(argv), "exit_code": 1, "stdout": "", "stderr": "unavailable"}
+        return runner(argv, cwd, env, timeout, credential)
+
+    definition = simulator_definition()
+    attempt_context = context(tmp_path, "inventory-gap")
+    setup = CoreSimulatorDriver(definition).run_phase(
+        "setup", attempt_context, unavailable_after_clone
+    )
+    assert not setup.ok
+    assert setup.present is None
+    assert setup.proof["action"]["provision_uncertain"] is True
+    assert len(devices) == 2
+
+    teardown_context = DriverContext(
+        **{
+            **attempt_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "setup_failed"},
+            "prior_driver_evidence": {"ios": setup.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase("teardown", teardown_context, runner)
+    assert teardown.proof["cleanup_proved"] is False
+    assert teardown.present is None
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+
+
+@pytest.mark.parametrize("failed_operation", ["shutdown", "delete"])
+def test_core_simulator_teardown_command_failure_stays_unproven(
+    tmp_path: Path, monkeypatch, failed_operation: str
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, commands = _fake_simulator_runner()
+    definition = simulator_definition()
+    setup = CoreSimulatorDriver(definition).run_phase("setup", context(tmp_path), runner)
+    assert setup.ok
+    if failed_operation == "shutdown":
+        devices[1]["state"] = "Booted"
+
+    def failing_teardown_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        if argv[2] == failed_operation:
+            commands.append(list(argv))
+            return {"argv": list(argv), "exit_code": 1, "stdout": "", "stderr": "failed"}
+        return runner(argv, cwd, env, timeout, credential)
+
+    teardown_context = context(tmp_path)
+    teardown_context = DriverContext(
+        **{
+            **teardown_context.__dict__,
+            "phase": "teardown",
+            "prior_driver_states": {"ios": "active"},
+            "prior_driver_evidence": {"ios": setup.as_dict()},
+        }
+    )
+    teardown = CoreSimulatorDriver(definition).run_phase(
+        "teardown", teardown_context, failing_teardown_runner
+    )
+    assert teardown.proof["cleanup_proved"] is False
+    assert teardown.present is True
+    assert any(
+        command[2] == failed_operation and command[3] == CLONE_SIMULATOR_UDID
+        for command in commands
+    )
+    if failed_operation == "shutdown":
+        assert not any(command[2] == "delete" for command in commands)
+    else:
+        assert [device["udid"] for device in devices] == [
+            BASE_SIMULATOR_UDID,
+            CLONE_SIMULATOR_UDID,
+        ]
+
+
+def test_unknown_driver_probe_is_never_verified_or_cleanup_proven(tmp_path: Path) -> None:
+    class UnknownResourceDriver(ResourceDriver):
+        kind = "unknown_test_resource"
+
+        def resource_id(self, attempt_context: DriverContext) -> str:
+            return f"resource-{attempt_context.attempt_id}"
+
+        def setup(self, attempt_context: DriverContext, runner):  # type: ignore[no-untyped-def]
+            del attempt_context, runner
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+        def probe(self, attempt_context: DriverContext, runner):  # type: ignore[no-untyped-def]
+            del attempt_context, runner
+            return None, {"argv": [], "exit_code": 0, "stdout": "", "stderr": ""}
+
+        def teardown(self, attempt_context: DriverContext, runner):  # type: ignore[no-untyped-def]
+            del attempt_context, runner
+            return {"argv": [], "exit_code": 0, "stdout": "", "stderr": ""}
+
+    driver = UnknownResourceDriver(
+        DriverDefinition(name="unknown", kind="unknown_test_resource", executable=None, options={})
+    )
+    attempt_context = context(tmp_path)
+
+    def runner(*_args):
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    verification = driver.run_phase("verify", attempt_context, runner)
+    cleanup = driver.run_phase("teardown", attempt_context, runner)
+
+    assert verification.present is None
+    assert verification.ok is False
+    assert cleanup.present is None
+    assert cleanup.proof["cleanup_proved"] is False
+    assert cleanup.ok is False
+
+
+def test_core_simulator_parallel_attempts_get_different_clones(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    runner, devices, _commands = _fake_simulator_runner(
+        (CLONE_SIMULATOR_UDID, REPLACEMENT_SIMULATOR_UDID)
+    )
+    definition = simulator_definition()
+    outcomes: dict[str, object] = {}
+
+    def launch(attempt_id: str) -> None:
+        outcomes[attempt_id] = CoreSimulatorDriver(definition).run_phase(
+            "setup", context(tmp_path, attempt_id), runner
+        )
+
+    threads = [
+        threading.Thread(target=launch, args=(attempt_id,))
+        for attempt_id in ("attempt-a", "attempt-b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert set(outcomes) == {"attempt-a", "attempt-b"}
+    evidence = [outcomes[attempt_id] for attempt_id in sorted(outcomes)]
+    assert all(item.ok for item in evidence)  # type: ignore[union-attr]
+    assert len({item.environment_exports["ACP_SIMULATOR_UDID"] for item in evidence}) == 2  # type: ignore[union-attr]
+    assert len({item.resource_id for item in evidence}) == 2  # type: ignore[union-attr]
+    assert len(devices) == 3
+    assert devices[0]["udid"] == BASE_SIMULATOR_UDID
+
+
+def test_core_simulator_config_is_macos_only_and_validates_target(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    entry = {
+        "name": "ios",
+        "kind": "core_simulator",
+        "executable": "/usr/bin/xcrun",
+        "base_udid": BASE_SIMULATOR_UDID,
+    }
+    monkeypatch.setattr(runtime_driver_module, "sys", SimpleNamespace(platform="linux"))
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions([entry], tmp_path)
+    assert error.value.code == "unsupported_platform"
+
+    monkeypatch.setattr(runtime_driver_module, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    invalid = dict(entry, base_udid="not-a-uuid")
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions([invalid], tmp_path)
+    assert error.value.code == "invalid_config"
+
+    definitions = parse_driver_definitions([entry], tmp_path)
+    assert definitions[0].options["base_udid"] == BASE_SIMULATOR_UDID
+    assert definitions[0].options["timeout_seconds"] == "300"
+
+
 def test_postgres_schema_is_passed_as_psql_variable_not_sql_text(tmp_path: Path) -> None:
     recorded: list[list[str]] = []
     environments: list[dict[str, str]] = []
@@ -700,6 +1195,110 @@ def test_supervisor_sets_up_and_proves_driver_cleanup(driver_repo: Path) -> None
     assert released[0]["state"] == "released"
     assert released[0]["evidence"]["proof"]["cleanup_proved"] is True
     assert not profile.exists()
+
+
+def test_supervisor_persists_verified_simulator_udid_across_all_attempt_phases(
+    driver_repo: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    runner, devices, commands = _fake_simulator_runner()
+
+    def fake_run_trusted(argv, cwd, env, timeout, credential, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        return runner(argv, cwd, env, timeout, credential)
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    (driver_repo / "acp.toml").write_text(
+        DRIVER_CONFIG.replace(
+            'name = "browser"\nkind = "browser_profile"',
+            'name = "ios"\nkind = "core_simulator"\n'
+            'executable = "/usr/bin/xcrun"\n'
+            f'base_udid = "{BASE_SIMULATOR_UDID}"',
+        ),
+        encoding="utf-8",
+    )
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+
+    runtime = supervisor.runtime_environment(attempt["id"])
+    assert runtime["state"] == "ready"
+    assert runtime["environment"]["ACP_SIMULATOR_UDID"] == CLONE_SIMULATOR_UDID
+    for phase in ("worker", "qc", "critic", "integration"):
+        phase_env = supervisor._phase_runtime_env(
+            runtime["environment"], phase, Path(attempt["worktree"])
+        )
+        assert phase_env["ACP_SIMULATOR_UDID"] == CLONE_SIMULATOR_UDID
+
+    supervisor.runtime_down(attempt["id"], _allow_active=True)
+    released = supervisor.runtime_environment(attempt["id"])
+    assert released["state"] == "released"
+    assert "ACP_SIMULATOR_UDID" not in released["environment"]
+    assert [device["udid"] for device in devices] == [BASE_SIMULATOR_UDID]
+    resource = supervisor.driver_resources(attempt["id"])[0]
+    assert resource["state"] == "released"
+    assert resource["evidence"]["proof"]["cleanup_proved"] is True
+    assert not any("download" in argument.lower() for command in commands for argument in command)
+
+
+def test_crash_after_clone_before_udid_commit_quarantines_without_guessing(
+    driver_repo: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    runner, devices, commands = _fake_simulator_runner()
+
+    def fake_run_trusted(argv, cwd, env, timeout, credential, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        return runner(argv, cwd, env, timeout, credential)
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    (driver_repo / "acp.toml").write_text(
+        DRIVER_CONFIG.replace(
+            'name = "browser"\nkind = "browser_profile"',
+            'name = "ios"\nkind = "core_simulator"\n'
+            'executable = "/usr/bin/xcrun"\n'
+            f'base_udid = "{BASE_SIMULATOR_UDID}"',
+        ),
+        encoding="utf-8",
+    )
+    supervisor = GitSupervisor(driver_repo)
+    original_record = supervisor._record_driver_evidence
+
+    def interrupt_after_external_setup(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if len(args) > 1 and args[1] == "setup":
+            raise SupervisorError("simulated_supervisor_crash", "evidence commit interrupted")
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "_record_driver_evidence", interrupt_after_external_setup)
+    task = supervisor.create_task(
+        "bounded change",
+        "Change only the declared path.",
+        ["The declared content is correct"],
+        ["alpha.txt"],
+    )
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(task["id"], "agent-a")
+    assert error.value.code == "simulated_supervisor_crash"
+    assert len(devices) == 2, "unknown clone identity must not trigger guessed cleanup"
+    assert not any(command[2] in {"shutdown", "delete"} for command in commands)
+    with sqlite3.connect(supervisor.db_path) as connection:
+        runtime_state = connection.execute(
+            "SELECT state FROM runtime_environments ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()[0]
+        resource_state = connection.execute(
+            "SELECT state FROM runtime_driver_resources ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()[0]
+    assert runtime_state == "teardown_failed"
+    assert resource_state == "quarantined"
 
 
 def test_runtime_restart_fails_closed_on_driver_config_drift(driver_repo: Path) -> None:
