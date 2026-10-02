@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ from support import (
 )
 
 from agent_control_plane.git_supervisor import GitSupervisor
-from agent_control_plane.status import _format_bytes
+from agent_control_plane.status import StatusView, _format_bytes
 
 
 @pytest.fixture
@@ -30,6 +31,72 @@ def repo(tmp_path: Path) -> Path:
 
 def entry_for(snapshot: dict, task_id: str) -> dict:
     return next(item for item in snapshot["tasks"] if item["task_id"] == task_id)
+
+
+def _install_revising_critic(supervisor: GitSupervisor, monkeypatch: pytest.MonkeyPatch) -> None:
+    def run_critic(
+        command: str,
+        cwd: Path,
+        environment: dict[str, str],
+        _trust_pin: dict | None = None,
+        **_kwargs: object,
+    ) -> dict:
+        case = (cwd / "alpha.txt").read_text(encoding="utf-8").strip()
+        if case == "pass":
+            payload = {"verdict": "pass", "findings": []}
+        else:
+            if case == "case2":
+                requirement, finding, required_fix = (
+                    " tests   PASS ",
+                    " SAME gap ",
+                    " Fix before retry ",
+                )
+            elif case == "different":
+                requirement, finding, required_fix = (
+                    "Tests pass",
+                    "a different gap",
+                    "Fix before retry",
+                )
+            else:
+                requirement, finding, required_fix = (
+                    "Tests pass",
+                    "same gap",
+                    "Fix before retry",
+                )
+            payload = {
+                "verdict": "revise",
+                "findings": [
+                    {
+                        "severity": "high",
+                        "requirement": requirement,
+                        "finding": finding,
+                        "required_fix": required_fix,
+                        "evidence": uuid.uuid4().hex,
+                    }
+                ],
+            }
+        Path(environment["ACP_REVIEW_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
+        return {
+            "command": command,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(supervisor, "_run_critic", run_critic)
+
+
+def _submit_revised_commit(
+    supervisor: GitSupervisor, task_id: str, content: str
+) -> tuple[dict, dict]:
+    attempt = supervisor.claim(task_id, "worker-a")
+    commit_sha = commit_change(attempt, "alpha.txt", f"{content}\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    qc = supervisor.run_qc(submission["id"], "independent-qc")
+    assert qc["verdict"] == "revise"
+    assert submission["commit_sha"] == commit_sha
+    return submission, qc
 
 
 def test_byte_formatter_switches_units_at_binary_boundaries() -> None:
@@ -416,6 +483,229 @@ def test_checkpoint_stale_threshold_is_advisory_only(repo: Path) -> None:
     assert "does not establish progress" in item["reason"]
     assert entry["heartbeat_age_seconds"] < 60
     assert supervisor.render_status(snapshot).count("checkpoint unchanged") == 1
+
+
+def test_status_reports_repeated_qc_finding_only_within_same_task(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        qc_commands=[python_command("pass")],
+        critic_command="builtin",
+    )
+    supervisor = GitSupervisor(repo)
+    _install_revising_critic(supervisor, monkeypatch)
+    repeated_task = make_task(supervisor, "alpha.txt", title="repeated finding")
+
+    first, first_qc = _submit_revised_commit(supervisor, repeated_task["id"], "case1")
+    latest, latest_qc = _submit_revised_commit(supervisor, repeated_task["id"], "case2")
+    assert first_qc["findings"][0]["evidence"] != latest_qc["findings"][0]["evidence"]
+
+    separate_task = make_task(supervisor, "alpha.txt", title="single finding")
+    _submit_revised_commit(supervisor, separate_task["id"], "case2")
+
+    def reject_candidate_execution(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("status must not execute candidate or QC code")
+
+    monkeypatch.setattr(supervisor, "_run_command", reject_candidate_execution)
+    monkeypatch.setattr(supervisor, "_run_critic", reject_candidate_execution)
+    before = state_fingerprint(supervisor)
+    snapshot = supervisor.status()
+    after = state_fingerprint(supervisor)
+
+    repeated_entry = entry_for(snapshot, repeated_task["id"])
+    assert repeated_entry["status"] == "changes_requested"
+    assert repeated_entry["qc"]["verdict"] == "revise"
+    assert len(repeated_entry["repeated_qc_findings"]) == 1
+    finding = repeated_entry["repeated_qc_findings"][0]
+    assert finding["advisory"] is True
+    assert finding["fingerprint"]
+    assert finding["requirement"] == " tests   PASS "
+    assert finding["finding"] == " SAME gap "
+    assert finding["required_fix"] == " Fix before retry "
+    assert finding["distinct_commit_count"] == 2
+    assert finding["latest_commit_sha"] == latest["commit_sha"]
+    assert finding["matching_prior_commit_count"] == 1
+    assert finding["matching_prior_commit_shas"] == [first["commit_sha"]]
+    assert finding["prior_commit_shas_truncated"] is False
+    assert finding["latest_qc_at"] == latest_qc["finished_at"]
+    assert "evidence" not in finding
+    assert json.loads(json.dumps(finding)) == finding
+    assert entry_for(snapshot, separate_task["id"])["repeated_qc_findings"] == []
+    assert state_fingerprint(supervisor) == before == after
+    assert "qc recurring findings 1" in supervisor.render_status(snapshot)
+    repeated_attention = next(
+        item for item in snapshot["attention"] if item["task_id"] == repeated_task["id"]
+    )
+    assert (
+        "QC feedback recurs for 1 finding(s) across distinct commits (advisory)"
+        in (repeated_attention["reason"])
+    )
+
+
+def test_status_hides_old_recurrence_when_latest_qc_passes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        qc_commands=[python_command("pass")],
+        critic_command="builtin",
+    )
+    supervisor = GitSupervisor(repo)
+    _install_revising_critic(supervisor, monkeypatch)
+    task = make_task(supervisor, "alpha.txt", title="resolved finding")
+
+    _submit_revised_commit(supervisor, task["id"], "case1")
+    _submit_revised_commit(supervisor, task["id"], "case2")
+
+    attempt = supervisor.claim(task["id"], "worker-a")
+    commit_change(attempt, "alpha.txt", "pass\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    qc = supervisor.run_qc(submission["id"], "independent-qc")
+    assert qc["verdict"] == "pass"
+
+    entry = entry_for(supervisor.status(), task["id"])
+    assert entry["qc"]["verdict"] == "pass"
+    assert entry["repeated_qc_findings"] == []
+
+
+def test_status_does_not_match_a_different_stable_finding(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        qc_commands=[python_command("pass")],
+        critic_command="builtin",
+    )
+    supervisor = GitSupervisor(repo)
+    _install_revising_critic(supervisor, monkeypatch)
+    task = make_task(supervisor, "alpha.txt", title="different finding")
+
+    _submit_revised_commit(supervisor, task["id"], "case1")
+    _submit_revised_commit(supervisor, task["id"], "different")
+
+    entry = entry_for(supervisor.status(), task["id"])
+    assert entry["qc"]["verdict"] == "revise"
+    assert entry["repeated_qc_findings"] == []
+
+
+def test_status_ignores_repeated_review_of_same_commit(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        qc_commands=[python_command("pass")],
+        critic_command="builtin",
+    )
+    supervisor = GitSupervisor(repo)
+    _install_revising_critic(supervisor, monkeypatch)
+    task = make_task(supervisor, "alpha.txt", title="one submitted commit")
+    submission, _ = _submit_revised_commit(supervisor, task["id"], "case1")
+
+    with supervisor.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO qc_runs
+              (id, submission_id, reviewer_id, commit_sha, verdict, findings_json,
+               results_json, packet_sha256, reviewer_provenance_json, reviewer_signature,
+               bundle_sha256, policy_fingerprint, trust_bundle_json, started_at, finished_at)
+            SELECT ?, submission_id, reviewer_id, commit_sha, verdict, findings_json,
+                   results_json, packet_sha256, reviewer_provenance_json, reviewer_signature,
+                   bundle_sha256, policy_fingerprint, trust_bundle_json, started_at, finished_at
+            FROM qc_runs WHERE submission_id = ?
+            """,
+            (f"duplicate-{uuid.uuid4()}", submission["id"]),
+        )
+
+    entry = entry_for(supervisor.status(), task["id"])
+    assert entry["repeated_qc_findings"] == []
+
+
+def test_status_uses_newest_submission_outcome_for_duplicate_commit_sha(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        qc_commands=[python_command("pass")],
+        critic_command="builtin",
+    )
+    supervisor = GitSupervisor(repo)
+    _install_revising_critic(supervisor, monkeypatch)
+    task = make_task(supervisor, "alpha.txt", title="duplicate commit submission")
+
+    older, _ = _submit_revised_commit(supervisor, task["id"], "case1")
+    latest, _ = _submit_revised_commit(supervisor, task["id"], "case2")
+    resubmission_id = f"resubmission-{uuid.uuid4()}"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE submissions SET created_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+            (older["id"],),
+        )
+        connection.execute(
+            """
+            INSERT INTO submissions
+              (id, task_id, attempt_id, worker_agent_id, commit_sha, tree_sha,
+               object_contract, patch_sha256, changed_paths_json, resource_tokens_json,
+               status, qc_resume_status, created_at)
+            SELECT ?, task_id, attempt_id, worker_agent_id, commit_sha, tree_sha,
+                   object_contract, patch_sha256, changed_paths_json, resource_tokens_json,
+                   status, qc_resume_status, '2020-01-02T00:00:00Z'
+            FROM submissions WHERE id = ?
+            """,
+            (resubmission_id, older["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO qc_runs
+              (id, submission_id, reviewer_id, commit_sha, verdict, findings_json,
+               results_json, packet_sha256, started_at, finished_at)
+            VALUES (?, ?, 'independent-qc', ?, 'pass', '[]', '{}', 'test', ?, ?)
+            """,
+            (
+                f"pass-{uuid.uuid4()}",
+                resubmission_id,
+                older["commit_sha"],
+                "2020-01-02T00:00:00Z",
+                "2020-01-02T00:00:01Z",
+            ),
+        )
+
+    entry = entry_for(supervisor.status(), task["id"])
+    assert entry["qc"]["verdict"] == "revise"
+    assert entry["qc"]["submission_id"] == latest["id"]
+    assert entry["repeated_qc_findings"] == []
+
+
+def test_qc_finding_identity_rejects_missing_fields_and_normalizes_text() -> None:
+    first = {
+        "requirement": "QC passes",
+        "finding": " same gap ",
+        "required_fix": "Fix this now",
+    }
+    equivalent = {
+        "requirement": " qc   PASSES ",
+        "finding": "SAME  gap",
+        "required_fix": " fix THIS now ",
+        "evidence": "different details are not identity",
+    }
+
+    assert StatusView._qc_finding_identity(first) == StatusView._qc_finding_identity(equivalent)
+    assert StatusView._qc_finding_identity({"requirement": "only one field"}) is None
+    assert StatusView._parse_qc_findings("not json") == []
+
+
+def test_qc_latest_lookup_has_a_covering_index(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        columns = connection.execute(
+            "PRAGMA index_info('idx_qc_runs_submission_latest')"
+        ).fetchall()
+
+    assert [row["name"] for row in columns] == [
+        "submission_id",
+        "finished_at",
+        "id",
+    ]
 
 
 def test_unknown_legacy_checkpoint_age_is_not_marked_stale(repo: Path) -> None:

@@ -13,6 +13,7 @@ Expired-but-unreaped attempts are reported as `awaiting_reap` instead.
 
 from __future__ import annotations
 
+import hashlib as _hashlib
 import json
 import os
 import sqlite3
@@ -239,7 +240,7 @@ class StatusView:
                     "FROM attempts ORDER BY id"
                 ).fetchall()
             ]
-            submissions = self._latest_submissions(connection)
+            submissions, repeated_qc_findings = self._submission_status(connection)
             runtimes = self._runtimes(connection)
             allocations = self._allocations(connection)
             quarantines = self._quarantines(connection, now)
@@ -261,6 +262,7 @@ class StatusView:
                     quarantine=quarantines.get(attempt["id"]) if attempt else None,
                     allocations=allocations.get(attempt["id"], []) if attempt else [],
                     submission=submissions.get(task["id"]),
+                    repeated_qc_findings=repeated_qc_findings.get(task["id"], []),
                     preview=previews.get(task["id"]),
                     now=now,
                     lease_risk_seconds=lease_risk_seconds,
@@ -352,6 +354,144 @@ class StatusView:
         return {row["task_id"]: dict(row) for row in rows}
 
     @staticmethod
+    def _submission_status(
+        connection: sqlite3.Connection,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        """Stream latest-per-commit QC data into status and recurrence views."""
+        rows = connection.execute(
+            """
+            WITH ranked_submissions AS (
+              SELECT submission.id, submission.task_id, submission.status,
+                     submission.commit_sha, submission.created_at,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY submission.task_id, submission.commit_sha
+                       ORDER BY submission.created_at DESC, submission.id DESC
+                     ) AS commit_rank
+              FROM submissions AS submission
+            )
+            SELECT submission.id, submission.task_id, submission.status,
+                   submission.commit_sha, submission.created_at, qc.verdict AS qc_verdict,
+                   qc.findings_json, qc.finished_at AS qc_finished_at
+            FROM ranked_submissions AS submission
+            LEFT JOIN qc_runs AS qc ON qc.id = (
+              SELECT id FROM qc_runs WHERE submission_id = submission.id
+              ORDER BY finished_at DESC, id DESC LIMIT 1
+            )
+            WHERE submission.commit_rank = 1
+            ORDER BY submission.task_id, submission.created_at DESC, submission.id DESC
+            """
+        )
+        latest_submissions: dict[str, dict[str, Any]] = {}
+        recurring: dict[str, list[dict[str, Any]]] = {}
+        current_task_id: str | None = None
+        latest_commit: str | None = None
+        latest_qc_at: str | None = None
+        latest_findings: dict[tuple[str, str, str], dict[str, Any]] = {}
+        matching_commit_counts: dict[tuple[str, str, str], int] = {}
+        prior_commit_samples: dict[tuple[str, str, str], list[str]] = {}
+
+        def finish_task() -> None:
+            if current_task_id is None or latest_commit is None:
+                return
+            repeats: list[dict[str, Any]] = []
+            for identity, finding in latest_findings.items():
+                distinct_count = matching_commit_counts[identity]
+                prior_count = distinct_count - 1
+                if prior_count < 1:
+                    continue
+                stable_fields = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+                fingerprint = _hashlib.sha256(stable_fields.encode("ascii")).hexdigest()[:16]
+                prior_shas = prior_commit_samples[identity]
+                repeats.append(
+                    {
+                        "advisory": True,
+                        "fingerprint": fingerprint,
+                        "requirement": finding["requirement"],
+                        "finding": finding["finding"],
+                        "required_fix": finding["required_fix"],
+                        "distinct_commit_count": distinct_count,
+                        "latest_commit_sha": latest_commit,
+                        "matching_prior_commit_count": prior_count,
+                        "matching_prior_commit_shas": prior_shas,
+                        "prior_commit_shas_truncated": prior_count > len(prior_shas),
+                        "latest_qc_at": latest_qc_at,
+                    }
+                )
+            if repeats:
+                recurring[current_task_id] = sorted(repeats, key=lambda item: item["fingerprint"])
+
+        for row in rows:
+            task_id = row["task_id"]
+            if task_id != current_task_id:
+                finish_task()
+                current_task_id = task_id
+                latest_commit = row["commit_sha"]
+                latest_qc_at = row["qc_finished_at"]
+                latest_findings = {}
+                matching_commit_counts = {}
+                prior_commit_samples = {}
+                latest_submissions[task_id] = {
+                    "id": row["id"],
+                    "status": row["status"],
+                    "qc_verdict": row["qc_verdict"],
+                    "qc_finished_at": row["qc_finished_at"],
+                }
+                if latest_commit and row["qc_verdict"] not in {None, "pass"}:
+                    for finding in StatusView._parse_qc_findings(row["findings_json"]):
+                        identity = StatusView._qc_finding_identity(finding)
+                        if identity is None:
+                            continue
+                        latest_findings.setdefault(identity, finding)
+                        matching_commit_counts.setdefault(identity, 1)
+                        prior_commit_samples.setdefault(identity, [])
+                continue
+
+            commit_sha = row["commit_sha"]
+            if not commit_sha:
+                continue
+            if not latest_findings or row["qc_verdict"] in {None, "pass"}:
+                continue
+            seen_in_commit: set[tuple[str, str, str]] = set()
+            for finding in StatusView._parse_qc_findings(row["findings_json"]):
+                identity = StatusView._qc_finding_identity(finding)
+                if identity not in latest_findings or identity in seen_in_commit:
+                    continue
+                seen_in_commit.add(identity)
+                matching_commit_counts[identity] += 1
+                samples = prior_commit_samples[identity]
+                if len(samples) < 4:
+                    samples.append(commit_sha)
+
+        finish_task()
+        return latest_submissions, recurring
+
+    @staticmethod
+    def _parse_qc_findings(findings_json: str | None) -> list[dict[str, Any]]:
+        try:
+            findings = json.loads(findings_json or "")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return (
+            [finding for finding in findings if isinstance(finding, dict)]
+            if isinstance(findings, list)
+            else []
+        )
+
+    @staticmethod
+    def _qc_finding_identity(finding: dict[str, Any]) -> tuple[str, str, str] | None:
+        """Use explicit finding text, not volatile evidence, as the recurrence key."""
+        stable: list[str] = []
+        for field in ("requirement", "finding", "required_fix"):
+            value = finding.get(field)
+            if not isinstance(value, str):
+                return None
+            normalized = " ".join(value.split()).casefold()
+            if not normalized:
+                return None
+            stable.append(normalized)
+        return stable[0], stable[1], stable[2]
+
+    @staticmethod
     def _runtimes(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         rows = connection.execute("SELECT * FROM runtime_environments").fetchall()
         return {row["attempt_id"]: dict(row) for row in rows}
@@ -433,6 +573,7 @@ class StatusView:
         lease_risk_seconds: int,
         checkpoint_stale_seconds: int | None,
         held_resources: list[str],
+        repeated_qc_findings: list[dict[str, Any]],
     ) -> dict[str, Any]:
         live = bool(attempt and attempt["status"] in LIVE_ATTEMPT_STATUSES)
         remaining = int(attempt["lease_expires_at"] - now) if live else None
@@ -493,6 +634,7 @@ class StatusView:
             }
             if submission
             else None,
+            "repeated_qc_findings": repeated_qc_findings,
             "ready": preview["ready"] if preview else None,
             "blockers": preview["blockers"] if preview else [],
         }
@@ -581,10 +723,17 @@ class StatusView:
 
     @staticmethod
     def _attention_item(entry: dict[str, Any]) -> dict[str, Any]:
+        reason = entry["reason"]
+        recurring_count = len(entry["repeated_qc_findings"])
+        if recurring_count:
+            reason += (
+                f"; QC feedback recurs for {recurring_count} finding(s) across distinct "
+                "commits (advisory)"
+            )
         return {
             "rank": CATEGORY_RANKS[entry["category"]],
             "category": entry["category"],
-            "reason": entry["reason"],
+            "reason": reason,
             "task_id": entry["task_id"],
             "title": entry["title"],
             "priority": entry["priority"],
@@ -624,10 +773,12 @@ class StatusView:
             checkpoint_label = f"cp {checkpoint}s" if checkpoint is not None else "cp unknown"
             if entry["checkpoint_stale_advisory"]:
                 checkpoint_label += " unchanged"
+            recurring = entry["repeated_qc_findings"]
+            recurring_label = f" qc recurring findings {len(recurring)}" if recurring else ""
             lines.append(
                 f"  {entry['phase']:<16} {entry['title'][:32]:<32} "
                 f"{entry['agent_id'] or '-':<16} hb {beat:<10} {checkpoint_label:<20} "
-                f"{','.join(entry['claimed_paths'])[:40]}"
+                f"{','.join(entry['claimed_paths'])[:40]}{recurring_label}"
             )
         if snapshot["truncated"]:
             lines.append(f"  ... {counts['tasks'] - len(snapshot['tasks'])} more")
