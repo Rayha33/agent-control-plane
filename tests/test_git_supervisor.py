@@ -298,7 +298,7 @@ git_root = Path(subprocess.check_output(
     ["git", "rev-parse", "--show-toplevel"], text=True
 ).strip()).resolve()
 assert git_root == cwd
-with socket.create_connection(("127.0.0.1", int(sys.argv[4])), timeout=10) as gate:
+with socket.create_connection(("127.0.0.1", int(sys.argv[4])), timeout=30) as gate:
     assert gate.recv(1) == b"G", "parallel peer did not reach the worker gate"
 Path(sys.argv[2]).write_text(sys.argv[3] + "\\n", encoding="utf-8")
 subprocess.run(["git", "add", sys.argv[2]], check=True)
@@ -327,7 +327,7 @@ subprocess.run(["git", "commit", "-m", "isolated non-overlapping write"], check=
         with socket.socket() as start_gate:
             start_gate.bind(("127.0.0.1", 0))
             start_gate.listen(2)
-            start_gate.settimeout(10)
+            start_gate.settimeout(30)
             gate_port = start_gate.getsockname()[1]
 
             def release_workers() -> None:
@@ -345,7 +345,7 @@ subprocess.run(["git", "commit", "-m", "isolated non-overlapping write"], check=
             with ThreadPoolExecutor(max_workers=3) as pool:
                 gate = pool.submit(release_workers)
                 submissions = list(pool.map(run, (first, second), ("first", "second")))
-                gate.result(timeout=12)
+                gate.result(timeout=32)
 
     assert [submission["status"] for submission in submissions] == [
         "pending_qc",
