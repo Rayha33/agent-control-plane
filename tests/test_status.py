@@ -621,6 +621,61 @@ def test_status_ignores_repeated_review_of_same_commit(
     assert entry["repeated_qc_findings"] == []
 
 
+def test_status_uses_newest_submission_outcome_for_duplicate_commit_sha(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        qc_commands=[python_command("pass")],
+        critic_command="builtin",
+    )
+    supervisor = GitSupervisor(repo)
+    _install_revising_critic(supervisor, monkeypatch)
+    task = make_task(supervisor, "alpha.txt", title="duplicate commit submission")
+
+    older, _ = _submit_revised_commit(supervisor, task["id"], "case1")
+    latest, _ = _submit_revised_commit(supervisor, task["id"], "case2")
+    resubmission_id = f"resubmission-{uuid.uuid4()}"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE submissions SET created_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+            (older["id"],),
+        )
+        connection.execute(
+            """
+            INSERT INTO submissions
+              (id, task_id, attempt_id, worker_agent_id, commit_sha, tree_sha,
+               object_contract, patch_sha256, changed_paths_json, resource_tokens_json,
+               status, qc_resume_status, created_at)
+            SELECT ?, task_id, attempt_id, worker_agent_id, commit_sha, tree_sha,
+                   object_contract, patch_sha256, changed_paths_json, resource_tokens_json,
+                   status, qc_resume_status, '2020-01-02T00:00:00Z'
+            FROM submissions WHERE id = ?
+            """,
+            (resubmission_id, older["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO qc_runs
+              (id, submission_id, reviewer_id, commit_sha, verdict, findings_json,
+               results_json, packet_sha256, started_at, finished_at)
+            VALUES (?, ?, 'independent-qc', ?, 'pass', '[]', '{}', 'test', ?, ?)
+            """,
+            (
+                f"pass-{uuid.uuid4()}",
+                resubmission_id,
+                older["commit_sha"],
+                "2020-01-02T00:00:00Z",
+                "2020-01-02T00:00:01Z",
+            ),
+        )
+
+    entry = entry_for(supervisor.status(), task["id"])
+    assert entry["qc"]["verdict"] == "revise"
+    assert entry["qc"]["submission_id"] == latest["id"]
+    assert entry["repeated_qc_findings"] == []
+
+
 def test_qc_finding_identity_rejects_missing_fields_and_normalizes_text() -> None:
     first = {
         "requirement": "QC passes",

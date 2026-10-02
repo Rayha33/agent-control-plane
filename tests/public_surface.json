@@ -762,6 +762,7 @@
       "_add_attempt_worktree_root",
       "_add_base_checkout_snapshot",
       "_add_declared_resources",
+      "_add_qc_runs_latest_lookup_index",
       "_age_seconds",
       "_apply_ledger",
       "_assert_not_newer",

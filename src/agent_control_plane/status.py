@@ -376,6 +376,7 @@ class StatusView:
         current_task_id: str | None = None
         latest_commit: str | None = None
         latest_qc_at: str | None = None
+        observed_task_commits: set[str] = set()
         latest_findings: dict[tuple[str, str, str], dict[str, Any]] = {}
         seen_commits: dict[tuple[str, str, str], set[str]] = {}
         prior_commit_samples: dict[tuple[str, str, str], list[str]] = {}
@@ -417,6 +418,7 @@ class StatusView:
                 current_task_id = task_id
                 latest_commit = row["commit_sha"]
                 latest_qc_at = row["qc_finished_at"]
+                observed_task_commits = {latest_commit} if latest_commit else set()
                 latest_findings = {}
                 seen_commits = {}
                 prior_commit_samples = {}
@@ -437,7 +439,10 @@ class StatusView:
                 continue
 
             commit_sha = row["commit_sha"]
-            if not latest_findings or row["qc_verdict"] in {None, "pass"} or not commit_sha:
+            if not commit_sha or commit_sha in observed_task_commits:
+                continue
+            observed_task_commits.add(commit_sha)
+            if not latest_findings or row["qc_verdict"] in {None, "pass"}:
                 continue
             for finding in StatusView._parse_qc_findings(row["findings_json"]):
                 identity = StatusView._qc_finding_identity(finding)

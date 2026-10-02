@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -302,6 +302,17 @@ def _add_attempt_worktree_root(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE attempts ADD COLUMN worktree_root TEXT NOT NULL DEFAULT ''")
 
 
+def _add_qc_runs_latest_lookup_index(connection: sqlite3.Connection) -> None:
+    """Index each submission's latest QC query for status and recurrence views."""
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_qc_runs_submission_latest
+          ON qc_runs(submission_id, finished_at DESC, id DESC)
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -309,6 +320,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (5, _require_base_checkout_snapshot),
     (6, _fence_legacy_attempt_inserts),
     (7, _add_attempt_worktree_root),
+    (8, _add_qc_runs_latest_lookup_index),
 )
 
 

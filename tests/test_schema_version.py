@@ -197,6 +197,53 @@ def test_attempt_worktree_root_migration_leaves_legacy_attempts_on_default_root(
     connection.close()
 
 
+def test_qc_latest_lookup_index_migration_is_idempotent() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE qc_runs (
+          id TEXT PRIMARY KEY,
+          submission_id TEXT NOT NULL,
+          finished_at TEXT NOT NULL
+        );
+        """
+    )
+
+    migration = dict(MIGRATIONS)[8]
+    migration(connection)
+    columns = connection.execute("PRAGMA index_info('idx_qc_runs_submission_latest')").fetchall()
+    migration(connection)
+    repeated = connection.execute("PRAGMA index_info('idx_qc_runs_submission_latest')").fetchall()
+
+    assert [row["name"] for row in columns] == ["submission_id", "finished_at", "id"]
+    assert [dict(row) for row in repeated] == [dict(row) for row in columns]
+    connection.close()
+
+
+def test_v7_read_only_open_requires_qc_latest_index_migration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("DROP INDEX idx_qc_runs_submission_latest")
+        connection.execute("UPDATE meta SET value = '7' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    before = fingerprint(repo)
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+    assert "version 7" in str(error.value)
+    assert fingerprint(repo) == before
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 7
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with migrated.connect() as connection:
+        columns = connection.execute(
+            "PRAGMA index_info('idx_qc_runs_submission_latest')"
+        ).fetchall()
+    assert [row["name"] for row in columns] == ["submission_id", "finished_at", "id"]
+
+
 def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:
     """A live old process cannot create a new marker-less attempt after upgrade."""
 
