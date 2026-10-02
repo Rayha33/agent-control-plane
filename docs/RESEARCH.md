@@ -138,6 +138,27 @@ retain attempt-root semantics. This narrows a path-identity mismatch at the stru
 hook boundary; it does not guard Bash, bypassed hooks, or the race between authorization
 and the actual write, and it is not an OS sandbox.
 
+### Parallel worktree provisioning reports (2026-10-02)
+
+Claude Code issue [#47266](https://github.com/anthropics/claude-code/issues/47266)
+reports multiple agents failing during simultaneous `git worktree add` calls with
+Git's shared `.git/config.lock` error. Issue
+[#39886](https://github.com/anthropics/claude-code/issues/39886) reports worktree
+isolation silently running in the parent checkout; Codex issue
+[#37226](https://github.com/openai/codex/issues/37226) describes concurrent chats and
+subagents sharing a checkout and overwriting or invalidating edits. These are individual
+user reports, not prevalence estimates or independently verified vendor root causes.
+
+ACP already wraps supervisor Git subprocesses in a cross-process
+`git-operations.lock`, and strips inherited Git repository overrides from worker
+environments. Existing coverage exercised same-process concurrent claims and parallel
+workers after sequential checkout provisioning, but did not pin independent OS processes
+claiming and creating worktrees at the same time. Regression tests now verify the lock
+is shared across processes and race three disjoint claims through the real provisioning
+path; they assert unique registered worktrees and branches, intact base checkout, and no
+leftover `.git/config.lock`. This verifies ACP's own coordination path, not vendor
+worktree isolation, and it does not make arbitrary tools or shell writes sandboxed.
+
 The product response is not to special-case those tools. It is to make the
 candidate commit, ownership token, checkout, and review evidence explicit and
 verifiable.
