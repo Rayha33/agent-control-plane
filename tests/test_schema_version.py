@@ -115,12 +115,120 @@ def test_attempt_progress_migration_keeps_legacy_ages_unknown() -> None:
     connection.close()
 
 
+def test_base_checkout_snapshot_migration_leaves_legacy_baseline_unknown() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE attempts (id TEXT PRIMARY KEY);
+        INSERT INTO attempts VALUES ('legacy-active-attempt');
+        """
+    )
+
+    migration = dict(MIGRATIONS)[4]
+    migration(connection)
+    assert (
+        connection.execute(
+            "SELECT base_checkout_snapshot_json FROM attempts WHERE id = 'legacy-active-attempt'"
+        ).fetchone()[0]
+        == ""
+    )
+    migration(connection)
+    assert (
+        connection.execute(
+            "SELECT base_checkout_snapshot_json FROM attempts WHERE id = 'legacy-active-attempt'"
+        ).fetchone()[0]
+        == ""
+    )
+    connection.close()
+
+
+def test_base_checkout_snapshot_requirement_migration_preserves_legacy_marker() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE attempts (id TEXT PRIMARY KEY);
+        INSERT INTO attempts VALUES ('legacy-active-attempt');
+        """
+    )
+
+    migration = dict(MIGRATIONS)[5]
+    migration(connection)
+    assert (
+        connection.execute(
+            "SELECT base_checkout_snapshot_required FROM attempts "
+            "WHERE id = 'legacy-active-attempt'"
+        ).fetchone()[0]
+        == 0
+    )
+    migration(connection)
+    assert (
+        connection.execute(
+            "SELECT base_checkout_snapshot_required FROM attempts "
+            "WHERE id = 'legacy-active-attempt'"
+        ).fetchone()[0]
+        == 0
+    )
+    connection.close()
+
+
+def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:
+    """A live old process cannot create a new marker-less attempt after upgrade."""
+
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(task["id"], "agent-a")
+
+    # Recreate the v4 database shape: snapshot JSON exists, but the old process
+    # predates the required marker and has already passed its startup check.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER attempts_require_base_checkout_snapshot")
+        connection.execute("ALTER TABLE attempts DROP COLUMN base_checkout_snapshot_required")
+        connection.execute("UPDATE meta SET value = '4' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 4
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+
+    with migrated.connect() as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="attempt_base_checkout_snapshot_required",
+        ):
+            # This uses the v4 column list: it can store the claim-time JSON but
+            # cannot set the v5 required marker. The trigger must fail closed.
+            connection.execute(
+                """
+                INSERT INTO attempts
+                  (id, task_id, number, agent_id, branch, worktree, claim_token,
+                   start_sha, checkpoint_json, status, lease_expires_at, created_at,
+                   updated_at, base_checkout_snapshot_json)
+                SELECT 'stale-writer-attempt', task_id, number + 1, agent_id,
+                       'acp/stale-writer', worktree, claim_token + 1, start_sha,
+                       checkpoint_json, 'provisioning', lease_expires_at, created_at,
+                       updated_at, base_checkout_snapshot_json
+                FROM attempts WHERE id = ?
+                """,
+                (attempt["id"],),
+            )
+
+        marker, snapshot = connection.execute(
+            "SELECT base_checkout_snapshot_required, base_checkout_snapshot_json "
+            "FROM attempts WHERE id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        assert marker == 0
+        assert snapshot
+
+
 def test_read_only_open_refuses_version_two_before_touching_database(repo: Path) -> None:
     """v2 databases lack independent heartbeat/checkpoint timestamps."""
 
     connection = sqlite3.connect(db_path(repo))
+    connection.execute("DROP TRIGGER attempts_require_base_checkout_snapshot")
+    connection.execute("ALTER TABLE attempts DROP COLUMN base_checkout_snapshot_required")
     connection.execute("ALTER TABLE attempts DROP COLUMN checkpoint_at")
     connection.execute("ALTER TABLE attempts DROP COLUMN heartbeat_at")
+    connection.execute("ALTER TABLE attempts DROP COLUMN base_checkout_snapshot_json")
     connection.execute("UPDATE meta SET value = '2' WHERE key = ?", (SCHEMA_VERSION_KEY,))
     connection.commit()
     connection.close()
@@ -133,7 +241,7 @@ def test_read_only_open_refuses_version_two_before_touching_database(repo: Path)
     assert fingerprint(repo) == before
 
 
-def test_read_write_open_applies_version_three_progress_migration(repo: Path) -> None:
+def test_read_write_open_applies_all_migrations_from_version_two(repo: Path) -> None:
     original = GitSupervisor(repo)
     created = make_task(original, "alpha.txt")
     attempt = original.claim(created["id"], "agent-a")
@@ -144,18 +252,30 @@ def test_read_write_open_applies_version_three_progress_migration(repo: Path) ->
         )
 
     connection = sqlite3.connect(db_path(repo))
+    connection.execute("DROP TRIGGER attempts_require_base_checkout_snapshot")
+    connection.execute("ALTER TABLE attempts DROP COLUMN base_checkout_snapshot_required")
     connection.execute("ALTER TABLE attempts DROP COLUMN checkpoint_at")
     connection.execute("ALTER TABLE attempts DROP COLUMN heartbeat_at")
+    connection.execute("ALTER TABLE attempts DROP COLUMN base_checkout_snapshot_json")
     connection.execute("UPDATE meta SET value = '2' WHERE key = ?", (SCHEMA_VERSION_KEY,))
     connection.commit()
     connection.close()
 
     supervisor = GitSupervisor(repo)
     assert supervisor.schema_version_on_open == 2
-    assert meta(repo)[SCHEMA_VERSION_KEY] == "3"
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
     with supervisor.connect() as migrated:
         columns = {row["name"] for row in migrated.execute("PRAGMA table_info(attempts)")}
-    assert {"heartbeat_at", "checkpoint_at"} <= columns
+        snapshot = migrated.execute(
+            "SELECT base_checkout_snapshot_json FROM attempts WHERE id = ?", (attempt["id"],)
+        ).fetchone()[0]
+    assert {
+        "heartbeat_at",
+        "checkpoint_at",
+        "base_checkout_snapshot_json",
+        "base_checkout_snapshot_required",
+    } <= columns
+    assert snapshot == ""
     restored = supervisor.attempt(attempt["id"])
     assert restored["checkpoint"] == {"phase": "tests"}
     assert restored["heartbeat_at"] == ""

@@ -92,10 +92,9 @@ class StoreMixin:
             ),
         )
 
-    def verify_event_chain(self) -> dict[str, Any]:
+    def _verify_event_chain(self, connection: sqlite3.Connection) -> dict[str, Any]:
         previous = GENESIS_HASH
-        with self.connect() as connection:
-            rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
+        rows = connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
         for row in rows:
             try:
                 payload = json.loads(row["payload_json"])
@@ -122,3 +121,7 @@ class StoreMixin:
                 }
             previous = row["event_hash"]
         return {"ok": True, "detail": f"{len(rows)} events verified"}
+
+    def verify_event_chain(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            return self._verify_event_chain(connection)

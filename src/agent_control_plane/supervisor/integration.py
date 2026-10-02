@@ -112,6 +112,19 @@ class IntegrationMixin:
                     "runtime_not_ready",
                     f"submission runtime state is {runtime['state'] if runtime else 'missing'}",
                 )
+            attempt = connection.execute(
+                "SELECT base_checkout_snapshot_json, base_checkout_snapshot_required "
+                "FROM attempts WHERE id = ?",
+                (submission["attempt_id"],),
+            ).fetchone()
+            if attempt is None:
+                raise SupervisorError("attempt_not_found", "submission attempt is missing")
+            self._assert_base_checkout_unchanged(
+                connection,
+                submission["attempt_id"],
+                attempt["base_checkout_snapshot_json"],
+                bool(attempt["base_checkout_snapshot_required"]),
+            )
             runtime_env = json.loads(runtime["env_json"])
             connection.execute(
                 "UPDATE tasks SET status = 'integrating', updated_at = ? WHERE id = ?",
@@ -1521,27 +1534,60 @@ class IntegrationMixin:
                 f"gitdir: {boundary.git_dir}\n".encode(),
             )
 
-    def _assert_safe_git_execution_config(self) -> None:
-        executable_config = self._git(
-            "config",
-            "--local",
-            "--name-only",
-            "--get-regexp",
-            (
+    def _assert_safe_git_execution_config(
+        self, repo: Path | None = None, *, snapshot_only: bool = False
+    ) -> None:
+        context = ("-C", str(repo)) if repo is not None else ()
+        unsafe_config = (
+            r"^(filter\..*\.(clean|smudge|process|required)|core\.fsmonitor|"
+            r"include\.path|includeif\..*\.path)$"
+            if snapshot_only
+            else (
                 r"^(filter\..*\.(clean|smudge|process|required)|merge\..*\.driver|"
                 r"core\.(fsmonitor|sshcommand)|diff\.external|difftool\..*\.cmd|"
                 r"mergetool\..*\.cmd|gpg(\..*)?\.program|credential(\..*)?\.helper|"
                 r"include\.path|includeif\..*\.path)$"
-            ),
+            )
+        )
+        worktree_config = self._git(
+            *context,
+            "config",
+            "--local",
+            "--bool",
+            "--get",
+            "extensions.worktreeConfig",
             check=False,
         )
-        if executable_config.returncode not in {0, 1}:
+        if worktree_config.returncode not in {0, 1}:
             raise SupervisorError(
                 "git_config_unreadable",
-                executable_config.stderr.decode(errors="replace").strip()
-                or "local Git execution config could not be inspected",
+                worktree_config.stderr.decode(errors="replace").strip()
+                or "Git worktree config setting could not be inspected",
             )
-        configured = executable_config.stdout.decode(errors="replace").splitlines()
+        scopes = ["--local"]
+        if worktree_config.returncode == 0 and worktree_config.stdout.strip().lower() == b"true":
+            scopes.append("--worktree")
+        configured = []
+        for scope in scopes:
+            executable_config = self._git(
+                *context,
+                "config",
+                scope,
+                "--name-only",
+                "--get-regexp",
+                unsafe_config,
+                check=False,
+            )
+            if executable_config.returncode not in {0, 1}:
+                raise SupervisorError(
+                    "git_config_unreadable",
+                    executable_config.stderr.decode(errors="replace").strip()
+                    or f"{scope[2:]} Git execution config could not be inspected",
+                )
+            configured.extend(
+                f"{scope[2:]}:{key}"
+                for key in executable_config.stdout.decode(errors="replace").splitlines()
+            )
         if configured:
             raise SupervisorError(
                 "unsafe_git_execution_config",

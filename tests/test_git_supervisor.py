@@ -147,6 +147,33 @@ def commit_change(attempt: dict, path: str, content: str, message: str = "implem
     return git(worktree, "rev-parse", "HEAD")
 
 
+def commit_main_change(
+    repo: Path,
+    *,
+    updates: dict[str, str] | None = None,
+    renames: tuple[tuple[str, str], ...] = (),
+    message: str,
+) -> str:
+    """Advance main in a second checkout without writing into ACP's base checkout."""
+
+    base_head = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "--detach", base_head)
+    worktree = repo.parent / f"{repo.name}-main-advance"
+    git(repo, "worktree", "add", str(worktree), "main")
+    try:
+        for source, destination in renames:
+            git(worktree, "mv", source, destination)
+        for path, content in (updates or {}).items():
+            target = worktree / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        git(worktree, "add", "-A")
+        git(worktree, "commit", "-m", message)
+        return git(worktree, "rev-parse", "HEAD")
+    finally:
+        git(repo, "worktree", "remove", "--force", str(worktree))
+
+
 def reference_porcelain_merge(
     repo: Path, base_sha: str, candidate_sha: str, label: str
 ) -> tuple[subprocess.CompletedProcess[str], str | None]:
@@ -446,6 +473,379 @@ def test_claim_refuses_overlapping_write_sets(repo: Path) -> None:
     assert collision.value.code == "resource_busy"
     assert supervisor.task(second_task["id"])["status"] == "open"
     assert supervisor.attempt(attempt["id"])["status"] == "working"
+
+
+def test_submit_accepts_an_unchanged_dirty_base_checkout(repo: Path) -> None:
+    """A pre-existing dirty checkout is preserved as baseline, not mistaken for escape."""
+
+    (repo / "alpha.txt").write_text("pre-existing staged secret\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    (repo / "beta.txt").write_text("pre-existing unstaged secret\n", encoding="utf-8")
+    (repo / "preexisting.txt").write_text("pre-existing untracked secret\n", encoding="utf-8")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        snapshot_json = connection.execute(
+            "SELECT base_checkout_snapshot_json FROM attempts WHERE id = ?",
+            (attempt["id"],),
+        ).fetchone()[0]
+    assert "pre-existing staged secret" not in snapshot_json
+    assert "pre-existing unstaged secret" not in snapshot_json
+    assert "pre-existing untracked secret" not in snapshot_json
+
+    commit_change(attempt, "beta.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert submission["status"] == "pending_qc"
+    assert (repo / "alpha.txt").read_text(encoding="utf-8") == "pre-existing staged secret\n"
+    assert (repo / "beta.txt").read_text(encoding="utf-8") == "pre-existing unstaged secret\n"
+    assert (repo / "preexisting.txt").read_text(
+        encoding="utf-8"
+    ) == "pre-existing untracked secret\n"
+
+
+@pytest.mark.parametrize("mutation", ["tracked", "staged", "hidden_tracked", "untracked"])
+def test_submit_rejects_base_checkout_source_mutation_without_cleanup(
+    repo: Path, mutation: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    secret = "private-root-content-must-not-appear-in-error"
+    if mutation in {"tracked", "staged", "hidden_tracked"}:
+        (repo / "alpha.txt").write_text(secret + "\n", encoding="utf-8")
+        if mutation == "staged":
+            git(repo, "add", "alpha.txt")
+        elif mutation == "hidden_tracked":
+            git(repo, "update-index", "--assume-unchanged", "alpha.txt")
+        changed_path = "alpha.txt"
+    else:
+        (repo / "new-root-source.txt").write_text(secret + "\n", encoding="utf-8")
+        changed_path = "new-root-source.txt"
+    commit_change(attempt, "beta.txt", "candidate\n")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert error.value.code == "base_checkout_mutated"
+    assert json.dumps(changed_path) in str(error.value)
+    assert secret not in str(error.value)
+    assert (repo / changed_path).exists()
+    assert Path(attempt["worktree"]).exists()
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_submit_detects_symlink_target_change_in_base_checkout(repo: Path) -> None:
+    link = repo / "source-link"
+    link.symlink_to("alpha.txt")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    link.unlink()
+    link.symlink_to("beta.txt")
+    commit_change(attempt, "beta.txt", "candidate\n")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert error.value.code == "base_checkout_mutated"
+    assert json.dumps("source-link") in str(error.value)
+    assert link.is_symlink()
+    assert os.readlink(link) == "beta.txt"
+    assert Path(attempt["worktree"]).exists()
+
+
+def test_snapshot_does_not_follow_parent_swapped_to_symlink(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_dir = repo / "source-dir"
+    source_dir.mkdir()
+    (source_dir / "source.txt").write_text("inside base checkout\n", encoding="utf-8")
+    git(repo, "add", "source-dir/source.txt")
+    git(repo, "commit", "-m", "add nested source")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "source.txt").write_text("external secret\n", encoding="utf-8")
+    supervisor = GitSupervisor(repo)
+    saved_dir = repo / "source-dir-original"
+    real_open = os.open
+    swapped = False
+    attempted_external_leaf_open = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal attempted_external_leaf_open, swapped
+        if path == "source.txt" and kwargs.get("dir_fd") is not None:
+            attempted_external_leaf_open = True
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if (
+            path == "source-dir"
+            and kwargs.get("dir_fd") is not None
+            and flags & getattr(os, "O_DIRECTORY", 0)
+            and not swapped
+        ):
+            source_dir.rename(saved_dir)
+            source_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    try:
+        with pytest.raises(SupervisorError) as error:
+            supervisor._fingerprint_base_path(
+                repo.resolve(), b"source-dir/source.txt", b"source-dir/source.txt"
+            )
+    finally:
+        monkeypatch.setattr(os, "open", real_open)
+        if source_dir.is_symlink():
+            source_dir.unlink()
+        if saved_dir.exists():
+            saved_dir.rename(source_dir)
+
+    assert swapped
+    assert not attempted_external_leaf_open
+    assert error.value.code == "base_checkout_uninspectable"
+    assert json.dumps("source-dir/source.txt") in str(error.value)
+    assert (source_dir / "source.txt").read_text(encoding="utf-8") == "inside base checkout\n"
+
+
+def test_submit_detects_source_change_inside_nonignored_untracked_repository(repo: Path) -> None:
+    nested = repo / "vendor-source"
+    nested.mkdir()
+    git(nested, "init", "-b", "main")
+    git(nested, "config", "user.name", "ACP Test")
+    git(nested, "config", "user.email", "acp@example.test")
+    nested_file = nested / "lib.txt"
+    nested_file.write_text("nested baseline\n", encoding="utf-8")
+    git(nested, "add", "lib.txt")
+    git(nested, "commit", "-m", "nested baseline")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    nested_file.write_text("nested escaped write\n", encoding="utf-8")
+    commit_change(attempt, "beta.txt", "candidate\n")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert error.value.code == "base_checkout_mutated"
+    assert json.dumps("vendor-source/lib.txt") in str(error.value)
+    assert nested_file.read_text(encoding="utf-8") == "nested escaped write\n"
+    assert Path(attempt["worktree"]).exists()
+
+
+def test_claim_refuses_unsafe_root_git_filter_before_scanning(repo: Path) -> None:
+    git(repo, "config", "filter.acp-test.clean", "true")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker")
+
+    assert error.value.code == "unsafe_git_execution_config"
+    assert supervisor.task(created["id"])["status"] == "open"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
+def test_claim_refuses_unsafe_root_worktree_git_filter_before_scanning(repo: Path) -> None:
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git(repo, "config", "--worktree", "filter.acp-test.clean", "true")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker")
+
+    assert error.value.code == "unsafe_git_execution_config"
+    assert supervisor.task(created["id"])["status"] == "open"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
+def test_claim_refuses_unsafe_nested_git_filter_before_scanning(repo: Path) -> None:
+    nested = repo / "vendor-source"
+    nested.mkdir()
+    git(nested, "init", "-b", "main")
+    git(nested, "config", "user.name", "ACP Test")
+    git(nested, "config", "user.email", "acp@example.test")
+    (nested / "lib.txt").write_text("nested baseline\n", encoding="utf-8")
+    git(nested, "add", "lib.txt")
+    git(nested, "commit", "-m", "nested baseline")
+    git(nested, "config", "filter.acp-test.clean", "true")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker")
+
+    assert error.value.code == "unsafe_git_execution_config"
+    assert supervisor.task(created["id"])["status"] == "open"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
+def test_claim_refuses_unsafe_nested_worktree_git_filter_before_scanning(repo: Path) -> None:
+    nested = repo / "vendor-source"
+    nested.mkdir()
+    git(nested, "init", "-b", "main")
+    git(nested, "config", "user.name", "ACP Test")
+    git(nested, "config", "user.email", "acp@example.test")
+    git(nested, "config", "extensions.worktreeConfig", "true")
+    (nested / "lib.txt").write_text("nested baseline\n", encoding="utf-8")
+    git(nested, "add", "lib.txt")
+    git(nested, "commit", "-m", "nested baseline")
+    git(nested, "config", "--worktree", "filter.acp-test.clean", "true")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker")
+
+    assert error.value.code == "unsafe_git_execution_config"
+    assert supervisor.task(created["id"])["status"] == "open"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
+def test_submit_rejects_tampered_claim_snapshot(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "beta.txt", "candidate\n")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET base_checkout_snapshot_json = '' WHERE id = ?",
+            (attempt["id"],),
+        )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert error.value.code == "base_checkout_snapshot_invalid"
+    assert Path(attempt["worktree"]).exists()
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+
+
+def test_submit_rejects_snapshot_downgrade_to_legacy(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "beta.txt", "candidate\n")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET base_checkout_snapshot_json = '' WHERE id = ?",
+            (attempt["id"],),
+        )
+        event = connection.execute(
+            "SELECT id, payload_json FROM events WHERE event_type = 'attempt.ready' "
+            "AND json_extract(payload_json, '$.attempt_id') = ? ORDER BY sequence DESC LIMIT 1",
+            (attempt["id"],),
+        ).fetchone()
+        payload = json.loads(event["payload_json"])
+        payload.pop("base_checkout_snapshot_sha256")
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), event["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert error.value.code == "base_checkout_snapshot_invalid"
+    assert supervisor.verify_event_chain()["ok"] is False
+    assert Path(attempt["worktree"]).exists()
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+
+
+def test_submit_rejects_tampered_claim_event_chain(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "beta.txt", "candidate\n")
+    with supervisor.connect() as connection:
+        event = connection.execute(
+            "SELECT id, payload_json FROM events WHERE event_type = 'attempt.ready' "
+            "AND json_extract(payload_json, '$.attempt_id') = ? ORDER BY sequence DESC LIMIT 1",
+            (attempt["id"],),
+        ).fetchone()
+        payload = json.loads(event["payload_json"])
+        payload["tampered"] = True
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), event["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert error.value.code == "base_checkout_snapshot_invalid"
+    assert supervisor.verify_event_chain()["ok"] is False
+    assert Path(attempt["worktree"]).exists()
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+
+
+def test_concurrent_claims_ignore_git_registration_and_acp_metadata(repo: Path) -> None:
+    (repo / "gamma.txt").write_text("base\n", encoding="utf-8")
+    git(repo, "add", "gamma.txt")
+    git(repo, "commit", "-m", "add third isolated resource")
+    supervisor = GitSupervisor(repo)
+    paths = ("alpha.txt", "beta.txt", "gamma.txt")
+    attempts = [
+        supervisor.claim(task(supervisor, path)["id"], f"worker-{index}")
+        for index, path in enumerate(paths)
+    ]
+    root_status = git(repo, "status", "--porcelain=v1", "-z")
+
+    for attempt, path in zip(attempts, paths, strict=True):
+        commit_change(attempt, path, f"candidate-{path}\n")
+    submissions = [supervisor.submit(attempt["id"], attempt["claim_token"]) for attempt in attempts]
+
+    assert [submission["status"] for submission in submissions] == [
+        "pending_qc",
+        "pending_qc",
+        "pending_qc",
+    ]
+    assert git(repo, "status", "--porcelain=v1", "-z") == root_status
+
+
+def test_persistent_write_racing_a_claim_snapshot_is_blocked_before_qc(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    original = supervisor._fingerprint_base_path
+    changed = False
+    secret = "root-write-during-snapshot"
+
+    def write_after_path_was_fingerprinted(
+        root_real: Path, relative: bytes, display: bytes
+    ) -> dict:
+        nonlocal changed
+        result = original(root_real, relative, display)
+        if relative == b"alpha.txt" and not changed:
+            changed = True
+            (repo / "alpha.txt").write_text(secret + "\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(supervisor, "_fingerprint_base_path", write_after_path_was_fingerprinted)
+    attempt = supervisor.claim(task(supervisor, "beta.txt")["id"], "worker")
+    commit_change(attempt, "beta.txt", "candidate\n")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert changed
+    assert error.value.code == "base_checkout_mutated"
+    assert json.dumps("alpha.txt") in str(error.value)
+    assert secret not in str(error.value)
+    assert (repo / "alpha.txt").read_text(encoding="utf-8") == secret + "\n"
 
 
 @requires_linux_worker
@@ -1178,6 +1578,33 @@ def test_passed_qc_creates_gated_integration_branch(repo: Path) -> None:
     assert supervisor.task(created["id"])["status"] == "done"
 
 
+def test_integration_rechecks_base_checkout_after_qc_without_touching_it(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "reviewed candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    private_root_change = "leave-this-user-edit-alone"
+    (repo / "beta.txt").write_text(private_root_change + "\n", encoding="utf-8")
+    with pytest.raises(SupervisorError) as error:
+        supervisor.integrate(created["id"])
+
+    assert error.value.code == "base_checkout_mutated"
+    assert json.dumps("beta.txt") in str(error.value)
+    assert private_root_change not in str(error.value)
+    assert (repo / "beta.txt").read_text(encoding="utf-8") == private_root_change + "\n"
+    assert supervisor.task(created["id"])["status"] == "approved"
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM integrations WHERE task_id = ?", (created["id"],)
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_integration_gate_cannot_leave_a_detached_child(repo: Path) -> None:
     marker = repo / "integration-detached-child"
     daemon = (
@@ -1311,9 +1738,11 @@ def test_integration_ignores_hostile_local_merge_driver(
     commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
-    git(repo, "add", "alpha.txt")
-    git(repo, "commit", "-m", "conflicting main change")
+    commit_main_change(
+        repo,
+        updates={"alpha.txt": "main moved\n"},
+        message="conflicting main change",
+    )
     marker = repo / "hostile-driver-ran"
     driver = repo.parent / "hostile-merge-driver"
     driver.write_text(
@@ -1342,9 +1771,11 @@ def test_isolated_merge_matches_git_tree_and_parent_semantics(repo: Path) -> Non
     candidate = commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    (repo / "beta.txt").write_text("main moved\n", encoding="utf-8")
-    git(repo, "add", "beta.txt")
-    git(repo, "commit", "-m", "non-conflicting main change")
+    commit_main_change(
+        repo,
+        updates={"beta.txt": "main moved\n"},
+        message="non-conflicting main change",
+    )
     current_base = git(repo, "rev-parse", "main")
     expected_tree = git(
         repo,
@@ -1400,8 +1831,8 @@ def test_integration_never_executes_path_selected_git(
     commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    marker = repo / "path-git-ran"
-    candidate_bin = repo / "candidate-bin"
+    marker = repo.parent / "path-git-ran"
+    candidate_bin = repo.parent / "candidate-bin"
     candidate_bin.mkdir()
     wrapper = candidate_bin / "git"
     wrapper.write_text(
@@ -1752,8 +2183,11 @@ def test_merge_renames_setting_matches_porcelain_merge(repo: Path) -> None:
     candidate = commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    git(repo, "mv", "alpha.txt", "renamed.txt")
-    git(repo, "commit", "-m", "rename on main")
+    commit_main_change(
+        repo,
+        renames=(("alpha.txt", "renamed.txt"),),
+        message="rename on main",
+    )
     current_base = git(repo, "rev-parse", "main")
     reference, reference_head = reference_porcelain_merge(
         repo, current_base, candidate, "renames-off"
@@ -1787,9 +2221,11 @@ def test_info_attributes_union_matches_porcelain_merge(repo: Path) -> None:
     candidate = commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
-    git(repo, "add", "alpha.txt")
-    git(repo, "commit", "-m", "main content")
+    commit_main_change(
+        repo,
+        updates={"alpha.txt": "main moved\n"},
+        message="main content",
+    )
     current_base = git(repo, "rev-parse", "main")
     reference, reference_head = reference_porcelain_merge(
         repo, current_base, candidate, "info-union"
@@ -1816,9 +2252,11 @@ def test_core_attributes_file_matches_porcelain_merge(repo: Path) -> None:
     candidate = commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
-    git(repo, "add", "alpha.txt")
-    git(repo, "commit", "-m", "main content")
+    commit_main_change(
+        repo,
+        updates={"alpha.txt": "main moved\n"},
+        message="main content",
+    )
     current_base = git(repo, "rev-parse", "main")
     reference, reference_head = reference_porcelain_merge(
         repo, current_base, candidate, "core-attributes"
@@ -1900,9 +2338,11 @@ def test_relative_core_attributes_ignores_live_worktree_only_bytes(
     candidate = commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
-    git(repo, "add", "alpha.txt")
-    git(repo, "commit", "-m", "main content")
+    commit_main_change(
+        repo,
+        updates={"alpha.txt": "main moved\n"},
+        message="main content",
+    )
     current_base = git(repo, "rev-parse", "main")
     reference, _ = reference_porcelain_merge(
         repo, current_base, candidate, f"core-attributes-{attributes_state}"
@@ -2073,11 +2513,14 @@ def test_already_integrated_candidate_preserves_current_head(
     candidate = commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    git(repo, "merge", "--ff-only", candidate)
+    git(repo, "checkout", "--detach", git(repo, "rev-parse", "HEAD"))
+    git(repo, "branch", "-f", "main", candidate)
     if advance_main:
-        (repo / "beta.txt").write_text("later main\n", encoding="utf-8")
-        git(repo, "add", "beta.txt")
-        git(repo, "commit", "-m", "advance main after candidate")
+        commit_main_change(
+            repo,
+            updates={"beta.txt": "later main\n"},
+            message="advance main after candidate",
+        )
     current_base = git(repo, "rev-parse", "main")
 
     integration = supervisor.integrate(created["id"])
@@ -2323,7 +2766,9 @@ def test_manual_submit_cannot_consume_running_worker(
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
-    ready = repo / "worker-ready"
+    # This is process-coordination state, not repository source; keep it under
+    # ACP's administrative directory so the base-checkout fence ignores it.
+    ready = repo / ".acp" / "worker-ready"
     command = [
         "/bin/sh",
         "-lc",
@@ -2490,9 +2935,11 @@ def test_merge_conflict_blocks_integration(repo: Path) -> None:
     commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
-    (repo / "alpha.txt").write_text("main moved\n", encoding="utf-8")
-    git(repo, "add", "alpha.txt")
-    git(repo, "commit", "-m", "conflicting main change")
+    commit_main_change(
+        repo,
+        updates={"alpha.txt": "main moved\n"},
+        message="conflicting main change",
+    )
     integration = supervisor.integrate(created["id"])
     assert integration["verdict"] == "conflict"
     assert supervisor.task(created["id"])["status"] == "conflicted"
