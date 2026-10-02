@@ -156,6 +156,13 @@ The worktree must be clean and committed. Every changed path must match the
 declared write set. A changed symlink resolving outside the assigned worktree is
 rejected.
 
+Claude Code's structured-write pre-hook also validates the host-reported `cwd`
+against the claimed worktree before authorizing a tool call. Relative targets are
+resolved from that cwd; an absent, invalid, or outside cwd is denied even when the
+target string itself looks in-scope. This detects a reported context mismatch, but it
+does not replace OS isolation: hooks can be bypassed, Bash is not parsed, and a hook
+check is not atomic with the subsequent write.
+
 ### 4. Runtime isolation follows the attempt
 
 Worktree isolation stops direct file overwrites but does not isolate ports,

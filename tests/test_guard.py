@@ -185,10 +185,18 @@ def test_hook_mode_exit_codes(claimed, repo: Path, monkeypatch) -> None:
     worktree = Path(attempt["worktree"])
 
     allowed = json.dumps(
-        {"tool_name": "Edit", "tool_input": {"file_path": str(worktree / "alpha.txt")}}
+        {
+            "cwd": str(worktree),
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(worktree / "alpha.txt")},
+        }
     )
     denied = json.dumps(
-        {"tool_name": "Edit", "tool_input": {"file_path": str(worktree / "beta.txt")}}
+        {
+            "cwd": str(worktree),
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(worktree / "beta.txt")},
+        }
     )
 
     assert run_hook(repo, attempt["id"], allowed, monkeypatch) == 0
@@ -207,6 +215,99 @@ def test_path_from_hook_payload_reads_the_editing_tools() -> None:
     assert path_from_hook_payload({"tool_input": {"notebook_path": "n.ipynb"}}) == "n.ipynb"
     assert path_from_hook_payload({"tool_input": {"command": "rm -rf /"}}) is None
     assert path_from_hook_payload("nonsense") is None
+
+
+def test_hook_relative_path_is_resolved_from_the_reported_subdirectory(
+    repo: Path, monkeypatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "src/**")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    subdirectory = worktree / "src"
+    subdirectory.mkdir()
+    payload = json.dumps(
+        {"cwd": str(subdirectory), "tool_name": "Write", "tool_input": {"file_path": "new.py"}}
+    )
+
+    assert run_hook(repo, attempt["id"], payload, monkeypatch) == 0
+    decision = supervisor.guard(attempt["id"], "new.py", cwd=str(subdirectory))
+    assert decision["allow"] is True
+    assert decision["relative_path"] == "src/new.py"
+
+
+def test_hook_cwd_outside_attempt_is_denied_even_for_declared_target(claimed, repo: Path) -> None:
+    supervisor, attempt = claimed
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt", cwd=str(repo))
+    absolute_decision = supervisor.guard(
+        attempt["id"],
+        str(Path(attempt["worktree"]) / "alpha.txt"),
+        cwd=str(repo),
+    )
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "cwd_outside_worktree"
+    assert absolute_decision["allow"] is False
+    assert absolute_decision["reason"] == "cwd_outside_worktree"
+
+
+def test_hook_cwd_in_peer_attempt_is_denied(claimed, repo: Path) -> None:
+    supervisor, attempt = claimed
+    peer_task = make_task(supervisor, "beta.txt")
+    peer_attempt = supervisor.claim(peer_task["id"], "peer")
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt", cwd=peer_attempt["worktree"])
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "cwd_outside_worktree"
+
+
+@pytest.mark.parametrize("cwd", ["relative/path", "/path/that/does/not/exist"])
+def test_hook_cwd_must_be_absolute_and_existing(claimed, cwd: str) -> None:
+    supervisor, attempt = claimed
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt", cwd=cwd)
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "invalid_working_directory"
+
+
+def test_hook_cwd_symlink_outside_attempt_is_denied(claimed, repo: Path) -> None:
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    outside_link = worktree / "outside"
+    outside_link.symlink_to(repo, target_is_directory=True)
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt", cwd=str(outside_link))
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "cwd_outside_worktree"
+
+
+def test_hook_cwd_must_be_a_directory(claimed, repo: Path) -> None:
+    supervisor, attempt = claimed
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt", cwd=str(repo / "alpha.txt"))
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "invalid_working_directory"
+
+
+def test_hook_mode_fails_closed_without_a_cwd(claimed, repo: Path, monkeypatch, capsys) -> None:
+    _, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    payload = json.dumps({"tool_input": {"file_path": str(worktree / "alpha.txt")}})
+
+    assert run_hook(repo, attempt["id"], payload, monkeypatch) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "unreadable_hook_payload"
+
+
+def test_hook_mode_fails_closed_on_cwd_drift(claimed, repo: Path, monkeypatch) -> None:
+    _, attempt = claimed
+    payload = json.dumps({"cwd": str(repo), "tool_input": {"file_path": "alpha.txt"}})
+
+    assert run_hook(repo, attempt["id"], payload, monkeypatch) == DENY_EXIT_CODE
 
 
 def test_bash_is_not_claimed_to_be_guarded() -> None:
@@ -279,13 +380,17 @@ def test_hook_mode_fails_closed_when_the_supervisor_cannot_open(tmp_path, monkey
     """
 
     monkeypatch.setenv("ACP_ATTEMPT_ID", "some-attempt")
-    monkeypatch.setattr("sys.stdin", io.StringIO('{"tool_input": {"file_path": "a.py"}}'))
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO('{"cwd": "/somewhere", "tool_input": {"file_path": "a.py"}}')
+    )
     assert main(["--repo", str(tmp_path / "not-a-repo"), "guard", "--hook"]) == DENY_EXIT_CODE
 
 
 def test_hook_mode_fails_closed_without_an_attempt_id(repo: Path, monkeypatch) -> None:
     monkeypatch.delenv("ACP_ATTEMPT_ID", raising=False)
-    monkeypatch.setattr("sys.stdin", io.StringIO('{"tool_input": {"file_path": "alpha.txt"}}'))
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO('{"cwd": "/somewhere", "tool_input": {"file_path": "alpha.txt"}}')
+    )
     assert main(["--repo", str(repo), "guard", "--hook"]) == DENY_EXIT_CODE
 
 
@@ -303,7 +408,11 @@ def test_hook_mode_fails_closed_on_a_stale_schema(claimed, repo: Path, monkeypat
     monkeypatch.setenv("ACP_ATTEMPT_ID", claimed[1]["id"])
     monkeypatch.setattr(
         "sys.stdin",
-        io.StringIO(json.dumps({"tool_input": {"file_path": str(worktree / "alpha.txt")}})),
+        io.StringIO(
+            json.dumps(
+                {"cwd": str(worktree), "tool_input": {"file_path": str(worktree / "alpha.txt")}}
+            )
+        ),
     )
     assert main(["--repo", str(repo), "guard", "--hook"]) == DENY_EXIT_CODE
 

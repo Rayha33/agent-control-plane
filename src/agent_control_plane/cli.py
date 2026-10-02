@@ -61,12 +61,18 @@ def parse_duration(text: str) -> int:
     return int(value[:-1]) * DURATION_UNITS[value[-1]]
 
 
-def _hook_target(raw: str) -> str | None:
+def _hook_target(raw: str) -> tuple[str, str] | None:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    return path_from_hook_payload(payload)
+    if not isinstance(payload, dict):
+        return None
+    target = path_from_hook_payload(payload)
+    cwd = payload.get("cwd")
+    if target is None or not isinstance(cwd, str) or not cwd:
+        return None
+    return target, cwd
 
 
 def _deny(decision: dict[str, Any]) -> int:
@@ -725,23 +731,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 emit(supervisor.guard_context(attempt_id))
                 return 0
             target = args.path
+            hook_cwd = None
             if args.hook:
-                target = _hook_target(sys.stdin.read())
-                if target is None:
-                    # Fail closed. Unable to read the request means unable to tell
-                    # whether it is in scope, and a guard that allows what it cannot
-                    # parse stops being a boundary the moment the payload changes.
+                hook_request = _hook_target(sys.stdin.read())
+                if hook_request is None:
+                    # Without both target and cwd we cannot tell whether the actual
+                    # edit is in scope. Allowing an unparseable request could silently
+                    # void the boundary when the hook payload changes.
                     return _deny(
                         {
                             "ok": True,
                             "allow": False,
                             "reason": "unreadable_hook_payload",
-                            "detail": "no writable path found in the PreToolUse payload",
+                            "detail": (
+                                "no writable path and working-directory field found "
+                                "in the PreToolUse payload"
+                            ),
                         }
                     )
+                target, hook_cwd = hook_request
             if not target:
                 raise SupervisorError("missing_path", "pass --path or use --hook")
-            decision = supervisor.guard(attempt_id, target)
+            decision = supervisor.guard(attempt_id, target, cwd=hook_cwd)
             if not decision["allow"]:
                 return _deny(decision)
             emit(decision)

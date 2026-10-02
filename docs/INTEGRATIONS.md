@@ -9,6 +9,8 @@ Every adapter **asks**; it never decides. `acp guard` answers with the same
 `_path_matches` that `acp submit` applies to the finished diff. A second implementation
 of the rule would eventually disagree with the one that matters, and an agent allowed
 to write something its own submission is later rejected for is the worst of both.
+For Claude Code structured-write hooks, the supervisor also checks the hook's
+host-reported working directory and resolves relative targets from that directory.
 
 ## `acp guard`
 
@@ -24,22 +26,31 @@ An agent told *"beta.txt is not in the task's declared write set; declared: alph
 corrects itself in one turn. Guard is read-only — a pre-write check must never itself
 become a reason the state changed.
 
-Denials, in the order they are checked:
+For hook calls, the adapter first validates the payload. If it cannot extract both a
+supported writable path and a non-empty string `cwd`, it denies with
+`unreadable_hook_payload` before looking up the attempt or checking its lease. The
+supervisor denials below are then checked in this order:
 
 | reason | meaning |
 | --- | --- |
 | `attempt_not_found` | no such attempt |
 | `attempt_not_live` | the attempt is orphaned, submitted or quarantined |
 | `lease_expired` | the claim lease has run out; heartbeat or re-claim |
+| `invalid_working_directory` | hook cwd is not absolute, an existing directory, or resolvable |
+| `cwd_outside_worktree` | hook cwd is outside this attempt's worktree |
+| `invalid_path` | the target path cannot be resolved |
 | `outside_worktree` | the path resolves outside the allocated worktree |
 | `undeclared_write` | inside the worktree, but not in the task's write set |
-| `unreadable_hook_payload` | the request could not be parsed, so it is refused |
-
 `outside_worktree` covers three things worth stating plainly: `../` traversal, absolute
 paths elsewhere on the machine, and **the base checkout** — even for a file that IS in
 the write set, because the copy in the base checkout is not the one the attempt leased.
 Paths are resolved before comparison, so a symlink planted inside the worktree cannot
-launder a write out of it.
+launder a write out of it. A Claude Code hook must include its absolute `cwd`; ACP
+requires it to resolve to the attempt worktree or one of its subdirectories. Relative
+tool paths are resolved from that reported directory, not silently re-rooted to the
+attempt root. An absolute target does not bypass the cwd check. Direct `acp guard
+--path` and read-only MCP `acp_guard` calls omit hook context and keep their existing
+attempt-root-relative path semantics.
 
 ## Claude Code
 
@@ -50,7 +61,9 @@ acp hooks install --claude-code
 Writes `.claude/settings.json` in the repository:
 
 - **PreToolUse** on `Edit|Write|MultiEdit|NotebookEdit` → `acp guard --hook`. Exit 2
-  blocks the tool call and returns the reason to the model.
+  blocks the tool call and returns the reason to the model. The adapter requires the
+  hook's `cwd`, verifies it is within the claimed worktree, and resolves relative edit
+  paths from it.
 - **SessionStart** → `acp guard --describe`, so the session starts knowing its worktree
   and write set rather than discovering the boundary by hitting it.
 
@@ -58,6 +71,13 @@ The install **merges**. Hooks you already have — including your own `PreToolUs
 entries — are preserved, previous ACP entries are replaced rather than duplicated, and
 a `settings.json` that is not valid JSON is left untouched with an error instead of
 being overwritten.
+
+This check addresses reported Claude Code cwd drift: one session or subagent can appear
+to enter another worktree. The official hook payload provides a `cwd` field, which lets
+ACP reject an invocation whose reported context is outside its claim. This is still a
+pre-write hook, not filesystem isolation: it does not cover Bash, unhooked tools, hook
+bypass, or a race after the check. Treat issue reports as individual experiences, not
+prevalence estimates.
 
 Export the attempt id from the claim before starting the session:
 
