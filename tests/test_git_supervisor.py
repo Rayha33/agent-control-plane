@@ -2766,7 +2766,9 @@ def test_manual_submit_cannot_consume_running_worker(
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
-    ready = repo / "worker-ready"
+    # This is process-coordination state, not repository source; keep it under
+    # ACP's administrative directory so the base-checkout fence ignores it.
+    ready = repo / ".acp" / "worker-ready"
     command = [
         "/bin/sh",
         "-lc",
