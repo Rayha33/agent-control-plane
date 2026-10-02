@@ -895,15 +895,18 @@ class ClaimsMixin:
             # makes recovery automatic; pruning all expired rows keeps the ledger small.
             connection.execute("DELETE FROM write_reservations WHERE expires_at <= ?", (epoch,))
             existing = connection.execute(
-                "SELECT path FROM write_reservations WHERE attempt_id = ? AND tool_use_id = ?",
+                "SELECT agent_id, path FROM write_reservations "
+                "WHERE attempt_id = ? AND tool_use_id = ?",
                 (attempt_id, tool_use_id),
             ).fetchone()
-            if existing is not None and existing["path"] != reservation_path:
+            if existing is not None and (
+                existing["path"] != reservation_path or existing["agent_id"] != agent_id
+            ):
                 return self._guard_denial(
                     attempt_id,
                     str(target),
                     "write_identity_conflict",
-                    "this Claude tool_use_id is already reserved for a different path; refusing to reuse the invocation identity",
+                    "this Claude tool_use_id is already reserved for a different path or agent; refusing to reuse the invocation identity",
                     declared=declared,
                     relative_path=relative,
                 )
@@ -915,7 +918,7 @@ class ClaimsMixin:
             conflicts = [
                 row
                 for row in active
-                if row["tool_use_id"] != tool_use_id
+                if (row["tool_use_id"], row["agent_id"]) != (tool_use_id, agent_id)
                 and _reservation_paths_overlap(reservation_path, row["path"])
             ]
             if conflicts:
@@ -961,16 +964,19 @@ class ClaimsMixin:
                 "reservation_expires_at": expires_at,
             }
 
-    def _release_write(self, attempt_id: str, tool_use_id: str) -> bool:
+    def _release_write(self, attempt_id: str, tool_use_id: str, *, agent_id: str = "") -> bool:
         """Release every path held by one Claude tool invocation; safe to repeat."""
 
         if not isinstance(tool_use_id, str) or not tool_use_id.strip() or len(tool_use_id) > 512:
             return False
+        if not isinstance(agent_id, str) or len(agent_id) > 512:
+            return False
         with _ephemeral_write_connection(self.db_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
-                "DELETE FROM write_reservations WHERE attempt_id = ? AND tool_use_id = ?",
-                (attempt_id, tool_use_id),
+                "DELETE FROM write_reservations "
+                "WHERE attempt_id = ? AND tool_use_id = ? AND agent_id = ?",
+                (attempt_id, tool_use_id, agent_id),
             )
             return cursor.rowcount > 0
 

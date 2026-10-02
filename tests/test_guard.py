@@ -88,14 +88,63 @@ def test_same_attempt_write_reservations_block_until_the_tool_finishes(claimed) 
     assert competing["allow"] is False
     assert competing["reason"] == "concurrent_write_conflict"
     assert competing["retry_after_seconds"] == WRITE_RESERVATION_TTL_SECONDS
-    assert supervisor._release_write(attempt["id"], "tool-1") is True
-    assert supervisor._release_write(attempt["id"], "tool-1") is False
+    assert supervisor._release_write(attempt["id"], "tool-1", agent_id="subagent-1") is True
+    assert supervisor._release_write(attempt["id"], "tool-1", agent_id="subagent-1") is False
     assert (
         supervisor._reserve_write(
             attempt["id"],
             "alpha.txt",
             caller_cwd=worktree,
             tool_use_id="tool-2",
+            agent_id="subagent-2",
+        )["allow"]
+        is True
+    )
+
+
+def test_same_tool_use_id_cannot_cross_agent_boundaries_or_release_another_agent(
+    claimed,
+) -> None:
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    first = supervisor._reserve_write(
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="reused-tool-id",
+        agent_id="subagent-1",
+    )
+    duplicate = supervisor._reserve_write(
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="reused-tool-id",
+        agent_id="subagent-2",
+    )
+
+    assert first["allow"] is True
+    assert duplicate["allow"] is False
+    assert duplicate["reason"] == "write_identity_conflict"
+    assert (
+        supervisor._release_write(attempt["id"], "reused-tool-id", agent_id="subagent-2") is False
+    )
+    assert (
+        supervisor._reserve_write(
+            attempt["id"],
+            "alpha.txt",
+            caller_cwd=worktree,
+            tool_use_id="other-tool-id",
+            agent_id="subagent-2",
+        )["reason"]
+        == "concurrent_write_conflict"
+    )
+    assert supervisor._release_write(attempt["id"], "reused-tool-id", agent_id="subagent-1") is True
+    assert (
+        supervisor._reserve_write(
+            attempt["id"],
+            "alpha.txt",
+            caller_cwd=worktree,
+            tool_use_id="reused-tool-id",
             agent_id="subagent-2",
         )["allow"]
         is True
@@ -1667,7 +1716,6 @@ def test_cli_pre_hook_serializes_same_attempt_writes_and_fails_closed_without_id
         "hook_event_name": "PostToolUse",
         "tool_name": "Write",
         "tool_use_id": "tool-1",
-        "agent_id": "agent-1",
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(finish)))
     assert main(["--repo", str(repo), "write-finish", "--hook"]) == 0
@@ -1692,6 +1740,20 @@ def test_write_finish_hook_releases_success_failure_and_permission_denial(
     )
     assert held["allow"] is True
     monkeypatch.setenv("ACP_ATTEMPT_ID", attempt["id"])
+    wrong_agent_finish = {
+        "hook_event_name": hook_event,
+        "tool_name": "Write",
+        "tool_use_id": "tool-1",
+        "agent_id": "agent-2",
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(wrong_agent_finish)))
+    assert main(["--repo", str(repo), "write-finish", "--hook"]) == 0
+    still_held = supervisor._reserve_write(
+        attempt["id"], "alpha.txt", caller_cwd=worktree, tool_use_id="tool-2", agent_id="agent-2"
+    )
+    assert still_held["allow"] is False
+    assert still_held["reason"] == "concurrent_write_conflict"
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1722,7 +1784,6 @@ def test_write_finish_releases_using_tool_use_id_when_agent_id_is_absent(
         "alpha.txt",
         caller_cwd=worktree,
         tool_use_id="tool-with-optional-agent-id",
-        agent_id="subagent-1",
     )["allow"]
     monkeypatch.setenv("ACP_ATTEMPT_ID", attempt["id"])
     monkeypatch.setattr(

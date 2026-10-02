@@ -132,13 +132,14 @@ acp --repo "$BASE" hooks install --claude-code --attempt "$ATTEMPT" \
 The pre-hook reserves the resolved path for that invocation before the editor runs. A
 second invocation in the same attempt that targets the same path or an ancestor/child
 path is denied with `concurrent_write_conflict`; a disjoint path may proceed. The
-reservation is keyed by `(attempt_id, tool_use_id)`; `agent_id` is diagnostic and may be
-absent on main-thread calls. `PostToolUse` and `PostToolUseFailure` release after success
-or execution failure. `PermissionDenied` also releases auto-mode denials, but Claude Code
-does not emit that event for a manually denied permission dialog. If a completion event
-is not emitted (including manual denial, interruption, or crash), the reservation expires
-after five minutes and is removed on the next reservation request. Missing or malformed
-`tool_use_id` fails closed for a new write.
+reservation is keyed by `(attempt_id, tool_use_id)` and bound to the same `agent_id` for
+idempotent reserve/release; `agent_id` may be absent on main-thread calls. Reusing one
+`tool_use_id` across agent identities fails closed. `PostToolUse` and `PostToolUseFailure`
+release after success or execution failure. `PermissionDenied` also releases auto-mode
+denials, but Claude Code does not emit that event for a manually denied permission dialog.
+If a completion event is not emitted (including manual denial, interruption, or crash),
+the reservation expires after five minutes and is removed on the next reservation request.
+Missing or malformed `tool_use_id` fails closed for a new write.
 
 This is opt-in and covers only the structured Claude Code tools in the matcher above. It
 does not mediate Bash, MCP/custom tools, external processes, or untrusted/disabled hooks;

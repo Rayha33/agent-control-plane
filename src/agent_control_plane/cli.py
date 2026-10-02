@@ -759,7 +759,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             tool_use_id = payload.get("tool_use_id")
             if not isinstance(tool_use_id, str):
                 return 0
-            supervisor._release_write(attempt_id, tool_use_id)
+            supervisor._release_write(
+                attempt_id,
+                tool_use_id,
+                agent_id=payload.get("agent_id", ""),
+            )
             return 0
         elif args.action == "doctor":
             result = supervisor.doctor()
