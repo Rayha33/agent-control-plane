@@ -335,3 +335,22 @@ the legacy default. It persists the resolved managed root per attempt, validates
 worker worktree identity, and limits cleanup to Git-registered paths under the
 recorded root. The option reduces path ambiguity; it does not replace a runtime
 sandbox or prove that every agent product honors its supplied cwd.
+
+### Worktree inventory is not live-session ownership (2026-10-02)
+
+In [Claude Code issue #76727](https://github.com/anthropics/claude-code/issues/76727),
+one developer running many sessions asks for a read-only registry of worktree paths
+and branches, and warns that a guard must inspect the target path rather than trust
+the caller's session cwd. [Codex issue #37226](https://github.com/openai/codex/issues/37226)
+describes separate chats sharing a checkout and overwriting newer edits. These are
+individual user reports, not prevalence estimates or independently verified vendor
+root-cause analyses.
+
+The product response is a read-only `acp status` inventory of Git-registered worktrees.
+ACP maps an entry to a persisted attempt only when its path and branch uniquely match.
+Every entry reports `owner=unknown`; an exact match may expose `recorded_agent_id` as
+historical audit context, not current ownership. Git metadata cannot establish which
+agent or person is currently using a directory.
+The inventory reads Git's worktree metadata only: it does not inspect foreign checkout
+contents, run commands there, or prevent writes. An unavailable or malformed Git listing
+is reported as unavailable, not as an empty inventory.

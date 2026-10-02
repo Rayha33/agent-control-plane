@@ -787,6 +787,8 @@ class ReaperMixin:
         connection: sqlite3.Connection,
         now: float,
         older_than_seconds: int,
+        *,
+        registered_worktrees: dict[str, str | None] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Classify every attempt worktree as reclaimable or retained. Reads only.
 
@@ -820,7 +822,8 @@ class ReaperMixin:
             ORDER BY attempt.created_at, attempt.id
             """
         ).fetchall()
-        registered_worktrees = self._registered_worktrees()
+        if registered_worktrees is None:
+            registered_worktrees = self._registered_worktrees()
 
         reclaimable: list[dict[str, Any]] = []
         retained: list[dict[str, Any]] = []

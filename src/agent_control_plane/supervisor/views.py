@@ -236,9 +236,18 @@ class ViewsMixin:
     ) -> dict[str, Any]:
         """Operator snapshot: attention queue, phases, runtimes, blockers. Read-only."""
         snapshot = StatusView(self).snapshot(limit, lease_risk_seconds, checkpoint_stale_seconds)
+        inventory = snapshot["git_worktrees"]
+        registered_worktrees = (
+            {entry["path"]: entry["branch"] for entry in inventory["entries"]}
+            if inventory["status"] == "available"
+            else {}
+        )
         with self.connect() as connection:
             reclaimable, retained = self._gc_survey(
-                connection, time.time(), DEFAULT_GC_RETENTION_SECONDS
+                connection,
+                time.time(),
+                DEFAULT_GC_RETENTION_SECONDS,
+                registered_worktrees=registered_worktrees,
             )
         try:
             filesystem_usage = shutil.disk_usage(self.state_dir)

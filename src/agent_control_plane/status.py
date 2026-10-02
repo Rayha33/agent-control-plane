@@ -63,6 +63,128 @@ def _format_bytes(byte_count: int) -> str:
     return f"{value:.1f} TiB"
 
 
+def _path_key(path: str) -> str:
+    """Normalize path spelling for matching without following symlinks."""
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+def _parse_git_worktree_listing(output: str) -> list[dict[str, Any]]:
+    """Parse Git's NUL-delimited porcelain without losing unusual path characters."""
+    entries: list[dict[str, Any]] = []
+    record: dict[str, str | bool] = {}
+
+    def finish_record() -> None:
+        if not record:
+            return
+        path = record.get("worktree")
+        if not isinstance(path, str) or not path or not os.path.isabs(path):
+            raise ValueError("Git worktree listing contains an invalid path")
+        head = record.get("HEAD")
+        if (
+            not isinstance(head, str)
+            or len(head) not in {40, 64}
+            or any(character not in "0123456789abcdefABCDEF" for character in head)
+        ):
+            raise ValueError("Git worktree listing contains an invalid HEAD")
+        branch = record.get("branch")
+        if isinstance(branch, str) and branch.startswith("refs/heads/"):
+            branch = branch.removeprefix("refs/heads/")
+        entries.append(
+            {
+                "path": path,
+                "head": head if isinstance(head, str) else None,
+                "branch": branch if isinstance(branch, str) else None,
+                "detached": record.get("detached") is True,
+                "bare": record.get("bare") is True,
+            }
+        )
+        record.clear()
+
+    for field in output.split("\0"):
+        if not field:
+            finish_record()
+            continue
+        if " " in field:
+            key, value = field.split(" ", 1)
+            if key in record:
+                raise ValueError("Git worktree listing contains a duplicate field")
+            record[key] = value
+        else:
+            if field in record:
+                raise ValueError("Git worktree listing contains a duplicate field")
+            record[field] = True
+    finish_record()
+    if not entries:
+        raise ValueError("Git worktree listing contains no worktree records")
+    paths = [_path_key(entry["path"]) for entry in entries]
+    if len(paths) != len(set(paths)):
+        raise ValueError("Git worktree listing contains duplicate paths")
+    return entries
+
+
+def _git_worktree_inventory(
+    supervisor: GitSupervisor, attempts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Inventory Git metadata and map only exact, unambiguous ACP attempt identities."""
+    from .supervisor.common import SupervisorError
+
+    try:
+        output = supervisor._git_readonly_bytes("worktree", "list", "--porcelain", "-z").decode(
+            "utf-8", errors="surrogateescape"
+        )
+        entries = _parse_git_worktree_listing(output)
+    except SupervisorError as error:
+        return {"status": "unavailable", "error": error.code, "entries": []}
+    except (OSError, ValueError):
+        return {"status": "unavailable", "error": "git_worktree_list_unavailable", "entries": []}
+
+    attempts_by_path: dict[str, list[dict[str, Any]]] = {}
+    for attempt in attempts:
+        attempt_path = attempt.get("worktree")
+        if not isinstance(attempt_path, str) or not os.path.isabs(attempt_path):
+            continue
+        attempts_by_path.setdefault(_path_key(attempt_path), []).append(
+            {
+                "attempt_id": attempt["id"],
+                "task_id": attempt["task_id"],
+                "status": attempt["status"],
+                "recorded_agent_id": attempt["agent_id"],
+                "branch": attempt["branch"],
+            }
+        )
+
+    for entry in entries:
+        matches = attempts_by_path.get(_path_key(entry["path"]), [])
+        if len(matches) == 1 and matches[0]["branch"] == entry["branch"]:
+            entry.update(
+                {
+                    "managed_by_acp": True,
+                    "mapping_status": "matched",
+                    "owner": "unknown",
+                    "recorded_agent_id": matches[0]["recorded_agent_id"],
+                    "attempts": matches,
+                }
+            )
+        else:
+            if not matches:
+                mapping_status = "unmatched"
+            elif len(matches) > 1:
+                mapping_status = "ambiguous"
+            else:
+                mapping_status = "branch_mismatch"
+            entry.update(
+                {
+                    "managed_by_acp": False,
+                    "mapping_status": mapping_status,
+                    "owner": "unknown",
+                    "recorded_agent_id": None,
+                    "attempts": matches,
+                }
+            )
+    entries.sort(key=lambda entry: _path_key(entry["path"]))
+    return {"status": "available", "error": None, "entries": entries}
+
+
 def _process_liveness(
     pid: int | None,
     expected_identity: str,
@@ -110,6 +232,13 @@ class StatusView:
             tasks = scheduler._task_records(connection)
             holders = scheduler._active_leases(connection, epoch)
             attempts = self._latest_attempts(connection)
+            attempts_for_inventory = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT id, task_id, status, agent_id, branch, worktree "
+                    "FROM attempts ORDER BY id"
+                ).fetchall()
+            ]
             submissions = self._latest_submissions(connection)
             runtimes = self._runtimes(connection)
             allocations = self._allocations(connection)
@@ -187,6 +316,7 @@ class StatusView:
             "counts": counts,
             "attention": attention if limit is None else attention[:limit],
             "tasks": shown,
+            "git_worktrees": _git_worktree_inventory(self.supervisor, attempts_for_inventory),
             "cleanup_failures": cleanup_failures,
             "truncated": len(shown) < len(entries),
         }
@@ -538,4 +668,37 @@ class StatusView:
                 )
             else:
                 lines.append(f"  filesystem capacity unavailable at {filesystem.get('path', '?')}")
+        worktrees = snapshot.get("git_worktrees")
+        if worktrees is not None:
+            lines += ["", "GIT WORKTREES"]
+            if worktrees.get("status") != "available":
+                lines.append(f"  inventory unavailable ({worktrees.get('error', 'unknown error')})")
+            else:
+                entries = worktrees.get("entries", [])
+                lines.append(
+                    f"  {len(entries)} registered; Git metadata only, owner may be unknown"
+                )
+                for entry in entries:
+                    branch = entry.get("branch") or (
+                        "detached"
+                        if entry.get("detached")
+                        else "bare"
+                        if entry.get("bare")
+                        else "-"
+                    )
+                    head = (entry.get("head") or "unknown")[:12]
+                    attempts = entry.get("attempts", [])
+                    if entry.get("mapping_status") == "matched" and len(attempts) == 1:
+                        attempt = attempts[0]
+                        recorded_agent = json.dumps(
+                            attempt.get("recorded_agent_id") or "unknown", ensure_ascii=True
+                        )
+                        association = (
+                            f"ACP attempt {attempt['attempt_id'][:8]} "
+                            f"{attempt['status']} recorded-agent={recorded_agent} owner=unknown"
+                        )
+                    else:
+                        association = f"owner=unknown ({entry.get('mapping_status', 'unknown')})"
+                    path = json.dumps(entry["path"], ensure_ascii=True)
+                    lines.append(f"  {path}  {branch}  HEAD {head}  {association}")
         return "\n".join(lines)

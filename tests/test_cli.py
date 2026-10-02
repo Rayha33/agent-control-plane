@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -393,6 +394,46 @@ def test_cli_plan_queue_and_status_are_read_only_previews(tmp_path: Path) -> Non
     assert text.returncode == 0
     assert "ATTENTION" in text.stdout
     assert "cli-worker" in text.stdout
+
+
+def test_cli_status_read_only_open_does_not_create_git_coordination_state(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    state_dir = repo / ".acp"
+    lock_path = state_dir / "git-operations.lock"
+    hooks_path = state_dir / "disabled-hooks"
+    database_path = state_dir / "control.db"
+    lock_path.unlink(missing_ok=True)
+    shutil.rmtree(hooks_path, ignore_errors=True)
+    assert not lock_path.exists()
+    assert not hooks_path.exists()
+
+    def git_output(*arguments: str) -> bytes:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *arguments], capture_output=True, check=True
+        )
+        return result.stdout
+
+    before_database = database_path.read_bytes()
+    before_index = (repo / ".git" / "index").read_bytes()
+    before_config = (repo / ".git" / "config").read_bytes()
+    before_refs = git_output("show-ref")
+    before_registrations = git_output("worktree", "list", "--porcelain")
+    before_repository_status = git_output("status", "--porcelain")
+
+    status = run_cli(repo, "status")
+
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["git_worktrees"]["status"] == "available"
+    assert not lock_path.exists()
+    assert not hooks_path.exists()
+    assert database_path.read_bytes() == before_database
+    assert (repo / ".git" / "index").read_bytes() == before_index
+    assert (repo / ".git" / "config").read_bytes() == before_config
+    assert git_output("show-ref") == before_refs
+    assert git_output("worktree", "list", "--porcelain") == before_registrations
+    assert git_output("status", "--porcelain") == before_repository_status
 
 
 def test_cli_status_watch_stops_after_requested_iterations(tmp_path: Path) -> None:

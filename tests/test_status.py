@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import time
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from support import (
     approve,
     commit_change,
+    git,
     init_repo,
     make_task,
     python_command,
@@ -52,6 +54,254 @@ def test_status_reports_phase_paths_and_runtime_for_a_working_attempt(repo: Path
     assert entry["checkpoint_age_seconds"] is None
     assert entry["checkpoint_stale_advisory"] is False
     assert entry["worker"]["status"] == "working"
+
+
+def test_status_inventories_git_worktrees_without_guessing_unmatched_owners(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="known attempt")
+    attempt = supervisor.claim(created["id"], "worker-alpha")
+    detached = repo.parent / "detached external\nworktree \x1b[31m"
+    attached = repo.parent / "attached external worktree"
+    git(repo, "worktree", "add", "--detach", str(detached), "HEAD")
+    git(repo, "worktree", "add", "-b", "inventory-branch", str(attached), "HEAD")
+    before_database = state_fingerprint(supervisor)
+    before_registrations = git(repo, "worktree", "list", "--porcelain")
+    before_repository_status = git(repo, "status", "--porcelain")
+    before_refs = git(repo, "show-ref")
+
+    snapshot = supervisor.status()
+
+    inventory = snapshot["git_worktrees"]
+    assert inventory["status"] == "available"
+    paths = [entry["path"] for entry in inventory["entries"]]
+    assert all(entry["owner"] == "unknown" for entry in inventory["entries"])
+    assert paths == sorted(
+        paths, key=lambda path: os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    )
+    by_path = {entry["path"]: entry for entry in inventory["entries"]}
+    primary = by_path[str(repo)]
+    assert primary["managed_by_acp"] is False
+    assert primary["owner"] == "unknown"
+    assert primary["mapping_status"] == "unmatched"
+    managed = by_path[attempt["worktree"]]
+    assert managed["managed_by_acp"] is True
+    assert managed["mapping_status"] == "matched"
+    assert managed["owner"] == "unknown"
+    assert managed["recorded_agent_id"] == "worker-alpha"
+    assert managed["attempts"] == [
+        {
+            "attempt_id": attempt["id"],
+            "task_id": created["id"],
+            "status": "working",
+            "recorded_agent_id": "worker-alpha",
+            "branch": attempt["branch"],
+        }
+    ]
+    assert len(managed["head"]) >= 40
+
+    detached_entry = by_path[str(detached)]
+    assert detached_entry["detached"] is True
+    assert detached_entry["branch"] is None
+    assert detached_entry["managed_by_acp"] is False
+    assert detached_entry["owner"] == "unknown"
+    assert detached_entry["mapping_status"] == "unmatched"
+
+    attached_entry = by_path[str(attached)]
+    assert attached_entry["branch"] == "inventory-branch"
+    assert attached_entry["detached"] is False
+    assert attached_entry["managed_by_acp"] is False
+    assert attached_entry["owner"] == "unknown"
+    rendered = supervisor.render_status(snapshot)
+    assert "owner=unknown" in rendered
+    assert all(json.dumps(path, ensure_ascii=True) in rendered for path in paths)
+    assert "\x1b" not in rendered
+    assert "\\u001b[31m" in rendered
+
+    assert state_fingerprint(supervisor) == before_database
+    assert git(repo, "worktree", "list", "--porcelain") == before_registrations
+    assert git(repo, "status", "--porcelain") == before_repository_status
+    assert git(repo, "show-ref") == before_refs
+
+
+def test_status_does_not_attribute_path_when_attempt_branch_mismatches(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker-alpha")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET branch = ? WHERE id = ?",
+            ("stale-recorded-branch", attempt["id"]),
+        )
+
+    entry = next(
+        entry
+        for entry in supervisor.status()["git_worktrees"]["entries"]
+        if entry["path"] == attempt["worktree"]
+    )
+
+    assert entry["managed_by_acp"] is False
+    assert entry["mapping_status"] == "branch_mismatch"
+    assert entry["owner"] == "unknown"
+    assert entry["attempts"][0]["attempt_id"] == attempt["id"]
+
+
+def test_status_does_not_resolve_relative_persisted_attempt_path(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker-alpha")
+    relative_path = Path(attempt["worktree"]).relative_to(repo.parent)
+    monkeypatch.chdir(repo.parent)
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET worktree = ? WHERE id = ?",
+            (str(relative_path), attempt["id"]),
+        )
+
+    entry = next(
+        entry
+        for entry in supervisor.status()["git_worktrees"]["entries"]
+        if entry["path"] == attempt["worktree"]
+    )
+
+    assert entry["managed_by_acp"] is False
+    assert entry["mapping_status"] == "unmatched"
+    assert entry["owner"] == "unknown"
+    assert entry["attempts"] == []
+
+
+def test_status_marks_malformed_git_worktree_listing_unavailable(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+
+    def malformed_listing(*arguments: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=arguments,
+            returncode=0,
+            stdout=b"not a valid worktree record\0",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", malformed_listing)
+
+    snapshot = supervisor.status()
+
+    assert snapshot["git_worktrees"] == {
+        "status": "unavailable",
+        "error": "git_worktree_list_unavailable",
+        "entries": [],
+    }
+    assert "inventory unavailable (git_worktree_list_unavailable)" in supervisor.render_status(
+        snapshot
+    )
+
+
+def test_status_rejects_unrecognized_git_object_id_width(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    listing = (
+        b"\0".join(
+            [
+                b"worktree " + str(repo).encode(),
+                b"HEAD " + b"a" * 42,
+                b"branch refs/heads/main",
+                b"",
+            ]
+        )
+        + b"\0"
+    )
+
+    def malformed_listing(*arguments: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=arguments, returncode=0, stdout=listing, stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", malformed_listing)
+
+    inventory = supervisor.status()["git_worktrees"]
+
+    assert inventory == {
+        "status": "unavailable",
+        "error": "git_worktree_list_unavailable",
+        "entries": [],
+    }
+
+
+@pytest.mark.parametrize("duplicate_field", ["worktree", "HEAD", "branch", "detached"])
+def test_status_rejects_duplicate_git_identity_fields(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, duplicate_field: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker-alpha")
+    branch = f"branch refs/heads/{attempt['branch']}".encode()
+    head = b"a" * 40
+    fields = [f"worktree {attempt['worktree']}".encode(), b"HEAD " + head, branch]
+    if duplicate_field == "worktree":
+        fields[0:1] = [b"worktree /foreign/worktree", fields[0]]
+    elif duplicate_field == "HEAD":
+        fields[2:2] = [b"HEAD " + head]
+    elif duplicate_field == "branch":
+        fields[2:2] = [branch]
+    else:
+        fields.extend([b"detached", b"detached"])
+    listing = b"\0".join(fields) + b"\0\0"
+
+    def duplicate_listing(*arguments: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=arguments, returncode=0, stdout=listing, stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", duplicate_listing)
+
+    inventory = supervisor.status()["git_worktrees"]
+
+    assert inventory == {
+        "status": "unavailable",
+        "error": "git_worktree_list_unavailable",
+        "entries": [],
+    }
+
+
+def test_status_reports_git_listing_failure_as_unavailable(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+
+    def failed_listing(*arguments: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=arguments, returncode=128, stdout=b"", stderr=b"simulated Git failure"
+        )
+
+    monkeypatch.setattr(subprocess, "run", failed_listing)
+
+    inventory = supervisor.status()["git_worktrees"]
+
+    assert inventory == {"status": "unavailable", "error": "git_error", "entries": []}
+
+
+def test_status_rejects_duplicate_git_worktree_paths(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    record = b"\0".join(
+        [b"worktree " + str(repo).encode(), b"HEAD " + b"a" * 40, b"branch refs/heads/main"]
+    )
+    listing = record + b"\0\0" + record + b"\0\0"
+
+    def duplicate_listing(*arguments: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=arguments, returncode=0, stdout=listing, stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", duplicate_listing)
+
+    inventory = supervisor.status()["git_worktrees"]
+
+    assert inventory == {
+        "status": "unavailable",
+        "error": "git_worktree_list_unavailable",
+        "entries": [],
+    }
 
 
 def test_first_explicit_empty_checkpoint_establishes_age(repo: Path) -> None:
