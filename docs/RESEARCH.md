@@ -156,8 +156,10 @@ workers after sequential checkout provisioning, but did not pin independent OS p
 claiming and creating worktrees at the same time. Regression tests now verify the lock
 is shared across processes and race three disjoint claims through the real provisioning
 path; they assert unique registered worktrees and branches, intact base checkout, and no
-leftover `.git/config.lock`. This verifies ACP's own coordination path, not vendor
-worktree isolation, and it does not make arbitrary tools or shell writes sandboxed.
+leftover `.git/config.lock`. A separate injected post-creation failure verifies partial
+worktree cleanup and claim rollback. This verifies ACP's own coordination path, not
+vendor worktree isolation, and it does not make arbitrary tools or shell writes
+sandboxed.
 
 The product response is not to special-case those tools. It is to make the
 candidate commit, ownership token, checkout, and review evidence explicit and

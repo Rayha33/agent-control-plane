@@ -377,21 +377,26 @@ def test_concurrent_process_claims_get_independent_registered_worktrees(repo: Pa
     assert not (repo / ".git" / "config.lock").exists()
 
 
-def test_worktree_provisioning_failure_rolls_back_the_claim(repo: Path, monkeypatch) -> None:
+def test_worktree_add_failure_after_creation_rolls_back_partial_claim(
+    repo: Path, monkeypatch
+) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "injected provisioning failure")
     original_git = supervisor._git
 
     def fail_worktree_add(*arguments, **options):
         if arguments[:2] == ("worktree", "add"):
-            raise SupervisorError("git_error", "injected config.lock collision")
+            original_git(*arguments, **options)
+            raise SupervisorError("git_error", "injected post-creation provisioning failure")
         return original_git(*arguments, **options)
 
     monkeypatch.setattr(supervisor, "_git", fail_worktree_add)
-    with pytest.raises(SupervisorError, match="injected config.lock collision"):
+    with pytest.raises(SupervisorError, match="injected post-creation provisioning failure"):
         supervisor.claim(created["id"], "agent-provisioning-failure")
 
-    assert supervisor.task(created["id"])["status"] == "open"
+    rolled_back_task = supervisor.task(created["id"])
+    assert rolled_back_task["status"] == "open"
+    assert rolled_back_task["current_attempt_id"] is None
     with supervisor.connect() as connection:
         attempt = connection.execute(
             "SELECT id, branch, worktree, status FROM attempts WHERE task_id = ?",
