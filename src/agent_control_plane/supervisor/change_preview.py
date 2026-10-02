@@ -108,18 +108,48 @@ try:
         fail_closed()
     if os.getuid() == 0 or os.geteuid() == 0:
         fail_closed()
+    executable_metadata = os.stat(executable, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(executable_metadata.st_mode)
+        or executable_metadata.st_uid != 0
+        or executable_metadata.st_mode
+        & (stat.S_ISUID | stat.S_ISGID | stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        fail_closed()
     resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
     if resource.getrlimit(resource.RLIMIT_NPROC) != (0, 0):
         fail_closed()
     if sys.platform.startswith("linux"):
+        capability_fields = {"CapEff", "CapPrm", "CapInh", "CapAmb"}
+        capability_values = {}
         with open("/proc/self/status", "r", encoding="ascii") as status_file:
-            capability_line = next(
-                (line for line in status_file if line.startswith("CapEff:")), ""
-            )
-        if not capability_line:
+            for line in status_file:
+                field, separator, value = line.partition(":")
+                if field in capability_fields:
+                    if not separator or field in capability_values:
+                        fail_closed()
+                    capability_values[field] = int(value, 16)
+        if set(capability_values) != capability_fields:
             fail_closed()
-        effective_capabilities = int(capability_line.split()[1], 16)
-        if effective_capabilities & ((1 << 21) | (1 << 24)):
+        nproc_exemption_capabilities = (1 << 21) | (1 << 24)
+        if any(
+            value & nproc_exemption_capabilities
+            for value in capability_values.values()
+        ):
+            fail_closed()
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = (
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        )
+        prctl.restype = ctypes.c_int
+        if prctl(38, 1, 0, 0, 0) != 0 or prctl(39, 0, 0, 0, 0) != 1:
             fail_closed()
     try:
         process_probe = os.fork()
@@ -135,7 +165,7 @@ try:
         fail_closed()
     os.fchdir(worktree_fd)
     os.execve(executable, [executable, *sys.argv[8:]], os.environ)
-except (OSError, ValueError, IndexError):
+except (OSError, ValueError, IndexError, ImportError, AttributeError, TypeError):
     fail_closed()
 """
 

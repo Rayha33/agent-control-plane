@@ -732,19 +732,39 @@ def test_preview_blocks_filter_spawn_after_final_scratch_check(
     assert not marker.exists(), "post-check filter escaped the child-process ceiling"
 
 
-def test_preview_fails_closed_when_linux_capability_bypasses_process_limit(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("capability_field", "synthetic_linux_capability"),
+    [("CapEff", 1 << 21), ("CapAmb", 1 << 24)],
+    ids=["effective-cap-sys-admin", "ambient-cap-sys-resource"],
+)
+def test_preview_fails_closed_when_linux_capability_can_bypass_process_limit(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capability_field: str,
+    synthetic_linux_capability: int,
 ) -> None:
     _supervisor, attempt = make_attempt(repo)
     original_launcher = change_preview_module._EXEC_GIT_FROM_DIR_FD
-    synthetic_linux_capability = 1 << 21  # CAP_SYS_ADMIN
+    capability_values = {
+        "CapEff": 0,
+        "CapPrm": 0,
+        "CapInh": 0,
+        "CapAmb": 0,
+    }
+    capability_values[capability_field] = synthetic_linux_capability
+    if capability_field == "CapAmb":
+        capability_values["CapPrm"] = synthetic_linux_capability
+        capability_values["CapInh"] = synthetic_linux_capability
+    capability_status = "\n".join(
+        f"{field}:\t{value:016x}" for field, value in capability_values.items()
+    )
     capability_setup = f"""\
 import io
 sys.platform = "linux"
 _trusted_open = open
 def open(path, *args, **kwargs):
     if path == "/proc/self/status":
-        return io.StringIO("CapEff:\\t{synthetic_linux_capability:016x}\\n")
+        return io.StringIO({capability_status!r})
     return _trusted_open(path, *args, **kwargs)
 """
     try_line = "try:\n    worktree_fd = int(sys.argv[1])"
@@ -753,6 +773,73 @@ def open(path, *args, **kwargs):
         change_preview_module,
         "_EXEC_GIT_FROM_DIR_FD",
         original_launcher.replace(try_line, capability_setup + try_line, 1),
+    )
+
+    with pytest.raises(SupervisorError, match="isolated Git metadata changed or became unsafe"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+
+def test_preview_fails_closed_when_linux_no_new_privileges_cannot_be_verified(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    original_launcher = change_preview_module._EXEC_GIT_FROM_DIR_FD
+    capability_status = "\n".join(
+        f"{field}:\t{0:016x}" for field in ("CapEff", "CapPrm", "CapInh", "CapAmb")
+    )
+    capability_setup = f"""\
+import ctypes
+import io
+sys.platform = "linux"
+_trusted_open = open
+def open(path, *args, **kwargs):
+    if path == "/proc/self/status":
+        return io.StringIO({capability_status!r})
+    return _trusted_open(path, *args, **kwargs)
+class _PrctlDenied:
+    def __init__(self):
+        self.prctl = lambda *args: -1
+ctypes.CDLL = lambda *args, **kwargs: _PrctlDenied()
+"""
+    try_line = "try:\n    worktree_fd = int(sys.argv[1])"
+    assert original_launcher.count(try_line) == 1
+    monkeypatch.setattr(
+        change_preview_module,
+        "_EXEC_GIT_FROM_DIR_FD",
+        original_launcher.replace(try_line, capability_setup + try_line, 1),
+    )
+
+    with pytest.raises(SupervisorError, match="isolated Git metadata changed or became unsafe"):
+        GitSupervisor(repo, read_only=True).change_preview(attempt["id"])
+
+
+@pytest.mark.parametrize(
+    "privilege_bit",
+    [1 << 11, 1 << 10],
+    ids=["setuid", "setgid"],
+)
+def test_preview_fails_closed_for_privileged_git_mode_bits(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    privilege_bit: int,
+) -> None:
+    _supervisor, attempt = make_attempt(repo)
+    original_launcher = change_preview_module._EXEC_GIT_FROM_DIR_FD
+    stat_setup = f"""\
+_trusted_os_stat = os.stat
+def _with_privileged_git_mode(path, *args, **kwargs):
+    metadata = _trusted_os_stat(path, *args, **kwargs)
+    if path == executable:
+        return os.stat_result((metadata.st_mode | {privilege_bit}, *metadata[1:]))
+    return metadata
+os.stat = _with_privileged_git_mode
+"""
+    try_line = "try:\n    worktree_fd = int(sys.argv[1])"
+    assert original_launcher.count(try_line) == 1
+    monkeypatch.setattr(
+        change_preview_module,
+        "_EXEC_GIT_FROM_DIR_FD",
+        original_launcher.replace(try_line, stat_setup + try_line, 1),
     )
 
     with pytest.raises(SupervisorError, match="isolated Git metadata changed or became unsafe"):
