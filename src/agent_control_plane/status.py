@@ -509,6 +509,11 @@ class StatusView:
                 f"reclaimable worktrees {disk['reclaimable_worktrees']} "
                 f"({_format_bytes(disk['reclaimable_bytes'])})"
             )
+            min_free_bytes = disk.get("admission_min_free_bytes")
+            if min_free_bytes is not None:
+                lines.append(
+                    f"  minimum available space before new worktree: {_format_bytes(min_free_bytes)}"
+                )
             worktrees = disk.get("attempt_worktrees", {})
             for managed in worktrees.get("managed_roots", []):
                 lines.append(

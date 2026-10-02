@@ -13,6 +13,7 @@ import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, Event
+from types import SimpleNamespace
 
 import pytest
 from support import python_command, requires_linux_worker
@@ -24,6 +25,7 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
 )
 from agent_control_plane.supervisor import claims as claims_module
+from agent_control_plane.supervisor import process as process_module
 from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
 
 
@@ -48,6 +50,7 @@ def write_config(
     runtime_teardown_commands: list[str] | None = None,
     runtime_ports: dict[str, tuple[int, int]] | None = None,
     attempts_root: Path | str | None = None,
+    min_free_bytes: int | bool | str | None = None,
 ) -> None:
     qc = qc_commands if qc_commands is not None else [python_command("pass")]
     integration = integration_commands if integration_commands is not None else qc
@@ -63,6 +66,17 @@ def write_config(
         f"{name} = [{bounds[0]}, {bounds[1]}]\n"
         for name, bounds in sorted((runtime_ports or {}).items())
     )
+    worktree_lines = []
+    if attempts_root is not None:
+        worktree_lines.append(f"attempts_root = {json.dumps(str(attempts_root))}\n")
+    if min_free_bytes is not None:
+        if isinstance(min_free_bytes, bool):
+            serialized_min_free = str(min_free_bytes).lower()
+        elif isinstance(min_free_bytes, str):
+            serialized_min_free = json.dumps(min_free_bytes)
+        else:
+            serialized_min_free = str(min_free_bytes)
+        worktree_lines.append(f"min_free_bytes = {serialized_min_free}\n")
     (repo / "acp.toml").write_text(
         "[supervisor]\n"
         "lease_seconds = 60\n"
@@ -78,12 +92,7 @@ def write_config(
         f"setup_commands = {content['runtime_setup']}\n"
         f"teardown_commands = {content['runtime_teardown']}\n\n"
         "[runtime.ports]\n"
-        f"{port_lines}"
-        + (
-            f"\n[worktrees]\nattempts_root = {json.dumps(str(attempts_root))}\n"
-            if attempts_root is not None
-            else ""
-        ),
+        f"{port_lines}" + (f"\n[worktrees]\n{''.join(worktree_lines)}" if worktree_lines else ""),
         encoding="utf-8",
     )
 
@@ -145,6 +154,229 @@ def test_external_attempt_worktree_root_rejects_linked_worktree_git_common_dir(
 
     assert error.value.code == "invalid_config"
     assert not (common_dir / "worktrees" / "attempts").exists()
+
+
+@pytest.mark.parametrize("min_free_bytes", [True, 0, -1, "1024"])
+def test_worktree_min_free_bytes_requires_a_positive_integer(
+    repo: Path, min_free_bytes: int | bool | str
+) -> None:
+    write_config(repo, min_free_bytes=min_free_bytes)
+
+    with pytest.raises(SupervisorError, match="worktrees.min_free_bytes") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
+
+
+def test_worktree_min_free_bytes_is_opt_in(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    supervisor = GitSupervisor(repo)
+    assert supervisor.config.min_free_bytes is None
+    created = task(supervisor, "alpha.txt")
+
+    def unexpected_probe(_path: Path) -> object:
+        raise AssertionError("unset disk floor must not probe capacity")
+
+    monkeypatch.setattr(process_module.os, "statvfs", unexpected_probe)
+
+    attempt = supervisor.claim(created["id"], "worker")
+
+    assert attempt["status"] == "working"
+
+
+def test_disk_headroom_boundary_deduplicates_same_filesystem_and_holds_git_lock(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    minimum = 1024
+    write_config(repo, min_free_bytes=minimum)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    usage_paths: list[Path] = []
+    lock_path = supervisor.state_dir / "git-operations.lock"
+    lock_probe = (
+        "import fcntl, os, sys; "
+        "fd=os.open(sys.argv[1], os.O_RDWR); "
+        "\ntry: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        "\nexcept BlockingIOError: print('locked')"
+        "\nelse: print('unlocked')"
+    )
+
+    def statvfs(path: Path) -> SimpleNamespace:
+        usage_paths.append(Path(path))
+        probe = subprocess.run(
+            [sys.executable, "-c", lock_probe, str(lock_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert probe.stdout.strip() == "locked"
+        return SimpleNamespace(f_bavail=minimum, f_frsize=1)
+
+    monkeypatch.setattr(process_module.os, "statvfs", statvfs)
+
+    attempt = supervisor.claim(created["id"], "worker")
+
+    assert attempt["status"] == "working"
+    assert len(usage_paths) == 1
+    assert usage_paths[0] == supervisor._attempt_worktree_root
+
+
+def test_disk_headroom_preserves_trailing_spaces_in_git_common_directory(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo, min_free_bytes=1)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    root = supervisor._attempt_worktree_root
+    common_dir_with_space = Path(f"{repo / '.git'} ")
+    common_dir_with_space.mkdir()
+    original_stat = Path.stat
+    usage_paths: list[Path] = []
+    original_run_git = supervisor._run_git_while_locked
+
+    def fake_run_git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        if arguments[:2] == ("rev-parse", "--path-format=absolute"):
+            return subprocess.CompletedProcess(
+                args=list(arguments),
+                returncode=0,
+                stdout=f"{common_dir_with_space}\n".encode(),
+                stderr=b"",
+            )
+        return original_run_git(*arguments)
+
+    def fake_stat(path: Path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        selected_device = (
+            101 if Path(path) == root else 202 if Path(path) == common_dir_with_space else None
+        )
+        if selected_device is None:
+            return result
+        values = list(result)
+        values[2] = selected_device
+        return os.stat_result(values)
+
+    def statvfs(path: Path) -> SimpleNamespace:
+        usage_paths.append(Path(path))
+        return SimpleNamespace(f_bavail=1, f_frsize=1)
+
+    monkeypatch.setattr(supervisor, "_run_git_while_locked", fake_run_git)
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(process_module.os, "statvfs", statvfs)
+
+    attempt = supervisor.claim(created["id"], "worker")
+
+    assert attempt["status"] == "working"
+    assert usage_paths == [root, common_dir_with_space]
+
+
+def test_disk_headroom_checks_distinct_git_filesystem_and_rolls_back_low_space(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    minimum = 1024
+    write_config(repo, min_free_bytes=minimum)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    root = supervisor._attempt_worktree_root
+    common_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    original_stat = Path.stat
+    usage_paths: list[Path] = []
+
+    def fake_stat(path: Path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        selected_device = 101 if Path(path) == root else 202 if Path(path) == common_dir else None
+        if selected_device is None:
+            return result
+        values = list(result)
+        values[2] = selected_device
+        return os.stat_result(values)
+
+    def statvfs(path: Path) -> SimpleNamespace:
+        path = Path(path)
+        usage_paths.append(path)
+        free = minimum if path == root else minimum - 1
+        return SimpleNamespace(f_bavail=free, f_frsize=1)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(process_module.os, "statvfs", statvfs)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker-low-space")
+
+    assert error.value.code == "insufficient_disk_headroom"
+    assert "Git common directory" in str(error.value)
+    assert usage_paths == [root, common_dir]
+    assert supervisor.task(created["id"])["status"] == "open"
+    assert supervisor.task(created["id"])["current_attempt_id"] is None
+    with supervisor.connect() as connection:
+        attempt = connection.execute(
+            "SELECT branch, worktree, status FROM attempts WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+        lease = connection.execute(
+            "SELECT task_id, attempt_id, lease_expires_at FROM resource_leases WHERE resource = ?",
+            ("alpha.txt",),
+        ).fetchone()
+    assert attempt["status"] == "failed"
+    assert not Path(attempt["worktree"]).exists()
+    assert git(repo, "branch", "--list", attempt["branch"]) == ""
+    assert lease["task_id"] is None
+    assert lease["attempt_id"] is None
+    assert lease["lease_expires_at"] == 0
+
+
+def test_disk_headroom_probe_failure_fails_closed(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo, min_free_bytes=1)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+
+    def unavailable(_path: Path) -> SimpleNamespace:
+        raise OSError("injected filesystem capacity failure")
+
+    monkeypatch.setattr(process_module.os, "statvfs", unavailable)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker-unavailable-space")
+
+    assert error.value.code == "disk_headroom_unavailable"
+    assert supervisor.task(created["id"])["status"] == "open"
+    with supervisor.connect() as connection:
+        attempt = connection.execute(
+            "SELECT branch, worktree FROM attempts WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert not Path(attempt["worktree"]).exists()
+    assert git(repo, "branch", "--list", attempt["branch"]) == ""
+
+
+def test_disk_headroom_git_directory_probe_failure_fails_closed(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo, min_free_bytes=1)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    original = supervisor._run_git_while_locked
+
+    def unavailable(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        if arguments[:2] == ("rev-parse", "--path-format=absolute"):
+            raise OSError("injected Git common-directory probe failure")
+        return original(*arguments)
+
+    monkeypatch.setattr(supervisor, "_run_git_while_locked", unavailable)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker-git-probe-failure")
+
+    assert error.value.code == "disk_headroom_unavailable"
+    assert supervisor.task(created["id"])["status"] == "open"
+    with supervisor.connect() as connection:
+        attempt = connection.execute(
+            "SELECT branch, worktree, status FROM attempts WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+    assert attempt["status"] == "failed"
+    assert not Path(attempt["worktree"]).exists()
+    assert git(repo, "branch", "--list", attempt["branch"]) == ""
 
 
 def test_attempt_worktree_collision_is_rejected_without_removing_existing_data(

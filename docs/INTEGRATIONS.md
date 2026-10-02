@@ -21,6 +21,7 @@ To use a sibling or external volume, configure an absolute root in the repositor
 ```toml
 [worktrees]
 attempts_root = "/srv/agent-worktrees/my-repository"
+min_free_bytes = 5_000_000_000
 ```
 
 ACP canonicalizes this path and rejects filesystem roots and any root that overlaps
@@ -31,6 +32,16 @@ both its absolute worktree path and the root used at claim time. Workers, runtim
 setup, submission, recovery and GC continue to use that attempt's stored path after
 `acp.toml` changes; legacy attempts without a stored root stay on the original
 `.acp/worktrees` path.
+
+`min_free_bytes` is optional and defaults to unset. When configured, each new
+worktree claim requires at least that many free bytes on both the selected
+worktree-root filesystem and the Git common-directory filesystem, measured as
+bytes available to the ACP process. When both
+paths share one filesystem it is measured once. An unavailable probe or low
+value refuses provisioning; `acp status` shows the configured floor. This is a
+pre-provision check, not an ongoing disk quota: workers can still consume space
+after launch, unregistered agent temp copies are outside ACP's inventory, and
+ACP does not delete files to make the check pass.
 
 GC only removes an existing path when it is the exact attempt-ID child of its stored
 managed root and Git still registers it on the attempt's branch. If that proof is

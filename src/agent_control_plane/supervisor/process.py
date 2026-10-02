@@ -406,6 +406,57 @@ class ProcessMixin:
             check=False,
         )
 
+    def _assert_attempt_worktree_headroom(self, worktree_root: Path) -> None:
+        """Enforce the optional disk floor while the caller holds the Git lock."""
+
+        minimum = self.config.min_free_bytes
+        if minimum is None:
+            return
+        try:
+            common = self._run_git_while_locked(
+                "rev-parse", "--path-format=absolute", "--git-common-dir"
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise SupervisorError(
+                "disk_headroom_unavailable",
+                "cannot resolve the Git common directory for the disk-headroom check",
+            ) from error
+        if common.returncode:
+            raise SupervisorError(
+                "disk_headroom_unavailable",
+                "cannot resolve the Git common directory for the disk-headroom check",
+            )
+        common_path = common.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
+        if not common_path or not Path(common_path).is_absolute():
+            raise SupervisorError(
+                "disk_headroom_unavailable",
+                "cannot resolve the Git common directory for the disk-headroom check",
+            )
+
+        seen_devices: set[int] = set()
+        for label, path in (
+            ("attempt worktree root", worktree_root),
+            ("Git common directory", Path(common_path)),
+        ):
+            try:
+                device = path.stat().st_dev
+                if device in seen_devices:
+                    continue
+                filesystem = os.statvfs(path)
+                available_bytes = filesystem.f_bavail * filesystem.f_frsize
+            except OSError as error:
+                raise SupervisorError(
+                    "disk_headroom_unavailable",
+                    f"cannot measure available space on the {label} filesystem",
+                ) from error
+            seen_devices.add(device)
+            if available_bytes < minimum:
+                raise SupervisorError(
+                    "insufficient_disk_headroom",
+                    f"{label} filesystem has {available_bytes} available bytes; "
+                    f"requires at least {minimum}",
+                )
+
     def _registered_worktrees(self) -> dict[str, str | None]:
         """Return Git-registered worktree paths and their checked-out branch names."""
 
@@ -610,7 +661,12 @@ class ProcessMixin:
             )
         return result.stdout
 
-    def _git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    def _git(
+        self,
+        *arguments: str,
+        check: bool = True,
+        _before: Any | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
         git = str(self._system_git_executable(self.root))
         argv = [
             *self._supervisor_git_prefix(git, self._disabled_git_hooks_dir()),
@@ -619,6 +675,8 @@ class ProcessMixin:
             *arguments,
         ]
         with self._git_operation_guard():
+            if _before is not None:
+                _before()
             result = subprocess.run(
                 argv,
                 env=self._supervisor_git_env(),
