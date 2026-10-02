@@ -67,18 +67,27 @@ src/auth/token.py
 config/*.toml
 config/runtime.toml
 
-logical:deployment/production
+logical:deployment
 logical:deployment/production
 ~~~
 
-Logical resources collide only by exact normalized name. They model non-file
-side effects, but downstream gateways must enforce their fencing tokens.
+Logical resources are case-folded slash-separated namespaces: an ancestor
+collides with its descendants at component boundaries, while sibling resources
+remain independent. For example, `logical:deployment/production` and
+`logical:deployment/staging` do not collide with each other, but either collides
+with `logical:deployment`. A declared logical scope is a coordination key, not
+automatic semantic analysis; users still need to declare shared types,
+migrations, and other coupled subsystems. These resources model non-file side
+effects, but downstream gateways must enforce their fencing tokens.
 
 Enforcement is fail-closed at claim time, but an operator should not have to
 launch an agent to discover a collision. `acp plan` and `acp queue` answer the
 same question in advance, classifying each collision as `exact` (identical
-normalized scopes) or `potential` (different scopes that can still match one
-path), and naming the owning task, attempt, and agent.
+normalized scopes) or `potential` (different scopes that can still overlap,
+through filesystem path matching or logical namespace ancestry), and naming the
+owning task, attempt, and agent. The `logical:` prefix is reserved
+case-insensitively; new filesystem resources cannot use a case variant such as
+`Logical:auth`.
 
 ### 1b. Planning is a preview, never a mutation
 

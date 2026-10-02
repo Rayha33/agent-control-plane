@@ -6,9 +6,11 @@ able to ask "what would happen" without changing what will happen. The read-only
 property is asserted by tests rather than assumed.
 
 Two scopes overlap `exact`ly when their normalized forms are identical, and
-`potential`ly when they are different strings that can still match one path
-(`src/**` against `src/module.py`). Both block a claim; the distinction tells an
-operator whether the task list needs re-partitioning or merely re-ordering.
+`potential`ly when different declarations may still overlap: filesystem globs
+can match a path (`src/**` against `src/module.py`) and logical scopes can be
+ancestors or descendants (`logical:auth` and `logical:auth/session`). Both block
+a claim; the distinction tells an operator whether the task list needs
+re-partitioning or merely re-ordering.
 """
 
 from __future__ import annotations
@@ -97,6 +99,7 @@ class Scheduler:
         rows = connection.execute(
             """
             SELECT lease.resource, lease.task_id, lease.attempt_id, lease.lease_expires_at,
+                   task.resources_json, task.declared_resources_json,
                    task.title AS task_title, attempt.agent_id AS agent_id
             FROM resource_leases AS lease
             LEFT JOIN tasks AS task ON task.id = lease.task_id
@@ -211,6 +214,7 @@ class Scheduler:
         resources: list[str],
         holders: list[dict[str, Any]],
         task_id: str,
+        declared_by_key: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         overlap_of = self.supervisor.resources_overlap
         blockers: list[dict[str, Any]] = []
@@ -218,7 +222,21 @@ class Scheduler:
             for holder in holders:
                 if holder["task_id"] == task_id:
                     continue
-                if not overlap_of(resource, holder["resource"]):
+                holder_declared = holder.get("declared_resource")
+                if holder_declared is None and holder.get("resources_json"):
+                    holder_declared = dict(
+                        zip(
+                            json.loads(holder["resources_json"]),
+                            declared_resources(holder),
+                            strict=False,
+                        )
+                    ).get(holder["resource"])
+                if not overlap_of(
+                    resource,
+                    holder["resource"],
+                    left_declared=(declared_by_key or {}).get(resource),
+                    right_declared=holder_declared,
+                ):
                     continue
                 blockers.append(
                     {
@@ -263,7 +281,12 @@ class Scheduler:
                 task, by_id, self._producers(tasks), self._dependency_edges(tasks)
             )
         )
-        blockers.extend(self._conflict_blockers(task["resources"], holders, task_id))
+        declared_by_key = dict(zip(task["resources"], task["declared_resources"], strict=False))
+        blockers.extend(
+            self._conflict_blockers(
+                task["resources"], holders, task_id, declared_by_key=declared_by_key
+            )
+        )
         return {
             "task_id": task["id"],
             "title": task["title"],
@@ -309,10 +332,14 @@ class Scheduler:
             if preview["ready"]:
                 preview["position"] = len(ready) + 1
                 ready.append(preview)
+                declared_by_key = dict(
+                    zip(task["resources"], task["declared_resources"], strict=False)
+                )
                 for resource in task["resources"]:
                     reserved.append(
                         {
                             "resource": resource,
+                            "declared_resource": declared_by_key.get(resource),
                             "task_id": task["id"],
                             "task_title": task["title"],
                             "attempt_id": None,
