@@ -5,6 +5,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -404,6 +406,298 @@ def test_cli_status_watch_stops_after_requested_iterations(tmp_path: Path) -> No
 
     assert watched.returncode == 0, watched.stderr
     assert watched.stdout.count("ATTENTION") == 2
+
+
+@pytest.mark.parametrize(
+    ("until_status", "next_status", "expected_result"),
+    [(None, "working", "changed"), ("done", "done", "status_reached")],
+)
+def test_cli_wait_observes_a_second_connection_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    until_status: str | None,
+    next_status: str,
+    expected_result: str,
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "transition while waiting", "owned.txt")
+    supervisor = cli.GitSupervisor(repo, read_only=True)
+    original_task = supervisor.task
+    baseline_read = threading.Event()
+    writer_errors: list[BaseException] = []
+
+    def observe_baseline(task_id: str) -> dict:
+        snapshot = original_task(task_id)
+        baseline_read.set()
+        return snapshot
+
+    def update_from_second_connection() -> None:
+        try:
+            if not baseline_read.wait(timeout=3):
+                raise AssertionError("waiter did not take its initial snapshot")
+            with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+                connection.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (next_status, "2026-10-02T00:00:00Z", task["id"]),
+                )
+        except BaseException as error:  # propagate background-thread assertion failures
+            writer_errors.append(error)
+
+    monkeypatch.setattr(supervisor, "task", observe_baseline)
+    writer = threading.Thread(target=update_from_second_connection, daemon=True)
+    writer.start()
+    result = cli._wait_for_task(
+        supervisor,
+        SimpleNamespace(
+            task_id=task["id"],
+            until_status=until_status,
+            timeout_seconds=2.0,
+            interval_seconds=0.05,
+        ),
+    )
+    writer.join(timeout=3)
+
+    assert not writer.is_alive()
+    assert not writer_errors
+    assert result["wait_result"] == expected_result
+    assert result["initial_status"] == "open"
+    assert result["current_status"] == next_status
+    assert result["task"]["id"] == task["id"]
+
+
+def test_cli_wait_returns_immediately_for_matching_status_and_reports_unknown_task(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "already open", "owned.txt")
+
+    immediate = run_cli(repo, "wait", task["id"], "--until-status", "open")
+
+    assert immediate.returncode == 0, immediate.stderr
+    assert json.loads(immediate.stdout)["wait_result"] == "status_reached"
+    assert immediate.stdout.count('"wait_result"') == 1
+
+    missing = run_cli(repo, "wait", "not-a-task", "--timeout-seconds", "0.1")
+
+    assert missing.returncode == 1
+    assert json.loads(missing.stderr)["error"] == "task_not_found"
+    assert not missing.stdout
+
+
+def test_cli_wait_timeout_does_not_reap_expired_attempt_but_explicit_reap_does(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "expired but observable", "owned.txt")
+    claimed = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
+    assert claimed.returncode == 0, claimed.stderr
+    attempt_id = json.loads(claimed.stdout)["id"]
+    database = repo / ".acp" / "control.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE attempts SET lease_expires_at = 1 WHERE id = ?", (attempt_id,))
+
+    def state() -> tuple:
+        with sqlite3.connect(database) as connection:
+            return (
+                connection.execute(
+                    "SELECT status, current_attempt_id FROM tasks WHERE id = ?", (task["id"],)
+                ).fetchone(),
+                connection.execute(
+                    "SELECT status, lease_expires_at FROM attempts WHERE id = ?", (attempt_id,)
+                ).fetchone(),
+                connection.execute(
+                    "SELECT COUNT(*) FROM resource_leases WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone(),
+                connection.execute("SELECT COUNT(*) FROM events").fetchone(),
+            )
+
+    before = state()
+    waited = run_cli(
+        repo,
+        "wait",
+        task["id"],
+        "--timeout-seconds",
+        "0.1",
+        "--interval-seconds",
+        "0.1",
+    )
+    assert waited.returncode == 0, waited.stderr
+    assert json.loads(waited.stdout)["wait_result"] == "timeout"
+    assert state() == before
+
+    reaped = run_cli(repo, "reap")
+    assert reaped.returncode == 0, reaped.stderr
+    assert task["id"] in json.loads(reaped.stdout)["orphaned"]
+    assert state() != before
+
+
+@pytest.mark.parametrize("late_phase", ["sleep", "read"])
+def test_cli_wait_does_not_accept_a_transition_after_its_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late_phase: str
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "transition after deadline", "owned.txt")
+    supervisor = cli.GitSupervisor(repo, read_only=True)
+    read_task = supervisor.task
+    clock = 0.0
+    task_reads = 0
+
+    def fake_monotonic() -> float:
+        return clock
+
+    def set_status_after_deadline() -> None:
+        with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+            connection.execute(
+                "UPDATE tasks SET status = 'working', updated_at = ? WHERE id = ?",
+                ("2026-10-02T00:00:00Z", task["id"]),
+            )
+
+    def wait(seconds: float) -> None:
+        nonlocal clock
+        if late_phase == "sleep":
+            set_status_after_deadline()
+            clock = 0.11
+        else:
+            clock += seconds
+
+    def delayed_task(task_id: str) -> dict:
+        nonlocal clock, task_reads
+        task_reads += 1
+        if late_phase == "read" and task_reads == 2:
+            set_status_after_deadline()
+            observed = read_task(task_id)
+            clock = 0.11
+            return observed
+        return read_task(task_id)
+
+    monkeypatch.setattr(cli.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(cli.time, "sleep", wait)
+    monkeypatch.setattr(supervisor, "task", delayed_task)
+    result = cli._wait_for_task(
+        supervisor,
+        SimpleNamespace(
+            task_id=task["id"],
+            until_status=None,
+            timeout_seconds=0.1,
+            interval_seconds=0.05,
+        ),
+    )
+
+    assert result["wait_result"] == "timeout"
+    assert result["current_status"] == "open"
+    assert result["task"]["status"] == "open"
+
+
+def test_cli_wait_ignores_heartbeat_and_checkpoint_churn_until_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "heartbeat only", "owned.txt")
+    claimed = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
+    attempt_id = json.loads(claimed.stdout)["id"]
+    supervisor = cli.GitSupervisor(repo, read_only=True)
+    real_sleep = time.sleep
+    progress_writes = 0
+
+    def heartbeat_only(seconds: float) -> None:
+        nonlocal progress_writes
+        real_sleep(min(seconds, 0.02))
+        with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+            connection.execute(
+                "UPDATE attempts SET heartbeat_at = ?, checkpoint_at = ?, updated_at = ?, "
+                "checkpoint_json = ? WHERE id = ?",
+                (
+                    "2040-01-01T00:00:00Z",
+                    "2040-01-01T00:00:00Z",
+                    "2040-01-01T00:00:00Z",
+                    '{"phase":"still-running"}',
+                    attempt_id,
+                ),
+            )
+        progress_writes += 1
+
+    monkeypatch.setattr(cli.time, "sleep", heartbeat_only)
+    result = cli._wait_for_task(
+        supervisor,
+        SimpleNamespace(
+            task_id=task["id"],
+            until_status=None,
+            timeout_seconds=0.1,
+            interval_seconds=0.04,
+        ),
+    )
+
+    assert progress_writes >= 2
+    assert result["wait_result"] == "timeout"
+    assert result["task"]["latest_attempt"]["checkpoint"] == {"phase": "still-running"}
+
+
+def test_cli_wait_interrupt_is_a_distinct_non_failure_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "interruptible", "owned.txt")
+    supervisor = cli.GitSupervisor(repo, read_only=True)
+
+    def interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", interrupt)
+    result = cli._wait_for_task(
+        supervisor,
+        SimpleNamespace(
+            task_id=task["id"],
+            until_status=None,
+            timeout_seconds=1.0,
+            interval_seconds=0.1,
+        ),
+    )
+
+    assert result["wait_result"] == "interrupted"
+    assert result["current_status"] == "open"
+
+
+def test_cli_wait_interrupt_before_initial_snapshot_returns_null_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "interrupt before first read", "owned.txt")
+    supervisor = cli.GitSupervisor(repo, read_only=True)
+
+    def interrupt(_task_id: str) -> dict:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(supervisor, "task", interrupt)
+    result = cli._wait_for_task(
+        supervisor,
+        SimpleNamespace(
+            task_id=task["id"],
+            until_status=None,
+            timeout_seconds=1.0,
+            interval_seconds=0.1,
+        ),
+    )
+
+    assert result["wait_result"] == "interrupted"
+    assert result["initial_status"] is None
+    assert result["current_status"] is None
+    assert result["task"] is None
+
+
+def test_cli_wait_bounds_are_finite_and_documented() -> None:
+    defaults = cli.parser().parse_args(["wait", "task-id"])
+    assert defaults.timeout_seconds == 300.0
+    assert defaults.interval_seconds == 1.0
+
+    for arguments in (
+        ["wait", "task-id", "--timeout-seconds", "nan"],
+        ["wait", "task-id", "--timeout-seconds", "0.09"],
+        ["wait", "task-id", "--timeout-seconds", "86400.1"],
+        ["wait", "task-id", "--interval-seconds", "30.1"],
+    ):
+        with pytest.raises(SystemExit) as error:
+            cli.parser().parse_args(arguments)
+        assert error.value.code == 2
 
 
 def test_cli_artifact_dependency_blocks_a_claim(tmp_path: Path) -> None:

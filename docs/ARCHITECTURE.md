@@ -82,7 +82,7 @@ path), and naming the owning task, attempt, and agent.
 
 ### 1b. Planning is a preview, never a mutation
 
-`plan`, `queue`, `merge-plan`, and `status` are read-only. They deliberately do
+`plan`, `queue`, `merge-plan`, `status`, and `wait` are read-only. They deliberately do
 not call `reap_expired()`, unlike `claim` and `list`: a view that reaped would
 orphan an attempt merely because an operator looked at the dashboard, and would
 change the state it was asked to report. Expired-but-unreaped attempts are
