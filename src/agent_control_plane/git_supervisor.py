@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -237,9 +237,65 @@ def _add_attempt_progress_timestamps(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE attempts ADD COLUMN checkpoint_at TEXT NOT NULL DEFAULT ''")
 
 
+def _add_base_checkout_snapshot(connection: sqlite3.Connection) -> None:
+    """Persist a claim-time fingerprint for the shared base checkout.
+
+    Existing active attempts cannot be assigned a truthful past baseline, so the
+    empty sentinel deliberately leaves them on the legacy path. New claims always
+    write a non-empty snapshot before they become working.
+    """
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+    if "base_checkout_snapshot_json" not in columns:
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN base_checkout_snapshot_json TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def _require_base_checkout_snapshot(connection: sqlite3.Connection) -> None:
+    """Mark new attempts as requiring a claim-time snapshot.
+
+    Existing attempts retain the default false value because a truthful historical
+    baseline cannot be reconstructed during migration.
+    """
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+    if "base_checkout_snapshot_required" not in columns:
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN base_checkout_snapshot_required "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _fence_legacy_attempt_inserts(connection: sqlite3.Connection) -> None:
+    """Reject claim rows from supervisors predating the snapshot contract.
+
+    A supervisor may stay alive across a database migration. It passed its schema
+    check before the upgrade, so a version check alone cannot prevent it from
+    inserting a new row afterward. Its old INSERT omits the marker, which defaults
+    to zero; the trigger makes that stale claim fail closed while leaving existing
+    legacy rows untouched.
+    """
+
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS attempts_require_base_checkout_snapshot
+        BEFORE INSERT ON attempts
+        WHEN NEW.base_checkout_snapshot_required != 1
+          OR NEW.base_checkout_snapshot_json = ''
+        BEGIN
+          SELECT RAISE(ABORT, 'attempt_base_checkout_snapshot_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
+    (4, _add_base_checkout_snapshot),
+    (5, _require_base_checkout_snapshot),
+    (6, _fence_legacy_attempt_inserts),
 )
 
 

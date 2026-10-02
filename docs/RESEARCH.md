@@ -161,6 +161,30 @@ worktree cleanup and claim rollback. This verifies ACP's own coordination path, 
 vendor worktree isolation, and it does not make arbitrary tools or shell writes
 sandboxed.
 
+### Base-checkout writes despite worktree claims (2026-10-02)
+
+Recent first-person reports describe a failure mode that path hooks alone cannot
+contain. Claude Code issue [#87643](https://github.com/anthropics/claude-code/issues/87643)
+reports structured edits targeting an agent worktree changing the parent checkout
+instead; the reporter says they checked the result with Git status, diffs and content
+hashes. Issue
+[#83000](https://github.com/anthropics/claude-code/issues/83000) describes inconsistent
+enforcement between Bash and PowerShell in WSL2, including a PowerShell write/commit
+against the shared checkout. Issue
+[#84685](https://github.com/anthropics/claude-code/issues/84685), closed as not planned,
+reports concurrent subagents sharing session-global worktree identity. These are
+individual reports, not prevalence estimates, independent reproductions or proof of
+vendor-wide root causes.
+
+The common product need is to preserve a user's base-checkout work even when an agent
+escapes its allocated worktree. ACP now fingerprints every tracked file and Git-reported
+nonignored untracked source path at claim time, accepting the current dirty state as
+baseline rather than requiring a clean checkout. It rechecks before QC submission and
+again before integration. On a mismatch it reports quoted paths only, blocks the next
+stage, and preserves both checkouts without automatic restore. This detects persistent
+source-state changes; it is not an OS sandbox and cannot detect a write reverted between
+checks. Full tracked-file hashing costs work proportional to checkout size.
+
 The product response is not to special-case those tools. It is to make the
 candidate commit, ownership token, checkout, and review evidence explicit and
 verifiable.

@@ -7,10 +7,14 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import time
 import unicodedata
@@ -37,10 +41,14 @@ class ClaimsMixin:
         if not agent_id.strip():
             raise SupervisorError("invalid_agent", "agent_id is required")
         self._authenticate(agent_id, "worker", credential)
+        self._assert_safe_git_execution_config()
         self.reap_expired()
         ttl = lease_seconds or self.config.lease_seconds
         if ttl < 10:
             raise SupervisorError("invalid_lease", "lease must be at least 10 seconds")
+        # Pin the shared checkout before this claim provisions anything. ACP does
+        # not require it to be clean; it records the exact pre-existing source state.
+        base_checkout_snapshot = self._capture_base_checkout_snapshot()
         expires = int(time.time()) + ttl
         attempt_id = str(uuid.uuid4())
         worktree = self.state_dir / "worktrees" / attempt_id
@@ -179,9 +187,10 @@ class ClaimsMixin:
                    start_sha, latest_sha, checkpoint_json, heartbeat_at, checkpoint_at,
                    trust_bundle_json,
                    pid, log_path, status,
-                   lease_expires_at, created_at, updated_at)
+                   lease_expires_at, created_at, updated_at, base_checkout_snapshot_json,
+                   base_checkout_snapshot_required)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, NULL, NULL,
-                        'provisioning', ?, ?, ?)
+                        'provisioning', ?, ?, ?, ?, 1)
                 """,
                 (
                     attempt_id,
@@ -200,6 +209,7 @@ class ClaimsMixin:
                     expires,
                     now,
                     now,
+                    canonical_json(base_checkout_snapshot),
                 ),
             )
             self._allocate_runtime(
@@ -284,7 +294,14 @@ class ClaimsMixin:
                 connection,
                 "attempt.ready",
                 "supervisor",
-                {"attempt_id": attempt_id, "worktree": str(worktree)},
+                {
+                    "attempt_id": attempt_id,
+                    "worktree": str(worktree),
+                    "base_checkout_snapshot_sha256": sha256(
+                        canonical_json(base_checkout_snapshot).encode()
+                    ),
+                    "base_checkout_path_count": len(base_checkout_snapshot["entries"]),
+                },
             )
         return self.attempt(attempt_id)
 
@@ -702,6 +719,443 @@ class ClaimsMixin:
             "declared": declared or [],
         }
 
+    @staticmethod
+    def _snapshot_metadata_path(path: bytes) -> bool:
+        """Exclude ACP runtime state and Git administration from source evidence."""
+
+        return any(path == name or path.startswith(name + b"/") for name in (b".acp", b".git"))
+
+    @staticmethod
+    def _snapshot_path_key(path: bytes) -> str:
+        return base64.b64encode(path).decode("ascii")
+
+    @staticmethod
+    def _snapshot_path_error(path: bytes) -> SupervisorError:
+        display = json.dumps(os.fsdecode(path), ensure_ascii=True)
+        return SupervisorError(
+            "base_checkout_uninspectable",
+            f"cannot safely fingerprint base checkout path {display}",
+        )
+
+    def _open_snapshot_directory(self, parent_fd: int, name: str, display: bytes) -> int:
+        descriptor = -1
+        try:
+            before_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(before_path.st_mode):
+                raise self._snapshot_path_error(display)
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+            opened = os.fstat(descriptor)
+            after_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except SupervisorError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise self._snapshot_path_error(display) from None
+        if self._stat_identity(before_path) != self._stat_identity(opened) or self._stat_identity(
+            opened
+        ) != self._stat_identity(after_path):
+            os.close(descriptor)
+            raise self._snapshot_path_error(display)
+        return descriptor
+
+    def _open_snapshot_root(
+        self, root_real: Path, display: bytes
+    ) -> tuple[int, list[int], list[tuple[int, str, int]]]:
+        if not root_real.is_absolute():
+            raise self._snapshot_path_error(display)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(root_real.anchor, flags)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise self._snapshot_path_error(display) from None
+        descriptors = [descriptor]
+        directories: list[tuple[int, str, int]] = []
+        try:
+            for component in root_real.parts[1:]:
+                parent_fd = descriptors[-1]
+                child_fd = self._open_snapshot_directory(parent_fd, component, display)
+                descriptors.append(child_fd)
+                directories.append((parent_fd, component, child_fd))
+        except Exception:
+            for opened_fd in reversed(descriptors):
+                os.close(opened_fd)
+            raise
+        return descriptors[-1], descriptors, directories
+
+    def _verify_snapshot_directories(
+        self, directories: list[tuple[int, str, int]], display: bytes
+    ) -> None:
+        try:
+            for parent_fd, name, child_fd in directories:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                opened = os.fstat(child_fd)
+                if self._stat_identity(current) != self._stat_identity(opened):
+                    raise self._snapshot_path_error(display)
+        except SupervisorError:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise self._snapshot_path_error(display) from None
+
+    def _fingerprint_base_path(
+        self, root_real: Path, relative: bytes, display: bytes
+    ) -> dict[str, Any]:
+        components = relative.split(b"/")
+        if not components or any(part in {b"", b".", b".."} for part in components):
+            raise self._snapshot_path_error(display)
+        decoded = [os.fsdecode(part) for part in components]
+        if any(
+            separator and separator in part for part in decoded for separator in (os.sep, os.altsep)
+        ):
+            raise self._snapshot_path_error(display)
+        if os.path.isabs(decoded[0]) or os.path.splitdrive(decoded[0])[0]:
+            raise self._snapshot_path_error(display)
+        _root_fd, descriptors, directories = self._open_snapshot_root(root_real, display)
+        try:
+            for component in decoded[:-1]:
+                parent_fd = descriptors[-1]
+                child_fd = self._open_snapshot_directory(parent_fd, component, display)
+                descriptors.append(child_fd)
+                directories.append((parent_fd, component, child_fd))
+            parent_fd = descriptors[-1]
+            leaf = decoded[-1]
+            before_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+            return {"kind": "missing"}
+        except SupervisorError:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError):
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+            raise self._snapshot_path_error(display) from None
+        try:
+            self._verify_snapshot_directories(directories, display)
+            if stat.S_ISLNK(before_path.st_mode):
+                try:
+                    target_value = os.readlink(leaf, dir_fd=parent_fd)
+                    after_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    raise self._snapshot_path_error(display) from None
+                self._verify_snapshot_directories(directories, display)
+                if self._stat_identity(before_path) != self._stat_identity(after_path):
+                    raise self._snapshot_path_error(display)
+                return {
+                    "kind": "symlink",
+                    "mode": stat.S_IMODE(before_path.st_mode),
+                    "target_sha256": sha256(os.fsencode(target_value)),
+                }
+            if stat.S_ISREG(before_path.st_mode):
+                file_fd = -1
+                try:
+                    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                    file_fd = os.open(leaf, flags, dir_fd=parent_fd)
+                    before_fd = os.fstat(file_fd)
+                    if not stat.S_ISREG(before_fd.st_mode):
+                        raise self._snapshot_path_error(display)
+                    digest = hashlib.sha256()
+                    while chunk := os.read(file_fd, 1024 * 1024):
+                        digest.update(chunk)
+                    after_fd = os.fstat(file_fd)
+                    after_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                    self._verify_snapshot_directories(directories, display)
+                except SupervisorError:
+                    raise
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    raise self._snapshot_path_error(display) from None
+                finally:
+                    if file_fd >= 0:
+                        os.close(file_fd)
+                if (
+                    self._stat_identity(before_path) != self._stat_identity(before_fd)
+                    or self._stat_identity(before_fd) != self._stat_identity(after_fd)
+                    or self._stat_identity(after_fd) != self._stat_identity(after_path)
+                ):
+                    raise self._snapshot_path_error(display)
+                return {
+                    "kind": "file",
+                    "mode": stat.S_IMODE(after_fd.st_mode),
+                    "size": after_fd.st_size,
+                    "sha256": digest.hexdigest(),
+                }
+            if stat.S_ISDIR(before_path.st_mode):
+                child_fd = self._open_snapshot_directory(parent_fd, leaf, display)
+                descriptors.append(child_fd)
+                directories.append((parent_fd, leaf, child_fd))
+                self._verify_snapshot_directories(directories, display)
+                metadata = os.fstat(child_fd)
+                return {"kind": "directory", "mode": stat.S_IMODE(metadata.st_mode)}
+            raise self._snapshot_path_error(display)
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    @staticmethod
+    def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def _snapshot_checkout_repository(
+        self,
+        root: Path,
+        prefix: bytes = b"",
+        ancestors: frozenset[Path] = frozenset(),
+    ) -> dict[str, Any]:
+        try:
+            real_root = root.resolve(strict=True)
+            if real_root in ancestors:
+                raise SupervisorError(
+                    "base_checkout_uninspectable", "nested Git checkout loop in base checkout"
+                )
+            if len(ancestors) >= 64:
+                raise SupervisorError(
+                    "base_checkout_uninspectable", "nested Git checkout depth exceeds the limit"
+                )
+            ancestors = ancestors | {real_root}
+            self._assert_safe_git_execution_config(real_root, snapshot_only=True)
+            reported_root = self._git_bytes(
+                "-C",
+                str(root),
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+            )
+            if (
+                not reported_root.endswith(b"\n")
+                or Path(os.fsdecode(reported_root[:-1])).resolve(strict=True) != real_root
+            ):
+                raise SupervisorError(
+                    "base_checkout_uninspectable",
+                    "nested Git checkout root does not match its source path",
+                )
+            status_raw = self._git_bytes(
+                "-C",
+                str(root),
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            )
+            index_raw = self._git_bytes("-C", str(root), "ls-files", "--stage", "-z")
+        except SupervisorError as error:
+            if error.code in {
+                "base_checkout_uninspectable",
+                "git_config_unreadable",
+                "unsafe_git_execution_config",
+            }:
+                raise
+            raise SupervisorError(
+                "base_checkout_uninspectable", "cannot inspect base checkout Git state"
+            ) from None
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            raise SupervisorError(
+                "base_checkout_uninspectable", "cannot inspect base checkout Git state"
+            ) from None
+
+        index: dict[bytes, list[str]] = {}
+        for record in index_raw.split(b"\0"):
+            if not record:
+                continue
+            separator = record.find(b"\t")
+            if separator < 0:
+                raise SupervisorError(
+                    "base_checkout_uninspectable", "base checkout index is unreadable"
+                )
+            header, path = record[:separator], record[separator + 1 :]
+            fields = header.split(b" ")
+            if len(fields) != 3 or self._snapshot_metadata_path(path):
+                if len(fields) != 3:
+                    raise SupervisorError(
+                        "base_checkout_uninspectable", "base checkout index is unreadable"
+                    )
+                continue
+            try:
+                index.setdefault(path, []).append(header.decode("ascii"))
+            except UnicodeDecodeError:
+                raise SupervisorError(
+                    "base_checkout_uninspectable", "base checkout index is unreadable"
+                ) from None
+
+        status: dict[bytes, str] = {}
+        records = status_raw.split(b"\0")
+        position = 0
+        while position < len(records):
+            record = records[position]
+            position += 1
+            if not record:
+                continue
+            if len(record) < 4 or record[2:3] != b" ":
+                raise SupervisorError(
+                    "base_checkout_uninspectable", "base checkout status is unreadable"
+                )
+            code = record[:2]
+            try:
+                code_text = code.decode("ascii")
+            except UnicodeDecodeError:
+                raise SupervisorError(
+                    "base_checkout_uninspectable", "base checkout status is unreadable"
+                ) from None
+            path = record[3:]
+            if path.endswith(b"/"):
+                path = path.rstrip(b"/")
+            changed_paths = [path]
+            if b"R" in code or b"C" in code:
+                if position >= len(records) or not records[position]:
+                    raise SupervisorError(
+                        "base_checkout_uninspectable", "base checkout rename state is unreadable"
+                    )
+                changed_paths.append(records[position])
+                position += 1
+            for changed_path in changed_paths:
+                if changed_path.endswith(b"/"):
+                    changed_path = changed_path.rstrip(b"/")
+                if not self._snapshot_metadata_path(changed_path):
+                    status[changed_path] = code_text
+
+        entries: dict[str, str] = {}
+        for path in sorted(set(index) | set(status)):
+            display = prefix + path
+            fingerprint = self._fingerprint_base_path(real_root, path, display)
+            index_entries = sorted(index.get(path, []))
+            modes = {entry.split(" ", 1)[0] for entry in index_entries}
+            target = root.joinpath(*(os.fsdecode(part) for part in path.split(b"/")))
+            is_gitlink = "160000" in modes
+            is_nested_repository = fingerprint["kind"] == "directory" and (
+                is_gitlink or os.path.lexists(target / ".git")
+            )
+            if is_nested_repository:
+                nested = self._snapshot_checkout_repository(
+                    target,
+                    display + b"/",
+                    ancestors,
+                )
+                fingerprint = {
+                    "kind": "gitlink" if is_gitlink else "nested-repository",
+                    "snapshot_sha256": sha256(canonical_json(nested).encode()),
+                }
+                entries.update(nested["entries"])
+            entry = {
+                "status": status.get(path, "  "),
+                "index": index_entries,
+                "worktree": fingerprint,
+            }
+            entries[self._snapshot_path_key(display)] = sha256(canonical_json(entry).encode())
+
+        return {"format": 1, "entries": entries}
+
+    def _capture_base_checkout_snapshot(self) -> dict[str, Any]:
+        return self._snapshot_checkout_repository(self.root)
+
+    def _assert_base_checkout_unchanged(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        snapshot_json: str,
+        snapshot_required: bool,
+    ) -> None:
+        # New attempts require the snapshot even if local audit data is damaged or
+        # the claim event is missing. Legacy attempts retain their explicit default
+        # marker because their true claim-time baseline cannot be reconstructed.
+        if snapshot_required:
+            chain = self._verify_event_chain(connection)
+            if not chain["ok"]:
+                raise SupervisorError(
+                    "base_checkout_snapshot_invalid",
+                    "attempt audit event chain failed integrity verification",
+                )
+        try:
+            anchor = connection.execute(
+                "SELECT payload_json FROM events "
+                "WHERE event_type = 'attempt.ready' "
+                "AND json_extract(payload_json, '$.attempt_id') = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (attempt_id,),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            raise SupervisorError(
+                "base_checkout_snapshot_invalid", "attempt audit record is unreadable"
+            ) from None
+        try:
+            anchor_payload = json.loads(anchor["payload_json"]) if anchor else {}
+        except (TypeError, json.JSONDecodeError):
+            anchor_payload = {}
+        anchor_digest = anchor_payload.get("base_checkout_snapshot_sha256")
+        if not snapshot_required and anchor_digest is None and not snapshot_json:
+            # A pre-migration attempt has no truthful claim-time baseline.
+            return
+        if (
+            not snapshot_required
+            or not snapshot_json
+            or anchor_digest != sha256(snapshot_json.encode())
+        ):
+            raise SupervisorError(
+                "base_checkout_snapshot_invalid",
+                "claim-time base checkout snapshot failed its audit integrity check",
+            )
+        try:
+            baseline = json.loads(snapshot_json)
+        except (TypeError, json.JSONDecodeError):
+            raise SupervisorError(
+                "base_checkout_snapshot_invalid", "claim-time base checkout snapshot is unreadable"
+            ) from None
+        if not isinstance(baseline, dict) or baseline.get("format") != 1:
+            raise SupervisorError(
+                "base_checkout_snapshot_invalid", "claim-time base checkout snapshot is unsupported"
+            )
+        current = self._capture_base_checkout_snapshot()
+        old_entries = baseline.get("entries")
+        new_entries = current["entries"]
+        if not isinstance(old_entries, dict):
+            raise SupervisorError(
+                "base_checkout_snapshot_invalid", "claim-time base checkout snapshot is unreadable"
+            )
+        changed_keys = {
+            key
+            for key in set(old_entries) | set(new_entries)
+            if old_entries.get(key) != new_entries.get(key)
+        }
+        try:
+            changed_paths = {
+                os.fsdecode(base64.b64decode(key.encode("ascii"), validate=True))
+                for key in changed_keys
+            }
+        except (UnicodeEncodeError, ValueError):
+            raise SupervisorError(
+                "base_checkout_snapshot_invalid", "claim-time base checkout paths are unreadable"
+            ) from None
+        if not changed_paths:
+            return
+        quoted_paths = ", ".join(
+            json.dumps(path, ensure_ascii=True) for path in sorted(changed_paths)
+        )
+        raise SupervisorError(
+            "base_checkout_mutated",
+            f"base checkout changed since attempt claim; paths: {quoted_paths}",
+        )
+
     def submit(
         self,
         attempt_id: str,
@@ -722,6 +1176,7 @@ class ClaimsMixin:
         expected_worker_pid: int | None,
         credential: str | None,
     ) -> dict[str, Any]:
+        self._assert_safe_git_execution_config()
         self._assert_no_git_grafts()
         epoch = int(time.time())
         with self.connect() as connection:
@@ -739,6 +1194,12 @@ class ClaimsMixin:
                     "supervised submit does not own the registered worker PID",
                 )
             task = self._task_row(connection, attempt["task_id"])
+            self._assert_base_checkout_unchanged(
+                connection,
+                attempt_id,
+                attempt["base_checkout_snapshot_json"],
+                bool(attempt["base_checkout_snapshot_required"]),
+            )
             worktree = Path(attempt["worktree"])
             if self._git_bytes("-C", str(worktree), "status", "--porcelain=v1", "-z"):
                 raise SupervisorError("dirty_worktree", "submission requires committed work")

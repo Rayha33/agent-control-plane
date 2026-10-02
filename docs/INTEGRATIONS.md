@@ -79,6 +79,47 @@ pre-write hook, not filesystem isolation: it does not cover Bash, unhooked tools
 bypass, or a race after the check. Treat issue reports as individual experiences, not
 prevalence estimates.
 
+### Detecting writes that escape into the base checkout
+
+Every new claim records a content fingerprint of the tracked files and Git-reported,
+nonignored untracked files in the base checkout. This deliberately allows a dirty
+checkout: its existing staged, unstaged, untracked and symlink state becomes the
+attempt's baseline. ACP stores hashes, index metadata and encoded path keys, not source
+file contents; the `attempt.ready` audit event binds the snapshot digest. `.acp/`
+runtime state and Git administration metadata are excluded.
+
+`acp submit` compares the current checkout with that baseline before creating a
+submission, so a detected root write cannot reach QC. `acp integrate` checks again
+after QC and before changing task state or creating an integration branch, closing the
+gap where the root checkout changes after submit. A mismatch returns
+`base_checkout_mutated` with quoted paths only. ACP leaves both the root checkout and
+the candidate worktree untouched; it never auto-resets or deletes user data. Existing
+attempts created before this snapshot field have no truthful claim-time baseline and
+retain their prior lifecycle behavior until drained.
+
+New attempts are explicitly marked as requiring a snapshot; a blank snapshot cannot
+downgrade them to the legacy path. Before trusting that baseline at submit or integration,
+ACP verifies the event hash chain that binds it. Claim and submit retain the full unsafe
+Git-config gate. Each snapshot also checks status-relevant settings (filters, fsmonitor,
+and config includes) across both local and enabled worktree config scopes before
+inspecting the root or nested Git checkouts. Integration's
+separately isolated merge path remains responsible for neutralizing merge drivers.
+The migration also installs a database trigger that rejects marker-less attempt inserts,
+so a supervisor process that remained alive across the upgrade cannot create an
+unfingerprinted post-upgrade claim. Existing attempts keep their legacy marker; no
+historical baseline is fabricated.
+
+This is a detection fence, not an OS sandbox or a write-interception mechanism. It
+does not lock the base checkout or make the scan atomic. File reads are anchored to
+no-follow directory descriptors, with parent identity rechecks to prevent a parent
+symlink swap from redirecting the byte read. Git's status/index queries remain
+path-based; a mutation fully reverted between checks or made after the final comparison
+cannot be stopped. Regression coverage exercises both a write racing claim-time
+fingerprinting and a parent symlink swap. Keep the worker inside an OS-level sandbox;
+this does not make arbitrary shell commands safe. Hashing all tracked checkout files on
+claim, submit and integration is proportional to checkout size, a deliberate cost for
+detecting Git-hidden changes as well as ordinary dirty status.
+
 Export the attempt id from the claim before starting the session:
 
 ```bash

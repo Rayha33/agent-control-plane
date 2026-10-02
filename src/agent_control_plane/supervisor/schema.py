@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS attempts (
   heartbeat_at TEXT NOT NULL DEFAULT '',
   checkpoint_at TEXT NOT NULL DEFAULT '',
   trust_bundle_json TEXT NOT NULL DEFAULT '{}',
+  base_checkout_snapshot_json TEXT NOT NULL DEFAULT '',
+  base_checkout_snapshot_required INTEGER NOT NULL DEFAULT 0,
   pid INTEGER,
   pid_identity TEXT NOT NULL DEFAULT '',
   termination_target_status TEXT NOT NULL DEFAULT '',
