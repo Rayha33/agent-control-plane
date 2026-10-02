@@ -2651,6 +2651,118 @@ def test_task_resolves_head_to_stable_base_branch(repo: Path) -> None:
     assert created["base_branch"] == "main"
 
 
+@pytest.mark.parametrize("mismatch", ["detached", "wrong-branch", "moved-and-replaced"])
+def test_worker_worktree_mismatch_fails_before_launch_state_changes(
+    repo: Path, mismatch: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    if mismatch == "detached":
+        git(repo, "-C", str(worktree), "checkout", "--detach", "HEAD")
+    elif mismatch == "wrong-branch":
+        git(repo, "-C", str(worktree), "checkout", "-b", "acp-test-wrong-branch")
+    else:
+        moved = worktree.with_name(f"{worktree.name}-moved")
+        worktree.rename(moved)
+        worktree.mkdir()
+
+    before = supervisor.attempt(attempt["id"])
+    head_before = git(repo, "rev-parse", "HEAD")
+    refs_before = git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    with supervisor.connect() as connection:
+        event_count_before = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    marker = worktree.parent / f"{mismatch}-worker-launched"
+    command = [
+        sys.executable,
+        "-c",
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('launched')",
+    ]
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert error.value.code == "worker_worktree_mismatch"
+    after = supervisor.attempt(attempt["id"])
+    assert after["status"] == before["status"] == "working"
+    assert after["pid"] is None
+    assert after["updated_at"] == before["updated_at"]
+    assert git(repo, "rev-parse", "HEAD") == head_before
+    assert git(repo, "for-each-ref", "--format=%(refname) %(objectname)") == refs_before
+    assert not marker.exists()
+    with supervisor.connect() as connection:
+        event_count_after = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert event_count_after == event_count_before
+
+
+def test_worker_worktree_identity_ignores_inherited_git_selection_env(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    foreign = tmp_path / "foreign-repository"
+    foreign.mkdir()
+    git(foreign, "init", "-b", "foreign")
+    git(foreign, "config", "user.name", "Foreign")
+    git(foreign, "config", "user.email", "foreign@example.test")
+    (foreign / "file.txt").write_text("foreign\n", encoding="utf-8")
+    git(foreign, "add", "file.txt")
+    git(foreign, "commit", "-m", "foreign base")
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(foreign / ".git" / "index"))
+
+    supervisor._verify_worker_worktree(supervisor.attempt(attempt["id"]))
+
+
+def test_worker_worktree_identity_ignores_unrelated_prunable_registration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    alpha = task(supervisor, "alpha.txt")
+    healthy_attempt = supervisor.claim(alpha["id"], "worker-a")
+    beta = task(supervisor, "beta.txt")
+    stale_attempt = supervisor.claim(beta["id"], "worker-b")
+    stale_path = Path(stale_attempt["worktree"])
+    stale_path.rename(stale_path.with_name(f"{stale_path.name}-moved"))
+
+    supervisor._verify_worker_worktree(supervisor.attempt(healthy_attempt["id"]))
+
+
+@requires_linux_worker
+def test_worker_worktree_is_rechecked_immediately_before_spawn(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    original_verify = supervisor._verify_worker_worktree
+    checks = 0
+
+    def detach_before_second_check(current: dict[str, object]) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            git(repo, "-C", str(worktree), "checkout", "--detach", "HEAD")
+        original_verify(current)
+
+    monkeypatch.setattr(supervisor, "_verify_worker_worktree", detach_before_second_check)
+    marker = worktree.parent / "changed-before-spawn-marker"
+    command = [
+        sys.executable,
+        "-c",
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('launched')",
+    ]
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert error.value.code == "worker_worktree_mismatch"
+    assert checks == 2
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+    assert not marker.exists()
+
+
 def test_expired_worker_is_never_spawned(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")

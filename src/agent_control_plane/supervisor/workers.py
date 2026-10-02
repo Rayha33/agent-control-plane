@@ -26,6 +26,74 @@ from .common import SupervisorError, utc_now
 class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
 
+    def _verify_worker_worktree(self, attempt: dict[str, Any]) -> None:
+        """Fail closed unless the attempt still names its registered checkout."""
+
+        try:
+            attempt_path = Path(attempt["worktree"]).resolve(strict=True)
+            repository_root = Path(self.root).resolve(strict=True)
+            repository_common = Path(self._git_common_dir).resolve(strict=True)
+            expected_branch = os.fsencode(f"refs/heads/{attempt['branch']}")
+            if attempt_path == repository_root:
+                raise ValueError("attempt points at the supervisor checkout")
+
+            registry = self._git_bytes("worktree", "list", "--porcelain", "-z")
+            records: list[dict[bytes, bytes]] = []
+            record: dict[bytes, bytes] = {}
+            for field in registry.split(b"\0"):
+                if not field:
+                    if record:
+                        records.append(record)
+                        record = {}
+                    continue
+                key, separator, value = field.partition(b" ")
+                record[key] = value if separator else b""
+            if record:
+                records.append(record)
+
+            matches = []
+            for registered in records:
+                registered_path = registered.get(b"worktree")
+                if registered_path is None:
+                    continue
+                # Other stale registrations must not prevent a healthy attempt
+                # from launching; realpath preserves a missing entry lexically.
+                if Path(os.path.realpath(os.fsdecode(registered_path))) == attempt_path:
+                    matches.append(registered)
+            if len(matches) != 1:
+                raise ValueError("attempt path is not exactly one registered worktree")
+
+            registered = matches[0]
+            if registered.get(b"prunable") is not None:
+                raise ValueError("registered worktree is prunable")
+            if registered.get(b"branch") != expected_branch:
+                raise ValueError("registered worktree branch does not match attempt")
+
+            # `-C` is supplied after the supervisor's pinned repository path;
+            # the supervisor Git environment strips inherited GIT_DIR and peers.
+            prefix = self._git_bytes("-C", str(attempt_path), "rev-parse", "--show-prefix")
+            if prefix != b"\n":
+                raise ValueError("attempt path is not the worktree root")
+            common_dir = self._git_bytes(
+                "-C",
+                str(attempt_path),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ).removesuffix(b"\n")
+            if Path(os.fsdecode(common_dir)).resolve(strict=True) != repository_common:
+                raise ValueError("attempt worktree belongs to a different repository")
+            branch = self._git_bytes(
+                "-C", str(attempt_path), "symbolic-ref", "--quiet", "--short", "HEAD"
+            ).removesuffix(b"\n")
+            if branch != os.fsencode(attempt["branch"]):
+                raise ValueError("checked-out branch does not match attempt")
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError, SupervisorError) as error:
+            raise SupervisorError(
+                "worker_worktree_mismatch",
+                "attempt worktree is missing, unregistered, or does not match its repository and branch",
+            ) from error
+
     def run_worker(
         self,
         attempt_id: str,
@@ -35,6 +103,8 @@ class WorkersMixin:
     ) -> dict[str, Any]:
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
+        # Read-only identity validation happens before heartbeat changes attempt state.
+        self._verify_worker_worktree(self.attempt(attempt_id))
         attempt = self.heartbeat(
             attempt_id,
             claim_token,
@@ -62,6 +132,9 @@ class WorkersMixin:
                 self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
                 launch_reserved = True
                 trampoline = Path(__file__).parent.with_name("worker_trampoline.py").resolve()
+                # Close the state-update-to-spawn gap as much as possible. This is
+                # still an optimistic filesystem check, not a same-UID sandbox.
+                self._verify_worker_worktree(attempt)
                 process = subprocess.Popen(
                     [
                         sys.executable,
