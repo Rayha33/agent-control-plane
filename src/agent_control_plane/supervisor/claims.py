@@ -794,6 +794,7 @@ class ClaimsMixin:
         *,
         caller_cwd: str | Path,
         tool_use_id: str,
+        session_id: str,
         agent_id: str = "",
         now: int | None = None,
     ) -> dict[str, Any]:
@@ -816,6 +817,24 @@ class ClaimsMixin:
                 decision["path"],
                 "write_identity_missing",
                 "Claude Code must provide a bounded tool_use_id before ACP can reserve this write",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if not isinstance(session_id, str) or len(session_id) > 512:
+            return self._guard_denial(
+                attempt_id,
+                decision["path"],
+                "write_identity_invalid",
+                "Claude Code session_id must be a string of at most 512 characters",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if not session_id.strip():
+            return self._guard_denial(
+                attempt_id,
+                decision["path"],
+                "write_identity_missing",
+                "Claude Code must provide session_id before ACP can reserve this write",
                 declared=decision["declared"],
                 relative_path=decision["relative_path"],
             )
@@ -895,30 +914,34 @@ class ClaimsMixin:
             # makes recovery automatic; pruning all expired rows keeps the ledger small.
             connection.execute("DELETE FROM write_reservations WHERE expires_at <= ?", (epoch,))
             existing = connection.execute(
-                "SELECT agent_id, path FROM write_reservations "
+                "SELECT session_id, agent_id, path FROM write_reservations "
                 "WHERE attempt_id = ? AND tool_use_id = ?",
                 (attempt_id, tool_use_id),
             ).fetchone()
             if existing is not None and (
-                existing["path"] != reservation_path or existing["agent_id"] != agent_id
+                existing["path"] != reservation_path
+                or existing["agent_id"] != agent_id
+                or existing["session_id"] != session_id
             ):
                 return self._guard_denial(
                     attempt_id,
                     str(target),
                     "write_identity_conflict",
-                    "this Claude tool_use_id is already reserved for a different path or agent; refusing to reuse the invocation identity",
+                    "this Claude tool_use_id is already reserved for a different path, session, or agent; refusing to reuse the invocation identity",
                     declared=declared,
                     relative_path=relative,
                 )
             active = connection.execute(
-                "SELECT agent_id, tool_use_id, path, expires_at FROM write_reservations "
+                "SELECT session_id, agent_id, tool_use_id, path, expires_at "
+                "FROM write_reservations "
                 "WHERE attempt_id = ? AND expires_at > ?",
                 (attempt_id, epoch),
             ).fetchall()
             conflicts = [
                 row
                 for row in active
-                if (row["tool_use_id"], row["agent_id"]) != (tool_use_id, agent_id)
+                if (row["tool_use_id"], row["session_id"], row["agent_id"])
+                != (tool_use_id, session_id, agent_id)
                 and _reservation_paths_overlap(reservation_path, row["path"])
             ]
             if conflicts:
@@ -940,11 +963,12 @@ class ClaimsMixin:
                 connection.execute(
                     """
                     INSERT INTO write_reservations
-                      (attempt_id, agent_id, tool_use_id, path, expires_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                      (attempt_id, session_id, agent_id, tool_use_id, path, expires_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         attempt_id,
+                        session_id,
                         agent_id,
                         tool_use_id,
                         reservation_path,
@@ -964,19 +988,28 @@ class ClaimsMixin:
                 "reservation_expires_at": expires_at,
             }
 
-    def _release_write(self, attempt_id: str, tool_use_id: str, *, agent_id: str = "") -> bool:
+    def _release_write(
+        self,
+        attempt_id: str,
+        tool_use_id: str,
+        *,
+        session_id: str,
+        agent_id: str = "",
+    ) -> bool:
         """Release every path held by one Claude tool invocation; safe to repeat."""
 
         if not isinstance(tool_use_id, str) or not tool_use_id.strip() or len(tool_use_id) > 512:
             return False
         if not isinstance(agent_id, str) or len(agent_id) > 512:
             return False
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 512:
+            return False
         with _ephemeral_write_connection(self.db_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 "DELETE FROM write_reservations "
-                "WHERE attempt_id = ? AND tool_use_id = ? AND agent_id = ?",
-                (attempt_id, tool_use_id, agent_id),
+                "WHERE attempt_id = ? AND tool_use_id = ? AND session_id = ? AND agent_id = ?",
+                (attempt_id, tool_use_id, session_id, agent_id),
             )
             return cursor.rowcount > 0
 

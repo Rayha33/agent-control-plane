@@ -203,6 +203,7 @@ def test_version_four_upgrade_creates_the_write_reservation_ledger(repo: Path) -
         }
     assert {
         "attempt_id",
+        "session_id",
         "agent_id",
         "tool_use_id",
         "path",
@@ -211,6 +212,32 @@ def test_version_four_upgrade_creates_the_write_reservation_ledger(repo: Path) -
     } <= columns
     assert primary_key == ["attempt_id", "tool_use_id"]
     assert "idx_write_reservations_attempt_expiry" in indexes
+
+
+def test_version_five_upgrade_adds_session_identity_to_existing_reservations(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        connection.execute("ALTER TABLE write_reservations DROP COLUMN session_id")
+        connection.execute(
+            """
+            INSERT INTO write_reservations
+              (attempt_id, agent_id, tool_use_id, path, expires_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (attempt["id"], "agent-1", "tool-1", "alpha.txt", 9_999_999_999, "legacy"),
+        )
+        connection.execute("UPDATE meta SET value = '5' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    upgraded = GitSupervisor(repo)
+    assert upgraded.schema_version_on_open == 5
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with upgraded.connect() as connection:
+        row = connection.execute(
+            "SELECT session_id FROM write_reservations WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+    assert row["session_id"] == ""
 
 
 def test_a_stamp_that_is_not_a_version_is_never_guessed(repo: Path) -> None:

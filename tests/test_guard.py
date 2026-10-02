@@ -73,6 +73,7 @@ def test_same_attempt_write_reservations_block_until_the_tool_finishes(claimed) 
         "alpha.txt",
         caller_cwd=worktree,
         tool_use_id="tool-1",
+        session_id="session-shared",
         agent_id="subagent-1",
     )
     competing = supervisor._reserve_write(
@@ -80,6 +81,7 @@ def test_same_attempt_write_reservations_block_until_the_tool_finishes(claimed) 
         "alpha.txt",
         caller_cwd=worktree,
         tool_use_id="tool-2",
+        session_id="session-shared",
         agent_id="subagent-2",
     )
 
@@ -88,14 +90,25 @@ def test_same_attempt_write_reservations_block_until_the_tool_finishes(claimed) 
     assert competing["allow"] is False
     assert competing["reason"] == "concurrent_write_conflict"
     assert competing["retry_after_seconds"] == WRITE_RESERVATION_TTL_SECONDS
-    assert supervisor._release_write(attempt["id"], "tool-1", agent_id="subagent-1") is True
-    assert supervisor._release_write(attempt["id"], "tool-1", agent_id="subagent-1") is False
+    assert (
+        supervisor._release_write(
+            attempt["id"], "tool-1", session_id="session-shared", agent_id="subagent-1"
+        )
+        is True
+    )
+    assert (
+        supervisor._release_write(
+            attempt["id"], "tool-1", session_id="session-shared", agent_id="subagent-1"
+        )
+        is False
+    )
     assert (
         supervisor._reserve_write(
             attempt["id"],
             "alpha.txt",
             caller_cwd=worktree,
             tool_use_id="tool-2",
+            session_id="session-shared",
             agent_id="subagent-2",
         )["allow"]
         is True
@@ -112,6 +125,7 @@ def test_same_tool_use_id_cannot_cross_agent_boundaries_or_release_another_agent
         "alpha.txt",
         caller_cwd=worktree,
         tool_use_id="reused-tool-id",
+        session_id="session-shared",
         agent_id="subagent-1",
     )
     duplicate = supervisor._reserve_write(
@@ -119,6 +133,7 @@ def test_same_tool_use_id_cannot_cross_agent_boundaries_or_release_another_agent
         "alpha.txt",
         caller_cwd=worktree,
         tool_use_id="reused-tool-id",
+        session_id="session-shared",
         agent_id="subagent-2",
     )
 
@@ -126,7 +141,13 @@ def test_same_tool_use_id_cannot_cross_agent_boundaries_or_release_another_agent
     assert duplicate["allow"] is False
     assert duplicate["reason"] == "write_identity_conflict"
     assert (
-        supervisor._release_write(attempt["id"], "reused-tool-id", agent_id="subagent-2") is False
+        supervisor._release_write(
+            attempt["id"],
+            "reused-tool-id",
+            session_id="session-shared",
+            agent_id="subagent-2",
+        )
+        is False
     )
     assert (
         supervisor._reserve_write(
@@ -134,21 +155,125 @@ def test_same_tool_use_id_cannot_cross_agent_boundaries_or_release_another_agent
             "alpha.txt",
             caller_cwd=worktree,
             tool_use_id="other-tool-id",
+            session_id="session-shared",
             agent_id="subagent-2",
         )["reason"]
         == "concurrent_write_conflict"
     )
-    assert supervisor._release_write(attempt["id"], "reused-tool-id", agent_id="subagent-1") is True
+    assert (
+        supervisor._release_write(
+            attempt["id"],
+            "reused-tool-id",
+            session_id="session-shared",
+            agent_id="subagent-1",
+        )
+        is True
+    )
     assert (
         supervisor._reserve_write(
             attempt["id"],
             "alpha.txt",
             caller_cwd=worktree,
             tool_use_id="reused-tool-id",
+            session_id="session-shared",
             agent_id="subagent-2",
         )["allow"]
         is True
     )
+
+
+def test_same_tool_use_id_cannot_alias_separate_claude_sessions(claimed) -> None:
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    first = supervisor._reserve_write(
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="session-collision",
+        session_id="claude-session-1",
+    )
+    duplicate = supervisor._reserve_write(
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="session-collision",
+        session_id="claude-session-2",
+    )
+
+    assert first["allow"] is True
+    assert duplicate["allow"] is False
+    assert duplicate["reason"] == "write_identity_conflict"
+    assert (
+        supervisor._release_write(attempt["id"], "session-collision", session_id="claude-session-2")
+        is False
+    )
+    assert (
+        supervisor._release_write(attempt["id"], "session-collision", session_id="claude-session-1")
+        is True
+    )
+    assert (
+        supervisor._reserve_write(
+            attempt["id"],
+            "alpha.txt",
+            caller_cwd=worktree,
+            tool_use_id="session-collision",
+            session_id="claude-session-2",
+        )["allow"]
+        is True
+    )
+
+
+def test_same_attempt_reservations_block_ancestor_descendant_paths_both_ways(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "src", "src/**", "src-other/**")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+
+    parent_first = supervisor._reserve_write(
+        attempt["id"],
+        "src",
+        caller_cwd=worktree,
+        tool_use_id="parent-first",
+        session_id="claude-session",
+    )
+    child_after_parent = supervisor._reserve_write(
+        attempt["id"],
+        "src/main.py",
+        caller_cwd=worktree,
+        tool_use_id="child-after-parent",
+        session_id="claude-session",
+    )
+    assert parent_first["allow"] is True
+    assert child_after_parent["reason"] == "concurrent_write_conflict"
+    assert (
+        supervisor._release_write(attempt["id"], "parent-first", session_id="claude-session")
+        is True
+    )
+
+    child_first = supervisor._reserve_write(
+        attempt["id"],
+        "src/main.py",
+        caller_cwd=worktree,
+        tool_use_id="child-first",
+        session_id="claude-session",
+    )
+    parent_after_child = supervisor._reserve_write(
+        attempt["id"],
+        "src",
+        caller_cwd=worktree,
+        tool_use_id="parent-after-child",
+        session_id="claude-session",
+    )
+    sibling_prefix = supervisor._reserve_write(
+        attempt["id"],
+        "src-other/file.py",
+        caller_cwd=worktree,
+        tool_use_id="sibling-prefix",
+        session_id="claude-session",
+    )
+    assert child_first["allow"] is True
+    assert parent_after_child["reason"] == "concurrent_write_conflict"
+    assert sibling_prefix["allow"] is True
 
 
 def test_same_attempt_write_reservations_allow_disjoint_paths_and_expire_after_crash(
@@ -163,13 +288,28 @@ def test_same_attempt_write_reservations_allow_disjoint_paths_and_expire_after_c
     now = int(time.time())
 
     source = supervisor._reserve_write(
-        attempt["id"], "src/main.py", caller_cwd=worktree, tool_use_id="tool-src", now=now
+        attempt["id"],
+        "src/main.py",
+        caller_cwd=worktree,
+        tool_use_id="tool-src",
+        session_id="session-shared",
+        now=now,
     )
     reused_identity = supervisor._reserve_write(
-        attempt["id"], "docs/readme.md", caller_cwd=worktree, tool_use_id="tool-src", now=now
+        attempt["id"],
+        "docs/readme.md",
+        caller_cwd=worktree,
+        tool_use_id="tool-src",
+        session_id="session-shared",
+        now=now,
     )
     docs = supervisor._reserve_write(
-        attempt["id"], "docs/readme.md", caller_cwd=worktree, tool_use_id="tool-docs", now=now
+        attempt["id"],
+        "docs/readme.md",
+        caller_cwd=worktree,
+        tool_use_id="tool-docs",
+        session_id="session-shared",
+        now=now,
     )
     assert source["allow"] is True
     assert reused_identity["allow"] is False
@@ -181,6 +321,7 @@ def test_same_attempt_write_reservations_allow_disjoint_paths_and_expire_after_c
         "src/main.py",
         caller_cwd=worktree,
         tool_use_id="tool-after-crash",
+        session_id="session-shared",
         now=now + WRITE_RESERVATION_TTL_SECONDS,
     )
     assert expired_retry["allow"] is True
@@ -206,6 +347,7 @@ def test_simultaneous_same_attempt_reservations_are_atomic(claimed, monkeypatch)
                 "alpha.txt",
                 caller_cwd=worktree,
                 tool_use_id=f"tool-{index}",
+                session_id="session-shared",
                 agent_id=f"agent-{index}",
             )
             for index in (1, 2)
@@ -1685,6 +1827,7 @@ def test_cli_pre_hook_serializes_same_attempt_writes_and_fails_closed_without_id
 
     base_payload = {
         "cwd": str(worktree),
+        "session_id": "claude-session-1",
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
         "tool_input": {"file_path": "alpha.txt", "content": "new"},
@@ -1692,6 +1835,21 @@ def test_cli_pre_hook_serializes_same_attempt_writes_and_fails_closed_without_id
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(base_payload)))
     assert main(command) == DENY_EXIT_CODE
     assert json.loads(capsys.readouterr().out)["reason"] == "write_identity_missing"
+
+    missing_session_payload = {**base_payload, "tool_use_id": "tool-missing-session"}
+    missing_session_payload.pop("session_id")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(missing_session_payload)))
+    assert main(command) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "write_identity_missing"
+
+    invalid_session_payload = {
+        **base_payload,
+        "tool_use_id": "tool-invalid-session",
+        "session_id": 7,
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(invalid_session_payload)))
+    assert main(command) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "write_identity_invalid"
 
     invalid_agent_payload = {
         **base_payload,
@@ -1716,6 +1874,7 @@ def test_cli_pre_hook_serializes_same_attempt_writes_and_fails_closed_without_id
         "hook_event_name": "PostToolUse",
         "tool_name": "Write",
         "tool_use_id": "tool-1",
+        "session_id": "claude-session-1",
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(finish)))
     assert main(["--repo", str(repo), "write-finish", "--hook"]) == 0
@@ -1724,6 +1883,7 @@ def test_cli_pre_hook_serializes_same_attempt_writes_and_fails_closed_without_id
         "alpha.txt",
         caller_cwd=worktree,
         tool_use_id="tool-2",
+        session_id="claude-session-1",
         agent_id="agent-2",
     )
     assert retry["allow"] is True
@@ -1736,7 +1896,12 @@ def test_write_finish_hook_releases_success_failure_and_permission_denial(
     supervisor, attempt = claimed
     worktree = Path(attempt["worktree"])
     held = supervisor._reserve_write(
-        attempt["id"], "alpha.txt", caller_cwd=worktree, tool_use_id="tool-1", agent_id="agent-1"
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="tool-1",
+        session_id="claude-session-1",
+        agent_id="agent-1",
     )
     assert held["allow"] is True
     monkeypatch.setenv("ACP_ATTEMPT_ID", attempt["id"])
@@ -1744,12 +1909,18 @@ def test_write_finish_hook_releases_success_failure_and_permission_denial(
         "hook_event_name": hook_event,
         "tool_name": "Write",
         "tool_use_id": "tool-1",
+        "session_id": "claude-session-1",
         "agent_id": "agent-2",
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(wrong_agent_finish)))
     assert main(["--repo", str(repo), "write-finish", "--hook"]) == 0
     still_held = supervisor._reserve_write(
-        attempt["id"], "alpha.txt", caller_cwd=worktree, tool_use_id="tool-2", agent_id="agent-2"
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="tool-2",
+        session_id="claude-session-1",
+        agent_id="agent-2",
     )
     assert still_held["allow"] is False
     assert still_held["reason"] == "concurrent_write_conflict"
@@ -1762,6 +1933,7 @@ def test_write_finish_hook_releases_success_failure_and_permission_denial(
                     "hook_event_name": hook_event,
                     "tool_name": "Write",
                     "tool_use_id": "tool-1",
+                    "session_id": "claude-session-1",
                     "agent_id": "agent-1",
                 }
             )
@@ -1769,7 +1941,12 @@ def test_write_finish_hook_releases_success_failure_and_permission_denial(
     )
     assert main(["--repo", str(repo), "write-finish", "--hook"]) == 0
     retry = supervisor._reserve_write(
-        attempt["id"], "alpha.txt", caller_cwd=worktree, tool_use_id="tool-2", agent_id="agent-2"
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="tool-2",
+        session_id="claude-session-1",
+        agent_id="agent-2",
     )
     assert retry["allow"] is True
 
@@ -1784,6 +1961,7 @@ def test_write_finish_releases_using_tool_use_id_when_agent_id_is_absent(
         "alpha.txt",
         caller_cwd=worktree,
         tool_use_id="tool-with-optional-agent-id",
+        session_id="claude-session-1",
     )["allow"]
     monkeypatch.setenv("ACP_ATTEMPT_ID", attempt["id"])
     monkeypatch.setattr(
@@ -1794,6 +1972,7 @@ def test_write_finish_releases_using_tool_use_id_when_agent_id_is_absent(
                     "hook_event_name": "PostToolUse",
                     "tool_name": "Write",
                     "tool_use_id": "tool-with-optional-agent-id",
+                    "session_id": "claude-session-1",
                 }
             )
         ),
@@ -1801,7 +1980,11 @@ def test_write_finish_releases_using_tool_use_id_when_agent_id_is_absent(
 
     assert main(["--repo", str(repo), "write-finish", "--hook"]) == 0
     retry = supervisor._reserve_write(
-        attempt["id"], "alpha.txt", caller_cwd=worktree, tool_use_id="tool-next"
+        attempt["id"],
+        "alpha.txt",
+        caller_cwd=worktree,
+        tool_use_id="tool-next",
+        session_id="claude-session-1",
     )
     assert retry["allow"] is True
 

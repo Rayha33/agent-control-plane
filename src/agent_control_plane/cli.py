@@ -762,6 +762,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             supervisor._release_write(
                 attempt_id,
                 tool_use_id,
+                session_id=payload.get("session_id", ""),
                 agent_id=payload.get("agent_id", ""),
             )
             return 0
@@ -881,6 +882,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     target,
                     caller_cwd=caller_cwd,
                     tool_use_id=tool_use_id,
+                    session_id=payload.get("session_id", ""),
                     agent_id=agent_id,
                 )
             if not decision["allow"]:
