@@ -280,6 +280,7 @@ def test_parallel_non_overlapping_workers_stay_in_their_own_worktrees(
     assert first["worktree"] != second["worktree"]
     assert first["branch"] != second["branch"]
     base_head = git(repo, "rev-parse", "HEAD")
+    base_status = git(repo, "status", "--porcelain")
 
     worker = """
 import os
@@ -360,7 +361,7 @@ subprocess.run(["git", "commit", "-m", "isolated non-overlapping write"], check=
     assert git(Path(first["worktree"]), "rev-parse", "HEAD^") == base_head
     assert git(Path(second["worktree"]), "rev-parse", "HEAD^") == base_head
     assert git(repo, "rev-parse", "HEAD") == base_head
-    assert not git(repo, "status", "--porcelain")
+    assert git(repo, "status", "--porcelain") == base_status
 
 
 @requires_linux_worker
