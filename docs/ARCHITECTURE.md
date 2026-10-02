@@ -78,16 +78,20 @@ remain independent. For example, `logical:deployment/production` and
 with `logical:deployment`. A declared logical scope is a coordination key, not
 automatic semantic analysis; users still need to declare shared types,
 migrations, and other coupled subsystems. These resources model non-file side
-effects, but downstream gateways must enforce their fencing tokens.
+effects, but downstream gateways must enforce their fencing tokens. The
+`logical:` prefix is reserved case-insensitively after path canonicalization, so
+new filesystem resources cannot use it. For compatibility, an existing schema-v2
+path declaration whose folded key is exactly the same as a logical resource is
+conservatively serialized as an exact-key conflict: the lease table has one
+global resource primary key. Distinct path and logical keys remain type-separated;
+this legacy exact conflict is over-blocking, not hierarchical matching.
 
 Enforcement is fail-closed at claim time, but an operator should not have to
 launch an agent to discover a collision. `acp plan` and `acp queue` answer the
 same question in advance, classifying each collision as `exact` (identical
 normalized scopes) or `potential` (different scopes that can still overlap,
 through filesystem path matching or logical namespace ancestry), and naming the
-owning task, attempt, and agent. The `logical:` prefix is reserved
-case-insensitively; new filesystem resources cannot use a case variant such as
-`Logical:auth`.
+owning task, attempt, and agent.
 
 ### 1b. Planning is a preview, never a mutation
 

@@ -76,8 +76,11 @@ def test_plan_classifies_parent_child_logical_scope_as_potential_overlap(repo: P
     assert conflict["conflicting_resource"] == "logical:auth"
 
 
+@pytest.mark.parametrize(
+    "legacy_declared_path", ["Logical:auth", "./Logical:auth", "./logical:auth"]
+)
 def test_plan_keeps_legacy_case_variant_prefix_path_separate_from_logical_scope(
-    repo: Path,
+    repo: Path, legacy_declared_path: str
 ) -> None:
     supervisor = GitSupervisor(repo)
     legacy_path = make_task(supervisor, "logical:auth", title="legacy path alias")
@@ -85,7 +88,7 @@ def test_plan_keeps_legacy_case_variant_prefix_path_separate_from_logical_scope(
     with supervisor.connect() as connection:
         connection.execute(
             "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
-            (json.dumps({"logical:auth": "Logical:auth"}), legacy_path["id"]),
+            (json.dumps({"logical:auth": legacy_declared_path}), legacy_path["id"]),
         )
     supervisor.claim(legacy_path["id"], "agent-path")
 
@@ -93,6 +96,29 @@ def test_plan_keeps_legacy_case_variant_prefix_path_separate_from_logical_scope(
 
     assert preview["ready"] is True
     assert blockers_of(preview, "resource_conflict") == []
+
+
+def test_plan_and_queue_serialize_identical_legacy_path_and_logical_keys(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    legacy_path = make_task(supervisor, "logical:auth", title="legacy path", priority=90)
+    logical_scope = make_task(supervisor, "logical:auth", title="logical namespace", priority=80)
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": "Logical:auth"}), legacy_path["id"]),
+        )
+
+    queue = supervisor.ready_queue()
+    supervisor.claim(legacy_path["id"], "agent-path")
+    preview = supervisor.plan_claim(logical_scope["id"])
+
+    assert preview["ready"] is False
+    conflict = blockers_of(preview, "resource_conflict")[0]
+    assert conflict["overlap"] == "exact"
+    assert conflict["owner_task_id"] == legacy_path["id"]
+    assert [entry["task_id"] for entry in queue["ready"]] == [legacy_path["id"]]
+    queued_conflict = blockers_of(queue["blocked"][0], "resource_conflict")[0]
+    assert queued_conflict["overlap"] == "exact"
 
 
 def test_plan_keeps_sibling_logical_scopes_parallel(repo: Path) -> None:
@@ -206,6 +232,25 @@ def test_ready_queue_reserves_parent_logical_scope_but_admits_sibling(repo: Path
     assert conflict["overlap"] == "potential"
     assert conflict["owner_kind"] == "queued"
     assert conflict["owner_task_id"] == parent["id"]
+
+
+def test_ready_queue_keeps_legacy_path_alias_separate_from_logical_child(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    legacy_path = make_task(supervisor, "logical:auth", title="legacy path", priority=90)
+    logical_child = make_task(supervisor, "logical:auth/sessions", title="sessions", priority=80)
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": "./logical:auth"}), legacy_path["id"]),
+        )
+
+    queue = supervisor.ready_queue()
+
+    assert [entry["task_id"] for entry in queue["ready"]] == [
+        legacy_path["id"],
+        logical_child["id"],
+    ]
+    assert queue["blocked"] == []
 
 
 def test_ready_queue_is_deterministic_and_read_only(repo: Path) -> None:

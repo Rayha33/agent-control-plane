@@ -33,7 +33,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from support import git, init_repo, make_task
+from support import commit_change, git, init_repo, make_task
 
 from agent_control_plane.git_supervisor import (
     META_CASE_SENSITIVE,
@@ -333,6 +333,27 @@ def test_submit_still_accepts_the_other_case_on_a_case_insensitive_filesystem(
 
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert submission["changed_paths"] == ["makefile"]
+
+
+@pytest.mark.parametrize("declared_path", ["./Logical:auth", "./logical:auth"])
+def test_submit_accepts_a_legacy_dot_prefixed_logical_path_alias(
+    repo: Path, declared_path: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "logical:auth")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": declared_path}), created["id"]),
+        )
+    attempt = supervisor.claim(created["id"], "worker")
+    record_case_sensitivity(supervisor, True)
+    changed_path = declared_path.removeprefix("./")
+    commit_change(attempt, changed_path, "value = 'legacy path'\n")
+
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert submission["changed_paths"] == [changed_path]
 
 
 # ------------------------------------------------------------- the operator surfaces

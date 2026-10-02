@@ -197,8 +197,12 @@ as file paths. A reservation on <code>logical:auth</code> overlaps
 independent. ACP compares declared names only—it does not infer semantic
 coupling from source code.
 
-The `logical:` prefix is reserved case-insensitively; filesystem resource names
-cannot use a case variant such as `Logical:auth`.
+The `logical:` prefix is reserved case-insensitively after path canonicalization;
+new filesystem resources cannot use a case variant such as `Logical:auth`. For
+compatibility, an existing path and logical scope with the same folded lease key
+are conservatively serialized as an exact-key conflict because ACP has one global
+lease primary key. Distinct path and logical keys do not inherit hierarchical
+overlap across types.
 
 The command must leave a clean, committed worktree. A successful supervised run
 submits automatically. For a manually operated agent:

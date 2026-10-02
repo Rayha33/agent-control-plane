@@ -596,8 +596,11 @@ class GitSupervisor(
         left_declared: str | None = None,
         right_declared: str | None = None,
     ) -> bool:
-        # Exact canonical keys always conflict: resource_leases has a single key
-        # namespace, so even a legacy path/logical alias cannot be leased twice.
+        # Exact canonical keys always conflict. `resource_leases` has one global
+        # primary-key namespace, so a pre-v3 path/logical alias with the same folded
+        # key must be serialized rather than allowed to overwrite its fencing row.
+        # This is a conservative legacy-only exact conflict; distinct keys never
+        # inherit logical ancestry across path/logical types.
         if left == right:
             return True
 
