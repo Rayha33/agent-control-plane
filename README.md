@@ -349,21 +349,33 @@ agent's attempt.
 ## Operator status
 
 Running three to six agents turns attention itself into the bottleneck — which
-session is stuck, which finished, which is quietly holding a resource.
+session needs a look, which finished, which is quietly holding a resource.
 
 ~~~bash
 uv run --extra dev acp status                      # canonical JSON
 uv run --extra dev acp status --format text        # one screen
+uv run --extra dev acp status --checkpoint-stale-seconds 900  # optional advisory threshold
 uv run --extra dev acp status --watch --interval 2 --format text
 ~~~
 
 The attention queue is ranked, worst first: <code>human_required</code>,
-<code>cleanup_failed</code>, <code>lease_risk</code>, <code>review</code>, then
-<code>active</code>. Every task reports its phase, heartbeat age, checkpoint,
-claimed paths, runtime allocations, worker liveness, latest QC verdict, and
-blockers. Attempts whose lease has expired but which no reaper has visited yet
+<code>cleanup_failed</code>, <code>lease_risk</code>, <code>review</code>,
+<code>checkpoint_stale</code> (only when its threshold is configured), then
+<code>active</code>. Every task reports its phase, lease-heartbeat age,
+checkpoint age and value, claimed paths, runtime allocations, worker liveness,
+latest QC verdict, and blockers. Omitting <code>--checkpoint</code> from a
+heartbeat renews liveness without replacing the explicit checkpoint. A newly
+asserted checkpoint establishes its age; a changed checkpoint refreshes it. The
+optional stale-checkpoint signal is only
+an operator advisory about an unchanged explicit checkpoint: it does not prove
+objective progress, fail or terminate a worker, or requeue a task. Attempts whose
+lease has expired but which no reaper has visited yet
 are reported as <code>awaiting_reap</code> rather than being reaped by the act
-of looking at them.
+of looking at them. For databases upgraded from schema v2, both heartbeat and
+checkpoint ages are unknown until the v3 code records them. Older workers can
+still renew their leases without updating the new timestamps, so status does not
+guess from their legacy writes; it shows <code>hb -</code> and <code>cp unknown</code>
+while lease countdown and registered-process identity remain separate signals.
 
 JSON remains canonical; <code>--format text</code> renders that same snapshot.
 Use <code>--limit</code> to bound large boards.

@@ -19,6 +19,7 @@ from support import init_repo, make_task
 from agent_control_plane import __version__, git_supervisor
 from agent_control_plane.cli import READ_ONLY_ACTIONS, main
 from agent_control_plane.git_supervisor import (
+    MIGRATIONS,
     SCHEMA_VERSION,
     GitSupervisor,
     SupervisorError,
@@ -74,6 +75,96 @@ def test_initialize_stamps_the_version_and_the_writer(repo: Path) -> None:
     recorded = meta(repo)
     assert recorded[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
     assert recorded[SCHEMA_WRITTEN_BY_KEY] == __version__
+
+
+def test_attempt_progress_migration_keeps_legacy_ages_unknown() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE tasks (id TEXT PRIMARY KEY);
+        CREATE TABLE attempts (
+          id TEXT PRIMARY KEY,
+          checkpoint_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE submissions (id TEXT PRIMARY KEY);
+        CREATE TABLE qc_runs (id TEXT PRIMARY KEY);
+        INSERT INTO attempts VALUES(
+          'attempt-1', '{"phase":"tests"}',
+          '2025-01-01T00:00:00Z', '2025-01-02T00:00:00Z'
+        );
+        """
+    )
+
+    migration = dict(MIGRATIONS)[3]
+    migration(connection)
+    row = connection.execute(
+        "SELECT heartbeat_at, checkpoint_at, checkpoint_json FROM attempts WHERE id = 'attempt-1'"
+    ).fetchone()
+    assert row["heartbeat_at"] == ""
+    assert row["checkpoint_at"] == ""
+    assert row["checkpoint_json"] == '{"phase":"tests"}'
+
+    migration(connection)
+    repeated = connection.execute(
+        "SELECT heartbeat_at, checkpoint_at, checkpoint_json FROM attempts WHERE id = 'attempt-1'"
+    ).fetchone()
+    assert dict(repeated) == dict(row)
+    connection.close()
+
+
+def test_read_only_open_refuses_version_two_before_touching_database(repo: Path) -> None:
+    """v2 databases lack independent heartbeat/checkpoint timestamps."""
+
+    connection = sqlite3.connect(db_path(repo))
+    connection.execute("ALTER TABLE attempts DROP COLUMN checkpoint_at")
+    connection.execute("ALTER TABLE attempts DROP COLUMN heartbeat_at")
+    connection.execute("UPDATE meta SET value = '2' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+    connection.commit()
+    connection.close()
+
+    before = fingerprint(repo)
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+    assert "version 2" in str(error.value)
+    assert fingerprint(repo) == before
+
+
+def test_read_write_open_applies_version_three_progress_migration(repo: Path) -> None:
+    original = GitSupervisor(repo)
+    created = make_task(original, "alpha.txt")
+    attempt = original.claim(created["id"], "agent-a")
+    with original.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET checkpoint_json = ? WHERE id = ?",
+            ('{"phase":"tests"}', attempt["id"]),
+        )
+
+    connection = sqlite3.connect(db_path(repo))
+    connection.execute("ALTER TABLE attempts DROP COLUMN checkpoint_at")
+    connection.execute("ALTER TABLE attempts DROP COLUMN heartbeat_at")
+    connection.execute("UPDATE meta SET value = '2' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+    connection.commit()
+    connection.close()
+
+    supervisor = GitSupervisor(repo)
+    assert supervisor.schema_version_on_open == 2
+    assert meta(repo)[SCHEMA_VERSION_KEY] == "3"
+    with supervisor.connect() as migrated:
+        columns = {row["name"] for row in migrated.execute("PRAGMA table_info(attempts)")}
+    assert {"heartbeat_at", "checkpoint_at"} <= columns
+    restored = supervisor.attempt(attempt["id"])
+    assert restored["checkpoint"] == {"phase": "tests"}
+    assert restored["heartbeat_at"] == ""
+    assert restored["checkpoint_at"] == ""
+    status = supervisor.status(checkpoint_stale_seconds=1)
+    entry = next(item for item in status["tasks"] if item["task_id"] == created["id"])
+    assert entry["heartbeat_age_seconds"] is None
+    assert entry["checkpoint_age_seconds"] is None
+    assert entry["checkpoint_stale_advisory"] is False
 
 
 def test_read_write_open_refuses_a_database_from_the_future(repo: Path) -> None:

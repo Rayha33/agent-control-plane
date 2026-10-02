@@ -238,6 +238,11 @@ def parser() -> argparse.ArgumentParser:
         default=DEFAULT_LEASE_RISK_SECONDS,
         help="flag an attempt whose lease expires within this many seconds",
     )
+    status.add_argument(
+        "--checkpoint-stale-seconds",
+        type=positive_seconds,
+        help="advisory when an active attempt's explicit checkpoint is unchanged this long",
+    )
     status.add_argument("--watch", action="store_true", help="refresh until interrupted")
     status.add_argument("--interval", type=float, default=2.0, help="seconds between refreshes")
     status.add_argument(
@@ -254,7 +259,10 @@ def parser() -> argparse.ArgumentParser:
     heartbeat = commands.add_parser("heartbeat", help="renew a fenced attempt")
     heartbeat.add_argument("attempt_id")
     heartbeat.add_argument("--token", type=int, required=True, dest="claim_token")
-    heartbeat.add_argument("--checkpoint", default="{}")
+    heartbeat.add_argument(
+        "--checkpoint",
+        help="replace the explicit progress checkpoint (omitting it only renews liveness)",
+    )
     heartbeat.add_argument("--lease-seconds", type=int)
     add_credential_source(heartbeat)
     submit = commands.add_parser("submit", help="submit committed Git evidence")
@@ -520,7 +528,9 @@ def watch_status(supervisor: GitSupervisor, args: Any) -> int:
     iteration = 0
     try:
         while True:
-            snapshot = supervisor.status(args.limit, args.lease_risk_seconds)
+            snapshot = supervisor.status(
+                args.limit, args.lease_risk_seconds, args.checkpoint_stale_seconds
+            )
             if args.output_format == "text":
                 print(supervisor.render_status(snapshot), flush=True)
             else:
@@ -531,6 +541,16 @@ def watch_status(supervisor: GitSupervisor, args: Any) -> int:
             time.sleep(max(0.1, args.interval))
     except KeyboardInterrupt:
         return 0
+
+
+def positive_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer number of seconds") from error
+    if seconds < 1:
+        raise argparse.ArgumentTypeError("must be at least one second")
+    return seconds
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -649,14 +669,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _read_credential(args),
             )
         elif args.action == "heartbeat":
-            try:
-                checkpoint = json.loads(args.checkpoint)
-            except json.JSONDecodeError as error:
-                raise SupervisorError(
-                    "invalid_checkpoint", "checkpoint must be a JSON object"
-                ) from error
-            if not isinstance(checkpoint, dict):
-                raise SupervisorError("invalid_checkpoint", "checkpoint must be a JSON object")
+            checkpoint = None
+            if args.checkpoint is not None:
+                try:
+                    checkpoint = json.loads(args.checkpoint)
+                except json.JSONDecodeError as error:
+                    raise SupervisorError(
+                        "invalid_checkpoint", "checkpoint must be a JSON object"
+                    ) from error
+                if not isinstance(checkpoint, dict):
+                    raise SupervisorError("invalid_checkpoint", "checkpoint must be a JSON object")
             result = supervisor.heartbeat(
                 args.attempt_id,
                 args.claim_token,

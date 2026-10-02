@@ -86,6 +86,8 @@ class ViewsMixin:
             "start_sha": row["start_sha"],
             "latest_sha": row["latest_sha"],
             "checkpoint": json.loads(row["checkpoint_json"]),
+            "heartbeat_at": row["heartbeat_at"],
+            "checkpoint_at": row["checkpoint_at"],
             "pid": row["pid"],
             "pid_identity": row["pid_identity"],
             "termination_target_status": row["termination_target_status"],
@@ -226,9 +228,10 @@ class ViewsMixin:
         self,
         limit: int | None = None,
         lease_risk_seconds: int = DEFAULT_LEASE_RISK_SECONDS,
+        checkpoint_stale_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Operator snapshot: attention queue, phases, runtimes, blockers. Read-only."""
-        snapshot = StatusView(self).snapshot(limit, lease_risk_seconds)
+        snapshot = StatusView(self).snapshot(limit, lease_risk_seconds, checkpoint_stale_seconds)
         with self.connect() as connection:
             reclaimable, _ = self._gc_survey(connection, time.time(), DEFAULT_GC_RETENTION_SECONDS)
         snapshot["disk"] = {

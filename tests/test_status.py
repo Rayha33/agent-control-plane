@@ -42,7 +42,24 @@ def test_status_reports_phase_paths_and_runtime_for_a_working_attempt(repo: Path
     assert entry["claimed_paths"] == ["alpha.txt"]
     assert entry["runtime"]["state"] == "ready"
     assert entry["heartbeat_age_seconds"] >= 0
+    assert entry["checkpoint_age_seconds"] is None
+    assert entry["checkpoint_stale_advisory"] is False
     assert entry["worker"]["status"] == "working"
+
+
+def test_first_explicit_empty_checkpoint_establishes_age(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "agent-a")
+
+    assert entry_for(supervisor.status(), created["id"])["checkpoint_age_seconds"] is None
+
+    supervisor.heartbeat(attempt["id"], attempt["claim_token"], {})
+
+    entry = entry_for(supervisor.status(), created["id"])
+    assert entry["checkpoint"] == {}
+    assert entry["checkpoint_age_seconds"] is not None
+    assert entry["checkpoint_age_seconds"] < 60
 
 
 def test_status_never_mutates_even_with_an_expired_attempt(repo: Path) -> None:
@@ -70,7 +87,13 @@ def test_heartbeat_age_shrinks_after_a_heartbeat(repo: Path) -> None:
     attempt = supervisor.claim(created["id"], "agent-a")
     with supervisor.connect() as connection:
         connection.execute(
-            "UPDATE attempts SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+            """
+            UPDATE attempts
+            SET heartbeat_at = '2020-01-01T00:00:00Z',
+                checkpoint_at = '2020-01-01T00:00:00Z',
+                updated_at = '2020-01-01T00:00:00Z'
+            WHERE id = ?
+            """,
             (attempt["id"],),
         )
     stale = entry_for(supervisor.status(), created["id"])["heartbeat_age_seconds"]
@@ -81,6 +104,78 @@ def test_heartbeat_age_shrinks_after_a_heartbeat(repo: Path) -> None:
     entry = entry_for(supervisor.status(), created["id"])
     assert entry["heartbeat_age_seconds"] < 60
     assert entry["checkpoint"] == {"phase": "tests"}
+    assert entry["checkpoint_age_seconds"] < 60
+
+
+def test_liveness_renewal_preserves_checkpoint_and_its_age(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    supervisor.heartbeat(attempt["id"], attempt["claim_token"], {"phase": "editing"})
+
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET checkpoint_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+            (attempt["id"],),
+        )
+
+    supervisor.heartbeat(attempt["id"], attempt["claim_token"])
+    entry = entry_for(supervisor.status(), created["id"])
+    assert entry["checkpoint"] == {"phase": "editing"}
+    assert entry["heartbeat_age_seconds"] < 60
+    assert entry["checkpoint_age_seconds"] > 100000
+
+    supervisor.heartbeat(attempt["id"], attempt["claim_token"], {"phase": "editing"})
+    same = entry_for(supervisor.status(), created["id"])
+    assert same["checkpoint_age_seconds"] > 100000
+
+    supervisor.heartbeat(attempt["id"], attempt["claim_token"], {"phase": "tests"})
+    changed = entry_for(supervisor.status(), created["id"])
+    assert changed["checkpoint"] == {"phase": "tests"}
+    assert changed["checkpoint_age_seconds"] < 60
+
+
+def test_checkpoint_stale_threshold_is_advisory_only(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="slow test run")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    supervisor.heartbeat(attempt["id"], attempt["claim_token"], {"phase": "tests"})
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET checkpoint_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+            (attempt["id"],),
+        )
+
+    without_threshold = entry_for(supervisor.status(), created["id"])
+    assert without_threshold["category"] == "active"
+    assert without_threshold["checkpoint_stale_advisory"] is False
+
+    snapshot = supervisor.status(checkpoint_stale_seconds=60)
+    entry = entry_for(snapshot, created["id"])
+    assert entry["checkpoint_stale_advisory"] is True
+    assert entry["status"] == "working"
+    item = next(item for item in snapshot["attention"] if item["task_id"] == created["id"])
+    assert item["category"] == "checkpoint_stale"
+    assert "does not establish progress" in item["reason"]
+    assert entry["heartbeat_age_seconds"] < 60
+    assert supervisor.render_status(snapshot).count("checkpoint unchanged") == 1
+
+
+def test_unknown_legacy_checkpoint_age_is_not_marked_stale(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="legacy checkpoint")
+    attempt = supervisor.claim(created["id"], "agent-a")
+    with supervisor.connect() as connection:
+        connection.execute("UPDATE attempts SET checkpoint_at = '' WHERE id = ?", (attempt["id"],))
+
+    snapshot = supervisor.status(checkpoint_stale_seconds=1)
+    entry = entry_for(snapshot, created["id"])
+
+    assert entry["heartbeat_age_seconds"] is not None
+    assert entry["checkpoint_age_seconds"] is None
+    assert entry["checkpoint_stale_advisory"] is False
+    assert entry["category"] == "active"
+    assert "cp unknown" in supervisor.render_status(snapshot)
 
 
 def test_attention_queue_ranks_human_required_above_active_work(repo: Path) -> None:
