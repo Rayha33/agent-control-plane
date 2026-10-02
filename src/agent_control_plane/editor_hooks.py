@@ -326,6 +326,86 @@ def _merge_hook_events(
     return merged
 
 
+def _acp_subcommand_index(arguments: list[str], *, allow_wrappers: bool) -> int | None:
+    """Return the ACP subcommand position only for a recognized launcher shape."""
+
+    if not arguments:
+        return None
+
+    def basename(argument: str) -> str:
+        executable = argument.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return executable[:-4] if executable.endswith(".exe") else executable
+
+    launcher = basename(arguments[0])
+    if launcher == "acp":
+        index = 1
+    elif allow_wrappers and launcher in {
+        "uv",
+        "poetry",
+        "pipenv",
+        "pipx",
+        "pdm",
+        "hatch",
+        "rye",
+    }:
+        if len(arguments) < 3 or arguments[1] != "run":
+            return None
+        index = 2
+        value_options = {
+            "--directory",
+            "--project",
+            "--with",
+            "--with-editable",
+            "--with-requirements",
+            "--with-package",
+            "--python",
+            "--script",
+            "--env-file",
+        }
+        while index < len(arguments) and arguments[index].startswith("-"):
+            option = arguments[index].split("=", 1)[0]
+            index += 2 if option in value_options and "=" not in arguments[index] else 1
+        if index >= len(arguments) or basename(arguments[index]) != "acp":
+            return None
+        index += 1
+    elif allow_wrappers and launcher == "env":
+        index = 1
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument in {"-u", "--unset", "-C", "--chdir"}:
+                index += 2
+            elif argument.startswith("-") or "=" in argument:
+                index += 1
+            else:
+                break
+        if index >= len(arguments) or basename(arguments[index]) != "acp":
+            return None
+        index += 1
+    elif allow_wrappers and launcher.startswith(("python", "pypy")):
+        module_position = next(
+            (
+                position
+                for position in range(1, len(arguments) - 1)
+                if arguments[position] == "-m"
+                and arguments[position + 1] in {"agent_control_plane", "agent_control_plane.cli"}
+            ),
+            None,
+        )
+        if module_position is None:
+            return None
+        index = module_position + 2
+    else:
+        return None
+
+    while index < len(arguments) and arguments[index].startswith("-"):
+        option = arguments[index].split("=", 1)[0]
+        if option in {"--repo", "--credential-fd"} and "=" not in arguments[index]:
+            index += 2
+        else:
+            index += 1
+    return index
+
+
 def _is_acp_hook(hook: Any, command: str) -> bool:
     if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
         return False
@@ -342,31 +422,23 @@ def _is_acp_hook(hook: Any, command: str) -> bool:
             or parts[index : index + 2] == ["snapshot", "--hook"]
         )
 
-    if ACP_MANAGED_HOOK_FLAG in arguments:
-        return any(is_managed_invocation(arguments, index) for index in range(len(arguments)))
+    # New hook commands carry an ownership marker. Still require it to follow
+    # an ACP launcher at the real executable/subcommand position; an `echo`
+    # command containing both the marker and ACP-looking words is user-owned.
+    managed_marker = ACP_MANAGED_HOOK_FLAG in arguments
+    index = _acp_subcommand_index(arguments, allow_wrappers=managed_marker)
+    if index is not None and is_managed_invocation(arguments, index):
+        return True
 
-    # Historical generated hooks have no ownership marker. Match the exact
-    # configured command prefix, or a direct `acp` executable with its known
-    # root-level options. Never search arbitrary argv tokens: `echo acp guard
-    # --hook` is somebody else's hook, not an ACP command.
+    # Older hooks may use a wrapper command without a marker. Remove those only
+    # while the exact configured wrapper is still selected. Direct `acp` paths
+    # above remain recognizable if the configured executable path has changed.
     if configured_prefix and arguments[: len(configured_prefix)] == configured_prefix:
-        return is_managed_invocation(arguments, len(configured_prefix))
-
-    if not arguments:
-        return False
-    executable = arguments[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if executable.endswith(".exe"):
-        executable = executable[:-4]
-    if executable != "acp":
-        return False
-    index = 1
-    while index < len(arguments) and arguments[index].startswith("-"):
-        option = arguments[index].split("=", 1)[0]
-        if option in {"--repo", "--credential-fd"} and "=" not in arguments[index]:
-            index += 2
-        else:
-            index += 1
-    return is_managed_invocation(arguments, index)
+        prefix_index = _acp_subcommand_index(configured_prefix, allow_wrappers=True)
+        return prefix_index == len(configured_prefix) and is_managed_invocation(
+            arguments, len(configured_prefix)
+        )
+    return False
 
 
 def _ensure_local_settings_ignored(root: Path) -> None:

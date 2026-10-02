@@ -20,6 +20,7 @@ from support import init_repo, make_task
 
 from agent_control_plane.cli import main
 from agent_control_plane.editor_hooks import (
+    ACP_MANAGED_HOOK_FLAG,
     DENY_EXIT_CODE,
     GUARDED_TOOLS,
     install_claude_code_hooks,
@@ -1013,6 +1014,10 @@ def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hoo
                                     "type": "command",
                                     "command": "echo acp guard --hook",
                                 },
+                                {
+                                    "type": "command",
+                                    "command": f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}",
+                                },
                                 {"type": "command", "command": "my-read-audit"},
                             ],
                         }
@@ -1060,10 +1065,42 @@ def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hoo
     assert "my-audit" in commands
     assert "my-read-audit" in commands
     assert "echo acp guard --hook" in commands
+    assert f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}" in commands
     assert any(command.startswith("acp guard --describe ") for command in commands)
     assert not any(command.startswith("/old/venv/acp ") for command in commands)
     assert not any("snapshot --hook" in command for command in commands)
     assert not any("guard --hook --freshness" in command for command in commands)
+
+
+def test_managed_hook_marker_removes_a_changed_wrapper_but_not_an_echo_hook(
+    tmp_path: Path,
+) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    install_claude_code_hooks(tmp_path, command="uv run acp", stale_write_guard=True)
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings["hooks"]["PreToolUse"].append(
+        {
+            "matcher": "Read",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}",
+                }
+            ],
+        }
+    )
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+    install_claude_code_hooks(tmp_path, command="acp")
+    installed = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]
+    commands = [
+        hook["command"]
+        for event in installed.values()
+        for entry in event
+        for hook in entry.get("hooks", [])
+    ]
+    assert f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}" in commands
+    assert not any(command.startswith("uv run acp ") for command in commands)
 
 
 def test_codex_install_preserves_user_hooks_and_replaces_its_own_entry(tmp_path: Path) -> None:
