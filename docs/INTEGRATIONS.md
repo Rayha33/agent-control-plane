@@ -78,6 +78,33 @@ checkout where it is installed.
 - **SessionStart** → `acp guard --describe`, so the session starts knowing its worktree
   and write set rather than discovering the boundary by hitting it.
 
+### Optional stale full-file write check
+
+Install with `--stale-write-guard` to add a conservative freshness check for Claude
+Code's structured `Write` tool:
+
+```bash
+acp --repo "$BASE" hooks install --claude-code --attempt "$ATTEMPT" \
+  --stale-write-guard
+```
+
+The `Read` pre-hook stores a SHA-256 snapshot for declared write paths. Before a full
+`Write` replacement, ACP compares the current bytes with the latest snapshot; a change,
+an expired/missing baseline for an existing file, or an unreadable/oversized file denies
+the write and tells the agent to read again. A still-absent path may be created. Only a
+subsequent supported `Read` refreshes the snapshot; an agent that writes a file must read
+it again before another full-file replacement. Snapshots are scoped to one attempt and
+path, expire after 24 hours, are capped at 256 paths per attempt, and are limited to 16 MiB
+per file. The option is off by default.
+
+This is an optimistic stale-content check, not a filesystem lock or atomic compare-and-
+swap: another process can still change a file in the small interval between the pre-write
+check and Claude Code's write. It covers only structured Claude `Write` operations whose
+`Read`/`Write` hooks actually run. It does not cover `Edit`, `MultiEdit`, Bash, MCP or
+custom clients, reads through other tools or `@` prompt references, or disabled/untrusted
+hooks. Do not treat it as a security boundary or as proof that every agent write was
+checked.
+
 The install **merges**. Hooks you already have — including your own `PreToolUse`
 entries — are preserved, previous ACP entries are replaced rather than duplicated, and
 a `settings.json` that is not valid JSON is left untouched with an error instead of

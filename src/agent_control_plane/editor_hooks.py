@@ -70,16 +70,36 @@ def cwd_from_hook_payload(payload: Any) -> str | None:
     return cwd if isinstance(cwd, str) and cwd.strip() else None
 
 
-def claude_code_hooks(command: str) -> dict[str, Any]:
+def claude_code_hooks(command: str, *, stale_write_guard: bool = False) -> dict[str, Any]:
     """The hook block ACP owns, keyed so an update can replace it in place."""
 
-    return {
-        "PreToolUse": [
+    guard_command = f"{command} guard --hook"
+    pre_tool_use = [
+        {
+            "matcher": HOOK_TOOL_MATCHER,
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{guard_command}{' --freshness' if stale_write_guard else ''}",
+                }
+            ],
+        }
+    ]
+    if stale_write_guard:
+        pre_tool_use.append(
             {
-                "matcher": HOOK_TOOL_MATCHER,
-                "hooks": [{"type": "command", "command": f"{command} guard --hook"}],
+                "matcher": "Read",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{command} snapshot --hook",
+                    }
+                ],
             }
-        ],
+        )
+    return {
+        "PreToolUse": pre_tool_use,
+        "PostToolUse": [],
         "SessionStart": [
             {"hooks": [{"type": "command", "command": f"{command} guard --describe"}]}
         ],
@@ -275,9 +295,13 @@ def _merge_hook_events(
     """
 
     merged = dict(existing)
-    for event, entries in generated.items():
+    for event in dict.fromkeys([*existing, *generated]):
+        entries = generated.get(event, [])
         kept = [entry for entry in merged.get(event, []) if not _is_acp_entry(entry, command)]
-        merged[event] = kept + entries
+        if kept or entries:
+            merged[event] = kept + entries
+        else:
+            merged.pop(event, None)
     return merged
 
 
@@ -287,7 +311,7 @@ def _is_acp_entry(entry: Any, command: str) -> bool:
     return any(
         isinstance(hook, dict)
         and isinstance(hook.get("command"), str)
-        and hook["command"].startswith(f"{command} guard")
+        and hook["command"].startswith((f"{command} guard", f"{command} snapshot"))
         for hook in entry.get("hooks", [])
     )
 
@@ -350,7 +374,11 @@ def _ensure_local_hook_file_ignored(root: Path, relative: Path, temporary_patter
 
 
 def install_claude_code_hooks(
-    root: Path, command: str = "acp", *, local: bool = False
+    root: Path,
+    command: str = "acp",
+    *,
+    local: bool = False,
+    stale_write_guard: bool = False,
 ) -> dict[str, Any]:
     """Write ACP hooks into project or personal-local settings, preserving the rest."""
 
@@ -387,7 +415,7 @@ def install_claude_code_hooks(
 
     settings["hooks"] = _merge_hook_events(
         settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {},
-        claude_code_hooks(command),
+        claude_code_hooks(command, stale_write_guard=stale_write_guard),
         command,
     )
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,6 +439,7 @@ def install_claude_code_hooks(
         "scope": "project-local" if local else "project",
         "guarded_tools": list(GUARDED_TOOLS),
         "unguarded": ["Bash"],
+        "stale_write_guard": stale_write_guard,
         "note": (
             "Bash is not guarded: what a shell command writes cannot be read off the "
             "command string. Confine the agent to the worktree instead."

@@ -126,6 +126,30 @@ def test_read_write_open_upgrades_an_unstamped_database(repo: Path) -> None:
     }
 
 
+def test_version_two_upgrade_creates_the_file_snapshot_ledger(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("DROP TABLE file_snapshots")
+        connection.execute("UPDATE meta SET value = '2' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    upgraded = GitSupervisor(repo)
+    assert upgraded.schema_version_on_open == 2
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with upgraded.connect() as connection:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(file_snapshots)")}
+        indexes = {row["name"] for row in connection.execute("PRAGMA index_list(file_snapshots)")}
+    assert {
+        "attempt_id",
+        "path",
+        "file_exists",
+        "sha256",
+        "byte_size",
+        "observed_at_ns",
+        "expires_at",
+    } <= columns
+    assert "idx_file_snapshots_expiry" in indexes
+
+
 def test_a_stamp_that_is_not_a_version_is_never_guessed(repo: Path) -> None:
     write_meta(repo, SCHEMA_VERSION_KEY, "v2-ish")
     with pytest.raises(SupervisorError) as error:

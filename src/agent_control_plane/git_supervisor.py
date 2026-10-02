@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -223,7 +223,32 @@ def _add_declared_resources(connection: sqlite3.Connection) -> None:
         )
 
 
-MIGRATIONS: tuple[Migration, ...] = ((2, _add_declared_resources),)
+def _create_file_snapshots(connection: sqlite3.Connection) -> None:
+    """Store short-lived per-attempt editor read fingerprints for opt-in freshness checks."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_snapshots (
+          attempt_id TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+          path TEXT NOT NULL,
+          file_exists INTEGER NOT NULL CHECK (file_exists IN (0, 1)),
+          sha256 TEXT NOT NULL,
+          byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+          observed_at_ns INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          PRIMARY KEY (attempt_id, path)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_snapshots_expiry ON file_snapshots(expires_at)"
+    )
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    (2, _add_declared_resources),
+    (3, _create_file_snapshots),
+)
 
 
 def stored_schema_version(connection: sqlite3.Connection) -> int | None:

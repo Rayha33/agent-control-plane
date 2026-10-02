@@ -7,21 +7,102 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import time
 import unicodedata
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..scheduling import declared_resources, normalize_artifact
 from .common import SUBMISSION_OBJECT_CONTRACT, SupervisorError, canonical_json, sha256, utc_now
 from .schema import META_CASE_SENSITIVE
+
+FILE_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
+MAX_FILE_SNAPSHOTS_PER_ATTEMPT = 256
+MAX_FILE_SNAPSHOT_BYTES = 16 * 1024 * 1024
+
+
+def _file_snapshot(path: Path) -> tuple[bool, str, int]:
+    """Return a bounded content fingerprint, or an explicit absent-file marker.
+
+    This is an optimistic stale-content check, not an OS-level write lock. Stat the
+    descriptor on both sides of the digest so a file changing while it is hashed is
+    never recorded as a trustworthy snapshot.
+    """
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False, "", 0
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("only regular files can be freshness-checked")
+    if info.st_size > MAX_FILE_SNAPSHOT_BYTES:
+        raise OverflowError(
+            f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
+        )
+
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("only regular files can be freshness-checked")
+        identity_at_open = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        identity_opened = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        if identity_at_open != identity_opened:
+            raise OSError("file changed while its freshness snapshot was being opened")
+        if before.st_size > MAX_FILE_SNAPSHOT_BYTES:
+            raise OverflowError(
+                f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
+            )
+        size = 0
+        while block := source.read(1024 * 1024):
+            size += len(block)
+            if size > MAX_FILE_SNAPSHOT_BYTES:
+                raise OverflowError(
+                    f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
+                )
+            digest.update(block)
+        after = os.fstat(source.fileno())
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after or size != after.st_size:
+        raise OSError("file changed while its freshness snapshot was being computed")
+    return True, digest.hexdigest(), size
+
+
+@contextmanager
+def _snapshot_write_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Open only the narrow SQLite transaction needed for ephemeral snapshots.
+
+    A normal read-write supervisor open also reconciles lifecycle state and changes
+    persistent SQLite pragmas. A Claude Read hook must not trigger those unrelated
+    effects, so this cache-like table gets its own explicit, minimal connection.
+    """
+
+    connection = sqlite3.connect(db_path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 class ClaimsMixin:
@@ -379,6 +460,218 @@ class ClaimsMixin:
             if not row:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             return self._attempt_view(connection, row)
+
+    def record_file_snapshot(
+        self,
+        attempt_id: str,
+        path: str,
+        *,
+        caller_cwd: str | Path | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Remember the bytes observed before a supported editor read.
+
+        This operation records advisory freshness state only. It never blocks a read;
+        later write authorization still goes through :meth:`guard` and the declared
+        write set. The adapter may therefore safely call this for every Claude Read.
+        """
+
+        epoch = int(time.time()) if now is None else now
+        decision = self.guard(attempt_id, path, caller_cwd=caller_cwd, now=epoch)
+        if not decision["allow"]:
+            return {
+                "ok": True,
+                "recorded": False,
+                "reason": decision["reason"],
+                "detail": decision["detail"],
+            }
+
+        target = Path(decision["path"])
+        try:
+            file_exists, digest, size = _file_snapshot(target)
+        except (OSError, OverflowError, ValueError) as error:
+            reason = (
+                "snapshot_too_large" if isinstance(error, OverflowError) else "snapshot_unavailable"
+            )
+            return {"ok": True, "recorded": False, "reason": reason, "detail": str(error)}
+
+        with _snapshot_write_connection(self.db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = connection.execute(
+                "SELECT status, lease_expires_at, worktree, task_id FROM attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt["status"] not in {"provisioning", "working"}
+                or attempt["lease_expires_at"] <= epoch
+            ):
+                return {
+                    "ok": True,
+                    "recorded": False,
+                    "reason": "attempt_not_live",
+                    "detail": "the attempt is no longer live; no freshness state was recorded",
+                }
+
+            worktree = Path(attempt["worktree"]).resolve()
+            if target != worktree and worktree not in target.parents:
+                return {
+                    "ok": True,
+                    "recorded": False,
+                    "reason": "outside_worktree",
+                    "detail": "the resolved file is outside the attempt worktree",
+                }
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (attempt["task_id"],)
+            ).fetchone()
+            declared_rules = (
+                self._write_set_rules(task, self._case_sensitive_paths(connection)) if task else []
+            )
+            relative_path = target.relative_to(worktree).as_posix()
+            if not any(
+                self._path_matches(relative_path, resource, fold=fold)
+                for resource, fold in declared_rules
+            ):
+                return {
+                    "ok": True,
+                    "recorded": False,
+                    "reason": "undeclared_write",
+                    "detail": "the file is not in the attempt's declared write set",
+                }
+
+            connection.execute("DELETE FROM file_snapshots WHERE expires_at <= ?", (epoch,))
+            connection.execute(
+                """
+                INSERT INTO file_snapshots (
+                  attempt_id, path, file_exists, sha256, byte_size, observed_at_ns, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attempt_id, path) DO UPDATE SET
+                  file_exists = excluded.file_exists,
+                  sha256 = excluded.sha256,
+                  byte_size = excluded.byte_size,
+                  observed_at_ns = excluded.observed_at_ns,
+                  expires_at = excluded.expires_at
+                """,
+                (
+                    attempt_id,
+                    str(target),
+                    1 if file_exists else 0,
+                    digest,
+                    size,
+                    time.time_ns(),
+                    epoch + FILE_SNAPSHOT_TTL_SECONDS,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM file_snapshots
+                WHERE attempt_id = ? AND path NOT IN (
+                  SELECT path FROM file_snapshots WHERE attempt_id = ?
+                  ORDER BY observed_at_ns DESC, path LIMIT ?
+                )
+                """,
+                (attempt_id, attempt_id, MAX_FILE_SNAPSHOTS_PER_ATTEMPT),
+            )
+        return {
+            "ok": True,
+            "recorded": True,
+            "attempt_id": attempt_id,
+            "path": str(target),
+            "file_exists": file_exists,
+            "byte_size": size,
+            "expires_at": epoch + FILE_SNAPSHOT_TTL_SECONDS,
+        }
+
+    def check_file_snapshot(
+        self,
+        attempt_id: str,
+        path: str,
+        *,
+        caller_cwd: str | Path | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Fail closed when a full-file write would replace bytes changed since Read.
+
+        This is an optimistic pre-write check, not a filesystem transaction: a separate
+        process can still modify the path in the small interval before the editor writes.
+        """
+
+        epoch = int(time.time()) if now is None else now
+        decision = self.guard(attempt_id, path, caller_cwd=caller_cwd, now=epoch)
+        if not decision["allow"]:
+            return decision
+        target = Path(decision["path"])
+        try:
+            file_exists, digest, size = _file_snapshot(target)
+        except (OSError, OverflowError, ValueError) as error:
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "freshness_snapshot_unavailable",
+                f"cannot verify the current file contents safely: {error}",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT status, lease_expires_at FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt["status"] not in {"provisioning", "working"}
+                or attempt["lease_expires_at"] <= epoch
+            ):
+                return self._guard_denial(
+                    attempt_id,
+                    str(target),
+                    "attempt_not_live",
+                    "the attempt stopped being live during the freshness check",
+                    declared=decision["declared"],
+                    relative_path=decision["relative_path"],
+                )
+            snapshot = connection.execute(
+                """
+                SELECT file_exists, sha256, byte_size, expires_at
+                FROM file_snapshots WHERE attempt_id = ? AND path = ?
+                """,
+                (attempt_id, str(target)),
+            ).fetchone()
+
+        if snapshot is None:
+            if not file_exists:
+                return {**decision, "freshness": "new_file_absent"}
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "freshness_snapshot_missing",
+                "read this file through the supported Claude Code Read tool before replacing it",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if snapshot["expires_at"] <= epoch:
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "freshness_snapshot_expired",
+                "the file snapshot expired; read the file again before replacing it",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if (
+            bool(snapshot["file_exists"]) != file_exists
+            or snapshot["sha256"] != digest
+            or snapshot["byte_size"] != size
+        ):
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "stale_file_snapshot",
+                "this file changed after the last supported Read; read it again before replacing it",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        return {**decision, "freshness": "unchanged_since_read"}
 
     def guard(
         self,
