@@ -12,6 +12,33 @@ to write something its own submission is later rejected for is the worst of both
 For Claude Code structured-write hooks, the supervisor also checks the hook's
 host-reported working directory and resolves relative targets from that directory.
 
+## Attempt worktree storage
+
+By default, attempt worktrees remain under `<repo>/.acp/worktrees/<attempt-id>`.
+To use a sibling or external volume, configure an absolute root in the repository's
+`acp.toml`:
+
+```toml
+[worktrees]
+attempts_root = "/srv/agent-worktrees/my-repository"
+```
+
+ACP canonicalizes this path and rejects filesystem roots and any root that overlaps
+the repository or Git's common administrative directory after symlink resolution.
+It creates the root only when a claim is provisioned; an existing attempt path or
+Git registration is a collision and is not removed or reused. Each attempt records
+both its absolute worktree path and the root used at claim time. Workers, runtime
+setup, submission, recovery and GC continue to use that attempt's stored path after
+`acp.toml` changes; legacy attempts without a stored root stay on the original
+`.acp/worktrees` path.
+
+GC only removes an existing path when it is the exact attempt-ID child of its stored
+managed root and Git still registers it on the attempt's branch. If that proof is
+missing or changes during cleanup, ACP retains the directory. `acp status` reports
+registered attempt-worktree bytes and filesystem capacity by managed root. External
+worktrees are still Git checkouts, not an OS sandbox: keep the agent runtime's own
+filesystem restrictions enabled.
+
 ## `acp guard`
 
 ```bash

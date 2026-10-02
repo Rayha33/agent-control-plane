@@ -315,3 +315,23 @@ The adoption path should stay local and incremental:
 5. hand the passing integration branch to the existing pull-request workflow.
 
 No vendor migration is required.
+
+### Worktree cwd ambiguity and storage placement (2026-10-02)
+
+Individual reports point to a narrower failure mode than worktree contention:
+[Claude Code issue #31546](https://github.com/anthropics/claude-code/issues/31546)
+describes nested subagent worktrees resolving repository reads/searches against the
+main checkout and suggests a sibling worktree location. [Codex issue #23095](https://github.com/openai/codex/issues/23095)
+requests an explicit worker workspace path because prose-only cwd direction can be
+fragile. [Claude Code issue #42282](https://github.com/anthropics/claude-code/issues/42282)
+reports cwd drift after worktree-isolated subagents. These are user reports, not
+prevalence estimates, independently reproduced bugs, or confirmed vendor-wide root
+causes.
+
+ACP already passes the claimed attempt path to workers and persists that path, but
+the attempt root was fixed inside the primary checkout at `.acp/worktrees`. ACP now
+supports an opt-in canonical sibling/external root for new attempts while retaining
+the legacy default. It persists the resolved managed root per attempt, validates
+worker worktree identity, and limits cleanup to Git-registered paths under the
+recorded root. The option reduces path ambiguity; it does not replace a runtime
+sandbox or prove that every agent product honors its supplied cwd.

@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -30,6 +29,36 @@ from .schema import META_CASE_SENSITIVE
 
 class ClaimsMixin:
     """Claiming a task, heartbeats, the write-set guard and submission."""
+
+    def _prepare_attempt_worktree(self, attempt_id: str) -> tuple[Path, Path]:
+        """Create/validate the managed root and reserve an unused attempt path.
+
+        Only the root is created here. The attempt directory itself is left to Git,
+        and a pre-existing path or Git registration is rejected before any attempt
+        row is inserted or worker can be launched.
+        """
+
+        root = self._attempt_worktree_root
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            canonical_root = root.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise SupervisorError(
+                "worktree_root_unavailable",
+                f"attempt worktree root cannot be safely created: {root}",
+            ) from error
+        if canonical_root != root or not canonical_root.is_dir() or canonical_root.is_symlink():
+            raise SupervisorError(
+                "unsafe_worktree_root",
+                f"attempt worktree root changed during creation: {root}",
+            )
+        worktree = canonical_root / attempt_id
+        if os.path.lexists(worktree) or str(worktree) in self._registered_worktrees():
+            raise SupervisorError(
+                "worktree_collision",
+                f"attempt worktree path is already present or registered: {worktree}",
+            )
+        return canonical_root, worktree
 
     def claim(
         self,
@@ -51,7 +80,7 @@ class ClaimsMixin:
         base_checkout_snapshot = self._capture_base_checkout_snapshot()
         expires = int(time.time()) + ttl
         attempt_id = str(uuid.uuid4())
-        worktree = self.state_dir / "worktrees" / attempt_id
+        worktree_root, worktree = self._prepare_attempt_worktree(attempt_id)
         now = utc_now()
         # Resolve ``current`` once, before the attempt exists. Every later phase
         # reads this stored pin, so a rotation affects only subsequent claims.
@@ -183,13 +212,13 @@ class ClaimsMixin:
                 """
                 INSERT INTO attempts
                   (id, task_id, number, agent_id, runner_credential_digest,
-                   branch, worktree, claim_token,
+                   branch, worktree, worktree_root, claim_token,
                    start_sha, latest_sha, checkpoint_json, heartbeat_at, checkpoint_at,
                    trust_bundle_json,
                    pid, log_path, status,
                    lease_expires_at, created_at, updated_at, base_checkout_snapshot_json,
                    base_checkout_snapshot_required)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, NULL, NULL,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, NULL, NULL,
                         'provisioning', ?, ?, ?, ?, 1)
                 """,
                 (
@@ -200,6 +229,7 @@ class ClaimsMixin:
                     identity["credential_digest"] if identity else None,
                     branch,
                     str(worktree),
+                    str(worktree_root),
                     counter,
                     start_sha,
                     start_sha,
@@ -271,13 +301,27 @@ class ClaimsMixin:
                     self.runtime_down(attempt_id, force=True, _allow_active=True)
                 except (OSError, subprocess.SubprocessError, SupervisorError):
                     pass
+                try:
+                    self._remove_worktree(worktree, delete_branch=True, expected_branch=branch)
+                except (OSError, subprocess.SubprocessError, SupervisorError):
+                    pass
             else:
                 self._abandon_runtime(attempt_id)
-            self._git("worktree", "remove", "--force", str(worktree), check=False)
-            if worktree.exists():
-                shutil.rmtree(worktree)
-            self._git("worktree", "prune", check=False)
-            self._git("branch", "-D", branch, check=False)
+                # A command wrapper or interruption can report failure after Git
+                # registered the exact path. Clean up only when the unique attempt
+                # path is registered on this attempt's branch; never infer ownership
+                # from a directory merely existing at the target path.
+                try:
+                    registered_branch = self._registered_worktrees().get(
+                        str(worktree.resolve(strict=False))
+                    )
+                except (OSError, subprocess.SubprocessError, SupervisorError):
+                    registered_branch = None
+                if registered_branch == branch:
+                    try:
+                        self._remove_worktree(worktree, delete_branch=True, expected_branch=branch)
+                    except (OSError, subprocess.SubprocessError, SupervisorError):
+                        pass
             self._rollback_provision(task_id, attempt_id)
             raise
         with self.connect() as connection:

@@ -810,7 +810,8 @@ class ReaperMixin:
         rows = connection.execute(
             """
             SELECT attempt.id AS attempt_id, attempt.task_id, attempt.branch,
-                   attempt.worktree, attempt.status AS attempt_status,
+                   attempt.worktree, attempt.worktree_root,
+                   attempt.status AS attempt_status,
                    attempt.updated_at AS attempt_updated_at,
                    task.status AS task_status, task.updated_at AS task_updated_at,
                    task.cleanup_target_status, task.cleanup_error
@@ -819,11 +820,17 @@ class ReaperMixin:
             ORDER BY attempt.created_at, attempt.id
             """
         ).fetchall()
+        registered_worktrees = self._registered_worktrees()
 
         reclaimable: list[dict[str, Any]] = []
         retained: list[dict[str, Any]] = []
         for row in rows:
             worktree = Path(row["worktree"])
+            worktree_root = (
+                Path(row["worktree_root"])
+                if row["worktree_root"]
+                else (self.state_dir / "worktrees").resolve(strict=False)
+            )
             entry = {
                 "attempt_id": row["attempt_id"],
                 "task_id": row["task_id"],
@@ -831,7 +838,18 @@ class ReaperMixin:
                 "attempt_status": row["attempt_status"],
                 "branch": row["branch"],
                 "worktree": str(worktree),
+                "worktree_root": str(worktree_root),
             }
+            if not self._attempt_worktree_is_managed(row["attempt_id"], worktree, worktree_root):
+                retained.append({**entry, "reason": "worktree_path_unmanaged"})
+                continue
+            if (
+                worktree.exists()
+                and registered_worktrees.get(str(worktree.resolve(strict=False))) != row["branch"]
+            ):
+                retained.append({**entry, "reason": "worktree_unregistered"})
+                continue
+            worktree_bytes = self._directory_bytes(worktree) if worktree.exists() else 0
             age = _age_seconds(row["task_updated_at"], now)
             reason = self._gc_retain_reason(
                 row,
@@ -842,11 +860,9 @@ class ReaperMixin:
                 exists=worktree.exists(),
             )
             if reason is not None:
-                retained.append({**entry, "reason": reason})
+                retained.append({**entry, "bytes": worktree_bytes, "reason": reason})
                 continue
-            reclaimable.append(
-                {**entry, "age_seconds": age, "bytes": self._directory_bytes(worktree)}
-            )
+            reclaimable.append({**entry, "age_seconds": age, "bytes": worktree_bytes})
         return reclaimable, retained
 
     @staticmethod
@@ -919,27 +935,42 @@ class ReaperMixin:
             ]
 
         removed: list[str] = []
+        removed_entries: list[dict[str, Any]] = []
         if not dry_run and reclaimable:
-            # No outer _git_operation_guard here: _git() takes it per invocation, and the
-            # flock is not reentrant, so wrapping the loop deadlocks against the first
-            # `git worktree remove`. The other _remove_worktree call sites are unguarded
-            # for the same reason.
+            # No outer _git_operation_guard here: _remove_worktree() owns one guard
+            # across its registration check, removal and branch deletion, so wrapping
+            # the loop would deadlock against its first call.
             for entry in reclaimable:
-                self._remove_worktree(Path(entry["worktree"]), delete_branch=True)
-                removed.append(entry["attempt_id"])
-            with self.connect() as connection:
-                for entry in reclaimable:
-                    self._event(
-                        connection,
-                        "worktree.reclaimed",
-                        "supervisor",
-                        {
-                            "attempt_id": entry["attempt_id"],
-                            "task_id": entry["task_id"],
-                            "branch": entry["branch"],
-                            "bytes": entry["bytes"],
-                        },
-                    )
+                worktree = Path(entry["worktree"])
+                worktree_root = Path(entry["worktree_root"])
+                if not self._attempt_worktree_is_managed(
+                    entry["attempt_id"], worktree, worktree_root
+                ):
+                    retained.append({**entry, "reason": "worktree_path_changed"})
+                    continue
+                if self._remove_worktree(
+                    worktree,
+                    delete_branch=True,
+                    expected_branch=entry["branch"],
+                ):
+                    removed.append(entry["attempt_id"])
+                    removed_entries.append(entry)
+                else:
+                    retained.append({**entry, "reason": "worktree_removal_unproven"})
+            if removed_entries:
+                with self.connect() as connection:
+                    for entry in removed_entries:
+                        self._event(
+                            connection,
+                            "worktree.reclaimed",
+                            "supervisor",
+                            {
+                                "attempt_id": entry["attempt_id"],
+                                "task_id": entry["task_id"],
+                                "branch": entry["branch"],
+                                "bytes": entry["bytes"],
+                            },
+                        )
 
         return {
             "ok": True,
@@ -947,7 +978,8 @@ class ReaperMixin:
             "older_than_seconds": older_than_seconds,
             "reclaimable": reclaimable,
             "removed": removed,
-            "bytes": sum(entry["bytes"] for entry in reclaimable),
+            "bytes": sum(entry["bytes"] for entry in removed_entries),
+            "reclaimable_bytes": sum(entry["bytes"] for entry in reclaimable),
             "retained": retained,
             "integration_branches": integration_branches,
         }
@@ -971,17 +1003,6 @@ class ReaperMixin:
             ).fetchall()
             for attempt in attempts:
                 latest = attempt["latest_sha"]
-                if Path(attempt["worktree"]).exists():
-                    latest = (
-                        self._git_text(
-                            "-C",
-                            attempt["worktree"],
-                            "rev-parse",
-                            "HEAD",
-                            check=False,
-                        )
-                        or latest
-                    )
                 stamp = utc_now()
                 connection.execute(
                     """
@@ -1111,6 +1132,35 @@ class ReaperMixin:
                                 "worker identity changed before termination proof was recorded",
                             )
                     self._prepare_terminated_attempt_cleanup(attempt_id)
+                    attempt_state = self.attempt(attempt_id)
+                    worktree = Path(attempt_state["worktree"])
+                    worktree_root = Path(attempt_state["worktree_root"])
+                    if worktree.exists():
+                        latest = self._attempt_worktree_head(
+                            attempt_id,
+                            worktree,
+                            worktree_root,
+                            attempt_state["branch"],
+                        )
+                        if latest and latest != attempt_state["latest_sha"]:
+                            recovered_at = utc_now()
+                            with self.connect() as connection:
+                                connection.execute("BEGIN IMMEDIATE")
+                                changed = connection.execute(
+                                    "UPDATE attempts SET latest_sha = ?, updated_at = ? "
+                                    "WHERE id = ? AND status = 'terminating'",
+                                    (latest, recovered_at, attempt_id),
+                                ).rowcount
+                                if changed:
+                                    self._event(
+                                        connection,
+                                        "attempt.recovery_head_captured",
+                                        "reaper",
+                                        {
+                                            "attempt_id": attempt_id,
+                                            "latest_sha": latest,
+                                        },
+                                    )
                     runtime = self._runtime_down_locked(
                         attempt_id,
                         force=True,

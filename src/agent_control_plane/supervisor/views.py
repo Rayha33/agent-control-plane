@@ -10,6 +10,7 @@ import json
 import shutil
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 from ..scheduling import Scheduler
@@ -83,6 +84,8 @@ class ViewsMixin:
             "agent_id": row["agent_id"],
             "branch": row["branch"],
             "worktree": row["worktree"],
+            "worktree_root": row["worktree_root"]
+            or str((self.state_dir / "worktrees").resolve(strict=False)),
             "claim_token": row["claim_token"],
             "start_sha": row["start_sha"],
             "latest_sha": row["latest_sha"],
@@ -234,7 +237,9 @@ class ViewsMixin:
         """Operator snapshot: attention queue, phases, runtimes, blockers. Read-only."""
         snapshot = StatusView(self).snapshot(limit, lease_risk_seconds, checkpoint_stale_seconds)
         with self.connect() as connection:
-            reclaimable, _ = self._gc_survey(connection, time.time(), DEFAULT_GC_RETENTION_SECONDS)
+            reclaimable, retained = self._gc_survey(
+                connection, time.time(), DEFAULT_GC_RETENTION_SECONDS
+            )
         try:
             filesystem_usage = shutil.disk_usage(self.state_dir)
         except OSError:
@@ -256,6 +261,43 @@ class ViewsMixin:
             "reclaimable_worktrees": len(reclaimable),
             "reclaimable_bytes": sum(entry["bytes"] for entry in reclaimable),
             "filesystem": filesystem,
+        }
+        default_worktree_root = (self.state_dir / "worktrees").resolve(strict=False)
+        configured_worktree_root = self._attempt_worktree_root.resolve(strict=False)
+        bytes_by_root: dict[str, int] = {}
+        for entry in (*reclaimable, *retained):
+            if "bytes" in entry:
+                root = str(Path(entry["worktree_root"]).resolve(strict=False))
+                bytes_by_root[root] = bytes_by_root.get(root, 0) + entry["bytes"]
+        bytes_by_root.setdefault(str(configured_worktree_root), 0)
+
+        managed_roots = []
+        for root, worktree_bytes in sorted(bytes_by_root.items()):
+            if root == str(default_worktree_root):
+                root_filesystem = filesystem
+            else:
+                try:
+                    usage = shutil.disk_usage(root)
+                except OSError:
+                    root_filesystem = {
+                        "path": root,
+                        "status": "unavailable",
+                        "total_bytes": None,
+                        "free_bytes": None,
+                    }
+                else:
+                    root_filesystem = {
+                        "path": root,
+                        "status": "available",
+                        "total_bytes": usage.total,
+                        "free_bytes": usage.free,
+                    }
+            managed_roots.append(
+                {"root": root, "registered_bytes": worktree_bytes, "filesystem": root_filesystem}
+            )
+        snapshot["disk"]["attempt_worktrees"] = {
+            "configured_root": str(configured_worktree_root),
+            "managed_roots": managed_roots,
         }
         return snapshot
 
