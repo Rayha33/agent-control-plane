@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-10-01.
+Research updated: 2026-10-02.
 
 ## Verdict
 
@@ -57,6 +57,19 @@ The pattern is consistent: products are improving how agents are launched and
 observed. The weakest common layer is the correctness protocol between task
 assignment and merge.
 
+Recent issue reports sharpen the write-collision boundary: Codex users describe
+independent chats or subagents sharing a checkout and overwriting work, while Claude
+Code reports describe parallel destructive operations and last-writer-wins updates to
+shared project files. These are user-reported cases, not verified root-cause analyses.
+Attempt-level worktrees and task leases prevent cross-attempt overlap, but subagents
+inside one attempt may still share its filesystem and lease. For supported structured
+editor calls, [Claude Code's current hook reference](https://code.claude.com/docs/en/hooks)
+documents per-tool invocation identity and completion hooks, making a short-lived
+same-attempt path reservation feasible. `PermissionDenied` covers auto-mode denials,
+not manual permission-dialog denials, so those reservations rely on bounded expiry.
+That is a narrower, testable safeguard; it is not a substitute for isolated worktrees
+or an OS sandbox.
+
 The added forum and community examples are a small, self-selected qualitative
 sample, not a prevalence estimate or a controlled comparison. They sharpen the
 tradeoff: worktree-per-agent can reduce direct overwrites and improve attribution,
@@ -71,6 +84,9 @@ vendor root-cause analyses:
 - [One session deleted another session's active worktree](https://github.com/anthropics/claude-code/issues/40850)
 - [Reviewer inspected the wrong worktree or diff](https://github.com/openai/codex/issues/33144)
 - [Continued session wrote to the original checkout](https://github.com/openai/codex/issues/34352)
+- [Concurrent Codex chats can share a checkout and clobber overlapping edits](https://github.com/openai/codex/issues/37226)
+- [Parallel Claude subagents raced destructive operations against shared files](https://github.com/anthropics/claude-code/issues/47005)
+- [Claude project writes reported as whole-document last-writer-wins](https://github.com/anthropics/claude-code/issues/93260)
 - [Unreaped run copies consumed 202 GB](https://github.com/openai/codex/issues/35383)
 - [Parallel sessions exhausted 128 GB memory](https://github.com/openai/codex/issues/23749)
 - [Stale runner records plus PID reuse wedged an orphan reaper](https://github.com/omnigent-ai/omnigent/issues/4819)

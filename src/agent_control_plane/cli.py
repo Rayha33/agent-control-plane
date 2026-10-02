@@ -16,6 +16,7 @@ from .editor_hooks import (
     ACP_MANAGED_HOOK_FLAG,
     CODEX_MAX_HOOK_INPUT_CHARS,
     DENY_EXIT_CODE,
+    GUARDED_TOOLS,
     cwd_from_hook_payload,
     install_claude_code_hooks,
     install_codex_hooks,
@@ -48,7 +49,8 @@ ARCHITECTURE.md 1b describes as the intended difference between it and `plan`/`q
 `merge-plan`/`status` — so it is a mutating command that happens to print a listing.
 `doctor` is what an operator runs when the database needs upgrading, so it has to be
 able to open one in order to say so. `message list` is read-only even though the
-sibling `message send` action writes.
+sibling `message send` action writes. `guard` is read-only, including its reservation
+mode; only the short-lived hook ledger is written through a narrow SQLite transaction.
 """
 
 
@@ -149,6 +151,11 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="check Claude Code full-file Write against its latest supported Read snapshot",
     )
+    guard.add_argument(
+        "--reserve-write",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     guard_mode = guard.add_mutually_exclusive_group()
     guard_mode.add_argument(
         "--hook",
@@ -165,6 +172,13 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the attempt's worktree and declared write set (SessionStart hook)",
     )
+
+    write_finish = commands.add_parser(
+        "write-finish", help="release an opt-in Claude structured-write reservation"
+    )
+    write_finish.add_argument("--attempt", dest="attempt_id", help="defaults to $ACP_ATTEMPT_ID")
+    write_finish.add_argument("--hook", action="store_true", required=True)
+    write_finish.add_argument(ACP_MANAGED_HOOK_FLAG, action="store_true", help=argparse.SUPPRESS)
 
     snapshot = commands.add_parser(
         "snapshot", help="record a supported Claude Code file read for opt-in freshness checks"
@@ -191,6 +205,11 @@ def parser() -> argparse.ArgumentParser:
         "--stale-write-guard",
         action="store_true",
         help="opt in to stale-snapshot checks for Claude Code's structured Write tool",
+    )
+    hooks_install.add_argument(
+        "--serialize-write-tools",
+        action="store_true",
+        help="reserve Claude structured file paths across each tool call to prevent same-attempt overlaps",
     )
 
     gc = commands.add_parser(
@@ -637,9 +656,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return serve(args.repo)
         if args.action == "hooks":
-            if args.stale_write_guard and args.codex_code:
+            if (args.stale_write_guard or args.serialize_write_tools) and args.codex_code:
                 raise SupervisorError(
-                    "invalid_arguments", "--stale-write-guard is currently Claude Code-only"
+                    "invalid_arguments",
+                    "--stale-write-guard and --serialize-write-tools are currently Claude Code-only",
                 )
             if args.attempt_id:
                 supervisor = GitSupervisor(args.repo, read_only=True)
@@ -661,6 +681,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             command,
                             local=True,
                             stale_write_guard=args.stale_write_guard,
+                            serialize_write_tools=args.serialize_write_tools,
                         )
                 except (OSError, ValueError) as error:
                     raise SupervisorError("hook_install_failed", str(error)) from error
@@ -671,14 +692,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         command = f"{args.command} --repo {shlex.quote(str(root_path))}"
                         result = install_codex_hooks(root_path, command)
                     else:
-                        if args.stale_write_guard:
-                            # Refuse to enable hooks whose snapshot table cannot be read
+                        if args.stale_write_guard or args.serialize_write_tools:
+                            # Refuse to enable hooks whose state tables cannot be read
                             # by the installed schema; hook installation never migrates.
                             GitSupervisor(args.repo, read_only=True)
                         result = install_claude_code_hooks(
                             Path(args.repo).resolve(),
                             args.command,
                             stale_write_guard=args.stale_write_guard,
+                            serialize_write_tools=args.serialize_write_tools,
                         )
                 except (OSError, ValueError) as error:
                     raise SupervisorError("hook_install_failed", str(error)) from error
@@ -691,11 +713,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = _run_trust_helper(args)
             emit(result)
             return 0
-        # Snapshot hooks validate the schema through a read-only supervisor; the
-        # snapshot method owns its separate, narrow cache-table write transaction.
+        # Hook-owned snapshot and reservation writes validate the schema through a
+        # read-only supervisor, then use narrow transactions for their own tables.
         read_only = (
             args.action in READ_ONLY_ACTIONS
-            or args.action == "snapshot"
+            or args.action in {"snapshot", "write-finish"}
             or (args.action == "message" and args.message_action == "list")
         )
         supervisor = GitSupervisor(
@@ -723,6 +745,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # guard still fails closed if it lacks a fresh, matching snapshot.
                 return 0
             return 0
+        if args.action == "write-finish":
+            attempt_id = args.attempt_id or os.environ.get("ACP_ATTEMPT_ID", "")
+            payload = _hook_payload(sys.stdin.read())
+            if (
+                not attempt_id
+                or not isinstance(payload, dict)
+                or payload.get("hook_event_name")
+                not in {"PostToolUse", "PostToolUseFailure", "PermissionDenied"}
+                or payload.get("tool_name") not in GUARDED_TOOLS
+            ):
+                return 0
+            tool_use_id = payload.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                return 0
+            supervisor._release_write(attempt_id, tool_use_id)
+            return 0
         elif args.action == "doctor":
             result = supervisor.doctor()
         elif args.action == "migrate":
@@ -731,6 +769,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             attempt_id = args.attempt_id or os.environ.get("ACP_ATTEMPT_ID", "")
             if not attempt_id:
                 raise SupervisorError("missing_attempt", "pass --attempt or export ACP_ATTEMPT_ID")
+            if args.reserve_write and not args.hook:
+                raise SupervisorError(
+                    "invalid_arguments", "--reserve-write requires a Claude Code --hook payload"
+                )
             if args.freshness and not args.hook:
                 raise SupervisorError(
                     "invalid_arguments", "--freshness requires a Claude Code --hook payload"
@@ -739,6 +781,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 emit(supervisor.guard_context(attempt_id))
                 return 0
             if args.codex_hook:
+                if args.reserve_write:
+                    return _codex_deny("--reserve-write is currently Claude Code-only")
                 if args.freshness:
                     return _codex_deny(
                         "--freshness is currently available only for Claude Code Write"
@@ -799,6 +843,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "detail": "the PreToolUse payload must include a writable path and caller cwd",
                         }
                     )
+                if args.reserve_write and (
+                    payload.get("hook_event_name") != "PreToolUse"
+                    or payload.get("tool_name") not in GUARDED_TOOLS
+                ):
+                    return _deny(
+                        {
+                            "ok": True,
+                            "allow": False,
+                            "reason": "unsupported_hook_event",
+                            "detail": "same-attempt reservations require a supported Claude Code structured-file PreToolUse event",
+                            "attempt_id": attempt_id,
+                            "path": target,
+                        }
+                    )
             if not target:
                 raise SupervisorError("missing_path", "pass --path or use --hook")
             decision = supervisor.guard(attempt_id, target, caller_cwd=caller_cwd)
@@ -810,6 +868,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             ):
                 decision = supervisor.check_file_snapshot(
                     attempt_id, decision["path"], caller_cwd=caller_cwd
+                )
+            if decision["allow"] and args.reserve_write:
+                tool_use_id = payload.get("tool_use_id") if isinstance(payload, dict) else None
+                agent_id = payload.get("agent_id", "") if isinstance(payload, dict) else ""
+                decision = supervisor._reserve_write(
+                    attempt_id,
+                    target,
+                    caller_cwd=caller_cwd,
+                    tool_use_id=tool_use_id,
+                    agent_id=agent_id,
                 )
             if not decision["allow"]:
                 return _deny(decision)

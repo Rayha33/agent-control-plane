@@ -21,8 +21,9 @@ acp guard --describe                                 # worktree + write set, for
 `--attempt` defaults to `$ACP_ATTEMPT_ID`. The decision is JSON on stdout; on a denial
 the reason is also a sentence on stderr, because that is what a runner shows the model.
 An agent told *"beta.txt is not in the task's declared write set; declared: alpha.txt"*
-corrects itself in one turn. Guard is read-only — a pre-write check must never itself
-become a reason the state changed.
+corrects itself in one turn. The normal guard is read-only. The opt-in
+`--serialize-write-tools` mode below adds only a short-lived reservation record around
+each supported structured edit.
 
 The `--hook` payload must include the editor's `cwd` as well as the target path. Missing,
 malformed, nonexistent, or out-of-attempt working directories deny before the editor
@@ -114,6 +115,38 @@ check and Claude Code's write. It covers only structured Claude `Write` operatio
 custom clients, reads through other tools or `@` prompt references, or disabled/untrusted
 hooks. Do not treat it as a security boundary or as proof that every agent write was
 checked.
+
+### Optional same-attempt structured-write serialization
+
+Claude Code subagents inherit the session's configured hooks and tool events carry
+`tool_use_id`; tool events inside subagents additionally carry `agent_id` for attribution.
+If several subagents share one ACP attempt, they share its worktree and task lease too. Install with
+`--serialize-write-tools` to add an atomic, attempt-scoped reservation around the
+structured file tools:
+
+```bash
+acp --repo "$BASE" hooks install --claude-code --attempt "$ATTEMPT" \
+  --serialize-write-tools
+```
+
+The pre-hook reserves the resolved path for that invocation before the editor runs. A
+second invocation in the same attempt that targets the same path or an ancestor/child
+path is denied with `concurrent_write_conflict`; a disjoint path may proceed. The
+reservation is keyed by `(attempt_id, tool_use_id)`; `agent_id` is diagnostic and may be
+absent on main-thread calls. `PostToolUse` and `PostToolUseFailure` release after success
+or execution failure. `PermissionDenied` also releases auto-mode denials, but Claude Code
+does not emit that event for a manually denied permission dialog. If a completion event
+is not emitted (including manual denial, interruption, or crash), the reservation expires
+after five minutes and is removed on the next reservation request. Missing or malformed
+`tool_use_id` fails closed for a new write.
+
+This is opt-in and covers only the structured Claude Code tools in the matcher above. It
+does not mediate Bash, MCP/custom tools, external processes, or untrusted/disabled hooks;
+it is a control-plane reservation, not an OS filesystem lock or a protection against a
+same-user process that writes outside the hook. ACP does not enforce a Claude Code
+version number: it relies on the documented event payloads and fails closed when a
+pre-write event lacks `tool_use_id`. Verify the documented events in the installed
+client. See the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
 
 The install **merges**. Hooks you already have — including your own `PreToolUse`
 entries — are preserved, previous ACP entries are replaced rather than duplicated, and

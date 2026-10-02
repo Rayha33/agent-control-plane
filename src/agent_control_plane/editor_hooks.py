@@ -72,20 +72,26 @@ def cwd_from_hook_payload(payload: Any) -> str | None:
     return cwd if isinstance(cwd, str) and cwd.strip() else None
 
 
-def claude_code_hooks(command: str, *, stale_write_guard: bool = False) -> dict[str, Any]:
+def claude_code_hooks(
+    command: str,
+    *,
+    stale_write_guard: bool = False,
+    serialize_write_tools: bool = False,
+) -> dict[str, Any]:
     """The hook block ACP owns, keyed so an update can replace it in place."""
 
     guard_command = f"{command} guard --hook"
+    if stale_write_guard:
+        guard_command += " --freshness"
+    if serialize_write_tools:
+        guard_command += " --reserve-write"
     pre_tool_use = [
         {
             "matcher": HOOK_TOOL_MATCHER,
             "hooks": [
                 {
                     "type": "command",
-                    "command": (
-                        f"{guard_command}{' --freshness' if stale_write_guard else ''} "
-                        f"{ACP_MANAGED_HOOK_FLAG}"
-                    ),
+                    "command": f"{guard_command} {ACP_MANAGED_HOOK_FLAG}",
                 }
             ],
         }
@@ -102,7 +108,7 @@ def claude_code_hooks(command: str, *, stale_write_guard: bool = False) -> dict[
                 ],
             }
         )
-    return {
+    events: dict[str, Any] = {
         "PreToolUse": pre_tool_use,
         "PostToolUse": [],
         "SessionStart": [
@@ -121,6 +127,22 @@ def claude_code_hooks(command: str, *, stale_write_guard: bool = False) -> dict[
         # An expired lease is currently visible as a `lease_expired` denial from the
         # guard, which is a loud failure rather than a silent one.
     }
+    if serialize_write_tools:
+        completion = [
+            {
+                "matcher": HOOK_TOOL_MATCHER,
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{command} write-finish --hook {ACP_MANAGED_HOOK_FLAG}",
+                    }
+                ],
+            }
+        ]
+        events["PostToolUse"] = completion
+        events["PostToolUseFailure"] = completion
+        events["PermissionDenied"] = completion
+    return events
 
 
 def parse_codex_patch_paths(command: str) -> list[str]:
@@ -446,6 +468,7 @@ def _is_acp_hook(hook: Any, command: str) -> bool:
             parts[index : index + 2] == ["guard", "--hook"]
             or parts[index : index + 2] == ["guard", "--describe"]
             or parts[index : index + 2] == ["snapshot", "--hook"]
+            or parts[index : index + 2] == ["write-finish", "--hook"]
         )
 
     # New hook commands carry an ownership marker. Still require it to follow
@@ -530,6 +553,7 @@ def install_claude_code_hooks(
     *,
     local: bool = False,
     stale_write_guard: bool = False,
+    serialize_write_tools: bool = False,
 ) -> dict[str, Any]:
     """Write ACP hooks into project or personal-local settings, preserving the rest."""
 
@@ -566,7 +590,11 @@ def install_claude_code_hooks(
 
     settings["hooks"] = _merge_hook_events(
         settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {},
-        claude_code_hooks(command, stale_write_guard=stale_write_guard),
+        claude_code_hooks(
+            command,
+            stale_write_guard=stale_write_guard,
+            serialize_write_tools=serialize_write_tools,
+        ),
         command,
     )
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -591,6 +619,7 @@ def install_claude_code_hooks(
         "guarded_tools": list(GUARDED_TOOLS),
         "unguarded": ["Bash"],
         "stale_write_guard": stale_write_guard,
+        "serialize_write_tools": serialize_write_tools,
         "note": (
             "Bash is not guarded: what a shell command writes cannot be read off the "
             "command string. Confine the agent to the worktree instead."
