@@ -170,7 +170,21 @@ class RuntimeMixin:
     def _child_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
         """Build candidate/driver child env without ACP's own bearer secret."""
         env = {name: value for name, value in os.environ.items() if name in PUBLIC_CHILD_ENV}
-        env.update(extra_env or {})
+        env.update(
+            {
+                name: value
+                for name, value in (extra_env or {}).items()
+                if not name.upper().startswith("GIT_")
+            }
+        )
+        # Git uses these process variables to override the repository, index, config,
+        # and object database. A worker must resolve Git from its own worktree, never
+        # from ambient state inherited from the launcher or runtime configuration.
+        # Keep the rule separate from PUBLIC_CHILD_ENV so a future allowlist expansion
+        # cannot accidentally re-enable a cross-worktree redirect.
+        for name in tuple(env):
+            if name.upper().startswith("GIT_"):
+                env.pop(name)
         env["GIT_ATTR_NOSYSTEM"] = "1"
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
         for name in SUPERVISOR_SECRET_ENV:

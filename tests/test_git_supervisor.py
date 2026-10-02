@@ -255,6 +255,114 @@ def test_non_overlapping_tasks_get_parallel_worktrees(repo: Path) -> None:
     assert claims[0]["worktree"] != claims[1]["worktree"]
 
 
+def test_claim_refuses_overlapping_write_sets(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    first_task = task(supervisor, "alpha.txt", "first writer")
+    second_task = task(supervisor, "alpha.txt", "second writer")
+    attempt = supervisor.claim(first_task["id"], "agent-first")
+
+    with pytest.raises(SupervisorError) as collision:
+        supervisor.claim(second_task["id"], "agent-second")
+
+    assert collision.value.code == "resource_busy"
+    assert supervisor.task(second_task["id"])["status"] == "open"
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+
+
+@requires_linux_worker
+def test_parallel_non_overlapping_workers_stay_in_their_own_worktrees(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepted parallel writes keep separate checkouts and Git state."""
+    supervisor = GitSupervisor(repo)
+    first = supervisor.claim(task(supervisor, "alpha.txt", "first agent")["id"], "agent-first")
+    second = supervisor.claim(task(supervisor, "beta.txt", "second agent")["id"], "agent-second")
+    assert first["worktree"] != second["worktree"]
+    assert first["branch"] != second["branch"]
+    base_head = git(repo, "rev-parse", "HEAD")
+
+    worker = """
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+cwd = Path.cwd().resolve()
+assert cwd == Path(os.environ["ACP_WORKTREE"]).resolve()
+assert os.environ["ACP_ATTEMPT_ID"] == sys.argv[1]
+assert not any(name.upper().startswith("GIT_") for name in os.environ if name not in {
+    "GIT_ATTR_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS"
+})
+git_root = Path(subprocess.check_output(
+    ["git", "rev-parse", "--show-toplevel"], text=True
+).strip()).resolve()
+assert git_root == cwd
+with socket.create_connection(("127.0.0.1", int(sys.argv[4])), timeout=10) as gate:
+    assert gate.recv(1) == b"G", "parallel peer did not reach the worker gate"
+Path(sys.argv[2]).write_text(sys.argv[3] + "\\n", encoding="utf-8")
+subprocess.run(["git", "add", sys.argv[2]], check=True)
+subprocess.run(["git", "commit", "-m", "isolated non-overlapping write"], check=True)
+"""
+
+    def run(attempt: dict, value: str) -> dict:
+        return supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            [
+                sys.executable,
+                "-c",
+                worker,
+                attempt["id"],
+                "alpha.txt" if attempt["id"] == first["id"] else "beta.txt",
+                value,
+                str(gate_port),
+            ],
+        )
+
+    with monkeypatch.context() as poisoned_environment:
+        poisoned_environment.setenv("GIT_DIR", str(repo / ".git"))
+        poisoned_environment.setenv("GIT_WORK_TREE", str(repo))
+        poisoned_environment.setenv("GIT_INDEX_FILE", str(repo / ".git" / "index"))
+        with socket.socket() as start_gate:
+            start_gate.bind(("127.0.0.1", 0))
+            start_gate.listen(2)
+            start_gate.settimeout(10)
+            gate_port = start_gate.getsockname()[1]
+
+            def release_workers() -> None:
+                peers = []
+                try:
+                    for _ in range(2):
+                        peer, _ = start_gate.accept()
+                        peers.append(peer)
+                    for peer in peers:
+                        peer.sendall(b"G")
+                finally:
+                    for peer in peers:
+                        peer.close()
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                gate = pool.submit(release_workers)
+                submissions = list(pool.map(run, (first, second), ("first", "second")))
+                gate.result(timeout=12)
+
+    assert [submission["status"] for submission in submissions] == [
+        "pending_qc",
+        "pending_qc",
+    ]
+    assert (repo / "alpha.txt").read_text(encoding="utf-8") == "base\n"
+    assert (repo / "beta.txt").read_text(encoding="utf-8") == "base\n"
+    assert (Path(first["worktree"]) / "alpha.txt").read_text(encoding="utf-8") == "first\n"
+    assert (Path(second["worktree"]) / "beta.txt").read_text(encoding="utf-8") == "second\n"
+    assert git(Path(first["worktree"]), "branch", "--show-current") == first["branch"]
+    assert git(Path(second["worktree"]), "branch", "--show-current") == second["branch"]
+    assert git(Path(first["worktree"]), "rev-parse", "HEAD^") == base_head
+    assert git(Path(second["worktree"]), "rev-parse", "HEAD^") == base_head
+    assert git(repo, "rev-parse", "HEAD") == base_head
+    assert not git(repo, "status", "--porcelain")
+
+
 @requires_linux_worker
 def test_runtime_ports_are_unique_and_reach_supervised_worker(repo: Path) -> None:
     start, end = two_free_ports()

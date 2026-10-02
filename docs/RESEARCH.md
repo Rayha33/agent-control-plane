@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-08-31.
+Research updated: 2026-10-02.
 
 ## Verdict
 
@@ -70,6 +70,54 @@ vendor root-cause analyses:
 - [Parallel sessions exhausted 128 GB memory](https://github.com/openai/codex/issues/23749)
 - [Stale runner records plus PID reuse wedged an orphan reaper](https://github.com/omnigent-ai/omnigent/issues/4819)
 - [Agent processes remained alive after sessions ended](https://github.com/NousResearch/hermes-agent/issues/7131)
+
+### Codex worktree and hook evidence (2026-10-02)
+
+Two recent first-party issue reports sharpen the concurrent-write gap:
+
+- [Codex issue #37226](https://github.com/openai/codex/issues/37226), opened Aug 6,
+  reports that separate local chats can share one checkout, causing stale overwrites;
+  the reporter says managing one worktree and handoff per writing chat is too much
+  coordination. This is a feature request and an individual report, not a prevalence
+  estimate.
+- [Claude Code issue #83311](https://github.com/anthropics/claude-code/issues/83311),
+  opened Aug 2, describes one 5-agent batch where 2 reportedly used the requested
+  worktrees and 3 touched parent/peer Git state, including stash/branch contamination.
+  Treat the 2/5 count as one user's batch, not a general failure rate.
+
+An ACP adapter must not mistake hook registration for enforcement. The open
+[Codex #27833 report](https://github.com/openai/codex/issues/27833) says an `apply_patch`
+PreToolUse denial was ignored on CLI 0.133.0 and Desktop 0.138.0-alpha.7; open
+[Codex #20879](https://github.com/openai/codex/issues/20879) says native patches did not
+carry per-call worktree context on CLI 0.128.0. Those reports do not establish behavior
+in every later stable release, but they are enough to require a current live test before
+shipping a hook as a hard guard. The official
+[Codex hook docs](https://learn.chatgpt.com/docs/hooks) also state that callback errors,
+timeouts, and malformed responses may fail without blocking.
+
+The research host had `codex-cli 0.144.6`. Its `codex exec --help` confirmed a
+noninteractive `exec`, the `workspace-write` sandbox option, `--config` overrides, and
+`-` for a prompt on stdin. This validates command syntax only; no model task, live
+sandbox, effective-config override, or hook-denial test was run.
+
+The [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+documents `sandbox_workspace_write.writable_roots` as additional write locations in
+`workspace-write` mode. [Developer settings](https://learn.chatgpt.com/docs/developer-settings)
+says one-run `--config` overrides have highest precedence, and `/status` plus
+`/debug-config` can inspect effective roots and config layers. Therefore the documented
+ACP command explicitly sets `writable_roots=[]` and excludes `/tmp` and `$TMPDIR`; this
+narrows known config expansion but is not proof of the effective sandbox under a
+managed policy or a live enforcement test.
+
+Immediate ACP response: use one claimed attempt/worktree per Codex CLI worker through
+the existing Linux-supervised `acp run` path. ACP denies concurrent claims whose
+declared write scopes overlap; the Linux regression therefore verifies simultaneous
+workers on distinct declared paths, each on a separate branch, and a separate claim
+regression verifies that an overlapping scope is rejected. Another Linux regression
+checks that inherited Git repository overrides cannot redirect child processes. This
+remains checkout/process management, not a general filesystem sandbox; keep Codex's own
+workspace sandbox enabled and constrain its effective writable roots to the attempt
+checkout. Codex Desktop and non-Linux supervised launch remain open integration gaps.
 
 The product response is not to special-case those tools. It is to make the
 candidate commit, ownership token, checkout, and review evidence explicit and

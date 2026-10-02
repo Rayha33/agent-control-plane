@@ -367,6 +367,38 @@ def test_candidate_child_environment_is_allowlisted(
     assert not set(secrets) & set(environment)
 
 
+def test_candidate_child_environment_rejects_git_repository_overrides(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_control_plane.supervisor.runtime as runtime
+
+    override_names = {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_PREFIX",
+        "git_dir",
+    }
+    for name in override_names:
+        monkeypatch.setenv(name, "/wrong/repository")
+
+    # Defend against future PUBLIC_CHILD_ENV changes as well as values added through
+    # attempt runtime configuration.
+    monkeypatch.setattr(runtime, "PUBLIC_CHILD_ENV", runtime.PUBLIC_CHILD_ENV | override_names)
+    environment = GitSupervisor(repo)._child_env(
+        {"ACP_ATTEMPT_ID": "attempt-1"} | {name: "/wrong/repository" for name in override_names}
+    )
+
+    assert override_names.isdisjoint(environment)
+    assert environment["GIT_ATTR_NOSYSTEM"] == "1"
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
 def test_runner_credential_is_scrubbed_from_qc_critic_and_integration(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
