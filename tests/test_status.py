@@ -639,6 +639,20 @@ def test_qc_finding_identity_rejects_missing_fields_and_normalizes_text() -> Non
     assert StatusView._parse_qc_findings("not json") == []
 
 
+def test_qc_latest_lookup_has_a_covering_index(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        columns = connection.execute(
+            "PRAGMA index_info('idx_qc_runs_submission_latest')"
+        ).fetchall()
+
+    assert [row["name"] for row in columns] == [
+        "submission_id",
+        "finished_at",
+        "id",
+    ]
+
+
 def test_unknown_legacy_checkpoint_age_is_not_marked_stale(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     created = make_task(supervisor, "alpha.txt", title="legacy checkpoint")

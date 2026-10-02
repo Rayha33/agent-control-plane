@@ -244,6 +244,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, priority DESC);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, number DESC);
 CREATE INDEX IF NOT EXISTS idx_submissions_task ON submissions(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_qc_runs_submission_latest
+  ON qc_runs(submission_id, finished_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_runtime_allocations_attempt
   ON runtime_allocations(attempt_id);
 """

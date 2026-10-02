@@ -240,8 +240,7 @@ class StatusView:
                     "FROM attempts ORDER BY id"
                 ).fetchall()
             ]
-            submissions, submission_histories = self._submission_history(connection)
-            repeated_qc_findings = self._repeated_qc_findings(submission_histories)
+            submissions, repeated_qc_findings = self._submission_status(connection)
             runtimes = self._runtimes(connection)
             allocations = self._allocations(connection)
             quarantines = self._quarantines(connection, now)
@@ -340,14 +339,30 @@ class StatusView:
         return {row["task_id"]: dict(row) for row in rows}
 
     @staticmethod
-    def _submission_history(
-        connection: sqlite3.Connection,
-    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
-        """Load each submission with only its latest QC result, newest first per task."""
+    def _latest_submissions(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         rows = connection.execute(
             """
-            SELECT submission.*, qc.verdict AS qc_verdict, qc.findings_json,
-                   qc.finished_at AS qc_finished_at
+            SELECT submission.*, qc.verdict AS qc_verdict, qc.finished_at AS qc_finished_at
+            FROM submissions AS submission
+            LEFT JOIN qc_runs AS qc ON qc.id = (
+              SELECT id FROM qc_runs WHERE submission_id = submission.id
+              ORDER BY finished_at DESC LIMIT 1
+            )
+            ORDER BY submission.created_at
+            """
+        ).fetchall()
+        return {row["task_id"]: dict(row) for row in rows}
+
+    @staticmethod
+    def _submission_status(
+        connection: sqlite3.Connection,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        """Stream minimal per-submission QC data into latest status and recurrence views."""
+        rows = connection.execute(
+            """
+            SELECT submission.id, submission.task_id, submission.status,
+                   submission.commit_sha, qc.verdict AS qc_verdict,
+                   qc.findings_json, qc.finished_at AS qc_finished_at
             FROM submissions AS submission
             LEFT JOIN qc_runs AS qc ON qc.id = (
               SELECT id FROM qc_runs WHERE submission_id = submission.id
@@ -355,71 +370,28 @@ class StatusView:
             )
             ORDER BY submission.task_id, submission.created_at DESC, submission.id DESC
             """
-        ).fetchall()
-        latest: dict[str, dict[str, Any]] = {}
-        histories: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            submission = dict(row)
-            task_id = row["task_id"]
-            latest.setdefault(task_id, submission)
-            histories.setdefault(task_id, []).append(submission)
-        return latest, histories
-
-    @staticmethod
-    def _latest_submissions(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
-        """Retain the existing helper surface and result shape for callers."""
-        latest, _ = StatusView._submission_history(connection)
-        return {
-            task_id: {key: value for key, value in submission.items() if key != "findings_json"}
-            for task_id, submission in latest.items()
-        }
-
-    @staticmethod
-    def _repeated_qc_findings(
-        histories: dict[str, list[dict[str, Any]]],
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Find structured QC issues that remain in the latest failed submission.
-
-        A recurrence is reported only when a finding on the latest submission is also
-        present on an earlier, distinct commit for the same task. Evidence is excluded
-        because it often contains paths, timestamps, or other volatile output.
-        """
+        )
+        latest_submissions: dict[str, dict[str, Any]] = {}
         recurring: dict[str, list[dict[str, Any]]] = {}
-        for task_id, history in histories.items():
-            latest = history[0]
-            latest_commit = latest.get("commit_sha")
-            if not latest_commit or latest.get("qc_verdict") in {None, "pass"}:
-                continue
+        current_task_id: str | None = None
+        latest_commit: str | None = None
+        latest_qc_at: str | None = None
+        latest_findings: dict[tuple[str, str, str], dict[str, Any]] = {}
+        seen_commits: dict[tuple[str, str, str], set[str]] = {}
+        prior_commit_samples: dict[tuple[str, str, str], list[str]] = {}
 
-            latest_findings = {
-                identity: finding
-                for finding in StatusView._parse_qc_findings(latest.get("findings_json"))
-                if (identity := StatusView._qc_finding_identity(finding)) is not None
-            }
+        def finish_task() -> None:
+            if current_task_id is None or latest_commit is None:
+                return
             repeats: list[dict[str, Any]] = []
             for identity, finding in latest_findings.items():
-                commits = [latest_commit]
-                seen_commits = {latest_commit}
-                for earlier in history[1:]:
-                    commit_sha = earlier.get("commit_sha")
-                    if (
-                        earlier.get("qc_verdict") in {None, "pass"}
-                        or not commit_sha
-                        or commit_sha in seen_commits
-                    ):
-                        continue
-                    earlier_findings = StatusView._parse_qc_findings(earlier.get("findings_json"))
-                    if any(
-                        StatusView._qc_finding_identity(candidate) == identity
-                        for candidate in earlier_findings
-                    ):
-                        seen_commits.add(commit_sha)
-                        commits.append(commit_sha)
-
-                if len(seen_commits) < 2:
+                distinct_count = len(seen_commits[identity])
+                prior_count = distinct_count - 1
+                if prior_count < 1:
                     continue
                 stable_fields = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
                 fingerprint = _hashlib.sha256(stable_fields.encode("ascii")).hexdigest()[:16]
+                prior_shas = prior_commit_samples[identity]
                 repeats.append(
                     {
                         "advisory": True,
@@ -427,17 +399,60 @@ class StatusView:
                         "requirement": finding["requirement"],
                         "finding": finding["finding"],
                         "required_fix": finding["required_fix"],
-                        "distinct_commit_count": len(seen_commits),
+                        "distinct_commit_count": distinct_count,
                         "latest_commit_sha": latest_commit,
-                        "matching_prior_commit_count": len(seen_commits) - 1,
-                        "matching_prior_commit_shas": commits[1:5],
-                        "prior_commit_shas_truncated": len(commits) > 5,
-                        "latest_qc_at": latest.get("qc_finished_at"),
+                        "matching_prior_commit_count": prior_count,
+                        "matching_prior_commit_shas": prior_shas,
+                        "prior_commit_shas_truncated": prior_count > len(prior_shas),
+                        "latest_qc_at": latest_qc_at,
                     }
                 )
             if repeats:
-                recurring[task_id] = sorted(repeats, key=lambda item: item["fingerprint"])
-        return recurring
+                recurring[current_task_id] = sorted(repeats, key=lambda item: item["fingerprint"])
+
+        for row in rows:
+            task_id = row["task_id"]
+            if task_id != current_task_id:
+                finish_task()
+                current_task_id = task_id
+                latest_commit = row["commit_sha"]
+                latest_qc_at = row["qc_finished_at"]
+                latest_findings = {}
+                seen_commits = {}
+                prior_commit_samples = {}
+                latest_submissions[task_id] = {
+                    "id": row["id"],
+                    "status": row["status"],
+                    "qc_verdict": row["qc_verdict"],
+                    "qc_finished_at": row["qc_finished_at"],
+                }
+                if latest_commit and row["qc_verdict"] not in {None, "pass"}:
+                    for finding in StatusView._parse_qc_findings(row["findings_json"]):
+                        identity = StatusView._qc_finding_identity(finding)
+                        if identity is None:
+                            continue
+                        latest_findings.setdefault(identity, finding)
+                        seen_commits.setdefault(identity, {latest_commit})
+                        prior_commit_samples.setdefault(identity, [])
+                continue
+
+            commit_sha = row["commit_sha"]
+            if not latest_findings or row["qc_verdict"] in {None, "pass"} or not commit_sha:
+                continue
+            for finding in StatusView._parse_qc_findings(row["findings_json"]):
+                identity = StatusView._qc_finding_identity(finding)
+                if identity not in latest_findings:
+                    continue
+                task_commits = seen_commits[identity]
+                if commit_sha in task_commits:
+                    continue
+                task_commits.add(commit_sha)
+                samples = prior_commit_samples[identity]
+                if len(samples) < 4:
+                    samples.append(commit_sha)
+
+        finish_task()
+        return latest_submissions, recurring
 
     @staticmethod
     def _parse_qc_findings(findings_json: str | None) -> list[dict[str, Any]]:
