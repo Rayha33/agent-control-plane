@@ -694,6 +694,70 @@ def test_directory_aliases_overlap_and_internal_paths_are_rejected(
         supervisor.normalize_resource("../escape")
 
 
+def test_claim_rejects_nested_logical_scope_and_keeps_waiting_task_open(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    holder = task(supervisor, "logical:auth", title="auth subsystem")
+    waiting = task(supervisor, "logical:auth/session-migration", title="session migration")
+    attempt = supervisor.claim(holder["id"], "agent-holder")
+
+    with pytest.raises(SupervisorError) as busy:
+        supervisor.claim(waiting["id"], "agent-waiting")
+
+    assert busy.value.code == "resource_busy"
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+    assert supervisor.task(waiting["id"])["status"] == "open"
+
+
+@pytest.mark.parametrize(
+    "legacy_declared_path", ["Logical:auth", "./Logical:auth", "./logical:auth"]
+)
+def test_claim_keeps_legacy_case_variant_prefix_path_separate_from_logical_scope(
+    repo: Path, legacy_declared_path: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    legacy_path = task(supervisor, "logical:auth", title="legacy path alias")
+    logical_child = task(supervisor, "logical:auth/session", title="logical child")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": legacy_declared_path}), legacy_path["id"]),
+        )
+
+    supervisor.claim(legacy_path["id"], "agent-path")
+    child_attempt = supervisor.claim(logical_child["id"], "agent-logical")
+
+    assert supervisor.attempt(child_attempt["id"])["status"] == "working"
+
+
+def test_claim_serializes_identical_legacy_path_and_logical_keys(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    legacy_path = task(supervisor, "logical:auth", title="legacy path alias")
+    logical_scope = task(supervisor, "logical:auth", title="logical namespace")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": "Logical:auth"}), legacy_path["id"]),
+        )
+
+    supervisor.claim(legacy_path["id"], "agent-path")
+    with pytest.raises(SupervisorError) as busy:
+        supervisor.claim(logical_scope["id"], "agent-logical")
+
+    assert busy.value.code == "resource_busy"
+    assert supervisor.task(logical_scope["id"])["status"] == "open"
+
+
+def test_claim_allows_sibling_logical_scopes(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    session = task(supervisor, "logical:auth/session", title="session flow")
+    tokens = task(supervisor, "logical:auth/tokens", title="token format")
+
+    session_attempt = supervisor.claim(session["id"], "agent-session")
+    token_attempt = supervisor.claim(tokens["id"], "agent-tokens")
+
+    assert session_attempt["id"] != token_attempt["id"]
+
+
 def test_submission_derives_diff_and_rejects_undeclared_write(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")

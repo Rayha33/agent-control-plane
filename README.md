@@ -49,7 +49,7 @@ wedge.
 
 | Control | Enforced behavior |
 |---|---|
-| Normalized resources | Repo-relative paths, globs, directory scopes, and logical resources |
+| Normalized resources | Repo-relative paths, globs, directory scopes, and hierarchical logical scopes |
 | Atomic claims | SQLite immediate transactions make a colliding claim fail closed |
 | Fencing | Every attempt and exact resource receives a monotonic token |
 | Worktree ownership | Every successful claim provisions a dedicated branch and worktree |
@@ -189,6 +189,20 @@ agent in that worktree, or let ACP supervise it:
 ~~~bash
 uv run --extra dev acp run ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../codex-session-17.credential -- your-agent-command
 ~~~
+
+For coupled areas spanning multiple files, declare a logical namespace as well
+as file paths. A reservation on <code>logical:auth</code> overlaps
+<code>logical:auth/migrations</code>; sibling scopes such as
+<code>logical:auth/tokens</code> and <code>logical:auth/sessions</code> remain
+independent. ACP compares declared names only—it does not infer semantic
+coupling from source code.
+
+The `logical:` prefix is reserved case-insensitively after path canonicalization;
+new filesystem resources cannot use a case variant such as `Logical:auth`. For
+compatibility, an existing path and logical scope with the same folded lease key
+are conservatively serialized as an exact-key conflict because ACP has one global
+lease primary key. Distinct path and logical keys do not inherit hierarchical
+overlap across types.
 
 The command must leave a clean, committed worktree. A successful supervised run
 submits automatically. For a manually operated agent:

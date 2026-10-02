@@ -81,20 +81,38 @@ class ClaimsMixin:
                         f"which is {producer['status']}",
                     )
             requested = json.loads(task["resources_json"])
+            requested_declared = dict(zip(requested, self._declared_resources(task), strict=False))
             leases = connection.execute(
                 """
                 SELECT lease.resource, lease.task_id, lease.attempt_id,
-                       attempt.agent_id AS agent_id
+                       attempt.agent_id AS agent_id,
+                       owner.resources_json AS resources_json,
+                       owner.declared_resources_json AS declared_resources_json
                 FROM resource_leases AS lease
                 LEFT JOIN attempts AS attempt ON attempt.id = lease.attempt_id
+                LEFT JOIN tasks AS owner ON owner.id = lease.task_id
                 WHERE lease.task_id IS NOT NULL AND lease.lease_expires_at > ?
                 """,
                 (int(time.time()),),
             ).fetchall()
             for resource in requested:
                 for lease in leases:
+                    holder_declared = (
+                        dict(
+                            zip(
+                                json.loads(lease["resources_json"]),
+                                declared_resources(lease),
+                                strict=False,
+                            )
+                        ).get(lease["resource"])
+                        if lease["resources_json"]
+                        else None
+                    )
                     if lease["task_id"] != task_id and self.resources_overlap(
-                        resource, lease["resource"]
+                        resource,
+                        lease["resource"],
+                        left_declared=requested_declared.get(resource),
+                        right_declared=holder_declared,
                     ):
                         overlap = "exact" if resource == lease["resource"] else "potential"
                         # Name BOTH sides as their tasks declared them (#1764, board #1630):
@@ -460,7 +478,10 @@ class ClaimsMixin:
             )
 
         relative = target.relative_to(worktree).as_posix()
-        if not any(self._path_matches(relative, resource, fold=fold) for resource, fold in rules):
+        if not any(
+            self._path_matches(relative, resource, fold=fold, is_logical=is_logical)
+            for resource, fold, is_logical in rules
+        ):
             return self._guard_denial(
                 attempt_id,
                 path,
@@ -500,8 +521,10 @@ class ClaimsMixin:
         return bool(row) and row["value"] == "1"
 
     @classmethod
-    def _write_set_rules(cls, task: sqlite3.Row, case_sensitive: bool) -> list[tuple[str, bool]]:
-        """The write set as `(resource, fold)` pairs for `_path_matches`.
+    def _write_set_rules(
+        cls, task: sqlite3.Row, case_sensitive: bool
+    ) -> list[tuple[str, bool, bool]]:
+        """The write set as `(resource, fold, is_logical)` rules for `_path_matches`.
 
         The stored resource is folded, and folded is what the lease is keyed on, so this
         does not change what a task owns. It changes what counts as being INSIDE what the
@@ -520,30 +543,55 @@ class ClaimsMixin:
         """
 
         folded = json.loads(task["resources_json"])
-        if not case_sensitive:
-            return [(item, True) for item in folded]
         try:
             declared = json.loads(task["declared_resources_json"] or "{}")
         except (KeyError, IndexError, TypeError, ValueError):
             declared = {}
-        rules: list[tuple[str, bool]] = []
+        rules: list[tuple[str, bool, bool]] = []
         for item in folded:
             raw = declared.get(item)
             if not isinstance(raw, str):
-                rules.append((item, True))
+                rules.append((item, True, item.startswith("logical:")))
+                continue
+            # Before `logical:` was reserved, a case-variant prefix could name an
+            # ordinary POSIX path and fold to the same stored key as a logical lock.
+            # Keep those old rows path-typed using their raw declaration. New rows
+            # cannot create this ambiguity (see normalize_resource).
+            if cls._is_legacy_logical_path(raw):
+                value = unicodedata.normalize("NFC", raw.strip().replace("\\", "/"))
+                cased = PurePosixPath(value).as_posix()
+                if item.endswith("/**") and not cased.endswith("/**"):
+                    cased = cased.rstrip("/") + "/**"
+                rules.append((cased, not case_sensitive, False))
+                continue
+            raw_value = unicodedata.normalize("NFC", raw.strip().replace("\\", "/"))
+            is_logical = raw_value.startswith("logical:")
+            if not case_sensitive:
+                rules.append((item, True, is_logical))
                 continue
             try:
                 cased = cls.normalize_resource(raw, fold=False)
             except SupervisorError:
-                rules.append((item, True))
+                rules.append((item, True, item.startswith("logical:")))
                 continue
             # The directory suffix came from a probe of the repository at task creation,
             # which cannot be re-run reliably later; take it from the folded form, which
             # recorded the answer.
             if item.endswith("/**") and not cased.endswith("/**"):
                 cased = cased.rstrip("/") + "/**"
-            rules.append((item, True) if cased.casefold() != item else (cased, False))
+            if cased.casefold() != item:
+                rules.append((item, True, item.startswith("logical:")))
+            else:
+                rules.append((cased, False, is_logical))
         return rules
+
+    @staticmethod
+    def _is_legacy_logical_path(raw: str) -> bool:
+        """Whether a pre-reservation declaration was a path alias of `logical:`."""
+
+        value = unicodedata.normalize("NFC", raw.strip().replace("\\", "/"))
+        canonical = PurePosixPath(value).as_posix()
+        return canonical.casefold().startswith("logical:") and not value.startswith("logical:")
 
     def guard_context(self, attempt_id: str) -> dict[str, Any]:
         """What an agent needs to stay inside its claim: worktree and write set.
@@ -668,7 +716,8 @@ class ClaimsMixin:
                 path
                 for path in changed
                 if not any(
-                    self._path_matches(path, resource, fold=fold) for resource, fold in rules
+                    self._path_matches(path, resource, fold=fold, is_logical=is_logical)
+                    for resource, fold, is_logical in rules
                 )
             ]
             if undeclared:
@@ -830,7 +879,9 @@ class ClaimsMixin:
             )
 
     @staticmethod
-    def _path_matches(path: str, resource: str, *, fold: bool = True) -> bool:
+    def _path_matches(
+        path: str, resource: str, *, fold: bool = True, is_logical: bool | None = None
+    ) -> bool:
         """Is `path` inside `resource`?
 
         `fold=False` compares capitalisation too, and the caller must then pass the
@@ -841,7 +892,10 @@ class ClaimsMixin:
         candidate = unicodedata.normalize("NFC", PurePosixPath(path).as_posix())
         if fold:
             candidate = candidate.casefold()
-        if resource.startswith("logical:"):
+        logical_resource = resource.startswith("logical:") if is_logical is None else is_logical
+        if fold:
+            resource = resource.casefold()
+        if logical_resource:
             return False
         if resource.endswith("/**"):
             prefix = resource[:-3].rstrip("/")
@@ -919,6 +973,11 @@ class ClaimsMixin:
             raise SupervisorError("invalid_resource", f"resource must be repo-relative: {raw}")
         value = path.as_posix()
         lowered = value.casefold()
+        if lowered.startswith("logical:"):
+            raise SupervisorError(
+                "invalid_resource",
+                "path uses the reserved logical: prefix (case-insensitive)",
+            )
         if lowered in {".git", ".acp"} or lowered.startswith((".git/", ".acp/")):
             raise SupervisorError("invalid_resource", f"internal resource forbidden: {raw}")
         directory = directory or bool(repo and (repo / value).is_dir())

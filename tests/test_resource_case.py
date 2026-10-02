@@ -33,7 +33,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from support import git, init_repo, make_task
+from support import commit_change, git, init_repo, make_task
 
 from agent_control_plane.git_supervisor import (
     META_CASE_SENSITIVE,
@@ -126,6 +126,34 @@ def test_logical_resources_stay_folded_even_when_asked_not_to() -> None:
     assert GitSupervisor.normalize_resource("logical:Deploy", fold=False) == "logical:deploy"
 
 
+def test_case_variant_logical_prefix_is_reserved_from_new_paths() -> None:
+    with pytest.raises(SupervisorError, match="reserved logical"):
+        GitSupervisor.normalize_resource("Logical:auth")
+    with pytest.raises(SupervisorError, match="reserved logical"):
+        GitSupervisor.normalize_resource("LOGICAL:auth/migrations/")
+    with pytest.raises(SupervisorError, match="reserved logical"):
+        GitSupervisor.normalize_resource("./Logical:auth")
+    with pytest.raises(SupervisorError, match="reserved logical"):
+        GitSupervisor.normalize_resource("./logical:auth")
+
+
+def test_logical_resources_overlap_by_slash_delimited_ancestry() -> None:
+    normalize = GitSupervisor.normalize_resource
+    overlaps = GitSupervisor.resources_overlap
+
+    assert overlaps(normalize("logical:Auth"), normalize("logical:auth/session-migration"))
+    assert overlaps(normalize("logical:auth/session"), normalize("logical:AUTH/session"))
+    assert not overlaps(normalize("logical:auth/session"), normalize("logical:auth/tokens"))
+    assert not overlaps(normalize("logical:auth"), normalize("logical:authentication"))
+    assert not overlaps(normalize("logical:auth"), normalize("auth"))
+    assert not overlaps(
+        normalize("logical:auth"),
+        normalize("logical:auth/session-migration"),
+        left_declared="Logical:auth",
+        right_declared="logical:auth/session-migration",
+    )
+
+
 def test_path_matches_is_case_sensitive_when_folding_is_off() -> None:
     assert GitSupervisor._path_matches("makefile", "makefile") is True
     assert GitSupervisor._path_matches("Makefile", "makefile") is True
@@ -136,6 +164,12 @@ def test_path_matches_is_case_sensitive_when_folding_is_off() -> None:
     assert GitSupervisor._path_matches("Docs/Guide.md", "Docs/**", fold=False) is True
     assert GitSupervisor._path_matches("Docs/g.txt", "Docs/*.txt", fold=False) is True
     assert GitSupervisor._path_matches("docs/g.txt", "Docs/*.txt", fold=False) is False
+
+
+def test_path_match_keeps_legacy_case_variant_namespace_alias_as_a_path() -> None:
+    assert GitSupervisor._path_matches("Logical:auth", "Logical:auth", fold=False)
+    assert GitSupervisor._path_matches("logical:auth", "Logical:auth", fold=True)
+    assert not GitSupervisor._path_matches("logical:auth/child", "Logical:auth", fold=True)
 
 
 # ------------------------------------------------------- THE GATE: guard, both ways
@@ -167,6 +201,46 @@ def test_guard_denies_the_other_case_on_a_case_sensitive_filesystem(declared_mak
     assert allowed["allow"] is True
     assert denied["allow"] is False
     assert denied["reason"] == "undeclared_write"
+
+
+@pytest.mark.parametrize(
+    "declared_path",
+    ["Logical:auth", "./Logical:auth", "./LOGICAL:auth", "./logical:auth"],
+)
+def test_guard_preserves_legacy_case_variant_prefix_as_path(repo: Path, declared_path: str) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "logical:auth")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": declared_path}), created["id"]),
+        )
+    attempt = supervisor.claim(created["id"], "worker")
+    record_case_sensitivity(supervisor, True)
+
+    canonical_path = declared_path.removeprefix("./")
+    other_case = "Logical:auth" if canonical_path == "logical:auth" else "logical:auth"
+    assert supervisor.guard(attempt["id"], canonical_path)["allow"] is True
+    denied = supervisor.guard(attempt["id"], other_case)
+    assert denied["allow"] is False
+    assert denied["reason"] == "undeclared_write"
+
+
+def test_guard_preserves_legacy_case_variant_prefix_on_insensitive_filesystem(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "logical:auth")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": "./Logical:auth"}), created["id"]),
+        )
+    attempt = supervisor.claim(created["id"], "worker")
+    record_case_sensitivity(supervisor, False)
+
+    assert supervisor.guard(attempt["id"], "Logical:auth")["allow"] is True
+    assert supervisor.guard(attempt["id"], "logical:auth")["allow"] is True
 
 
 def test_guard_still_allows_the_other_case_on_a_case_insensitive_filesystem(
@@ -259,6 +333,27 @@ def test_submit_still_accepts_the_other_case_on_a_case_insensitive_filesystem(
 
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     assert submission["changed_paths"] == ["makefile"]
+
+
+@pytest.mark.parametrize("declared_path", ["./Logical:auth", "./logical:auth"])
+def test_submit_accepts_a_legacy_dot_prefixed_logical_path_alias(
+    repo: Path, declared_path: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "logical:auth")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET declared_resources_json = ? WHERE id = ?",
+            (json.dumps({"logical:auth": declared_path}), created["id"]),
+        )
+    attempt = supervisor.claim(created["id"], "worker")
+    record_case_sensitivity(supervisor, True)
+    changed_path = declared_path.removeprefix("./")
+    commit_change(attempt, changed_path, "value = 'legacy path'\n")
+
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert submission["changed_paths"] == [changed_path]
 
 
 # ------------------------------------------------------------- the operator surfaces

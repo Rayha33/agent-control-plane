@@ -589,11 +589,39 @@ class GitSupervisor(
         return Path(result.stdout.strip()).resolve()
 
     @staticmethod
-    def resources_overlap(left: str, right: str) -> bool:
-        if left.startswith("logical:") or right.startswith("logical:"):
-            return left == right
+    def resources_overlap(
+        left: str,
+        right: str,
+        *,
+        left_declared: str | None = None,
+        right_declared: str | None = None,
+    ) -> bool:
+        # Exact canonical keys always conflict. `resource_leases` has one global
+        # primary-key namespace, so a pre-v3 path/logical alias with the same folded
+        # key must be serialized rather than allowed to overwrite its fencing row.
+        # This is a conservative legacy-only exact conflict; distinct keys never
+        # inherit logical ancestry across path/logical types.
         if left == right:
             return True
+
+        def is_logical(resource: str, declared: str | None) -> bool:
+            if declared is None:
+                return resource.startswith("logical:")
+            raw = unicodedata.normalize("NFC", declared.strip().replace("\\", "/"))
+            return raw.startswith("logical:")
+
+        left_is_logical = is_logical(left, left_declared)
+        right_is_logical = is_logical(right, right_declared)
+        if left_is_logical or right_is_logical:
+            if not left_is_logical or not right_is_logical:
+                return False
+            left_scope = left.removeprefix("logical:")
+            right_scope = right.removeprefix("logical:")
+            return (
+                left_scope == right_scope
+                or left_scope.startswith(right_scope + "/")
+                or right_scope.startswith(left_scope + "/")
+            )
         for pattern, candidate in ((left, right), (right, left)):
             if pattern.endswith("/**"):
                 prefix = pattern[:-3].rstrip("/")
