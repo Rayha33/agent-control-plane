@@ -299,7 +299,7 @@ def test_supervised_worker_heartbeat_does_not_replace_explicit_checkpoint(repo: 
         "pathlib.Path('alpha.txt').write_text('worker\\n'); "
         "subprocess.run(['git','add','alpha.txt'],check=True); "
         "subprocess.run(['git','commit','-m','slow worker'],check=True); "
-        "time.sleep(7)"
+        "time.sleep(12)"
     )
 
     submission = supervisor.run_worker(
