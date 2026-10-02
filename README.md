@@ -63,7 +63,7 @@ wedge.
 | Overlap preview | A dry-run claim reports exact and potential scope collisions, and who owns them, before an agent starts |
 | Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
 | Merge scheduling | Approved submissions get an ordering preview, shared-path conflict prediction, and staleness when the base moves |
-| Operator status | One read-only screen ranks what needs a human, what failed cleanup, and what is merely running |
+| Operator status | One read-only screen ranks what needs a human, what failed cleanup, what is running, and backing-filesystem capacity |
 | Reviewer provenance | Signed identity/provider/model/prompt-policy on every verdict, with a replayable bundle |
 | Policy ratification | A reviewer or prompt upgrade stops QC until a human ratifies the new fingerprint |
 | Evaluator calibration | Golden seeded defects score false-pass/false-block rates with Wilson intervals |
@@ -390,6 +390,13 @@ checkpoint ages are unknown until the v3 code records them. Older workers can
 still renew their leases without updating the new timestamps, so status does not
 guess from their legacy writes; it shows <code>hb -</code> and <code>cp unknown</code>
 while lease countdown and registered-process identity remain separate signals.
+
+The <code>disk</code> section separates ACP-owned state/reclaimable-worktree
+bytes from total and free bytes on the filesystem containing <code>.acp/</code>.
+Filesystem capacity is the OS-reported, point-in-time total/free value for that
+filesystem: it does not attribute space to ACP or other providers, reserve
+capacity, enforce a quota, or authorize cleanup. If the probe fails, its byte
+values are <code>null</code> with status <code>unavailable</code>, never zero.
 
 JSON remains canonical; <code>--format text</code> renders that same snapshot.
 

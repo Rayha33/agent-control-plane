@@ -113,6 +113,12 @@ is the command that upgrades it. `list` is excluded on purpose, because
 `list_tasks()` reaps; `doctor` is excluded because it is what an operator runs when
 the database needs upgrading, so it has to be able to open one to say so.
 
+`acp status` also samples OS-reported total and free bytes for the filesystem
+containing the ACP state/worktree root. These values are separate from measured
+ACP-owned state and reclaimable-worktree bytes; they cannot attribute provider
+temp copies, reserve space, enforce a quota, or justify deleting files. A failed
+capacity probe is reported as unavailable with unknown byte values.
+
 The ready queue reserves each admitted task's scopes for the remainder of the
 pass. Its `ready` list is therefore a set of tasks that can run *concurrently*,
 not a list of tasks that could each run alone.
