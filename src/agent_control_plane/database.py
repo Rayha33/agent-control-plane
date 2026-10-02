@@ -23,7 +23,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 1
+SERVICE_SCHEMA_VERSION = 3
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -32,11 +32,112 @@ by `acp init` — and coupling their numbers would force a version bump on one w
 the other changed.
 """
 
-# Numbered upgrades from SERVICE_SCHEMA_VERSION - 1 to SERVICE_SCHEMA_VERSION. Version 1
-# is the baseline: the CREATE TABLE IF NOT EXISTS script plus the column adds that
-# predate stamping. Anything after 1 goes here, including changes ALTER TABLE ADD COLUMN
-# cannot express.
-MIGRATIONS: tuple[Migration, ...] = ()
+
+def _add_mandate_descendant_cap(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(mandates)")}
+    if "max_descendant_mandates" not in columns:
+        connection.execute("ALTER TABLE mandates ADD COLUMN max_descendant_mandates INTEGER")
+
+
+def _install_mandate_fanout_guard(connection: sqlite3.Connection) -> None:
+    """Enforce issued-mandate caps below old service workers too.
+
+    A worker that was already running when the service database was migrated has
+    already passed its startup schema-version check. Its old INSERT statement does
+    not know about the cap, so the persistent database trigger is the compatibility
+    boundary during a rolling upgrade.
+    """
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS mandate_fanout_guard
+        BEFORE INSERT ON mandates
+        WHEN NEW.parent_mandate_id IS NOT NULL
+        BEGIN
+            SELECT CASE WHEN EXISTS (
+                WITH RECURSIVE
+                ancestors(id, parent_id, cap) AS (
+                    SELECT id, parent_mandate_id, max_descendant_mandates
+                    FROM mandates
+                    WHERE id = NEW.parent_mandate_id
+                    UNION
+                    SELECT parent.id, parent.parent_mandate_id,
+                           parent.max_descendant_mandates
+                    FROM mandates AS parent
+                    JOIN ancestors AS child ON parent.id = child.parent_id
+                ),
+                descendants(ancestor_id, descendant_id) AS (
+                    SELECT ancestor.id, child.id
+                    FROM ancestors AS ancestor
+                    JOIN mandates AS child ON child.parent_mandate_id = ancestor.id
+                    WHERE ancestor.cap IS NOT NULL
+                    UNION
+                    SELECT descendants.ancestor_id, child.id
+                    FROM descendants
+                    JOIN mandates AS child
+                      ON child.parent_mandate_id = descendants.descendant_id
+                )
+                SELECT 1
+                FROM ancestors AS ancestor
+                WHERE ancestor.cap IS NOT NULL
+                  AND (
+                      SELECT COUNT(*)
+                      FROM descendants
+                      WHERE descendants.ancestor_id = ancestor.id
+                  ) >= ancestor.cap
+            ) THEN RAISE(ABORT, 'mandate_fanout_exhausted') END;
+        END;
+        """
+    )
+
+
+def _install_schema_version_monotonicity_guard(connection: sqlite3.Connection) -> None:
+    """Keep a stale initializer from making a migrated DB look older again.
+
+    An older process can have read its startup version before this migration takes
+    the writer lock. Its legacy ``INSERT OR REPLACE`` stamp must not overwrite the
+    newer version after that process resumes.
+    """
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS service_schema_version_no_downgrade
+        BEFORE INSERT ON meta
+        WHEN NEW.key = 'schema_version'
+          AND EXISTS (
+              SELECT 1 FROM meta
+              WHERE key = NEW.key
+                AND CAST(value AS INTEGER) > CAST(NEW.value AS INTEGER)
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'service_schema_version_downgrade');
+        END;
+        """
+    )
+
+
+def _install_service_upgrade_guards(connection: sqlite3.Connection) -> None:
+    _install_mandate_fanout_guard(connection)
+    _install_schema_version_monotonicity_guard(connection)
+
+
+def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("incomplete SQL statement in service schema")
+
+
+# Version 1 is the baseline CREATE TABLE script plus pre-stamp column additions.
+# Numbered upgrades from 2 onward are applied transactionally by the schema ledger.
+MIGRATIONS: tuple[Migration, ...] = (
+    (2, _add_mandate_descendant_cap),
+    (3, _install_service_upgrade_guards),
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -171,6 +272,7 @@ CREATE TABLE IF NOT EXISTS reviews (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mandates_agent ON mandates(agent_id);
+CREATE INDEX IF NOT EXISTS idx_mandates_parent ON mandates(parent_mandate_id);
 CREATE INDEX IF NOT EXISTS idx_policies_agent ON policies(agent_id);
 CREATE INDEX IF NOT EXISTS idx_actions_status ON action_requests(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority DESC);
@@ -219,7 +321,6 @@ class Database:
         with self.connect() as connection:
             # Read the stamp before the first CREATE or ALTER. Checking afterwards
             # would be checking a database this binary had already written to.
-            connection.executescript(META_TABLE)
             stored = stored_schema_version(connection)
             assert_schema_not_newer(
                 stored,
@@ -231,7 +332,20 @@ class Database:
                 # Validate the schema before changing the file's journal mode.
                 # WAL lets readers continue while another connection holds a claim.
                 connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(SCHEMA)
+            # Serialize all schema work. Re-read only after obtaining the write lock:
+            # another process may have completed this migration after our first read.
+            # This explicit transaction also makes the ledger stamp atomic with its
+            # ALTER/trigger statements; executescript() would implicitly COMMIT it.
+            connection.execute("BEGIN IMMEDIATE")
+            stored = stored_schema_version(connection)
+            assert_schema_not_newer(
+                stored,
+                binary_version=SERVICE_SCHEMA_VERSION,
+                component="service database",
+                package_version=__version__,
+            )
+            connection.execute(META_TABLE)
+            _execute_script_in_transaction(connection, SCHEMA)
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(agents)").fetchall()
             }

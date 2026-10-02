@@ -688,6 +688,20 @@ The repository also retains the FastAPI authority prototype from v0.1: signed
 mandates, delegation attenuation, policy checks, approvals, agent kill
 switches, and coordination endpoints.
 
+Mandate issuance optionally accepts `max_descendant_mandates`: a lifetime cap on
+all mandate rows issued below that mandate, across every depth. Each capped
+ancestor is enforced, and expired or revoked descendants still consume a slot.
+The check and child insert run in one SQLite write transaction, so concurrent
+issuers cannot spend the same remaining slot. A database trigger also enforces
+the cap for already-running older service workers during rolling upgrades; schema
+migrations are serialized under a SQLite write lock, and a DB trigger prevents a
+stale initializer from downgrading the recorded schema version. An older worker
+blocked by the mandate trigger may report a generic request failure; the structured
+denial and audit event are produced by updated workers. Omitting the field
+preserves the legacy unlimited behavior. This limits only delegation that uses
+ACP-issued mandates; it does not observe provider-internal subagent creation or
+meter model tokens. `max_amount_cents` remains a separate per-action limit.
+
 ~~~bash
 export ACP_ADMIN_KEY="replace-with-a-long-random-value"
 export ACP_SIGNING_KEY="replace-with-an-independent-long-random-value"

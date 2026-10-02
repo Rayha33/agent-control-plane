@@ -106,102 +106,139 @@ class ControlPlaneService:
     def issue_mandate(
         self, request: MandateCreate, delegator_token: str | None = None
     ) -> dict[str, Any]:
-        agent = self._agent(request.agent_id)
-        if not agent:
-            raise ControlPlaneError(404, "agent_not_found", "agent not found")
-        if agent["disabled"]:
-            raise ControlPlaneError(409, "agent_disabled", "agent is disabled")
-
-        expires_at = int(time.time()) + request.ttl_seconds
-        parent = None
-        if request.parent_mandate_id:
-            if not delegator_token:
-                raise ControlPlaneError(
-                    401, "delegator_token_required", "parent mandate token is required"
-                )
-            # authenticated_agent, not authenticate: a kill-switched parent (or
-            # any disabled ancestor) must not mint child mandates that would come
-            # alive the moment the switch is reset.
-            parent_claims, parent, _parent_agent = self.authenticated_agent(delegator_token)
-            if parent["id"] != request.parent_mandate_id:
-                raise ControlPlaneError(
-                    403,
-                    "parent_token_mismatch",
-                    "token does not represent parent mandate",
-                )
-            if agent["parent_agent_id"] != parent["agent_id"]:
-                raise ControlPlaneError(
-                    403,
-                    "invalid_delegation_chain",
-                    "mandates may only delegate to a direct child agent",
-                )
-            parent_scopes = parent_claims["scopes"]
-            requested_scopes = [scope.model_dump() for scope in request.scopes]
-            if not all(scope_is_delegable(scope, parent_scopes) for scope in requested_scopes):
-                raise ControlPlaneError(
-                    403, "scope_escalation", "child scopes exceed parent authority"
-                )
-            if expires_at > parent["expires_at"]:
-                raise ControlPlaneError(
-                    403, "expiry_escalation", "child mandate outlives parent mandate"
-                )
-            parent_max = parent["max_amount_cents"]
-            if parent_max is not None and (
-                request.max_amount_cents is None or request.max_amount_cents > parent_max
-            ):
-                raise ControlPlaneError(
-                    403,
-                    "amount_escalation",
-                    "child amount limit exceeds parent authority",
-                )
+        if request.parent_mandate_id and not delegator_token:
+            raise ControlPlaneError(
+                401, "delegator_token_required", "parent mandate token is required"
+            )
 
         mandate_id = str(uuid.uuid4())
         scopes = [scope.model_dump() for scope in request.scopes]
-        created_at = utc_now()
-        # Minted before the row exists: signing is pure, so a failure here must not
-        # leave a mandate behind that no token was ever issued against.
-        token = issue_token(
-            signing_key=self.settings.signing_key,
-            issuer=self.settings.issuer,
-            agent_id=request.agent_id,
-            mandate_id=mandate_id,
-            subject=request.subject,
-            scopes=scopes,
-            expires_at=expires_at,
-        )
+        fanout_exhaustion: dict[str, int | str] | None = None
+        token: str | None = None
+        # The check and row insert share one write transaction. BEGIN IMMEDIATE
+        # serializes sibling issuers so they cannot both spend the same last slot.
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO mandates
-                    (id, agent_id, subject, parent_mandate_id, scopes_json,
-                     max_amount_cents, expires_at, revoked, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-                """,
-                (
-                    mandate_id,
-                    request.agent_id,
+            agent = self._agent(request.agent_id)
+            if not agent:
+                raise ControlPlaneError(404, "agent_not_found", "agent not found")
+            if agent["disabled"]:
+                raise ControlPlaneError(409, "agent_disabled", "agent is disabled")
+
+            expires_at = int(time.time()) + request.ttl_seconds
+            parent = None
+            if request.parent_mandate_id:
+                # Check the full active lineage while the issuance transaction owns
+                # SQLite's writer lock; a concurrent revoke/kill switch cannot race
+                # this mint after the authority check.
+                parent_claims, parent, _parent_agent = self.authenticated_agent(
+                    delegator_token or ""
+                )
+                if parent["id"] != request.parent_mandate_id:
+                    raise ControlPlaneError(
+                        403,
+                        "parent_token_mismatch",
+                        "token does not represent parent mandate",
+                    )
+                if agent["parent_agent_id"] != parent["agent_id"]:
+                    raise ControlPlaneError(
+                        403,
+                        "invalid_delegation_chain",
+                        "mandates may only delegate to a direct child agent",
+                    )
+                parent_scopes = parent_claims["scopes"]
+                if not all(scope_is_delegable(scope, parent_scopes) for scope in scopes):
+                    raise ControlPlaneError(
+                        403, "scope_escalation", "child scopes exceed parent authority"
+                    )
+                if expires_at > parent["expires_at"]:
+                    raise ControlPlaneError(
+                        403, "expiry_escalation", "child mandate outlives parent mandate"
+                    )
+                parent_max = parent["max_amount_cents"]
+                if parent_max is not None and (
+                    request.max_amount_cents is None or request.max_amount_cents > parent_max
+                ):
+                    raise ControlPlaneError(
+                        403,
+                        "amount_escalation",
+                        "child amount limit exceeds parent authority",
+                    )
+
+                fanout_exhaustion = self._mandate_fanout_exhaustion(
+                    connection, request.parent_mandate_id
+                )
+
+            if fanout_exhaustion:
+                self.database.append_audit(
+                    "mandate.fanout_denied",
                     request.subject,
-                    request.parent_mandate_id,
-                    canonical_json(scopes),
-                    request.max_amount_cents,
-                    expires_at,
-                    created_at,
-                ),
+                    {
+                        "agent_id": request.agent_id,
+                        "ancestor_mandate_id": fanout_exhaustion["ancestor_mandate_id"],
+                        "issued_descendant_mandates": fanout_exhaustion[
+                            "issued_descendant_mandates"
+                        ],
+                        "max_descendant_mandates": fanout_exhaustion["max_descendant_mandates"],
+                        "parent_mandate_id": request.parent_mandate_id,
+                    },
+                    connection=connection,
+                )
+            else:
+                # Signing is pure; do it only after the cap check, then atomically
+                # commit the mandate and its audit receipt.
+                token = issue_token(
+                    signing_key=self.settings.signing_key,
+                    issuer=self.settings.issuer,
+                    agent_id=request.agent_id,
+                    mandate_id=mandate_id,
+                    subject=request.subject,
+                    scopes=scopes,
+                    expires_at=expires_at,
+                )
+                created_at = utc_now()
+                connection.execute(
+                    """
+                    INSERT INTO mandates
+                        (id, agent_id, subject, parent_mandate_id, scopes_json,
+                         max_amount_cents, max_descendant_mandates, expires_at,
+                         revoked, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    """,
+                    (
+                        mandate_id,
+                        request.agent_id,
+                        request.subject,
+                        request.parent_mandate_id,
+                        canonical_json(scopes),
+                        request.max_amount_cents,
+                        request.max_descendant_mandates,
+                        expires_at,
+                        created_at,
+                    ),
+                )
+                self.database.append_audit(
+                    "mandate.issued",
+                    request.subject,
+                    {
+                        "agent_id": request.agent_id,
+                        "expires_at": expires_at,
+                        "mandate_id": mandate_id,
+                        "max_amount_cents": request.max_amount_cents,
+                        "max_descendant_mandates": request.max_descendant_mandates,
+                        "parent_mandate_id": request.parent_mandate_id,
+                        "scopes": scopes,
+                    },
+                    connection=connection,
+                )
+
+        if fanout_exhaustion:
+            raise ControlPlaneError(
+                403,
+                "mandate_fanout_exhausted",
+                "an ancestor mandate has exhausted its descendant issuance allowance",
             )
-            self.database.append_audit(
-                "mandate.issued",
-                request.subject,
-                {
-                    "agent_id": request.agent_id,
-                    "expires_at": expires_at,
-                    "mandate_id": mandate_id,
-                    "max_amount_cents": request.max_amount_cents,
-                    "parent_mandate_id": request.parent_mandate_id,
-                    "scopes": scopes,
-                },
-                connection=connection,
-            )
+        assert token is not None
         return {
             "id": mandate_id,
             "agent_id": request.agent_id,
@@ -209,8 +246,57 @@ class ControlPlaneService:
             "scopes": scopes,
             "expires_at": expires_at,
             "max_amount_cents": request.max_amount_cents,
+            "max_descendant_mandates": request.max_descendant_mandates,
             "parent_mandate_id": request.parent_mandate_id,
         }
+
+    @staticmethod
+    def _mandate_fanout_exhaustion(
+        connection: sqlite3.Connection, parent_mandate_id: str
+    ) -> dict[str, int | str] | None:
+        """Return the first capped ancestor with no remaining lifetime child slots."""
+        seen: set[str] = set()
+        current_id: str | None = parent_mandate_id
+        while current_id:
+            if current_id in seen:
+                raise ControlPlaneError(
+                    401, "invalid_mandate_chain", "mandate delegation cycle detected"
+                )
+            seen.add(current_id)
+            row = connection.execute(
+                """
+                SELECT id, parent_mandate_id, max_descendant_mandates
+                FROM mandates WHERE id = ?
+                """,
+                (current_id,),
+            ).fetchone()
+            if row is None:
+                raise ControlPlaneError(
+                    401, "invalid_mandate_chain", "an ancestor mandate is missing"
+                )
+            cap = row["max_descendant_mandates"]
+            if cap is not None:
+                count = connection.execute(
+                    """
+                    WITH RECURSIVE descendants(id) AS (
+                        SELECT id FROM mandates WHERE parent_mandate_id = ?
+                        UNION
+                        SELECT mandate.id
+                        FROM mandates AS mandate
+                        JOIN descendants ON mandate.parent_mandate_id = descendants.id
+                    )
+                    SELECT COUNT(*) FROM descendants
+                    """,
+                    (current_id,),
+                ).fetchone()[0]
+                if count >= cap:
+                    return {
+                        "ancestor_mandate_id": row["id"],
+                        "issued_descendant_mandates": count,
+                        "max_descendant_mandates": cap,
+                    }
+            current_id = row["parent_mandate_id"]
+        return None
 
     def authenticate(self, token: str) -> tuple[dict[str, Any], dict[str, Any]]:
         try:
