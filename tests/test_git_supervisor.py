@@ -36,6 +36,23 @@ def git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def terminate_process_group(process: subprocess.Popen[str], timeout: int = 3) -> None:
+    """Stop a test worker and any Git subprocess it may have left behind."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate(timeout=timeout)
+
+
 def write_config(
     repo: Path,
     qc_commands: list[str] | None = None,
@@ -335,6 +352,7 @@ def test_git_operation_guard_serializes_git_invocation_across_processes(
     gate = tmp_path / "git-operation-go"
     ready = tmp_path / "git-operation-ready"
     waiting = tmp_path / "git-operation-waiting"
+    acquired = tmp_path / "git-operation-acquired"
     finished = tmp_path / "git-operation-finished"
     source_root = Path(__file__).resolve().parents[1] / "src"
     environment = os.environ.copy()
@@ -348,13 +366,19 @@ def test_git_operation_guard_serializes_git_invocation_across_processes(
             "import sys, time",
             "from agent_control_plane.git_supervisor import GitSupervisor",
             "from agent_control_plane.supervisor import process as process_module",
-            "repo, gate, ready, waiting, finished = map(Path, sys.argv[1:6])",
+            "repo, gate, ready, waiting, acquired, finished = map(Path, sys.argv[1:7])",
             "supervisor = GitSupervisor(repo)",
             "real_flock = process_module.fcntl.flock",
             "def observed_flock(fd, operation):",
             "    if operation == process_module.fcntl.LOCK_EX:",
-            "        waiting.touch()",
-            "    return real_flock(fd, operation)",
+            "        try:",
+            "            real_flock(fd, operation | process_module.fcntl.LOCK_NB)",
+            "        except BlockingIOError:",
+            "            waiting.touch()",
+            "    result = real_flock(fd, operation)",
+            "    if operation == process_module.fcntl.LOCK_EX:",
+            "        acquired.touch()",
+            "    return result",
             "process_module.fcntl.flock = observed_flock",
             "ready.touch()",
             "deadline = time.monotonic() + 10",
@@ -374,6 +398,7 @@ def test_git_operation_guard_serializes_git_invocation_across_processes(
             str(gate),
             str(ready),
             str(waiting),
+            str(acquired),
             str(finished),
         ],
         cwd=repo,
@@ -381,6 +406,7 @@ def test_git_operation_guard_serializes_git_invocation_across_processes(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
     try:
         deadline = time.monotonic() + 10
@@ -399,20 +425,16 @@ def test_git_operation_guard_serializes_git_invocation_across_processes(
             ):
                 time.sleep(0.01)
             assert waiting.exists(), "child Git invocation did not attempt the shared lock"
+            assert not acquired.exists(), "child acquired the shared lock while the parent held it"
             time.sleep(0.1)
+            assert not acquired.exists(), "child acquired the shared lock while the parent held it"
             assert not finished.exists(), "child Git invocation passed the lock while held"
 
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
         assert finished.read_text(encoding="utf-8") == git(repo, "rev-parse", "HEAD")
     finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate(timeout=3)
+        terminate_process_group(process)
 
 
 def test_parallel_process_claims_preserve_sibling_worktrees_and_failed_cleanup(
@@ -429,6 +451,8 @@ def test_parallel_process_claims_preserve_sibling_worktrees_and_failed_cleanup(
         )
 
     gate = tmp_path / "parallel-claims-go"
+    cleanup_waiting = tmp_path / "parallel-claims-cleanup-waiting"
+    cleanup_release = tmp_path / "parallel-claims-cleanup-release"
     source_root = Path(__file__).resolve().parents[1] / "src"
     environment = os.environ.copy()
     inherited_pythonpath = environment.get("PYTHONPATH")
@@ -442,8 +466,20 @@ def test_parallel_process_claims_preserve_sibling_worktrees_and_failed_cleanup(
             "from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError",
             "repo = Path(sys.argv[1])",
             "task_id, agent_id = sys.argv[2:4]",
-            "ready, gate, result = map(Path, sys.argv[4:7])",
+            "ready, gate, result, cleanup_waiting, cleanup_release = map(Path, sys.argv[4:9])",
             "supervisor = GitSupervisor(repo)",
+            "real_git = supervisor._git",
+            "if agent_id == 'agent-invalid-base':",
+            "    def wait_before_failed_cleanup(*arguments, **kwargs):",
+            "        if tuple(arguments[:3]) == ('worktree', 'remove', '--force'):",
+            "            cleanup_waiting.touch()",
+            "            deadline = time.monotonic() + 20",
+            "            while not cleanup_release.exists():",
+            "                if time.monotonic() >= deadline:",
+            "                    raise TimeoutError('parent did not release failed-claim cleanup')",
+            "                time.sleep(0.005)",
+            "        return real_git(*arguments, **kwargs)",
+            "    supervisor._git = wait_before_failed_cleanup",
             "ready.touch()",
             "deadline = time.monotonic() + 10",
             "while not gate.exists():",
@@ -484,12 +520,15 @@ def test_parallel_process_claims_preserve_sibling_worktrees_and_failed_cleanup(
                     str(ready),
                     str(gate),
                     str(result),
+                    str(cleanup_waiting),
+                    str(cleanup_release),
                 ],
                 cwd=repo,
                 env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
             processes.append((process, ready, result))
 
@@ -506,6 +545,44 @@ def test_parallel_process_claims_preserve_sibling_worktrees_and_failed_cleanup(
             if not ready.exists()
         ]
         gate.touch()
+
+        deadline = time.monotonic() + 20
+        while (
+            not cleanup_waiting.exists()
+            and processes[2][0].poll() is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        if not cleanup_waiting.exists():
+            failed_process = processes[2][0]
+            exited = (failed_process.returncode, failed_process.communicate(timeout=2))
+            assert cleanup_waiting.exists(), (
+                f"failed claim did not reach its cleanup barrier: {exited}"
+            )
+
+        sibling_results = [result for _, _, result in processes[:2]]
+        deadline = time.monotonic() + 20
+        while (
+            not any(result.exists() for result in sibling_results)
+            and any(process.poll() is None for process, _, _ in processes[:2])
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        registered_siblings = [result for result in sibling_results if result.exists()]
+        assert registered_siblings, (
+            "a sibling claim must finish before failed cleanup is released; "
+            "process_states="
+            f"{[(process.poll(), result.exists()) for process, _, result in processes[:2]]}"
+        )
+        sibling_payloads = [
+            json.loads(result.read_text(encoding="utf-8")) for result in registered_siblings
+        ]
+        assert all(payload["ok"] for payload in sibling_payloads), sibling_payloads
+        worktree_listing = git(repo, "worktree", "list", "--porcelain")
+        assert all(
+            f"worktree {payload['worktree']}" in worktree_listing for payload in sibling_payloads
+        ), "sibling worktrees must be registered before failed cleanup begins"
+        cleanup_release.touch()
 
         payloads = []
         for process, _, result in processes:
@@ -536,14 +613,9 @@ def test_parallel_process_claims_preserve_sibling_worktrees_and_failed_cleanup(
         assert not git(repo, "branch", "--list", failed_branch)
     finally:
         gate.touch()
+        cleanup_release.touch()
         for process, _, _ in processes:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.communicate(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.communicate(timeout=3)
+            terminate_process_group(process)
 
 
 @requires_linux_worker
