@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import stat
 import subprocess
@@ -20,6 +21,7 @@ from .trust_bundles import DEFAULT_HELPER, DEFAULT_TRUST_ROOT, TrustBundleError,
 READ_ONLY_ACTIONS = frozenset(
     {
         "status",
+        "wait",
         "show",
         "plan",
         "queue",
@@ -213,6 +215,26 @@ def parser() -> argparse.ArgumentParser:
 
     show = commands.add_parser("show", help="show a task")
     show.add_argument("task_id")
+    wait = commands.add_parser(
+        "wait", help="wait for one task state transition without changing or reaping it"
+    )
+    wait.add_argument("task_id")
+    wait.add_argument(
+        "--until-status",
+        help="return when the task reaches this exact status; by default return on the first meaningful state change",
+    )
+    wait.add_argument(
+        "--timeout-seconds",
+        type=_wait_timeout_seconds,
+        default=300.0,
+        help="observation deadline (0.1 to 86400 seconds; default: 300)",
+    )
+    wait.add_argument(
+        "--interval-seconds",
+        type=_wait_interval_seconds,
+        default=1.0,
+        help="bounded internal state-check interval (0.1 to 30 seconds; default: 1)",
+    )
     plan = commands.add_parser("plan", help="dry-run a claim and report what would block it")
     plan.add_argument("task_id")
     commands.add_parser("queue", help="ordered ready queue with overlap and dependency blockers")
@@ -543,6 +565,110 @@ def watch_status(supervisor: GitSupervisor, args: Any) -> int:
         return 0
 
 
+def _wait_state_fingerprint(task: dict[str, Any]) -> tuple[Any, ...]:
+    """Fields whose changes should wake a task waiter; ignore heartbeat/checkpoint churn."""
+
+    attempt = task.get("latest_attempt") or {}
+    runtime = attempt.get("runtime") or {}
+    submission = task.get("latest_submission") or {}
+    qc = submission.get("latest_qc") or {}
+    return (
+        task.get("status"),
+        task.get("cleanup_target_status"),
+        task.get("cleanup_error"),
+        task.get("current_attempt_id"),
+        attempt.get("number"),
+        attempt.get("status"),
+        attempt.get("termination_target_status"),
+        runtime.get("state"),
+        runtime.get("recovery_action"),
+        submission.get("status"),
+        submission.get("qc_resume_status"),
+        qc.get("verdict"),
+    )
+
+
+def _wait_for_task(supervisor: GitSupervisor, args: Any) -> dict[str, Any]:
+    """Wait inside one CLI invocation and return one read-only task snapshot."""
+
+    started = time.monotonic()
+    deadline = started + args.timeout_seconds
+    try:
+        initial = supervisor.task(args.task_id)
+    except KeyboardInterrupt:
+        return {
+            "wait_result": "interrupted",
+            "task_id": args.task_id,
+            "initial_status": None,
+            "current_status": None,
+            "target_status": args.until_status,
+            "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
+            "task": None,
+        }
+    initial_status = initial["status"]
+    initial_fingerprint = _wait_state_fingerprint(initial)
+    target_status = args.until_status
+
+    if time.monotonic() >= deadline:
+        outcome = "timeout"
+        current = initial
+    elif target_status is not None and initial_status == target_status:
+        outcome = "status_reached"
+        current = initial
+    else:
+        current = initial
+        outcome = "timeout"
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(args.interval_seconds, remaining))
+                if time.monotonic() >= deadline:
+                    break
+                observed = supervisor.task(args.task_id)
+                if time.monotonic() >= deadline:
+                    break
+                current = observed
+                if target_status is not None:
+                    if observed["status"] == target_status:
+                        outcome = "status_reached"
+                        break
+                elif _wait_state_fingerprint(observed) != initial_fingerprint:
+                    outcome = "changed"
+                    break
+        except KeyboardInterrupt:
+            outcome = "interrupted"
+
+    return {
+        "wait_result": outcome,
+        "task_id": args.task_id,
+        "initial_status": initial_status,
+        "current_status": current["status"],
+        "target_status": target_status,
+        "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
+        "task": current,
+    }
+
+
+def _finite_wait_seconds(value: str, flag: str, maximum: float) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{flag} must be a finite number of seconds") from error
+    if not math.isfinite(seconds) or not 0.1 <= seconds <= maximum:
+        raise argparse.ArgumentTypeError(f"{flag} must be between 0.1 and {maximum:g} seconds")
+    return seconds
+
+
+def _wait_timeout_seconds(value: str) -> float:
+    return _finite_wait_seconds(value, "--timeout-seconds", 86400.0)
+
+
+def _wait_interval_seconds(value: str) -> float:
+    return _finite_wait_seconds(value, "--interval-seconds", 30.0)
+
+
 def positive_seconds(value: str) -> int:
     try:
         seconds = int(value)
@@ -645,6 +771,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.action == "show":
             result = supervisor.task(args.task_id)
+        elif args.action == "wait":
+            result = _wait_for_task(supervisor, args)
         elif args.action == "plan":
             result = supervisor.plan_claim(args.task_id)
         elif args.action == "queue":

@@ -152,7 +152,7 @@ pinned CI runner and a newer operator install, say:
   contract could approve work the newer contract rejects. It now stops with
   `schema_newer_than_binary` and tells you to upgrade acp.
 - **Only commands that admit they mutate will upgrade one.** `plan`, `queue`,
-  `merge-plan`, `status`, `show`, `reviewers`, `bundle` and `verify-events` open
+  `merge-plan`, `status`, `wait`, `show`, `reviewers`, `bundle` and `verify-events` open
   `mode=ro`. Against a database that is behind, they report
   `schema_upgrade_required` and leave the file byte for byte as they found it.
 
@@ -378,6 +378,31 @@ guess from their legacy writes; it shows <code>hb -</code> and <code>cp unknown<
 while lease countdown and registered-process identity remain separate signals.
 
 JSON remains canonical; <code>--format text</code> renders that same snapshot.
+
+### Wait for one task transition
+
+~~~bash
+uv run --extra dev acp wait TASK_ID --until-status done --timeout-seconds 3600
+~~~
+
+`acp wait` blocks within one CLI process, checks the task at a bounded interval,
+and returns one JSON result instead of printing repeated status snapshots. By
+default it returns on the first meaningful task/attempt/runtime/submission/QC
+state change; `--until-status` waits for an exact task status and returns
+immediately if it already matches. Heartbeat timestamps and checkpoint text
+changes alone do not wake it. Results distinguish `changed`, `status_reached`,
+`timeout`, and `interrupted`; a timeout or Ctrl-C is not reported as a task
+failure, and interruption returns the most recently observed snapshot (null if
+interrupted before the first read). The
+default observation deadline is five minutes (maximum 24 hours), and the polling
+interval defaults to one second (bounded to 0.1–30 seconds). The deadline
+includes the initial snapshot and excludes transitions first observed after it;
+it is not a hard process-kill deadline, because a database read already waiting
+on SQLite's 30-second busy timeout can delay the final response. This is bounded
+polling, not a push/event stream, so very brief states between polls may be missed.
+
+The command opens the control database read-only. It never reaps, claims,
+changes leases, retries, requeues, or terminates a worker.
 Use <code>--limit</code> to bound large boards.
 
 ## Runtime isolation
