@@ -187,7 +187,7 @@ class WorkersMixin:
                         self.heartbeat(
                             attempt_id,
                             claim_token,
-                            {"pid": process.pid, "command": list(command)},
+                            None,
                             credential=credential,
                         )
             except BaseException:

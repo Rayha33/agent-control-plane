@@ -32,7 +32,8 @@ CATEGORY_RANKS: dict[str, int] = {
     "cleanup_failed": 1,
     "lease_risk": 2,
     "review": 3,
-    "active": 4,
+    "checkpoint_stale": 4,
+    "active": 5,
 }
 
 HUMAN_REQUIRED_STATUSES = frozenset({"blocked", "conflicted", "changes_requested"})
@@ -89,7 +90,10 @@ class StatusView:
         self,
         limit: int | None = None,
         lease_risk_seconds: int = DEFAULT_LEASE_RISK_SECONDS,
+        checkpoint_stale_seconds: int | None = None,
     ) -> dict[str, Any]:
+        if checkpoint_stale_seconds is not None and checkpoint_stale_seconds < 1:
+            raise ValueError("checkpoint_stale_seconds must be at least 1")
         now = time.time()
         epoch = int(now)
         scheduler = Scheduler(self.supervisor)
@@ -122,6 +126,7 @@ class StatusView:
                     preview=previews.get(task["id"]),
                     now=now,
                     lease_risk_seconds=lease_risk_seconds,
+                    checkpoint_stale_seconds=checkpoint_stale_seconds,
                     held_resources=held_resources.get(task["id"], []),
                 )
             )
@@ -169,6 +174,7 @@ class StatusView:
         return {
             "generated_at": epoch,
             "repo": str(self.supervisor.root),
+            "checkpoint_stale_after_seconds": checkpoint_stale_seconds,
             "counts": counts,
             "attention": attention if limit is None else attention[:limit],
             "tasks": shown,
@@ -286,10 +292,19 @@ class StatusView:
         preview: dict[str, Any] | None,
         now: float,
         lease_risk_seconds: int,
+        checkpoint_stale_seconds: int | None,
         held_resources: list[str],
     ) -> dict[str, Any]:
         live = bool(attempt and attempt["status"] in LIVE_ATTEMPT_STATUSES)
         remaining = int(attempt["lease_expires_at"] - now) if live else None
+        heartbeat_age = _age_seconds(attempt["heartbeat_at"], now) if attempt else None
+        checkpoint_age = _age_seconds(attempt["checkpoint_at"], now) if attempt else None
+        checkpoint_stale = bool(
+            live
+            and checkpoint_stale_seconds is not None
+            and checkpoint_age is not None
+            and checkpoint_age >= checkpoint_stale_seconds
+        )
         entry: dict[str, Any] = {
             "task_id": task["id"],
             "title": task["title"],
@@ -301,7 +316,9 @@ class StatusView:
             "branch": attempt["branch"] if attempt else None,
             "worktree": attempt["worktree"] if attempt else None,
             "checkpoint": json.loads(attempt["checkpoint_json"]) if attempt else {},
-            "heartbeat_age_seconds": _age_seconds(attempt["updated_at"], now) if attempt else None,
+            "heartbeat_age_seconds": heartbeat_age,
+            "checkpoint_age_seconds": checkpoint_age,
+            "checkpoint_stale_advisory": checkpoint_stale,
             "lease_seconds_remaining": remaining,
             "lease_expired": bool(live and remaining is not None and remaining <= 0),
             "awaiting_reap": bool(
@@ -413,6 +430,12 @@ class StatusView:
             return "lease_risk", f"lease expires in {remaining}s"
         if entry["status"] in REVIEW_STATUSES:
             return "review", f"awaiting review action ({entry['status']})"
+        if entry["checkpoint_stale_advisory"]:
+            age = entry["checkpoint_age_seconds"]
+            return "checkpoint_stale", (
+                f"explicit checkpoint unchanged for {age}s; worker liveness alone "
+                "does not establish progress"
+            )
         if entry["status"] in ACTIVE_STATUSES:
             return "active", f"{entry['agent_id'] or 'an agent'} is working"
         return None, ""
@@ -458,9 +481,13 @@ class StatusView:
         for entry in snapshot["tasks"][:15]:
             heartbeat = entry["heartbeat_age_seconds"]
             beat = f"{heartbeat}s ago" if heartbeat is not None else "-"
+            checkpoint = entry["checkpoint_age_seconds"]
+            checkpoint_label = f"cp {checkpoint}s" if checkpoint is not None else "cp unknown"
+            if entry["checkpoint_stale_advisory"]:
+                checkpoint_label += " unchanged"
             lines.append(
                 f"  {entry['phase']:<16} {entry['title'][:32]:<32} "
-                f"{entry['agent_id'] or '-':<16} hb {beat:<10} "
+                f"{entry['agent_id'] or '-':<16} hb {beat:<10} {checkpoint_label:<20} "
                 f"{','.join(entry['claimed_paths'])[:40]}"
             )
         if snapshot["truncated"]:

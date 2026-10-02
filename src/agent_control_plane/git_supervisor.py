@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -221,7 +221,26 @@ def _add_declared_resources(connection: sqlite3.Connection) -> None:
         )
 
 
-MIGRATIONS: tuple[Migration, ...] = ((2, _add_declared_resources),)
+def _add_attempt_progress_timestamps(connection: sqlite3.Connection) -> None:
+    """Separate attempt liveness from explicit checkpoint freshness.
+
+    Old heartbeats rewrote both ``updated_at`` and ``checkpoint_json``. A v2
+    worker that survives this migration also cannot refresh the new dedicated
+    timestamps. Leave both ages unknown until a v3 heartbeat/checkpoint records
+    them; neither a legacy update nor lease renewal proves fresh liveness here.
+    """
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+    if "heartbeat_at" not in columns:
+        connection.execute("ALTER TABLE attempts ADD COLUMN heartbeat_at TEXT NOT NULL DEFAULT ''")
+    if "checkpoint_at" not in columns:
+        connection.execute("ALTER TABLE attempts ADD COLUMN checkpoint_at TEXT NOT NULL DEFAULT ''")
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    (2, _add_declared_resources),
+    (3, _add_attempt_progress_timestamps),
+)
 
 
 def stored_schema_version(connection: sqlite3.Connection) -> int | None:

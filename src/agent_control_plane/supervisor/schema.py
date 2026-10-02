@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS attempts (
   start_sha TEXT NOT NULL,
   latest_sha TEXT,
   checkpoint_json TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL DEFAULT '',
+  checkpoint_at TEXT NOT NULL DEFAULT '',
   trust_bundle_json TEXT NOT NULL DEFAULT '{}',
   pid INTEGER,
   pid_identity TEXT NOT NULL DEFAULT '',

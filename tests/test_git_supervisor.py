@@ -285,6 +285,33 @@ def test_runtime_ports_are_unique_and_reach_supervised_worker(repo: Path) -> Non
     assert active_cleanup.value.code == "runtime_in_use"
 
 
+@requires_linux_worker
+def test_supervised_worker_heartbeat_does_not_replace_explicit_checkpoint(repo: Path) -> None:
+    config = repo / "acp.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace("lease_seconds = 60", "lease_seconds = 15"),
+        encoding="utf-8",
+    )
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "agent-a")
+    command = (
+        "import pathlib,subprocess,time; "
+        "pathlib.Path('alpha.txt').write_text('worker\\n'); "
+        "subprocess.run(['git','add','alpha.txt'],check=True); "
+        "subprocess.run(['git','commit','-m','slow worker'],check=True); "
+        "time.sleep(12)"
+    )
+
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
+
+    assert submission["status"] == "pending_qc"
+    final_attempt = supervisor.attempt(attempt["id"])
+    assert final_attempt["checkpoint"]["phase"] == "launching"
+    assert final_attempt["checkpoint_at"] < final_attempt["heartbeat_at"]
+
+
 def test_parallel_runtime_claims_receive_unique_ports(repo: Path) -> None:
     start, end = free_port_range(6)
     write_config(repo, runtime_ports={"APP_PORT": (start, end)})

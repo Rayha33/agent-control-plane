@@ -158,10 +158,11 @@ class ClaimsMixin:
                 INSERT INTO attempts
                   (id, task_id, number, agent_id, runner_credential_digest,
                    branch, worktree, claim_token,
-                   start_sha, latest_sha, checkpoint_json, trust_bundle_json,
+                   start_sha, latest_sha, checkpoint_json, heartbeat_at, checkpoint_at,
+                   trust_bundle_json,
                    pid, log_path, status,
                    lease_expires_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, NULL, NULL,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, NULL, NULL,
                         'provisioning', ?, ?, ?)
                 """,
                 (
@@ -175,6 +176,8 @@ class ClaimsMixin:
                     counter,
                     start_sha,
                     start_sha,
+                    now,
+                    "",
                     canonical_json(trust_pin),
                     expires,
                     now,
@@ -304,6 +307,8 @@ class ClaimsMixin:
         lease_seconds: int | None = None,
         credential: str | None = None,
     ) -> dict[str, Any]:
+        if checkpoint is not None and not isinstance(checkpoint, dict):
+            raise SupervisorError("invalid_checkpoint", "checkpoint must be a JSON object")
         # Authenticate before a verification failure is allowed to change state.
         with self.connect() as connection:
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
@@ -340,13 +345,21 @@ class ClaimsMixin:
                 raise SupervisorError("stale_fencing_token", "resource lease set changed")
             head = self._git_text("-C", attempt["worktree"], "rev-parse", "HEAD")
             now = utc_now()
-            connection.execute(
-                """
-                UPDATE attempts SET latest_sha = ?, checkpoint_json = ?,
-                  lease_expires_at = ?, updated_at = ? WHERE id = ?
-                """,
-                (head, canonical_json(checkpoint or {}), expires, now, attempt_id),
-            )
+            assignments = [
+                "latest_sha = ?",
+                "heartbeat_at = ?",
+                "lease_expires_at = ?",
+                "updated_at = ?",
+            ]
+            values: list[Any] = [head, now, expires, now]
+            checkpoint_json = canonical_json(checkpoint) if checkpoint is not None else None
+            if checkpoint_json is not None and (
+                checkpoint_json != attempt["checkpoint_json"] or not attempt["checkpoint_at"]
+            ):
+                assignments.extend(["checkpoint_json = ?", "checkpoint_at = ?"])
+                values.extend([checkpoint_json, now])
+            values.append(attempt_id)
+            connection.execute(f"UPDATE attempts SET {', '.join(assignments)} WHERE id = ?", values)
             count = connection.execute(
                 """
                 UPDATE resource_leases SET lease_expires_at = ?, updated_at = ?

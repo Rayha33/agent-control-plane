@@ -312,6 +312,59 @@ def _add(repo: Path, title: str, resource: str, *extra: str) -> dict:
     return json.loads(created.stdout)
 
 
+def test_cli_heartbeat_without_checkpoint_only_renews_liveness(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "heartbeat keeps progress", "owned.txt")
+    claimed = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
+    assert claimed.returncode == 0, claimed.stderr
+    attempt = json.loads(claimed.stdout)
+
+    explicit = run_cli(
+        repo,
+        "heartbeat",
+        attempt["id"],
+        "--token",
+        str(attempt["claim_token"]),
+        "--checkpoint",
+        '{"phase":"tests"}',
+    )
+    assert explicit.returncode == 0, explicit.stderr
+
+    database = repo / ".acp" / "control.db"
+    connection = sqlite3.connect(database)
+    old = "2020-01-01T00:00:00Z"
+    connection.execute(
+        "UPDATE attempts SET heartbeat_at = ?, checkpoint_at = ?, updated_at = ? WHERE id = ?",
+        (old, old, old, attempt["id"]),
+    )
+    connection.commit()
+    connection.close()
+
+    renewed = run_cli(repo, "heartbeat", attempt["id"], "--token", str(attempt["claim_token"]))
+    assert renewed.returncode == 0, renewed.stderr
+
+    connection = sqlite3.connect(database)
+    row = connection.execute(
+        "SELECT checkpoint_json, heartbeat_at, checkpoint_at FROM attempts WHERE id = ?",
+        (attempt["id"],),
+    ).fetchone()
+    connection.close()
+    assert json.loads(row[0]) == {"phase": "tests"}
+    assert row[1] != old
+    assert row[2] == old
+
+    status = run_cli(repo, "status", "--checkpoint-stale-seconds", "60")
+    assert status.returncode == 0, status.stderr
+    snapshot = json.loads(status.stdout)
+    entry = next(item for item in snapshot["tasks"] if item["task_id"] == task["id"])
+    assert entry["heartbeat_age_seconds"] < 60
+    assert entry["checkpoint_stale_advisory"] is True
+    assert entry["category"] == "checkpoint_stale"
+
+    invalid = run_cli(repo, "status", "--checkpoint-stale-seconds", "0")
+    assert invalid.returncode == 2
+
+
 def test_cli_plan_queue_and_status_are_read_only_previews(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     holder = _add(repo, "holder", "owned.txt")
