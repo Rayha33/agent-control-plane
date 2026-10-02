@@ -31,6 +31,7 @@ from .schema import META_CASE_SENSITIVE
 FILE_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
 MAX_FILE_SNAPSHOTS_PER_ATTEMPT = 256
 MAX_FILE_SNAPSHOT_BYTES = 16 * 1024 * 1024
+WRITE_RESERVATION_TTL_SECONDS = 5 * 60
 
 
 def _file_stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -39,6 +40,21 @@ def _file_stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 def _directory_change_token(info: os.stat_result) -> str:
     return f"{info.st_dev:x}:{info.st_ino:x}:{info.st_mtime_ns:x}:{info.st_ctime_ns:x}"
+
+
+def _normalized_reservation_path(path: str, *, case_sensitive: bool) -> str:
+    normalized = unicodedata.normalize("NFC", PurePosixPath(path).as_posix())
+    return normalized if case_sensitive else normalized.casefold()
+
+
+def _reservation_paths_overlap(left: str, right: str) -> bool:
+    """Treat a file and any descendant path as overlapping (file/directory swap)."""
+
+    return (
+        left == right
+        or left.startswith(right.rstrip("/") + "/")
+        or right.startswith(left.rstrip("/") + "/")
+    )
 
 
 def _open_snapshot_parent(
@@ -173,12 +189,12 @@ def _file_snapshot(path: Path, *, root: Path) -> tuple[bool, str, int, str]:
 
 
 @contextmanager
-def _snapshot_write_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """Open only the narrow SQLite transaction needed for ephemeral snapshots.
+def _ephemeral_write_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Open a narrow SQLite transaction for short-lived hook state.
 
     A normal read-write supervisor open also reconciles lifecycle state and changes
-    persistent SQLite pragmas. A Claude Read hook must not trigger those unrelated
-    effects, so this cache-like table gets its own explicit, minimal connection.
+    persistent SQLite pragmas. Hook-owned snapshots and write reservations must not
+    trigger those unrelated effects, so their tables use an explicit minimal connection.
     """
 
     connection = sqlite3.connect(db_path, timeout=30)
@@ -587,7 +603,7 @@ class ClaimsMixin:
             )
             return {"ok": True, "recorded": False, "reason": reason, "detail": str(error)}
 
-        with _snapshot_write_connection(self.db_path) as connection:
+        with _ephemeral_write_connection(self.db_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = connection.execute(
                 "SELECT status, lease_expires_at, worktree, task_id FROM attempts WHERE id = ?",
@@ -770,6 +786,232 @@ class ClaimsMixin:
                 relative_path=decision["relative_path"],
             )
         return {**decision, "freshness": "unchanged_since_read"}
+
+    def _reserve_write(
+        self,
+        attempt_id: str,
+        path: str,
+        *,
+        caller_cwd: str | Path,
+        tool_use_id: str,
+        session_id: str,
+        agent_id: str = "",
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve one structured-tool path until its post-tool hook runs.
+
+        The normal write-set guard remains the authority. This adds a short-lived
+        same-attempt mutex for parallel Claude subagents, which share one attempt and
+        therefore one task-level lease. Cross-attempt exclusion remains in the task
+        resource lease table.
+        """
+
+        epoch = int(time.time()) if now is None else now
+        decision = self.guard(attempt_id, path, caller_cwd=caller_cwd, now=epoch)
+        if not decision["allow"]:
+            return decision
+
+        if not isinstance(tool_use_id, str) or not tool_use_id.strip() or len(tool_use_id) > 512:
+            return self._guard_denial(
+                attempt_id,
+                decision["path"],
+                "write_identity_missing",
+                "Claude Code must provide a bounded tool_use_id before ACP can reserve this write",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if not isinstance(session_id, str) or len(session_id) > 512:
+            return self._guard_denial(
+                attempt_id,
+                decision["path"],
+                "write_identity_invalid",
+                "Claude Code session_id must be a string of at most 512 characters",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if not session_id.strip():
+            return self._guard_denial(
+                attempt_id,
+                decision["path"],
+                "write_identity_missing",
+                "Claude Code must provide session_id before ACP can reserve this write",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if not isinstance(agent_id, str) or len(agent_id) > 512:
+            return self._guard_denial(
+                attempt_id,
+                decision["path"],
+                "write_identity_invalid",
+                "the optional Claude agent_id must be a string of at most 512 characters",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+
+        with _ephemeral_write_connection(self.db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = connection.execute(
+                "SELECT task_id, worktree, status, lease_expires_at FROM attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None or attempt["status"] not in {"provisioning", "working"}:
+                return self._guard_denial(
+                    attempt_id,
+                    decision["path"],
+                    "attempt_not_live",
+                    "the attempt stopped being live before ACP could reserve this write",
+                    declared=decision["declared"],
+                    relative_path=decision["relative_path"],
+                )
+            if attempt["lease_expires_at"] <= epoch:
+                return self._guard_denial(
+                    attempt_id,
+                    decision["path"],
+                    "lease_expired",
+                    "the claim lease expired before ACP could reserve this write",
+                    declared=decision["declared"],
+                    relative_path=decision["relative_path"],
+                )
+
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (attempt["task_id"],)
+            ).fetchone()
+            worktree = Path(attempt["worktree"]).resolve(strict=True)
+            actual_cwd = Path(caller_cwd).resolve(strict=True)
+            target = Path(path)
+            if not target.is_absolute():
+                target = actual_cwd / target
+            target = target.resolve()
+            try:
+                relative = target.relative_to(worktree).as_posix()
+            except ValueError:
+                return self._guard_denial(
+                    attempt_id,
+                    str(target),
+                    "outside_worktree",
+                    "the guarded path moved outside the attempt worktree before reservation",
+                    declared=self._declared_resources(task) if task else [],
+                    relative_path=decision["relative_path"],
+                )
+
+            case_sensitive = self._case_sensitive_paths(connection)
+            declared = self._declared_resources(task) if task else []
+            rules = self._write_set_rules(task, case_sensitive) if task else []
+            if not any(
+                self._path_matches(relative, resource, fold=fold) for resource, fold in rules
+            ):
+                return self._guard_denial(
+                    attempt_id,
+                    str(target),
+                    "undeclared_write",
+                    "the attempt write set changed before ACP could reserve this path",
+                    declared=declared,
+                    relative_path=relative,
+                )
+
+            reservation_path = _normalized_reservation_path(relative, case_sensitive=case_sensitive)
+            # A crashed or cancelled tool may miss its completion hook. Its short TTL
+            # makes recovery automatic; pruning all expired rows keeps the ledger small.
+            connection.execute("DELETE FROM write_reservations WHERE expires_at <= ?", (epoch,))
+            existing = connection.execute(
+                "SELECT session_id, agent_id, path FROM write_reservations "
+                "WHERE attempt_id = ? AND tool_use_id = ?",
+                (attempt_id, tool_use_id),
+            ).fetchone()
+            if existing is not None and (
+                existing["path"] != reservation_path
+                or existing["agent_id"] != agent_id
+                or existing["session_id"] != session_id
+            ):
+                return self._guard_denial(
+                    attempt_id,
+                    str(target),
+                    "write_identity_conflict",
+                    "this Claude tool_use_id is already reserved for a different path, session, or agent; refusing to reuse the invocation identity",
+                    declared=declared,
+                    relative_path=relative,
+                )
+            active = connection.execute(
+                "SELECT session_id, agent_id, tool_use_id, path, expires_at "
+                "FROM write_reservations "
+                "WHERE attempt_id = ? AND expires_at > ?",
+                (attempt_id, epoch),
+            ).fetchall()
+            conflicts = [
+                row
+                for row in active
+                if (row["tool_use_id"], row["session_id"], row["agent_id"])
+                != (tool_use_id, session_id, agent_id)
+                and _reservation_paths_overlap(reservation_path, row["path"])
+            ]
+            if conflicts:
+                conflict = min(conflicts, key=lambda row: row["expires_at"])
+                retry_after = max(1, int(conflict["expires_at"] - epoch))
+                result = self._guard_denial(
+                    attempt_id,
+                    str(target),
+                    "concurrent_write_conflict",
+                    f"another structured edit is in flight for {relative}; retry after it completes (or in about {retry_after}s if it was abandoned)",
+                    declared=declared,
+                    relative_path=relative,
+                )
+                result["retry_after_seconds"] = retry_after
+                return result
+
+            expires_at = epoch + WRITE_RESERVATION_TTL_SECONDS
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO write_reservations
+                      (attempt_id, session_id, agent_id, tool_use_id, path, expires_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        session_id,
+                        agent_id,
+                        tool_use_id,
+                        reservation_path,
+                        expires_at,
+                        utc_now(),
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE write_reservations SET expires_at = ?, updated_at = ? "
+                    "WHERE attempt_id = ? AND tool_use_id = ?",
+                    (expires_at, utc_now(), attempt_id, tool_use_id),
+                )
+            return {
+                **decision,
+                "write_reservation": "held",
+                "reservation_expires_at": expires_at,
+            }
+
+    def _release_write(
+        self,
+        attempt_id: str,
+        tool_use_id: str,
+        *,
+        session_id: str,
+        agent_id: str = "",
+    ) -> bool:
+        """Release every path held by one Claude tool invocation; safe to repeat."""
+
+        if not isinstance(tool_use_id, str) or not tool_use_id.strip() or len(tool_use_id) > 512:
+            return False
+        if not isinstance(agent_id, str) or len(agent_id) > 512:
+            return False
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 512:
+            return False
+        with _ephemeral_write_connection(self.db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "DELETE FROM write_reservations "
+                "WHERE attempt_id = ? AND tool_use_id = ? AND session_id = ? AND agent_id = ?",
+                (attempt_id, tool_use_id, session_id, agent_id),
+            )
+            return cursor.rowcount > 0
 
     def guard(
         self,

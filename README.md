@@ -70,6 +70,7 @@ wedge.
 | High-risk review | Configured paths can demand two reviewers, provider diversity, or a human |
 | Server-derived evidence | Commit, tree, binary patch hash, and changed paths come from Git |
 | Write-set validation | Undeclared changed paths and escaping symlinks are rejected |
+| Intra-attempt write coordination | Optional same-attempt reservations prevent overlapping Claude structured file-tool calls, including subagents; shell and external writes are outside this hook boundary |
 | Independent QC | A configured reviewer runs deterministic commands in a fresh detached worktree |
 | Structured critic | An optional external critic returns evidence-based findings |
 | Process lifecycle boundary | Linux subreaper monitors retain descendants and lifecycle locks; Darwin bounded commands run in a no-fork kernel sandbox |

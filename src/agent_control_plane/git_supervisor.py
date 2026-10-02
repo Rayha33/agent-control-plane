@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -255,10 +255,44 @@ def _add_file_snapshot_change_token(connection: sqlite3.Connection) -> None:
         )
 
 
+def _create_write_reservations(connection: sqlite3.Connection) -> None:
+    """Store short-lived structured-tool write reservations within an attempt."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS write_reservations (
+          attempt_id TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+          session_id TEXT NOT NULL DEFAULT '',
+          agent_id TEXT NOT NULL,
+          tool_use_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          expires_at INTEGER NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (attempt_id, tool_use_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_write_reservations_attempt_expiry "
+        "ON write_reservations(attempt_id, expires_at)"
+    )
+
+
+def _add_write_reservation_session_id(connection: sqlite3.Connection) -> None:
+    """Bind Claude write reservations to their owning top-level session."""
+
+    if "session_id" not in _columns(connection, "write_reservations"):
+        connection.execute(
+            "ALTER TABLE write_reservations ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _create_file_snapshots),
     (4, _add_file_snapshot_change_token),
+    (5, _create_write_reservations),
+    (6, _add_write_reservation_session_id),
 )
 
 
