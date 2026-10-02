@@ -211,6 +211,18 @@ uv run --extra dev acp run ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../c
 The command must leave a clean, committed worktree. A successful supervised run
 submits automatically. For a manually operated agent:
 
+Before `acp run` changes the attempt to its launching phase, ACP verifies that
+the recorded path resolves to exactly one non-prunable linked worktree in the
+same Git common directory, and that both Git's registered branch and the
+worktree's attached `HEAD` match the branch recorded for that attempt. It
+repeats the read-only check immediately before spawning the worker. A missing,
+moved, replaced, detached, cross-repository, or wrong-branch checkout fails with
+`worker_worktree_mismatch` and does not run candidate code. This is a
+point-in-time misassignment guard, not an atomic filesystem lock: a worker
+command can intentionally switch repositories or branches after it starts, and
+a same-UID process can race the check or attack ACP directly. Use a separate OS
+identity and container/cgroup boundary for hostile candidate code.
+
 ~~~bash
 uv run --extra dev acp heartbeat ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../codex-session-17.credential --checkpoint '{"phase":"tests"}'
 uv run --extra dev acp submit ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../codex-session-17.credential
