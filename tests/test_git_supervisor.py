@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import multiprocessing
 import os
 import signal
 import socket
@@ -100,6 +101,40 @@ def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change"
         ["The declared content is correct", "QC passes"],
         [resource],
     )
+
+
+def _claim_in_process(repo_root: str, task_id: int, agent_id: str, gate, results) -> None:
+    try:
+        gate.wait(timeout=20)
+        attempt = GitSupervisor(Path(repo_root)).claim(task_id, agent_id)
+        results.put(
+            {
+                "ok": True,
+                "attempt_id": attempt["id"],
+                "worktree": attempt["worktree"],
+                "branch": attempt["branch"],
+            }
+        )
+    except BaseException as error:
+        results.put({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+def _probe_git_operation_lock(repo_root: str, results) -> None:
+    from agent_control_plane.supervisor import process as process_module
+
+    original_flock = process_module.fcntl.flock
+
+    def try_nonblocking(fd: int, operation: int) -> None:
+        original_flock(fd, operation | process_module.fcntl.LOCK_NB)
+
+    process_module.fcntl.flock = try_nonblocking
+    try:
+        with GitSupervisor(Path(repo_root))._git_operation_guard():
+            results.put("acquired")
+    except BlockingIOError:
+        results.put("blocked_by_parent_lock")
+    except BaseException as error:
+        results.put(f"error: {type(error).__name__}: {error}")
 
 
 def commit_change(attempt: dict, path: str, content: str, message: str = "implement") -> str:
@@ -253,6 +288,150 @@ def test_non_overlapping_tasks_get_parallel_worktrees(repo: Path) -> None:
         claims = list(pool.map(claim_one, [(first, "agent-alpha"), (second, "agent-beta")]))
     assert all(Path(claim["worktree"]).is_dir() for claim in claims)
     assert claims[0]["worktree"] != claims[1]["worktree"]
+
+
+def test_git_operation_lock_is_shared_across_processes(repo: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    probe = context.Process(target=_probe_git_operation_lock, args=(str(repo), results))
+    supervisor = GitSupervisor(repo)
+    started = False
+    try:
+        with supervisor._git_operation_guard():
+            probe.start()
+            started = True
+            assert results.get(timeout=20) == "blocked_by_parent_lock"
+    finally:
+        if started:
+            probe.join(timeout=20)
+            if probe.is_alive():
+                probe.terminate()
+                probe.join(timeout=20)
+        results.close()
+        results.join_thread()
+
+    assert not probe.is_alive()
+    assert probe.exitcode == 0
+
+
+def test_concurrent_process_claims_get_independent_registered_worktrees(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    tasks = [
+        task(supervisor, f"parallel/agent-{index}.py", f"parallel claim {index}")
+        for index in range(3)
+    ]
+    base_head = git(repo, "rev-parse", "HEAD")
+    base_status = git(repo, "status", "--porcelain")
+    context = multiprocessing.get_context("spawn")
+    gate = context.Barrier(len(tasks) + 1)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_claim_in_process,
+            args=(str(repo), item["id"], f"agent-{index}", gate, results),
+        )
+        for index, item in enumerate(tasks)
+    ]
+    started = []
+    try:
+        for process in processes:
+            process.start()
+            started.append(process)
+        gate.wait(timeout=20)
+        deadline = time.monotonic() + 60
+        for process in started:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+        assert not any(process.is_alive() for process in started)
+        outcomes = [results.get(timeout=10) for _ in tasks]
+        assert all(outcome["ok"] for outcome in outcomes), outcomes
+        assert all(process.exitcode == 0 for process in started)
+    finally:
+        for process in started:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+        results.close()
+        results.join_thread()
+
+    assert len({outcome["attempt_id"] for outcome in outcomes}) == len(tasks)
+    assert len({outcome["branch"] for outcome in outcomes}) == len(tasks)
+    assert len({outcome["worktree"] for outcome in outcomes}) == len(tasks)
+    registered = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in git(repo, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    }
+    for outcome in outcomes:
+        attempt = supervisor.attempt(outcome["attempt_id"])
+        worktree = Path(outcome["worktree"]).resolve()
+        assert attempt["status"] == "working"
+        assert attempt["branch"] == outcome["branch"]
+        assert worktree.is_dir()
+        assert worktree in registered
+        assert git(worktree, "branch", "--show-current") == outcome["branch"]
+        assert git(worktree, "rev-parse", "HEAD") == base_head
+
+    assert git(repo, "rev-parse", "HEAD") == base_head
+    assert git(repo, "branch", "--show-current") == "main"
+    assert git(repo, "status", "--porcelain") == base_status
+    assert not (repo / ".git" / "config.lock").exists()
+
+
+def test_worktree_add_failure_after_creation_rolls_back_partial_claim(
+    repo: Path, monkeypatch
+) -> None:
+    port, _ = free_port_range(1)
+    write_config(repo, runtime_ports={"APP_PORT": (port, port)})
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "injected provisioning failure")
+    original_git = supervisor._git
+
+    def fail_worktree_add(*arguments, **options):
+        if arguments[:2] == ("worktree", "add"):
+            original_git(*arguments, **options)
+            raise SupervisorError("git_error", "injected post-creation provisioning failure")
+        return original_git(*arguments, **options)
+
+    monkeypatch.setattr(supervisor, "_git", fail_worktree_add)
+    with pytest.raises(SupervisorError, match="injected post-creation provisioning failure"):
+        supervisor.claim(created["id"], "agent-provisioning-failure")
+
+    rolled_back_task = supervisor.task(created["id"])
+    assert rolled_back_task["status"] == "open"
+    assert rolled_back_task["current_attempt_id"] is None
+    with supervisor.connect() as connection:
+        attempt = connection.execute(
+            "SELECT id, branch, worktree, status FROM attempts WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+        runtime = connection.execute(
+            "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        lease = connection.execute(
+            "SELECT task_id, attempt_id, lease_expires_at FROM resource_leases WHERE resource = ?",
+            ("alpha.txt",),
+        ).fetchone()
+        allocations = connection.execute(
+            "SELECT pool_name, value, attempt_id FROM runtime_allocations WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchall()
+
+    assert attempt["status"] == "failed"
+    assert runtime["state"] == "released"
+    assert lease["task_id"] is None
+    assert lease["attempt_id"] is None
+    assert lease["lease_expires_at"] == 0
+    assert allocations == []
+    assert not Path(attempt["worktree"]).exists()
+    assert git(repo, "branch", "--list", attempt["branch"]) == ""
+    registered = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in git(repo, "worktree", "list", "--porcelain").splitlines()
+        if line.startswith("worktree ")
+    }
+    assert registered == {repo.resolve()}
+    assert not (repo / ".git" / "config.lock").exists()
 
 
 def test_claim_refuses_overlapping_write_sets(repo: Path) -> None:

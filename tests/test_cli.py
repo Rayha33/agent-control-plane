@@ -6,7 +6,6 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -596,12 +595,14 @@ def test_cli_wait_ignores_heartbeat_and_checkpoint_churn_until_timeout(
     claimed = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
     attempt_id = json.loads(claimed.stdout)["id"]
     supervisor = cli.GitSupervisor(repo, read_only=True)
-    real_sleep = time.sleep
+    clock = 0.0
     progress_writes = 0
 
+    def monotonic() -> float:
+        return clock
+
     def heartbeat_only(seconds: float) -> None:
-        nonlocal progress_writes
-        real_sleep(min(seconds, 0.02))
+        nonlocal clock, progress_writes
         with sqlite3.connect(repo / ".acp" / "control.db") as connection:
             connection.execute(
                 "UPDATE attempts SET heartbeat_at = ?, checkpoint_at = ?, updated_at = ?, "
@@ -615,7 +616,9 @@ def test_cli_wait_ignores_heartbeat_and_checkpoint_churn_until_timeout(
                 ),
             )
         progress_writes += 1
+        clock += seconds
 
+    monkeypatch.setattr(cli.time, "monotonic", monotonic)
     monkeypatch.setattr(cli.time, "sleep", heartbeat_only)
     result = cli._wait_for_task(
         supervisor,
