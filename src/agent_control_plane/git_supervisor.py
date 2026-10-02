@@ -542,7 +542,15 @@ class GitSupervisor(
         _apply_ledger(connection, stored, MIGRATIONS)
 
     def _finish_open(self) -> None:
-        common_value = self._git_text("rev-parse", "--path-format=absolute", "--git-common-dir")
+        arguments = ("rev-parse", "--path-format=absolute", "--git-common-dir")
+        if self.read_only:
+            common_value = (
+                self._git_readonly_bytes(*arguments)
+                .decode("utf-8", errors="surrogateescape")
+                .rstrip("\r\n")
+            )
+        else:
+            common_value = self._git_text(*arguments)
         self._git_common_dir = Path(common_value)
         if not self._git_common_dir.is_absolute():
             self._git_common_dir = (self.root / self._git_common_dir).resolve()

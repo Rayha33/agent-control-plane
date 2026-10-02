@@ -125,6 +125,22 @@ floor refuses creation. The floor does not reserve capacity or limit later worke
 writes, and ACP does not sweep unregistered provider temp copies. Status reports the configured floor so the
 operator can distinguish admission policy from measured free space.
 
+Status also includes a complete, path-sorted, read-only inventory from
+`git worktree list --porcelain -z`. The read-only supervisor resolves Git metadata
+through its sanitized, hooks-disabled query path without creating the normal
+write-coordination lock or hook directory, and reuses the same inventory during
+the cleanup survey. An entry is mapped to an ACP attempt only when its normalized
+lexical path and branch uniquely match a persisted attempt. Every entry reports
+`owner=unknown`: a recorded attempt agent is historical metadata, not proof that
+its process is still alive or that it currently owns the directory. Exact matches
+may expose that value as `recorded_agent_id` for audit context. The view
+does not inspect foreign checkout contents or run commands there; text output
+escapes control characters in paths while JSON preserves the raw path. If Git returns
+malformed data or cannot provide the listing, status reports the inventory as
+unavailable instead of claiming there are no worktrees. Concurrent provisioning
+can make this cross-source snapshot momentarily incomplete; rerun status after the
+operation settles.
+
 The ready queue reserves each admitted task's scopes for the remainder of the
 pass. Its `ready` list is therefore a set of tasks that can run *concurrently*,
 not a list of tasks that could each run alone.

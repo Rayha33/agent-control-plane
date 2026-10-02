@@ -661,6 +661,34 @@ class ProcessMixin:
             )
         return result.stdout
 
+    def _git_readonly_bytes(self, *arguments: str, check: bool = True) -> bytes:
+        """Run a sanitized read-only Git query without creating ACP lock/hook state."""
+        git = str(self._system_git_executable(self.root))
+        argv = [
+            *self._supervisor_git_prefix(git, Path(os.devnull)),
+            "-C",
+            str(self.root),
+            *arguments,
+        ]
+        try:
+            result = subprocess.run(
+                argv,
+                env=self._supervisor_git_env(),
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise SupervisorError("git_timeout", "read-only Git query timed out") from error
+        if check and result.returncode:
+            raise SupervisorError(
+                "git_error",
+                result.stderr.decode(errors="replace").strip()
+                or result.stdout.decode(errors="replace").strip()
+                or "Git read-only query failed",
+            )
+        return result.stdout
+
     def _git(
         self,
         *arguments: str,
