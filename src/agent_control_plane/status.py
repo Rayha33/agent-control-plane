@@ -13,6 +13,7 @@ Expired-but-unreaped attempts are reported as `awaiting_reap` instead.
 
 from __future__ import annotations
 
+import hashlib as _hashlib
 import json
 import os
 import sqlite3
@@ -239,7 +240,8 @@ class StatusView:
                     "FROM attempts ORDER BY id"
                 ).fetchall()
             ]
-            submissions = self._latest_submissions(connection)
+            submissions, submission_histories = self._submission_history(connection)
+            repeated_qc_findings = self._repeated_qc_findings(submission_histories)
             runtimes = self._runtimes(connection)
             allocations = self._allocations(connection)
             quarantines = self._quarantines(connection, now)
@@ -261,6 +263,7 @@ class StatusView:
                     quarantine=quarantines.get(attempt["id"]) if attempt else None,
                     allocations=allocations.get(attempt["id"], []) if attempt else [],
                     submission=submissions.get(task["id"]),
+                    repeated_qc_findings=repeated_qc_findings.get(task["id"], []),
                     preview=previews.get(task["id"]),
                     now=now,
                     lease_risk_seconds=lease_risk_seconds,
@@ -337,19 +340,130 @@ class StatusView:
         return {row["task_id"]: dict(row) for row in rows}
 
     @staticmethod
-    def _latest_submissions(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    def _submission_history(
+        connection: sqlite3.Connection,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        """Load each submission with only its latest QC result, newest first per task."""
         rows = connection.execute(
             """
-            SELECT submission.*, qc.verdict AS qc_verdict, qc.finished_at AS qc_finished_at
+            SELECT submission.*, qc.verdict AS qc_verdict, qc.findings_json,
+                   qc.finished_at AS qc_finished_at
             FROM submissions AS submission
             LEFT JOIN qc_runs AS qc ON qc.id = (
               SELECT id FROM qc_runs WHERE submission_id = submission.id
-              ORDER BY finished_at DESC LIMIT 1
+              ORDER BY finished_at DESC, id DESC LIMIT 1
             )
-            ORDER BY submission.created_at
+            ORDER BY submission.task_id, submission.created_at DESC, submission.id DESC
             """
         ).fetchall()
-        return {row["task_id"]: dict(row) for row in rows}
+        latest: dict[str, dict[str, Any]] = {}
+        histories: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            submission = dict(row)
+            task_id = row["task_id"]
+            latest.setdefault(task_id, submission)
+            histories.setdefault(task_id, []).append(submission)
+        return latest, histories
+
+    @staticmethod
+    def _latest_submissions(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+        """Retain the existing helper surface and result shape for callers."""
+        latest, _ = StatusView._submission_history(connection)
+        return {
+            task_id: {key: value for key, value in submission.items() if key != "findings_json"}
+            for task_id, submission in latest.items()
+        }
+
+    @staticmethod
+    def _repeated_qc_findings(
+        histories: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Find structured QC issues that remain in the latest failed submission.
+
+        A recurrence is reported only when a finding on the latest submission is also
+        present on an earlier, distinct commit for the same task. Evidence is excluded
+        because it often contains paths, timestamps, or other volatile output.
+        """
+        recurring: dict[str, list[dict[str, Any]]] = {}
+        for task_id, history in histories.items():
+            latest = history[0]
+            latest_commit = latest.get("commit_sha")
+            if not latest_commit or latest.get("qc_verdict") in {None, "pass"}:
+                continue
+
+            latest_findings = {
+                identity: finding
+                for finding in StatusView._parse_qc_findings(latest.get("findings_json"))
+                if (identity := StatusView._qc_finding_identity(finding)) is not None
+            }
+            repeats: list[dict[str, Any]] = []
+            for identity, finding in latest_findings.items():
+                commits = [latest_commit]
+                seen_commits = {latest_commit}
+                for earlier in history[1:]:
+                    commit_sha = earlier.get("commit_sha")
+                    if (
+                        earlier.get("qc_verdict") in {None, "pass"}
+                        or not commit_sha
+                        or commit_sha in seen_commits
+                    ):
+                        continue
+                    earlier_findings = StatusView._parse_qc_findings(earlier.get("findings_json"))
+                    if any(
+                        StatusView._qc_finding_identity(candidate) == identity
+                        for candidate in earlier_findings
+                    ):
+                        seen_commits.add(commit_sha)
+                        commits.append(commit_sha)
+
+                if len(seen_commits) < 2:
+                    continue
+                stable_fields = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
+                fingerprint = _hashlib.sha256(stable_fields.encode("ascii")).hexdigest()[:16]
+                repeats.append(
+                    {
+                        "advisory": True,
+                        "fingerprint": fingerprint,
+                        "requirement": finding["requirement"],
+                        "finding": finding["finding"],
+                        "required_fix": finding["required_fix"],
+                        "distinct_commit_count": len(seen_commits),
+                        "latest_commit_sha": latest_commit,
+                        "matching_prior_commit_count": len(seen_commits) - 1,
+                        "matching_prior_commit_shas": commits[1:5],
+                        "prior_commit_shas_truncated": len(commits) > 5,
+                        "latest_qc_at": latest.get("qc_finished_at"),
+                    }
+                )
+            if repeats:
+                recurring[task_id] = sorted(repeats, key=lambda item: item["fingerprint"])
+        return recurring
+
+    @staticmethod
+    def _parse_qc_findings(findings_json: str | None) -> list[dict[str, Any]]:
+        try:
+            findings = json.loads(findings_json or "")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return (
+            [finding for finding in findings if isinstance(finding, dict)]
+            if isinstance(findings, list)
+            else []
+        )
+
+    @staticmethod
+    def _qc_finding_identity(finding: dict[str, Any]) -> tuple[str, str, str] | None:
+        """Use explicit finding text, not volatile evidence, as the recurrence key."""
+        stable: list[str] = []
+        for field in ("requirement", "finding", "required_fix"):
+            value = finding.get(field)
+            if not isinstance(value, str):
+                return None
+            normalized = " ".join(value.split()).casefold()
+            if not normalized:
+                return None
+            stable.append(normalized)
+        return stable[0], stable[1], stable[2]
 
     @staticmethod
     def _runtimes(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -433,6 +547,7 @@ class StatusView:
         lease_risk_seconds: int,
         checkpoint_stale_seconds: int | None,
         held_resources: list[str],
+        repeated_qc_findings: list[dict[str, Any]],
     ) -> dict[str, Any]:
         live = bool(attempt and attempt["status"] in LIVE_ATTEMPT_STATUSES)
         remaining = int(attempt["lease_expires_at"] - now) if live else None
@@ -493,6 +608,7 @@ class StatusView:
             }
             if submission
             else None,
+            "repeated_qc_findings": repeated_qc_findings,
             "ready": preview["ready"] if preview else None,
             "blockers": preview["blockers"] if preview else [],
         }
@@ -581,10 +697,17 @@ class StatusView:
 
     @staticmethod
     def _attention_item(entry: dict[str, Any]) -> dict[str, Any]:
+        reason = entry["reason"]
+        recurring_count = len(entry["repeated_qc_findings"])
+        if recurring_count:
+            reason += (
+                f"; QC feedback recurs for {recurring_count} finding(s) across distinct "
+                "commits (advisory)"
+            )
         return {
             "rank": CATEGORY_RANKS[entry["category"]],
             "category": entry["category"],
-            "reason": entry["reason"],
+            "reason": reason,
             "task_id": entry["task_id"],
             "title": entry["title"],
             "priority": entry["priority"],
@@ -624,10 +747,12 @@ class StatusView:
             checkpoint_label = f"cp {checkpoint}s" if checkpoint is not None else "cp unknown"
             if entry["checkpoint_stale_advisory"]:
                 checkpoint_label += " unchanged"
+            recurring = entry["repeated_qc_findings"]
+            recurring_label = f" qc recurring findings {len(recurring)}" if recurring else ""
             lines.append(
                 f"  {entry['phase']:<16} {entry['title'][:32]:<32} "
                 f"{entry['agent_id'] or '-':<16} hb {beat:<10} {checkpoint_label:<20} "
-                f"{','.join(entry['claimed_paths'])[:40]}"
+                f"{','.join(entry['claimed_paths'])[:40]}{recurring_label}"
             )
         if snapshot["truncated"]:
             lines.append(f"  ... {counts['tasks'] - len(snapshot['tasks'])} more")

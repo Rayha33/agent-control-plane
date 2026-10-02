@@ -391,6 +391,14 @@ still renew their leases without updating the new timestamps, so status does not
 guess from their legacy writes; it shows <code>hb -</code> and <code>cp unknown</code>
 while lease countdown and registered-process identity remain separate signals.
 
+Status also exposes <code>repeated_qc_findings</code> when the latest failed QC
+contains the same structured finding as an earlier failed QC on a different
+submitted commit for that task. Matching uses the finding's requirement, finding,
+and required-fix text; volatile evidence is ignored. This read-only advisory can
+help an operator spot feedback that survived another revision, but does not prove
+that an agent is stuck, cover every acceptance gap, change a verdict, or trigger
+retry, termination, or requeue.
+
 The <code>disk</code> section separates ACP-owned state/reclaimable-worktree
 bytes from total and free bytes on the filesystem containing <code>.acp/</code>.
 Filesystem capacity is the OS-reported, point-in-time total/free value for that
