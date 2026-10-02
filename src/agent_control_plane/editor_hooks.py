@@ -382,18 +382,44 @@ def _acp_subcommand_index(arguments: list[str], *, allow_wrappers: bool) -> int 
             return None
         index += 1
     elif allow_wrappers and launcher.startswith(("python", "pypy")):
-        module_position = next(
-            (
-                position
-                for position in range(1, len(arguments) - 1)
-                if arguments[position] == "-m"
-                and arguments[position + 1] in {"agent_control_plane", "agent_control_plane.cli"}
-            ),
-            None,
-        )
-        if module_position is None:
+        index = 1
+        python_value_options = {"-W", "-X"}
+        python_flags = {
+            "-B",
+            "-E",
+            "-I",
+            "-O",
+            "-OO",
+            "-S",
+            "-b",
+            "-bb",
+            "-i",
+            "-q",
+            "-s",
+            "-u",
+            "-v",
+            "-vv",
+            "-vvv",
+        }
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument == "-m":
+                if index + 1 >= len(arguments) or arguments[index + 1] != "agent_control_plane.cli":
+                    return None
+                index += 2
+                break
+            if argument in {"-c", "--"} or not argument.startswith("-"):
+                return None
+            if argument in python_value_options:
+                index += 2
+            elif argument.startswith(("-W", "-X")) and len(argument) > 2:
+                index += 1
+            elif argument in python_flags:
+                index += 1
+            else:
+                return None
+        else:
             return None
-        index = module_position + 2
     else:
         return None
 

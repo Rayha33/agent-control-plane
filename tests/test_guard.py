@@ -1089,6 +1089,28 @@ def test_managed_hook_marker_removes_a_changed_wrapper_but_not_an_echo_hook(
             ],
         }
     )
+    python_user_command = (
+        f"python -c 'print(1)' -m agent_control_plane.cli guard --hook {ACP_MANAGED_HOOK_FLAG}"
+    )
+    settings["hooks"]["PreToolUse"].append(
+        {
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": python_user_command}],
+        }
+    )
+    settings["hooks"]["SessionStart"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        f"python -m agent_control_plane.cli guard --describe "
+                        f"{ACP_MANAGED_HOOK_FLAG}"
+                    ),
+                }
+            ]
+        }
+    )
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
 
     install_claude_code_hooks(tmp_path, command="acp")
@@ -1100,7 +1122,9 @@ def test_managed_hook_marker_removes_a_changed_wrapper_but_not_an_echo_hook(
         for hook in entry.get("hooks", [])
     ]
     assert f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}" in commands
+    assert python_user_command in commands
     assert not any(command.startswith("uv run acp ") for command in commands)
+    assert not any(command.startswith("python -m agent_control_plane.cli ") for command in commands)
 
 
 def test_codex_install_preserves_user_hooks_and_replaces_its_own_entry(tmp_path: Path) -> None:
