@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import subprocess
 import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ class Config:
     critic_selector: str
     trust_root: Path | None
     trust_owner_uid: int
+    attempts_root: Path | None
 
 
 class ConfigMixin:
@@ -106,6 +108,7 @@ class ConfigMixin:
         with self.config_path.open("rb") as handle:
             raw = tomllib.load(handle)
         supervisor = raw.get("supervisor", {})
+        worktrees = raw.get("worktrees", {})
         qc = raw.get("qc", {})
         integration = raw.get("integration", {})
         runtime = raw.get("runtime", {})
@@ -129,6 +132,65 @@ class ConfigMixin:
                 if not self._diagnostic:
                     raise SupervisorError(error.code, error.message) from error
                 self._trust_config_error = f"{error.code}: {error.message}"
+        if not isinstance(worktrees, dict):
+            raise SupervisorError("invalid_config", "worktrees must be a table")
+        attempts_root: Path | None = None
+        attempts_root_value = worktrees.get("attempts_root")
+        if attempts_root_value is not None:
+            if not isinstance(attempts_root_value, str) or not attempts_root_value.strip():
+                raise SupervisorError(
+                    "invalid_config", "worktrees.attempts_root must be an absolute path"
+                )
+            candidate_root = Path(attempts_root_value).expanduser()
+            if not candidate_root.is_absolute():
+                raise SupervisorError(
+                    "invalid_config", "worktrees.attempts_root must be an absolute path"
+                )
+            try:
+                attempts_root = candidate_root.resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise SupervisorError(
+                    "invalid_config", "worktrees.attempts_root cannot be canonicalized"
+                ) from error
+            if attempts_root == Path(attempts_root.anchor):
+                raise SupervisorError(
+                    "invalid_config", "worktrees.attempts_root cannot be a filesystem root"
+                )
+            if self._paths_overlap(attempts_root, self.root):
+                raise SupervisorError(
+                    "invalid_config",
+                    "worktrees.attempts_root must be disjoint from the repository; "
+                    "choose a sibling or external directory",
+                )
+            try:
+                git = str(self._system_git_executable(self.root))
+                common_result = subprocess.run(
+                    [
+                        git,
+                        "-C",
+                        str(self.root),
+                        "rev-parse",
+                        "--path-format=absolute",
+                        "--git-common-dir",
+                    ],
+                    env=self._supervisor_git_env(),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if common_result.returncode:
+                    raise ValueError(common_result.stderr.strip() or "git rev-parse failed")
+                git_common_dir = Path(common_result.stdout.rstrip("\r\n")).resolve(strict=True)
+            except (OSError, RuntimeError, ValueError, SupervisorError) as error:
+                raise SupervisorError(
+                    "invalid_config",
+                    "worktrees.attempts_root cannot be checked against the Git common directory",
+                ) from error
+            if self._paths_overlap(attempts_root, git_common_dir):
+                raise SupervisorError(
+                    "invalid_config",
+                    "worktrees.attempts_root must be disjoint from Git administrative data",
+                )
         lease = int(supervisor.get("lease_seconds", 300))
         timeout = int(supervisor.get("qc_timeout_seconds", 900))
         if lease < 10 or timeout < 1:
@@ -290,7 +352,29 @@ class ConfigMixin:
             critic_selector=critic_selector,
             trust_root=trust_root,
             trust_owner_uid=trust_owner_uid,
+            attempts_root=attempts_root,
         )
+
+    @staticmethod
+    def _paths_overlap(first: Path, second: Path) -> bool:
+        """Whether either canonical path contains the other."""
+
+        try:
+            first.relative_to(second)
+            return True
+        except ValueError:
+            pass
+        try:
+            second.relative_to(first)
+            return True
+        except ValueError:
+            return False
+
+    @property
+    def _attempt_worktree_root(self) -> Path:
+        """Configured root for new attempts; legacy/default attempts stay in `.acp`."""
+
+        return self.config.attempts_root or self.state_dir / "worktrees"
 
     def _current_trust_pin(self) -> dict[str, Any]:
         if self.config.trust_root is None:

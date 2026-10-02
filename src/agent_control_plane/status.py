@@ -509,6 +509,21 @@ class StatusView:
                 f"reclaimable worktrees {disk['reclaimable_worktrees']} "
                 f"({_format_bytes(disk['reclaimable_bytes'])})"
             )
+            worktrees = disk.get("attempt_worktrees", {})
+            for managed in worktrees.get("managed_roots", []):
+                lines.append(
+                    f"  attempt worktrees at {managed['root']}: "
+                    f"{_format_bytes(managed['registered_bytes'])} registered"
+                )
+                root_filesystem = managed.get("filesystem", {})
+                if root_filesystem.get("status") == "available" and root_filesystem.get(
+                    "path"
+                ) != disk.get("filesystem", {}).get("path"):
+                    lines.append(
+                        f"  worktree filesystem at {root_filesystem['path']}: "
+                        f"{_format_bytes(root_filesystem['free_bytes'])} free / "
+                        f"{_format_bytes(root_filesystem['total_bytes'])} total"
+                    )
             filesystem = disk.get("filesystem", {})
             if filesystem.get("status") == "available":
                 lines.append(

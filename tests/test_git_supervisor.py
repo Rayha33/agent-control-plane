@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, Event
@@ -22,6 +23,7 @@ from agent_control_plane.git_supervisor import (
     GitSupervisor,
     SupervisorError,
 )
+from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
 
 
@@ -45,6 +47,7 @@ def write_config(
     runtime_setup_commands: list[str] | None = None,
     runtime_teardown_commands: list[str] | None = None,
     runtime_ports: dict[str, tuple[int, int]] | None = None,
+    attempts_root: Path | str | None = None,
 ) -> None:
     qc = qc_commands if qc_commands is not None else [python_command("pass")]
     integration = integration_commands if integration_commands is not None else qc
@@ -75,7 +78,12 @@ def write_config(
         f"setup_commands = {content['runtime_setup']}\n"
         f"teardown_commands = {content['runtime_teardown']}\n\n"
         "[runtime.ports]\n"
-        f"{port_lines}",
+        f"{port_lines}"
+        + (
+            f"\n[worktrees]\nattempts_root = {json.dumps(str(attempts_root))}\n"
+            if attempts_root is not None
+            else ""
+        ),
         encoding="utf-8",
     )
 
@@ -101,6 +109,66 @@ def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change"
         ["The declared content is correct", "QC passes"],
         [resource],
     )
+
+
+def test_external_attempt_worktree_root_rejects_relative_repository_and_symlink_paths(
+    repo: Path,
+) -> None:
+    write_config(repo, attempts_root="relative/worktrees")
+    with pytest.raises(SupervisorError) as relative:
+        GitSupervisor(repo)
+    assert relative.value.code == "invalid_config"
+
+    write_config(repo, attempts_root=repo / "external-worktrees")
+    with pytest.raises(SupervisorError) as internal:
+        GitSupervisor(repo)
+    assert internal.value.code == "invalid_config"
+
+    redirected = repo.parent / f"{repo.name}-redirected-worktrees"
+    redirected.symlink_to(repo / "outside", target_is_directory=True)
+    write_config(repo, attempts_root=redirected)
+    with pytest.raises(SupervisorError) as symlink_escape:
+        GitSupervisor(repo)
+    assert symlink_escape.value.code == "invalid_config"
+
+
+def test_external_attempt_worktree_root_rejects_linked_worktree_git_common_dir(
+    repo: Path,
+) -> None:
+    linked = repo.parent / f"{repo.name}-linked-worktree"
+    git(repo, "worktree", "add", "-b", "linked-config-test", str(linked))
+    common_dir = Path(git(linked, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    write_config(linked, attempts_root=common_dir / "worktrees" / "attempts")
+
+    with pytest.raises(SupervisorError, match="Git administrative data") as error:
+        GitSupervisor(linked)
+
+    assert error.value.code == "invalid_config"
+    assert not (common_dir / "worktrees" / "attempts").exists()
+
+
+def test_attempt_worktree_collision_is_rejected_without_removing_existing_data(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_root = repo.parent / f"{repo.name}-collision-worktrees"
+    attempt_id = _uuid.UUID("00000000-0000-4000-8000-000000000233")
+    collision = external_root / str(attempt_id)
+    collision.mkdir(parents=True)
+    sentinel = collision / "keep.txt"
+    sentinel.write_text("unrelated", encoding="utf-8")
+    write_config(repo, attempts_root=external_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    monkeypatch.setattr(claims_module.uuid, "uuid4", lambda: attempt_id)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(created["id"], "worker")
+
+    assert error.value.code == "worktree_collision"
+    assert sentinel.read_text(encoding="utf-8") == "unrelated"
+    assert supervisor.task(created["id"])["status"] == "open"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM attempts").fetchone()[0] == 0
 
 
 def _claim_in_process(repo_root: str, task_id: int, agent_id: str, gate, results) -> None:
@@ -314,6 +382,8 @@ def test_non_overlapping_tasks_get_parallel_worktrees(repo: Path) -> None:
     with ThreadPoolExecutor(max_workers=2) as pool:
         claims = list(pool.map(claim_one, [(first, "agent-alpha"), (second, "agent-beta")]))
     assert all(Path(claim["worktree"]).is_dir() for claim in claims)
+    assert all(Path(claim["worktree"]).parent == repo / ".acp" / "worktrees" for claim in claims)
+    assert all(claim["worktree_root"] == str(repo / ".acp" / "worktrees") for claim in claims)
     assert claims[0]["worktree"] != claims[1]["worktree"]
 
 
@@ -404,11 +474,15 @@ def test_concurrent_process_claims_get_independent_registered_worktrees(repo: Pa
     assert not (repo / ".git" / "config.lock").exists()
 
 
+@pytest.mark.parametrize("external_root", [False, True])
 def test_worktree_add_failure_after_creation_rolls_back_partial_claim(
-    repo: Path, monkeypatch
+    repo: Path, monkeypatch, external_root: bool
 ) -> None:
     port, _ = free_port_range(1)
-    write_config(repo, runtime_ports={"APP_PORT": (port, port)})
+    attempts_root = (
+        repo.parent / f"{repo.name}-failed-external-worktrees" if external_root else None
+    )
+    write_config(repo, runtime_ports={"APP_PORT": (port, port)}, attempts_root=attempts_root)
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "injected provisioning failure")
     original_git = supervisor._git
@@ -458,6 +532,9 @@ def test_worktree_add_failure_after_creation_rolls_back_partial_claim(
         if line.startswith("worktree ")
     }
     assert registered == {repo.resolve()}
+    if attempts_root is not None:
+        assert attempts_root.is_dir()
+        assert list(attempts_root.iterdir()) == []
     assert not (repo / ".git" / "config.lock").exists()
 
 
@@ -853,10 +930,16 @@ def test_parallel_non_overlapping_workers_stay_in_their_own_worktrees(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Accepted parallel writes keep separate checkouts and Git state."""
+    external_root = repo.parent / f"{repo.name}-attempt-worktrees"
+    write_config(repo, attempts_root=external_root)
     supervisor = GitSupervisor(repo)
     first = supervisor.claim(task(supervisor, "alpha.txt", "first agent")["id"], "agent-first")
     second = supervisor.claim(task(supervisor, "beta.txt", "second agent")["id"], "agent-second")
     assert first["worktree"] != second["worktree"]
+    assert Path(first["worktree"]).parent == external_root.resolve()
+    assert Path(second["worktree"]).parent == external_root.resolve()
+    assert first["worktree_root"] == str(external_root.resolve())
+    assert second["worktree_root"] == str(external_root.resolve())
     assert first["branch"] != second["branch"]
     base_head = git(repo, "rev-parse", "HEAD")
     base_status = git(repo, "status", "--porcelain")

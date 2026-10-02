@@ -300,7 +300,7 @@ class QcMixin:
                 result_path.unlink(missing_ok=True)
                 packet_path.unlink(missing_ok=True)
                 if worktree.exists():
-                    self._remove_worktree(worktree, delete_branch=False)
+                    self._remove_worktree(worktree, delete_branch=False, expected_branch=None)
             results.append(
                 {
                     "name": case.name,
@@ -636,7 +636,7 @@ class QcMixin:
             )
         finally:
             if qc_dir.exists():
-                self._remove_worktree(qc_dir, delete_branch=False)
+                self._remove_worktree(qc_dir, delete_branch=False, expected_branch=None)
 
         serious = {"critical", "high", "medium"}
         if any(result["exit_code"] for result in results):

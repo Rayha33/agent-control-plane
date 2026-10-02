@@ -15,12 +15,12 @@ import fcntl
 import os
 import re
 import select
-import shutil
 import signal
 import stat
 import subprocess
 import sys
 import time
+import uuid as _uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -332,18 +332,208 @@ class ProcessMixin:
             return f"darwin:{pid}:{started}" if result.returncode == 0 and started else None
         return None
 
-    def _remove_worktree(self, path: Path, delete_branch: bool) -> None:
-        branch = (
-            self._git_text("-C", str(path), "branch", "--show-current", check=False)
-            if path.exists()
-            else ""
+    def _remove_worktree(
+        self, path: Path, delete_branch: bool, expected_branch: str | None
+    ) -> bool:
+        """Remove only the exact registered worktree and branch owned by the caller.
+
+        Registration, branch validation, removal, and the optional branch deletion are
+        serialized as one ACP Git operation. In particular, cleanup never derives the
+        branch to delete from a fresh path that may have been replaced since its owner
+        was surveyed.
+        """
+
+        canonical = path.resolve(strict=False)
+        with self._git_operation_guard():
+            listed = self._run_git_while_locked("worktree", "list", "--porcelain", "-z")
+            if listed.returncode:
+                return False
+            registered = self._parse_registered_worktrees(
+                listed.stdout.decode("utf-8", errors="surrogateescape")
+            )
+            canonical_text = str(canonical)
+            if canonical_text not in registered or registered[canonical_text] != expected_branch:
+                return False
+            if path.is_symlink():
+                return False
+            if path.exists():
+                try:
+                    if path.resolve(strict=True) != canonical:
+                        return False
+                except (OSError, RuntimeError):
+                    return False
+                current = self._run_git_while_locked("-C", str(path), "branch", "--show-current")
+                if current.returncode:
+                    return False
+                actual_branch = current.stdout.decode("utf-8", errors="surrogateescape").strip()
+                if (actual_branch or None) != expected_branch:
+                    return False
+
+            removed = self._run_git_while_locked("worktree", "remove", "--force", str(path))
+            if removed.returncode or path.exists() or path.is_symlink():
+                # Git did not prove it removed the registered worktree. Never use a
+                # recursive fallback: the path could have been replaced by user data.
+                return False
+            self._run_git_while_locked("worktree", "prune")
+            listed_after = self._run_git_while_locked("worktree", "list", "--porcelain", "-z")
+            if listed_after.returncode:
+                return False
+            remaining = self._parse_registered_worktrees(
+                listed_after.stdout.decode("utf-8", errors="surrogateescape")
+            )
+            if canonical_text in remaining:
+                return False
+            if delete_branch and expected_branch:
+                # Git refuses to delete a branch still checked out in another worktree.
+                # A failure may leave an orphaned ref, but cannot redirect deletion.
+                self._run_git_while_locked("branch", "-D", "--", expected_branch)
+            return True
+
+    def _run_git_while_locked(self, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+        """Run one system-Git command while the caller holds `_git_operation_guard`."""
+
+        git = str(self._system_git_executable(self.root))
+        argv = [
+            *self._supervisor_git_prefix(git, self._disabled_git_hooks_dir()),
+            "-C",
+            str(self.root),
+            *arguments,
+        ]
+        return subprocess.run(
+            argv,
+            env=self._supervisor_git_env(),
+            capture_output=True,
+            check=False,
         )
-        self._git("worktree", "remove", "--force", str(path), check=False)
-        if path.exists():
-            shutil.rmtree(path)
-        self._git("worktree", "prune", check=False)
-        if delete_branch and branch:
-            self._git("branch", "-D", branch, check=False)
+
+    def _registered_worktrees(self) -> dict[str, str | None]:
+        """Return Git-registered worktree paths and their checked-out branch names."""
+
+        output = self._git_bytes("worktree", "list", "--porcelain", "-z").decode(
+            "utf-8", errors="surrogateescape"
+        )
+        return self._parse_registered_worktrees(output)
+
+    @staticmethod
+    def _parse_registered_worktrees(output: str) -> dict[str, str | None]:
+        registered: dict[str, str | None] = {}
+        record: dict[str, str] = {}
+
+        def add_record() -> None:
+            worktree = record.get("worktree")
+            if worktree:
+                branch = record.get("branch", "")
+                if branch.startswith("refs/heads/"):
+                    branch = branch.removeprefix("refs/heads/")
+                registered[str(Path(worktree).resolve(strict=False))] = branch or None
+            record.clear()
+
+        for field in output.split("\0"):
+            if not field:
+                add_record()
+            elif field.startswith("worktree "):
+                record["worktree"] = field.removeprefix("worktree ")
+            elif field.startswith("branch "):
+                record["branch"] = field.removeprefix("branch ")
+        add_record()
+        return registered
+
+    def _attempt_worktree_is_managed(self, attempt_id: str, worktree: Path, root: Path) -> bool:
+        """Validate the exact registered-root child an attempt is allowed to own."""
+
+        try:
+            if str(_uuid.UUID(attempt_id)) != attempt_id:
+                return False
+            if not worktree.is_absolute() or not root.is_absolute():
+                return False
+            if worktree != root / attempt_id or root.resolve(strict=False) != root:
+                return False
+            default_root = (self.state_dir / "worktrees").resolve(strict=False)
+            if root != default_root and self._paths_overlap(root, self.root):
+                return False
+            if root.is_symlink() or worktree.is_symlink():
+                return False
+            if root.exists() and (not root.is_dir() or root.resolve(strict=True) != root):
+                return False
+            if worktree.exists() and worktree.resolve(strict=True) != worktree:
+                return False
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _attempt_worktree_head(
+        self,
+        attempt_id: str,
+        worktree: Path,
+        root: Path,
+        expected_branch: str | None,
+    ) -> str | None:
+        """Read recovery HEAD only while path, repository and branch ownership hold."""
+
+        try:
+            with self._git_operation_guard():
+                canonical = str(worktree.resolve(strict=False))
+
+                def owned_registration() -> bool:
+                    if not self._attempt_worktree_is_managed(attempt_id, worktree, root):
+                        return False
+                    listed = self._run_git_while_locked("worktree", "list", "--porcelain", "-z")
+                    if listed.returncode:
+                        return False
+                    registered = self._parse_registered_worktrees(
+                        listed.stdout.decode("utf-8", errors="surrogateescape")
+                    )
+                    return canonical in registered and registered[canonical] == expected_branch
+
+                def worktree_identity_holds() -> bool:
+                    if not owned_registration():
+                        return False
+                    branch = self._run_git_while_locked(
+                        "-C", str(worktree), "branch", "--show-current"
+                    )
+                    top = self._run_git_while_locked(
+                        "-C", str(worktree), "rev-parse", "--show-toplevel"
+                    )
+                    common = self._run_git_while_locked(
+                        "-C",
+                        str(worktree),
+                        "rev-parse",
+                        "--path-format=absolute",
+                        "--git-common-dir",
+                    )
+                    repository_common = self._run_git_while_locked(
+                        "rev-parse", "--path-format=absolute", "--git-common-dir"
+                    )
+                    if any(
+                        result.returncode for result in (branch, top, common, repository_common)
+                    ):
+                        return False
+                    branch_name = branch.stdout.decode("utf-8", errors="surrogateescape").strip()
+                    top_path = Path(
+                        top.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
+                    ).resolve(strict=True)
+                    worktree_common = Path(
+                        common.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
+                    ).resolve(strict=True)
+                    repository_common_path = Path(
+                        repository_common.stdout.decode("utf-8", errors="surrogateescape").rstrip(
+                            "\r\n"
+                        )
+                    ).resolve(strict=True)
+                    return (
+                        (branch_name or None) == expected_branch
+                        and top_path == worktree
+                        and worktree_common == repository_common_path
+                    )
+
+                if not worktree_identity_holds():
+                    return None
+                head = self._run_git_while_locked("-C", str(worktree), "rev-parse", "HEAD")
+                if head.returncode or not worktree_identity_holds():
+                    return None
+                return head.stdout.decode("utf-8", errors="surrogateescape").strip() or None
+        except (OSError, RuntimeError, SupervisorError, ValueError):
+            return None
 
     @contextmanager
     def _git_operation_guard(self) -> Iterator[int]:

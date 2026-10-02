@@ -171,6 +171,32 @@ def test_base_checkout_snapshot_requirement_migration_preserves_legacy_marker() 
     connection.close()
 
 
+def test_attempt_worktree_root_migration_leaves_legacy_attempts_on_default_root() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE attempts (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
+        INSERT INTO attempts VALUES ('legacy-attempt', '/repo/.acp/worktrees/legacy-attempt');
+        """
+    )
+
+    migration = dict(MIGRATIONS)[7]
+    migration(connection)
+    row = connection.execute(
+        "SELECT worktree, worktree_root FROM attempts WHERE id = 'legacy-attempt'"
+    ).fetchone()
+    assert row["worktree"] == "/repo/.acp/worktrees/legacy-attempt"
+    assert row["worktree_root"] == ""
+
+    migration(connection)
+    repeated = connection.execute(
+        "SELECT worktree_root FROM attempts WHERE id = 'legacy-attempt'"
+    ).fetchone()
+    assert repeated["worktree_root"] == ""
+    connection.close()
+
+
 def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:
     """A live old process cannot create a new marker-less attempt after upgrade."""
 

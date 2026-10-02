@@ -170,6 +170,17 @@ database schemas, browser profiles, or service state. During the same claim
 transaction, ACP allocates one available value from every configured local port
 pool and persists the assignment against the attempt.
 
+Attempt worktrees default to `.acp/worktrees/<attempt-id>`. An operator may set
+`[worktrees].attempts_root` in `acp.toml` to a canonical sibling or external path
+that does not overlap the checkout or Git's common administrative directory.
+The resolved absolute path and its managed root are stored on each attempt, so a
+later config change affects only new claims. GC requires the path to be the exact
+attempt-ID child of that stored root and still registered by Git on the recorded
+branch; it never recursively deletes a path after Git refuses removal. This is
+storage placement, not an OS-level filesystem sandbox.
+GC reports bytes actually removed separately from the size of its surveyed
+reclaimable set, which remains an estimate (including for dry runs).
+
 After the worktree exists, ACP creates a private runtime directory and runs
 configured setup commands or trusted resource drivers with generated environment variables. The environment
 is then injected into the supervised worker, deterministic QC, the critic, and

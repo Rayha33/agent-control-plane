@@ -11,6 +11,8 @@ deletes anyway would pass the weaker check.
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -58,6 +60,11 @@ def reasons(report: dict) -> dict[str, str]:
     return {entry["attempt_id"]: entry["reason"] for entry in report["retained"]}
 
 
+def configure_attempt_worktree_root(repo: Path, root: Path) -> None:
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[worktrees]\nattempts_root = {json.dumps(str(root))}\n")
+
+
 def test_gc_reclaims_a_finished_task_worktree_and_branch(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = finish_a_task(supervisor)
@@ -72,6 +79,115 @@ def test_gc_reclaims_a_finished_task_worktree_and_branch(repo: Path) -> None:
     assert attempt["branch"] not in git(repo, "branch", "--list", "--format=%(refname:short)")
     # The registration has to go too, or `git worktree list` keeps naming a dead path.
     assert str(worktree) not in git(repo, "worktree", "list")
+
+
+def test_external_worktree_root_stays_pinned_across_config_change_and_gc(repo: Path) -> None:
+    original_root = repo.parent / f"{repo.name}-external-worktrees"
+    replacement_root = repo.parent / f"{repo.name}-replacement-worktrees"
+    configure_attempt_worktree_root(repo, original_root)
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="external worker")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+
+    assert worktree.parent == original_root.resolve()
+    assert attempt["worktree_root"] == str(original_root.resolve())
+    storage = supervisor.status()["disk"]["attempt_worktrees"]
+    assert storage["configured_root"] == str(original_root.resolve())
+    assert storage["managed_roots"][0]["root"] == str(original_root.resolve())
+    assert storage["managed_roots"][0]["registered_bytes"] > 0
+    assert storage["managed_roots"][0]["filesystem"]["path"] == str(original_root.resolve())
+    assert f"attempt worktrees at {original_root.resolve()}" in supervisor.render_status(
+        supervisor.status()
+    )
+
+    config_path = repo / "acp.toml"
+    config = config_path.read_text(encoding="utf-8")
+    (repo / "acp.toml").write_text(
+        config.replace(str(original_root), str(replacement_root)), encoding="utf-8"
+    )
+    reopened = GitSupervisor(repo)
+    assert reopened.attempt(attempt["id"])["worktree"] == str(worktree)
+    assert reopened.attempt(attempt["id"])["worktree_root"] == str(original_root.resolve())
+    # The independent base-checkout snapshot correctly rejects a source-config edit
+    # during an active attempt. Restore the original file while retaining the reopened
+    # supervisor's changed in-memory setting to isolate path pinning from that guard.
+    config_path.write_text(config, encoding="utf-8")
+    commit_change(attempt, "alpha.txt", "external change\n")
+    submission = reopened.submit(attempt["id"], attempt["claim_token"])
+    assert reopened.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    assert reopened.integrate(created["id"])["verdict"] == "pass"
+
+    report = reopened.gc(older_than_seconds=0)
+
+    assert report["removed"] == [attempt["id"]]
+    assert not worktree.exists()
+
+
+def test_gc_rechecks_the_expected_branch_after_survey(repo: Path, monkeypatch) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    unexpected_branch = "acp-unexpected-gc-branch"
+    original_remove = supervisor._remove_worktree
+
+    def switch_branch_then_remove(path, delete_branch, expected_branch):
+        git(path, "switch", "-c", unexpected_branch)
+        return original_remove(path, delete_branch, expected_branch)
+
+    monkeypatch.setattr(supervisor, "_remove_worktree", switch_branch_then_remove)
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_removal_unproven"
+    assert report["bytes"] == 0
+    assert report["reclaimable_bytes"] > 0
+    assert worktree.exists()
+    assert git(worktree, "branch", "--show-current") == unexpected_branch
+    surviving = git(repo, "branch", "--list", "--format=%(refname:short)")
+    assert attempt["branch"] in surviving
+    assert unexpected_branch in surviving
+
+
+def test_gc_never_removes_an_unregistered_directory_at_attempt_path(repo: Path) -> None:
+    external_root = repo.parent / f"{repo.name}-external-worktrees"
+    configure_attempt_worktree_root(repo, external_root)
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+
+    git(repo, "worktree", "remove", "--force", str(worktree))
+    worktree.mkdir()
+    sentinel = worktree / "unrelated.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_unregistered"
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_gc_never_removes_an_unrelated_sibling_outside_the_attempt_id(repo: Path) -> None:
+    external_root = repo.parent / f"{repo.name}-external-worktrees"
+    configure_attempt_worktree_root(repo, external_root)
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    unrelated = external_root / "unrelated-checkout"
+    unrelated.mkdir()
+    sentinel = unrelated / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET worktree = ? WHERE id = ?", (str(unrelated), attempt["id"])
+        )
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_path_unmanaged"
+    assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
 def test_gc_refuses_a_live_attempt(repo: Path) -> None:
@@ -110,8 +226,103 @@ def test_dry_run_reports_without_removing(repo: Path) -> None:
     assert report["dry_run"] is True
     assert report["removed"] == []
     assert [entry["attempt_id"] for entry in report["reclaimable"]] == [attempt["id"]]
-    assert report["bytes"] > 0
+    assert report["bytes"] == 0
+    assert report["reclaimable_bytes"] > 0
     assert Path(attempt["worktree"]).exists()
+
+
+def test_expired_recovery_keeps_last_sha_when_worktree_path_becomes_symlink(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="recovery path identity")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    original_path = worktree.with_name(f"{worktree.name}-original")
+    latest_before = attempt["latest_sha"]
+    commit_change(attempt, "alpha.txt", "unheartbeat-ed commit\n")
+    worktree_head = git(worktree, "rev-parse", "HEAD")
+    assert worktree_head != latest_before
+
+    foreign = tmp_path / "foreign-repository"
+    foreign.mkdir()
+    git(foreign, "init", "-b", "main")
+    git(foreign, "config", "user.name", "ACP Test")
+    git(foreign, "config", "user.email", "acp@example.test")
+    (foreign / "foreign.txt").write_text("unrelated\n", encoding="utf-8")
+    git(foreign, "add", "foreign.txt")
+    git(foreign, "commit", "-m", "unrelated")
+    foreign_head = git(foreign, "rev-parse", "HEAD")
+    assert foreign_head != latest_before
+
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = ?, pid_identity = ? WHERE id = ?",
+            (4242, "linux:4242:1", attempt["id"]),
+        )
+
+    def replace_worktree_after_worker_termination(_pid: int, _identity: str) -> str:
+        worktree.rename(original_path)
+        worktree.symlink_to(foreign, target_is_directory=True)
+        return "already_gone"
+
+    monkeypatch.setattr(
+        supervisor, "_terminate_registered_group", replace_worktree_after_worker_termination
+    )
+    try:
+        supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+        with supervisor.connect() as connection:
+            latest_after = connection.execute(
+                "SELECT latest_sha FROM attempts WHERE id = ?", (attempt["id"],)
+            ).fetchone()["latest_sha"]
+        assert latest_after == latest_before
+        assert worktree.is_symlink()
+    finally:
+        worktree.unlink(missing_ok=True)
+        original_path.rename(worktree)
+
+
+def test_expired_recovery_captures_head_from_registered_attempt_worktree(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="recovery commit identity")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "committed before crash\n")
+    recovered_head = git(Path(attempt["worktree"]), "rev-parse", "HEAD")
+
+    supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+
+    with supervisor.connect() as connection:
+        latest_sha = connection.execute(
+            "SELECT latest_sha FROM attempts WHERE id = ?", (attempt["id"],)
+        ).fetchone()["latest_sha"]
+    assert latest_sha == recovered_head
+
+
+def test_expired_recovery_does_not_read_head_while_launch_owner_is_live(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="launch owner recovery fence")
+    attempt = supervisor.claim(created["id"], "worker")
+    latest_before = attempt["latest_sha"]
+    commit_change(attempt, "alpha.txt", "launcher may still be active\n")
+    assert git(Path(attempt["worktree"]), "rev-parse", "HEAD") != latest_before
+    owner_identity = supervisor._process_identity(os.getpid())
+    assert owner_identity
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = -1, launch_owner_pid = ?, "
+            "launch_owner_identity = ? WHERE id = ?",
+            (os.getpid(), owner_identity, attempt["id"]),
+        )
+
+    report = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+
+    with supervisor.connect() as connection:
+        latest_after = connection.execute(
+            "SELECT latest_sha FROM attempts WHERE id = ?", (attempt["id"],)
+        ).fetchone()["latest_sha"]
+    assert latest_after == latest_before
+    assert report["runtime_cleanup"][0]["state"] == "cleanup_error"
+    assert "launch owner is still active" in report["runtime_cleanup"][0]["error"]
 
 
 def test_gc_refuses_a_fenced_attempt(repo: Path) -> None:
