@@ -250,10 +250,17 @@ class StatusView:
         # "launchable now, alongside everything above it", not "launchable alone".
         plan = scheduler.plan_pass(tasks, holders)
         previews = {entry["task_id"]: entry for entry in [*plan["ready"], *plan["blocked"]]}
+        read_resource_tree_cache: dict[tuple[str, tuple[str, ...]], dict[str, str]] = {}
         entries: list[dict[str, Any]] = []
         for task in tasks:
             attempt = attempts.get(task["id"])
             runtime = runtimes.get(attempt["id"]) if attempt else None
+            read_dependency_advisory = self.supervisor._read_resource_advisory(
+                task.get("declared_read_resources", []),
+                attempt.get("read_resources_snapshot_json", "") if attempt else "",
+                task["base_branch"],
+                tree_cache=read_resource_tree_cache,
+            )
             entries.append(
                 self._task_entry(
                     task=task,
@@ -268,6 +275,7 @@ class StatusView:
                     lease_risk_seconds=lease_risk_seconds,
                     checkpoint_stale_seconds=checkpoint_stale_seconds,
                     held_resources=held_resources.get(task["id"], []),
+                    read_dependency_advisory=read_dependency_advisory,
                 )
             )
 
@@ -574,6 +582,7 @@ class StatusView:
         checkpoint_stale_seconds: int | None,
         held_resources: list[str],
         repeated_qc_findings: list[dict[str, Any]],
+        read_dependency_advisory: dict[str, Any] | None,
     ) -> dict[str, Any]:
         live = bool(attempt and attempt["status"] in LIVE_ATTEMPT_STATUSES)
         remaining = int(attempt["lease_expires_at"] - now) if live else None
@@ -611,6 +620,8 @@ class StatusView:
             # case-sensitive checkout.
             "claimed_paths": task["resources"],
             "declared_claimed_paths": task.get("declared_resources", task["resources"]),
+            "declared_read_resources": task.get("declared_read_resources", []),
+            "read_dependency_advisory": read_dependency_advisory,
             "held_resources": held_resources,
             "cleanup_target_status": task.get("cleanup_target_status", ""),
             "cleanup_error": task.get("cleanup_error", ""),
@@ -775,10 +786,17 @@ class StatusView:
                 checkpoint_label += " unchanged"
             recurring = entry["repeated_qc_findings"]
             recurring_label = f" qc recurring findings {len(recurring)}" if recurring else ""
+            read_advisory = entry["read_dependency_advisory"]
+            if read_advisory is None:
+                read_label = ""
+            elif read_advisory["state"] == "changed":
+                read_label = f" read inputs changed {read_advisory['changed_path_count']}"
+            else:
+                read_label = f" read inputs {read_advisory['state']}"
             lines.append(
                 f"  {entry['phase']:<16} {entry['title'][:32]:<32} "
                 f"{entry['agent_id'] or '-':<16} hb {beat:<10} {checkpoint_label:<20} "
-                f"{','.join(entry['claimed_paths'])[:40]}{recurring_label}"
+                f"{','.join(entry['claimed_paths'])[:40]}{recurring_label}{read_label}"
             )
         if snapshot["truncated"]:
             lines.append(f"  ... {counts['tasks'] - len(snapshot['tasks'])} more")

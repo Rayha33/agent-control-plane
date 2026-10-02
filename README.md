@@ -166,8 +166,18 @@ Create and claim bounded work:
 ~~~bash
 uv run --extra dev acp task-add --title "Harden token refresh" --accept "refresh regression tests pass" --resource "src/auth/**" --resource "tests/auth/**"
 
+# Optional read inputs are tracked for freshness; they do not reserve write access.
+uv run --extra dev acp task-add --title "Update API client" --accept "client tests pass" \
+  --resource "client/**" --read-resource "src/api/schema.py" --read-resource "openapi/**"
+
 uv run --extra dev acp claim TASK_ID --agent codex-session-17
 ~~~
+
+Read-input globs use recursive `**` matching and are advisory only. A glob must
+have a literal directory prefix; repository-root-wide patterns report `unknown`
+rather than scan the entire tree. Prefix scans over 10,000 tracked entries or
+16 MiB report `unknown`. This is deliberately fail-closed and does not block,
+requeue, or change task state.
 
 The zero-configuration local mode is intentionally unauthenticated. Enable
 role-scoped authentication by enrolling the first runner. Authentication then
@@ -355,6 +365,15 @@ deterministically by priority, creation time, and id. Each entry reports the
 paths it shares with earlier entries, and becomes <code>stale</code> with an
 <code>upstream_commits</code> count when commits land on the base branch after
 approval.
+
+Tasks may also opt in to `--read-resource PATH_OR_GLOB`. At claim, ACP snapshots
+the Git object ids of matching tracked paths on the task's base. `status` and
+`merge-plan` show a read-only `read_dependency_advisory` with exact before/after
+object ids when those inputs change on the configured base. Read declarations do
+not reserve files, block a claim or merge, infer what an agent actually read, or
+prove that a change is semantically incompatible. Missing/untracked scopes and
+unavailable snapshots are reported as `unknown`, never as unchanged. Tasks with
+no declared read resources retain the existing behavior.
 
 All four planning commands are read-only. Unlike <code>claim</code> and
 <code>list</code>, they never reap: looking at the board does not orphan an

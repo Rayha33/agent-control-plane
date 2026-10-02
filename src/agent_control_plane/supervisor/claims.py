@@ -8,27 +8,121 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 from __future__ import annotations
 
 import base64
+import fnmatch
 import hashlib
 import json
 import os
+import queue
 import re
 import sqlite3
 import stat
 import subprocess
+import threading
 import time
 import unicodedata
 import uuid
 from collections.abc import Sequence
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..scheduling import declared_resources, normalize_artifact
+from ..scheduling import declared_read_resources, declared_resources, normalize_artifact
 from .common import SUBMISSION_OBJECT_CONTRACT, SupervisorError, canonical_json, sha256, utc_now
 from .schema import META_CASE_SENSITIVE
+
+_READ_RESOURCE_MAX_PATHS = 10_000
+_READ_RESOURCE_MAX_CACHED_SCOPES = 16
+_READ_RESOURCE_MAX_LISTING_BYTES = 16 * 1024 * 1024
 
 
 class ClaimsMixin:
     """Claiming a task, heartbeats, the write-set guard and submission."""
+
+    def _git_readonly_bytes_bounded(self, *arguments: str, max_bytes: int) -> bytes:
+        """Read a sanitized Git query without buffering an unbounded tree listing."""
+        git = str(self._system_git_executable(self.root))
+        argv = [
+            *self._supervisor_git_prefix(git, Path(os.devnull)),
+            "-C",
+            str(self.root),
+            *arguments,
+        ]
+        try:
+            process = subprocess.Popen(
+                argv,
+                env=self._supervisor_git_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            raise SupervisorError("git_error", "could not start read-only Git query") from error
+
+        chunks: queue.Queue[bytes] = queue.Queue(maxsize=2)
+        reader_done = threading.Event()
+        stop_reader = threading.Event()
+
+        def drain_stdout() -> None:
+            try:
+                assert process.stdout is not None
+                while not stop_reader.is_set():
+                    chunk = process.stdout.read1(64 * 1024)
+                    if not chunk:
+                        break
+                    while not stop_reader.is_set():
+                        try:
+                            chunks.put(chunk, timeout=0.05)
+                            break
+                        except queue.Full:
+                            continue
+            except (OSError, ValueError):
+                # The parent closes the pipe after a timeout or size-limit refusal.
+                pass
+            finally:
+                reader_done.set()
+
+        reader = threading.Thread(target=drain_stdout, daemon=True)
+        reader.start()
+        output = bytearray()
+        deadline = time.monotonic() + 10
+        try:
+            while not reader_done.is_set() or not chunks.empty():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SupervisorError("git_timeout", "read-only Git query timed out")
+                try:
+                    chunk = chunks.get(timeout=min(0.05, remaining))
+                except queue.Empty:
+                    continue
+                if len(output) + len(chunk) > max_bytes:
+                    raise SupervisorError(
+                        "read_resource_scope_too_large",
+                        f"read-resource Git listing exceeded {max_bytes} bytes",
+                    )
+                output.extend(chunk)
+            try:
+                return_code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as error:
+                raise SupervisorError("git_timeout", "read-only Git query timed out") from error
+            if return_code:
+                raise SupervisorError("git_error", "read-only Git query failed")
+            return bytes(output)
+        finally:
+            stop_reader.set()
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+            reader.join(timeout=1)
 
     def _prepare_attempt_worktree(self, attempt_id: str) -> tuple[Path, Path]:
         """Create/validate the managed root and reserve an unused attempt path.
@@ -200,13 +294,22 @@ class ClaimsMixin:
             ).fetchone()["value"]
             resume = connection.execute(
                 """
-                SELECT latest_sha FROM attempts
+                SELECT latest_sha, read_resources_snapshot_json FROM attempts
                 WHERE task_id = ? AND latest_sha IS NOT NULL
                 ORDER BY number DESC LIMIT 1
                 """,
                 (task_id,),
             ).fetchone()
             start_sha = resume["latest_sha"] if resume else task["base_sha"]
+            read_resources = declared_read_resources(task)
+            read_snapshot_json = (
+                resume["read_resources_snapshot_json"]
+                if resume and resume["read_resources_snapshot_json"]
+                else self._capture_read_resource_snapshot(
+                    start_sha,
+                    read_resources,
+                )
+            )
             branch = f"acp/task-{task_id[:8]}-a{number}"
             connection.execute(
                 """
@@ -214,11 +317,11 @@ class ClaimsMixin:
                   (id, task_id, number, agent_id, runner_credential_digest,
                    branch, worktree, worktree_root, claim_token,
                    start_sha, latest_sha, checkpoint_json, heartbeat_at, checkpoint_at,
-                   trust_bundle_json,
+                   read_resources_snapshot_json, trust_bundle_json,
                    pid, log_path, status,
                    lease_expires_at, created_at, updated_at, base_checkout_snapshot_json,
                    base_checkout_snapshot_required)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, NULL, NULL,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, NULL, NULL,
                         'provisioning', ?, ?, ?, ?, 1)
                 """,
                 (
@@ -235,6 +338,7 @@ class ClaimsMixin:
                     start_sha,
                     now,
                     "",
+                    read_snapshot_json,
                     canonical_json(trust_pin),
                     expires,
                     now,
@@ -647,6 +751,292 @@ class ClaimsMixin:
             "SELECT value FROM meta WHERE key = ?", (META_CASE_SENSITIVE,)
         ).fetchone()
         return bool(row) and row["value"] == "1"
+
+    def _capture_read_resource_snapshot(
+        self,
+        base_sha: str,
+        resources: Sequence[str],
+        *,
+        tree_cache: dict[tuple[str, tuple[str, ...]], dict[str, str]] | None = None,
+    ) -> str:
+        """Capture matching tracked Git object ids without executing candidate code."""
+        if not resources:
+            return ""
+        files: dict[str, str] = {}
+        matched = {resource: False for resource in resources}
+        try:
+            normalized_resources = {
+                resource: self.normalize_resource(resource, self.root, fold=False)
+                for resource in resources
+            }
+            prefixes: set[str] = set()
+            for resource in normalized_resources.values():
+                has_glob = any(character in resource for character in "*?[")
+                prefix = (
+                    self._literal_prefix(resource) if has_glob else resource.removesuffix("/**")
+                )
+                if has_glob and not prefix:
+                    return canonical_json(
+                        {
+                            "state": "unknown",
+                            "base_sha": base_sha,
+                            "files": {},
+                            "unmatched_resources": [
+                                item
+                                for item, normalized in normalized_resources.items()
+                                if any(character in normalized for character in "*?[")
+                                and not self._literal_prefix(normalized)
+                            ],
+                            "reason": (
+                                "root-wide glob has no literal directory prefix; narrow the "
+                                "read resource to avoid scanning the full repository"
+                            ),
+                        }
+                    )
+                if prefix:
+                    prefixes.add(prefix)
+
+            # A parent prefix already covers every descendant; removing descendants keeps
+            # Git's literal pathspec query and the per-render cache bounded and predictable.
+            pathspecs: list[str] = []
+            for prefix in sorted(prefixes, key=lambda item: (item.count("/"), item)):
+                if not any(
+                    prefix == parent or prefix.startswith(parent + "/") for parent in pathspecs
+                ):
+                    pathspecs.append(prefix)
+            cache_key = (base_sha, tuple(pathspecs))
+            tracked = tree_cache.get(cache_key) if tree_cache is not None else None
+            if tracked is None:
+                listing = self._git_readonly_bytes_bounded(
+                    "--literal-pathspecs",
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    base_sha,
+                    "--",
+                    *pathspecs,
+                    max_bytes=_READ_RESOURCE_MAX_LISTING_BYTES,
+                )
+                tracked = {}
+                offset = 0
+                entry_count = 0
+                while offset < len(listing):
+                    end = listing.find(b"\0", offset)
+                    if end < 0:
+                        end = len(listing)
+                    entry = listing[offset:end]
+                    offset = end + 1
+                    if not entry:
+                        continue
+                    entry_count += 1
+                    if entry_count > _READ_RESOURCE_MAX_PATHS:
+                        return canonical_json(
+                            {
+                                "state": "unknown",
+                                "base_sha": base_sha,
+                                "files": {},
+                                "unmatched_resources": list(resources),
+                                "reason": (
+                                    "read-resource prefix scan exceeded "
+                                    f"{_READ_RESOURCE_MAX_PATHS} tracked paths"
+                                ),
+                            }
+                        )
+                    metadata, separator, path_bytes = entry.partition(b"\t")
+                    if not separator:
+                        continue
+                    fields = metadata.decode("ascii", errors="replace").split()
+                    if len(fields) != 3 or fields[1] not in {"blob", "commit"}:
+                        continue
+                    path = path_bytes.decode("utf-8", errors="surrogateescape")
+                    tracked[path] = fields[2]
+                if tree_cache is not None and len(tree_cache) < _READ_RESOURCE_MAX_CACHED_SCOPES:
+                    tree_cache[cache_key] = tracked
+            for path, object_id in tracked.items():
+                for resource, normalized in normalized_resources.items():
+                    if not self._path_matches(
+                        path,
+                        normalized,
+                        fold=False,
+                        is_logical=False,
+                    ):
+                        continue
+                    files[path] = object_id
+                    matched[resource] = True
+        except (OSError, SupervisorError, subprocess.SubprocessError, ValueError) as error:
+            return canonical_json(
+                {
+                    "state": "unknown",
+                    "base_sha": base_sha,
+                    "files": {},
+                    "unmatched_resources": list(resources),
+                    "reason": f"read-resource snapshot failed: {error}",
+                }
+            )
+        return canonical_json(
+            {
+                "state": "known",
+                "base_sha": base_sha,
+                "files": files,
+                "unmatched_resources": [
+                    resource for resource, found in matched.items() if not found
+                ],
+            }
+        )
+
+    def _read_resource_advisory(
+        self,
+        resources: Sequence[str],
+        snapshot_json: str | None,
+        base_branch: str,
+        *,
+        tree_cache: dict[tuple[str, tuple[str, ...]], dict[str, str]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Compare declared input identities with the current integration base."""
+        if not resources:
+            return None
+        try:
+            baseline = json.loads(snapshot_json or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            baseline = None
+        try:
+            current_base = (
+                self._git_readonly_bytes("rev-parse", base_branch, check=False)
+                .decode("ascii", errors="ignore")
+                .strip()
+            )
+        except (OSError, SupervisorError, subprocess.SubprocessError):
+            current_base = ""
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", current_base):
+            return {
+                "advisory": True,
+                "state": "unknown",
+                "base_branch": base_branch,
+                "captured_base_sha": baseline.get("base_sha")
+                if isinstance(baseline, dict)
+                else None,
+                "current_base_sha": None,
+                "changed_path_count": 0,
+                "changed_paths": [],
+                "changed_paths_truncated": False,
+                "unmatched_resources": list(resources),
+                "reason": "configured integration base is unavailable",
+            }
+        if (
+            not isinstance(baseline, dict)
+            or baseline.get("state") != "known"
+            or not isinstance(baseline.get("base_sha"), str)
+            or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", baseline["base_sha"])
+        ):
+            return {
+                "advisory": True,
+                "state": "unknown",
+                "base_branch": base_branch,
+                "captured_base_sha": baseline.get("base_sha")
+                if isinstance(baseline, dict)
+                else None,
+                "current_base_sha": current_base,
+                "changed_path_count": 0,
+                "changed_paths": [],
+                "changed_paths_truncated": False,
+                "unmatched_resources": list(resources),
+                "reason": (
+                    baseline.get("reason", "claim-time read-resource snapshot is unavailable")
+                    if isinstance(baseline, dict)
+                    else "claim-time read-resource snapshot is unavailable"
+                ),
+            }
+        current_snapshot = json.loads(
+            self._capture_read_resource_snapshot(current_base, resources, tree_cache=tree_cache)
+        )
+        if current_snapshot.get("state") != "known":
+            return {
+                "advisory": True,
+                "state": "unknown",
+                "base_branch": base_branch,
+                "captured_base_sha": baseline.get("base_sha"),
+                "current_base_sha": current_base,
+                "changed_path_count": 0,
+                "changed_paths": [],
+                "changed_paths_truncated": False,
+                "unmatched_resources": list(resources),
+                "reason": current_snapshot.get(
+                    "reason", "current read-resource snapshot is unavailable"
+                ),
+            }
+        before = baseline.get("files")
+        after = current_snapshot.get("files")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            changed: list[dict[str, Any]] = []
+            reason = "read-resource snapshot has an invalid file map"
+            state = "unknown"
+        elif len(before) > _READ_RESOURCE_MAX_PATHS or len(after) > _READ_RESOURCE_MAX_PATHS:
+            changed = []
+            reason = "read-resource snapshot exceeds the tracked-path limit"
+            state = "unknown"
+        else:
+            if any(
+                not isinstance(path, str)
+                or not isinstance(object_id, str)
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id)
+                for file_map in (before, after)
+                for path, object_id in file_map.items()
+            ):
+                changed = []
+                reason = "read-resource snapshot has an invalid file identity"
+                state = "unknown"
+            else:
+                changed = [
+                    {
+                        "path": path,
+                        "before_object_oid": before.get(path),
+                        "after_object_oid": after.get(path),
+                    }
+                    for path in sorted(before.keys() | after.keys())
+                    if before.get(path) != after.get(path)
+                ]
+                baseline_unmatched = baseline.get("unmatched_resources", [])
+                current_unmatched = current_snapshot.get("unmatched_resources", [])
+                if (
+                    not isinstance(baseline_unmatched, list)
+                    or not all(isinstance(item, str) for item in baseline_unmatched)
+                    or not isinstance(current_unmatched, list)
+                    or not all(isinstance(item, str) for item in current_unmatched)
+                ):
+                    baseline_unmatched = list(resources)
+                    current_unmatched = []
+                    reason = "read-resource snapshot has invalid unmatched-scope metadata"
+                    state = "unknown"
+                else:
+                    unmatched = set(baseline_unmatched) | set(current_unmatched)
+                    state = "unknown" if unmatched else "changed" if changed else "unchanged"
+                    reason = (
+                        "declared read resource did not match a tracked file" if unmatched else ""
+                    )
+        baseline_unmatched = baseline.get("unmatched_resources", [])
+        current_unmatched = current_snapshot.get("unmatched_resources", [])
+        if not isinstance(baseline_unmatched, list) or not all(
+            isinstance(item, str) for item in baseline_unmatched
+        ):
+            baseline_unmatched = list(resources)
+        if not isinstance(current_unmatched, list) or not all(
+            isinstance(item, str) for item in current_unmatched
+        ):
+            current_unmatched = []
+        unmatched_resources = sorted(set(baseline_unmatched) | set(current_unmatched))
+        sample_limit = 20
+        return {
+            "advisory": True,
+            "state": state,
+            "base_branch": base_branch,
+            "captured_base_sha": baseline.get("base_sha"),
+            "current_base_sha": current_base,
+            "changed_path_count": len(changed),
+            "changed_paths": changed[:sample_limit],
+            "changed_paths_truncated": len(changed) > sample_limit,
+            "unmatched_resources": unmatched_resources,
+            "reason": reason,
+        }
 
     @classmethod
     def _write_set_rules(
@@ -1469,11 +1859,29 @@ class ClaimsMixin:
             resource = resource.casefold()
         if logical_resource:
             return False
-        if resource.endswith("/**"):
+        if resource.endswith("/**") and not any(character in resource[:-3] for character in "*?["):
             prefix = resource[:-3].rstrip("/")
             return candidate == prefix or candidate.startswith(prefix + "/")
         if any(character in resource for character in "*?["):
-            return PurePosixPath(candidate).match(resource)
+            path_parts = tuple(candidate.split("/"))
+            pattern_parts = tuple(resource.split("/"))
+
+            @cache
+            def match_parts(path_index: int, pattern_index: int) -> bool:
+                if pattern_index == len(pattern_parts):
+                    return path_index == len(path_parts)
+                pattern_part = pattern_parts[pattern_index]
+                if pattern_part == "**":
+                    return match_parts(path_index, pattern_index + 1) or (
+                        path_index < len(path_parts) and match_parts(path_index + 1, pattern_index)
+                    )
+                return (
+                    path_index < len(path_parts)
+                    and fnmatch.fnmatchcase(path_parts[path_index], pattern_part)
+                    and match_parts(path_index + 1, pattern_index + 1)
+                )
+
+            return match_parts(0, 0)
         return candidate == resource
 
     def _restore_candidate(self, worktree: Path, commit_sha: str) -> None:
@@ -1580,6 +1988,7 @@ class ClaimsMixin:
         base_branch: str = "HEAD",
         produces: Sequence[str] = (),
         consumes: Sequence[str] = (),
+        read_resources: Sequence[str] = (),
     ) -> dict[str, Any]:
         if not title.strip() or not acceptance:
             raise SupervisorError("invalid_task", "title and acceptance criteria are required")
@@ -1590,6 +1999,15 @@ class ClaimsMixin:
         normalized = sorted(declared)
         if not normalized:
             raise SupervisorError("invalid_task", "at least one write resource is required")
+        declared_reads: dict[str, str] = {}
+        for item in read_resources:
+            canonical = self.normalize_resource(item, self.root, fold=False)
+            if canonical.startswith("logical:"):
+                raise SupervisorError(
+                    "invalid_resource", "read resources must be tracked repository paths"
+                )
+            declared_reads.setdefault(canonical, canonical)
+        normalized_reads = sorted(declared_reads)
         produced = sorted({normalize_artifact(item) for item in produces})
         consumed = sorted({normalize_artifact(item) for item in consumes})
         base_sha = self._git_text("rev-parse", base_branch)
@@ -1613,9 +2031,10 @@ class ClaimsMixin:
                 INSERT INTO tasks
                   (id, title, description, acceptance_json, resources_json,
                    declared_resources_json,
+                   read_resources_json, declared_read_resources_json,
                    dependencies_json, produces_json, consumes_json, base_branch,
                    base_sha, priority, status, current_attempt_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
                 """,
                 (
                     task_id,
@@ -1624,6 +2043,8 @@ class ClaimsMixin:
                     canonical_json(list(acceptance)),
                     canonical_json(normalized),
                     canonical_json(declared),
+                    canonical_json(normalized_reads),
+                    canonical_json(declared_reads),
                     canonical_json(list(dependencies)),
                     canonical_json(produced),
                     canonical_json(consumed),
@@ -1641,6 +2062,7 @@ class ClaimsMixin:
                 {
                     "task_id": task_id,
                     "resources": normalized,
+                    "read_resources": normalized_reads,
                     "produces": produced,
                     "consumes": consumed,
                     "base_sha": base_sha,

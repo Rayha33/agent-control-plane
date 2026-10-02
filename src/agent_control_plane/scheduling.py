@@ -54,6 +54,16 @@ def declared_resources(row: Any) -> list[str]:
     return [declared.get(item, item) for item in folded]
 
 
+def declared_read_resources(row: Any) -> list[str]:
+    """The tracked read paths as the operator typed them, for display and matching."""
+    folded = json.loads(row["read_resources_json"] or "[]")
+    try:
+        declared = json.loads(row["declared_read_resources_json"] or "{}")
+    except (KeyError, IndexError, TypeError, ValueError):
+        declared = {}
+    return [declared.get(item, item) for item in folded]
+
+
 def normalize_artifact(raw: str) -> str:
     """Artifacts are logical names, not paths; they are matched case-insensitively."""
     from .git_supervisor import SupervisorError
@@ -87,6 +97,8 @@ class Scheduler:
             record["resources"] = json.loads(row["resources_json"])
             # #1764: folded stays as the lease key; declared is what the operator typed.
             record["declared_resources"] = declared_resources(row)
+            record["read_resources"] = json.loads(row["read_resources_json"] or "[]")
+            record["declared_read_resources"] = declared_read_resources(row)
             record["dependencies"] = json.loads(row["dependencies_json"])
             record["produces"] = json.loads(row["produces_json"])
             record["consumes"] = json.loads(row["consumes_json"])
@@ -357,6 +369,7 @@ class Scheduler:
     def merge_plan(self) -> dict[str, Any]:
         """Order approved submissions for integration and flag ones the base invalidated."""
         excluded: list[dict[str, Any]] = []
+        read_resource_tree_cache: dict[tuple[str, tuple[str, ...]], dict[str, str]] = {}
         with self.supervisor.connect() as connection:
             tasks = self._task_records(connection)
             candidates = []
@@ -386,6 +399,13 @@ class Scheduler:
                         }
                     )
                     continue
+                attempt = connection.execute(
+                    "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?",
+                    (submission["attempt_id"],),
+                ).fetchone()
+                task["_read_resources_snapshot_json"] = (
+                    attempt["read_resources_snapshot_json"] if attempt else ""
+                )
                 candidates.append((task, dict(submission)))
 
         ordered = self._merge_order(candidates)
@@ -412,6 +432,12 @@ class Scheduler:
                     "conflicts_with": conflicts_with,
                     "predicted_conflict_paths": sorted(conflict_paths),
                     "blocked_by": self._blocking_dependencies(task, ordered),
+                    "read_dependency_advisory": self.supervisor._read_resource_advisory(
+                        task.get("declared_read_resources", []),
+                        task.get("_read_resources_snapshot_json", ""),
+                        task["base_branch"],
+                        tree_cache=read_resource_tree_cache,
+                    ),
                     **self._base_state(task, submission),
                 }
             )
