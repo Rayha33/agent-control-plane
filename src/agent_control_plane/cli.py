@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .editor_hooks import (
+    ACP_MANAGED_HOOK_FLAG,
     CODEX_MAX_HOOK_INPUT_CHARS,
     DENY_EXIT_CODE,
     cwd_from_hook_payload,
@@ -142,6 +143,7 @@ def parser() -> argparse.ArgumentParser:
     )
     guard.add_argument("--attempt", dest="attempt_id", help="defaults to $ACP_ATTEMPT_ID")
     guard.add_argument("--path", help="the path the tool is about to write")
+    guard.add_argument(ACP_MANAGED_HOOK_FLAG, action="store_true", help=argparse.SUPPRESS)
     guard.add_argument(
         "--freshness",
         action="store_true",
@@ -169,6 +171,7 @@ def parser() -> argparse.ArgumentParser:
     )
     snapshot.add_argument("--attempt", dest="attempt_id", help="defaults to $ACP_ATTEMPT_ID")
     snapshot.add_argument("--hook", action="store_true", required=True)
+    snapshot.add_argument(ACP_MANAGED_HOOK_FLAG, action="store_true", help=argparse.SUPPRESS)
 
     hooks = commands.add_parser("hooks", help="install editor adapters that call the kernel")
     hooks_commands = hooks.add_subparsers(dest="hooks_action", required=True)

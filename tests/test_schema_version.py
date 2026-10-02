@@ -153,6 +153,12 @@ def test_version_two_upgrade_creates_the_file_snapshot_ledger(repo: Path) -> Non
 
 def test_version_three_upgrade_adds_file_snapshot_change_token(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    assert supervisor.record_file_snapshot(attempt["id"], "alpha.txt", caller_cwd=worktree)[
+        "recorded"
+    ]
     with supervisor.connect() as connection:
         connection.execute("ALTER TABLE file_snapshots DROP COLUMN change_token")
         connection.execute("UPDATE meta SET value = '3' WHERE key = ?", (SCHEMA_VERSION_KEY,))
@@ -162,7 +168,19 @@ def test_version_three_upgrade_adds_file_snapshot_change_token(repo: Path) -> No
     assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
     with upgraded.connect() as connection:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(file_snapshots)")}
+        legacy = connection.execute(
+            "SELECT change_token FROM file_snapshots WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
     assert "change_token" in columns
+    assert legacy["change_token"] == ""
+
+    stale = upgraded.check_file_snapshot(attempt["id"], "alpha.txt", caller_cwd=worktree)
+    assert stale["reason"] == "stale_file_snapshot"
+    assert upgraded.record_file_snapshot(attempt["id"], "alpha.txt", caller_cwd=worktree)[
+        "recorded"
+    ]
+    refreshed = upgraded.check_file_snapshot(attempt["id"], "alpha.txt", caller_cwd=worktree)
+    assert refreshed["freshness"] == "unchanged_since_read"
 
 
 def test_a_stamp_that_is_not_a_version_is_never_guessed(repo: Path) -> None:

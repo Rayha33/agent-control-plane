@@ -37,6 +37,45 @@ def _file_stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _directory_change_token(info: os.stat_result) -> str:
+    return f"{info.st_dev:x}:{info.st_ino:x}:{info.st_mtime_ns:x}:{info.st_ctime_ns:x}"
+
+
+def _open_snapshot_parent(
+    root: Path,
+    parent_components: Sequence[str],
+    *,
+    missing_parent_is_absent: bool,
+) -> tuple[int | None, tuple[str, ...]]:
+    """Open the file's parent beneath root and capture each directory's change token."""
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(os.sep, directory_flags)
+    try:
+        for component in root.parts[1:]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+
+        tokens = [_directory_change_token(os.fstat(descriptor))]
+        for component in parent_components:
+            try:
+                next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not missing_parent_is_absent:
+                    raise
+                os.close(descriptor)
+                return None, ()
+            os.close(descriptor)
+            descriptor = next_descriptor
+            tokens.append(_directory_change_token(os.fstat(descriptor)))
+        return descriptor, tuple(tokens)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _file_snapshot(path: Path, *, root: Path) -> tuple[bool, str, int, str]:
     """Fingerprint one regular file beneath ``root`` without following path links.
 
@@ -68,24 +107,12 @@ def _file_snapshot(path: Path, *, root: Path) -> tuple[bool, str, int, str]:
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         raise OSError("no-follow directory opens are unavailable on this platform")
 
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    directory_flags |= getattr(os, "O_CLOEXEC", 0)
-    parent_fd = os.open(os.sep, directory_flags)
+    parent_fd, directory_tokens = _open_snapshot_parent(
+        root, relative.parts[:-1], missing_parent_is_absent=True
+    )
+    if parent_fd is None:
+        return False, "", 0, ""
     try:
-        # Open every absolute root and target-parent component relative to the
-        # already-pinned directory. Never let a symlink component be followed.
-        for component in root.parts[1:]:
-            next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
-            os.close(parent_fd)
-            parent_fd = next_fd
-        for component in relative.parts[:-1]:
-            try:
-                next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
-            except FileNotFoundError:
-                return False, "", 0, ""
-            os.close(parent_fd)
-            parent_fd = next_fd
-
         name = relative.parts[-1]
         try:
             info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -129,7 +156,17 @@ def _file_snapshot(path: Path, *, root: Path) -> tuple[bool, str, int, str]:
             after = os.fstat(source.fileno())
         if _file_stat_identity(before) != _file_stat_identity(after) or size != after.st_size:
             raise OSError("file changed while its freshness snapshot was being computed")
-        change_token = f"{after.st_dev:x}:{after.st_ino:x}:{after.st_ctime_ns:x}"
+        verification_fd, verified_directory_tokens = _open_snapshot_parent(
+            root, relative.parts[:-1], missing_parent_is_absent=False
+        )
+        if verification_fd is None:
+            raise OSError("file's parent directory disappeared during freshness check")
+        try:
+            if verified_directory_tokens != directory_tokens:
+                raise OSError("file's parent directory changed during freshness check")
+        finally:
+            os.close(verification_fd)
+        change_token = f"dirs:{'|'.join(directory_tokens)}|file:{_directory_change_token(after)}"
         return True, digest.hexdigest(), size, change_token
     finally:
         os.close(parent_fd)

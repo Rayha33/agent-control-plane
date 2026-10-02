@@ -209,13 +209,13 @@ def run_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
 def run_snapshot_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
     monkeypatch.setenv("ACP_ATTEMPT_ID", attempt_id)
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
-    return main(["--repo", str(repo), "snapshot", "--hook"])
+    return main(["--repo", str(repo), "snapshot", "--hook", "--acp-managed-hook"])
 
 
 def run_freshness_guard(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
     monkeypatch.setenv("ACP_ATTEMPT_ID", attempt_id)
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
-    return main(["--repo", str(repo), "guard", "--hook", "--freshness"])
+    return main(["--repo", str(repo), "guard", "--hook", "--freshness", "--acp-managed-hook"])
 
 
 def run_codex_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
@@ -306,6 +306,37 @@ def test_opt_in_freshness_detects_a_changed_file_restored_to_the_same_bytes(
     assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == DENY_EXIT_CODE
     assert json.loads(capsys.readouterr().out)["reason"] == "stale_file_snapshot"
     assert target.read_text(encoding="utf-8") == original
+
+
+def test_opt_in_freshness_detects_a_swapped_and_restored_parent_directory(
+    claimed, repo: Path
+) -> None:
+    supervisor, _ = claimed
+    created = make_task(supervisor, "nested/alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker-two")
+    worktree = Path(attempt["worktree"])
+    parent = worktree / "nested"
+    parent.mkdir()
+    target = parent / "alpha.txt"
+    target.write_text("contents Claude read\n", encoding="utf-8")
+    assert supervisor.record_file_snapshot(attempt["id"], "nested/alpha.txt", caller_cwd=worktree)[
+        "recorded"
+    ]
+
+    moved_original = worktree / "nested.original"
+    replacement = worktree / "nested.replacement"
+    parent.rename(moved_original)
+    parent.mkdir()
+    (parent / "alpha.txt").write_text("different file Claude actually read\n", encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "different file Claude actually read\n"
+
+    parent.rename(replacement)
+    moved_original.rename(parent)
+    assert target.read_text(encoding="utf-8") == "contents Claude read\n"
+    decision = supervisor.check_file_snapshot(
+        attempt["id"], "nested/alpha.txt", caller_cwd=worktree
+    )
+    assert decision["reason"] == "stale_file_snapshot"
 
 
 def test_opt_in_freshness_requires_snapshot_for_existing_file_but_allows_creation(
@@ -978,6 +1009,10 @@ def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hoo
                                     "type": "command",
                                     "command": "/old/venv/acp snapshot --hook",
                                 },
+                                {
+                                    "type": "command",
+                                    "command": "echo acp guard --hook",
+                                },
                                 {"type": "command", "command": "my-read-audit"},
                             ],
                         }
@@ -1024,7 +1059,8 @@ def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hoo
     ]
     assert "my-audit" in commands
     assert "my-read-audit" in commands
-    assert "acp guard --describe" in commands
+    assert "echo acp guard --hook" in commands
+    assert any(command.startswith("acp guard --describe ") for command in commands)
     assert not any(command.startswith("/old/venv/acp ") for command in commands)
     assert not any("snapshot --hook" in command for command in commands)
     assert not any("guard --hook --freshness" in command for command in commands)
