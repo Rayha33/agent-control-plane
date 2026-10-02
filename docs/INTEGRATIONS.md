@@ -121,6 +121,77 @@ subcommand.
 - **No MCP server.** `acp_plan` / `acp_claim` / `acp_submit` as callable tools would let
   an agent drive the lifecycle itself rather than being placed in a worktree by a human.
   Guarding writes was the part that closes a hole; that part adds a capability.
-- **No Codex or Cursor adapter.** The `guard` command is runner-agnostic — `--path` with
-  an exit code is all an adapter needs — but nobody has written and tested those hook
-  configurations.
+- **No Codex pre-write hook.** We are not installing a project-local Codex hook as a
+  write boundary. The official hook contract supports denials, but first-party reports
+  describe `apply_patch` denials not being enforced and the hook lacking the effective
+  patch worktree. Those reports cover older Codex builds; the current stable behavior
+  has not been independently verified. Codex's own docs also warn that hook errors,
+  timeouts, and malformed responses may continue without blocking. See the supervised
+  CLI workflow below instead. There is no Cursor adapter.
+
+## Codex CLI through an ACP worker (Linux only)
+
+For a noninteractive Codex CLI run, ACP can allocate a distinct attempt worktree and
+launch Codex from that checkout through the existing supervised worker. Each accepted
+parallel attempt gets a different filesystem checkout and branch; the worker environment
+drops Git repository/index override variables so ambient `GIT_DIR` or `GIT_WORK_TREE`
+cannot redirect its Git operations. ACP refuses a new claim while its declared write
+scope overlaps a live claim (`resource_busy`), so tasks writing the same file are
+serialized rather than run simultaneously. When Codex exits successfully, ACP submits
+the attempt for the independent QC gate.
+
+The following assumes the task already has a bounded resource/write set and the named
+worker identity is enrolled. The credential file must be private (mode `0600`). Keep
+the prompt on stdin rather than a command argument so it is not recorded in the worker
+launch checkpoint:
+
+```bash
+CLAIM=$(acp --repo "$REPO" claim "$TASK_ID" --agent codex-worker \
+  --credential-file "$ACP_CREDENTIAL_FILE")
+ATTEMPT=$(printf '%s' "$CLAIM" | jq -r .id)
+TOKEN=$(printf '%s' "$CLAIM" | jq -r .claim_token)
+printf '%s\n' "$PROMPT" | acp --repo "$REPO" run "$ATTEMPT" --token "$TOKEN" \
+  --credential-file "$ACP_CREDENTIAL_FILE" -- \
+  codex exec --sandbox workspace-write \
+    --config 'sandbox_workspace_write.writable_roots=[]' \
+    --config 'sandbox_workspace_write.exclude_tmpdir_env_var=true' \
+    --config 'sandbox_workspace_write.exclude_slash_tmp=true' \
+    -
+```
+
+`acp run` is a noninteractive supervised worker, not a Codex Desktop session. It
+requires Linux child-subreaper support, captures Codex output in
+`.acp/logs/worker-ATTEMPT_ID.log`, and submits after a successful exit. The example
+selects Codex's workspace-write sandbox and uses one-run config overrides to clear
+configured extra writable roots and exclude `/tmp` and `$TMPDIR`. Codex otherwise reads
+user and trusted-project config; a pre-existing `sandbox_workspace_write.writable_roots`
+could grant writes outside the attempt checkout. The documented CLI overrides have
+higher precedence than those config layers, but do not bypass organization-managed
+policy. Confirm the effective writable roots are limited to the attempt workspace; for
+an interactive diagnostic, Codex `/status` reports writable roots and `/debug-config`
+shows config-layer precedence and managed requirements. Use a noninteractive approval
+policy already appropriate for the job. Do not add `--add-dir`, disable sandboxing, or
+use dangerous bypass flags. ACP worktrees are source isolation, not a general filesystem
+sandbox: keep Codex's own sandbox enabled. Codex Desktop, ordinary local chats, and
+non-Linux `acp run` remain outside this integration.
+
+Why there is no Codex hook installer yet:
+
+- [Codex issue #27833](https://github.com/openai/codex/issues/27833) is open and reports
+  that supported PreToolUse deny outputs were ignored for `apply_patch` on CLI 0.133.0
+  and Desktop 0.138.0-alpha.7. This is one user report on those versions, not proof of
+  behavior in every current release; this machine's Codex CLI 0.144.6 was help-checked
+  but not live-probed.
+- [Codex issue #20879](https://github.com/openai/codex/issues/20879) is open and reports
+  native `apply_patch` lacks per-call workdir context on CLI 0.128.0, so a hook may not
+  see the worktree that will receive the patch.
+- [Codex's official hook documentation](https://learn.chatgpt.com/docs/hooks) describes
+  hook trust and supported denial responses, and explicitly notes that hook callback
+  errors, timeouts, or malformed responses can fail without blocking the tool.
+- [Codex configuration documentation](https://learn.chatgpt.com/docs/config-file/config-reference)
+  defines `sandbox_workspace_write.writable_roots` as extra writable paths;
+  [developer settings](https://learn.chatgpt.com/docs/developer-settings) documents
+  one-run CLI override precedence and ways to inspect effective roots.
+
+Until the current supported releases pass a disposable live denial/worktree test, do not
+describe Codex PreToolUse hooks as an ACP safety boundary.
