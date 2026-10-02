@@ -29,6 +29,7 @@ class MandateCreate(BaseModel):
     scopes: list[Scope] = Field(min_length=1, max_length=100)
     ttl_seconds: int = Field(default=3600, ge=60, le=86_400)
     max_amount_cents: int | None = Field(default=None, ge=0)
+    max_descendant_mandates: int | None = Field(default=None, ge=0)
     parent_mandate_id: str | None = None
 
 
@@ -39,6 +40,7 @@ class MandateIssued(BaseModel):
     scopes: list[Scope]
     expires_at: int
     max_amount_cents: int | None
+    max_descendant_mandates: int | None
     parent_mandate_id: str | None
 
 

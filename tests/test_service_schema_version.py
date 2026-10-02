@@ -87,6 +87,68 @@ def test_an_unstamped_database_is_upgraded_and_stamped(database_path: Path) -> N
     assert meta(database_path)[SCHEMA_VERSION_KEY] == str(SERVICE_SCHEMA_VERSION)
 
 
+def test_v1_service_database_gets_the_nullable_mandate_descendant_cap(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "service-v1.db"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '1');
+        CREATE TABLE agents (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            parent_agent_id TEXT,
+            role TEXT NOT NULL DEFAULT 'worker',
+            disabled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE mandates (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            parent_mandate_id TEXT,
+            scopes_json TEXT NOT NULL,
+            max_amount_cents INTEGER,
+            expires_at INTEGER NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO agents(id, name, owner, created_at)
+        VALUES ('legacy-agent', 'legacy', 'owner', '2026-01-01T00:00:00+00:00');
+        INSERT INTO mandates(
+            id, agent_id, subject, scopes_json, max_amount_cents, expires_at, created_at
+        ) VALUES (
+            'legacy-mandate', 'legacy-agent', 'owner', '[]', 2500, 4102444800,
+            '2026-01-01T00:00:00+00:00'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    Database(str(database_path)).initialize()
+
+    connection = sqlite3.connect(database_path)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(mandates)")}
+        mandate = connection.execute(
+            "SELECT max_amount_cents, max_descendant_mandates "
+            "FROM mandates WHERE id = 'legacy-mandate'"
+        ).fetchone()
+        recorded_version = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert "max_descendant_mandates" in columns
+    assert mandate == (2500, None)
+    assert recorded_version == str(SERVICE_SCHEMA_VERSION)
+
+
 def test_a_corrupt_stamp_is_not_guessed(database_path: Path) -> None:
     write_meta(database_path, SCHEMA_VERSION_KEY, "one")
 

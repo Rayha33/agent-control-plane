@@ -23,7 +23,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 1
+SERVICE_SCHEMA_VERSION = 2
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -32,11 +32,16 @@ by `acp init` — and coupling their numbers would force a version bump on one w
 the other changed.
 """
 
-# Numbered upgrades from SERVICE_SCHEMA_VERSION - 1 to SERVICE_SCHEMA_VERSION. Version 1
-# is the baseline: the CREATE TABLE IF NOT EXISTS script plus the column adds that
-# predate stamping. Anything after 1 goes here, including changes ALTER TABLE ADD COLUMN
-# cannot express.
-MIGRATIONS: tuple[Migration, ...] = ()
+
+def _add_mandate_descendant_cap(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(mandates)")}
+    if "max_descendant_mandates" not in columns:
+        connection.execute("ALTER TABLE mandates ADD COLUMN max_descendant_mandates INTEGER")
+
+
+# Version 1 is the baseline CREATE TABLE script plus pre-stamp column additions.
+# Numbered upgrades from 2 onward are applied transactionally by the schema ledger.
+MIGRATIONS: tuple[Migration, ...] = ((2, _add_mandate_descendant_cap),)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -171,6 +176,7 @@ CREATE TABLE IF NOT EXISTS reviews (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mandates_agent ON mandates(agent_id);
+CREATE INDEX IF NOT EXISTS idx_mandates_parent ON mandates(parent_mandate_id);
 CREATE INDEX IF NOT EXISTS idx_policies_agent ON policies(agent_id);
 CREATE INDEX IF NOT EXISTS idx_actions_status ON action_requests(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority DESC);
