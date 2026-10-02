@@ -244,6 +244,35 @@ def test_v7_read_only_open_requires_qc_latest_index_migration(repo: Path) -> Non
     assert [row["name"] for row in columns] == ["submission_id", "finished_at", "id"]
 
 
+def test_v8_read_only_open_requires_read_dependency_migration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("ALTER TABLE tasks DROP COLUMN declared_read_resources_json")
+        connection.execute("ALTER TABLE tasks DROP COLUMN read_resources_json")
+        connection.execute("ALTER TABLE attempts DROP COLUMN read_resources_snapshot_json")
+        connection.execute("UPDATE meta SET value = '8' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    before = fingerprint(repo)
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+    assert "version 8" in str(error.value)
+    assert fingerprint(repo) == before
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 8
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with migrated.connect() as connection:
+        task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+        attempt_columns = {row["name"] for row in connection.execute("PRAGMA table_info(attempts)")}
+    assert {"read_resources_json", "declared_read_resources_json"} <= task_columns
+    assert "read_resources_snapshot_json" in attempt_columns
+    with migrated.connect() as connection:
+        migration = dict(MIGRATIONS)[9]
+        migration(connection)
+        migration(connection)
+
+
 def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:
     """A live old process cannot create a new marker-less attempt after upgrade."""
 

@@ -372,3 +372,20 @@ agent or person is currently using a directory.
 The inventory reads Git's worktree metadata only: it does not inspect foreign checkout
 contents, run commands there, or prevent writes. An unavailable or malformed Git listing
 is reported as unavailable, not as an empty inventory.
+
+### Declared read dependencies can go stale across parallel attempts (2026-10-02)
+
+[Codex issue #37226](https://github.com/openai/codex/issues/37226) requests coordination
+for separate local chats sharing a checkout and describes newer edits being overwritten.
+A separate [r/aiagents practitioner thread](https://www.reddit.com/r/aiagents/comments/1uth7r5/whats_your_setup_for_multiple_coding_agents/)
+reports agents implementing against different versions of an interface and suggests
+first-class interface changes and stale-read detection. These are individual reports,
+not prevalence data or independently reproduced root causes.
+
+ACP's existing write scopes and merge-conflict preview do not identify a task that writes
+one file but depends on a different interface file changed by a peer. The bounded response
+is opt-in `--read-resource` path/glob declarations: snapshot Git object ids for matching
+tracked paths at claim, then expose changed paths and before/after object ids in read-only
+status and integration preview. The signal is advisory only. It neither infers actual reads
+nor proves a semantic break; missing scopes or Git state stay visibly unknown, and no
+automatic blocking or requeue follows.

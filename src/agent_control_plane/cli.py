@@ -201,6 +201,13 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--description", default="")
     add.add_argument("--accept", action="append", required=True, dest="acceptance")
     add.add_argument("--resource", action="append", required=True, dest="resources")
+    add.add_argument(
+        "--read-resource",
+        action="append",
+        default=[],
+        dest="read_resources",
+        help="tracked repository path or glob this task depends on (advisory only)",
+    )
     add.add_argument("--depends-on", action="append", default=[], dest="dependencies")
     add.add_argument(
         "--produces",
@@ -779,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.base_branch,
                 args.produces,
                 args.consumes,
+                read_resources=args.read_resources,
             )
         elif args.action == "show":
             result = supervisor.task(args.task_id)

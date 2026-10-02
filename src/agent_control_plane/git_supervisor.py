@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -313,6 +313,25 @@ def _add_qc_runs_latest_lookup_index(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_read_dependency_snapshots(connection: sqlite3.Connection) -> None:
+    """Store optional task read scopes and their per-attempt Git snapshots."""
+
+    task_columns = _columns(connection, "tasks")
+    if "read_resources_json" not in task_columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN read_resources_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "declared_read_resources_json" not in task_columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN declared_read_resources_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    attempt_columns = _columns(connection, "attempts")
+    if "read_resources_snapshot_json" not in attempt_columns:
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN read_resources_snapshot_json TEXT NOT NULL DEFAULT ''"
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -321,6 +340,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (6, _fence_legacy_attempt_inserts),
     (7, _add_attempt_worktree_root),
     (8, _add_qc_runs_latest_lookup_index),
+    (9, _add_read_dependency_snapshots),
 )
 
 

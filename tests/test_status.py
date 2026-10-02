@@ -120,7 +120,371 @@ def test_status_reports_phase_paths_and_runtime_for_a_working_attempt(repo: Path
     assert entry["heartbeat_age_seconds"] >= 0
     assert entry["checkpoint_age_seconds"] is None
     assert entry["checkpoint_stale_advisory"] is False
+    assert entry["read_dependency_advisory"] is None
     assert entry["worker"]["status"] == "working"
+
+
+def test_status_tracks_only_declared_glob_read_inputs_and_is_read_only(repo: Path) -> None:
+    (repo / "src" / "api").mkdir(parents=True)
+    (repo / "src" / "ui").mkdir(parents=True)
+    (repo / "src" / "api" / "schema.py").write_text("schema v1\n", encoding="utf-8")
+    (repo / "src" / "ui" / "client.py").write_text("client v1\n", encoding="utf-8")
+    git(repo, "add", "src")
+    git(repo, "commit", "-m", "add API and client")
+    git(repo, "branch", "integration", "HEAD")
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Update client",
+        "Use the API schema to update the generated client.",
+        ["client checks pass"],
+        ["beta.txt"],
+        base_branch="integration",
+        read_resources=["src/**", "src/"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+
+    assert task["read_resources"] == ["src/**"]
+    assert task["declared_read_resources"] == ["src/**"]
+    with supervisor.connect() as connection:
+        baseline = json.loads(
+            connection.execute(
+                "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?",
+                (attempt["id"],),
+            ).fetchone()["read_resources_snapshot_json"]
+        )
+    expected_schema_oid = git(repo, "rev-parse", f"{task['base_sha']}:src/api/schema.py")
+    assert baseline["base_sha"] == task["base_sha"]
+    assert baseline["files"]["src/api/schema.py"] == expected_schema_oid
+    assert baseline["files"]["src/ui/client.py"]
+
+    before_view = state_fingerprint(supervisor)
+    unchanged = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+    assert unchanged["state"] == "unchanged"
+    assert state_fingerprint(supervisor) == before_view
+
+    unrelated_commit = commit_change(attempt, "beta.txt", "parallel edit\n")
+    git(repo, "update-ref", "refs/heads/integration", unrelated_commit)
+    before_view = state_fingerprint(supervisor)
+    unrelated = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+    assert unrelated["state"] == "unchanged"
+    assert state_fingerprint(supervisor) == before_view
+
+    changed_commit = commit_change(
+        attempt, "src/api/schema.py", "schema v2\n", message="change API schema"
+    )
+    git(repo, "update-ref", "refs/heads/integration", changed_commit)
+    before_view = state_fingerprint(supervisor)
+    changed_snapshot = supervisor.status()
+    changed = entry_for(changed_snapshot, task["id"])["read_dependency_advisory"]
+    assert changed["state"] == "changed"
+    assert changed["changed_path_count"] == 1
+    assert "read inputs changed 1" in StatusView.render(changed_snapshot)
+    assert changed["changed_paths"] == [
+        {
+            "path": "src/api/schema.py",
+            "before_object_oid": expected_schema_oid,
+            "after_object_oid": git(repo, "rev-parse", "integration:src/api/schema.py"),
+        }
+    ]
+    assert state_fingerprint(supervisor) == before_view
+
+
+def test_recursive_glob_tracks_deeply_nested_read_inputs(repo: Path) -> None:
+    (repo / "src" / "api" / "v2").mkdir(parents=True)
+    (repo / "src" / "api" / "schema.py").write_text("schema v1\n", encoding="utf-8")
+    (repo / "src" / "api" / "v2" / "schema.py").write_text("nested schema v1\n", encoding="utf-8")
+    git(repo, "add", "src")
+    git(repo, "commit", "-m", "add shallow and nested schemas")
+    git(repo, "branch", "integration", "HEAD")
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Update generated API files",
+        "Use every Python schema under the API directory.",
+        ["client checks pass"],
+        ["client/**"],
+        base_branch="integration",
+        read_resources=["src/api/**/*.py"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+    with supervisor.connect() as connection:
+        baseline = json.loads(
+            connection.execute(
+                "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?",
+                (attempt["id"],),
+            ).fetchone()["read_resources_snapshot_json"]
+        )
+    assert set(baseline["files"]) == {
+        "src/api/schema.py",
+        "src/api/v2/schema.py",
+    }
+
+    changed_commit = commit_change(
+        attempt,
+        "src/api/v2/schema.py",
+        "nested schema v2\n",
+        message="change deeply nested schema",
+    )
+    git(repo, "update-ref", "refs/heads/integration", changed_commit)
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert advisory["state"] == "changed"
+    assert advisory["changed_paths"] == [
+        {
+            "path": "src/api/v2/schema.py",
+            "before_object_oid": baseline["files"]["src/api/v2/schema.py"],
+            "after_object_oid": git(repo, "rev-parse", "integration:src/api/v2/schema.py"),
+        }
+    ]
+
+
+def test_recursive_glob_after_wildcard_directory_tracks_nested_inputs(repo: Path) -> None:
+    (repo / "src" / "api" / "v2").mkdir(parents=True)
+    (repo / "src" / "api" / "schema.py").write_text("schema v1\n", encoding="utf-8")
+    (repo / "src" / "api" / "v2" / "nested.py").write_text("nested v1\n", encoding="utf-8")
+    git(repo, "add", "src")
+    git(repo, "commit", "-m", "add API files")
+    git(repo, "branch", "integration", "HEAD")
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Update API consumers",
+        "Read files below any immediate src directory.",
+        ["consumer checks pass"],
+        ["client/**"],
+        base_branch="integration",
+        read_resources=["src/*/**"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+    with supervisor.connect() as connection:
+        baseline = json.loads(
+            connection.execute(
+                "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?",
+                (attempt["id"],),
+            ).fetchone()["read_resources_snapshot_json"]
+        )
+    assert set(baseline["files"]) == {
+        "src/api/schema.py",
+        "src/api/v2/nested.py",
+    }
+
+    changed_commit = commit_change(
+        attempt,
+        "src/api/v2/nested.py",
+        "nested v2\n",
+        message="change wildcard child input",
+    )
+    git(repo, "update-ref", "refs/heads/integration", changed_commit)
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert advisory["state"] == "changed"
+    assert [item["path"] for item in advisory["changed_paths"]] == ["src/api/v2/nested.py"]
+
+
+def test_root_wide_read_glob_is_unknown_instead_of_scanning_repository(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Use all Python inputs",
+        "Declare the broad input as a glob.",
+        ["checks pass"],
+        ["beta.txt"],
+        read_resources=["**/*.py"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+    with supervisor.connect() as connection:
+        baseline = json.loads(
+            connection.execute(
+                "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?",
+                (attempt["id"],),
+            ).fetchone()["read_resources_snapshot_json"]
+        )
+
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert baseline["state"] == "unknown"
+    assert "root-wide glob" in baseline["reason"]
+    assert advisory["state"] == "unknown"
+    assert "root-wide glob" in advisory["reason"]
+
+
+def test_read_resource_prefix_scan_limit_is_unknown(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (repo / "src").mkdir()
+    (repo / "src" / "a.py").write_text("a\n", encoding="utf-8")
+    (repo / "src" / "b.py").write_text("b\n", encoding="utf-8")
+    git(repo, "add", "src")
+    git(repo, "commit", "-m", "add source files")
+    supervisor = GitSupervisor(repo)
+    monkeypatch.setattr("agent_control_plane.supervisor.claims._READ_RESOURCE_MAX_PATHS", 1)
+    task = supervisor.create_task(
+        "Update Python inputs",
+        "Declare the directory-scoped input.",
+        ["checks pass"],
+        ["beta.txt"],
+        read_resources=["src/**/*.py"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+    with supervisor.connect() as connection:
+        baseline = json.loads(
+            connection.execute(
+                "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?",
+                (attempt["id"],),
+            ).fetchone()["read_resources_snapshot_json"]
+        )
+
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert baseline["state"] == "unknown"
+    assert "exceeded 1 tracked paths" in baseline["reason"]
+    assert advisory["state"] == "unknown"
+    assert "exceeded 1 tracked paths" in advisory["reason"]
+
+
+def test_read_resource_listing_byte_limit_is_unknown(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    monkeypatch.setattr("agent_control_plane.supervisor.claims._READ_RESOURCE_MAX_LISTING_BYTES", 1)
+    task = supervisor.create_task(
+        "Use a tracked input",
+        "Declare an exact file input.",
+        ["checks pass"],
+        ["beta.txt"],
+        read_resources=["alpha.txt"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+    with supervisor.connect() as connection:
+        baseline = json.loads(
+            connection.execute(
+                "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?",
+                (attempt["id"],),
+            ).fetchone()["read_resources_snapshot_json"]
+        )
+
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert baseline["state"] == "unknown"
+    assert "listing exceeded 1 bytes" in baseline["reason"]
+    assert advisory["state"] == "unknown"
+    assert "listing exceeded 1 bytes" in advisory["reason"]
+
+
+def test_unmatched_read_resource_is_unknown_not_unchanged(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Use an external schema",
+        "Declare the interface input.",
+        ["checks pass"],
+        ["beta.txt"],
+        read_resources=["missing/schema.json"],
+    )
+    supervisor.claim(task["id"], "worker-a")
+    before_view = state_fingerprint(supervisor)
+
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert advisory["state"] == "unknown"
+    assert advisory["unmatched_resources"] == ["missing/schema.json"]
+    assert "did not match" in advisory["reason"]
+    assert state_fingerprint(supervisor) == before_view
+
+
+def test_deleted_declared_file_is_unknown_with_deletion_identity(repo: Path) -> None:
+    git(repo, "branch", "integration", "HEAD")
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Read a file removed upstream",
+        "Declare a tracked input.",
+        ["checks pass"],
+        ["beta.txt"],
+        base_branch="integration",
+        read_resources=["alpha.txt"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+    before_oid = git(repo, "rev-parse", f"{task['base_sha']}:alpha.txt")
+    worktree = Path(attempt["worktree"])
+    git(worktree, "rm", "alpha.txt")
+    git(worktree, "commit", "-m", "remove declared input")
+    deleted_commit = git(worktree, "rev-parse", "HEAD")
+    git(repo, "update-ref", "refs/heads/integration", deleted_commit)
+    before_view = state_fingerprint(supervisor)
+
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert advisory["state"] == "unknown"
+    assert advisory["unmatched_resources"] == ["alpha.txt"]
+    assert advisory["changed_paths"] == [
+        {
+            "path": "alpha.txt",
+            "before_object_oid": before_oid,
+            "after_object_oid": None,
+        }
+    ]
+    assert state_fingerprint(supervisor) == before_view
+
+
+def test_unavailable_integration_base_is_unknown(repo: Path) -> None:
+    git(repo, "branch", "integration", "HEAD")
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Use an interface on integration",
+        "Declare the tracked input.",
+        ["checks pass"],
+        ["beta.txt"],
+        base_branch="integration",
+        read_resources=["alpha.txt"],
+    )
+    supervisor.claim(task["id"], "worker-a")
+    git(repo, "update-ref", "-d", "refs/heads/integration")
+    before_view = state_fingerprint(supervisor)
+
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+
+    assert advisory["state"] == "unknown"
+    assert advisory["current_base_sha"] is None
+    assert advisory["reason"] == "configured integration base is unavailable"
+    assert state_fingerprint(supervisor) == before_view
+
+
+def test_retry_preserves_original_read_resource_snapshot(repo: Path) -> None:
+    git(repo, "branch", "integration", "HEAD")
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Retry consumer",
+        "Use the declared API input.",
+        ["checks pass"],
+        ["beta.txt"],
+        base_branch="integration",
+        read_resources=["alpha.txt"],
+    )
+    first = supervisor.claim(task["id"], "worker-a")
+    with supervisor.connect() as connection:
+        first_snapshot = connection.execute(
+            "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?", (first["id"],)
+        ).fetchone()["read_resources_snapshot_json"]
+    changed_commit = commit_change(first, "alpha.txt", "changed API input\n")
+    git(repo, "update-ref", "refs/heads/integration", changed_commit)
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET latest_sha = ?, lease_expires_at = 1 WHERE id = ?",
+            (changed_commit, first["id"]),
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = 1 WHERE attempt_id = ?",
+            (first["id"],),
+        )
+
+    second = supervisor.claim(task["id"], "worker-b")
+
+    with supervisor.connect() as connection:
+        second_snapshot = connection.execute(
+            "SELECT read_resources_snapshot_json FROM attempts WHERE id = ?", (second["id"],)
+        ).fetchone()["read_resources_snapshot_json"]
+    assert second_snapshot == first_snapshot
+    advisory = entry_for(supervisor.status(), task["id"])["read_dependency_advisory"]
+    assert advisory["state"] == "changed"
+    assert advisory["changed_paths"][0]["before_object_oid"] == git(
+        repo, "rev-parse", f"{task['base_sha']}:alpha.txt"
+    )
 
 
 def test_status_inventories_git_worktrees_without_guessing_unmatched_owners(

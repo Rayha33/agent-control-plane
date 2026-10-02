@@ -31,6 +31,24 @@ def test_plan_reports_ready_task_without_mutating_state(repo: Path) -> None:
     assert state_fingerprint(supervisor) == before
 
 
+def test_declared_read_inputs_do_not_reserve_peer_write_resources(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update API client",
+        "Read the API declaration while changing the client.",
+        ["client checks pass"],
+        ["beta.txt"],
+        read_resources=["alpha.txt"],
+    )
+    api_writer = make_task(supervisor, "alpha.txt", title="change API declaration")
+
+    queue = supervisor.ready_queue()
+
+    assert {consumer["id"], api_writer["id"]} <= {entry["task_id"] for entry in queue["ready"]}
+    supervisor.claim(consumer["id"], "consumer-worker")
+    supervisor.claim(api_writer["id"], "api-worker")
+
+
 def test_plan_names_the_owner_of_an_exact_overlap(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     holder = make_task(supervisor, "alpha.txt", title="holder")
@@ -323,6 +341,41 @@ def test_merge_plan_invalidates_a_submission_when_upstream_lands(repo: Path) -> 
     assert entry["stale"] is True
     assert entry["current_base_sha"] == git(repo, "rev-parse", "main")
     assert entry["upstream_commits"] == 1
+
+
+def test_merge_plan_reports_stale_read_input_without_mutating_state(repo: Path) -> None:
+    git(repo, "branch", "integration", "HEAD")
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Update API consumer",
+        "Use the tracked API input.",
+        ["consumer checks pass"],
+        ["beta.txt"],
+        base_branch="integration",
+        read_resources=["alpha.txt"],
+    )
+    attempt = supervisor.claim(task["id"], "worker-a")
+    commit_change(attempt, "beta.txt", "consumer update\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    qc = supervisor.run_qc(submission["id"], "independent-qc")
+    assert qc["verdict"] == "pass"
+
+    changed_base = commit_change(attempt, "alpha.txt", "API input v2\n")
+    git(repo, "update-ref", "refs/heads/integration", changed_base)
+    before_view = state_fingerprint(supervisor)
+
+    entry = supervisor.merge_plan()["order"][0]
+
+    advisory = entry["read_dependency_advisory"]
+    assert advisory["state"] == "changed"
+    assert advisory["changed_paths"] == [
+        {
+            "path": "alpha.txt",
+            "before_object_oid": git(repo, "rev-parse", f"{task['base_sha']}:alpha.txt"),
+            "after_object_oid": git(repo, "rev-parse", "integration:alpha.txt"),
+        }
+    ]
+    assert state_fingerprint(supervisor) == before_view
 
 
 def test_merge_plan_is_read_only(repo: Path) -> None:

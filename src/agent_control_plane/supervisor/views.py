@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..scheduling import Scheduler
+from ..scheduling import Scheduler, declared_read_resources
 from ..status import DEFAULT_LEASE_RISK_SECONDS, StatusView
 from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError
 
@@ -47,6 +47,8 @@ class ViewsMixin:
             # path that does not exist in a case-sensitive checkout.
             "resources": json.loads(row["resources_json"]),
             "declared_resources": self._declared_resources(row),
+            "read_resources": json.loads(row["read_resources_json"] or "[]"),
+            "declared_read_resources": declared_read_resources(row),
             "dependencies": json.loads(row["dependencies_json"]),
             "produces": json.loads(row["produces_json"]),
             "consumes": json.loads(row["consumes_json"]),

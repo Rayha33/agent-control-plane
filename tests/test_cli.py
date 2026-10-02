@@ -235,6 +235,47 @@ def _repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_cli_task_add_accepts_optional_normalized_read_resources(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    created = run_cli(
+        repo,
+        "task-add",
+        "--title",
+        "Read-dependent task",
+        "--accept",
+        "generated client passes",
+        "--resource",
+        "client/**",
+        "--read-resource",
+        "./owned.txt",
+        "--read-resource",
+        "owned.txt",
+        "--read-resource",
+        "Owned.txt",
+    )
+
+    assert created.returncode == 0, created.stderr
+    task = json.loads(created.stdout)
+    assert task["resources"] == ["client/**"]
+    assert task["read_resources"] == ["Owned.txt", "owned.txt"]
+    assert task["declared_read_resources"] == ["Owned.txt", "owned.txt"]
+
+    logical = run_cli(
+        repo,
+        "task-add",
+        "--title",
+        "Reject logical read inputs",
+        "--accept",
+        "checks pass",
+        "--resource",
+        "client/**",
+        "--read-resource",
+        "logical:api-schema",
+    )
+    assert logical.returncode == 1
+    assert json.loads(logical.stderr)["error"] == "invalid_resource"
+
+
 def test_cli_credentials_use_private_sinks_and_never_argv_or_json(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
 
