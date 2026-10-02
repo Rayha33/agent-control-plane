@@ -26,6 +26,10 @@ from .common import SupervisorError, utc_now
 class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
 
+    @staticmethod
+    def _open_worker_handshake_pipe() -> tuple[int, int]:
+        return os.pipe()
+
     def _verify_worker_worktree(self, attempt: dict[str, Any]) -> None:
         """Fail closed unless the attempt still names its registered checkout."""
 
@@ -128,7 +132,7 @@ class WorkersMixin:
             handshake_write = -1
             launch_reserved = False
             try:
-                handshake_read, handshake_write = os.pipe()
+                handshake_read, handshake_write = self._open_worker_handshake_pipe()
                 self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
                 launch_reserved = True
                 trampoline = Path(__file__).parent.with_name("worker_trampoline.py").resolve()

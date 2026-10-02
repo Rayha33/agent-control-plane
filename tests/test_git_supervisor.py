@@ -2890,7 +2890,8 @@ def test_pipe_failure_does_not_leave_launch_reservation(
     attempt = supervisor.claim(created["id"], "worker")
     with monkeypatch.context() as patch:
         patch.setattr(
-            "agent_control_plane.git_supervisor.os.pipe",
+            supervisor,
+            "_open_worker_handshake_pipe",
             lambda: (_ for _ in ()).throw(OSError("injected pipe failure")),
         )
         with pytest.raises(OSError, match="injected pipe failure"):
