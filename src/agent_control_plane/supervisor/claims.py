@@ -7,21 +7,192 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import time
 import unicodedata
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..scheduling import declared_resources, normalize_artifact
 from .common import SUBMISSION_OBJECT_CONTRACT, SupervisorError, canonical_json, sha256, utc_now
 from .schema import META_CASE_SENSITIVE
+
+FILE_SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
+MAX_FILE_SNAPSHOTS_PER_ATTEMPT = 256
+MAX_FILE_SNAPSHOT_BYTES = 16 * 1024 * 1024
+
+
+def _file_stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _directory_change_token(info: os.stat_result) -> str:
+    return f"{info.st_dev:x}:{info.st_ino:x}:{info.st_mtime_ns:x}:{info.st_ctime_ns:x}"
+
+
+def _open_snapshot_parent(
+    root: Path,
+    parent_components: Sequence[str],
+    *,
+    missing_parent_is_absent: bool,
+) -> tuple[int | None, tuple[str, ...]]:
+    """Open the file's parent beneath root and capture each directory's change token."""
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(os.sep, directory_flags)
+    try:
+        for component in root.parts[1:]:
+            next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+
+        tokens = [_directory_change_token(os.fstat(descriptor))]
+        for component in parent_components:
+            try:
+                next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not missing_parent_is_absent:
+                    raise
+                os.close(descriptor)
+                return None, ()
+            os.close(descriptor)
+            descriptor = next_descriptor
+            tokens.append(_directory_change_token(os.fstat(descriptor)))
+        return descriptor, tuple(tokens)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _file_snapshot(path: Path, *, root: Path) -> tuple[bool, str, int, str]:
+    """Fingerprint one regular file beneath ``root`` without following path links.
+
+    Walk from the filesystem root using pinned directory descriptors and
+    ``O_NOFOLLOW`` for every component. This keeps a parent-directory symlink swap
+    from redirecting the hash outside the attempt worktree. The content digest is
+    paired with device, inode and ctime so an A -> B -> A edit is still detected on
+    filesystems that expose normal POSIX change-time metadata.
+
+    This is an optimistic stale-content check, not an OS-level write lock. Stat the
+    opened descriptor on both sides of the digest so a file changing while it is
+    hashed is never recorded as a trustworthy snapshot.
+    """
+
+    path = Path(path)
+    root = Path(root)
+    if not path.is_absolute() or not root.is_absolute() or root.anchor != os.sep:
+        raise ValueError("freshness paths must use absolute POSIX paths")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("freshness path is outside its attempt worktree") from error
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("freshness path must name a file beneath its attempt worktree")
+    if os.open not in getattr(os, "supports_dir_fd", set()) or os.stat not in getattr(
+        os, "supports_dir_fd", set()
+    ):
+        raise OSError("safe descriptor-relative path traversal is unavailable on this platform")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("no-follow directory opens are unavailable on this platform")
+
+    parent_fd, directory_tokens = _open_snapshot_parent(
+        root, relative.parts[:-1], missing_parent_is_absent=True
+    )
+    if parent_fd is None:
+        return False, "", 0, ""
+    try:
+        name = relative.parts[-1]
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False, "", 0, ""
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("only regular files can be freshness-checked")
+        if info.st_size > MAX_FILE_SNAPSHOT_BYTES:
+            raise OverflowError(
+                f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
+            )
+
+        digest = hashlib.sha256()
+        flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW
+        )
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError("only regular files can be freshness-checked") from error
+            raise
+        with os.fdopen(descriptor, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("only regular files can be freshness-checked")
+            if _file_stat_identity(info) != _file_stat_identity(before):
+                raise OSError("file changed while its freshness snapshot was being opened")
+            if before.st_size > MAX_FILE_SNAPSHOT_BYTES:
+                raise OverflowError(
+                    f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
+                )
+            size = 0
+            while block := source.read(1024 * 1024):
+                size += len(block)
+                if size > MAX_FILE_SNAPSHOT_BYTES:
+                    raise OverflowError(
+                        f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
+                    )
+                digest.update(block)
+            after = os.fstat(source.fileno())
+        if _file_stat_identity(before) != _file_stat_identity(after) or size != after.st_size:
+            raise OSError("file changed while its freshness snapshot was being computed")
+        verification_fd, verified_directory_tokens = _open_snapshot_parent(
+            root, relative.parts[:-1], missing_parent_is_absent=False
+        )
+        if verification_fd is None:
+            raise OSError("file's parent directory disappeared during freshness check")
+        try:
+            if verified_directory_tokens != directory_tokens:
+                raise OSError("file's parent directory changed during freshness check")
+        finally:
+            os.close(verification_fd)
+        change_token = f"dirs:{'|'.join(directory_tokens)}|file:{_directory_change_token(after)}"
+        return True, digest.hexdigest(), size, change_token
+    finally:
+        os.close(parent_fd)
+
+
+@contextmanager
+def _snapshot_write_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Open only the narrow SQLite transaction needed for ephemeral snapshots.
+
+    A normal read-write supervisor open also reconciles lifecycle state and changes
+    persistent SQLite pragmas. A Claude Read hook must not trigger those unrelated
+    effects, so this cache-like table gets its own explicit, minimal connection.
+    """
+
+    connection = sqlite3.connect(db_path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 class ClaimsMixin:
@@ -379,6 +550,226 @@ class ClaimsMixin:
             if not row:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             return self._attempt_view(connection, row)
+
+    def record_file_snapshot(
+        self,
+        attempt_id: str,
+        path: str,
+        *,
+        caller_cwd: str | Path | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Remember the bytes observed before a supported editor read.
+
+        This operation records advisory freshness state only. It never blocks a read;
+        later write authorization still goes through :meth:`guard` and the declared
+        write set. The adapter may therefore safely call this for every Claude Read.
+        """
+
+        epoch = int(time.time()) if now is None else now
+        decision = self.guard(attempt_id, path, caller_cwd=caller_cwd, now=epoch)
+        if not decision["allow"]:
+            return {
+                "ok": True,
+                "recorded": False,
+                "reason": decision["reason"],
+                "detail": decision["detail"],
+            }
+
+        target = Path(decision["path"])
+        try:
+            file_exists, digest, size, change_token = _file_snapshot(
+                target, root=Path(decision["worktree"])
+            )
+        except (OSError, OverflowError, ValueError) as error:
+            reason = (
+                "snapshot_too_large" if isinstance(error, OverflowError) else "snapshot_unavailable"
+            )
+            return {"ok": True, "recorded": False, "reason": reason, "detail": str(error)}
+
+        with _snapshot_write_connection(self.db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = connection.execute(
+                "SELECT status, lease_expires_at, worktree, task_id FROM attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt["status"] not in {"provisioning", "working"}
+                or attempt["lease_expires_at"] <= epoch
+            ):
+                return {
+                    "ok": True,
+                    "recorded": False,
+                    "reason": "attempt_not_live",
+                    "detail": "the attempt is no longer live; no freshness state was recorded",
+                }
+
+            worktree = Path(attempt["worktree"]).resolve()
+            if target != worktree and worktree not in target.parents:
+                return {
+                    "ok": True,
+                    "recorded": False,
+                    "reason": "outside_worktree",
+                    "detail": "the resolved file is outside the attempt worktree",
+                }
+            task = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (attempt["task_id"],)
+            ).fetchone()
+            declared_rules = (
+                self._write_set_rules(task, self._case_sensitive_paths(connection)) if task else []
+            )
+            relative_path = target.relative_to(worktree).as_posix()
+            if not any(
+                self._path_matches(relative_path, resource, fold=fold)
+                for resource, fold in declared_rules
+            ):
+                return {
+                    "ok": True,
+                    "recorded": False,
+                    "reason": "undeclared_write",
+                    "detail": "the file is not in the attempt's declared write set",
+                }
+
+            connection.execute("DELETE FROM file_snapshots WHERE expires_at <= ?", (epoch,))
+            connection.execute(
+                """
+                INSERT INTO file_snapshots (
+                  attempt_id, path, file_exists, sha256, byte_size, change_token,
+                  observed_at_ns, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attempt_id, path) DO UPDATE SET
+                  file_exists = excluded.file_exists,
+                  sha256 = excluded.sha256,
+                  byte_size = excluded.byte_size,
+                  change_token = excluded.change_token,
+                  observed_at_ns = excluded.observed_at_ns,
+                  expires_at = excluded.expires_at
+                """,
+                (
+                    attempt_id,
+                    str(target),
+                    1 if file_exists else 0,
+                    digest,
+                    size,
+                    change_token,
+                    time.time_ns(),
+                    epoch + FILE_SNAPSHOT_TTL_SECONDS,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM file_snapshots
+                WHERE attempt_id = ? AND path NOT IN (
+                  SELECT path FROM file_snapshots WHERE attempt_id = ?
+                  ORDER BY observed_at_ns DESC, path LIMIT ?
+                )
+                """,
+                (attempt_id, attempt_id, MAX_FILE_SNAPSHOTS_PER_ATTEMPT),
+            )
+        return {
+            "ok": True,
+            "recorded": True,
+            "attempt_id": attempt_id,
+            "path": str(target),
+            "file_exists": file_exists,
+            "byte_size": size,
+            "expires_at": epoch + FILE_SNAPSHOT_TTL_SECONDS,
+        }
+
+    def check_file_snapshot(
+        self,
+        attempt_id: str,
+        path: str,
+        *,
+        caller_cwd: str | Path | None = None,
+        now: int | None = None,
+    ) -> dict[str, Any]:
+        """Fail closed when a full-file write would replace bytes changed since Read.
+
+        This is an optimistic pre-write check, not a filesystem transaction: a separate
+        process can still modify the path in the small interval before the editor writes.
+        """
+
+        epoch = int(time.time()) if now is None else now
+        decision = self.guard(attempt_id, path, caller_cwd=caller_cwd, now=epoch)
+        if not decision["allow"]:
+            return decision
+        target = Path(decision["path"])
+        try:
+            file_exists, digest, size, change_token = _file_snapshot(
+                target, root=Path(decision["worktree"])
+            )
+        except (OSError, OverflowError, ValueError) as error:
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "freshness_snapshot_unavailable",
+                f"cannot verify the current file contents safely: {error}",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT status, lease_expires_at FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt["status"] not in {"provisioning", "working"}
+                or attempt["lease_expires_at"] <= epoch
+            ):
+                return self._guard_denial(
+                    attempt_id,
+                    str(target),
+                    "attempt_not_live",
+                    "the attempt stopped being live during the freshness check",
+                    declared=decision["declared"],
+                    relative_path=decision["relative_path"],
+                )
+            snapshot = connection.execute(
+                """
+                SELECT file_exists, sha256, byte_size, change_token, expires_at
+                FROM file_snapshots WHERE attempt_id = ? AND path = ?
+                """,
+                (attempt_id, str(target)),
+            ).fetchone()
+
+        if snapshot is None:
+            if not file_exists:
+                return {**decision, "freshness": "new_file_absent"}
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "freshness_snapshot_missing",
+                "read this file through the supported Claude Code Read tool before replacing it",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if snapshot["expires_at"] <= epoch:
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "freshness_snapshot_expired",
+                "the file snapshot expired; read the file again before replacing it",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        if (
+            bool(snapshot["file_exists"]) != file_exists
+            or snapshot["sha256"] != digest
+            or snapshot["byte_size"] != size
+            or snapshot["change_token"] != change_token
+        ):
+            return self._guard_denial(
+                attempt_id,
+                str(target),
+                "stale_file_snapshot",
+                "this file changed after the last supported Read; read it again before replacing it",
+                declared=decision["declared"],
+                relative_path=decision["relative_path"],
+            )
+        return {**decision, "freshness": "unchanged_since_read"}
 
     def guard(
         self,

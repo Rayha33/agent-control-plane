@@ -78,6 +78,43 @@ checkout where it is installed.
 - **SessionStart** → `acp guard --describe`, so the session starts knowing its worktree
   and write set rather than discovering the boundary by hitting it.
 
+Generated Claude commands carry a private `--acp-managed-hook` ownership flag. The
+installer uses it to recognize ACP hooks after the executable path changes, without
+mistaking a user command such as `echo acp guard --hook` for an ACP hook.
+
+### Optional stale full-file write check
+
+Install with `--stale-write-guard` to add a conservative freshness check for Claude
+Code's structured `Write` tool:
+
+```bash
+acp --repo "$BASE" hooks install --claude-code --attempt "$ATTEMPT" \
+  --stale-write-guard
+```
+
+The `Read` pre-hook stores a bounded SHA-256 snapshot plus filesystem identity/change-time
+tokens for the file and each directory from the attempt worktree root through its parent.
+Before a full `Write` replacement, ACP compares them with the current path; edits restored
+to identical bytes and parent-directory swaps are detected on filesystems with normal POSIX
+ctime behavior. Other directory-entry changes along that path can conservatively require a
+fresh read. An expired/missing baseline for an existing file, or an unreadable/oversized
+file, denies the write and tells the agent to read again. A still-absent path may be created.
+Snapshot traversal is anchored at the attempt worktree, opens each path component without
+following symlinks, and verifies the directory chain stayed unchanged while hashing; if
+those safe descriptor-relative APIs are not available, snapshot recording fails and
+replacement of an existing file fails closed. Only a subsequent supported `Read` refreshes
+the snapshot; an agent that writes a file must read it again before another full-file
+replacement. Snapshots are scoped to one attempt and path, expire after 24 hours, are capped
+at 256 paths per attempt, and are limited to 16 MiB per file. The option is off by default.
+
+This is an optimistic stale-content check, not a filesystem lock or atomic compare-and-
+swap: another process can still change a file in the small interval between the pre-write
+check and Claude Code's write. It covers only structured Claude `Write` operations whose
+`Read`/`Write` hooks actually run. It does not cover `Edit`, `MultiEdit`, Bash, MCP or
+custom clients, reads through other tools or `@` prompt references, or disabled/untrusted
+hooks. Do not treat it as a security boundary or as proof that every agent write was
+checked.
+
 The install **merges**. Hooks you already have — including your own `PreToolUse`
 entries — are preserved, previous ACP entries are replaced rather than duplicated, and
 a `settings.json` that is not valid JSON is left untouched with an error instead of

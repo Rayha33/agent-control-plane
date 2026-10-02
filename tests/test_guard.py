@@ -20,6 +20,7 @@ from support import init_repo, make_task
 
 from agent_control_plane.cli import main
 from agent_control_plane.editor_hooks import (
+    ACP_MANAGED_HOOK_FLAG,
     DENY_EXIT_CODE,
     GUARDED_TOOLS,
     install_claude_code_hooks,
@@ -28,6 +29,11 @@ from agent_control_plane.editor_hooks import (
     path_from_hook_payload,
 )
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.supervisor.claims import (
+    FILE_SNAPSHOT_TTL_SECONDS,
+    MAX_FILE_SNAPSHOTS_PER_ATTEMPT,
+    _file_snapshot,
+)
 
 
 @pytest.fixture
@@ -201,6 +207,18 @@ def run_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
     return main(["--repo", str(repo), "guard", "--hook"])
 
 
+def run_snapshot_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
+    monkeypatch.setenv("ACP_ATTEMPT_ID", attempt_id)
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    return main(["--repo", str(repo), "snapshot", "--hook", "--acp-managed-hook"])
+
+
+def run_freshness_guard(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
+    monkeypatch.setenv("ACP_ATTEMPT_ID", attempt_id)
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    return main(["--repo", str(repo), "guard", "--hook", "--freshness", "--acp-managed-hook"])
+
+
 def run_codex_hook(repo: Path, attempt_id: str, payload: str, monkeypatch) -> int:
     monkeypatch.setenv("ACP_ATTEMPT_ID", attempt_id)
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
@@ -228,6 +246,342 @@ def test_hook_mode_exit_codes(claimed, repo: Path, monkeypatch) -> None:
 
     assert run_hook(repo, attempt["id"], allowed, monkeypatch) == 0
     assert run_hook(repo, attempt["id"], denied, monkeypatch) == DENY_EXIT_CODE
+
+
+def test_opt_in_freshness_hook_denies_a_full_write_after_the_file_changes(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    target = worktree / "alpha.txt"
+    target.write_text("agent read this\n", encoding="utf-8")
+    read_payload = json.dumps(
+        {"cwd": str(worktree), "tool_name": "Read", "tool_input": {"file_path": str(target)}}
+    )
+    write_payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(target), "content": "stale agent content\n"},
+        }
+    )
+
+    assert run_snapshot_hook(repo, attempt["id"], read_payload, monkeypatch) == 0
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == 0
+    capsys.readouterr()
+
+    target.write_text("newer human edit\n", encoding="utf-8")
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == DENY_EXIT_CODE
+    denial = json.loads(capsys.readouterr().out)
+    assert denial["reason"] == "stale_file_snapshot"
+    assert target.read_text(encoding="utf-8") == "newer human edit\n"
+
+    assert run_snapshot_hook(repo, attempt["id"], read_payload, monkeypatch) == 0
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == 0
+    capsys.readouterr()
+
+
+def test_opt_in_freshness_detects_a_changed_file_restored_to_the_same_bytes(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    _, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    target = worktree / "alpha.txt"
+    original = "contents Claude read\n"
+    target.write_text(original, encoding="utf-8")
+    read_payload = json.dumps(
+        {"cwd": str(worktree), "tool_name": "Read", "tool_input": {"file_path": str(target)}}
+    )
+    write_payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(target), "content": "stale replacement\n"},
+        }
+    )
+
+    assert run_snapshot_hook(repo, attempt["id"], read_payload, monkeypatch) == 0
+    target.write_text("intervening edit\n", encoding="utf-8")
+    target.write_text(original, encoding="utf-8")
+
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "stale_file_snapshot"
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_opt_in_freshness_detects_a_swapped_and_restored_parent_directory(
+    claimed, repo: Path
+) -> None:
+    supervisor, _ = claimed
+    created = make_task(supervisor, "nested/alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker-two")
+    worktree = Path(attempt["worktree"])
+    parent = worktree / "nested"
+    parent.mkdir()
+    target = parent / "alpha.txt"
+    target.write_text("contents Claude read\n", encoding="utf-8")
+    assert supervisor.record_file_snapshot(attempt["id"], "nested/alpha.txt", caller_cwd=worktree)[
+        "recorded"
+    ]
+
+    moved_original = worktree / "nested.original"
+    replacement = worktree / "nested.replacement"
+    parent.rename(moved_original)
+    parent.mkdir()
+    (parent / "alpha.txt").write_text("different file Claude actually read\n", encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == "different file Claude actually read\n"
+
+    parent.rename(replacement)
+    moved_original.rename(parent)
+    assert target.read_text(encoding="utf-8") == "contents Claude read\n"
+    decision = supervisor.check_file_snapshot(
+        attempt["id"], "nested/alpha.txt", caller_cwd=worktree
+    )
+    assert decision["reason"] == "stale_file_snapshot"
+
+
+def test_opt_in_freshness_requires_snapshot_for_existing_file_but_allows_creation(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", "new.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    existing_payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(worktree / "alpha.txt"), "content": "replacement"},
+        }
+    )
+    new_payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(worktree / "new.txt"), "content": "new"},
+        }
+    )
+
+    assert run_freshness_guard(repo, attempt["id"], existing_payload, monkeypatch) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "freshness_snapshot_missing"
+    assert run_freshness_guard(repo, attempt["id"], new_payload, monkeypatch) == 0
+    capsys.readouterr()
+
+
+def test_absent_file_snapshot_denies_when_another_writer_creates_the_path(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "new.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    target = worktree / "new.txt"
+    read_payload = json.dumps(
+        {"cwd": str(worktree), "tool_name": "Read", "tool_input": {"file_path": str(target)}}
+    )
+    write_payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(target), "content": "agent contents\n"},
+        }
+    )
+
+    assert run_snapshot_hook(repo, attempt["id"], read_payload, monkeypatch) == 0
+    target.write_text("another writer created this\n", encoding="utf-8")
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "stale_file_snapshot"
+
+
+def test_a_successful_write_requires_a_new_read_before_another_full_replacement(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    _, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    target = worktree / "alpha.txt"
+    target.write_text("initial contents\n", encoding="utf-8")
+    read_payload = json.dumps(
+        {"cwd": str(worktree), "tool_name": "Read", "tool_input": {"file_path": str(target)}}
+    )
+    write_payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(target), "content": "agent replacement\n"},
+        }
+    )
+
+    assert run_snapshot_hook(repo, attempt["id"], read_payload, monkeypatch) == 0
+    target.write_text("agent replacement\n", encoding="utf-8")
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "stale_file_snapshot"
+
+    assert run_snapshot_hook(repo, attempt["id"], read_payload, monkeypatch) == 0
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == 0
+    capsys.readouterr()
+
+
+def test_file_snapshot_rejects_a_symlink_instead_of_following_it(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private contents\n", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    link.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="regular files"):
+        _file_snapshot(link, root=tmp_path)
+
+    assert outside.read_text(encoding="utf-8") == "private contents\n"
+
+
+def test_file_snapshot_rejects_a_file_that_changes_while_being_hashed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import os
+
+    target = tmp_path / "changing.txt"
+    target.write_text("initial contents\n", encoding="utf-8")
+    real_fstat = os.fstat
+    calls = 0
+
+    def change_before_second_stat(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.write_text("changed while hashing\n", encoding="utf-8")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr("agent_control_plane.supervisor.claims.os.fstat", change_before_second_stat)
+    with pytest.raises(OSError, match="changed while"):
+        _file_snapshot(target, root=tmp_path)
+
+
+def test_file_snapshot_rejects_parent_symlink_swap_after_guard(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "nested/**")
+    attempt = supervisor.claim(task["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    parent = worktree / "nested"
+    parent.mkdir()
+    target = parent / "alpha.txt"
+    target.write_text("same snapshot bytes\n", encoding="utf-8")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / target.name).write_text("same snapshot bytes\n", encoding="utf-8")
+    assert supervisor.record_file_snapshot(attempt["id"], "nested/alpha.txt", caller_cwd=worktree)[
+        "recorded"
+    ]
+
+    moved_parent = worktree / "nested.original"
+    from agent_control_plane.supervisor import claims
+
+    real_snapshot = claims._file_snapshot
+
+    def swap_then_snapshot(path: Path, *, root: Path):
+        parent.rename(moved_parent)
+        parent.symlink_to(external, target_is_directory=True)
+        try:
+            return real_snapshot(path, root=root)
+        finally:
+            parent.unlink()
+            moved_parent.rename(parent)
+
+    monkeypatch.setattr(claims, "_file_snapshot", swap_then_snapshot)
+    decision = supervisor.check_file_snapshot(
+        attempt["id"], "nested/alpha.txt", caller_cwd=worktree
+    )
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "freshness_snapshot_unavailable"
+    assert (external / target.name).read_text(encoding="utf-8") == "same snapshot bytes\n"
+    assert target.read_text(encoding="utf-8") == "same snapshot bytes\n"
+
+
+def test_file_snapshots_are_isolated_per_attempt(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    first_task = make_task(supervisor, "alpha.txt", title="first")
+    second_task = make_task(supervisor, "beta.txt", title="second")
+    first = supervisor.claim(first_task["id"], "worker-first")
+    second = supervisor.claim(second_task["id"], "worker-second")
+    first_worktree = Path(first["worktree"])
+    second_worktree = Path(second["worktree"])
+
+    assert supervisor.record_file_snapshot(first["id"], "alpha.txt", caller_cwd=first_worktree)[
+        "recorded"
+    ]
+    decision = supervisor.check_file_snapshot(second["id"], "beta.txt", caller_cwd=second_worktree)
+    assert decision["allow"] is False
+    assert decision["reason"] == "freshness_snapshot_missing"
+    assert supervisor.record_file_snapshot(second["id"], "beta.txt", caller_cwd=second_worktree)[
+        "recorded"
+    ]
+    with supervisor.connect() as connection:
+        rows = connection.execute(
+            "SELECT attempt_id, path FROM file_snapshots ORDER BY attempt_id"
+        ).fetchall()
+    assert {(row["attempt_id"], Path(row["path"]).name) for row in rows} == {
+        (first["id"], "alpha.txt"),
+        (second["id"], "beta.txt"),
+    }
+
+
+def test_snapshot_cannot_bypass_attempt_write_set(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(task["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    outside_write_set = supervisor.record_file_snapshot(
+        attempt["id"], "beta.txt", caller_cwd=worktree
+    )
+
+    assert outside_write_set["recorded"] is False
+    assert outside_write_set["reason"] == "undeclared_write"
+    with supervisor.connect() as connection:
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM file_snapshots WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()[0]
+    assert rows == 0
+
+
+def test_expired_snapshot_is_denied_even_when_the_attempt_lease_is_live(repo: Path) -> None:
+    import time
+
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(task["id"], "worker", lease_seconds=FILE_SNAPSHOT_TTL_SECONDS * 2)
+    worktree = Path(attempt["worktree"])
+    now = int(time.time())
+    assert supervisor.record_file_snapshot(
+        attempt["id"], "alpha.txt", caller_cwd=worktree, now=now
+    )["recorded"]
+
+    decision = supervisor.check_file_snapshot(
+        attempt["id"], "alpha.txt", caller_cwd=worktree, now=now + FILE_SNAPSHOT_TTL_SECONDS + 1
+    )
+    assert decision["allow"] is False
+    assert decision["reason"] == "freshness_snapshot_expired"
+
+
+def test_snapshot_history_is_bounded_per_attempt(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "src/**")
+    attempt = supervisor.claim(task["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    source_dir = worktree / "src"
+    source_dir.mkdir()
+
+    for index in range(MAX_FILE_SNAPSHOTS_PER_ATTEMPT + 1):
+        relative = f"src/file-{index}.txt"
+        (worktree / relative).write_text(str(index), encoding="utf-8")
+        result = supervisor.record_file_snapshot(attempt["id"], relative, caller_cwd=worktree)
+        assert result["recorded"]
+
+    with supervisor.connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM file_snapshots WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()[0]
+    assert count == MAX_FILE_SNAPSHOTS_PER_ATTEMPT
 
 
 @pytest.mark.parametrize("payload", ["not json at all", "{}", '{"tool_input": {}}', "[]"])
@@ -639,6 +993,140 @@ def test_install_creates_settings_when_absent(tmp_path: Path) -> None:
     assert written["hooks"]["PreToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
 
 
+def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hooks(
+    tmp_path: Path,
+) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Read",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "/old/venv/acp snapshot --hook",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": "echo acp guard --hook",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}",
+                                },
+                                {"type": "command", "command": "my-read-audit"},
+                            ],
+                        }
+                    ],
+                    "PostToolUse": [
+                        {"matcher": "Write", "hooks": [{"type": "command", "command": "my-audit"}]}
+                    ],
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "/old/venv/acp guard --describe",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    install_claude_code_hooks(tmp_path, command="/old/venv/acp", stale_write_guard=True)
+    enabled = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]
+    pre_hooks = [hook for entry in enabled["PreToolUse"] for hook in entry["hooks"]]
+    assert any("guard --hook --freshness" in hook["command"] for hook in pre_hooks)
+    assert any("snapshot --hook" in hook["command"] for hook in pre_hooks)
+    assert any(hook["command"] == "my-read-audit" for hook in pre_hooks)
+    assert enabled["PostToolUse"][0]["hooks"][0]["command"] == "my-audit"
+    assert not any(
+        "snapshot --hook" in hook["command"]
+        for entry in enabled["PostToolUse"]
+        for hook in entry.get("hooks", [])
+    )
+
+    install_claude_code_hooks(tmp_path, command="acp")
+    disabled = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]
+    commands = [
+        hook["command"]
+        for event in disabled.values()
+        for entry in event
+        for hook in entry.get("hooks", [])
+    ]
+    assert "my-audit" in commands
+    assert "my-read-audit" in commands
+    assert "echo acp guard --hook" in commands
+    assert f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}" in commands
+    assert any(command.startswith("acp guard --describe ") for command in commands)
+    assert not any(command.startswith("/old/venv/acp ") for command in commands)
+    assert not any("snapshot --hook" in command for command in commands)
+    assert not any("guard --hook --freshness" in command for command in commands)
+
+
+def test_managed_hook_marker_removes_a_changed_wrapper_but_not_an_echo_hook(
+    tmp_path: Path,
+) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    install_claude_code_hooks(tmp_path, command="uv run acp", stale_write_guard=True)
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings["hooks"]["PreToolUse"].append(
+        {
+            "matcher": "Read",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}",
+                }
+            ],
+        }
+    )
+    python_user_command = (
+        f"python -c 'print(1)' -m agent_control_plane.cli guard --hook {ACP_MANAGED_HOOK_FLAG}"
+    )
+    settings["hooks"]["PreToolUse"].append(
+        {
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": python_user_command}],
+        }
+    )
+    settings["hooks"]["SessionStart"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        f"python -m agent_control_plane.cli guard --describe "
+                        f"{ACP_MANAGED_HOOK_FLAG}"
+                    ),
+                }
+            ]
+        }
+    )
+    settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+    install_claude_code_hooks(tmp_path, command="acp")
+    installed = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]
+    commands = [
+        hook["command"]
+        for event in installed.values()
+        for entry in event
+        for hook in entry.get("hooks", [])
+    ]
+    assert f"echo guard --hook {ACP_MANAGED_HOOK_FLAG}" in commands
+    assert python_user_command in commands
+    assert not any(command.startswith("uv run acp ") for command in commands)
+    assert not any(command.startswith("python -m agent_control_plane.cli ") for command in commands)
+
+
 def test_codex_install_preserves_user_hooks_and_replaces_its_own_entry(tmp_path: Path) -> None:
     root = init_repo(tmp_path)
     hooks_path = root / ".codex" / "hooks.json"
@@ -903,6 +1391,7 @@ def test_attempt_hooks_use_local_ignored_settings_and_canonical_state_root(
         ).returncode
         == 0
     )
+
     assert (
         subprocess.run(
             ["git", "-C", str(worktree), "status", "--porcelain"],
@@ -935,6 +1424,39 @@ def test_attempt_hooks_use_local_ignored_settings_and_canonical_state_root(
         ),
     )
     assert main(shlex.split(hook)[1:]) == DENY_EXIT_CODE
+
+
+def test_attempt_hook_cli_enables_stale_write_guard_only_when_requested(
+    claimed, repo: Path
+) -> None:
+    attempt = claimed[1]
+    worktree = Path(attempt["worktree"])
+    assert (
+        main(
+            [
+                "--repo",
+                str(repo),
+                "hooks",
+                "install",
+                "--claude-code",
+                "--attempt",
+                attempt["id"],
+                "--stale-write-guard",
+            ]
+        )
+        == 0
+    )
+    settings = json.loads(
+        (worktree / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+    )["hooks"]
+    commands = [
+        hook["command"]
+        for event in settings.values()
+        for entry in event
+        for hook in entry.get("hooks", [])
+    ]
+    assert any("guard --hook --freshness" in command for command in commands)
+    assert any("snapshot --hook" in command for command in commands)
 
 
 def test_hook_mode_fails_closed_when_the_supervisor_cannot_open(tmp_path, monkeypatch) -> None:

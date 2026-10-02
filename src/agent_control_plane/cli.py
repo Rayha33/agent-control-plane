@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .editor_hooks import (
+    ACP_MANAGED_HOOK_FLAG,
     CODEX_MAX_HOOK_INPUT_CHARS,
     DENY_EXIT_CODE,
     cwd_from_hook_payload,
@@ -142,6 +143,12 @@ def parser() -> argparse.ArgumentParser:
     )
     guard.add_argument("--attempt", dest="attempt_id", help="defaults to $ACP_ATTEMPT_ID")
     guard.add_argument("--path", help="the path the tool is about to write")
+    guard.add_argument(ACP_MANAGED_HOOK_FLAG, action="store_true", help=argparse.SUPPRESS)
+    guard.add_argument(
+        "--freshness",
+        action="store_true",
+        help="check Claude Code full-file Write against its latest supported Read snapshot",
+    )
     guard_mode = guard.add_mutually_exclusive_group()
     guard_mode.add_argument(
         "--hook",
@@ -159,6 +166,13 @@ def parser() -> argparse.ArgumentParser:
         help="print the attempt's worktree and declared write set (SessionStart hook)",
     )
 
+    snapshot = commands.add_parser(
+        "snapshot", help="record a supported Claude Code file read for opt-in freshness checks"
+    )
+    snapshot.add_argument("--attempt", dest="attempt_id", help="defaults to $ACP_ATTEMPT_ID")
+    snapshot.add_argument("--hook", action="store_true", required=True)
+    snapshot.add_argument(ACP_MANAGED_HOOK_FLAG, action="store_true", help=argparse.SUPPRESS)
+
     hooks = commands.add_parser("hooks", help="install editor adapters that call the kernel")
     hooks_commands = hooks.add_subparsers(dest="hooks_action", required=True)
     hooks_install = hooks_commands.add_parser("install", help="write the hook configuration")
@@ -172,6 +186,11 @@ def parser() -> argparse.ArgumentParser:
         "--attempt",
         dest="attempt_id",
         help="install personal Claude settings into this attempt worktree",
+    )
+    hooks_install.add_argument(
+        "--stale-write-guard",
+        action="store_true",
+        help="opt in to stale-snapshot checks for Claude Code's structured Write tool",
     )
 
     gc = commands.add_parser(
@@ -618,6 +637,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return serve(args.repo)
         if args.action == "hooks":
+            if args.stale_write_guard and args.codex_code:
+                raise SupervisorError(
+                    "invalid_arguments", "--stale-write-guard is currently Claude Code-only"
+                )
             if args.attempt_id:
                 supervisor = GitSupervisor(args.repo, read_only=True)
                 attempt = supervisor.attempt(args.attempt_id)
@@ -633,7 +656,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                             worktree, command, local=True, attempt_id=args.attempt_id
                         )
                     else:
-                        result = install_claude_code_hooks(worktree, command, local=True)
+                        result = install_claude_code_hooks(
+                            worktree,
+                            command,
+                            local=True,
+                            stale_write_guard=args.stale_write_guard,
+                        )
                 except (OSError, ValueError) as error:
                     raise SupervisorError("hook_install_failed", str(error)) from error
             else:
@@ -643,7 +671,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         command = f"{args.command} --repo {shlex.quote(str(root_path))}"
                         result = install_codex_hooks(root_path, command)
                     else:
-                        result = install_claude_code_hooks(Path(args.repo).resolve(), args.command)
+                        if args.stale_write_guard:
+                            # Refuse to enable hooks whose snapshot table cannot be read
+                            # by the installed schema; hook installation never migrates.
+                            GitSupervisor(args.repo, read_only=True)
+                        result = install_claude_code_hooks(
+                            Path(args.repo).resolve(),
+                            args.command,
+                            stale_write_guard=args.stale_write_guard,
+                        )
                 except (OSError, ValueError) as error:
                     raise SupervisorError("hook_install_failed", str(error)) from error
             emit(result)
@@ -655,15 +691,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = _run_trust_helper(args)
             emit(result)
             return 0
-        read_only = args.action in READ_ONLY_ACTIONS or (
-            args.action == "message" and args.message_action == "list"
+        # Snapshot hooks validate the schema through a read-only supervisor; the
+        # snapshot method owns its separate, narrow cache-table write transaction.
+        read_only = (
+            args.action in READ_ONLY_ACTIONS
+            or args.action == "snapshot"
+            or (args.action == "message" and args.message_action == "list")
         )
         supervisor = GitSupervisor(
             args.repo,
             diagnostic=args.action == "doctor",
             read_only=read_only,
         )
-        if args.action == "doctor":
+        if args.action == "snapshot":
+            attempt_id = args.attempt_id or os.environ.get("ACP_ATTEMPT_ID", "")
+            payload = _hook_payload(sys.stdin.read())
+            if (
+                not attempt_id
+                or not isinstance(payload, dict)
+                or payload.get("tool_name") != "Read"
+            ):
+                return 0
+            target = path_from_hook_payload(payload)
+            caller_cwd = cwd_from_hook_payload(payload)
+            if target is None or caller_cwd is None:
+                return 0
+            try:
+                supervisor.record_file_snapshot(attempt_id, target, caller_cwd=caller_cwd)
+            except Exception:
+                # Snapshot hooks are advisory and must not block reads. A later Write
+                # guard still fails closed if it lacks a fresh, matching snapshot.
+                return 0
+            return 0
+        elif args.action == "doctor":
             result = supervisor.doctor()
         elif args.action == "migrate":
             result = supervisor.migrate()
@@ -671,10 +731,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             attempt_id = args.attempt_id or os.environ.get("ACP_ATTEMPT_ID", "")
             if not attempt_id:
                 raise SupervisorError("missing_attempt", "pass --attempt or export ACP_ATTEMPT_ID")
+            if args.freshness and not args.hook:
+                raise SupervisorError(
+                    "invalid_arguments", "--freshness requires a Claude Code --hook payload"
+                )
             if args.describe:
                 emit(supervisor.guard_context(attempt_id))
                 return 0
             if args.codex_hook:
+                if args.freshness:
+                    return _codex_deny(
+                        "--freshness is currently available only for Claude Code Write"
+                    )
                 raw_payload = sys.stdin.read(CODEX_MAX_HOOK_INPUT_CHARS + 1)
                 if len(raw_payload) > CODEX_MAX_HOOK_INPUT_CHARS:
                     return _codex_deny(
@@ -714,6 +782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             target = args.path
             caller_cwd = os.getcwd()
+            payload = None
             if args.hook:
                 payload = _hook_payload(sys.stdin.read())
                 target = path_from_hook_payload(payload)
@@ -733,6 +802,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not target:
                 raise SupervisorError("missing_path", "pass --path or use --hook")
             decision = supervisor.guard(attempt_id, target, caller_cwd=caller_cwd)
+            if (
+                decision["allow"]
+                and args.freshness
+                and isinstance(payload, dict)
+                and payload.get("tool_name") == "Write"
+            ):
+                decision = supervisor.check_file_snapshot(
+                    attempt_id, decision["path"], caller_cwd=caller_cwd
+                )
             if not decision["allow"]:
                 return _deny(decision)
             emit(decision)
@@ -894,6 +972,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
     except (SupervisorError, TrustBundleError) as error:
+        if args.action == "snapshot":
+            return 0
         if args.action == "guard" and getattr(args, "codex_hook", False):
             return _codex_deny(f"ACP could not decide whether the write is in scope: {error}")
         print(
@@ -915,6 +995,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return DENY_EXIT_CODE
         return 1
     except Exception as error:
+        if args.action == "snapshot":
+            return 0
         if args.action == "guard" and getattr(args, "codex_hook", False):
             return _codex_deny(f"ACP could not decide whether the write is in scope: {error}")
         if args.action == "guard" and getattr(args, "hook", False):
