@@ -290,14 +290,23 @@ def _merge_hook_events(
     A settings file is the user's, and it is normal for it to carry hooks that have
     nothing to do with ACP. Replacing the file — or even the `hooks` key — to install
     an integration would be a destructive act performed on the user's behalf, so this
-    drops only previous ACP entries (recognised by the command prefix) and appends the
-    current ones, leaving every other hook untouched.
+    removes only ACP-owned hook commands and appends the current ones, leaving other
+    hooks intact even when they share a matcher entry with ACP.
     """
 
     merged = dict(existing)
     for event in dict.fromkeys([*existing, *generated]):
         entries = generated.get(event, [])
-        kept = [entry for entry in merged.get(event, []) if not _is_acp_entry(entry, command)]
+        kept: list[Any] = []
+        for entry in merged.get(event, []):
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                kept.append(entry)
+                continue
+            hooks = [hook for hook in entry["hooks"] if not _is_acp_hook(hook, command)]
+            if len(hooks) == len(entry["hooks"]):
+                kept.append(entry)
+            elif hooks:
+                kept.append({**entry, "hooks": hooks})
         if kept or entries:
             merged[event] = kept + entries
         else:
@@ -305,15 +314,26 @@ def _merge_hook_events(
     return merged
 
 
-def _is_acp_entry(entry: Any, command: str) -> bool:
-    if not isinstance(entry, dict):
+def _is_acp_hook(hook: Any, command: str) -> bool:
+    if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
         return False
-    return any(
-        isinstance(hook, dict)
-        and isinstance(hook.get("command"), str)
-        and hook["command"].startswith((f"{command} guard", f"{command} snapshot"))
-        for hook in entry.get("hooks", [])
-    )
+    hook_command = hook["command"]
+    if hook_command.startswith((f"{command} guard", f"{command} snapshot")):
+        return True
+    try:
+        arguments = shlex.split(hook_command)
+    except ValueError:
+        return False
+    for index, argument in enumerate(arguments[:-2]):
+        executable = argument.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if executable.endswith(".exe"):
+            executable = executable[:-4]
+        if executable == "acp" and (
+            (arguments[index + 1] == "guard" and arguments[index + 2] in {"--hook", "--describe"})
+            or (arguments[index + 1] == "snapshot" and arguments[index + 2] == "--hook")
+        ):
+            return True
+    return False
 
 
 def _ensure_local_settings_ignored(root: Path) -> None:

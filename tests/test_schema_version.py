@@ -144,10 +144,25 @@ def test_version_two_upgrade_creates_the_file_snapshot_ledger(repo: Path) -> Non
         "file_exists",
         "sha256",
         "byte_size",
+        "change_token",
         "observed_at_ns",
         "expires_at",
     } <= columns
     assert "idx_file_snapshots_expiry" in indexes
+
+
+def test_version_three_upgrade_adds_file_snapshot_change_token(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("ALTER TABLE file_snapshots DROP COLUMN change_token")
+        connection.execute("UPDATE meta SET value = '3' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    upgraded = GitSupervisor(repo)
+    assert upgraded.schema_version_on_open == 3
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with upgraded.connect() as connection:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(file_snapshots)")}
+    assert "change_token" in columns
 
 
 def test_a_stamp_that_is_not_a_version_is_never_guessed(repo: Path) -> None:

@@ -280,6 +280,34 @@ def test_opt_in_freshness_hook_denies_a_full_write_after_the_file_changes(
     capsys.readouterr()
 
 
+def test_opt_in_freshness_detects_a_changed_file_restored_to_the_same_bytes(
+    claimed, repo: Path, monkeypatch, capsys
+) -> None:
+    _, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    target = worktree / "alpha.txt"
+    original = "contents Claude read\n"
+    target.write_text(original, encoding="utf-8")
+    read_payload = json.dumps(
+        {"cwd": str(worktree), "tool_name": "Read", "tool_input": {"file_path": str(target)}}
+    )
+    write_payload = json.dumps(
+        {
+            "cwd": str(worktree),
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(target), "content": "stale replacement\n"},
+        }
+    )
+
+    assert run_snapshot_hook(repo, attempt["id"], read_payload, monkeypatch) == 0
+    target.write_text("intervening edit\n", encoding="utf-8")
+    target.write_text(original, encoding="utf-8")
+
+    assert run_freshness_guard(repo, attempt["id"], write_payload, monkeypatch) == DENY_EXIT_CODE
+    assert json.loads(capsys.readouterr().out)["reason"] == "stale_file_snapshot"
+    assert target.read_text(encoding="utf-8") == original
+
+
 def test_opt_in_freshness_requires_snapshot_for_existing_file_but_allows_creation(
     repo: Path, monkeypatch, capsys
 ) -> None:
@@ -368,7 +396,7 @@ def test_file_snapshot_rejects_a_symlink_instead_of_following_it(tmp_path: Path)
     link.symlink_to(outside)
 
     with pytest.raises(ValueError, match="regular files"):
-        _file_snapshot(link)
+        _file_snapshot(link, root=tmp_path)
 
     assert outside.read_text(encoding="utf-8") == "private contents\n"
 
@@ -392,7 +420,50 @@ def test_file_snapshot_rejects_a_file_that_changes_while_being_hashed(
 
     monkeypatch.setattr("agent_control_plane.supervisor.claims.os.fstat", change_before_second_stat)
     with pytest.raises(OSError, match="changed while"):
-        _file_snapshot(target)
+        _file_snapshot(target, root=tmp_path)
+
+
+def test_file_snapshot_rejects_parent_symlink_swap_after_guard(
+    repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "nested/**")
+    attempt = supervisor.claim(task["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    parent = worktree / "nested"
+    parent.mkdir()
+    target = parent / "alpha.txt"
+    target.write_text("same snapshot bytes\n", encoding="utf-8")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / target.name).write_text("same snapshot bytes\n", encoding="utf-8")
+    assert supervisor.record_file_snapshot(attempt["id"], "nested/alpha.txt", caller_cwd=worktree)[
+        "recorded"
+    ]
+
+    moved_parent = worktree / "nested.original"
+    from agent_control_plane.supervisor import claims
+
+    real_snapshot = claims._file_snapshot
+
+    def swap_then_snapshot(path: Path, *, root: Path):
+        parent.rename(moved_parent)
+        parent.symlink_to(external, target_is_directory=True)
+        try:
+            return real_snapshot(path, root=root)
+        finally:
+            parent.unlink()
+            moved_parent.rename(parent)
+
+    monkeypatch.setattr(claims, "_file_snapshot", swap_then_snapshot)
+    decision = supervisor.check_file_snapshot(
+        attempt["id"], "nested/alpha.txt", caller_cwd=worktree
+    )
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "freshness_snapshot_unavailable"
+    assert (external / target.name).read_text(encoding="utf-8") == "same snapshot bytes\n"
+    assert target.read_text(encoding="utf-8") == "same snapshot bytes\n"
 
 
 def test_file_snapshots_are_isolated_per_attempt(repo: Path) -> None:
@@ -899,20 +970,43 @@ def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hoo
         json.dumps(
             {
                 "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Read",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "/old/venv/acp snapshot --hook",
+                                },
+                                {"type": "command", "command": "my-read-audit"},
+                            ],
+                        }
+                    ],
                     "PostToolUse": [
                         {"matcher": "Write", "hooks": [{"type": "command", "command": "my-audit"}]}
-                    ]
+                    ],
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "/old/venv/acp guard --describe",
+                                }
+                            ]
+                        }
+                    ],
                 }
             }
         ),
         encoding="utf-8",
     )
 
-    install_claude_code_hooks(tmp_path, stale_write_guard=True)
+    install_claude_code_hooks(tmp_path, command="/old/venv/acp", stale_write_guard=True)
     enabled = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]
     pre_hooks = [hook for entry in enabled["PreToolUse"] for hook in entry["hooks"]]
     assert any("guard --hook --freshness" in hook["command"] for hook in pre_hooks)
     assert any("snapshot --hook" in hook["command"] for hook in pre_hooks)
+    assert any(hook["command"] == "my-read-audit" for hook in pre_hooks)
     assert enabled["PostToolUse"][0]["hooks"][0]["command"] == "my-audit"
     assert not any(
         "snapshot --hook" in hook["command"]
@@ -920,7 +1014,7 @@ def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hoo
         for hook in entry.get("hooks", [])
     )
 
-    install_claude_code_hooks(tmp_path)
+    install_claude_code_hooks(tmp_path, command="acp")
     disabled = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]
     commands = [
         hook["command"]
@@ -929,6 +1023,9 @@ def test_stale_write_guard_is_opt_in_and_reinstall_removes_only_acp_snapshot_hoo
         for hook in entry.get("hooks", [])
     ]
     assert "my-audit" in commands
+    assert "my-read-audit" in commands
+    assert "acp guard --describe" in commands
+    assert not any(command.startswith("/old/venv/acp ") for command in commands)
     assert not any("snapshot --hook" in command for command in commands)
     assert not any("guard --hook --freshness" in command for command in commands)
 

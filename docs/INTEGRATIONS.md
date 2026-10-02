@@ -88,11 +88,15 @@ acp --repo "$BASE" hooks install --claude-code --attempt "$ATTEMPT" \
   --stale-write-guard
 ```
 
-The `Read` pre-hook stores a SHA-256 snapshot for declared write paths. Before a full
-`Write` replacement, ACP compares the current bytes with the latest snapshot; a change,
-an expired/missing baseline for an existing file, or an unreadable/oversized file denies
-the write and tells the agent to read again. A still-absent path may be created. Only a
-subsequent supported `Read` refreshes the snapshot; an agent that writes a file must read
+The `Read` pre-hook stores a bounded SHA-256 snapshot plus a filesystem identity/change-time
+token for declared write paths. Before a full `Write` replacement, ACP compares both with
+the current file; edits restored to identical bytes are still detected on filesystems with
+normal POSIX ctime behavior. An expired/missing baseline for an existing file, or an
+unreadable/oversized file, denies the write and tells the agent to read again. A still-absent
+path may be created. Snapshot traversal is anchored at the attempt worktree and opens each
+path component without following symlinks; if those safe descriptor-relative APIs are not
+available, snapshot recording fails and replacement of an existing file fails closed. Only
+a subsequent supported `Read` refreshes the snapshot; an agent that writes a file must read
 it again before another full-file replacement. Snapshots are scoped to one attempt and
 path, expire after 24 hours, are capped at 256 paths per attempt, and are limited to 16 MiB
 per file. The option is off by default.

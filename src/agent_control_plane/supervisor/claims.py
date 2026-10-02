@@ -7,6 +7,7 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -32,54 +33,106 @@ MAX_FILE_SNAPSHOTS_PER_ATTEMPT = 256
 MAX_FILE_SNAPSHOT_BYTES = 16 * 1024 * 1024
 
 
-def _file_snapshot(path: Path) -> tuple[bool, str, int]:
-    """Return a bounded content fingerprint, or an explicit absent-file marker.
+def _file_stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _file_snapshot(path: Path, *, root: Path) -> tuple[bool, str, int, str]:
+    """Fingerprint one regular file beneath ``root`` without following path links.
+
+    Walk from the filesystem root using pinned directory descriptors and
+    ``O_NOFOLLOW`` for every component. This keeps a parent-directory symlink swap
+    from redirecting the hash outside the attempt worktree. The content digest is
+    paired with device, inode and ctime so an A -> B -> A edit is still detected on
+    filesystems that expose normal POSIX change-time metadata.
 
     This is an optimistic stale-content check, not an OS-level write lock. Stat the
-    descriptor on both sides of the digest so a file changing while it is hashed is
-    never recorded as a trustworthy snapshot.
+    opened descriptor on both sides of the digest so a file changing while it is
+    hashed is never recorded as a trustworthy snapshot.
     """
 
+    path = Path(path)
+    root = Path(root)
+    if not path.is_absolute() or not root.is_absolute() or root.anchor != os.sep:
+        raise ValueError("freshness paths must use absolute POSIX paths")
     try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return False, "", 0
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("only regular files can be freshness-checked")
-    if info.st_size > MAX_FILE_SNAPSHOT_BYTES:
-        raise OverflowError(
-            f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
-        )
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("freshness path is outside its attempt worktree") from error
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("freshness path must name a file beneath its attempt worktree")
+    if os.open not in getattr(os, "supports_dir_fd", set()) or os.stat not in getattr(
+        os, "supports_dir_fd", set()
+    ):
+        raise OSError("safe descriptor-relative path traversal is unavailable on this platform")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("no-follow directory opens are unavailable on this platform")
 
-    digest = hashlib.sha256()
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    with os.fdopen(descriptor, "rb") as source:
-        before = os.fstat(source.fileno())
-        if not stat.S_ISREG(before.st_mode):
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    parent_fd = os.open(os.sep, directory_flags)
+    try:
+        # Open every absolute root and target-parent component relative to the
+        # already-pinned directory. Never let a symlink component be followed.
+        for component in root.parts[1:]:
+            next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        for component in relative.parts[:-1]:
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return False, "", 0, ""
+            os.close(parent_fd)
+            parent_fd = next_fd
+
+        name = relative.parts[-1]
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False, "", 0, ""
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError("only regular files can be freshness-checked")
-        identity_at_open = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-        identity_opened = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        if identity_at_open != identity_opened:
-            raise OSError("file changed while its freshness snapshot was being opened")
-        if before.st_size > MAX_FILE_SNAPSHOT_BYTES:
+        if info.st_size > MAX_FILE_SNAPSHOT_BYTES:
             raise OverflowError(
                 f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
             )
-        size = 0
-        while block := source.read(1024 * 1024):
-            size += len(block)
-            if size > MAX_FILE_SNAPSHOT_BYTES:
+
+        digest = hashlib.sha256()
+        flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW
+        )
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError("only regular files can be freshness-checked") from error
+            raise
+        with os.fdopen(descriptor, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("only regular files can be freshness-checked")
+            if _file_stat_identity(info) != _file_stat_identity(before):
+                raise OSError("file changed while its freshness snapshot was being opened")
+            if before.st_size > MAX_FILE_SNAPSHOT_BYTES:
                 raise OverflowError(
                     f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
                 )
-            digest.update(block)
-        after = os.fstat(source.fileno())
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_after or size != after.st_size:
-        raise OSError("file changed while its freshness snapshot was being computed")
-    return True, digest.hexdigest(), size
+            size = 0
+            while block := source.read(1024 * 1024):
+                size += len(block)
+                if size > MAX_FILE_SNAPSHOT_BYTES:
+                    raise OverflowError(
+                        f"file exceeds the {MAX_FILE_SNAPSHOT_BYTES}-byte freshness-check limit"
+                    )
+                digest.update(block)
+            after = os.fstat(source.fileno())
+        if _file_stat_identity(before) != _file_stat_identity(after) or size != after.st_size:
+            raise OSError("file changed while its freshness snapshot was being computed")
+        change_token = f"{after.st_dev:x}:{after.st_ino:x}:{after.st_ctime_ns:x}"
+        return True, digest.hexdigest(), size, change_token
+    finally:
+        os.close(parent_fd)
 
 
 @contextmanager
@@ -488,7 +541,9 @@ class ClaimsMixin:
 
         target = Path(decision["path"])
         try:
-            file_exists, digest, size = _file_snapshot(target)
+            file_exists, digest, size, change_token = _file_snapshot(
+                target, root=Path(decision["worktree"])
+            )
         except (OSError, OverflowError, ValueError) as error:
             reason = (
                 "snapshot_too_large" if isinstance(error, OverflowError) else "snapshot_unavailable"
@@ -543,12 +598,14 @@ class ClaimsMixin:
             connection.execute(
                 """
                 INSERT INTO file_snapshots (
-                  attempt_id, path, file_exists, sha256, byte_size, observed_at_ns, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                  attempt_id, path, file_exists, sha256, byte_size, change_token,
+                  observed_at_ns, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(attempt_id, path) DO UPDATE SET
                   file_exists = excluded.file_exists,
                   sha256 = excluded.sha256,
                   byte_size = excluded.byte_size,
+                  change_token = excluded.change_token,
                   observed_at_ns = excluded.observed_at_ns,
                   expires_at = excluded.expires_at
                 """,
@@ -558,6 +615,7 @@ class ClaimsMixin:
                     1 if file_exists else 0,
                     digest,
                     size,
+                    change_token,
                     time.time_ns(),
                     epoch + FILE_SNAPSHOT_TTL_SECONDS,
                 ),
@@ -602,7 +660,9 @@ class ClaimsMixin:
             return decision
         target = Path(decision["path"])
         try:
-            file_exists, digest, size = _file_snapshot(target)
+            file_exists, digest, size, change_token = _file_snapshot(
+                target, root=Path(decision["worktree"])
+            )
         except (OSError, OverflowError, ValueError) as error:
             return self._guard_denial(
                 attempt_id,
@@ -632,7 +692,7 @@ class ClaimsMixin:
                 )
             snapshot = connection.execute(
                 """
-                SELECT file_exists, sha256, byte_size, expires_at
+                SELECT file_exists, sha256, byte_size, change_token, expires_at
                 FROM file_snapshots WHERE attempt_id = ? AND path = ?
                 """,
                 (attempt_id, str(target)),
@@ -662,6 +722,7 @@ class ClaimsMixin:
             bool(snapshot["file_exists"]) != file_exists
             or snapshot["sha256"] != digest
             or snapshot["byte_size"] != size
+            or snapshot["change_token"] != change_token
         ):
             return self._guard_denial(
                 attempt_id,

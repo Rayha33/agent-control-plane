@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -234,6 +234,7 @@ def _create_file_snapshots(connection: sqlite3.Connection) -> None:
           file_exists INTEGER NOT NULL CHECK (file_exists IN (0, 1)),
           sha256 TEXT NOT NULL,
           byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+          change_token TEXT NOT NULL DEFAULT '',
           observed_at_ns INTEGER NOT NULL,
           expires_at INTEGER NOT NULL,
           PRIMARY KEY (attempt_id, path)
@@ -245,9 +246,19 @@ def _create_file_snapshots(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_file_snapshot_change_token(connection: sqlite3.Connection) -> None:
+    """Persist file identity/change-time alongside bytes to catch restored content."""
+
+    if "change_token" not in _columns(connection, "file_snapshots"):
+        connection.execute(
+            "ALTER TABLE file_snapshots ADD COLUMN change_token TEXT NOT NULL DEFAULT ''"
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _create_file_snapshots),
+    (4, _add_file_snapshot_change_token),
 )
 
 
