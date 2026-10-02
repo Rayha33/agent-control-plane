@@ -197,6 +197,20 @@ def test_inbox_is_read_only_and_labels_agent_text_untrusted(repo: Path) -> None:
     assert state_fingerprint(supervisor) == before
 
 
+def test_changes_tool_is_a_credential_free_alias_for_the_read_only_preview(repo: Path) -> None:
+    writable = GitSupervisor(repo)
+    task = make_task(writable, "alpha.txt", title="change preview")
+    attempt = writable.claim(task["id"], "preview-worker")
+    supervisor = GitSupervisor(repo, read_only=True)
+    expected = supervisor.change_preview(attempt["id"])
+
+    actual = mcp_server.dispatch(supervisor, "acp_changes", {"attempt_id": attempt["id"]})
+
+    assert actual == expected
+    assert "claim_token" not in actual
+    assert "credential" not in actual
+
+
 def test_the_bundle_tool_cannot_be_used_to_read_other_files(repo: Path) -> None:
     """The traversal an untrusted caller would reach for (board #1709)."""
 

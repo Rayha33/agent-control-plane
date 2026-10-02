@@ -216,9 +216,10 @@ without shelling out:
 {"mcpServers": {"acp": {"command": "acp", "args": ["--repo", "/path/to/repo", "mcp-serve"]}}}
 ```
 
-Eleven tools, each a one-line delegation to a supervisor method: `acp_status`,
+Twelve tools, each a one-line delegation to a supervisor method: `acp_status`,
 `acp_queue`, `acp_merge_plan`, `acp_reviewers`, `acp_verify_events`, `acp_show`,
-`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`, and `acp_inbox`.
+`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`, `acp_inbox`, and
+`acp_changes`.
 
 **No writes and no credential, on purpose.** `claim`, `heartbeat`, `submit`, `qc` and
 `integrate` are authenticated, and `runner_identity.py` keeps worker, critic and
@@ -238,10 +239,81 @@ There is no third-party dependency: the wire format is newline-delimited JSON-RP
 small enough to implement honestly and not worth an SDK in `acp`'s import graph for one
 subcommand.
 
+### Read-only change previews
+
+Use the base checkout to inspect one known attempt; the command does not change or
+reconcile its worktree:
+
+```bash
+acp --repo "$BASE" changes "$ATTEMPT"
+```
+
+The preview separates committed path/status changes from the current index/worktree and
+untracked path names. It reports the attempt's start SHA, the HEAD observed before and
+after the scan, and per-status path counts. Output is path metadata only: no file contents,
+line-level diff, credential, or claim token. Lists are capped at 1,000 paths per section;
+counts cover inventories up to 10,000 records per section and `paths_truncated` identifies a
+capped list. Larger inventories or Git output over 16 MiB fail closed. Git reads the
+captured index in disposable metadata and an isolated object directory containing copies of
+regular loose objects and paired pack/index files in the ACP repository's local object store.
+The preview does not copy or follow `objects/info/alternates` (including transitive
+alternates), and the temporary object database has no alternate path of its own; commits
+available only through an external alternate therefore fail closed. A snapshot with more than
+250,000 object-store directory entries or over 1 GiB of object data fails closed. Git index
+directories are incrementally capped at 1,024 entries. It does not load
+repository/worktree/global/system Git config,
+configured worker filters, external excludes files, `.git/info/exclude`, or external attribute
+files. Attribute lookup is pinned to a generated empty tree using Git's
+`--attr-source=<tree-ish>` option, and the isolated Git metadata contains a guarded
+`info/attributes` file that unsets `filter`. Git versions without `--attr-source` fail
+closed. Consequently, a path excluded only through those settings can appear in the
+preview, and paths marked with a filter attribute may be conservatively reported as
+modified. This intentionally favors a bounded inventory over exact parity with a user's
+normal `git status` configuration.
+
+Live worktrees can change during inspection. `stable: false` means HEAD, index, or the
+path/status inventory changed between observations; even `stable: true` is best-effort,
+not a snapshot guarantee (content can change without changing the observed path/status set).
+Treat the displayed file and directory names as potentially sensitive. This view does not
+make an uncommitted file safe to reuse and does not authorize checkout, cherry-pick, copy,
+or merge.
+
+The CLI and `acp_changes` MCP tool call the same supervisor method on a `mode=ro` database.
+Git is invoked with optional index writes disabled, external diff/textconv/pager and
+fsmonitor disabled, external attribute files ignored, and submodule traversal suppressed.
+The scratch repository is created under `/tmp` rather than honoring `TMPDIR`, `TMP`, or
+`TEMP`, so caller-controlled temporary-directory settings cannot write metadata into the
+attempt being inspected.
+Repository and worktree Git config are not loaded, so changes there cannot supply preview
+settings or filter executables. Git uses fixed command-line overrides and isolated scratch
+metadata. The index is copied via no-follow reads into temporary metadata and checked again
+afterward; a changing HEAD, index, status inventory, or allocated worktree makes the result
+unstable or fails closed.
+The isolated Git config, HEAD, guarded `info/attributes`, copied index, scratch-parent
+identity/signature, and empty alternates/ref directories are fingerprinted around every
+Git invocation. Immediately before exec, the pinned-worktree launcher rechecks the scratch
+parent and Git-directory identities, config digest, and filter guard. Those checks are not
+atomic with Git opening its metadata paths, so the isolated child also receives a verified
+zero soft and hard process-creation limits before Git runs. It rejects set-user-ID and
+set-group-ID Git executables. On Linux it also rejects relevant effective, permitted,
+inheritable, or ambient capabilities, sets and verifies `no_new_privs` before exec, and
+probes that a fork is actually denied. If the platform cannot prove these conditions or
+the process runs as root, the launcher fails closed. A hostile same-UID process can still
+cause denial of service by racing scratch files, but Git cannot start a clean filter or
+other helper from that race, and the post-invocation metadata fingerprints reject observed
+changes. This is not isolation from arbitrary code already running as the same OS user.
+The copied object store is checked against its copy-time file inventory; file bytes are
+compared while copying, the trusted empty-tree attribute source is added to that inventory,
+and the complete object-file signature inventory is rechecked before returning. Observed
+scratch-parent swaps, injected objects, or other metadata changes fail closed.
+An active index lock or index snapshot beyond the bounded per-file/aggregate size limits
+fails closed. The temporary metadata is removed at the end. The preview does not create
+Git locks or touch refs, index entries, worktree files, ACP rows, or audit events.
+
 ### What this does not do yet
 
 - **The MCP server is read-only today.** `acp mcp-serve` is shipped and exposes
-  ten read-only tools, including `acp_plan` and `acp_guard`; it does not expose the
+  twelve read-only tools, including `acp_plan`, `acp_guard`, and `acp_changes`; it does not expose the
   authenticated lifecycle mutations (`claim`, `heartbeat`, `submit`, `qc`, or
   `integrate`). Adding those requires resolving the credential boundary above first.
 - **No heartbeat hook.** `acp heartbeat` is a write needing the claim token and the
