@@ -357,17 +357,27 @@ class StatusView:
     def _submission_status(
         connection: sqlite3.Connection,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
-        """Stream minimal per-submission QC data into latest status and recurrence views."""
+        """Stream latest-per-commit QC data into status and recurrence views."""
         rows = connection.execute(
             """
+            WITH ranked_submissions AS (
+              SELECT submission.id, submission.task_id, submission.status,
+                     submission.commit_sha, submission.created_at,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY submission.task_id, submission.commit_sha
+                       ORDER BY submission.created_at DESC, submission.id DESC
+                     ) AS commit_rank
+              FROM submissions AS submission
+            )
             SELECT submission.id, submission.task_id, submission.status,
-                   submission.commit_sha, qc.verdict AS qc_verdict,
+                   submission.commit_sha, submission.created_at, qc.verdict AS qc_verdict,
                    qc.findings_json, qc.finished_at AS qc_finished_at
-            FROM submissions AS submission
+            FROM ranked_submissions AS submission
             LEFT JOIN qc_runs AS qc ON qc.id = (
               SELECT id FROM qc_runs WHERE submission_id = submission.id
               ORDER BY finished_at DESC, id DESC LIMIT 1
             )
+            WHERE submission.commit_rank = 1
             ORDER BY submission.task_id, submission.created_at DESC, submission.id DESC
             """
         )
@@ -376,9 +386,8 @@ class StatusView:
         current_task_id: str | None = None
         latest_commit: str | None = None
         latest_qc_at: str | None = None
-        observed_task_commits: set[str] = set()
         latest_findings: dict[tuple[str, str, str], dict[str, Any]] = {}
-        seen_commits: dict[tuple[str, str, str], set[str]] = {}
+        matching_commit_counts: dict[tuple[str, str, str], int] = {}
         prior_commit_samples: dict[tuple[str, str, str], list[str]] = {}
 
         def finish_task() -> None:
@@ -386,7 +395,7 @@ class StatusView:
                 return
             repeats: list[dict[str, Any]] = []
             for identity, finding in latest_findings.items():
-                distinct_count = len(seen_commits[identity])
+                distinct_count = matching_commit_counts[identity]
                 prior_count = distinct_count - 1
                 if prior_count < 1:
                     continue
@@ -418,9 +427,8 @@ class StatusView:
                 current_task_id = task_id
                 latest_commit = row["commit_sha"]
                 latest_qc_at = row["qc_finished_at"]
-                observed_task_commits = {latest_commit} if latest_commit else set()
                 latest_findings = {}
-                seen_commits = {}
+                matching_commit_counts = {}
                 prior_commit_samples = {}
                 latest_submissions[task_id] = {
                     "id": row["id"],
@@ -434,24 +442,22 @@ class StatusView:
                         if identity is None:
                             continue
                         latest_findings.setdefault(identity, finding)
-                        seen_commits.setdefault(identity, {latest_commit})
+                        matching_commit_counts.setdefault(identity, 1)
                         prior_commit_samples.setdefault(identity, [])
                 continue
 
             commit_sha = row["commit_sha"]
-            if not commit_sha or commit_sha in observed_task_commits:
+            if not commit_sha:
                 continue
-            observed_task_commits.add(commit_sha)
             if not latest_findings or row["qc_verdict"] in {None, "pass"}:
                 continue
+            seen_in_commit: set[tuple[str, str, str]] = set()
             for finding in StatusView._parse_qc_findings(row["findings_json"]):
                 identity = StatusView._qc_finding_identity(finding)
-                if identity not in latest_findings:
+                if identity not in latest_findings or identity in seen_in_commit:
                     continue
-                task_commits = seen_commits[identity]
-                if commit_sha in task_commits:
-                    continue
-                task_commits.add(commit_sha)
+                seen_in_commit.add(identity)
+                matching_commit_counts[identity] += 1
                 samples = prior_commit_samples[identity]
                 if len(samples) < 4:
                     samples.append(commit_sha)
