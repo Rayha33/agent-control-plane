@@ -260,6 +260,7 @@ class ViewsMixin:
             "state_bytes": self._directory_bytes(self.state_dir),
             "reclaimable_worktrees": len(reclaimable),
             "reclaimable_bytes": sum(entry["bytes"] for entry in reclaimable),
+            "admission_min_free_bytes": self.config.min_free_bytes,
             "filesystem": filesystem,
         }
         default_worktree_root = (self.state_dir / "worktrees").resolve(strict=False)

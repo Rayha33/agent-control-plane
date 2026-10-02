@@ -255,6 +255,7 @@
       "_active_attempt",
       "_allocate_runtime",
       "_apply_migration_ledger",
+      "_assert_attempt_worktree_headroom",
       "_assert_base_checkout_unchanged",
       "_assert_driver_config_unchanged",
       "_assert_integration_git_boundary",
@@ -516,6 +517,7 @@
       "ok"
     ],
     "class:ProcessMixin": [
+      "_assert_attempt_worktree_headroom",
       "_attempt_worktree_head",
       "_attempt_worktree_is_managed",
       "_containment_permits_fork",
@@ -1513,6 +1515,7 @@
   },
   "agent_control_plane.supervisor.process": {
     "class:ProcessMixin": [
+      "_assert_attempt_worktree_headroom",
       "_attempt_worktree_head",
       "_attempt_worktree_is_managed",
       "_containment_permits_fork",

@@ -435,6 +435,21 @@ def test_render_text_is_a_single_screen_summary(repo: Path) -> None:
     assert len(text.splitlines()) < 40
 
 
+def test_status_discloses_configured_disk_admission_floor(repo: Path) -> None:
+    config_path = repo / "acp.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\n[worktrees]\nmin_free_bytes = 1024\n",
+        encoding="utf-8",
+    )
+    supervisor = GitSupervisor(repo)
+
+    snapshot = supervisor.status()
+    text = supervisor.render_status(snapshot)
+
+    assert snapshot["disk"]["admission_min_free_bytes"] == 1024
+    assert "minimum available space before new worktree: 1.0 KiB" in text
+
+
 def test_status_reports_ports_held_by_an_attempt(repo: Path) -> None:
     port = _free_port()
     (repo / "acp.toml").write_text(

@@ -56,6 +56,7 @@ class Config:
     trust_root: Path | None
     trust_owner_uid: int
     attempts_root: Path | None
+    min_free_bytes: int | None
 
 
 class ConfigMixin:
@@ -134,6 +135,15 @@ class ConfigMixin:
                 self._trust_config_error = f"{error.code}: {error.message}"
         if not isinstance(worktrees, dict):
             raise SupervisorError("invalid_config", "worktrees must be a table")
+        min_free_bytes = worktrees.get("min_free_bytes")
+        if min_free_bytes is not None and (
+            isinstance(min_free_bytes, bool)
+            or not isinstance(min_free_bytes, int)
+            or min_free_bytes < 1
+        ):
+            raise SupervisorError(
+                "invalid_config", "worktrees.min_free_bytes must be a positive integer"
+            )
         attempts_root: Path | None = None
         attempts_root_value = worktrees.get("attempts_root")
         if attempts_root_value is not None:
@@ -353,6 +363,7 @@ class ConfigMixin:
             trust_root=trust_root,
             trust_owner_uid=trust_owner_uid,
             attempts_root=attempts_root,
+            min_free_bytes=min_free_bytes,
         )
 
     @staticmethod

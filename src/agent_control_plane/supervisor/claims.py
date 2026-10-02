@@ -292,7 +292,15 @@ class ClaimsMixin:
         worktree_created = False
         try:
             self._assert_safe_git_execution_config()
-            self._git("worktree", "add", "-b", branch, str(worktree), start_sha)
+            self._git(
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(worktree),
+                start_sha,
+                _before=lambda: self._assert_attempt_worktree_headroom(worktree_root),
+            )
             worktree_created = True
             self._runtime_up(attempt_id)
         except (OSError, subprocess.SubprocessError, SupervisorError):

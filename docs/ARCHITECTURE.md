@@ -116,8 +116,14 @@ the database needs upgrading, so it has to be able to open one to say so.
 `acp status` also samples OS-reported total and free bytes for the filesystem
 containing the ACP state/worktree root. These values are separate from measured
 ACP-owned state and reclaimable-worktree bytes; they cannot attribute provider
-temp copies, reserve space, enforce a quota, or justify deleting files. A failed
-capacity probe is reported as unavailable with unknown byte values.
+temp copies, reserve space, enforce a quota, or justify deleting files. An
+optional `worktrees.min_free_bytes` setting adds a pre-provision admission floor:
+under the cross-process Git-operation lock, ACP probes the attempt-worktree root
+and Git common-directory filesystems using bytes available to the ACP process,
+checking a shared filesystem once. A failed probe or a value below the configured
+floor refuses creation. The floor does not reserve capacity or limit later worker
+writes, and ACP does not sweep unregistered provider temp copies. Status reports the configured floor so the
+operator can distinguish admission policy from measured free space.
 
 The ready queue reserves each admitted task's scopes for the remainder of the
 pass. Its `ready` list is therefore a set of tasks that can run *concurrently*,
