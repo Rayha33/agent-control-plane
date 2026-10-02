@@ -328,6 +328,224 @@ def test_non_overlapping_tasks_get_parallel_worktrees(repo: Path) -> None:
     assert claims[0]["worktree"] != claims[1]["worktree"]
 
 
+def test_git_operation_guard_serializes_git_invocation_across_processes(
+    repo: Path, tmp_path: Path
+) -> None:
+    supervisor = GitSupervisor(repo)
+    gate = tmp_path / "git-operation-go"
+    ready = tmp_path / "git-operation-ready"
+    waiting = tmp_path / "git-operation-waiting"
+    finished = tmp_path / "git-operation-finished"
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = os.environ.copy()
+    inherited_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(source_root), inherited_pythonpath) if value
+    )
+    child = "\n".join(
+        (
+            "from pathlib import Path",
+            "import sys, time",
+            "from agent_control_plane.git_supervisor import GitSupervisor",
+            "from agent_control_plane.supervisor import process as process_module",
+            "repo, gate, ready, waiting, finished = map(Path, sys.argv[1:6])",
+            "supervisor = GitSupervisor(repo)",
+            "real_flock = process_module.fcntl.flock",
+            "def observed_flock(fd, operation):",
+            "    if operation == process_module.fcntl.LOCK_EX:",
+            "        waiting.touch()",
+            "    return real_flock(fd, operation)",
+            "process_module.fcntl.flock = observed_flock",
+            "ready.touch()",
+            "deadline = time.monotonic() + 10",
+            "while not gate.exists():",
+            "    if time.monotonic() >= deadline:",
+            "        raise TimeoutError('parent did not release the test gate')",
+            "    time.sleep(0.005)",
+            "finished.write_text(supervisor._git_text('rev-parse', 'HEAD'), encoding='utf-8')",
+        )
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child,
+            str(repo),
+            str(gate),
+            str(ready),
+            str(waiting),
+            str(finished),
+        ],
+        cwd=repo,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), process.communicate(timeout=5)[1]
+
+        with supervisor._git_operation_guard():
+            gate.touch()
+            deadline = time.monotonic() + 10
+            while (
+                not waiting.exists()
+                and not finished.exists()
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            assert waiting.exists(), "child Git invocation did not attempt the shared lock"
+            time.sleep(0.1)
+            assert not finished.exists(), "child Git invocation passed the lock while held"
+
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+        assert finished.read_text(encoding="utf-8") == git(repo, "rev-parse", "HEAD")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=3)
+
+
+def test_parallel_process_claims_preserve_sibling_worktrees_and_failed_cleanup(
+    repo: Path, tmp_path: Path
+) -> None:
+    supervisor = GitSupervisor(repo)
+    first = task(supervisor, "alpha.txt", "process-alpha")
+    second = task(supervisor, "beta.txt", "process-beta")
+    invalid_base = task(supervisor, "logical:process/failure", "invalid-base")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET base_sha = ? WHERE id = ?",
+            ("0" * 40, invalid_base["id"]),
+        )
+
+    gate = tmp_path / "parallel-claims-go"
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment = os.environ.copy()
+    inherited_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(source_root), inherited_pythonpath) if value
+    )
+    child = "\n".join(
+        (
+            "import json, sys, time",
+            "from pathlib import Path",
+            "from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError",
+            "repo = Path(sys.argv[1])",
+            "task_id, agent_id = sys.argv[2:4]",
+            "ready, gate, result = map(Path, sys.argv[4:7])",
+            "supervisor = GitSupervisor(repo)",
+            "ready.touch()",
+            "deadline = time.monotonic() + 10",
+            "while not gate.exists():",
+            "    if time.monotonic() >= deadline:",
+            "        raise TimeoutError('parent did not release the test gate')",
+            "    time.sleep(0.005)",
+            "try:",
+            "    attempt = supervisor.claim(task_id, agent_id)",
+            "    payload = {",
+            "        'ok': True,",
+            "        'attempt_id': attempt['id'],",
+            "        'branch': attempt['branch'],",
+            "        'worktree': attempt['worktree'],",
+            "    }",
+            "except SupervisorError as error:",
+            "    payload = {'ok': False, 'code': error.code}",
+            "result.write_text(json.dumps(payload), encoding='utf-8')",
+        )
+    )
+    specs = [
+        (first, "agent-process-alpha", "process-alpha"),
+        (second, "agent-process-beta", "process-beta"),
+        (invalid_base, "agent-invalid-base", "invalid-base"),
+    ]
+    processes: list[tuple[subprocess.Popen[str], Path, Path]] = []
+    try:
+        for index, (created, agent_id, _label) in enumerate(specs):
+            ready = tmp_path / f"parallel-claims-ready-{index}"
+            result = tmp_path / f"parallel-claims-result-{index}.json"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    child,
+                    str(repo),
+                    created["id"],
+                    agent_id,
+                    str(ready),
+                    str(gate),
+                    str(result),
+                ],
+                cwd=repo,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            processes.append((process, ready, result))
+
+        deadline = time.monotonic() + 15
+        while (
+            not all(ready.exists() for _, ready, _ in processes)
+            and all(process.poll() is None for process, _, _ in processes)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert all(ready.exists() for _, ready, _ in processes), [
+            process.communicate(timeout=5)[1]
+            for process, ready, _ in processes
+            if not ready.exists()
+        ]
+        gate.touch()
+
+        payloads = []
+        for process, _, result in processes:
+            stdout, stderr = process.communicate(timeout=30)
+            assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+            payloads.append(json.loads(result.read_text(encoding="utf-8")))
+
+        successful = [payload for payload in payloads if payload["ok"]]
+        failed = [payload for payload in payloads if not payload["ok"]]
+        assert len(successful) == 2
+        assert len(failed) == 1 and failed[0]["code"] == "git_error"
+        assert len({payload["attempt_id"] for payload in successful}) == 2
+        assert len({payload["branch"] for payload in successful}) == 2
+        worktrees = {Path(payload["worktree"]) for payload in successful}
+        assert len(worktrees) == 2
+        assert all(path.is_dir() for path in worktrees)
+        assert all(
+            supervisor.task(created["id"])["status"] == "working" for created, _, _ in specs[:2]
+        )
+        assert supervisor.task(invalid_base["id"])["status"] == "open"
+
+        worktree_listing = git(repo, "worktree", "list", "--porcelain")
+        assert all(f"worktree {path}" in worktree_listing for path in worktrees)
+        assert all(
+            f"branch refs/heads/{payload['branch']}" in worktree_listing for payload in successful
+        )
+        failed_branch = f"acp/task-{invalid_base['id'][:8]}-a1"
+        assert not git(repo, "branch", "--list", failed_branch)
+    finally:
+        gate.touch()
+        for process, _, _ in processes:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=3)
+
+
 @requires_linux_worker
 def test_runtime_ports_are_unique_and_reach_supervised_worker(repo: Path) -> None:
     start, end = two_free_ports()
