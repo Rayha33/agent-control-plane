@@ -14,6 +14,7 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from support import git, init_repo, make_task
@@ -192,6 +193,52 @@ def test_status_reports_reclaimable_disk(repo: Path) -> None:
     assert disk["reclaimable_worktrees"] == 0
 
 
+def test_status_reports_filesystem_capacity_separately_from_acp_usage(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    observed_paths: list[Path] = []
+
+    def disk_usage(path: Path) -> SimpleNamespace:
+        observed_paths.append(path)
+        return SimpleNamespace(total=1000, used=700, free=300)
+
+    monkeypatch.setattr("agent_control_plane.supervisor.views.shutil.disk_usage", disk_usage)
+
+    disk = supervisor.status()["disk"]
+
+    assert observed_paths == [supervisor.state_dir]
+    assert disk["state_bytes"] > 0
+    assert disk["filesystem"] == {
+        "path": str(supervisor.state_dir),
+        "status": "available",
+        "total_bytes": 1000,
+        "free_bytes": 300,
+    }
+
+
+def test_status_keeps_working_when_filesystem_capacity_is_unavailable(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+
+    def fail_disk_usage(_path: Path) -> SimpleNamespace:
+        raise OSError("probe failed")
+
+    monkeypatch.setattr("agent_control_plane.supervisor.views.shutil.disk_usage", fail_disk_usage)
+
+    snapshot = supervisor.status()
+    filesystem = snapshot["disk"]["filesystem"]
+
+    assert filesystem == {
+        "path": str(supervisor.state_dir),
+        "status": "unavailable",
+        "total_bytes": None,
+        "free_bytes": None,
+    }
+    assert "filesystem capacity unavailable" in supervisor.render_status(snapshot)
+
+
 def test_parse_duration_requires_a_unit() -> None:
     assert parse_duration("30s") == 30
     assert parse_duration("15m") == 900
@@ -212,6 +259,8 @@ def test_a_read_only_supervisor_can_survey_but_not_gc(repo: Path) -> None:
     finish_a_task(supervisor)
 
     viewer = GitSupervisor(repo, read_only=True)
-    assert viewer.status()["disk"]["state_bytes"] > 0
+    disk = viewer.status()["disk"]
+    assert disk["state_bytes"] > 0
+    assert disk["filesystem"]["status"] == "available"
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
         viewer.gc(older_than_seconds=0)

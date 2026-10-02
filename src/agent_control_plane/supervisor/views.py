@@ -7,6 +7,7 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import time
 from typing import Any
@@ -234,10 +235,27 @@ class ViewsMixin:
         snapshot = StatusView(self).snapshot(limit, lease_risk_seconds, checkpoint_stale_seconds)
         with self.connect() as connection:
             reclaimable, _ = self._gc_survey(connection, time.time(), DEFAULT_GC_RETENTION_SECONDS)
+        try:
+            filesystem_usage = shutil.disk_usage(self.state_dir)
+        except OSError:
+            filesystem = {
+                "path": str(self.state_dir),
+                "status": "unavailable",
+                "total_bytes": None,
+                "free_bytes": None,
+            }
+        else:
+            filesystem = {
+                "path": str(self.state_dir),
+                "status": "available",
+                "total_bytes": filesystem_usage.total,
+                "free_bytes": filesystem_usage.free,
+            }
         snapshot["disk"] = {
             "state_bytes": self._directory_bytes(self.state_dir),
             "reclaimable_worktrees": len(reclaimable),
             "reclaimable_bytes": sum(entry["bytes"] for entry in reclaimable),
+            "filesystem": filesystem,
         }
         return snapshot
 

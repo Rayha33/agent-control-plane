@@ -54,6 +54,15 @@ def _age_seconds(stamp: str | None, now: float) -> int | None:
     return max(0, int(now - moment.timestamp()))
 
 
+def _format_bytes(byte_count: int) -> str:
+    value = float(byte_count)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
 def _process_liveness(
     pid: int | None,
     expected_identity: str,
@@ -492,4 +501,21 @@ class StatusView:
             )
         if snapshot["truncated"]:
             lines.append(f"  ... {counts['tasks'] - len(snapshot['tasks'])} more")
+        disk = snapshot.get("disk")
+        if disk is not None:
+            lines += ["", "DISK"]
+            lines.append(
+                f"  ACP-owned state {_format_bytes(disk['state_bytes'])}; "
+                f"reclaimable worktrees {disk['reclaimable_worktrees']} "
+                f"({_format_bytes(disk['reclaimable_bytes'])})"
+            )
+            filesystem = disk.get("filesystem", {})
+            if filesystem.get("status") == "available":
+                lines.append(
+                    f"  filesystem at {filesystem['path']}: "
+                    f"{_format_bytes(filesystem['free_bytes'])} free / "
+                    f"{_format_bytes(filesystem['total_bytes'])} total"
+                )
+            else:
+                lines.append(f"  filesystem capacity unavailable at {filesystem.get('path', '?')}")
         return "\n".join(lines)

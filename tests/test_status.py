@@ -18,6 +18,7 @@ from support import (
 )
 
 from agent_control_plane.git_supervisor import GitSupervisor
+from agent_control_plane.status import _format_bytes
 
 
 @pytest.fixture
@@ -27,6 +28,12 @@ def repo(tmp_path: Path) -> Path:
 
 def entry_for(snapshot: dict, task_id: str) -> dict:
     return next(item for item in snapshot["tasks"] if item["task_id"] == task_id)
+
+
+def test_byte_formatter_switches_units_at_binary_boundaries() -> None:
+    assert _format_bytes(1023) == "1023.0 B"
+    assert _format_bytes(1024) == "1.0 KiB"
+    assert _format_bytes(1024**3) == "1.0 GiB"
 
 
 def test_status_reports_phase_paths_and_runtime_for_a_working_attempt(repo: Path) -> None:
@@ -423,6 +430,8 @@ def test_render_text_is_a_single_screen_summary(repo: Path) -> None:
     assert "live work" in text
     assert "ATTENTION" in text
     assert "agent-a" in text
+    assert "DISK" in text
+    assert "filesystem at" in text
     assert len(text.splitlines()) < 40
 
 
