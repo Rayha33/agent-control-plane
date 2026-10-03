@@ -33,6 +33,12 @@ from .schema import META_CASE_SENSITIVE
 _READ_RESOURCE_MAX_PATHS = 10_000
 _READ_RESOURCE_MAX_CACHED_SCOPES = 16
 _READ_RESOURCE_MAX_LISTING_BYTES = 16 * 1024 * 1024
+_RESULT_MANIFEST_MAX_BYTES = 64 * 1024
+_RESULT_SUMMARY_MAX_BYTES = 4 * 1024
+_RESULT_ARTIFACT_MAX_COUNT = 16
+_RESULT_ARTIFACT_MAX_PATH_BYTES = 1024
+_RESULT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
+_RESULT_ARTIFACT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
 
 
 class ClaimsMixin:
@@ -123,6 +129,225 @@ class ClaimsMixin:
             if process.stdout is not None:
                 process.stdout.close()
             reader.join(timeout=1)
+
+    @staticmethod
+    def _result_manifest_path(value: Any) -> str:
+        """Return one portable repository-relative UTF-8 path or reject it."""
+        if not isinstance(value, str) or not value or "\\" in value:
+            raise SupervisorError(
+                "invalid_result_manifest", "completion result manifest contains an invalid path"
+            )
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise SupervisorError(
+                "invalid_result_manifest", "completion result manifest contains an invalid path"
+            ) from error
+        parts = value.split("/")
+        path = PurePosixPath(value)
+        if (
+            len(encoded) > _RESULT_ARTIFACT_MAX_PATH_BYTES
+            or path.is_absolute()
+            or path.as_posix() != value
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
+        ):
+            raise SupervisorError(
+                "invalid_result_manifest", "completion result manifest contains an invalid path"
+            )
+        return value
+
+    def _result_manifest_tree_entry(self, commit: str, path: str) -> tuple[str, str, str]:
+        """Resolve one literal path from an immutable commit without reading file bodies."""
+        try:
+            listing = self._git_readonly_bytes_bounded(
+                "--literal-pathspecs",
+                "ls-tree",
+                "-rz",
+                "--full-tree",
+                commit,
+                "--",
+                path,
+                max_bytes=128 * 1024,
+            )
+        except SupervisorError as error:
+            raise SupervisorError(
+                "invalid_result_manifest",
+                "completion result manifest references an unreadable path",
+            ) from error
+        wanted = path.encode("utf-8")
+        matches: list[tuple[str, str, str]] = []
+        for record in listing.split(b"\0"):
+            if not record:
+                continue
+            metadata, separator, raw_path = record.partition(b"\t")
+            if not separator or raw_path != wanted:
+                continue
+            try:
+                mode, object_type, object_id = metadata.decode("ascii").split(" ")
+            except (UnicodeDecodeError, ValueError) as error:
+                raise SupervisorError(
+                    "invalid_result_manifest",
+                    "completion result manifest references an invalid Git entry",
+                ) from error
+            matches.append((mode, object_type, object_id))
+        if len(matches) != 1:
+            raise SupervisorError(
+                "invalid_result_manifest", "completion result manifest path is absent or ambiguous"
+            )
+        mode, object_type, object_id = matches[0]
+        if (
+            mode not in {"100644", "100755"}
+            or object_type != "blob"
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id) is None
+        ):
+            raise SupervisorError(
+                "invalid_result_manifest",
+                "completion result manifest only supports regular Git files",
+            )
+        return mode, object_type, object_id
+
+    def _completion_receipt_json(
+        self,
+        commit: str,
+        changed_paths: list[str],
+        manifest_path: str | None,
+        credential: str | None,
+    ) -> str:
+        """Validate an optional manifest against the submitted commit and store only refs."""
+        if manifest_path is None:
+            return ""
+
+        manifest_path = self._result_manifest_path(manifest_path)
+        if manifest_path not in changed_paths:
+            raise SupervisorError(
+                "invalid_result_manifest", "completion manifest must be changed in the submission"
+            )
+        _, _, manifest_blob = self._result_manifest_tree_entry(commit, manifest_path)
+        try:
+            manifest_size = int(self._git_text("cat-file", "-s", manifest_blob))
+            if manifest_size < 1 or manifest_size > _RESULT_MANIFEST_MAX_BYTES:
+                raise ValueError("manifest size outside configured limit")
+            raw_manifest = self._git_readonly_bytes_bounded(
+                "cat-file", "blob", manifest_blob, max_bytes=_RESULT_MANIFEST_MAX_BYTES
+            )
+            text_manifest = raw_manifest.decode("utf-8")
+
+            def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                result: dict[str, Any] = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate JSON key")
+                    result[key] = value
+                return result
+
+            payload = json.loads(text_manifest, object_pairs_hook=unique_object)
+        except (
+            SupervisorError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+            RecursionError,
+        ) as error:
+            raise SupervisorError(
+                "invalid_result_manifest", "completion result manifest is unreadable or over limit"
+            ) from error
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"version", "summary", "artifacts"}
+            or type(payload.get("version")) is not int
+            or payload["version"] != 1
+        ):
+            raise SupervisorError(
+                "invalid_result_manifest", "completion result manifest has an unsupported shape"
+            )
+
+        summary = payload.get("summary")
+        artifacts = payload.get("artifacts")
+        if not isinstance(summary, str) or not summary.strip() or not isinstance(artifacts, list):
+            raise SupervisorError(
+                "invalid_result_manifest",
+                "completion result manifest requires a summary and artifacts",
+            )
+        try:
+            summary_bytes = summary.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise SupervisorError(
+                "invalid_result_manifest", "completion summary is not valid UTF-8"
+            ) from error
+        if (
+            len(summary_bytes) > _RESULT_SUMMARY_MAX_BYTES
+            or any(
+                ord(character) < 32 and character not in "\n\t" or 127 <= ord(character) <= 159
+                for character in summary
+            )
+            or (credential and credential in summary)
+            or (credential and credential in manifest_path)
+        ):
+            raise SupervisorError(
+                "invalid_result_manifest", "completion summary is unsafe or over its size limit"
+            )
+        if not artifacts or len(artifacts) > _RESULT_ARTIFACT_MAX_COUNT:
+            raise SupervisorError(
+                "invalid_result_manifest", "completion artifact count is outside configured limits"
+            )
+
+        resolved: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        total_bytes = 0
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or set(artifact) != {"path", "blob_oid"}:
+                raise SupervisorError(
+                    "invalid_result_manifest",
+                    "completion artifacts require exactly a path and Git blob id",
+                )
+            path = self._result_manifest_path(artifact["path"])
+            if path == manifest_path or path in seen or (credential and credential in path):
+                raise SupervisorError(
+                    "invalid_result_manifest",
+                    "completion result manifest contains a duplicate or unsafe path",
+                )
+            expected_blob_id = artifact["blob_oid"]
+            if (
+                not isinstance(expected_blob_id, str)
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_blob_id) is None
+            ):
+                raise SupervisorError(
+                    "invalid_result_manifest", "completion artifact Git blob id is invalid"
+                )
+            seen.add(path)
+            _, _, blob_id = self._result_manifest_tree_entry(commit, path)
+            if blob_id != expected_blob_id:
+                raise SupervisorError(
+                    "invalid_result_manifest",
+                    "completion artifact Git blob id does not match the submitted commit",
+                )
+            try:
+                size = int(self._git_text("cat-file", "-s", blob_id))
+            except (SupervisorError, ValueError) as error:
+                raise SupervisorError(
+                    "invalid_result_manifest", "completion artifact size could not be verified"
+                ) from error
+            if size < 0 or size > _RESULT_ARTIFACT_MAX_BYTES:
+                raise SupervisorError(
+                    "invalid_result_manifest", "completion artifact exceeds its size limit"
+                )
+            total_bytes += size
+            if total_bytes > _RESULT_ARTIFACT_TOTAL_MAX_BYTES:
+                raise SupervisorError(
+                    "invalid_result_manifest", "completion artifacts exceed aggregate size limit"
+                )
+            resolved.append({"path": path, "blob_oid": blob_id, "size_bytes": size})
+
+        return canonical_json(
+            {
+                "version": 1,
+                "summary": summary,
+                "manifest_path": manifest_path,
+                "manifest_blob_oid": manifest_blob,
+                "artifacts": resolved,
+            }
+        )
 
     def _prepare_attempt_worktree(self, attempt_id: str) -> tuple[Path, Path]:
         """Create/validate the managed root and reserve an unused attempt path.
@@ -1603,12 +1828,14 @@ class ClaimsMixin:
         attempt_id: str,
         claim_token: int,
         credential: str | None = None,
+        result_manifest_path: str | None = None,
     ) -> dict[str, Any]:
         return self._submit(
             attempt_id,
             claim_token,
             expected_worker_pid=None,
             credential=credential,
+            result_manifest_path=result_manifest_path,
         )
 
     def _submit(
@@ -1617,6 +1844,7 @@ class ClaimsMixin:
         claim_token: int,
         expected_worker_pid: int | None,
         credential: str | None,
+        result_manifest_path: str | None = None,
     ) -> dict[str, Any]:
         self._assert_safe_git_execution_config()
         self._assert_no_git_grafts()
@@ -1672,6 +1900,9 @@ class ClaimsMixin:
             changed = sorted(value.decode("utf-8") for value in raw.split(b"\0") if value)
             if not changed:
                 raise SupervisorError("empty_submission", "no changed paths")
+            result_manifest_json = self._completion_receipt_json(
+                commit, changed, result_manifest_path, credential
+            )
             declared = json.loads(task["resources_json"])
             rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
             undeclared = [
@@ -1728,9 +1959,9 @@ class ClaimsMixin:
                 """
                 INSERT INTO submissions
                   (id, task_id, attempt_id, worker_agent_id, commit_sha, tree_sha,
-                   object_contract, patch_sha256, changed_paths_json, resource_tokens_json,
-                   status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_qc', ?)
+                   object_contract, result_manifest_json, patch_sha256, changed_paths_json,
+                   resource_tokens_json, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_qc', ?)
                 """,
                 (
                     submission_id,
@@ -1740,6 +1971,7 @@ class ClaimsMixin:
                     commit,
                     tree,
                     SUBMISSION_OBJECT_CONTRACT,
+                    result_manifest_json,
                     sha256(patch),
                     canonical_json(changed),
                     canonical_json(tokens),

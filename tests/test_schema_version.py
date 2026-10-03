@@ -14,7 +14,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from support import init_repo, make_task
+from support import commit_change, init_repo, make_task
 
 from agent_control_plane import __version__, git_supervisor
 from agent_control_plane.cli import READ_ONLY_ACTIONS, main
@@ -300,6 +300,42 @@ def test_v9_read_only_open_requires_criterion_coverage_migration(repo: Path) -> 
         migration = dict(MIGRATIONS)[10]
         migration(connection)
         migration(connection)
+
+
+def test_v10_read_only_open_requires_completion_receipt_migration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="legacy submission")
+    attempt = supervisor.claim(created["id"], "legacy-worker")
+    commit_change(attempt, "alpha.txt", "legacy candidate\n")
+    legacy_submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    with supervisor.connect() as connection:
+        connection.execute("ALTER TABLE submissions DROP COLUMN result_manifest_json")
+        connection.execute("UPDATE meta SET value = '10' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    before = fingerprint(repo)
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+    assert "version 10" in str(error.value)
+    assert fingerprint(repo) == before
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 10
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with migrated.connect() as connection:
+        column = next(
+            row
+            for row in connection.execute("PRAGMA table_info(submissions)")
+            if row["name"] == "result_manifest_json"
+        )
+        migration = dict(MIGRATIONS)[11]
+        migration(connection)
+        migration(connection)
+    assert column["type"] == "TEXT"
+    assert column["dflt_value"] == "''"
+    assert migrated.submission(legacy_submission["id"])["completion_receipt"] == {
+        "state": "not_provided"
+    }
 
 
 def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:

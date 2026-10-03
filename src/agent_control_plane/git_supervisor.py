@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -347,6 +347,16 @@ def _add_qc_acceptance_coverage(connection: sqlite3.Connection) -> None:
         )
 
 
+def _add_submission_result_manifest(connection: sqlite3.Connection) -> None:
+    """Store a bounded completion receipt beside its immutable candidate submission."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(submissions)")}
+    if "result_manifest_json" not in columns:
+        connection.execute(
+            "ALTER TABLE submissions ADD COLUMN result_manifest_json TEXT NOT NULL DEFAULT ''"
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -357,6 +367,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (8, _add_qc_runs_latest_lookup_index),
     (9, _add_read_dependency_snapshots),
     (10, _add_qc_acceptance_coverage),
+    (11, _add_submission_result_manifest),
 )
 
 

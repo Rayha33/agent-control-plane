@@ -204,6 +204,50 @@ def test_status_tracks_only_declared_glob_read_inputs_and_is_read_only(repo: Pat
     assert state_fingerprint(supervisor) == before_view
 
 
+def test_status_exposes_only_the_bounded_completion_receipt_and_is_read_only(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="receipt status")
+    submission = approve(supervisor, created["id"], "alpha.txt", "candidate\n")
+    receipt = {
+        "version": 1,
+        "summary": "The check passed; inspect the pinned artifact.",
+        "manifest_path": "reports/result-manifest.json",
+        "manifest_blob_oid": "1" * 40,
+        "artifacts": [
+            {
+                "path": "reports/findings.md",
+                "blob_oid": "2" * 40,
+                "size_bytes": 19,
+            }
+        ],
+    }
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE submissions SET result_manifest_json = ? WHERE id = ?",
+            (json.dumps(receipt), submission["id"]),
+        )
+    with supervisor.connect() as connection:
+        before_row = connection.execute(
+            "SELECT result_manifest_json FROM submissions WHERE id = ?", (submission["id"],)
+        ).fetchone()["result_manifest_json"]
+    before_state = state_fingerprint(supervisor)
+
+    snapshot = supervisor.status()
+
+    entry = entry_for(snapshot, created["id"])
+    assert entry["completion_receipt"] == {"state": "provided", **receipt}
+    serialized = json.dumps(snapshot)
+    assert "The check passed" in serialized
+    assert state_fingerprint(supervisor) == before_state
+    with supervisor.connect() as connection:
+        after_row = connection.execute(
+            "SELECT result_manifest_json FROM submissions WHERE id = ?", (submission["id"],)
+        ).fetchone()["result_manifest_json"]
+    assert after_row == before_row
+
+
 def test_recursive_glob_tracks_deeply_nested_read_inputs(repo: Path) -> None:
     (repo / "src" / "api" / "v2").mkdir(parents=True)
     (repo / "src" / "api" / "schema.py").write_text("schema v1\n", encoding="utf-8")

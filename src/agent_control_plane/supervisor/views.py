@@ -7,10 +7,11 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..scheduling import Scheduler, declared_read_resources
@@ -20,6 +21,104 @@ from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError
 
 class ViewsMixin:
     """Row lookups and read-only JSON views of tasks, attempts, runtimes, submissions and QC runs."""
+
+    @staticmethod
+    def _completion_receipt_view(row: Any) -> dict[str, Any]:
+        raw = row["result_manifest_json"] or ""
+        if not raw:
+            return {"state": "not_provided"}
+        if not isinstance(raw, str):
+            return {"state": "unavailable"}
+        try:
+            if len(raw.encode("utf-8")) > 64 * 1024:
+                return {"state": "unavailable"}
+            receipt = json.loads(raw)
+        except (TypeError, UnicodeEncodeError, ValueError, RecursionError):
+            return {"state": "unavailable"}
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "version",
+            "summary",
+            "manifest_path",
+            "manifest_blob_oid",
+            "artifacts",
+        }:
+            return {"state": "unavailable"}
+        try:
+            summary_size = len(receipt["summary"].encode("utf-8"))
+        except (AttributeError, UnicodeEncodeError):
+            return {"state": "unavailable"}
+        if (
+            type(receipt["version"]) is not int
+            or receipt["version"] != 1
+            or not isinstance(receipt["summary"], str)
+            or not receipt["summary"].strip()
+            or summary_size > 4 * 1024
+            or any(
+                ord(character) < 32 and character not in "\n\t" or 127 <= ord(character) <= 159
+                for character in receipt["summary"]
+            )
+        ):
+            return {"state": "unavailable"}
+
+        def valid_path(value: Any) -> bool:
+            if not isinstance(value, str) or not value or "\\" in value:
+                return False
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+            path = PurePosixPath(value)
+            return (
+                len(encoded) <= 1024
+                and not path.is_absolute()
+                and path.as_posix() == value
+                and all(part not in {"", ".", ".."} for part in value.split("/"))
+                and not any(
+                    ord(character) < 32 or 127 <= ord(character) <= 159 for character in value
+                )
+            )
+
+        oid_pattern = r"[0-9a-f]{40}|[0-9a-f]{64}"
+        manifest_path = receipt["manifest_path"]
+        manifest_oid = receipt["manifest_blob_oid"]
+        artifacts = receipt["artifacts"]
+        if (
+            not valid_path(manifest_path)
+            or not isinstance(manifest_oid, str)
+            or re.fullmatch(oid_pattern, manifest_oid) is None
+            or not isinstance(artifacts, list)
+            or not artifacts
+            or len(artifacts) > 16
+        ):
+            return {"state": "unavailable"}
+        seen: set[str] = set()
+        total_size = 0
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or set(artifact) != {
+                "path",
+                "blob_oid",
+                "size_bytes",
+            }:
+                return {"state": "unavailable"}
+            path = artifact["path"]
+            blob_oid = artifact["blob_oid"]
+            size = artifact["size_bytes"]
+            if (
+                not valid_path(path)
+                or path == manifest_path
+                or path in seen
+                or not isinstance(blob_oid, str)
+                or re.fullmatch(oid_pattern, blob_oid) is None
+                or type(size) is not int
+                or size < 0
+                or size > 64 * 1024 * 1024
+            ):
+                return {"state": "unavailable"}
+            seen.add(path)
+            total_size += size
+            if total_size > 256 * 1024 * 1024:
+                return {"state": "unavailable"}
+        return {"state": "provided", **receipt}
 
     def _task_view(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         attempt = connection.execute(
@@ -157,6 +256,7 @@ class ViewsMixin:
             "resource_tokens": json.loads(row["resource_tokens_json"]),
             "status": row["status"],
             "qc_resume_status": row["qc_resume_status"],
+            "completion_receipt": self._completion_receipt_view(row),
             "latest_qc": self._qc_view(qc) if qc else None,
             "created_at": row["created_at"],
         }

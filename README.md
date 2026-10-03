@@ -215,7 +215,37 @@ lease primary key. Distinct path and logical keys do not inherit hierarchical
 overlap across types.
 
 The command must leave a clean, committed worktree. A successful supervised run
-submits automatically. For a manually operated agent:
+submits automatically. For a manually operated agent, an optional bounded result
+manifest can preserve a short handoff and pointers to files in that commit:
+
+~~~json
+{"version":1,"summary":"Audit complete; see the findings table.","artifacts":[{"path":"reports/findings.md","blob_oid":"<Git blob ID>"}]}
+~~~
+
+Commit the manifest and every referenced artifact in the attempt worktree, then
+set each `blob_oid` to the artifact's Git blob ID (for example, run
+`git hash-object reports/findings.md` after writing that file). Commit the manifest
+and referenced artifacts, then pass the manifest's repository-relative path to
+either `acp run` or `acp submit`:
+
+~~~bash
+uv run --extra dev acp submit ATTEMPT_ID --token CLAIM_TOKEN \
+  --result-manifest reports/result-manifest.json
+~~~
+
+ACP reads at most 64 KiB of manifest data, limits the UTF-8 summary to 4 KiB and
+the artifact list to 16 entries, and records only the immutable Git blob id and
+size for each regular file (64 MiB per file, 256 MiB total). Symlinks,
+submodules, missing paths, traversal paths, and malformed or oversized manifests
+are rejected. `show`, `status`, and `merge-plan` expose the bounded summary and
+references, never artifact bodies; a consumer must explicitly fetch an artifact
+from the pinned commit. The summary and artifact names are untrusted worker-authored
+text, are not semantic validation, and are never injected into an agent prompt.
+This receipt is separate from heartbeats/checkpoints and task chat: it captures
+neither progress history nor conversation, and does not replace either. Submissions
+without a manifest remain valid and report `not_provided`.
+
+For a manually operated agent, send heartbeats while working:
 
 ~~~bash
 uv run --extra dev acp heartbeat ATTEMPT_ID --token CLAIM_TOKEN --credential-file ../codex-session-17.credential --checkpoint '{"phase":"tests"}'

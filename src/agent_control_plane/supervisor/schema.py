@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   commit_sha TEXT NOT NULL,
   tree_sha TEXT NOT NULL,
   object_contract TEXT NOT NULL DEFAULT '',
+  result_manifest_json TEXT NOT NULL DEFAULT '',
   patch_sha256 TEXT NOT NULL,
   changed_paths_json TEXT NOT NULL,
   resource_tokens_json TEXT NOT NULL,

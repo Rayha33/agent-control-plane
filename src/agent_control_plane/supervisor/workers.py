@@ -32,6 +32,7 @@ class WorkersMixin:
         claim_token: int,
         command: Sequence[str],
         credential: str | None = None,
+        result_manifest_path: str | None = None,
     ) -> dict[str, Any]:
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
@@ -219,12 +220,13 @@ class WorkersMixin:
             )
         self._record_worker_exit(attempt_id, process.pid, process.returncode)
         try:
-            return self._submit(
-                attempt_id,
-                claim_token,
-                expected_worker_pid=process.pid,
-                credential=credential,
-            )
+            submit_options = {
+                "expected_worker_pid": process.pid,
+                "credential": credential,
+            }
+            if result_manifest_path is not None:
+                submit_options["result_manifest_path"] = result_manifest_path
+            return self._submit(attempt_id, claim_token, **submit_options)
         except BaseException:
             self._clear_worker_registration(
                 attempt_id,

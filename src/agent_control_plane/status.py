@@ -371,6 +371,7 @@ class StatusView:
             WITH ranked_submissions AS (
               SELECT submission.id, submission.task_id, submission.status,
                      submission.commit_sha, submission.created_at,
+                     submission.result_manifest_json,
                      ROW_NUMBER() OVER (
                        PARTITION BY submission.task_id, submission.commit_sha
                        ORDER BY submission.created_at DESC, submission.id DESC
@@ -378,7 +379,8 @@ class StatusView:
               FROM submissions AS submission
             )
             SELECT submission.id, submission.task_id, submission.status,
-                   submission.commit_sha, submission.created_at, qc.verdict AS qc_verdict,
+                   submission.commit_sha, submission.created_at,
+                   submission.result_manifest_json, qc.verdict AS qc_verdict,
                    qc.findings_json, qc.finished_at AS qc_finished_at
             FROM ranked_submissions AS submission
             LEFT JOIN qc_runs AS qc ON qc.id = (
@@ -443,6 +445,7 @@ class StatusView:
                     "status": row["status"],
                     "qc_verdict": row["qc_verdict"],
                     "qc_finished_at": row["qc_finished_at"],
+                    "result_manifest_json": row["result_manifest_json"],
                 }
                 if latest_commit and row["qc_verdict"] not in {None, "pass"}:
                     for finding in StatusView._parse_qc_findings(row["findings_json"]):
@@ -622,6 +625,11 @@ class StatusView:
             "declared_claimed_paths": task.get("declared_resources", task["resources"]),
             "declared_read_resources": task.get("declared_read_resources", []),
             "read_dependency_advisory": read_dependency_advisory,
+            "completion_receipt": (
+                self.supervisor._completion_receipt_view(submission)
+                if submission
+                else {"state": "not_provided"}
+            ),
             "held_resources": held_resources,
             "cleanup_target_status": task.get("cleanup_target_status", ""),
             "cleanup_error": task.get("cleanup_error", ""),

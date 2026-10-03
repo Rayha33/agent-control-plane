@@ -45,7 +45,7 @@ the old approval as current.
 | runtime driver resource | scoped resource, internal ownership capability, lifecycle state and cleanup proof |
 | credential handle | provider/name/version, exact internal source reference, and keyed target fingerprint—never plaintext |
 | runner identity | one role, credential digest, enrollment and revocation state |
-| submission | immutable commit/tree/patch hashes, changed paths, resource tokens |
+| submission | immutable commit/tree/patch hashes, changed paths, resource tokens, optional bounded completion receipt |
 | QC run | reviewer, immutable commit, commands, outputs, structured findings, inherited attempt trust pin |
 | integration | merge result, integration commands, branch and commit |
 | event | same-transaction domain event in a hash chain |
@@ -429,6 +429,23 @@ against the current base uses `git merge-tree --write-tree`, which computes the
 merge in memory: it writes only unreferenced objects and touches no worktree,
 index, or ref. Where the installed Git is too old, `base_conflicts` is `null`
 rather than a silently empty list.
+
+An optional `acp submit --result-manifest PATH` records a bounded completion
+receipt alongside the candidate. The manifest itself must be a changed regular
+file in the submitted commit and contain version 1, a short summary, and up to
+16 relative artifact paths paired with expected Git blob ids. ACP resolves each
+path from the immutable commit tree, accepts regular blobs only, rejects an
+expected id that does not match, and records the verified blob ids and sizes; it
+does not copy artifact contents into SQLite, status, audit events, or agent prompts.
+Manifest bytes, summary bytes, path bytes, per-file bytes, and aggregate bytes
+have fixed limits. The read-only task, status, and merge-plan views return only
+the summary and pinned references. Legacy submissions and ordinary submissions
+without a manifest explicitly report `not_provided`. This is a recoverability
+and handoff aid, not evidence that the artifact is correct or complete; the
+summary and paths remain untrusted worker-authored text and independent QC still
+owns correctness review. It is not a heartbeat/checkpoint or task-chat transcript,
+does not preserve progress history or conversation, and does not replace those
+separate mechanisms.
 
 ### 8. Events cannot be lost independently of state
 

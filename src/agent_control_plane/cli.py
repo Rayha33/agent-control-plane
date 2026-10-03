@@ -303,6 +303,11 @@ def parser() -> argparse.ArgumentParser:
     submit = commands.add_parser("submit", help="submit committed Git evidence")
     submit.add_argument("attempt_id")
     submit.add_argument("--token", type=int, required=True, dest="claim_token")
+    submit.add_argument(
+        "--result-manifest",
+        metavar="PATH",
+        help="optional manifest path in the submitted commit (relative to the attempt worktree)",
+    )
     add_credential_source(submit)
     qc = commands.add_parser("qc", help="run QC in a fresh detached worktree")
     qc.add_argument("submission_id")
@@ -315,6 +320,11 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run an agent command in its worktree")
     run.add_argument("attempt_id")
     run.add_argument("--token", type=int, required=True, dest="claim_token")
+    run.add_argument(
+        "--result-manifest",
+        metavar="PATH",
+        help="optional manifest path in the worker commit (relative to the attempt worktree)",
+    )
     add_credential_source(run)
     run.add_argument("command", nargs=argparse.REMAINDER)
     terminate = commands.add_parser("terminate", help="stop a supervised worker")
@@ -834,7 +844,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _read_credential(args),
             )
         elif args.action == "submit":
-            result = supervisor.submit(args.attempt_id, args.claim_token, _read_credential(args))
+            result = supervisor.submit(
+                args.attempt_id,
+                args.claim_token,
+                _read_credential(args),
+                result_manifest_path=args.result_manifest,
+            )
         elif args.action == "qc":
             reviewer = args.reviewer or supervisor.config.critic_identity
             result = supervisor.run_qc(args.submission_id, reviewer, _read_credential(args))
@@ -843,7 +858,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             result = supervisor.run_worker(
-                args.attempt_id, args.claim_token, command, _read_credential(args)
+                args.attempt_id,
+                args.claim_token,
+                command,
+                _read_credential(args),
+                result_manifest_path=args.result_manifest,
             )
         elif args.action == "terminate":
             result = supervisor.terminate_worker(args.attempt_id, _read_credential(args))
