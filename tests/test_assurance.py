@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -415,6 +416,21 @@ def test_provider_diversity_config_needs_two_providers(repo: Path) -> None:
 
 
 # ------------------------------------------------------------------- calibration
+
+
+def test_review_packet_fd_is_an_immutable_read_only_pipe() -> None:
+    packet = b"frozen review packet\n" * 65536
+    received: list[bytes] = []
+
+    with GitSupervisor._read_only_review_packet_fd(packet) as packet_fd:
+        assert stat.S_ISFIFO(os.fstat(packet_fd).st_mode)
+        with pytest.raises(OSError):
+            os.write(packet_fd, b"attempted mutation")
+        with Path(f"/dev/fd/{packet_fd}").open("rb") as packet_stream:
+            while chunk := packet_stream.read(65536):
+                received.append(chunk)
+
+    assert b"".join(received) == packet
 
 
 def test_calibration_catches_a_seeded_defect_and_reports_intervals(repo: Path) -> None:

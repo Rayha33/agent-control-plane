@@ -75,9 +75,7 @@ def _install_revising_critic(supervisor: GitSupervisor, monkeypatch: pytest.Monk
                     }
                 ],
             }
-        packet_data = _kwargs.get("stdin_data")
-        assert isinstance(packet_data, bytes)
-        packet = json.loads(packet_data)
+        packet = json.loads(Path(environment["ACP_REVIEW_PACKET"]).read_text(encoding="utf-8"))
         evidence_id = packet["evidence_catalog"][0]["id"]
         payload["contract_version"] = 2
         payload["acceptance_coverage"] = [

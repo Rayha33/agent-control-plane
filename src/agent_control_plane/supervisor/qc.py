@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -287,19 +291,20 @@ class QcMixin:
                 packet_bytes = json.dumps(packet, indent=2).encode("utf-8")
                 packet_hash = sha256(packet_bytes)
                 packet_path.write_bytes(packet_bytes)
-                critic = self._run_critic(
-                    reviewer.command or "builtin",
-                    worktree,
-                    {
-                        "ACP_PHASE": "calibration",
-                        "ACP_WORKTREE": str(worktree),
-                        "ACP_REPO_ROOT": str(self.root),
-                        "ACP_REVIEW_PACKET": "/dev/stdin",
-                        "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
-                        "ACP_REVIEW_RESULT": str(result_path),
-                    },
-                    stdin_data=packet_bytes,
-                )
+                with self._read_only_review_packet_fd(packet_bytes) as packet_fd:
+                    critic = self._run_critic(
+                        reviewer.command or "builtin",
+                        worktree,
+                        {
+                            "ACP_PHASE": "calibration",
+                            "ACP_WORKTREE": str(worktree),
+                            "ACP_REPO_ROOT": str(self.root),
+                            "ACP_REVIEW_PACKET": f"/dev/fd/{packet_fd}",
+                            "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
+                            "ACP_REVIEW_RESULT": str(result_path),
+                        },
+                        review_packet_fd=packet_fd,
+                    )
                 if critic["exit_code"]:
                     error = f"critic exited {critic['exit_code']}"
                 else:
@@ -668,19 +673,20 @@ class QcMixin:
                 if reviewer.command.startswith("trusted:"):
                     trust_pin = self._verify_attempt_trust(submission["attempt_id"])
                 result_path = self.state_dir / "logs" / f"critic-{submission_id}-{qc_id}.json"
-                critic = self._run_critic(
-                    reviewer.command,
-                    qc_dir,
-                    self._phase_runtime_env(runtime_env, "critic", qc_dir)
-                    | {
-                        "ACP_REVIEW_PACKET": "/dev/stdin",
-                        "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
-                        "ACP_REVIEW_RESULT": str(result_path),
-                    },
-                    trust_pin,
-                    pass_fds=(operation_guard_fd,),
-                    stdin_data=packet_bytes,
-                )
+                with self._read_only_review_packet_fd(packet_bytes) as packet_fd:
+                    critic = self._run_critic(
+                        reviewer.command,
+                        qc_dir,
+                        self._phase_runtime_env(runtime_env, "critic", qc_dir)
+                        | {
+                            "ACP_REVIEW_PACKET": f"/dev/fd/{packet_fd}",
+                            "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
+                            "ACP_REVIEW_RESULT": str(result_path),
+                        },
+                        trust_pin,
+                        pass_fds=(operation_guard_fd,),
+                        review_packet_fd=packet_fd,
+                    )
                 results.append(critic)
                 try:
                     packet_is_unchanged = (
@@ -1161,6 +1167,73 @@ class QcMixin:
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    @contextmanager
+    def _read_only_review_packet_fd(packet_bytes: bytes) -> Iterator[int]:
+        """Stream immutable packet bytes to the reviewer through a read-only pipe FD."""
+        packet_fd, writer_fd = os.pipe()
+        cancelled = threading.Event()
+        written = 0
+        write_error: OSError | None = None
+
+        def feed_packet() -> None:
+            nonlocal write_error, written
+            remaining = memoryview(packet_bytes)
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(writer_fd, selectors.EVENT_WRITE)
+                    while remaining and not cancelled.is_set():
+                        try:
+                            count = os.write(writer_fd, remaining)
+                        except BlockingIOError:
+                            selector.select(timeout=0.1)
+                            continue
+                        except InterruptedError:
+                            continue
+                        if count <= 0:
+                            raise OSError("review packet pipe accepted no bytes")
+                        remaining = remaining[count:]
+                        written += count
+                    if remaining and not cancelled.is_set():
+                        raise OSError("review packet pipe closed before delivery completed")
+            except (OSError, ValueError) as error:
+                write_error = (
+                    error
+                    if isinstance(error, OSError)
+                    else OSError("review packet selector failed")
+                )
+            finally:
+                os.close(writer_fd)
+
+        feeder = threading.Thread(target=feed_packet, name="acp-review-packet", daemon=True)
+        try:
+            os.set_blocking(writer_fd, False)
+            feeder.start()
+        except BaseException:
+            os.close(packet_fd)
+            os.close(writer_fd)
+            raise
+        body_failed = False
+        try:
+            yield packet_fd
+        except BaseException:
+            body_failed = True
+            raise
+        finally:
+            os.close(packet_fd)
+            cancelled.set()
+            feeder.join(timeout=2)
+            if feeder.is_alive():
+                raise SupervisorError(
+                    "review_packet_stream_stalled",
+                    "review packet feeder did not stop after the critic exited",
+                )
+            if not body_failed and (written != len(packet_bytes) or write_error is not None):
+                raise SupervisorError(
+                    "review_packet_delivery_failed",
+                    "critic did not receive the complete frozen review packet",
+                ) from write_error
 
     @staticmethod
     def _cleanup_calibration_artifact(path: Path) -> None:

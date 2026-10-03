@@ -1170,7 +1170,7 @@ class GitSupervisor(
         extra_env: dict[str, str],
         trust_pin: dict[str, Any] | None = None,
         pass_fds: Sequence[int] = (),
-        stdin_data: bytes | None = None,
+        review_packet_fd: int | None = None,
     ) -> dict[str, Any]:
         if command != "builtin":
             env = self._child_env(extra_env)
@@ -1189,7 +1189,7 @@ class GitSupervisor(
                     ),
                     guard_fd=pass_fds[0] if pass_fds else None,
                     process_runner=self._run_trusted_contained,
-                    stdin_data=stdin_data,
+                    pass_fds=(review_packet_fd,) if review_packet_fd is not None else (),
                 )
             except DriverError as error:
                 raise SupervisorError(error.code, error.message) from error
@@ -1201,8 +1201,8 @@ class GitSupervisor(
             "builtin:structural-critic",
             cwd,
             env,
+            pass_fds=(review_packet_fd,) if review_packet_fd is not None else (),
             lifecycle_fds=pass_fds,
-            stdin_data=stdin_data,
         )
 
     @staticmethod

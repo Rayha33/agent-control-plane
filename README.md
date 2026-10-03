@@ -661,9 +661,10 @@ critic_command = "/absolute/path/outside/the/repository/critic-wrapper"
 
 ACP starts the critic itself in the detached candidate worktree. It provides:
 
-- <code>ACP_REVIEW_PACKET</code>: <code>/dev/stdin</code>, carrying the exact frozen JSON
-  packet for this QC run and candidate commit. Read this stream as the authoritative
-  reviewer input; it cannot be rewritten by changing the archived packet;
+- <code>ACP_REVIEW_PACKET</code>: <code>/dev/fd/&lt;fd&gt;</code>, a read-only pipe carrying the
+  exact frozen JSON packet for this QC run and candidate commit. Read this stream as
+  the authoritative reviewer input; it cannot be rewritten through the reviewer FD,
+  is independent of the diagnostic archive, and does not occupy stdin;
 - <code>ACP_REVIEW_PACKET_ARCHIVE</code>: persisted diagnostic copy of that packet. ACP
   hash-checks and restores this archive if the reviewer modifies it; it is not the
   authoritative input stream;
