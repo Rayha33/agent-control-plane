@@ -57,9 +57,10 @@ grant.
 Build an opt-in `SandboxedWorkerExecutor` as a separate supervised-worker
 execution backend. Do not treat `NamespaceRuntimeDriver` as the worker sandbox
 and do not put a worker command inside its current resource-driver lifecycle.
-Keep the existing direct worker path unchanged until the new backend passes the
-gates below; an unsupported or partially configured sandbox must fail before
-candidate code starts.
+Keep the direct execution backend and routing unchanged apart from the bounded
+host-log capture described below until the new backend passes the gates; an
+unsupported or partially configured sandbox must fail before candidate code
+starts.
 
 The existing worker lifecycle registers a host PID and process identity,
 launches `worker_trampoline.py` directly with the registered worktree as its
