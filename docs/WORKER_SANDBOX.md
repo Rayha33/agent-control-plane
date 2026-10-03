@@ -202,6 +202,48 @@ assumptions, not properties proved by a namespace test.
    unavailable or differs. No resource quota is proven by this composition
    probe.
 
+   **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
+   rootless OCI composition run on the NAS added runtime-only evidence. The
+   measured host was Debian 12,
+   Linux 6.18.15, cgroup v2, runc 1.3.5 / OCI 1.2.1 and systemd 252.39. Its
+   readonly rootfs contained BusyBox and its three dynamic libraries (libc,
+   libresolv and the ELF loader) as its only executable/runtime-library
+   closure, with an empty generated `/etc`; the OCI `config.json` SHA-256 was
+   `1e715ea5ae3d0eae4a0d82f52e8536c22be6f43d6125257962ce388becbbb31a`.
+   The explicit mount allowlist was readonly `/proc`, one writable fixture
+   workspace, and two readonly single-file mounts for the host-controlled
+   launch gate and client-PID metadata. No host `/etc`, `/usr`, home, `/run`,
+   `/tmp` parent, Git metadata, or socket tree was mounted; the workspace was
+   the only host writable bind. After runc setup, the private root contained
+   mode-000 `/dev` placeholder files; no host `/dev` mount was present.
+
+   The fake command wrote its expected markers only under the fixture
+   workspace. It verified that `/etc/hostname`, `/etc/passwd`, representative
+   home/Codex-config and D-Bus/Docker-socket paths, and a host-temp canary were
+   absent; an absolute workspace symlink to that host canary was unreadable;
+   writes to the readonly root and `/tmp` failed; its host runc-client PID was
+   absent from container `/proc`; and `/proc/net/dev` exposed only loopback.
+   While held at the launch gate, the host init PID's cgroup exactly matched
+   `acp-smoke-goal-20261001-f.scope`; readback from that exact cgroup was
+   `memory.max=67108864`, `pids.max=32`, and `cpu.max=100000 100000`. The host
+   and container PID/network namespace inodes differed. The attached `runc
+   run --keep` returned 0 after host gate release; the client PID/start-time
+   and init PID/start-time were recorded separately. Afterward, `runc state`
+   was stopped with PID 0; an explicit `runc delete` removed the exact ID,
+   its state-root entry and systemd scope were absent, and both recorded
+   process identities were absent.
+
+   This closes the earlier probe's missing exact-delete/state-root evidence
+   for this bounded fixture and proves exact quota configuration readback,
+   not quota-violation enforcement. It is still not an ACP registered-worker
+   test: no base/sibling-worktree comparison, actual host `/etc` sentinel,
+   readonly-gate write attempt, provider credentials/egress, worker cancel or
+   restart recovery, concurrent attempt, or result import/QC was exercised.
+   The fixture rootfs is not an audited Codex toolchain. The worker still
+   launches directly on the host; its bounded 8 MiB log capture is a separate
+   existing hardening change, not filesystem isolation. Strict worker mode and
+   `externalSandbox` remain disabled.
+
    Treat the wrapper service as the runc-client lifecycle, and the exact
    per-container scope as the container-process/cancellation target. A normal
    gated fixture wrote its expected result; the wrapper service and scope were
@@ -254,10 +296,16 @@ implementation; a wrapper around `Popen` alone is insufficient.
 
 ## Measured host assumptions (2026-10-03)
 
-Read-only NAS inventory reported Debian GNU/Linux 12 (bookworm), Linux kernel
-6.18.15, systemd 252.38 (`252.38-1~deb12u1`), cgroup v2 (`cgroup2fs`),
+An earlier read-only NAS inventory sample reported Debian GNU/Linux 12
+(bookworm), Linux kernel 6.18.15, systemd 252.38 (`252.38-1~deb12u1`), cgroup v2 (`cgroup2fs`),
 `/usr/bin/systemd-run`, `/usr/bin/unshare`, rootless `/usr/bin/runc` 1.3.5,
 and delegated user namespaces. No Codex executable was found on the NAS `PATH`.
+The separate repeat-fixture preflight later queried the user manager at
+2026-10-03 22:00 UTC and returned `252.39-1~deb12u2` from
+`systemctl --user show --property=Version --value`. These are time-separated
+observations from different systemd queries; the available record does not
+establish a package transition, so neither result is substituted for the
+other.
 The user manager reported degraded, although a transient user service, rootless
 OCI run, and runc-created per-container systemd scope all worked in this
 session. The wrapper-only cgroup arrangement failed ownership/cancellation
@@ -319,8 +367,9 @@ before releasing the worker gate.
 This is runtime feasibility evidence only, not the required registered-ACP
 worker proof: it does not exercise `run_worker`, an audited rootfs/toolchain,
 Codex/App Server, credentials or provider egress, ACP crash/cancel/recovery,
-concurrent attempts, or the host-validated result-import path. The current
-direct worker path remains unchanged and `externalSandbox` remains disabled.
+concurrent attempts, or the host-validated result-import path. Worker
+execution remains direct-host with bounded log capture only; no filesystem
+isolation is integrated, and `externalSandbox` remains disabled.
 
 ### systemd/runc cgroup composition probe (2026-10-03)
 
@@ -345,18 +394,20 @@ were unloaded. The saved task note reports that all test containers and the
 exact leased temporary root were removed, but runtime-state absence was not
 independently recorded.
 
-The note does not preserve whether this probe used `--keep`, the exact `runc
-delete` invocation, or a post-delete check that the container ID was absent
-from the configured runc state root. Unloaded systemd units do not prove runc
-state-root cleanup. If `--keep` was used, runc requires manual deletion; on a
-repeat, record the exact cleanup command and verify state-root, cgroup, and unit
-absence before counting cleanup as proven.
+The earlier saved note does not preserve whether this probe used `--keep`, its
+exact `runc delete` invocation, or a post-delete check that the container ID
+was absent from the configured runc state root; that historical record remains
+incomplete. The separate repeat fixture above records an explicit delete and
+positive state-root, PID-identity, and systemd-scope absence checks. This is
+cleanup evidence for that disposable fixture only, not supervisor-managed
+crash/cancel recovery or release of an ACP execution fence.
 
 This does not prove that ACP persists either systemd invocation, captures an
 attached runc exit receipt, coordinates cancellation/recovery across supervisor
 restart, or safely releases its execution/result-import fences. It also does
-not prove credential or provider egress policy. The direct worker path remains
-unchanged and `externalSandbox` remains disabled.
+not prove credential or provider egress policy. Worker execution is still
+direct-host with bounded log capture only; no OCI filesystem isolation is
+integrated, and `externalSandbox` remains disabled.
 
 ## Required proof gates
 
