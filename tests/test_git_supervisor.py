@@ -148,20 +148,87 @@ def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change"
 
 
 def _record_test_worker_exit(supervisor: GitSupervisor, attempt_id: str) -> int:
-    process = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(0.1)"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    identity = supervisor._process_identity(process.pid)
-    assert identity is not None
-    with supervisor.connect() as connection:
-        connection.execute(
-            "UPDATE attempts SET pid = ?, pid_identity = ? WHERE id = ?",
-            (process.pid, identity, attempt_id),
+    gate_read, gate_write = os.pipe()
+    command = [
+        sys.executable,
+        "-c",
+        "import os,sys; os.read(int(sys.argv[1]),1)",
+        str(gate_read),
+    ]
+    monitor = [
+        sys.executable,
+        "-c",
+        (
+            "import subprocess; "
+            f"child=subprocess.Popen({command!r},pass_fds=({gate_read},)); "
+            "print(child.pid,flush=True); child.wait()"
+        ),
+    ]
+    try:
+        process = subprocess.Popen(
+            monitor,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            pass_fds=(gate_read,),
         )
+    except BaseException:
+        os.close(gate_write)
+        raise
+    finally:
+        os.close(gate_read)
+
+    def release_gate() -> None:
+        try:
+            os.write(gate_write, b"G")
+        except BrokenPipeError:
+            pass
+        finally:
+            os.close(gate_write)
+
+    try:
+        assert process.stdout is not None
+        command_pid = int(process.stdout.readline())
+        process.stdout.close()
+        monitor_identity = supervisor._process_identity(process.pid)
+        command_identity = supervisor._process_identity(command_pid)
+        assert monitor_identity is not None
+        assert command_identity is not None
+        attempt = supervisor.attempt(attempt_id)
+        with supervisor.connect() as connection:
+            connection.execute(
+                "UPDATE attempts SET pid = ?, pid_identity = ? WHERE id = ?",
+                (process.pid, monitor_identity, attempt_id),
+            )
+        command_digest = supervisor._record_worker_command_ready(
+            attempt_id,
+            attempt["claim_token"],
+            process.pid,
+            monitor_identity,
+            command_pid,
+            command_identity,
+            command,
+            None,
+        )
+    except BaseException:
+        release_gate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        raise
+    else:
+        release_gate()
     exit_code = process.wait(timeout=5)
-    supervisor._record_worker_exit(attempt_id, process.pid, exit_code)
+    supervisor._record_worker_exit(
+        attempt_id,
+        process.pid,
+        exit_code,
+        command_pid,
+        command_identity,
+        command_digest,
+    )
     return process.pid
 
 
@@ -1080,6 +1147,60 @@ def test_import_worker_result_submits_immutable_host_commit_without_checkout_mut
     with pytest.raises(SupervisorError) as corrupted:
         supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
     assert corrupted.value.code == "result_import_ambiguous"
+
+
+@requires_linux_worker
+@pytest.mark.parametrize("corruption", ["missing_ready", "identity_type", "digest_mismatch"])
+def test_import_rejects_unbound_or_malformed_worker_command_receipt(
+    repo: Path, result_root: Path, corruption: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject unbound worker command receipt")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+
+    with supervisor.connect() as connection:
+        if corruption == "missing_ready":
+            row = connection.execute(
+                "SELECT id, payload_json FROM events WHERE event_type = 'worker.command_ready' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            payload = json.loads(row["payload_json"])
+            payload["attempt_id"] = "different-attempt"
+        else:
+            row = connection.execute(
+                "SELECT id, payload_json FROM events WHERE event_type = 'worker.exited' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            payload = json.loads(row["payload_json"])
+            if corruption == "identity_type":
+                payload["command_identity"] = {}
+            else:
+                payload["command_digest"] = "f" * 64
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), row["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    assert rejected.value.code == "worker_exit_receipt_invalid"
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
 
 
 @requires_linux_worker
@@ -4265,6 +4386,222 @@ subprocess.run(["git", "commit", "-m", "contained worker"], check=True)
 
 
 @requires_linux_worker
+def test_worker_payload_waits_for_durable_command_identity_receipt(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "payload-started"
+    ready_entered = Event()
+    release_ready = Event()
+    original_record = supervisor._record_worker_command_ready
+
+    def block_before_receipt(*arguments, **keywords):
+        ready_entered.set()
+        assert release_ready.wait(timeout=5)
+        return original_record(*arguments, **keywords)
+
+    monkeypatch.setattr(supervisor, "_record_worker_command_ready", block_before_receipt)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,subprocess; "
+            f"pathlib.Path({str(marker)!r}).write_text('ran'); "
+            "pathlib.Path('alpha.txt').write_text('gated worker\\n'); "
+            "subprocess.run(['git','add','alpha.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','gated worker'],check=True)"
+        ),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
+        assert ready_entered.wait(timeout=5)
+        try:
+            assert not marker.exists()
+        finally:
+            release_ready.set()
+        submission = future.result(timeout=10)
+
+    assert submission["status"] == "pending_qc"
+    assert marker.read_text(encoding="utf-8") == "ran"
+    with supervisor.connect() as connection:
+        events = connection.execute(
+            """
+            SELECT sequence, event_type, payload_json FROM events
+            WHERE json_extract(payload_json, '$.attempt_id') = ?
+              AND event_type IN ('worker.command_ready', 'worker.exited')
+            ORDER BY sequence
+            """,
+            (attempt["id"],),
+        ).fetchall()
+    assert [row["event_type"] for row in events] == ["worker.command_ready", "worker.exited"]
+    ready = json.loads(events[0]["payload_json"])
+    exited = json.loads(events[1]["payload_json"])
+    assert events[0]["sequence"] < events[1]["sequence"]
+    assert ready["command_pid"] != ready["monitor_pid"]
+    assert ready["command_pid"] == exited["command_pid"]
+    assert ready["command_identity"] == exited["command_identity"]
+    assert ready["command_digest"] == exited["command_digest"]
+    assert (
+        ready["command_digest"]
+        == hashlib.sha256(
+            json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+    )
+
+
+@requires_linux_worker
+def test_worker_command_receipt_failure_keeps_payload_gated(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "unrecorded-payload-started"
+
+    def reject_command_receipt(*_arguments, **_keywords):
+        raise SupervisorError("injected_receipt_failure", "injected command receipt failure")
+
+    monkeypatch.setattr(supervisor, "_record_worker_command_ready", reject_command_receipt)
+    command = [
+        sys.executable,
+        "-c",
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')",
+    ]
+    with pytest.raises(SupervisorError, match="injected command receipt failure"):
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert not marker.exists()
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'worker.exited' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+
+
+@requires_linux_worker
+def test_worker_exit_receipt_failure_clears_dead_process_registration(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = Path(attempt["worktree"]) / "payload-ran-before-exit-receipt-failure"
+
+    def reject_exit_receipt(*_arguments, **_keywords):
+        raise SupervisorError("injected_exit_receipt_failure", "injected exit receipt failure")
+
+    monkeypatch.setattr(supervisor, "_record_worker_exit", reject_exit_receipt)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,subprocess; "
+            f"pathlib.Path({str(marker)!r}).write_text('ran'); "
+            "pathlib.Path('alpha.txt').write_text('worker finished\\n'); "
+            "subprocess.run(['git','add','alpha.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','worker finished'],check=True)"
+        ),
+    ]
+    with pytest.raises(SupervisorError, match="injected exit receipt failure"):
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert marker.read_text(encoding="utf-8") == "ran"
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'worker.exit_receipt_failed' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            is not None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'worker.exited' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+
+
+@requires_linux_worker
+def test_worker_receipt_digest_uses_frozen_caller_argv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = Path(attempt["worktree"]) / "argv-snapshot"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,subprocess; "
+            f"pathlib.Path({str(marker)!r}).write_text('frozen'); "
+            "pathlib.Path('alpha.txt').write_text('frozen argv\\n'); "
+            "subprocess.run(['git','add','alpha.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','frozen argv'],check=True)"
+        ),
+    ]
+    frozen_command = tuple(command)
+    original_popen = subprocess.Popen
+    mutated_script = command[2].replace("'frozen'", "'mutated'")
+
+    def mutate_after_trampoline_spawn(*arguments, **keywords):
+        process = original_popen(*arguments, **keywords)
+        argv = arguments[0]
+        if isinstance(argv, list) and any(
+            Path(str(argument)).name == "worker_trampoline.py" for argument in argv
+        ):
+            command[2] = mutated_script
+        return process
+
+    monkeypatch.setattr(
+        "agent_control_plane.git_supervisor.subprocess.Popen", mutate_after_trampoline_spawn
+    )
+    submission = supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert submission["status"] == "pending_qc"
+    assert command[2] == mutated_script
+    assert marker.read_text(encoding="utf-8") == "frozen"
+    with supervisor.connect() as connection:
+        ready = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type = 'worker.command_ready' "
+            "AND json_extract(payload_json, '$.attempt_id') = ?",
+            (attempt["id"],),
+        ).fetchone()
+    payload = json.loads(ready["payload_json"])
+    assert (
+        payload["command_digest"]
+        == hashlib.sha256(
+            json.dumps(list(frozen_command), ensure_ascii=True, separators=(",", ":")).encode(
+                "ascii"
+            )
+        ).hexdigest()
+    )
+
+
+@requires_linux_worker
 def test_registration_failure_terminates_spawned_worker(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5077,10 +5414,24 @@ def test_trust_loss_after_worker_exit_blocks_submission_and_retains_proved_ident
     release_exit = Event()
     original_record_exit = supervisor._record_worker_exit
 
-    def blocked_record_exit(attempt_id: str, pid: int, exit_code: int) -> None:
+    def blocked_record_exit(
+        attempt_id: str,
+        pid: int,
+        exit_code: int,
+        command_pid: int,
+        command_identity: str,
+        command_digest: str,
+    ) -> None:
         worker_exited.set()
         assert release_exit.wait(timeout=5)
-        original_record_exit(attempt_id, pid, exit_code)
+        original_record_exit(
+            attempt_id,
+            pid,
+            exit_code,
+            command_pid,
+            command_identity,
+            command_digest,
+        )
 
     monkeypatch.setattr(supervisor, "_record_worker_exit", blocked_record_exit)
     command = [

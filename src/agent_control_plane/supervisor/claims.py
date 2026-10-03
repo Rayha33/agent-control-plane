@@ -1983,7 +1983,7 @@ class ClaimsMixin:
         try:
             row = connection.execute(
                 """
-                SELECT id, event_hash, created_at, payload_json FROM events
+                SELECT id, event_hash, created_at, payload_json, sequence FROM events
                 WHERE event_type = 'worker.exited'
                   AND json_extract(payload_json, '$.attempt_id') = ?
                   AND json_extract(payload_json, '$.claim_token') = ?
@@ -2008,6 +2008,57 @@ class ClaimsMixin:
             raise SupervisorError(
                 "worker_exit_receipt_invalid", "worker exit audit record is malformed"
             ) from None
+        command_pid = payload.get("command_pid")
+        command_identity = payload.get("command_identity")
+        command_digest = payload.get("command_digest")
+        if (
+            type(command_pid) is not int
+            or command_pid < 1
+            or command_pid == expected_pid
+            or type(command_identity) is not str
+            or type(command_digest) is not str
+            or re.fullmatch(rf"linux:{command_pid}:[0-9]+", command_identity) is None
+            or re.fullmatch(r"[0-9a-f]{64}", command_digest) is None
+        ):
+            raise SupervisorError(
+                "worker_exit_receipt_invalid",
+                "worker exit audit record lacks a valid pre-exec command identity",
+            )
+        try:
+            ready = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE event_type = 'worker.command_ready'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.claim_token') = ?
+                  AND json_extract(payload_json, '$.monitor_pid') = ?
+                  AND json_extract(payload_json, '$.monitor_identity') = ?
+                  AND json_extract(payload_json, '$.command_pid') = ?
+                  AND json_extract(payload_json, '$.command_identity') = ?
+                  AND json_extract(payload_json, '$.command_digest') = ?
+                  AND sequence < ?
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (
+                    attempt["id"],
+                    attempt["claim_token"],
+                    expected_pid,
+                    identity,
+                    command_pid,
+                    command_identity,
+                    command_digest,
+                    row["sequence"],
+                ),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            raise SupervisorError(
+                "worker_exit_receipt_invalid", "worker command identity record is unreadable"
+            ) from None
+        if ready is None:
+            raise SupervisorError(
+                "worker_exit_receipt_invalid",
+                "worker exit has no matching durable pre-exec command identity record",
+            )
         if type(payload.get("exit_code")) is not int or payload["exit_code"] != 0:
             raise SupervisorError("worker_failed", "worker did not exit successfully")
         return canonical_json(

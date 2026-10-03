@@ -10,7 +10,11 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+import select
 import signal
 import subprocess
 import sys
@@ -34,6 +38,9 @@ class WorkersMixin:
         credential: str | None = None,
         result_manifest_path: str | None = None,
     ) -> dict[str, Any]:
+        # Freeze caller-owned mutable argv before it is logged, expanded into
+        # Popen, or hashed for the pre-exec receipt.
+        command = tuple(command)
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
         attempt = self.heartbeat(
@@ -57,9 +64,15 @@ class WorkersMixin:
             process: subprocess.Popen[bytes] | None = None
             handshake_read = -1
             handshake_write = -1
+            target_read = -1
+            target_write = -1
+            start_read = -1
+            start_write = -1
             launch_reserved = False
             try:
                 handshake_read, handshake_write = os.pipe()
+                target_read, target_write = os.pipe()
+                start_read, start_write = os.pipe()
                 self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
                 launch_reserved = True
                 trampoline = Path(__file__).parent.with_name("worker_trampoline.py").resolve()
@@ -69,17 +82,18 @@ class WorkersMixin:
                         "-I",
                         str(trampoline),
                         str(handshake_read),
-                        "-1",
-                        "-1",
+                        str(target_write),
+                        str(start_read),
                         MONITOR_MODE,
                         LIFECYCLE_FDS_PREFIX,
                         *command,
                     ],
                     cwd=attempt["worktree"],
+                    stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
-                    pass_fds=(handshake_read,),
+                    pass_fds=(handshake_read, target_write, start_read),
                     env=worker_env,
                 )
                 process_identity = self._process_identity(process.pid)
@@ -88,8 +102,9 @@ class WorkersMixin:
                         "worker_identity_unavailable",
                         "worker kernel identity could not be recorded",
                     )
-                os.close(handshake_read)
-                handshake_read = -1
+                for descriptor in (handshake_read, target_write, start_read):
+                    os.close(descriptor)
+                handshake_read = target_write = start_read = -1
                 launch_fenced = False
                 with self.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
@@ -172,13 +187,45 @@ class WorkersMixin:
                         "worker_launch_fenced",
                         "trust quarantine fenced the worker before launch authorization",
                     )
-                # Revalidate after the kernel identity is durable but before the
-                # handshake authorizes candidate code. If the pin disappeared,
-                # quarantine retains this PID until the monitor is reaped.
+                # The first gate releases only the trusted monitor. Its child
+                # blocks before exec while ACP records the exact command PID and
+                # start identity; candidate code remains unable to run.
                 self._verify_attempt_trust(attempt_id)
                 os.write(handshake_write, b"G")
                 os.close(handshake_write)
                 handshake_write = -1
+                ready, _, _ = select.select([target_read], [], [], 3)
+                raw_target = os.read(target_read, 32) if ready else b""
+                if not re.fullmatch(rb"[1-9][0-9]*\n", raw_target):
+                    raise SupervisorError(
+                        "worker_identity_unavailable",
+                        "worker monitor did not report its blocked command identity",
+                    )
+                command_pid = int(raw_target)
+                command_identity = self._process_identity(command_pid)
+                if command_identity is None:
+                    raise SupervisorError(
+                        "worker_identity_unavailable",
+                        "worker command kernel identity could not be recorded before exec",
+                    )
+                os.close(target_read)
+                target_read = -1
+                command_digest = self._record_worker_command_ready(
+                    attempt_id,
+                    claim_token,
+                    process.pid,
+                    process_identity,
+                    command_pid,
+                    command_identity,
+                    command,
+                    credential,
+                )
+                # Revalidate after both monitor and command identities are
+                # durable, but before the second gate authorizes candidate code.
+                self._verify_attempt_trust(attempt_id)
+                os.write(start_write, b"G")
+                os.close(start_write)
+                start_write = -1
                 interval = max(2, min(10, self.config.lease_seconds // 3))
                 while True:
                     try:
@@ -192,7 +239,14 @@ class WorkersMixin:
                             credential=credential,
                         )
             except BaseException:
-                for descriptor in (handshake_read, handshake_write):
+                for descriptor in (
+                    handshake_read,
+                    handshake_write,
+                    target_read,
+                    target_write,
+                    start_read,
+                    start_write,
+                ):
                     if descriptor >= 0:
                         os.close(descriptor)
                 if process is not None:
@@ -218,7 +272,23 @@ class WorkersMixin:
                 "worker_failed",
                 f"worker exited {process.returncode}; log: {log_path}",
             )
-        self._record_worker_exit(attempt_id, process.pid, process.returncode)
+        try:
+            self._record_worker_exit(
+                attempt_id,
+                process.pid,
+                process.returncode,
+                command_pid,
+                command_identity,
+                command_digest,
+            )
+        except BaseException:
+            self._clear_worker_registration(
+                attempt_id,
+                {process.pid},
+                "worker.exit_receipt_failed",
+                process.returncode,
+            )
+            raise
         try:
             submit_options = {
                 "expected_worker_pid": process.pid,
@@ -474,7 +544,71 @@ class WorkersMixin:
             )
             return target
 
-    def _record_worker_exit(self, attempt_id: str, pid: int, exit_code: int) -> None:
+    def _record_worker_command_ready(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        monitor_pid: int,
+        monitor_identity: str,
+        command_pid: int,
+        command_identity: str,
+        command: Sequence[str],
+        credential: str | None,
+    ) -> str:
+        """Persist the blocked command identity before releasing its exec gate."""
+
+        command_digest = hashlib.sha256(
+            json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+        if (
+            command_pid < 1
+            or command_pid == monitor_pid
+            or type(command_identity) is not str
+            or re.fullmatch(rf"linux:{command_pid}:[0-9]+", command_identity) is None
+            or self._process_identity(command_pid) != command_identity
+        ):
+            raise SupervisorError(
+                "worker_identity_unavailable",
+                "blocked worker command identity is missing or changed before exec",
+            )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            if (
+                attempt["pid"] != monitor_pid
+                or attempt["pid_identity"] != monitor_identity
+                or self._process_identity(monitor_pid) != monitor_identity
+            ):
+                raise SupervisorError(
+                    "worker_registration_lost",
+                    "worker monitor identity changed before command authorization",
+                )
+            self._event(
+                connection,
+                "worker.command_ready",
+                attempt["agent_id"],
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "monitor_pid": monitor_pid,
+                    "monitor_identity": monitor_identity,
+                    "command_pid": command_pid,
+                    "command_identity": command_identity,
+                    "command_digest": command_digest,
+                },
+            )
+        return command_digest
+
+    def _record_worker_exit(
+        self,
+        attempt_id: str,
+        pid: int,
+        exit_code: int,
+        command_pid: int,
+        command_identity: str,
+        command_digest: str,
+    ) -> None:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = connection.execute(
@@ -490,6 +624,46 @@ class WorkersMixin:
                     "worker_identity_unavailable",
                     "worker exit cannot be tied to a recorded kernel identity",
                 )
+            if (
+                command_pid < 1
+                or command_pid == pid
+                or type(command_identity) is not str
+                or type(command_digest) is not str
+                or re.fullmatch(rf"linux:{command_pid}:[0-9]+", command_identity) is None
+                or re.fullmatch(r"[0-9a-f]{64}", command_digest) is None
+            ):
+                raise SupervisorError(
+                    "worker_identity_unavailable",
+                    "worker command identity or digest is malformed",
+                )
+            ready = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE event_type = 'worker.command_ready'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.claim_token') = ?
+                  AND json_extract(payload_json, '$.monitor_pid') = ?
+                  AND json_extract(payload_json, '$.monitor_identity') = ?
+                  AND json_extract(payload_json, '$.command_pid') = ?
+                  AND json_extract(payload_json, '$.command_identity') = ?
+                  AND json_extract(payload_json, '$.command_digest') = ?
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (
+                    attempt_id,
+                    attempt["claim_token"],
+                    pid,
+                    attempt["pid_identity"],
+                    command_pid,
+                    command_identity,
+                    command_digest,
+                ),
+            ).fetchone()
+            if ready is None:
+                raise SupervisorError(
+                    "worker_identity_unavailable",
+                    "worker exit has no durable pre-exec command identity record",
+                )
             self._event(
                 connection,
                 "worker.exited",
@@ -499,6 +673,9 @@ class WorkersMixin:
                     "claim_token": attempt["claim_token"],
                     "pid": pid,
                     "pid_identity": attempt["pid_identity"],
+                    "command_pid": command_pid,
+                    "command_identity": command_identity,
+                    "command_digest": command_digest,
                     "exit_code": exit_code,
                     "observed_by": "supervisor_popen_wait",
                 },
