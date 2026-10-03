@@ -1,19 +1,31 @@
 # Per-attempt worker sandbox decision
 
 **Status:** proposed end-to-end architecture. Standalone bounded snapshot and
-change-set primitives, including exact host-side manifest replay validation,
-are implemented, but they are not integrated into a worker executor or
-registered-worktree import. End-to-end proof remains incomplete. This record
-does not authorize `externalSandbox` for ACP workers.
+change-set primitives, exact host-side manifest replay validation, secure
+snapshot readback, and an isolated-index candidate-tree builder are implemented.
+They are not integrated into a worker executor or registered-worktree import.
+The candidate builder writes host-generated blobs and a tree into the trusted
+repository's object store but does not create a commit/ref or modify the
+registered worktree or its real index; without a durable import journal those
+objects are provisional and must not be treated as imported. End-to-end proof
+remains incomplete. This record does not authorize `externalSandbox` for ACP
+workers.
 
-The current replay helper reconstructs and compares the complete result
-manifest; it does not write files, create Git objects, mutate a registered
-worktree, or journal/recover an import. Directory changes are represented so
-empty directories affect the result digest. A newly created parent directory
-may inherit authorization only from a directly authorized changed leaf below
-it; a removed directory may inherit it only when every removed descendant leaf
-is directly authorized. Standalone empty-directory changes require an explicit
-write-set grant.
+The replay helper reconstructs and compares the complete result manifest;
+directory changes are represented so empty directories affect the result
+digest. The candidate-tree builder takes that validated delta plus the baseline
+snapshot, verifies the snapshot again with no-follow descriptor-relative reads,
+binds the operation to the exact current base commit, and rejects any snapshot
+whose tracked paths, modes, blob bytes, or directory shape differ from that Git
+tree (including ignored or untracked local files). It hashes host-generated
+blob bytes with Git filters disabled and uses a temporary `GIT_INDEX_FILE` to
+create a candidate tree. It ignores empty directories, as Git trees do. It does
+not import the tree into a registered worktree, create a commit, or
+journal/recover a crash. A newly created parent directory may inherit
+authorization only from a directly authorized changed leaf below it; a removed
+directory may inherit it only when every removed descendant leaf is directly
+authorized. Standalone empty-directory changes require an explicit write-set
+grant.
 
 ## Decision
 

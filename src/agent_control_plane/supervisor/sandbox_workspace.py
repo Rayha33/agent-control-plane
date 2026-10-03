@@ -443,6 +443,54 @@ def copy_snapshot(
         os.close(source_parent_fd)
 
 
+def read_snapshot_files(
+    snapshot: Snapshot,
+    *,
+    limits: SnapshotLimits = _DEFAULT_LIMITS,
+) -> dict[str, bytes]:
+    """Read and verify every regular file in an immutable private snapshot.
+
+    This reopens each path with no-follow descriptor-relative traversal, checks
+    file and directory identity while reading, and requires the complete tree
+    to reproduce the snapshot's original manifest. It is intended for trusted
+    host-side consumers such as candidate Git-object construction.
+    """
+
+    if type(snapshot) is not Snapshot:
+        raise SupervisorError("invalid_snapshot", "snapshot handle is invalid")
+    snapshot.manifest.validate(limits)
+    parent_fd, name, root_fd = _open_existing_directory(snapshot.root)
+    try:
+        state = _CaptureState(limits, baseline={}, entries=[], changed_content={})
+        _walk_tree(
+            root_fd,
+            None,
+            parent_fd=parent_fd,
+            node_name=name,
+            relative="",
+            state=state,
+            root=True,
+            exclude_root_git=False,
+            require_canonical_modes=True,
+        )
+        _assert_source_stable(parent_fd, name, os.fstat(root_fd))
+        observed = _make_manifest(tuple(state.entries or ()), state.total_bytes)
+        observed.validate(limits)
+        if observed != snapshot.manifest:
+            raise SupervisorError(
+                "snapshot_changed", "private snapshot no longer matches its captured manifest"
+            )
+        files = state.changed_content or {}
+        if set(files) != {entry.path for entry in observed.entries if entry.kind == "file"}:
+            raise SupervisorError(
+                "snapshot_changed", "private snapshot file contents are incomplete"
+            )
+        return files
+    finally:
+        os.close(root_fd)
+        os.close(parent_fd)
+
+
 def collect_changes(
     baseline: TreeManifest,
     output_root: str | Path,
@@ -676,6 +724,99 @@ def apply_changes_to_manifest(
         raise SupervisorError(
             "incomplete_change_set", "change set does not reproduce the declared result digest"
         )
+    return result
+
+
+def validate_change_set_write_set(
+    baseline: TreeManifest,
+    change_set: ChangeSet,
+    *,
+    write_set_rules: Sequence[tuple[str, bool, bool]],
+    limits: SnapshotLimits = _DEFAULT_LIMITS,
+    path_matches: Callable[..., bool] | None = None,
+) -> TreeManifest:
+    """Revalidate a complete change set against the declared write set.
+
+    This is deliberately callable by host-side import code even when the
+    change-set object did not originate in ``collect_changes``. Nonempty
+    directory ancestors may inherit authority from an authorized changed
+    leaf; directory deletion is structural only when every changed baseline
+    leaf below it is an authorized deletion.
+    """
+
+    result = apply_changes_to_manifest(baseline, change_set, limits=limits)
+    rules = tuple(write_set_rules)
+    if any(
+        not isinstance(rule, (tuple, list))
+        or len(rule) != 3
+        or not isinstance(rule[0], str)
+        or not isinstance(rule[1], bool)
+        or not isinstance(rule[2], bool)
+        for rule in rules
+    ):
+        raise SupervisorError("invalid_write_set", "declared write-set rules are invalid")
+
+    before = {entry.path: entry for entry in baseline.entries}
+    after = {entry.path: entry for entry in result.entries}
+    changed_paths = sorted(
+        (path for path in set(before) | set(after) if before.get(path) != after.get(path)),
+        key=lambda value: value.encode("utf-8"),
+    )
+    matcher = path_matches or _existing_write_set_matcher
+    directly_authorized = {
+        path: any(
+            matcher(path, resource, fold=fold, is_logical=is_logical)
+            for resource, fold, is_logical in rules
+        )
+        for path in changed_paths
+    }
+    authorized_created_leaf_paths = sorted(
+        path
+        for path in changed_paths
+        if before.get(path) is None
+        and after.get(path) is not None
+        and after[path].kind != "directory"
+        and directly_authorized[path]
+    )
+    baseline_leaf_change_paths = sorted(
+        path
+        for path in changed_paths
+        if before.get(path) is not None and before[path].kind != "directory"
+    )
+    authorized_deleted_leaf_paths = sorted(
+        path
+        for path in baseline_leaf_change_paths
+        if after.get(path) is None and directly_authorized[path]
+    )
+
+    for path in changed_paths:
+        previous = before.get(path)
+        current = after.get(path)
+        authorized = directly_authorized[path]
+        if (
+            not authorized
+            and previous is None
+            and current is not None
+            and current.kind == "directory"
+        ):
+            start, end = _descendant_path_range(authorized_created_leaf_paths, path)
+            authorized = start < end
+        if (
+            not authorized
+            and previous is not None
+            and previous.kind == "directory"
+            and current is None
+        ):
+            leaf_start, leaf_end = _descendant_path_range(baseline_leaf_change_paths, path)
+            deleted_start, deleted_end = _descendant_path_range(authorized_deleted_leaf_paths, path)
+            leaf_count = leaf_end - leaf_start
+            authorized_deletion_count = deleted_end - deleted_start
+            authorized = leaf_count > 0 and leaf_count == authorized_deletion_count
+        if not authorized:
+            raise SupervisorError(
+                "undeclared_write",
+                f"worker result path {path!r} is outside the declared write set",
+            )
     return result
 
 

@@ -15,6 +15,7 @@ from agent_control_plane.supervisor.sandbox_workspace import (
     apply_changes_to_manifest,
     collect_changes,
     copy_snapshot,
+    read_snapshot_files,
 )
 
 
@@ -53,6 +54,20 @@ def test_snapshot_is_private_bounded_copy_and_excludes_only_root_git(tmp_path: P
     assert os.stat(copied / "first.txt").st_ino != os.stat(copied / "second.txt").st_ino
     assert snapshot.manifest.digest == snapshot.manifest.as_json()["sha256"]
     snapshot.manifest.validate()
+
+
+def test_read_snapshot_files_verifies_and_returns_only_regular_file_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "registered"
+    source.mkdir()
+    (source / "nested").mkdir()
+    (source / "nested" / "binary").write_bytes(b"\x00payload\xff")
+    (source / "link").symlink_to("nested/binary")
+    snapshot = copy_snapshot(source, tmp_path / "private")
+
+    assert read_snapshot_files(snapshot) == {"nested/binary": b"\x00payload\xff"}
+
+    (snapshot.root / "nested" / "binary").write_bytes(b"tampered!")
+    assert _codes(read_snapshot_files, snapshot) == "snapshot_changed"
 
 
 def test_root_git_file_is_excluded_and_never_interpreted(tmp_path: Path) -> None:
