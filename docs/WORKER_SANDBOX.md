@@ -202,6 +202,46 @@ assumptions, not properties proved by a namespace test.
    unavailable or differs. No resource quota is proven by this composition
    probe.
 
+   **Executor lifecycle contract (candidate; not integrated).** Keep runc
+   attached in the foreground with `runc --systemd-cgroup --root <state-root>
+   run --bundle <bundle-path> --keep --pid-file <host-only-pid-file>
+   <container-id>`. The explicit bundle path avoids relying on runc's
+   current-working-directory default. The OCI init must block at a
+   host-controlled launch gate. `runc run --keep` preserves stopped
+   state/cgroup for post-exit inspection and requires a later manual
+   `runc delete`; the pid file identifies the initial container process. The
+   `runc` client PID, ACP's supervisor/monitor PID, and container-init PID are
+   distinct identities and must not be substituted for one another. Before
+   releasing the inner gate, the supervisor must match the pid file against
+   `runc state`, sample the host PID/start-time identity, and verify that PID's
+   cgroup matches the exact per-attempt scope. The durable write-ahead
+   execution record must bind the attempt/fencing epoch to the ACP monitor
+   PID/start identity, runc-client PID/start identity, container-init PID/start
+   identity, container ID, state root, bundle/image digests, runtime version,
+   wrapper service unit name and InvocationID, container scope unit name and
+   InvocationID, and exact cgroup path. These are separate identities; existing
+   direct-worker receipts alone do not constitute this OCI execution record.
+   Revalidate the claim/fencing token before gate release. Any missing or
+   conflicting value fails closed with the gate held. The attached `runc run`
+   completion supplies the candidate exit status; cancellation and restart
+   recovery must target the recorded exact scope/container, not just the wrapper process
+   group. Keep the execution fence until the runtime reports stopped, exact
+   `runc delete` succeeds, the ID is absent from the configured state root,
+   the recorded container-init PID/start identity is absent, and the exact
+   scope/cgroup is gone. Independently persist the attached runc client's wait
+   result and prove that client has been reaped. The ACP monitor may remain
+   alive while it coordinates cleanup; its parent must reap it with
+   `Popen.wait()`, persist the matching hash-chained `worker.exited` monitor
+   receipt (`observed_by=supervisor_popen_wait`), and only then release the
+   attempt fence. That receipt does not replace the separate runc-client wait
+   result or container-init absence proof. Never use monitor absence as a
+   substitute for container-init absence.
+   Unknown cleanup state retains the fence. This protocol is derived from the
+   [runc 1.3.5 `run` manual](https://github.com/opencontainers/runc/blob/v1.3.5/man/runc-run.8.md)
+   and [systemd cgroup driver](https://github.com/opencontainers/runc/blob/v1.3.5/docs/systemd.md),
+   plus the bounded NAS fixture above; it is an implementation contract, not
+   proof that ACP currently performs these steps.
+
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
    measured host was Debian 12,
@@ -255,16 +295,21 @@ assumptions, not properties proved by a namespace test.
    scope/cancel feasibility path on this host; it is not a crash/restart
    recovery test.
    Before accepting an integration, persist a write-ahead execution row and
-   bind both the wrapper service invocation ID and container scope invocation
-   ID, container ID, bundle/image digests, exact cgroup path, host
-   container-init PID/start identity, and attached runc exit receipt to the same
-   attempt/fencing epoch. Keep the launch gate closed until these identities
-   and the attempt/trust fence are durably checked. Cancel/recover/reap the
-   exact scope with a finite TERM grace followed by KILL escalation, and
-   positively verify stopped state, identity absence, and unit/cgroup absence
-   before releasing fences. The runc client wait status and container-init
-   identity are separate evidence; never conflate them. Any uncertain identity
-   or absence retains the attempt and resource fences.
+   bind the ACP monitor PID/start identity, runc-client PID/start identity,
+   host container-init PID/start identity, wrapper service unit name and
+   InvocationID, container scope unit name and InvocationID, container ID,
+   state root, bundle/image digests, exact cgroup path, runtime version, and
+   attached runc exit receipt to the same attempt/fencing epoch. Keep the launch
+   gate closed until these identities and the attempt/trust fence are durably
+   checked. Cancel/recover/reap the exact scope with a finite TERM grace
+   followed by KILL escalation, and positively verify stopped state, absence
+   of the container-init PID/start identity, state-root ID absence, and exact
+   unit/cgroup absence. Persist and reap the runc client separately. The ACP
+   parent then waits for/reaps its monitor with `Popen.wait()`, records the
+   hash-chained `worker.exited` monitor receipt, and only then releases the
+   attempt fence. The runc-client wait status, monitor receipt, and
+   container-init identity are distinct evidence; never conflate them. Any
+   uncertain identity or absence retains the attempt and resource fences.
 4. **Credential and network boundary.** Do not mount host home, Codex config,
    SSH agents, D-Bus sockets, or inherited provider variables. A future provider
    adapter must grant a named, short-lived credential through the existing
