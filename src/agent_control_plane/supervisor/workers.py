@@ -91,8 +91,13 @@ class WorkersMixin:
             output_bytes_written = 0
             output_truncated = False
             log_bytes_existing = os.fstat(log.fileno()).st_size
-            log_bytes_available = max(0, _MAX_WORKER_LOG_BYTES - log_bytes_existing)
-            output_bytes_budget = max(0, log_bytes_available - len(_WORKER_LOG_TRUNCATION_MARKER))
+            log_bytes_available = _MAX_WORKER_LOG_BYTES - log_bytes_existing
+            if log_bytes_available < len(_WORKER_LOG_TRUNCATION_MARKER):
+                raise SupervisorError(
+                    "worker_log_budget_exhausted",
+                    "existing worker log leaves no room for the bounded output notice",
+                )
+            output_bytes_budget = log_bytes_available - len(_WORKER_LOG_TRUNCATION_MARKER)
             launch_reserved = False
             try:
                 handshake_read, handshake_write = os.pipe()

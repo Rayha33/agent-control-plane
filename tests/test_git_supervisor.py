@@ -34,6 +34,7 @@ from agent_control_plane.git_supervisor import (
 from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import process as process_module
 from agent_control_plane.supervisor import result_import as result_import_module
+from agent_control_plane.supervisor import workers as workers_module
 from agent_control_plane.supervisor.common import canonical_json, sha256
 from agent_control_plane.supervisor.result_import import result_ref_name
 from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
@@ -2616,9 +2617,18 @@ def test_supervised_worker_heartbeat_does_not_replace_explicit_checkpoint(repo: 
         "time.sleep(12)"
     )
 
-    submission = supervisor.run_worker(
-        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
-    )
+    def timeout_worker_output(_signum: int, _frame: object) -> None:
+        raise TimeoutError("worker output drain exceeded 15 seconds")
+
+    previous_alarm_handler = signal.signal(signal.SIGALRM, timeout_worker_output)
+    signal.setitimer(signal.ITIMER_REAL, 15)
+    try:
+        submission = supervisor.run_worker(
+            attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
 
     assert submission["status"] == "pending_qc"
     final_attempt = supervisor.attempt(attempt["id"])
@@ -5668,3 +5678,75 @@ sys.stdout.flush()
     assert b"visible-prefix\n" in log
     assert b"[ACP worker output truncated at 8 MiB]" in log
     assert len(log) <= 8 * 1024 * 1024
+
+
+@requires_linux_worker
+def test_worker_output_uses_remaining_attempt_log_budget(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    log_path = Path(supervisor.state_dir) / "logs" / f"worker-{attempt['id']}.log"
+    marker = workers_module._WORKER_LOG_TRUNCATION_MARKER
+    log_prefix = b"previous attempt output\n" * 100
+    log_prefix += b"p" * (workers_module._MAX_WORKER_LOG_BYTES - len(marker) - 16 - len(log_prefix))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_bytes(log_prefix)
+    command = """
+import pathlib
+import subprocess
+import sys
+
+pathlib.Path('alpha.txt').write_text('near-cap output\\n')
+subprocess.run(['git', 'add', 'alpha.txt'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.run(['git', 'commit', '-m', 'near-cap output'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+sys.stdout.buffer.write(b'near-cap-output-is-truncated')
+sys.stdout.flush()
+"""
+
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
+
+    assert submission["status"] == "pending_qc"
+    log = log_path.read_bytes()
+    assert len(log) == workers_module._MAX_WORKER_LOG_BYTES
+    assert log.startswith(log_prefix)
+    assert len(log[len(log_prefix) :]) == 16 + len(marker)
+    assert log.endswith(marker)
+
+
+@pytest.mark.parametrize(
+    "existing_log_size",
+    [
+        pytest.param(
+            workers_module._MAX_WORKER_LOG_BYTES
+            - len(workers_module._WORKER_LOG_TRUNCATION_MARKER)
+            + 1,
+            id="not-enough-room-for-marker",
+        ),
+        pytest.param(workers_module._MAX_WORKER_LOG_BYTES + 1, id="already-over-cap"),
+    ],
+)
+@requires_linux_worker
+def test_worker_launch_fails_closed_when_existing_log_budget_is_exhausted(
+    repo: Path, existing_log_size: int
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    log_path = Path(supervisor.state_dir) / "logs" / f"worker-{attempt['id']}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_bytes(b"x" * existing_log_size)
+    marker = Path(supervisor.state_dir) / f"must-not-launch-{attempt['id']}"
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('started')",
+    ]
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert error.value.code == "worker_log_budget_exhausted"
+    assert log_path.stat().st_size == existing_log_size
+    assert not marker.exists()
