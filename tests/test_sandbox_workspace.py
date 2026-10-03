@@ -723,6 +723,12 @@ def test_write_set_allows_directory_removal_only_for_claimed_descendant_deletion
     )
 
 
+def test_descendant_path_range_excludes_prefix_similar_siblings() -> None:
+    paths = sorted(["a/b", "a/b-", "a/b/child", "a/b/child/grand", "a/b0", "a/c"])
+    start, end = sandbox_workspace._descendant_path_range(paths, "a/b")
+    assert paths[start:end] == ["a/b/child", "a/b/child/grand"]
+
+
 def test_collect_changes_uses_existing_case_sensitive_write_set_rules(tmp_path: Path) -> None:
     source = tmp_path / "registered"
     source.mkdir()

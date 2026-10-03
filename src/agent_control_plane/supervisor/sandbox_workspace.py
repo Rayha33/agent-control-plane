@@ -11,6 +11,7 @@ import hashlib
 import os
 import stat
 import unicodedata
+from bisect import bisect_left
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -504,6 +505,24 @@ def collect_changes(
             )
             for path in changed_paths
         }
+        authorized_created_leaf_paths = sorted(
+            candidate
+            for candidate in changed_paths
+            if before.get(candidate) is None
+            and after.get(candidate) is not None
+            and after[candidate].kind != "directory"
+            and directly_authorized[candidate]
+        )
+        baseline_leaf_change_paths = sorted(
+            candidate
+            for candidate in changed_paths
+            if before.get(candidate) is not None and before[candidate].kind != "directory"
+        )
+        authorized_deleted_leaf_paths = sorted(
+            candidate
+            for candidate in baseline_leaf_change_paths
+            if after.get(candidate) is None and directly_authorized[candidate]
+        )
         for path in changed_paths:
             previous = before.get(path)
             current = after.get(path)
@@ -514,17 +533,14 @@ def collect_changes(
                 and current is not None
                 and current.kind == "directory"
             ):
-                # A new nonempty parent directory is structural when it only
-                # contains a directly authorized changed leaf. Empty directory
-                # creation still needs an explicit write-set grant.
-                authorized = any(
-                    candidate.startswith(path + "/")
-                    and before.get(candidate) is None
-                    and after.get(candidate) is not None
-                    and after[candidate].kind != "directory"
-                    and directly_authorized[candidate]
-                    for candidate in changed_paths
+                # A new nonempty parent directory is structural when it is an
+                # ancestor of a directly authorized changed leaf. Every other
+                # changed descendant is checked independently; an empty
+                # directory still needs an explicit write-set grant.
+                created_start, created_end = _descendant_path_range(
+                    authorized_created_leaf_paths, path
                 )
+                authorized = created_start < created_end
             if (
                 not authorized
                 and previous is not None
@@ -532,18 +548,16 @@ def collect_changes(
                 and current is None
             ):
                 # Removing a directory is structural only when every changed
-                # leaf below it is an explicitly authorized deletion. An empty
-                # directory deletion still needs an explicit grant.
-                descendant_leaves = [
-                    candidate
-                    for candidate in changed_paths
-                    if candidate.startswith(path + "/")
-                    and before.get(candidate) is not None
-                    and before[candidate].kind != "directory"
-                ]
-                authorized = bool(descendant_leaves) and all(
-                    after.get(candidate) is None and directly_authorized[candidate]
-                    for candidate in descendant_leaves
+                # baseline leaf below it is an explicitly authorized deletion.
+                # An empty directory deletion still needs an explicit grant.
+                leaves_start, leaves_end = _descendant_path_range(baseline_leaf_change_paths, path)
+                deleted_start, deleted_end = _descendant_path_range(
+                    authorized_deleted_leaf_paths, path
+                )
+                descendant_leaf_count = leaves_end - leaves_start
+                authorized_deletion_count = deleted_end - deleted_start
+                authorized = (
+                    descendant_leaf_count > 0 and descendant_leaf_count == authorized_deletion_count
                 )
             if not authorized:
                 raise SupervisorError(
@@ -1009,6 +1023,14 @@ def _make_change_set(
     }
     digest = sha256(canonical_json(payload).encode("utf-8"))
     return ChangeSet(baseline_digest, result_digest, ordered, total_bytes, digest)
+
+
+def _descendant_path_range(sorted_paths: Sequence[str], directory: str) -> tuple[int, int]:
+    """Return the sorted-path slice strictly below a canonical directory path."""
+
+    # '/' sorts before '0', so this bounds the prefix range without scanning
+    # descendants. All paths were validated as relative UTF-8 before indexing.
+    return bisect_left(sorted_paths, directory + "/"), bisect_left(sorted_paths, directory + "0")
 
 
 def _validate_tree_shape(entries: Sequence[ManifestEntry]) -> None:
