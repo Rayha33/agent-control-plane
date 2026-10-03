@@ -14,6 +14,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -34,7 +35,12 @@ from .result_import import (
     candidate_commit_object,
     candidate_commit_payload,
     candidate_ref_target,
+    candidate_tree_object_ids,
+    cleanup_candidate_object_temps,
+    missing_candidate_objects,
+    promote_candidate_objects,
     publish_candidate_ref,
+    remove_unreachable_candidate_objects,
     result_ref_name,
     verify_candidate_objects,
 )
@@ -50,6 +56,8 @@ _RESULT_ARTIFACT_MAX_COUNT = 16
 _RESULT_ARTIFACT_MAX_PATH_BYTES = 1024
 _RESULT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
 _RESULT_ARTIFACT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
+_RESULT_IMPORT_STAGE_MAX_BYTES = 512 * 1024 * 1024
+_RESULT_IMPORT_STAGING_TOTAL_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class ClaimsMixin:
@@ -2070,6 +2078,475 @@ class ClaimsMixin:
                 "registered attempt worktree is not clean at the recorded base",
             )
 
+    def _result_import_staging_root(self, *, create: bool = False) -> Path:
+        state_root = self.state_dir.resolve(strict=True)
+        root = state_root / "result-import-staging"
+        if root.is_symlink():
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging root must not be a symlink"
+            )
+        try:
+            if create:
+                root.mkdir(mode=0o700, exist_ok=True)
+                if os.name != "nt":
+                    self._fsync_result_import_directory(state_root)
+            resolved = root.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging root is unavailable"
+            ) from error
+        if resolved != root or not resolved.is_dir():
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging root identity is invalid"
+            )
+        return resolved
+
+    def _result_import_stage_path(self, import_id: str, *, create: bool = False) -> Path:
+        try:
+            if str(uuid.UUID(import_id)) != import_id:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError):
+            raise SupervisorError(
+                "invalid_worker_result", "result stage identity is invalid"
+            ) from None
+        root = self._result_import_staging_root(create=create)
+        stage = root / import_id
+        if stage.is_symlink():
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result import stage must not be a symlink"
+            )
+        if create:
+            try:
+                stage.mkdir(mode=0o700)
+                (stage / "objects").mkdir(mode=0o700)
+            except FileExistsError:
+                raise SupervisorError(
+                    "result_import_staging_unavailable",
+                    "result import stage already exists without a matching journal",
+                ) from None
+            except OSError as error:
+                raise SupervisorError(
+                    "result_import_staging_unavailable", "result import stage could not be created"
+                ) from error
+        return stage
+
+    @staticmethod
+    def _parse_result_import_object_ids(raw: str, object_id_length: int) -> tuple[str, ...] | None:
+        try:
+            values = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(values, list) or any(
+            not isinstance(value, str)
+            or re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", value) is None
+            for value in values
+        ):
+            return None
+        if values != sorted(set(values)):
+            return None
+        return tuple(values)
+
+    def _result_import_stage_size(self, root: Path) -> int:
+        total = 0
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        try:
+            for current, directories, files in os.walk(root, followlinks=False, onerror=fail_walk):
+                current_path = Path(current)
+                for name in directories:
+                    path = current_path / name
+                    if path.is_symlink():
+                        raise SupervisorError(
+                            "result_import_staging_unavailable", "staging tree contains a symlink"
+                        )
+                for name in files:
+                    path = current_path / name
+                    if path.is_symlink():
+                        raise SupervisorError(
+                            "result_import_staging_unavailable", "staging tree contains a symlink"
+                        )
+                    total += path.stat(follow_symlinks=False).st_size
+        except OSError as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "staging size could not be measured"
+            ) from error
+        return total
+
+    def _fsync_result_import_stage(self, root: Path) -> None:
+        """Flush the exact staged object files before the SQLite journal can name them."""
+
+        directories: list[Path] = []
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        try:
+            for current, child_directories, files in os.walk(
+                root, followlinks=False, onerror=fail_walk
+            ):
+                current_path = Path(current)
+                directories.append(current_path)
+                for name in (*child_directories, *files):
+                    if (current_path / name).is_symlink():
+                        raise OSError("staging tree contains a symlink")
+                for name in files:
+                    descriptor = os.open(current_path / name, os.O_RDONLY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            if os.name != "nt":
+                for directory in reversed(directories):
+                    descriptor = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                self._fsync_result_import_directory(root.parent)
+        except OSError as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "staged Git objects could not be flushed"
+            ) from error
+
+    @staticmethod
+    def _fsync_result_import_directory(directory: Path) -> None:
+        if os.name == "nt":
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(directory, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _cleanup_result_import_staging_locked(self) -> None:
+        """Remove only unjournaled/terminal private stages and proven unreachable owned blobs."""
+
+        root = self._result_import_staging_root(create=True)
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM result_imports").fetchall()
+        by_id = {row["id"]: row for row in rows}
+
+        try:
+            entries = tuple(os.scandir(root))
+        except OSError as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging directory could not be listed"
+            ) from error
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                if str(uuid.UUID(entry.name)) != entry.name:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            row = by_id.get(entry.name)
+            if row is not None and row["phase"] == "prepared":
+                recorded_path = row["staging_path"]
+                if recorded_path and Path(recorded_path) == root / entry.name:
+                    continue
+            if row is not None and row["phase"] not in {"ref_published", "submitted", "ambiguous"}:
+                continue
+            target = root / entry.name
+            if target.is_symlink() or target.parent != root:
+                continue
+            try:
+                shutil.rmtree(target)
+            except OSError as error:
+                raise SupervisorError(
+                    "result_import_staging_unavailable",
+                    "terminal private result stage could not be removed",
+                ) from error
+
+        cleanup_rows = [
+            row
+            for row in rows
+            if row["phase"] == "ambiguous"
+            and row["staging_path"]
+            and Path(row["staging_path"]) == root / row["id"]
+        ]
+        if not cleanup_rows:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+
+        prepared_events = self._result_import_prepared_events_locked(cleanup_rows)
+        if prepared_events is None:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+
+        object_format_result = self._run_git_while_locked("rev-parse", "--show-object-format")
+        if object_format_result.returncode:
+            return
+        object_format = object_format_result.stdout.decode("ascii", errors="strict").strip()
+        if object_format not in {"sha1", "sha256"}:
+            return
+        object_id_length = 64 if object_format == "sha256" else 40
+
+        protected: set[str] = set()
+        terminal_rows: list[sqlite3.Row] = []
+        inventory_valid = True
+        git_executable = self._system_git_executable(self.root)
+        cleanup_import_ids = {row["id"] for row in cleanup_rows}
+        promote_inventory_by_import: dict[str, tuple[str, ...]] = {}
+        for row in cleanup_rows:
+            object_ids = self._parse_result_import_object_ids(
+                row["object_ids_json"] or "[]", object_id_length
+            )
+            promote_ids = self._parse_result_import_object_ids(
+                row["promote_object_ids_json"] or "[]", object_id_length
+            )
+            if (
+                object_ids is None
+                or promote_ids is None
+                or not set(promote_ids).issubset(object_ids)
+                or row["tree_sha"] not in object_ids
+                or row["commit_sha"] not in object_ids
+                or not self._prepared_result_import_event_matches(
+                    row, object_ids, promote_ids, prepared_events.get(row["id"])
+                )
+            ):
+                completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+                self._clear_result_import_staging_paths(completed_rows)
+                return
+            promote_inventory_by_import[row["id"]] = promote_ids
+
+        for row in rows:
+            object_ids = self._parse_result_import_object_ids(
+                row["object_ids_json"] or "[]", object_id_length
+            )
+            promote_ids = self._parse_result_import_object_ids(
+                row["promote_object_ids_json"] or "[]", object_id_length
+            )
+            if object_ids is None or promote_ids is None:
+                if row["phase"] != "ambiguous":
+                    inventory_valid = False
+                continue
+            if row["phase"] == "ambiguous":
+                if row["id"] in cleanup_import_ids:
+                    cleanup_candidate_object_temps(
+                        self.root,
+                        row["id"],
+                        promote_inventory_by_import[row["id"]],
+                        git_executable=git_executable,
+                    )
+                    if not (root / row["id"]).exists() and not (root / row["id"]).is_symlink():
+                        terminal_rows.append(row)
+            else:
+                protected.update(object_ids)
+                if not object_ids:
+                    try:
+                        protected.update(
+                            candidate_tree_object_ids(
+                                self.root,
+                                row["tree_sha"],
+                                git_executable=git_executable,
+                            )
+                        )
+                    except SupervisorError:
+                        inventory_valid = False
+                if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", row["commit_sha"]):
+                    protected.add(row["commit_sha"])
+        if not inventory_valid:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+        reachable = self._result_import_reachable_objects_locked(object_id_length)
+        if reachable is None:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+        for row in cleanup_rows:
+            remove_unreachable_candidate_objects(
+                self.root,
+                promote_inventory_by_import[row["id"]],
+                protected_object_ids=protected,
+                reachable_object_ids=reachable,
+                git_executable=git_executable,
+            )
+        completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+        self._clear_result_import_staging_paths([*completed_rows, *terminal_rows])
+
+    def _result_import_prepared_events_locked(
+        self, rows: Sequence[sqlite3.Row]
+    ) -> dict[str, dict[str, Any]] | None:
+        """Load prepared event provenance only from an intact audit chain."""
+
+        payloads: dict[str, dict[str, Any]] = {}
+        with self.connect() as connection:
+            if not self._verify_event_chain(connection)["ok"]:
+                return None
+            for row in rows:
+                events = connection.execute(
+                    "SELECT payload_json FROM events WHERE event_type = ? "
+                    "AND json_extract(payload_json, '$.import_id') = ?",
+                    ("worker.result_import_prepared", row["id"]),
+                ).fetchall()
+                if len(events) != 1:
+                    return None
+                try:
+                    payload = json.loads(events[0]["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                if not isinstance(payload, dict):
+                    return None
+                payloads[row["id"]] = payload
+        return payloads
+
+    @staticmethod
+    def _prepared_result_import_event_matches(
+        row: sqlite3.Row,
+        object_ids: Sequence[str],
+        promote_ids: Sequence[str],
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if payload is None:
+            return False
+        expected = {
+            "import_id": row["id"],
+            "attempt_id": row["attempt_id"],
+            "claim_token": row["claim_token"],
+            "worker_pid": row["worker_pid"],
+            "worker_identity": row["worker_identity"],
+            "worker_exit_receipt_digest": sha256(row["worker_exit_receipt_json"].encode("utf-8")),
+            "result_digest": row["result_digest"],
+            "tree_sha": row["tree_sha"],
+            "commit_sha": row["commit_sha"],
+            "result_ref": row["result_ref"],
+            "staging_path": row["staging_path"],
+            "object_inventory_digest": sha256(canonical_json(list(object_ids)).encode("utf-8")),
+            "promotion_inventory_digest": sha256(canonical_json(list(promote_ids)).encode("utf-8")),
+            "promotion_object_count": len(promote_ids),
+        }
+        return all(payload.get(key) == value for key, value in expected.items())
+
+    @staticmethod
+    def _cleanup_completed_result_stages_locked(
+        rows: Sequence[sqlite3.Row], root: Path
+    ) -> list[sqlite3.Row]:
+        """Return completed imports whose canonical private stage is already absent."""
+
+        completed: list[sqlite3.Row] = []
+        for row in rows:
+            if row["phase"] not in {"ref_published", "submitted"}:
+                continue
+            if not row["staging_path"] or Path(row["staging_path"]) != root / row["id"]:
+                continue
+            stage = root / row["id"]
+            if stage.exists() or stage.is_symlink():
+                continue
+            completed.append(row)
+        return completed
+
+    def _clear_result_import_staging_paths(self, rows: Sequence[sqlite3.Row]) -> None:
+        if not rows:
+            return
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for import_id in sorted({row["id"] for row in rows}):
+                current = connection.execute(
+                    "SELECT attempt_id, claim_token, result_digest, phase, staging_path "
+                    "FROM result_imports WHERE id = ?",
+                    (import_id,),
+                ).fetchone()
+                if (
+                    current is None
+                    or not current["staging_path"]
+                    or current["phase"] not in {"ref_published", "submitted", "ambiguous"}
+                ):
+                    continue
+                connection.execute(
+                    "UPDATE result_imports SET staging_path = '' WHERE id = ?",
+                    (import_id,),
+                )
+                self._event(
+                    connection,
+                    "worker.result_import_stage_cleaned",
+                    "recovery",
+                    {
+                        "import_id": import_id,
+                        "attempt_id": current["attempt_id"],
+                        "claim_token": current["claim_token"],
+                        "result_digest": current["result_digest"],
+                        "phase": current["phase"],
+                    },
+                )
+
+    def _result_import_reachable_objects_locked(self, object_id_length: int) -> set[str] | None:
+        """Read refs, reflogs, every registered worktree HEAD, and every worktree index."""
+
+        listed = self._run_git_while_locked("worktree", "list", "--porcelain", "-z")
+        if listed.returncode:
+            return None
+        try:
+            worktrees = self._parse_registered_worktrees(
+                listed.stdout.decode("utf-8", errors="surrogateescape")
+            )
+        except (UnicodeError, ValueError):
+            return None
+        if not worktrees:
+            return None
+        heads: set[str] = set()
+        indexed: set[str] = set()
+        for worktree_text in worktrees:
+            worktree = Path(worktree_text)
+            if worktree.is_symlink() or not worktree.is_dir():
+                return None
+            head = self._run_git_while_locked(
+                "-C", str(worktree), "rev-parse", "--verify", "HEAD^{commit}"
+            )
+            if head.returncode:
+                return None
+            head_id = head.stdout.decode("ascii", errors="strict").strip()
+            if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", head_id) is None:
+                return None
+            heads.add(head_id)
+            index = self._run_git_while_locked("-C", str(worktree), "ls-files", "--stage", "-z")
+            if index.returncode:
+                return None
+            for record in index.stdout.split(b"\0"):
+                if not record:
+                    continue
+                metadata, separator, _path = record.partition(b"\t")
+                fields = metadata.split(b" ")
+                if not separator or len(fields) != 3:
+                    return None
+                try:
+                    object_id = fields[1].decode("ascii", errors="strict")
+                except UnicodeDecodeError:
+                    return None
+                if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", object_id) is None:
+                    return None
+                indexed.add(object_id)
+
+        arguments = (
+            "rev-list",
+            "--objects",
+            "--all",
+            "--reflog",
+            "--no-object-names",
+            *sorted(heads),
+        )
+        reachable_result = self._run_git_while_locked(*arguments)
+        if reachable_result.returncode:
+            return None
+        reachable = set(indexed)
+        for line in reachable_result.stdout.splitlines():
+            if not line:
+                continue
+            try:
+                object_id = line.split(maxsplit=1)[0].decode("ascii", errors="strict")
+            except UnicodeDecodeError:
+                return None
+            if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", object_id) is None:
+                return None
+            reachable.add(object_id)
+        return reachable
+
     def import_worker_result(
         self,
         attempt_id: str,
@@ -2156,55 +2633,98 @@ class ClaimsMixin:
 
         git_executable = self._system_git_executable(self.root)
         with self._git_operation_guard():
-            self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
-            candidate = build_candidate_tree(
-                attempt_snapshot["worktree"],
-                baseline,
-                change_set,
-                base_sha=base_sha,
-                write_set_rules=rules,
-                git_executable=git_executable,
-            )
-            self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
+            self._cleanup_result_import_staging_locked()
             journal_id = import_id
             with self.connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute(
-                    "SELECT * FROM result_imports WHERE attempt_id = ? "
+                    "SELECT id FROM result_imports WHERE attempt_id = ? "
                     "AND claim_token = ? AND result_digest = ?",
                     (attempt_id, claim_token, result_digest),
                 ).fetchone()
-                if existing:
-                    if any(
-                        existing[column] != expected
-                        for column, expected in (
-                            ("id", import_id),
-                            ("worker_pid", worker_pid),
-                            ("worker_identity", attempt_snapshot["pid_identity"]),
-                            ("worker_exit_receipt_json", exit_receipt),
-                            ("base_sha", base_sha),
-                            ("tree_sha", candidate.tree_sha),
-                            ("baseline_digest", candidate.baseline_digest),
-                            ("change_digest", candidate.change_digest),
-                            ("result_ref", reference),
-                        )
-                    ):
-                        self._mark_result_import_ambiguous_in(
-                            connection,
-                            existing["id"],
-                            "same result digest resolved to different import evidence",
-                        )
-                        connection.commit()
-                        raise SupervisorError(
-                            "result_import_ambiguous",
-                            "existing result journal conflicts with output",
-                        )
-                    if existing["phase"] == "ambiguous":
-                        raise SupervisorError(
-                            "result_import_ambiguous", "result import is fenced as ambiguous"
-                        )
-                    journal_id = existing["id"]
-                else:
+            if existing:
+                if existing["id"] != import_id:
+                    self._mark_result_import_ambiguous(
+                        existing["id"], "result journal ID is not its deterministic identity"
+                    )
+                    raise SupervisorError(
+                        "result_import_ambiguous", "result journal identity is inconsistent"
+                    )
+                journal_id = existing["id"]
+            else:
+                self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
+                staging_root = self._result_import_staging_root()
+                existing_stage_bytes = self._result_import_stage_size(staging_root)
+                if (
+                    existing_stage_bytes
+                    > _RESULT_IMPORT_STAGING_TOTAL_MAX_BYTES - _RESULT_IMPORT_STAGE_MAX_BYTES
+                ):
+                    raise SupervisorError(
+                        "result_import_storage_limit",
+                        "bounded result-import staging capacity is exhausted",
+                    )
+                stage_path = self._result_import_stage_path(import_id, create=True)
+                stage_objects = stage_path / "objects"
+                common_objects = Path(self._git_common_dir).resolve(strict=True) / "objects"
+                candidate = build_candidate_tree(
+                    attempt_snapshot["worktree"],
+                    baseline,
+                    change_set,
+                    base_sha=base_sha,
+                    write_set_rules=rules,
+                    object_directory=stage_objects,
+                    alternate_object_directory=common_objects,
+                    git_executable=git_executable,
+                )
+                self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
+                committed_at = int(time.time())
+                payload = candidate_commit_payload(
+                    candidate,
+                    attempt_id=attempt_id,
+                    claim_token=claim_token,
+                    result_digest=result_digest,
+                    committed_at=committed_at,
+                )
+                commit_sha = candidate_commit_object(
+                    attempt_snapshot["worktree"],
+                    payload,
+                    write=False,
+                    object_directory=stage_objects,
+                    git_executable=git_executable,
+                )
+                written_commit = candidate_commit_object(
+                    attempt_snapshot["worktree"],
+                    payload,
+                    write=True,
+                    object_directory=stage_objects,
+                    git_executable=git_executable,
+                )
+                if written_commit != commit_sha:
+                    raise SupervisorError(
+                        "candidate_tree_failed", "staged result commit hash changed while writing"
+                    )
+                self._fsync_result_import_stage(stage_path)
+                object_ids = tuple(sorted({*candidate.object_ids, commit_sha}))
+                promote_ids = missing_candidate_objects(
+                    attempt_snapshot["worktree"],
+                    object_ids,
+                    git_executable=git_executable,
+                )
+                stage_bytes = self._result_import_stage_size(stage_path)
+                total_stage_bytes = self._result_import_stage_size(
+                    self._result_import_staging_root()
+                )
+                if (
+                    stage_bytes > _RESULT_IMPORT_STAGE_MAX_BYTES
+                    or total_stage_bytes > _RESULT_IMPORT_STAGING_TOTAL_MAX_BYTES
+                ):
+                    shutil.rmtree(stage_path)
+                    raise SupervisorError(
+                        "result_import_storage_limit",
+                        "bounded result-import staging capacity is exhausted",
+                    )
+                stamp = utc_now()
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
                     current = self._active_attempt(
                         connection, attempt_id, claim_token, int(time.time())
                     )
@@ -2219,29 +2739,15 @@ class ClaimsMixin:
                             "stale_worker_result",
                             "worker or task fence changed during result import",
                         )
-                    committed_at = int(time.time())
-                    payload = candidate_commit_payload(
-                        candidate,
-                        attempt_id=attempt_id,
-                        claim_token=claim_token,
-                        result_digest=result_digest,
-                        committed_at=committed_at,
-                    )
-                    commit_sha = candidate_commit_object(
-                        attempt_snapshot["worktree"],
-                        payload,
-                        write=False,
-                        git_executable=git_executable,
-                    )
-                    stamp = utc_now()
                     connection.execute(
                         """
                         INSERT INTO result_imports
                           (id, attempt_id, claim_token, worker_pid, worker_identity,
                            worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
                            result_digest, change_digest, result_ref, commit_timestamp,
-                           commit_sha, phase, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
+                           commit_sha, phase, staging_path, object_ids_json,
+                           promote_object_ids_json, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)
                         """,
                         (
                             import_id,
@@ -2258,6 +2764,9 @@ class ClaimsMixin:
                             reference,
                             committed_at,
                             commit_sha,
+                            str(stage_path),
+                            canonical_json(list(object_ids)),
+                            canonical_json(list(promote_ids)),
                             stamp,
                             stamp,
                         ),
@@ -2272,10 +2781,19 @@ class ClaimsMixin:
                             "claim_token": claim_token,
                             "worker_pid": worker_pid,
                             "worker_identity": current["pid_identity"],
+                            "worker_exit_receipt_digest": sha256(exit_receipt.encode("utf-8")),
                             "result_digest": result_digest,
                             "tree_sha": candidate.tree_sha,
                             "commit_sha": commit_sha,
                             "result_ref": reference,
+                            "staging_path": str(stage_path),
+                            "object_inventory_digest": sha256(
+                                canonical_json(list(object_ids)).encode("utf-8")
+                            ),
+                            "promotion_inventory_digest": sha256(
+                                canonical_json(list(promote_ids)).encode("utf-8")
+                            ),
+                            "promotion_object_count": len(promote_ids),
                         },
                     )
 
@@ -2324,6 +2842,8 @@ class ClaimsMixin:
 
         self._assert_safe_git_execution_config()
         self._assert_no_git_grafts()
+        with self._git_operation_guard():
+            self._cleanup_result_import_staging_locked()
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM result_imports WHERE id = ?", (import_id,)
@@ -2529,29 +3049,97 @@ class ClaimsMixin:
                         current["result_ref"],
                         git_executable=git_executable,
                     )
-                    verify_candidate_objects(
-                        attempt_snapshot["worktree"],
-                        candidate,
-                        commit_sha=target,
-                        git_executable=git_executable,
-                    )
                     if target is None:
                         if current["phase"] != "prepared":
                             raise SupervisorError(
                                 "result_import_ambiguous",
                                 "published result ref disappeared; automatic replay refused",
                             )
-                        written = candidate_commit_object(
-                            attempt_snapshot["worktree"],
-                            payload,
-                            write=True,
-                            git_executable=git_executable,
-                        )
-                        if written != expected_commit:
-                            raise SupervisorError(
-                                "result_import_ambiguous",
-                                "written result commit differs from journal",
+                        if current["staging_path"]:
+                            expected_stage = self._result_import_stage_path(import_id)
+                            if current["staging_path"] != str(expected_stage):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result stage path is not canonical",
+                                )
+                            stage_objects = expected_stage / "objects"
+                            if (
+                                expected_stage.is_symlink()
+                                or not expected_stage.is_dir()
+                                or stage_objects.is_symlink()
+                                or not stage_objects.is_dir()
+                            ):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result object stage is unavailable",
+                                )
+                            object_id_length = len(current["base_sha"])
+                            object_ids = self._parse_result_import_object_ids(
+                                current["object_ids_json"], object_id_length
                             )
+                            promote_ids = self._parse_result_import_object_ids(
+                                current["promote_object_ids_json"], object_id_length
+                            )
+                            if (
+                                object_ids is None
+                                or promote_ids is None
+                                or current["tree_sha"] not in object_ids
+                                or current["commit_sha"] not in object_ids
+                                or not set(promote_ids).issubset(object_ids)
+                            ):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result object provenance is invalid",
+                                )
+                            tree_object_ids = candidate_tree_object_ids(
+                                attempt_snapshot["worktree"],
+                                current["tree_sha"],
+                                object_directory=stage_objects,
+                                git_executable=git_executable,
+                            )
+                            if set(tree_object_ids) | {current["commit_sha"]} != set(object_ids):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result object inventory does not match its tree",
+                                )
+                            verify_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                candidate,
+                                commit_sha=expected_commit,
+                                object_directory=stage_objects,
+                                git_executable=git_executable,
+                            )
+                            promote_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                stage_objects,
+                                promote_ids,
+                                import_id=import_id,
+                                git_executable=git_executable,
+                            )
+                            verify_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                candidate,
+                                commit_sha=expected_commit,
+                                git_executable=git_executable,
+                            )
+                        else:
+                            # Pre-v13 journals already wrote trees to the shared ODB.
+                            verify_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                candidate,
+                                git_executable=git_executable,
+                            )
+                            written = candidate_commit_object(
+                                attempt_snapshot["worktree"],
+                                payload,
+                                write=True,
+                                git_executable=git_executable,
+                            )
+                            if written != expected_commit:
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "written result commit differs from journal",
+                                )
                         publish_candidate_ref(
                             attempt_snapshot["worktree"],
                             current["result_ref"],
@@ -2605,7 +3193,7 @@ class ClaimsMixin:
             raise
 
         try:
-            return self._submit(
+            submission = self._submit(
                 journal["attempt_id"],
                 journal["claim_token"],
                 expected_worker_pid=journal["worker_pid"],
@@ -2632,10 +3220,20 @@ class ClaimsMixin:
                 if completed and completed["phase"] == "submitted" and completed["submission_id"]:
                     return self.recover_worker_result_import(import_id, credential=credential)
                 self._mark_result_import_ambiguous(import_id, str(error))
+                with self._git_operation_guard():
+                    self._cleanup_result_import_staging_locked()
                 raise SupervisorError(
                     "result_import_ambiguous", "submission lost its claim fence; result is retained"
                 ) from error
             raise
+        try:
+            with self._git_operation_guard():
+                self._cleanup_result_import_staging_locked()
+        except SupervisorError:
+            # Submission is already durable. Staging remains bounded and will be
+            # retried by the next import/recovery call if cleanup was unavailable.
+            pass
+        return submission
 
     def _submit(
         self,

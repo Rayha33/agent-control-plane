@@ -15,7 +15,12 @@ from agent_control_plane.supervisor.result_import import (
     candidate_commit_object,
     candidate_commit_payload,
     candidate_ref_target,
+    candidate_tree_object_ids,
+    cleanup_candidate_object_temps,
+    missing_candidate_objects,
+    promote_candidate_objects,
     publish_candidate_ref,
+    remove_unreachable_candidate_objects,
     result_ref_name,
     verify_candidate_objects,
 )
@@ -157,6 +162,177 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
     assert _git(repository, "rev-parse", "HEAD") == head_before
     assert _git(repository, "status", "--porcelain=v1", "-z") == status_before == b""
     assert index_path.read_bytes() == index_before
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_candidate_objects_are_staged_promoted_and_cleaned_by_exact_provenance(
+    tmp_path: Path, object_format: str
+) -> None:
+    repository = _repository(tmp_path / "repo", object_format=object_format)
+    (repository / "change.txt").write_text("before\n")
+    (repository / "keep.txt").write_text("unchanged\n")
+    _commit_initial(repository)
+    base_sha = os.fsdecode(_git(repository, "rev-parse", "HEAD").strip())
+    baseline = copy_snapshot(repository, tmp_path / "baseline")
+    output = copy_snapshot(repository, tmp_path / "worker-output").root
+    (output / "change.txt").write_text("after\n")
+    change_set = collect_changes(
+        baseline.manifest,
+        output,
+        write_set_rules=_all_paths(),
+    )
+    common = Path(
+        os.fsdecode(
+            _git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        )
+    )
+    stage_objects = tmp_path / "state" / "result-import-staging" / str(uuid.uuid4()) / "objects"
+
+    candidate = build_candidate_tree(
+        repository,
+        baseline,
+        change_set,
+        base_sha=base_sha,
+        write_set_rules=_all_paths(),
+        object_directory=stage_objects,
+        alternate_object_directory=common / "objects",
+    )
+    assert candidate.object_ids == candidate_tree_object_ids(
+        repository, candidate.tree_sha, object_directory=stage_objects
+    )
+    tree_before_promotion = subprocess.run(
+        ["git", "-C", str(repository), "cat-file", "-e", candidate.tree_sha],
+        capture_output=True,
+        check=False,
+    )
+    assert tree_before_promotion.returncode != 0
+
+    attempt_id = str(uuid.uuid4())
+    result_digest = "d" * 64
+    payload = candidate_commit_payload(
+        candidate,
+        attempt_id=attempt_id,
+        claim_token=3,
+        result_digest=result_digest,
+        committed_at=123456,
+    )
+    commit_sha = candidate_commit_object(
+        repository, payload, write=False, object_directory=stage_objects
+    )
+    assert (
+        candidate_commit_object(repository, payload, write=True, object_directory=stage_objects)
+        == commit_sha
+    )
+    inventory = tuple(sorted({*candidate.object_ids, commit_sha}))
+    promotion = missing_candidate_objects(repository, inventory)
+    assert commit_sha in promotion
+    assert len(promotion) < len(inventory)
+
+    promote_candidate_objects(repository, stage_objects, promotion, import_id=attempt_id)
+    verify_candidate_objects(repository, candidate, commit_sha=commit_sha)
+    assert _git(repository, "show", f"{commit_sha}:change.txt").strip() == b"after"
+    assert missing_candidate_objects(repository, inventory) == ()
+    common_objects = common / "objects"
+    interrupted_temp = (
+        common_objects / promotion[0][:2] / f".acp-result-{attempt_id}-{promotion[0]}.tmp"
+    )
+    interrupted_temp.write_bytes(b"incomplete copy")
+    assert cleanup_candidate_object_temps(repository, attempt_id, [promotion[0]]) == (promotion[0],)
+    assert _git(repository, "cat-file", "-e", promotion[0]) == b""
+    reachable = set(
+        os.fsdecode(
+            _git(repository, "rev-list", "--objects", "--all", "--reflog", "--no-object-names")
+        ).splitlines()
+    )
+    protected_id = promotion[0]
+    removed = remove_unreachable_candidate_objects(
+        repository,
+        promotion,
+        protected_object_ids={protected_id},
+        reachable_object_ids=reachable,
+    )
+    assert set(removed) == set(promotion) - {protected_id}
+    assert _git(repository, "cat-file", "-e", protected_id) == b""
+    assert remove_unreachable_candidate_objects(
+        repository,
+        [protected_id],
+        protected_object_ids=set(),
+        reachable_object_ids=reachable,
+    ) == (protected_id,)
+    missing_commit = subprocess.run(
+        ["git", "-C", str(repository), "cat-file", "-e", commit_sha],
+        capture_output=True,
+        check=False,
+    )
+    assert missing_commit.returncode != 0
+    assert os.fsdecode(_git(repository, "rev-parse", "HEAD").strip()) == base_sha
+
+
+def test_result_object_promotion_rejects_symlink_stage_directory(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "repo")
+    (repository / "tracked.txt").write_text("baseline\n")
+    _commit_initial(repository)
+    real_stage = tmp_path / "objects"
+    real_stage.mkdir()
+    linked_stage = tmp_path / "objects-link"
+    try:
+        linked_stage.symlink_to(real_stage, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    with pytest.raises(SupervisorError) as raised:
+        promote_candidate_objects(repository, linked_stage, [], import_id=str(uuid.uuid4()))
+
+    assert raised.value.code == "result_import_ambiguous"
+
+
+def test_result_object_helpers_reject_symlink_fanout_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path / "repo")
+    (repository / "tracked.txt").write_text("baseline\n")
+    _commit_initial(repository)
+    common = Path(
+        os.fsdecode(
+            _git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        )
+    )
+    common_objects = common / "objects"
+    prefix = next(
+        candidate
+        for candidate in "0123456789abcdef"
+        if not (common_objects / (candidate * 2)).exists()
+    )
+    object_id = prefix * 2 + "0" * 38
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fanout_link = common_objects / object_id[:2]
+    fanout_link.symlink_to(outside, target_is_directory=True)
+    import_id = str(uuid.uuid4())
+    loose_name = object_id[2:]
+    outside_object = outside / loose_name
+    outside_temporary = outside / f".acp-result-{import_id}-{object_id}.tmp"
+    outside_object.write_bytes(b"outside object must survive")
+    outside_temporary.write_bytes(b"outside temporary must survive")
+    stage_objects = tmp_path / "stage" / "objects"
+    stage_objects.mkdir(parents=True)
+
+    try:
+        with pytest.raises(SupervisorError):
+            promote_candidate_objects(repository, stage_objects, [object_id], import_id=import_id)
+        with pytest.raises(SupervisorError):
+            cleanup_candidate_object_temps(repository, import_id, [object_id])
+        with pytest.raises(SupervisorError):
+            remove_unreachable_candidate_objects(
+                repository,
+                [object_id],
+                protected_object_ids=set(),
+                reachable_object_ids=set(),
+            )
+        assert outside_object.read_bytes() == b"outside object must survive"
+        assert outside_temporary.read_bytes() == b"outside temporary must survive"
+    finally:
+        fanout_link.unlink()
 
 
 def test_candidate_tree_fails_closed_on_git_without_config_environment_support(

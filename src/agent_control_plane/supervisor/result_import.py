@@ -12,10 +12,13 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Sequence
+import zlib
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +42,7 @@ class CandidateTree:
     baseline_digest: str
     result_digest: str
     change_digest: str
+    object_ids: tuple[str, ...] = ()
 
 
 def result_ref_name(attempt_id: str, claim_token: int, result_digest: str) -> str:
@@ -125,6 +129,7 @@ def candidate_commit_object(
     payload: bytes,
     *,
     write: bool,
+    object_directory: str | Path | None = None,
     git_executable: str | Path = "git",
 ) -> str:
     """Compute or write a commit object using isolated, trusted Git settings."""
@@ -143,7 +148,7 @@ def candidate_commit_object(
         index_path = Path(temporary_directory) / "index"
         hooks_path = Path(temporary_directory) / "empty-hooks"
         hooks_path.mkdir(mode=0o700)
-        environment = _git_environment(index_path, hooks_path)
+        environment = _git_environment(index_path, hooks_path, object_directory=object_directory)
         _assert_supported_git_version(executable, environment)
         arguments = ("hash-object", *(("-w",) if write else ()), "-t", "commit", "--stdin")
         object_id = (
@@ -168,6 +173,7 @@ def verify_candidate_objects(
     candidate: CandidateTree,
     *,
     commit_sha: str | None = None,
+    object_directory: str | Path | None = None,
     git_executable: str | Path = "git",
 ) -> None:
     """Verify the exact base/tree objects, and optionally the host commit's edges."""
@@ -188,7 +194,7 @@ def verify_candidate_objects(
         index_path = Path(temporary_directory) / "index"
         hooks_path = Path(temporary_directory) / "empty-hooks"
         hooks_path.mkdir(mode=0o700)
-        environment = _git_environment(index_path, hooks_path)
+        environment = _git_environment(index_path, hooks_path, object_directory=object_directory)
         _assert_supported_git_version(executable, environment)
         base_type = (
             _run_git(
@@ -252,6 +258,53 @@ def verify_candidate_objects(
             raise SupervisorError(
                 "result_import_ambiguous", "host result commit edges do not match"
             )
+
+
+def candidate_tree_object_ids(
+    repository: str | Path,
+    tree_sha: str,
+    *,
+    object_directory: str | Path | None = None,
+    git_executable: str | Path = "git",
+) -> tuple[str, ...]:
+    """Enumerate the exact tree/blob closure represented by a candidate tree."""
+
+    try:
+        resolved_repository = Path(repository).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SupervisorError(
+            "invalid_git_repository", "registered repository path is invalid"
+        ) from error
+    executable = shutil.which(os.fspath(git_executable))
+    if executable is None or not os.access(executable, os.X_OK):
+        raise SupervisorError("git_unavailable", "trusted Git executable is unavailable")
+    with tempfile.TemporaryDirectory(prefix="acp-candidate-inventory-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        hooks_path = temporary / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(
+            temporary / "index", hooks_path, object_directory=object_directory
+        )
+        _assert_supported_git_version(executable, environment)
+        object_format = (
+            _run_git(
+                executable, resolved_repository, ("rev-parse", "--show-object-format"), environment
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+        if object_format not in {"sha1", "sha256"}:
+            raise SupervisorError("invalid_git_repository", "Git object format is unsupported")
+        object_id_length = 40 if object_format == "sha1" else 64
+        if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", tree_sha) is None:
+            raise SupervisorError("invalid_worker_result", "candidate tree ID is invalid")
+        raw = _run_git(
+            executable,
+            resolved_repository,
+            ("ls-tree", "-r", "-t", "-z", tree_sha),
+            environment,
+        )
+    return _parse_candidate_tree_inventory(raw, tree_sha, object_id_length)
 
 
 def candidate_ref_target(
@@ -361,6 +414,8 @@ def build_candidate_tree(
     *,
     base_sha: str,
     write_set_rules: Sequence[tuple[str, bool, bool]],
+    object_directory: str | Path | None = None,
+    alternate_object_directory: str | Path | None = None,
     git_executable: str | Path = "git",
     limits: SnapshotLimits = _DEFAULT_LIMITS,
 ) -> CandidateTree:
@@ -397,11 +452,48 @@ def build_candidate_tree(
     if executable is None or not os.access(executable, os.X_OK):
         raise SupervisorError("git_unavailable", "trusted Git executable is unavailable")
 
+    resolved_object_directory: Path | None = None
+    if object_directory is not None:
+        try:
+            supplied_object_directory = Path(object_directory)
+            if supplied_object_directory.is_symlink():
+                raise ValueError("staging object directory must not be a symlink")
+            resolved_object_directory = supplied_object_directory.resolve(strict=False)
+            resolved_object_directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            (resolved_object_directory / "info").mkdir(mode=0o700, exist_ok=True)
+            (resolved_object_directory / "pack").mkdir(mode=0o700, exist_ok=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "private result object store is unavailable"
+            ) from error
+        if resolved_object_directory.is_symlink() or not resolved_object_directory.is_dir():
+            raise SupervisorError(
+                "result_import_staging_unavailable", "private result object store is unsafe"
+            )
+        if alternate_object_directory is not None:
+            try:
+                alternate = Path(alternate_object_directory).resolve(strict=True)
+                if (
+                    not alternate.is_dir()
+                    or "\n" in os.fspath(alternate)
+                    or "\r" in os.fspath(alternate)
+                ):
+                    raise ValueError("invalid alternate object directory")
+                alternate_file = resolved_object_directory / "info" / "alternates"
+                alternate_file.write_text(f"{alternate}\n", encoding="utf-8")
+            except (OSError, RuntimeError, ValueError) as error:
+                raise SupervisorError(
+                    "result_import_staging_unavailable",
+                    "shared base objects could not be registered as a staging alternate",
+                ) from error
+
     with tempfile.TemporaryDirectory(prefix="acp-candidate-index-") as temporary_directory:
         index_path = Path(temporary_directory) / "index"
         hooks_path = Path(temporary_directory) / "empty-hooks"
         hooks_path.mkdir(mode=0o700)
-        environment = _git_environment(index_path, hooks_path)
+        environment = _git_environment(
+            index_path, hooks_path, object_directory=resolved_object_directory
+        )
         _assert_supported_git_version(executable, environment)
         raw_top_level = _run_git(
             executable,
@@ -556,6 +648,15 @@ def build_candidate_tree(
         )
         if object_type != "tree":
             raise SupervisorError("candidate_tree_failed", "Git candidate object is not a tree")
+        tree_entries = _run_git(
+            executable,
+            resolved_repository,
+            ("ls-tree", "-r", "-t", "-z", tree_sha),
+            environment,
+        )
+        candidate_object_ids = _parse_candidate_tree_inventory(
+            tree_entries, tree_sha, object_id_length
+        )
         current_head = (
             _run_git(
                 executable,
@@ -577,7 +678,656 @@ def build_candidate_tree(
         baseline_digest=baseline.manifest.digest,
         result_digest=result_manifest.digest,
         change_digest=change_set.digest,
+        object_ids=candidate_object_ids,
     )
+
+
+def _parse_candidate_tree_inventory(
+    tree_entries: bytes, tree_sha: str, object_id_length: int
+) -> tuple[str, ...]:
+    object_ids = {tree_sha}
+    for entry in tree_entries.split(b"\0"):
+        if not entry:
+            continue
+        metadata, separator, _path = entry.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise SupervisorError(
+                "candidate_tree_failed", "Git returned an invalid candidate tree inventory"
+            )
+        try:
+            object_id = fields[2].decode("ascii", errors="strict")
+        except UnicodeDecodeError:
+            raise SupervisorError(
+                "candidate_tree_failed", "Git returned an invalid candidate object ID"
+            ) from None
+        if not re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", object_id):
+            raise SupervisorError(
+                "candidate_tree_failed", "Git returned an invalid candidate object ID"
+            )
+        object_ids.add(object_id)
+    return tuple(sorted(object_ids))
+
+
+def promote_candidate_objects(
+    repository: str | Path,
+    object_directory: str | Path,
+    object_ids: Sequence[str],
+    *,
+    import_id: str,
+    git_executable: str | Path = "git",
+) -> None:
+    """Atomically promote only the journaled loose objects from one import stage."""
+
+    resolved_repository, executable, common_objects, object_id_length = _object_store_context(
+        repository, git_executable
+    )
+    stage_path = Path(object_directory)
+    if stage_path.is_symlink():
+        raise SupervisorError("result_import_ambiguous", "journaled result object stage is unsafe")
+    resolved_stage = stage_path.resolve(strict=True)
+    if not resolved_stage.is_dir():
+        raise SupervisorError("result_import_ambiguous", "journaled result object stage is unsafe")
+    try:
+        if str(uuid.UUID(import_id)) != import_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise SupervisorError(
+            "result_import_ambiguous", "journaled result stage identity is invalid"
+        ) from None
+    if len(set(object_ids)) != len(object_ids):
+        raise SupervisorError(
+            "result_import_ambiguous", "journaled result object inventory repeats IDs"
+        )
+    with tempfile.TemporaryDirectory(prefix="acp-object-promote-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        index_path = temporary / "index"
+        hooks_path = temporary / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        common_environment = _git_environment(
+            index_path, hooks_path, object_directory=common_objects
+        )
+        _assert_supported_git_version(executable, common_environment)
+
+        for object_id in object_ids:
+            if not isinstance(object_id, str) or not re.fullmatch(
+                rf"[0-9a-f]{{{object_id_length}}}", object_id
+            ):
+                raise SupervisorError(
+                    "result_import_ambiguous", "journaled result object ID is invalid"
+                )
+            destination_name = object_id[2:]
+            temporary_name = f".acp-result-{import_id}-{object_id}.tmp"
+            with _object_fanout(
+                common_objects,
+                object_id,
+                create=True,
+                error_code="result_import_ambiguous",
+            ) as (destination_directory_fd, destination_directory):
+                destination_entry = _object_file_stat(
+                    destination_directory_fd,
+                    destination_directory,
+                    destination_name,
+                    error_code="result_import_ambiguous",
+                )
+                if destination_entry is not None and not _verify_loose_object(
+                    _loose_object_path(common_objects, object_id),
+                    object_id,
+                    object_id_length,
+                    directory_descriptor=destination_directory_fd,
+                    filename=destination_name,
+                ):
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "shared loose result object failed integrity checks",
+                    )
+                temporary_entry = _object_file_stat(
+                    destination_directory_fd,
+                    destination_directory,
+                    temporary_name,
+                    error_code="result_import_ambiguous",
+                )
+                if temporary_entry is not None:
+                    _unlink_object_file(
+                        destination_directory_fd, destination_directory, temporary_name
+                    )
+                if _git_object_exists(
+                    executable, resolved_repository, object_id, common_environment
+                ):
+                    continue
+
+                source_path = _loose_object_path(resolved_stage, object_id)
+                source_descriptor: int | None = None
+                temporary_descriptor: int | None = None
+                try:
+                    with _object_fanout(
+                        resolved_stage,
+                        object_id,
+                        create=False,
+                        error_code="result_import_ambiguous",
+                    ) as (source_directory_fd, source_directory):
+                        source_entry = _object_file_stat(
+                            source_directory_fd,
+                            source_directory,
+                            destination_name,
+                            error_code="result_import_ambiguous",
+                        )
+                        if source_entry is None:
+                            raise SupervisorError(
+                                "result_import_ambiguous",
+                                "journaled result object is missing from its stage",
+                            )
+                        source_descriptor = _open_object_file(
+                            source_directory_fd,
+                            source_directory,
+                            destination_name,
+                            os.O_RDONLY,
+                        )
+                        if not _verify_loose_object(
+                            source_path,
+                            object_id,
+                            object_id_length,
+                            descriptor=os.dup(source_descriptor),
+                        ):
+                            raise SupervisorError(
+                                "result_import_ambiguous",
+                                "journaled staged result object failed integrity checks",
+                            )
+                        os.lseek(source_descriptor, 0, os.SEEK_SET)
+                        temporary_descriptor = _open_object_file(
+                            destination_directory_fd,
+                            destination_directory,
+                            temporary_name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        )
+                        with os.fdopen(source_descriptor, "rb") as staged:
+                            source_descriptor = None
+                            with os.fdopen(temporary_descriptor, "wb") as temporary_object:
+                                temporary_descriptor = None
+                                shutil.copyfileobj(staged, temporary_object, length=1024 * 1024)
+                                temporary_object.flush()
+                                os.fsync(temporary_object.fileno())
+                    try:
+                        _link_object_file(
+                            destination_directory_fd,
+                            destination_directory,
+                            temporary_name,
+                            destination_name,
+                        )
+                    except FileExistsError:
+                        pass
+                    _unlink_object_file(
+                        destination_directory_fd, destination_directory, temporary_name
+                    )
+                    # Persist the new name before recovery can publish a ref to it.
+                    _fsync_object_fanout(destination_directory_fd, destination_directory)
+                except SupervisorError:
+                    raise
+                except OSError as error:
+                    raise SupervisorError(
+                        "result_object_promotion_failed",
+                        "staged result object could not be promoted",
+                    ) from error
+                finally:
+                    if source_descriptor is not None:
+                        os.close(source_descriptor)
+                    if temporary_descriptor is not None:
+                        os.close(temporary_descriptor)
+            if not _git_object_exists(
+                executable, resolved_repository, object_id, common_environment
+            ):
+                raise SupervisorError(
+                    "result_object_promotion_failed", "promoted result object is not readable"
+                )
+
+
+def cleanup_candidate_object_temps(
+    repository: str | Path,
+    import_id: str,
+    object_ids: Sequence[str],
+    *,
+    git_executable: str | Path = "git",
+) -> tuple[str, ...]:
+    """Delete only deterministic incomplete promotion files owned by one journal."""
+
+    _resolved_repository, _executable, common_objects, object_id_length = _object_store_context(
+        repository, git_executable
+    )
+    try:
+        if str(uuid.UUID(import_id)) != import_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise SupervisorError(
+            "result_import_ambiguous", "journaled result stage identity is invalid"
+        ) from None
+    removed: list[str] = []
+    for object_id in object_ids:
+        if not isinstance(object_id, str) or not re.fullmatch(
+            rf"[0-9a-f]{{{object_id_length}}}", object_id
+        ):
+            raise SupervisorError(
+                "result_import_ambiguous", "journaled result object ID is invalid"
+            )
+        temporary_name = f".acp-result-{import_id}-{object_id}.tmp"
+        with _object_fanout(
+            common_objects,
+            object_id,
+            create=False,
+            error_code="result_import_ambiguous",
+        ) as (directory_descriptor, directory_path):
+            if (
+                _object_file_stat(
+                    directory_descriptor,
+                    directory_path,
+                    temporary_name,
+                    error_code="result_import_ambiguous",
+                )
+                is None
+            ):
+                continue
+            try:
+                _unlink_object_file(directory_descriptor, directory_path, temporary_name)
+                _fsync_object_fanout(directory_descriptor, directory_path)
+                removed.append(object_id)
+            except FileNotFoundError:
+                continue
+    return tuple(removed)
+
+
+def missing_candidate_objects(
+    repository: str | Path,
+    object_ids: Sequence[str],
+    *,
+    git_executable: str | Path = "git",
+) -> tuple[str, ...]:
+    """Return only candidate IDs absent from the shared repository object database."""
+
+    resolved_repository, executable, common_objects, object_id_length = _object_store_context(
+        repository, git_executable
+    )
+    if len(set(object_ids)) != len(object_ids):
+        raise SupervisorError("invalid_worker_result", "candidate object inventory repeats IDs")
+    with tempfile.TemporaryDirectory(prefix="acp-object-inventory-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        hooks_path = temporary / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(
+            temporary / "index", hooks_path, object_directory=common_objects
+        )
+        _assert_supported_git_version(executable, environment)
+        missing: list[str] = []
+        for object_id in object_ids:
+            if not isinstance(object_id, str) or not re.fullmatch(
+                rf"[0-9a-f]{{{object_id_length}}}", object_id
+            ):
+                raise SupervisorError("invalid_worker_result", "candidate object ID is invalid")
+            with _object_fanout(
+                common_objects,
+                object_id,
+                create=False,
+                error_code="invalid_git_repository",
+            ) as (directory_descriptor, directory_path):
+                _object_file_stat(
+                    directory_descriptor,
+                    directory_path,
+                    object_id[2:],
+                    error_code="invalid_git_repository",
+                )
+                if not _git_object_exists(executable, resolved_repository, object_id, environment):
+                    missing.append(object_id)
+    return tuple(missing)
+
+
+def remove_unreachable_candidate_objects(
+    repository: str | Path,
+    object_ids: Sequence[str],
+    *,
+    protected_object_ids: set[str],
+    reachable_object_ids: set[str],
+    git_executable: str | Path = "git",
+) -> tuple[str, ...]:
+    """Remove only journal-owned loose objects after caller proves they are unreferenced."""
+
+    _resolved_repository, _executable, common_objects, object_id_length = _object_store_context(
+        repository, git_executable
+    )
+    removed: list[str] = []
+    for object_id in object_ids:
+        if not isinstance(object_id, str) or not re.fullmatch(
+            rf"[0-9a-f]{{{object_id_length}}}", object_id
+        ):
+            raise SupervisorError(
+                "result_import_ambiguous", "journaled cleanup object ID is invalid"
+            )
+        if object_id in protected_object_ids or object_id in reachable_object_ids:
+            continue
+        with _object_fanout(
+            common_objects,
+            object_id,
+            create=False,
+            error_code="result_import_ambiguous",
+        ) as (directory_descriptor, directory_path):
+            if (
+                _object_file_stat(
+                    directory_descriptor,
+                    directory_path,
+                    object_id[2:],
+                    error_code="result_import_ambiguous",
+                )
+                is None
+            ):
+                continue
+            path = _loose_object_path(common_objects, object_id)
+            if not _verify_loose_object(
+                path,
+                object_id,
+                object_id_length,
+                directory_descriptor=directory_descriptor,
+                filename=object_id[2:],
+            ):
+                continue
+            try:
+                _unlink_object_file(directory_descriptor, directory_path, object_id[2:])
+                _fsync_object_fanout(directory_descriptor, directory_path)
+                removed.append(object_id)
+            except FileNotFoundError:
+                continue
+    return tuple(removed)
+
+
+def _object_store_context(
+    repository: str | Path, git_executable: str | Path
+) -> tuple[Path, str, Path, int]:
+    try:
+        resolved_repository = Path(repository).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SupervisorError(
+            "invalid_git_repository", "registered repository path is invalid"
+        ) from error
+    executable = shutil.which(os.fspath(git_executable))
+    if executable is None or not os.access(executable, os.X_OK):
+        raise SupervisorError("git_unavailable", "trusted Git executable is unavailable")
+    with tempfile.TemporaryDirectory(prefix="acp-object-store-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        index_path = temporary / "index"
+        hooks_path = temporary / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(index_path, hooks_path)
+        common = (
+            _run_git(
+                executable,
+                resolved_repository,
+                ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+                environment,
+            )
+            .decode("utf-8", errors="strict")
+            .strip()
+        )
+        object_format = (
+            _run_git(
+                executable, resolved_repository, ("rev-parse", "--show-object-format"), environment
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+    if object_format not in {"sha1", "sha256"}:
+        raise SupervisorError("invalid_git_repository", "Git object format is unsupported")
+    common_path = Path(common)
+    if not common_path.is_absolute():
+        common_path = (resolved_repository / common_path).resolve(strict=True)
+    common_objects = (common_path / "objects").resolve(strict=True)
+    if not common_objects.is_dir():
+        raise SupervisorError("invalid_git_repository", "repository object store is unavailable")
+    return resolved_repository, executable, common_objects, 40 if object_format == "sha1" else 64
+
+
+def _git_object_exists(
+    executable: str, repository: Path, object_id: str, environment: dict[str, str]
+) -> bool:
+    try:
+        _run_git(executable, repository, ("cat-file", "-e", object_id), environment)
+    except SupervisorError:
+        return False
+    return True
+
+
+def _loose_object_path(object_directory: Path, object_id: str) -> Path:
+    return object_directory / object_id[:2] / object_id[2:]
+
+
+@contextmanager
+def _object_fanout(
+    object_directory: Path,
+    object_id: str,
+    *,
+    create: bool,
+    error_code: str,
+) -> Iterator[tuple[int | None, Path]]:
+    """Open one loose-object fanout without following a replaceable directory link."""
+
+    fanout = object_directory / object_id[:2]
+    dir_fd_functions = (os.open, os.mkdir, os.stat, os.unlink, os.link)
+    if os.name != "nt" and all(function in os.supports_dir_fd for function in dir_fd_functions):
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        root_descriptor: int | None = None
+        fanout_descriptor: int | None = None
+        try:
+            root_descriptor = os.open(object_directory, directory_flags)
+            try:
+                fanout_descriptor = os.open(object_id[:2], directory_flags, dir_fd=root_descriptor)
+            except FileNotFoundError:
+                if not create:
+                    yield None, fanout
+                    return
+                try:
+                    os.mkdir(object_id[:2], mode=0o755, dir_fd=root_descriptor)
+                except FileExistsError:
+                    pass
+                # Persist the fanout entry before a later ref can depend on it,
+                # whether this process created it or observed a concurrent creator.
+                os.fsync(root_descriptor)
+                fanout_descriptor = os.open(object_id[:2], directory_flags, dir_fd=root_descriptor)
+            if not stat.S_ISDIR(os.fstat(fanout_descriptor).st_mode):
+                raise OSError("loose-object fanout is not a directory")
+            yield fanout_descriptor, fanout
+        except SupervisorError:
+            raise
+        except OSError as error:
+            raise SupervisorError(
+                error_code, "Git loose-object fanout is unsafe or unavailable"
+            ) from error
+        finally:
+            if fanout_descriptor is not None:
+                os.close(fanout_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+        return
+
+    try:
+        if fanout.is_symlink():
+            raise OSError("loose-object fanout must not be a symlink")
+        if create:
+            fanout.mkdir(mode=0o755, exist_ok=True)
+        if fanout.exists() and not fanout.is_dir():
+            raise OSError("loose-object fanout is not a directory")
+        yield None, fanout
+    except SupervisorError:
+        raise
+    except OSError as error:
+        raise SupervisorError(
+            error_code, "Git loose-object fanout is unsafe or unavailable"
+        ) from error
+
+
+def _object_file_stat(
+    directory_descriptor: int | None,
+    directory_path: Path,
+    name: str,
+    *,
+    error_code: str,
+) -> os.stat_result | None:
+    try:
+        result = (
+            os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            if directory_descriptor is not None
+            else os.lstat(directory_path / name)
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SupervisorError(error_code, "loose-object entry could not be inspected") from error
+    if not stat.S_ISREG(result.st_mode):
+        raise SupervisorError(error_code, "loose-object entry is not a regular file")
+    return result
+
+
+def _open_object_file(
+    directory_descriptor: int | None,
+    directory_path: Path,
+    name: str,
+    flags: int,
+    *,
+    mode: int = 0o600,
+) -> int:
+    safe_flags = flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    if directory_descriptor is not None:
+        return os.open(name, safe_flags, mode, dir_fd=directory_descriptor)
+    return os.open(directory_path / name, safe_flags, mode)
+
+
+def _unlink_object_file(directory_descriptor: int | None, directory_path: Path, name: str) -> None:
+    if directory_descriptor is not None:
+        os.unlink(name, dir_fd=directory_descriptor)
+    else:
+        (directory_path / name).unlink()
+
+
+def _link_object_file(
+    directory_descriptor: int | None,
+    directory_path: Path,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    if directory_descriptor is not None:
+        os.link(
+            source_name,
+            destination_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    else:
+        os.link(directory_path / source_name, directory_path / destination_name)
+
+
+def _fsync_object_fanout(directory_descriptor: int | None, directory_path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = directory_descriptor
+    owned_descriptor = False
+    if descriptor is None:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(directory_path, flags)
+        owned_descriptor = True
+    try:
+        os.fsync(descriptor)
+    finally:
+        if owned_descriptor:
+            os.close(descriptor)
+
+
+def _verify_loose_object(
+    path: Path,
+    object_id: str,
+    object_id_length: int,
+    *,
+    directory_descriptor: int | None = None,
+    filename: str | None = None,
+    descriptor: int | None = None,
+) -> bool:
+    algorithm = "sha1" if object_id_length == 40 else "sha256"
+    decompressor = zlib.decompressobj()
+    digest = hashlib.new(algorithm)
+    header_buffer = bytearray()
+    expected_size: int | None = None
+    content_size = 0
+    owned_descriptor: int | None = descriptor
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if owned_descriptor is None:
+            if directory_descriptor is not None:
+                if filename is None:
+                    return False
+                owned_descriptor = os.open(filename, flags, dir_fd=directory_descriptor)
+            else:
+                owned_descriptor = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(owned_descriptor).st_mode):
+            return False
+        with os.fdopen(owned_descriptor, "rb") as source:
+            owned_descriptor = None
+            while compressed := source.read(64 * 1024):
+                expanded = decompressor.decompress(compressed)
+                if expected_size is None:
+                    header_buffer.extend(expanded)
+                    separator = header_buffer.find(0)
+                    if separator < 0:
+                        if len(header_buffer) > 128:
+                            return False
+                        continue
+                    header = bytes(header_buffer[: separator + 1])
+                    kind, raw_size = header[:-1].split(b" ", 1)
+                    if kind not in {b"blob", b"tree", b"commit", b"tag"} or not raw_size.isdigit():
+                        return False
+                    expected_size = int(raw_size)
+                    digest.update(header)
+                    payload = bytes(header_buffer[separator + 1 :])
+                    digest.update(payload)
+                    content_size += len(payload)
+                    header_buffer.clear()
+                else:
+                    digest.update(expanded)
+                    content_size += len(expanded)
+            tail = decompressor.flush()
+            if expected_size is None:
+                header_buffer.extend(tail)
+                separator = header_buffer.find(0)
+                if separator < 0:
+                    return False
+                header = bytes(header_buffer[: separator + 1])
+                kind, raw_size = header[:-1].split(b" ", 1)
+                if kind not in {b"blob", b"tree", b"commit", b"tag"} or not raw_size.isdigit():
+                    return False
+                expected_size = int(raw_size)
+                digest.update(header)
+                payload = bytes(header_buffer[separator + 1 :])
+                digest.update(payload)
+                content_size += len(payload)
+            else:
+                digest.update(tail)
+                content_size += len(tail)
+        return (
+            decompressor.eof
+            and not decompressor.unused_data
+            and expected_size == content_size
+            and digest.hexdigest() == object_id
+        )
+    except (OSError, ValueError, zlib.error):
+        return False
+    finally:
+        if owned_descriptor is not None:
+            os.close(owned_descriptor)
 
 
 def _assert_snapshot_matches_tree(
@@ -780,7 +1530,12 @@ def _assert_supported_git_version(executable: str, environment: dict[str, str]) 
         )
 
 
-def _git_environment(index_path: Path, hooks_path: Path) -> dict[str, str]:
+def _git_environment(
+    index_path: Path,
+    hooks_path: Path,
+    *,
+    object_directory: str | Path | None = None,
+) -> dict[str, str]:
     environment = os.environ.copy()
     for name in tuple(environment):
         if name == "GIT" or name.startswith("GIT_"):
@@ -809,6 +1564,8 @@ def _git_environment(index_path: Path, hooks_path: Path) -> dict[str, str]:
             "PAGER": "cat",
         }
     )
+    if object_directory is not None:
+        environment["GIT_OBJECT_DIRECTORY"] = os.fspath(object_directory)
     return environment
 
 

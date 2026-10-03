@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -393,6 +393,20 @@ def _add_result_import_journal(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_result_import_object_staging(connection: sqlite3.Connection) -> None:
+    """Bind private staged object provenance to each prepared result import."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(result_imports)")}
+    additions = (
+        ("staging_path", "TEXT NOT NULL DEFAULT ''"),
+        ("object_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("promote_object_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE result_imports ADD COLUMN {name} {definition}")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -405,6 +419,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (10, _add_qc_acceptance_coverage),
     (11, _add_submission_result_manifest),
     (12, _add_result_import_journal),
+    (13, _add_result_import_object_staging),
 )
 
 
@@ -507,6 +522,7 @@ class GitSupervisor(
         (self.state_dir / "worktrees").mkdir(exist_ok=True)
         (self.state_dir / "logs").mkdir(exist_ok=True)
         (self.state_dir / "runtime").mkdir(exist_ok=True)
+        (self.state_dir / "result-import-staging").mkdir(mode=0o700, exist_ok=True)
         with self.connect() as connection:
             # Read the stamp before the first CREATE/ALTER. Checking afterwards would be
             # checking a database this binary had already written to.
