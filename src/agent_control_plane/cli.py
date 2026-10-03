@@ -30,6 +30,7 @@ READ_ONLY_ACTIONS = frozenset(
         "bundle",
         "verify-events",
         "guard",
+        "runtime-resources",
     }
 )
 """Commands that only look. They open the database mode=ro and never migrate it.
@@ -362,6 +363,18 @@ def parser() -> argparse.ArgumentParser:
         help="show driver-managed resources and their cleanup proofs for an attempt",
     )
     driver_resources.add_argument("attempt_id")
+    driver_resources.add_argument(
+        "--fresh",
+        action="store_true",
+        help="include a live, read-only systemd cgroup usage sample",
+    )
+    driver_resources.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+        dest="output_format",
+        help="output format (default: json)",
+    )
     quarantine = commands.add_parser(
         "runtime-quarantine",
         help="list, explain and recover allocations whose cleanup could not be proven",
@@ -416,6 +429,78 @@ def parser() -> argparse.ArgumentParser:
 
 def emit(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _render_runtime_resources(value: list[dict[str, Any]] | dict[str, Any]) -> str:
+    """Render the resource view without implying unknown counters are zero."""
+
+    def measured(number: Any, unit: str = "") -> str:
+        return (
+            f"{number}{unit}"
+            if isinstance(number, int) and not isinstance(number, bool)
+            else "unknown"
+        )
+
+    def limit(number: Any, unbounded: Any, unit: str = "") -> str:
+        if unbounded is True:
+            return "unbounded"
+        return measured(number, unit)
+
+    lines = ["Runtime resources:"]
+    if isinstance(value, list):
+        if not value:
+            return "Runtime resources: none recorded"
+        for resource in value:
+            lines.append(f"- {resource['driver']} ({resource['kind']}): {resource['state']}")
+            lines.append(f"  Resource: {resource['resource_id']}")
+            lines.append(f"  Expires: {resource['expires_at']}")
+        return "\n".join(lines)
+
+    for resource in value.get("resources", []):
+        lines.append(f"- {resource['driver']} ({resource['kind']}): {resource['state']}")
+        lines.append(f"  Resource: {resource['resource_id']}")
+        lines.append(f"  Expires: {resource['expires_at']}")
+
+    sample = value.get("live_sample", {})
+    lines.extend(
+        [
+            "Fresh cgroup sample:",
+            f"  Sampled at: {sample.get('sampled_at', 'unknown')}",
+            f"  Source: {sample.get('source', 'unknown')}",
+            f"  Available: {'yes' if sample.get('available') is True else 'no'}",
+        ]
+    )
+    if sample.get("reason"):
+        lines.append(f"  Reason: {sample['reason']}")
+    for driver in sample.get("drivers", []):
+        usage = driver.get("usage", {})
+        presence = driver.get("present")
+        present_text = "yes" if presence is True else "no" if presence is False else "unknown"
+        lines.append(f"  Driver: {driver.get('driver', 'unknown')}")
+        lines.append(f"    Active state: {driver.get('active_state') or 'unknown'}")
+        lines.append(f"    Present: {present_text}")
+        lines.append(
+            "    Tasks: current "
+            f"{measured(usage.get('tasks_current'))}, limit "
+            f"{limit(usage.get('tasks_max'), usage.get('tasks_max_unbounded'))}"
+        )
+        lines.append(
+            "    Memory: current "
+            f"{measured(usage.get('memory_current_bytes'), ' B')}, limit "
+            f"{limit(usage.get('memory_max_bytes'), usage.get('memory_max_unbounded'), ' B')}"
+        )
+        accounting = usage.get("cpu_accounting_enabled")
+        cpu_usage = usage.get("cpu_usage_ns")
+        if accounting is True and isinstance(cpu_usage, int) and not isinstance(cpu_usage, bool):
+            cpu_text = f"cumulative {cpu_usage} ns"
+        elif accounting is False:
+            cpu_text = "unavailable (CPU accounting disabled)"
+        else:
+            cpu_text = "unknown"
+        lines.append(f"    CPU time: {cpu_text}")
+    for limitation in sample.get("limitations", []):
+        lines.append(f"  Note: {limitation}")
+    return "\n".join(lines)
 
 
 def _run_trust_helper(args: argparse.Namespace) -> dict[str, Any]:
@@ -896,7 +981,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "runner-list":
             result = supervisor.runners()
         elif args.action == "runtime-resources":
-            result = supervisor.driver_resources(args.attempt_id)
+            result = supervisor.driver_resources(args.attempt_id, fresh=args.fresh)
         elif args.action == "runtime-quarantine":
             quarantine_action = getattr(args, "quarantine_action", None)
             if quarantine_action == "explain":
@@ -918,7 +1003,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             root.error(f"unknown action {args.action}")
             return 2
-        emit(result)
+        if args.action == "runtime-resources" and args.output_format == "text":
+            print(_render_runtime_resources(result))
+        else:
+            emit(result)
         if args.action in {"doctor", "verify-events"} and not result["ok"]:
             return 1
         return 0

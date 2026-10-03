@@ -353,6 +353,7 @@ class RuntimeMixin:
         phase: str = "",
         prior_driver_states: dict[str, str] | None = None,
         prior_driver_evidence: dict[str, dict[str, Any]] | None = None,
+        read_only: bool = False,
     ) -> DriverContext:
         attempt = self.attempt(attempt_id)
         runtime_dir = Path(environment["ACP_RUNTIME_DIR"])
@@ -361,7 +362,7 @@ class RuntimeMixin:
             task_id=str(attempt["task_id"]),
             runtime_dir=runtime_dir,
             expires_at=int(time.time()) + self.config.lease_seconds,
-            secret=self._driver_secret(),
+            secret=(self._driver_secret_read_only() if read_only else self._driver_secret()),
             environment=environment,
             credential_registry=registry,
             credential_handles=handles or {},
@@ -661,7 +662,9 @@ class RuntimeMixin:
                     (canonical_json(environment), stamp, attempt_id),
                 )
 
-    def driver_resources(self, attempt_id: str) -> list[dict[str, Any]]:
+    def driver_resources(
+        self, attempt_id: str, *, fresh: bool = False
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM runtime_driver_resources WHERE attempt_id = ? ORDER BY driver",
@@ -681,7 +684,113 @@ class RuntimeMixin:
                     "evidence": evidence,
                 }
             )
-        return resources
+        if not fresh:
+            return resources
+        stored_summaries = [
+            {
+                "driver": resource["driver"],
+                "kind": resource["kind"],
+                "resource_id": resource["resource_id"],
+                "expires_at": resource["expires_at"],
+                "state": resource["state"],
+                "last_evidence": {
+                    key: resource["evidence"].get(key) for key in ("phase", "exit_code", "present")
+                },
+            }
+            for resource in resources
+        ]
+        return {
+            # Old lifecycle proof remains available from the default command.
+            # The combined fresh view omits raw argv/stdout so setup environment
+            # values or command details are not echoed beside the live sample.
+            "resources": stored_summaries,
+            "live_sample": self._fresh_runtime_usage_sample(attempt_id),
+        }
+
+    def _fresh_runtime_usage_sample(self, attempt_id: str) -> dict[str, Any]:
+        """Read current cgroup counters without persisting probe evidence."""
+
+        runtime = self.runtime_environment(attempt_id)
+        rows = self._stored_driver_rows(attempt_id)
+        driver_names = {str(row["driver"]) for row in rows if row["kind"] == "namespace_runtime"}
+        if not driver_names:
+            return {
+                "sampled_at": utc_now(),
+                "source": "systemd user unit / cgroup",
+                "available": False,
+                "reason": "no_namespace_runtime_driver",
+                "drivers": [],
+            }
+
+        evidence = self._run_driver_phase(
+            "verify",
+            attempt_id,
+            runtime["environment"],
+            only_drivers=driver_names,
+            persist_evidence=False,
+            read_only=True,
+        )
+        sampled_at = utc_now()
+        fields = (
+            "tasks_current",
+            "tasks_max",
+            "tasks_max_unbounded",
+            "memory_current_bytes",
+            "memory_max_bytes",
+            "memory_max_unbounded",
+            "cpu_accounting_enabled",
+            "cpu_usage_ns",
+            "cpu_quota_per_sec_usec",
+            "cpu_quota_unbounded",
+        )
+        drivers: list[dict[str, Any]] = []
+        for item in evidence:
+            observation = item.proof.get("observation")
+            observation = observation if isinstance(observation, dict) else {}
+            active_state = observation.get("active_state") if item.ok else None
+            active_states = {"active", "activating", "deactivating", "reloading"}
+            inactive_states = {"inactive", "failed"}
+            if not item.ok:
+                present: bool | None = None
+            elif observation.get("absence_proved_by") == "systemd-unit-not-found":
+                present = False
+            elif active_state in active_states:
+                present = True
+            elif active_state in inactive_states:
+                present = False
+            else:
+                # Missing or unrecognized ActiveState is not proof of absence.
+                present = None
+            available = item.ok and present is True
+            drivers.append(
+                {
+                    "driver": item.driver,
+                    "active_state": active_state or None,
+                    "present": present,
+                    "available": available,
+                    "error_code": item.proof.get("code")
+                    or (None if item.ok else "runtime_probe_unavailable"),
+                    # systemd can return useful-looking partial stdout alongside
+                    # an error, and inactive-unit counters can reflect stale
+                    # state. Only an active, successful probe is a current sample.
+                    "usage": (
+                        {name: observation.get(name) for name in fields}
+                        if available
+                        else {name: None for name in fields}
+                    ),
+                }
+            )
+        return {
+            "sampled_at": sampled_at,
+            "source": "systemd user unit / cgroup",
+            "available": any(driver["available"] for driver in drivers),
+            "drivers": drivers,
+            "limitations": [
+                "task and memory values describe the host cgroup, not AI-agent count or model work",
+                "CPUUsageNSec is cumulative CPU time, not instantaneous utilization",
+                "provider tokens and billing are not measured",
+            ],
+        }
 
     def quarantined_resources(self) -> list[dict[str, Any]]:
         """Allocations whose cleanup could not be proven.

@@ -436,6 +436,43 @@ class ConfigMixin:
             raise SupervisorError("trust_bundle_invalid", "stored trust pin is not an object")
         return value
 
+    def _verify_attempt_trust_read_only(self, attempt_id: str) -> dict[str, Any]:
+        """Validate a stored attempt pin without quarantining or repairing state.
+
+        Diagnostic reads must not turn malformed or stale trust data into a
+        state transition. Mutating lifecycle paths continue to use
+        ``_verify_attempt_trust`` and its quarantine behavior.
+        """
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT trust_bundle_json FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+        if not row:
+            raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
+        try:
+            pin = json.loads(row["trust_bundle_json"] or "{}")
+        except (json.JSONDecodeError, TypeError) as error:
+            raise SupervisorError(
+                "trust_bundle_invalid", "stored trust pin is invalid JSON"
+            ) from error
+        if not isinstance(pin, dict):
+            raise SupervisorError("trust_bundle_invalid", "stored trust pin is not an object")
+        if not pin:
+            if self.config.trust_root is not None:
+                raise SupervisorError(
+                    "trust_bundle_quarantined",
+                    "attempt has no trust pin; refusing to adopt the current bundle",
+                )
+            return {}
+        result = verify_bundle_pin(pin)
+        if not result["ok"]:
+            raise SupervisorError(
+                "trust_bundle_quarantined",
+                "pinned trust bundle failed: " + "; ".join(result["errors"]),
+            )
+        return pin
+
     def _quarantine_trust_attempt(self, attempt_id: str, errors: Sequence[str]) -> None:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")

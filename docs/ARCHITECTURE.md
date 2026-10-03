@@ -215,6 +215,17 @@ the OS confirms that the ports can be rebound. Failed cleanup remains durable
 as <code>teardown_failed</code> and keeps the allocation quarantined for an
 operator retry.
 
+<code>acp runtime-resources ATTEMPT_ID --fresh</code> can additionally query an
+attempt-owned systemd user unit for a point-in-time cgroup sample without
+persisting evidence or changing attempt/resource state. The sample is separate
+from the stored setup/teardown proof and includes its observation time. Missing
+or unsupported counters and an unrecognized active state remain unknown. JSON
+is canonical; <code>--format text</code> is a human-readable rendering of the
+same fresh sample. Task count and memory describe the host
+cgroup, not the number of AI agents or their model work; CPUUsageNSec is a
+cumulative counter, not instantaneous utilization. This interface does not
+measure provider tokens or billing and never kills, retries, or requeues work.
+
 Port allocation is a local coordination guarantee, not a kernel reservation.
 An unrelated process can still bind after ACP's availability check. Drivers
 scope Compose projects, PostgreSQL schemas, and browser profiles by attempt and

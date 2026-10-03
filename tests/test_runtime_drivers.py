@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from support import python_command, requires_linux_worker
 
+import agent_control_plane.cli as cli_module
 import agent_control_plane.git_supervisor as supervisor_module
 import agent_control_plane.runtime_drivers as runtime_driver_module
 from agent_control_plane.credential_providers import (
@@ -202,6 +203,16 @@ def test_run_trusted_refuses_relative_argv(tmp_path: Path) -> None:
     with pytest.raises(DriverError) as error:
         run_trusted(["docker", "ps"], tmp_path, {})
     assert error.value.code == "invalid_driver_invocation"
+
+
+def test_run_trusted_read_only_refuses_missing_cwd_without_recreating_it(tmp_path: Path) -> None:
+    missing = tmp_path / "removed-attempt-runtime"
+
+    with pytest.raises(DriverError) as error:
+        run_trusted(["/bin/echo", "sample"], missing, {}, create_cwd=False)
+
+    assert error.value.code == "driver_staging_failed"
+    assert not missing.exists()
 
 
 def test_run_trusted_revalidates_immediately_before_exec(tmp_path: Path) -> None:
@@ -1959,7 +1970,9 @@ def recording_runner(stdout_for: dict[str, str] | None = None):
 TRUSTED_BIN = "/bin/sh"
 
 ACTIVE_SHOW = (
-    "ActiveState=active\nResult=success\nExecMainStatus=0\nTasksMax=16\nMemoryMax=67108864\n"
+    "ActiveState=active\nResult=success\nExecMainStatus=0\nTasksMax=16\nTasksCurrent=5\n"
+    "MemoryMax=67108864\nMemoryCurrent=3145728\nCPUAccounting=yes\n"
+    "CPUUsageNSec=123456789\nCPUQuotaPerSecUSec=500000\n"
 )
 GONE_SHOW = "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
 NOT_FOUND_SHOW = "LoadState=not-found\nActiveState=inactive\n"
@@ -2023,11 +2036,41 @@ def test_namespace_runtime_egress_allow_skips_only_the_network_namespace(tmp_pat
 
 def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path) -> None:
     driver = namespace_driver()
-    runner, _ = recording_runner({"show": ACTIVE_SHOW})
+    runner, calls = recording_runner({"show": ACTIVE_SHOW})
     present, observation = driver.probe(context(tmp_path), runner)
     assert present is True
     assert observation["writable_layer_bytes"] is None
     assert observation["writable_layer_accounting"] == "kernel-enforced-tmpfs-cap"
+    assert observation["tasks_current"] == 5
+    assert observation["tasks_max"] == 16
+    assert observation["memory_current_bytes"] == 3145728
+    assert observation["memory_max_bytes"] == 67108864
+    assert observation["cpu_accounting_enabled"] is True
+    assert observation["cpu_usage_ns"] == 123456789
+    assert observation["cpu_quota_per_sec_usec"] == 500000
+    assert "--property=TasksCurrent" in calls[0]
+    assert "--property=CPUUsageNSec" in calls[0]
+
+    runner, _ = recording_runner(
+        {
+            "show": (
+                "ActiveState=active\nTasksCurrent=[not set]\nTasksMax=infinity\n"
+                "MemoryCurrent=[not set]\nMemoryMax=infinity\nCPUAccounting=no\n"
+                "CPUUsageNSec=[not set]\nCPUQuotaPerSecUSec=infinity\n"
+            )
+        }
+    )
+    _present, unavailable = driver.probe(context(tmp_path), runner)
+    assert unavailable["tasks_current"] is None
+    assert unavailable["tasks_max"] is None
+    assert unavailable["tasks_max_unbounded"] is True
+    assert unavailable["memory_current_bytes"] is None
+    assert unavailable["memory_max_bytes"] is None
+    assert unavailable["memory_max_unbounded"] is True
+    assert unavailable["cpu_accounting_enabled"] is False
+    assert unavailable["cpu_usage_ns"] is None
+    assert unavailable["cpu_quota_per_sec_usec"] is None
+    assert unavailable["cpu_quota_unbounded"] is True
 
     runner, _ = recording_runner({"show": GONE_SHOW})
     present, _observation = driver.probe(context(tmp_path), runner)
@@ -2037,6 +2080,326 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     present, observation = driver.probe(context(tmp_path), runner)
     assert present is False
     assert observation["absence_proved_by"] == "systemd-unit-not-found"
+
+
+def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
+    driver_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    config = (driver_repo / "acp.toml").read_text(encoding="utf-8")
+    config = config.replace(
+        'name = "browser"\nkind = "browser_profile"',
+        'name = "runtime"\nkind = "namespace_runtime"\n'
+        'executable = "/usr/bin/systemd-run"\n'
+        'systemctl_path = "/usr/bin/systemctl"\n'
+        'payload = "/bin/sleep 30"\n'
+        'tasks_max = "16"\n'
+        'memory_max = "64M"\n'
+        'cpu_quota = "50%"\n'
+        'wall_clock_seconds = "120"',
+    )
+    (driver_repo / "acp.toml").write_text(config, encoding="utf-8")
+    calls: list[list[str]] = []
+    show_payload = {"value": ACTIVE_SHOW, "exit_code": 0}
+
+    def fake_run_trusted(argv, cwd, env, timeout, credential, **kwargs):  # type: ignore[no-untyped-def]
+        del env, timeout, credential
+        if kwargs.get("create_cwd", True):
+            cwd.mkdir(parents=True, exist_ok=True)
+        elif not cwd.is_dir():
+            raise DriverError("driver_staging_failed", "driver runtime directory is unavailable")
+        calls.append(list(argv))
+        stdout = show_payload["value"] if len(argv) > 2 and argv[2] == "show" else ""
+        return {
+            "argv": list(argv),
+            "exit_code": show_payload["exit_code"],
+            "stdout": stdout,
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+    calls.clear()
+
+    def acp_snapshot() -> dict[str, object]:
+        files = {
+            str(path.relative_to(supervisor.state_dir)): path.read_bytes()
+            for path in supervisor.state_dir.rglob("*")
+            if path.is_file() and not path.name.endswith(("-shm", "-wal"))
+        }
+        with sqlite3.connect(supervisor.db_path) as connection:
+            events = connection.execute(
+                "SELECT sequence, event_hash FROM events ORDER BY sequence"
+            ).fetchall()
+            resources = connection.execute(
+                "SELECT driver, state, evidence_json, updated_at "
+                "FROM runtime_driver_resources ORDER BY driver"
+            ).fetchall()
+            attempts = connection.execute(
+                "SELECT id, status, updated_at, trust_bundle_json FROM attempts ORDER BY id"
+            ).fetchall()
+            runtimes = connection.execute(
+                "SELECT attempt_id, state, updated_at FROM runtime_environments ORDER BY attempt_id"
+            ).fetchall()
+        return {
+            "files": files,
+            "events": events,
+            "resources": resources,
+            "attempts": attempts,
+            "runtimes": runtimes,
+        }
+
+    before = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    output = capsys.readouterr().out
+    result = json.loads(output)
+
+    assert exit_code == 0
+    assert result["resources"][0]["state"] == "active"
+    sample = result["live_sample"]
+    assert sample["available"] is True
+    assert sample["sampled_at"].endswith("+00:00")
+    assert sample["drivers"][0]["present"] is True
+    assert sample["drivers"][0]["usage"]["tasks_current"] == 5
+    assert sample["drivers"][0]["usage"]["memory_current_bytes"] == 3145728
+    assert sample["drivers"][0]["usage"]["cpu_usage_ns"] == 123456789
+    assert "ownership_token" not in output
+    assert "ACP_RUNTIME_DIR" not in output
+    assert all(len(argv) > 2 and argv[2] == "show" for argv in calls)
+    assert acp_snapshot() == before, "fresh sampling must not persist probe or audit state"
+
+    calls.clear()
+    exit_code = cli_module.main(
+        [
+            "--repo",
+            str(driver_repo),
+            "runtime-resources",
+            attempt["id"],
+            "--fresh",
+            "--format",
+            "text",
+        ]
+    )
+    human_output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Fresh cgroup sample:" in human_output
+    assert "Source: systemd user unit / cgroup" in human_output
+    assert "Tasks: current 5, limit 16" in human_output
+    assert "Memory: current 3145728 B, limit 67108864 B" in human_output
+    assert "CPU time: cumulative 123456789 ns" in human_output
+    assert acp_snapshot() == before
+
+    show_payload.update(value=GONE_SHOW, exit_code=0)
+    calls.clear()
+    before_inactive = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    inactive = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert inactive["available"] is False
+    assert inactive["drivers"][0]["present"] is False
+    assert inactive["drivers"][0]["usage"]["tasks_current"] is None
+    assert acp_snapshot() == before_inactive
+
+    show_payload.update(
+        value=(
+            "ActiveState=inactive\nTasksCurrent=0\nTasksMax=16\n"
+            "MemoryCurrent=0\nMemoryMax=67108864\n"
+            "CPUAccounting=yes\nCPUUsageNSec=987654321\n"
+        ),
+        exit_code=0,
+    )
+    calls.clear()
+    before_inactive_counters = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    inactive_counters = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert inactive_counters["drivers"][0]["present"] is False
+    assert inactive_counters["drivers"][0]["usage"]["tasks_current"] is None
+    assert inactive_counters["drivers"][0]["usage"]["memory_current_bytes"] is None
+    assert inactive_counters["drivers"][0]["usage"]["cpu_usage_ns"] is None
+    assert acp_snapshot() == before_inactive_counters
+
+    show_payload.update(value="LoadState=loaded\nActiveState=not-a-state\n", exit_code=0)
+    calls.clear()
+    before_unknown = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    unknown = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert unknown["available"] is False
+    assert unknown["drivers"][0]["active_state"] == "not-a-state"
+    assert unknown["drivers"][0]["present"] is None
+    assert unknown["drivers"][0]["usage"]["tasks_current"] is None
+    assert acp_snapshot() == before_unknown
+
+    show_payload.update(value="ActiveState=maintenance\nTasksCurrent=3\n", exit_code=0)
+    before_maintenance = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    maintenance = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert maintenance["available"] is False
+    assert maintenance["drivers"][0]["active_state"] == "maintenance"
+    assert maintenance["drivers"][0]["present"] is None
+    assert maintenance["drivers"][0]["usage"]["tasks_current"] is None
+    assert acp_snapshot() == before_maintenance
+
+    show_payload.update(
+        value="ActiveState=active\nTasksCurrent=7\nMemoryCurrent=4096\n",
+        exit_code=1,
+    )
+    calls.clear()
+    before_partial = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    partial = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert partial["available"] is False
+    assert partial["drivers"][0]["active_state"] is None
+    assert partial["drivers"][0]["present"] is None
+    assert partial["drivers"][0]["error_code"] == "runtime_probe_unavailable"
+    assert partial["drivers"][0]["usage"]["tasks_current"] is None
+    assert partial["drivers"][0]["usage"]["memory_current_bytes"] is None
+    assert acp_snapshot() == before_partial
+
+    # Sampling after lifecycle cleanup must not recreate the deleted attempt cwd.
+    runtime_dir = Path(
+        supervisor.runtime_environment(attempt["id"])["environment"]["ACP_RUNTIME_DIR"]
+    )
+    runtime_dir.rmdir()
+    before_missing_runtime_dir = acp_snapshot()
+    calls.clear()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    missing_runtime = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert missing_runtime["available"] is False
+    assert missing_runtime["drivers"][0]["present"] is None
+    assert missing_runtime["drivers"][0]["error_code"] == "driver_staging_failed"
+    assert calls == []
+    assert not runtime_dir.exists()
+    assert acp_snapshot() == before_missing_runtime_dir
+
+    # A mismatched stored resource identity is refused before any systemd query,
+    # without converting a diagnostic read into quarantine or another mutation.
+    with sqlite3.connect(supervisor.db_path) as connection:
+        connection.execute(
+            "UPDATE runtime_driver_resources SET resource_id = 'foreign-unit' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    before_refusal = acp_snapshot()
+    calls.clear()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    refused = json.loads(capsys.readouterr().out)
+    live_driver = refused["live_sample"]["drivers"][0]
+    assert exit_code == 0
+    assert live_driver["available"] is False
+    assert live_driver["error_code"] == "runtime_driver_identity_mismatch"
+    assert live_driver["usage"]["tasks_current"] is None
+    assert calls == [], "an unverified stored unit must never be queried"
+    assert acp_snapshot() == before_refusal
+
+
+def test_fresh_runtime_sample_marks_non_systemd_driver_unavailable(driver_repo: Path) -> None:
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+
+    result = supervisor.driver_resources(attempt["id"], fresh=True)
+
+    assert result["live_sample"]["available"] is False
+    assert result["live_sample"]["reason"] == "no_namespace_runtime_driver"
+    assert result["live_sample"]["drivers"] == []
+
+
+def test_fresh_runtime_sample_refuses_corrupt_trust_pin_without_quarantine(
+    driver_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    config = (driver_repo / "acp.toml").read_text(encoding="utf-8")
+    config = config.replace(
+        'name = "browser"\nkind = "browser_profile"',
+        'name = "runtime"\nkind = "namespace_runtime"\n'
+        'executable = "/usr/bin/systemd-run"\n'
+        'systemctl_path = "/usr/bin/systemctl"\n'
+        'payload = "/bin/sleep 30"',
+    )
+    (driver_repo / "acp.toml").write_text(config, encoding="utf-8")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        supervisor_module,
+        "run_trusted",
+        lambda argv, *_args, **_kwargs: (
+            calls.append(list(argv))
+            or {"argv": list(argv), "exit_code": 0, "stdout": ACTIVE_SHOW, "stderr": ""}
+        ),
+    )
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+    with sqlite3.connect(supervisor.db_path) as connection:
+        connection.execute(
+            "UPDATE attempts SET trust_bundle_json = 'not-json' WHERE id = ?",
+            (attempt["id"],),
+        )
+
+    def acp_snapshot() -> dict[str, object]:
+        files = {
+            str(path.relative_to(supervisor.state_dir)): path.read_bytes()
+            for path in supervisor.state_dir.rglob("*")
+            if path.is_file() and not path.name.endswith(("-shm", "-wal"))
+        }
+        with sqlite3.connect(supervisor.db_path) as connection:
+            events = connection.execute(
+                "SELECT sequence, event_hash FROM events ORDER BY sequence"
+            ).fetchall()
+            resources = connection.execute(
+                "SELECT driver, state, evidence_json, updated_at "
+                "FROM runtime_driver_resources ORDER BY driver"
+            ).fetchall()
+            attempts = connection.execute(
+                "SELECT id, status, updated_at, trust_bundle_json FROM attempts ORDER BY id"
+            ).fetchall()
+            runtimes = connection.execute(
+                "SELECT attempt_id, state, updated_at FROM runtime_environments ORDER BY attempt_id"
+            ).fetchall()
+        return {
+            "files": files,
+            "events": events,
+            "resources": resources,
+            "attempts": attempts,
+            "runtimes": runtimes,
+        }
+
+    before = acp_snapshot()
+    calls.clear()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    output = json.loads(capsys.readouterr().err)
+    assert exit_code != 0
+    assert output["error"] == "trust_bundle_invalid"
+    assert calls == []
+    assert acp_snapshot() == before, "read-only trust refusal must not quarantine the attempt"
 
 
 def test_namespace_runtime_unloaded_transient_unit_is_positive_absence_proof(
