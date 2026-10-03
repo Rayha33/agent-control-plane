@@ -378,6 +378,268 @@ def test_merge_plan_reports_stale_read_input_without_mutating_state(repo: Path) 
     assert state_fingerprint(supervisor) == before_view
 
 
+def test_merge_plan_reports_peer_writes_to_glob_reads_regardless_of_order(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update the generated client",
+        "Use the source schema while changing the client.",
+        ["client checks pass"],
+        ["beta.txt"],
+        priority=99,
+        read_resources=["src/**"],
+    )
+    writer = make_task(
+        supervisor,
+        "src/api/schema.json",
+        title="Update the API schema",
+        priority=50,
+    )
+    second_writer = make_task(
+        supervisor,
+        "src/client/types.py",
+        title="Update generated client types",
+        priority=40,
+    )
+    consumer_submission = approve(supervisor, consumer["id"], "beta.txt", "client v2\n")
+    writer_submission = approve(supervisor, writer["id"], "src/api/schema.json", "schema v2\n")
+    second_writer_submission = approve(
+        supervisor, second_writer["id"], "src/client/types.py", "types v2\n"
+    )
+    before_view = state_fingerprint(supervisor)
+
+    plan = supervisor.merge_plan()
+
+    assert [entry["task_id"] for entry in plan["order"]] == [
+        consumer["id"],
+        writer["id"],
+        second_writer["id"],
+    ]
+    consumer_entry = plan["order"][0]
+    advisory = consumer_entry["cross_submission_read_write_advisory"]
+    assert advisory["state"] == "changed"
+    assert advisory["complete"] is True
+    assert advisory["changed_by"] == sorted(
+        [
+            {
+                "task_id": writer["id"],
+                "title": "Update the API schema",
+                "submission_id": writer_submission["id"],
+                "changed_paths": ["src/api/schema.json"],
+            },
+            {
+                "task_id": second_writer["id"],
+                "title": "Update generated client types",
+                "submission_id": second_writer_submission["id"],
+                "changed_paths": ["src/client/types.py"],
+            },
+        ],
+        key=lambda item: item["task_id"],
+    )
+    assert plan["order"][1]["cross_submission_read_write_advisory"]["state"] == ("not_declared")
+    assert consumer_entry["conflicts_with"] == []
+    assert consumer_entry["predicted_conflict_paths"] == []
+    assert consumer_entry["submission_id"] == consumer_submission["id"]
+    assert state_fingerprint(supervisor) == before_view
+
+
+def test_merge_plan_read_write_advisory_sees_deleted_source_of_rename(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update the API consumer",
+        "Use the API input while updating the consumer.",
+        ["consumer checks pass"],
+        ["beta.txt"],
+        priority=99,
+        read_resources=["alpha.txt"],
+    )
+    rename_task = supervisor.create_task(
+        "Rename the API input",
+        "Move the tracked input to its new path.",
+        ["the input is renamed"],
+        ["alpha.txt", "renamed.txt"],
+        priority=50,
+    )
+    approve(supervisor, consumer["id"], "beta.txt", "consumer v2\n")
+
+    attempt = supervisor.claim(rename_task["id"], "rename-worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "alpha.txt").rename(worktree / "renamed.txt")
+    git(worktree, "add", "-A", "--", "alpha.txt", "renamed.txt")
+    git(worktree, "commit", "-m", "rename API input")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    supervisor.run_qc(submission["id"], "independent-qc")
+
+    plan = supervisor.merge_plan()
+    consumer_entry = next(item for item in plan["order"] if item["task_id"] == consumer["id"])
+    advisory = consumer_entry["cross_submission_read_write_advisory"]
+
+    assert advisory["state"] == "changed"
+    assert advisory["complete"] is True
+    assert advisory["changed_by"] == [
+        {
+            "task_id": rename_task["id"],
+            "title": "Rename the API input",
+            "submission_id": submission["id"],
+            "changed_paths": ["alpha.txt"],
+        }
+    ]
+
+
+def test_merge_plan_read_write_advisory_uses_exact_case_and_approved_peers_only(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update the schema consumer",
+        "Use the case-sensitive schema input.",
+        ["consumer checks pass"],
+        ["beta.txt"],
+        priority=99,
+        read_resources=["Schema.json"],
+    )
+    wrong_case_writer = make_task(supervisor, "schema.json", title="lowercase schema")
+    correct_case_writer = make_task(supervisor, "Schema.json", title="uppercase schema")
+    pending_writer = make_task(supervisor, "Schema.json", title="unapproved schema")
+    approve(supervisor, consumer["id"], "beta.txt", "consumer v2\n")
+    approve(supervisor, wrong_case_writer["id"], "schema.json", "lowercase v2\n")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE resource_leases SET task_id = NULL, attempt_id = NULL, "
+            "lease_expires_at = 0 WHERE task_id = ?",
+            (wrong_case_writer["id"],),
+        )
+    correct_submission = approve(
+        supervisor, correct_case_writer["id"], "Schema.json", "uppercase v2\n"
+    )
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE resource_leases SET task_id = NULL, attempt_id = NULL, "
+            "lease_expires_at = 0 WHERE task_id = ?",
+            (correct_case_writer["id"],),
+        )
+    pending_attempt = supervisor.claim(pending_writer["id"], "pending-writer")
+    commit_change(pending_attempt, "Schema.json", "pending v2\n")
+    supervisor.submit(pending_attempt["id"], pending_attempt["claim_token"])
+
+    plan = supervisor.merge_plan()
+    consumer_entry = next(item for item in plan["order"] if item["task_id"] == consumer["id"])
+    advisory = consumer_entry["cross_submission_read_write_advisory"]
+
+    assert advisory["state"] == "changed"
+    assert advisory["changed_by"] == [
+        {
+            "task_id": correct_case_writer["id"],
+            "title": "uppercase schema",
+            "submission_id": correct_submission["id"],
+            "changed_paths": ["Schema.json"],
+        }
+    ]
+
+
+def test_merge_plan_read_write_advisory_reports_unknown_scope(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update the consumer",
+        "Use the declared input.",
+        ["consumer checks pass"],
+        ["beta.txt"],
+        read_resources=["alpha.txt"],
+    )
+    writer = make_task(supervisor, "alpha.txt", title="unrelated writer")
+    approve(supervisor, consumer["id"], "beta.txt", "consumer v2\n")
+    approve(supervisor, writer["id"], "alpha.txt", "writer v2\n")
+
+    def fail_path_match(
+        path: str,
+        resource: str,
+        *,
+        fold: bool = True,
+        is_logical: bool | None = None,
+    ) -> bool:
+        if is_logical is None:
+            raise ValueError("simulated invalid scope")
+        return GitSupervisor._path_matches(path, resource, fold=fold, is_logical=is_logical)
+
+    monkeypatch.setattr(supervisor, "_path_matches", fail_path_match)
+
+    entry = next(
+        item for item in supervisor.merge_plan()["order"] if item["task_id"] == consumer["id"]
+    )
+
+    advisory = entry["cross_submission_read_write_advisory"]
+    assert advisory["state"] == "unknown"
+    assert advisory["complete"] is False
+    assert advisory["changed_by"] == []
+    assert advisory["unresolved_resources"] == ["alpha.txt"]
+
+
+@pytest.mark.parametrize(
+    "scan_error",
+    [
+        SupervisorError("git_timeout", "simulated advisory scan timeout"),
+        OSError("simulated Git process cleanup race"),
+    ],
+    ids=["supervisor-error", "cleanup-os-error"],
+)
+def test_merge_plan_read_write_advisory_reports_unknown_peer_scan(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, scan_error: Exception
+) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update the API consumer",
+        "Use the schema input.",
+        ["consumer checks pass"],
+        ["beta.txt"],
+        read_resources=["alpha.txt"],
+    )
+    writer = make_task(supervisor, "alpha.txt", title="Update the schema")
+    approve(supervisor, consumer["id"], "beta.txt", "consumer v2\n")
+    writer_submission = approve(supervisor, writer["id"], "alpha.txt", "schema v2\n")
+    original_scan = supervisor._git_readonly_bytes_bounded
+
+    def fail_advisory_scan(*arguments: str, max_bytes: int) -> bytes:
+        if "--no-renames" in arguments:
+            raise scan_error
+        return original_scan(*arguments, max_bytes=max_bytes)
+
+    monkeypatch.setattr(supervisor, "_git_readonly_bytes_bounded", fail_advisory_scan)
+
+    entry = next(
+        item for item in supervisor.merge_plan()["order"] if item["task_id"] == consumer["id"]
+    )
+
+    advisory = entry["cross_submission_read_write_advisory"]
+    assert advisory["state"] == "unknown"
+    assert advisory["complete"] is False
+    assert advisory["changed_by"] == []
+    assert advisory["unresolved_submissions"] == [writer_submission["id"]]
+
+
+def test_merge_plan_read_write_advisory_is_clear_when_no_peer_path_matches(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update the client",
+        "Use the schema as an input.",
+        ["client checks pass"],
+        ["beta.txt"],
+        read_resources=["alpha.txt"],
+    )
+    writer = make_task(supervisor, "gamma.txt", title="change unrelated file")
+    approve(supervisor, consumer["id"], "beta.txt", "client v2\n")
+    approve(supervisor, writer["id"], "gamma.txt", "unrelated v2\n")
+
+    entry = next(
+        item for item in supervisor.merge_plan()["order"] if item["task_id"] == consumer["id"]
+    )
+
+    advisory = entry["cross_submission_read_write_advisory"]
+    assert advisory["state"] == "unchanged"
+    assert advisory["complete"] is True
+    assert advisory["changed_by"] == []
+
+
 def test_merge_plan_is_read_only(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     created = make_task(supervisor, "alpha.txt", title="only")
