@@ -5636,6 +5636,7 @@ def test_worker_output_uses_pipe_and_host_log_capture_is_bounded(repo: Path) -> 
     command = f"""
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 
@@ -5650,73 +5651,18 @@ for descriptor in os.listdir('/proc/self/fd'):
 pathlib.Path('alpha.txt').write_text(stdout_target + '\\n' + ('host-log-fd-present' if log_fd_present else 'host-log-fd-absent'))
 subprocess.run(['git', 'add', 'alpha.txt'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 subprocess.run(['git', 'commit', '-m', 'bounded worker output'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# Bound only the candidate process so a stalled pipe cannot replace pytest's SIGALRM.
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.alarm(15)
 sys.stdout.buffer.write(stdout_target.encode() + b'\\nvisible-prefix\\n')
 for _ in range(9):
     sys.stdout.buffer.write(b'x' * (1024 * 1024))
 sys.stdout.flush()
 """
 
-    previous_alarm_handler = signal.getsignal(signal.SIGALRM)
-    previous_timer = signal.getitimer(signal.ITIMER_REAL)
-    timer_started_at = time.monotonic()
-
-    previous_delay, previous_interval = previous_timer
-    previous_alarm_at = timer_started_at + previous_delay if previous_delay > 0 else None
-    deadline_at = timer_started_at + 15
-    previous_default_expired = False
-
-    def timeout_worker_output(signum: int, frame: object) -> None:
-        nonlocal previous_alarm_at, previous_default_expired
-        now = time.monotonic()
-        if previous_alarm_at is not None and now >= previous_alarm_at:
-            if previous_interval > 0:
-                previous_alarm_at += previous_interval
-                while previous_alarm_at <= now:
-                    previous_alarm_at += previous_interval
-            else:
-                previous_alarm_at = None
-
-            if previous_alarm_handler is signal.SIG_DFL:
-                previous_default_expired = True
-                raise TimeoutError("pre-existing SIGALRM expired")
-            if previous_alarm_handler is not signal.SIG_IGN:
-                previous_alarm_handler(signum, frame)
-
-        now = time.monotonic()
-        if now >= deadline_at:
-            raise TimeoutError("worker output drain exceeded 15 seconds")
-        next_alarm_at = deadline_at
-        if previous_alarm_at is not None:
-            next_alarm_at = min(next_alarm_at, previous_alarm_at)
-        signal.setitimer(signal.ITIMER_REAL, max(0.001, next_alarm_at - now))
-
-    signal.signal(signal.SIGALRM, timeout_worker_output)
-    first_alarm_at = min(deadline_at, previous_alarm_at or deadline_at)
-    signal.setitimer(signal.ITIMER_REAL, max(0.001, first_alarm_at - time.monotonic()))
-    try:
-        submission = supervisor.run_worker(
-            attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
-        )
-    finally:
-        now = time.monotonic()
-        pending_previous_alarm = previous_default_expired
-        remaining_delay = 0.0
-        if previous_alarm_at is not None:
-            remaining_delay = previous_alarm_at - now
-            if remaining_delay <= 0:
-                pending_previous_alarm = True
-                if previous_interval > 0:
-                    while previous_alarm_at <= now:
-                        previous_alarm_at += previous_interval
-                    remaining_delay = previous_alarm_at - now
-                else:
-                    remaining_delay = 0.0
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_alarm_handler)
-        if remaining_delay > 0:
-            signal.setitimer(signal.ITIMER_REAL, remaining_delay, previous_interval)
-        if pending_previous_alarm:
-            signal.raise_signal(signal.SIGALRM)
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
 
     assert submission["status"] == "pending_qc"
     worker_metadata = git(Path(attempt["worktree"]), "show", "HEAD:alpha.txt")
