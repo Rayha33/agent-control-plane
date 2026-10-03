@@ -22,10 +22,13 @@ import time
 import unicodedata
 from typing import TYPE_CHECKING, Any
 
+from .supervisor.common import SupervisorError
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .git_supervisor import GitSupervisor
 
 CLAIMABLE_STATUSES = frozenset({"open", "orphaned", "changes_requested"})
+_MERGE_PLAN_CHANGED_PATHS_MAX_BYTES = 16 * 1024 * 1024
 
 
 def declared_resources(row: Any) -> list[str]:
@@ -366,6 +369,137 @@ class Scheduler:
 
     # ------------------------------------------------------------- merge plan
 
+    def _cross_submission_read_write_advisory(
+        self,
+        task: dict[str, Any],
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]],
+        changed_paths_by_submission: dict[Any, list[str] | None],
+    ) -> dict[str, Any]:
+        """Report approved peers that write inside this task's declared read scope.
+
+        This is deliberately independent of merge order: a later write can invalidate an
+        earlier consumer just as an earlier write can. The declaration is a scope, not
+        evidence that the worker actually read every matching file.
+        """
+        resources = task.get("declared_read_resources")
+        if not isinstance(resources, list):
+            return {
+                "advisory": True,
+                "state": "unknown",
+                "complete": False,
+                "changed_by": [],
+                "unresolved_resources": [],
+                "unresolved_submissions": [],
+                "reason": "declared read resources are unavailable or invalid",
+            }
+        if not resources:
+            return {
+                "advisory": True,
+                "state": "not_declared",
+                "complete": True,
+                "changed_by": [],
+                "unresolved_resources": [],
+                "unresolved_submissions": [],
+                "reason": "task has no declared read resources",
+            }
+
+        unresolved_resources = [
+            resource for resource in resources if not isinstance(resource, str) or not resource
+        ]
+        unresolved_submissions: set[Any] = set()
+
+        def mark_unresolved(resource: Any) -> None:
+            if resource not in unresolved_resources:
+                unresolved_resources.append(resource)
+
+        valid_resources = [
+            resource for resource in resources if isinstance(resource, str) and resource
+        ]
+        changed_by: list[dict[str, Any]] = []
+        ordered_candidates = sorted(
+            candidates,
+            key=lambda item: (item[0]["id"], str(item[1]["id"])),
+        )
+        for peer_task, peer_submission in ordered_candidates:
+            if peer_task["id"] == task["id"]:
+                continue
+            peer_paths = changed_paths_by_submission[peer_submission["id"]]
+            if peer_paths is None:
+                unresolved_submissions.add(peer_submission["id"])
+                continue
+            overlapping_paths: set[str] = set()
+            for path in peer_paths:
+                if not isinstance(path, str):
+                    unresolved_submissions.add(peer_submission["id"])
+                    continue
+                for resource in valid_resources:
+                    try:
+                        matches = self.supervisor._path_matches(path, resource, fold=False)
+                    except (RecursionError, TypeError, ValueError):
+                        mark_unresolved(resource)
+                        continue
+                    if matches:
+                        overlapping_paths.add(path)
+                        break
+            if overlapping_paths:
+                changed_by.append(
+                    {
+                        "task_id": peer_task["id"],
+                        "title": peer_task["title"],
+                        "submission_id": peer_submission["id"],
+                        "changed_paths": sorted(overlapping_paths),
+                    }
+                )
+
+        unresolved = sorted(unresolved_resources, key=str)
+        unresolved_peer_ids = sorted(unresolved_submissions, key=str)
+        if changed_by:
+            state = "changed"
+        elif unresolved or unresolved_peer_ids:
+            state = "unknown"
+        else:
+            state = "unchanged"
+        return {
+            "advisory": True,
+            "state": state,
+            "complete": not unresolved and not unresolved_peer_ids,
+            "changed_by": changed_by,
+            "unresolved_resources": unresolved,
+            "unresolved_submissions": unresolved_peer_ids,
+            "reason": (
+                "one or more declared read scopes or peer submissions could not be evaluated"
+                if unresolved or unresolved_peer_ids
+                else "no approved peer submission changes a path in the declared read scope"
+            ),
+        }
+
+    def _advisory_changed_paths(
+        self, task: dict[str, Any], submission: dict[str, Any]
+    ) -> list[str] | None:
+        """Read complete add/delete paths, including both sides of a detected rename.
+
+        The submitted `changed_paths` list is retained for compatibility, but Git's default
+        rename detection can hide the deleted source. This bounded read-only diff is used only
+        by the advisory, so it cannot change submission admission or lease semantics.
+        """
+        try:
+            raw = self.supervisor._git_readonly_bytes_bounded(
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                task["base_sha"],
+                submission["commit_sha"],
+                max_bytes=_MERGE_PLAN_CHANGED_PATHS_MAX_BYTES,
+            )
+            paths = sorted({value.decode("utf-8") for value in raw.split(b"\0") if value})
+            recorded = json.loads(submission["changed_paths_json"])
+            if not isinstance(recorded, list) or not set(recorded).issubset(paths):
+                return None
+        except (SupervisorError, OSError, TypeError, ValueError):
+            return None
+        return paths
+
     def merge_plan(self) -> dict[str, Any]:
         """Order approved submissions for integration and flag ones the base invalidated."""
         excluded: list[dict[str, Any]] = []
@@ -409,10 +543,20 @@ class Scheduler:
                 candidates.append((task, dict(submission)))
 
         ordered = self._merge_order(candidates)
+        changed_paths_by_submission = {
+            submission["id"]: sorted(set(json.loads(submission["changed_paths_json"])))
+            for _, submission in ordered
+        }
+        advisory_changed_paths_by_submission: dict[Any, list[str] | None] = {}
+        if any(task.get("declared_read_resources") for task, _ in ordered):
+            advisory_changed_paths_by_submission = {
+                submission["id"]: self._advisory_changed_paths(task, submission)
+                for task, submission in ordered
+            }
         entries: list[dict[str, Any]] = []
         merged_paths: list[tuple[str, set[str]]] = []
         for position, (task, submission) in enumerate(ordered, start=1):
-            changed = set(json.loads(submission["changed_paths_json"]))
+            changed = set(changed_paths_by_submission[submission["id"]])
             conflicts_with = []
             conflict_paths: set[str] = set()
             for earlier_id, earlier_paths in merged_paths:
@@ -437,6 +581,13 @@ class Scheduler:
                         task.get("_read_resources_snapshot_json", ""),
                         task["base_branch"],
                         tree_cache=read_resource_tree_cache,
+                    ),
+                    "cross_submission_read_write_advisory": (
+                        self._cross_submission_read_write_advisory(
+                            task,
+                            ordered,
+                            advisory_changed_paths_by_submission,
+                        )
                     ),
                     **self._base_state(task, submission),
                 }

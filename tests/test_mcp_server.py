@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from support import init_repo, make_task
+from support import approve, init_repo, make_task
 
 from agent_control_plane import mcp_server
 from agent_control_plane.git_supervisor import GitSupervisor
@@ -160,6 +160,43 @@ def test_a_real_query_returns_real_data(repo: Path) -> None:
 
     assert result["isError"] is False
     assert body(result)["id"] == created["id"]
+
+
+def test_merge_plan_read_write_advisory_is_identical_over_cli_and_mcp(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    consumer = supervisor.create_task(
+        "Update the API consumer",
+        "Use the declared schema input.",
+        ["consumer checks pass"],
+        ["beta.txt"],
+        priority=99,
+        read_resources=["alpha.txt"],
+    )
+    writer = make_task(supervisor, "alpha.txt", title="Update the schema", priority=50)
+    approve(supervisor, consumer["id"], "beta.txt", "consumer v2\n")
+    approve(supervisor, writer["id"], "alpha.txt", "schema v2\n")
+
+    cli_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_control_plane.cli",
+            "--repo",
+            str(repo),
+            "merge-plan",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    mcp_result = body(call(repo, "acp_merge_plan"))
+
+    assert cli_result.returncode == 0, cli_result.stderr
+    cli_plan = json.loads(cli_result.stdout)
+    assert cli_plan == mcp_result
+    consumer_entry = next(item for item in cli_plan["order"] if item["task_id"] == consumer["id"])
+    assert consumer_entry["cross_submission_read_write_advisory"]["state"] == "changed"
 
 
 def test_the_bundle_tool_cannot_be_used_to_read_other_files(repo: Path) -> None:

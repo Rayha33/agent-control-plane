@@ -375,6 +375,20 @@ prove that a change is semantically incompatible. Missing/untracked scopes and
 unavailable snapshots are reported as `unknown`, never as unchanged. Tasks with
 no declared read resources retain the existing behavior.
 
+Each `merge-plan` entry also includes a read-only
+`cross_submission_read_write_advisory`. It compares that task's declared read
+scopes with the changed paths of every other approved, assurance-ready
+submission in the plan, regardless of merge order. `changed_by` names matching
+peer tasks/submissions and exact paths; `unchanged` means no included peer write
+matched, `not_declared` means the task has no read scope, and `unknown` means a
+scope or peer write could not be evaluated. `complete` and
+`unresolved_submissions` make partial/unknown matching explicit. The advisory
+uses a bounded read-only diff with rename detection disabled, so both the removed
+source and added destination are considered without changing the stored
+submission paths or write-set admission. This does not infer actual reads or
+semantic incompatibility, and does not block, reorder, or mutate submissions; it
+also cannot account for work that has not reached an approved submission.
+
 All four planning commands are read-only. Unlike <code>claim</code> and
 <code>list</code>, they never reap: looking at the board does not orphan an
 agent's attempt.
