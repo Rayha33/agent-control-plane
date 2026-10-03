@@ -14,9 +14,12 @@ successful supervisor `Popen.wait` audit receipt, base/tree and result digests.
 It does not use the namespace runtime's systemd unit ID as worker identity.
 Recovery adopts only the exact journaled commit/ref; a stale claim, missing
 object, or conflicting ref remains fenced as ambiguous. Result refs are retained
-pending a separate retention/cleanup policy. End-to-end worker isolation proof
-remains incomplete. This record does not authorize `externalSandbox` for ACP
-workers.
+pending a separate retention/cleanup policy. Candidate blobs and trees are
+written before the prepared journal row, so a stop during tree construction can
+leave unreachable Git objects; ACP does not currently prune those objects,
+though content-addressed retries reuse identical objects. End-to-end worker
+isolation proof remains incomplete. This record does not authorize
+`externalSandbox` for ACP workers.
 
 The namespace runtime probe records a validated
 `systemd_unit_invocation_id` in its runtime-driver evidence and append-only

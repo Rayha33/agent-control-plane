@@ -2102,6 +2102,7 @@ class ClaimsMixin:
                 }
             ).encode("utf-8")
         )
+        reference = result_ref_name(attempt_id, claim_token, result_digest)
         import_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -2165,7 +2166,6 @@ class ClaimsMixin:
                 git_executable=git_executable,
             )
             self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
-            reference = result_ref_name(attempt_id, claim_token, result_digest)
             journal_id = import_id
             with self.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -2322,6 +2322,8 @@ class ClaimsMixin:
     ) -> dict[str, Any]:
         """Reconcile only the exact journaled commit/ref; stale claims stay fenced."""
 
+        self._assert_safe_git_execution_config()
+        self._assert_no_git_grafts()
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM result_imports WHERE id = ?", (import_id,)
@@ -2382,6 +2384,49 @@ class ClaimsMixin:
                     raise SupervisorError(
                         "result_import_ambiguous",
                         "submitted result journal does not match its submission",
+                    )
+                candidate = CandidateTree(
+                    tree_sha=row["tree_sha"],
+                    base_sha=row["base_sha"],
+                    baseline_digest=row["baseline_digest"],
+                    result_digest=row["result_digest"],
+                    change_digest=row["change_digest"],
+                )
+                payload = candidate_commit_payload(
+                    candidate,
+                    attempt_id=row["attempt_id"],
+                    claim_token=row["claim_token"],
+                    result_digest=row["result_digest"],
+                    committed_at=row["commit_timestamp"],
+                )
+                git_executable = self._system_git_executable(self.root)
+                try:
+                    expected_commit = candidate_commit_object(
+                        self.root,
+                        payload,
+                        write=False,
+                        git_executable=git_executable,
+                    )
+                    target = candidate_ref_target(
+                        self.root,
+                        expected_ref,
+                        git_executable=git_executable,
+                    )
+                    verify_candidate_objects(
+                        self.root,
+                        candidate,
+                        commit_sha=target,
+                        git_executable=git_executable,
+                    )
+                except SupervisorError as error:
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "submitted result commit or ref cannot be verified",
+                    ) from error
+                if target != row["commit_sha"] or expected_commit != row["commit_sha"]:
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "submitted result ref does not match its journaled commit",
                     )
                 return self.submission(row["submission_id"])
             if row["phase"] == "ambiguous":
@@ -2579,6 +2624,13 @@ class ClaimsMixin:
                 "reservation_lost",
                 "stale_reservation",
             }:
+                with self.connect() as connection:
+                    completed = connection.execute(
+                        "SELECT phase, submission_id FROM result_imports WHERE id = ?",
+                        (import_id,),
+                    ).fetchone()
+                if completed and completed["phase"] == "submitted" and completed["submission_id"]:
+                    return self.recover_worker_result_import(import_id, credential=credential)
                 self._mark_result_import_ambiguous(import_id, str(error))
                 raise SupervisorError(
                     "result_import_ambiguous", "submission lost its claim fence; result is retained"
