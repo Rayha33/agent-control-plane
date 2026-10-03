@@ -5,6 +5,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -3344,10 +3345,11 @@ def test_trusted_external_critic_cannot_leave_a_detached_child(repo: Path) -> No
     marker = repo / "critic-detached-child"
     trust_root = repo.parent / "critic-containment-trust"
     source = repo.parent / "critic-containment-source"
+    detached_command = f"/bin/sleep 1; /usr/bin/touch {shlex.quote(str(marker))}"
     script = passing_critic_script().replace(
         "\nimport json, os\n",
         "\nimport json, os, subprocess\n"
-        f"subprocess.Popen(['/bin/sh', '-c', '/bin/sleep 1; /usr/bin/touch {str(marker)!r}'], "
+        f"subprocess.Popen(['/bin/sh', '-c', {detached_command!r}], "
         "start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n",
         1,
     )
