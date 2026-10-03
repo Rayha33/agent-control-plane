@@ -2617,18 +2617,9 @@ def test_supervised_worker_heartbeat_does_not_replace_explicit_checkpoint(repo: 
         "time.sleep(12)"
     )
 
-    def timeout_worker_output(_signum: int, _frame: object) -> None:
-        raise TimeoutError("worker output drain exceeded 15 seconds")
-
-    previous_alarm_handler = signal.signal(signal.SIGALRM, timeout_worker_output)
-    signal.setitimer(signal.ITIMER_REAL, 15)
-    try:
-        submission = supervisor.run_worker(
-            attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
-        )
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_alarm_handler)
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
 
     assert submission["status"] == "pending_qc"
     final_attempt = supervisor.attempt(attempt["id"])
@@ -5665,9 +5656,33 @@ for _ in range(9):
 sys.stdout.flush()
 """
 
-    submission = supervisor.run_worker(
-        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
-    )
+    def timeout_worker_output(_signum: int, _frame: object) -> None:
+        raise TimeoutError("worker output drain exceeded 15 seconds")
+
+    previous_alarm_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    timer_started_at = time.monotonic()
+    signal.signal(signal.SIGALRM, timeout_worker_output)
+    signal.setitimer(signal.ITIMER_REAL, 15)
+    try:
+        submission = supervisor.run_worker(
+            attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+        )
+    finally:
+        elapsed = time.monotonic() - timer_started_at
+        previous_delay, previous_interval = previous_timer
+        remaining_delay = previous_delay - elapsed
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
+        if previous_delay > 0:
+            if remaining_delay > 0:
+                signal.setitimer(signal.ITIMER_REAL, remaining_delay, previous_interval)
+            elif previous_interval > 0:
+                elapsed_after_first = elapsed - previous_delay
+                until_next = previous_interval - (elapsed_after_first % previous_interval)
+                signal.setitimer(signal.ITIMER_REAL, max(0.001, until_next), previous_interval)
+            else:
+                signal.raise_signal(signal.SIGALRM)
 
     assert submission["status"] == "pending_qc"
     worker_metadata = git(Path(attempt["worktree"]), "show", "HEAD:alpha.txt")
@@ -5736,7 +5751,8 @@ def test_worker_launch_fails_closed_when_existing_log_budget_is_exhausted(
     attempt = supervisor.claim(created["id"], "worker")
     log_path = Path(supervisor.state_dir) / "logs" / f"worker-{attempt['id']}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_bytes(b"x" * existing_log_size)
+    existing_log = b"x" * existing_log_size
+    log_path.write_bytes(existing_log)
     marker = Path(supervisor.state_dir) / f"must-not-launch-{attempt['id']}"
     command = [
         sys.executable,
@@ -5748,5 +5764,5 @@ def test_worker_launch_fails_closed_when_existing_log_budget_is_exhausted(
         supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
 
     assert error.value.code == "worker_log_budget_exhausted"
-    assert log_path.stat().st_size == existing_log_size
+    assert log_path.read_bytes() == existing_log
     assert not marker.exists()
