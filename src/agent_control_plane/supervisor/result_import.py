@@ -1128,12 +1128,12 @@ def _object_fanout(
                     os.mkdir(object_id[:2], mode=0o755, dir_fd=root_descriptor)
                 except FileExistsError:
                     pass
-                # Persist the fanout entry before a later ref can depend on it,
-                # whether this process created it or observed a concurrent creator.
-                os.fsync(root_descriptor)
                 fanout_descriptor = os.open(object_id[:2], directory_flags, dir_fd=root_descriptor)
             if not stat.S_ISDIR(os.fstat(fanout_descriptor).st_mode):
                 raise OSError("loose-object fanout is not a directory")
+            # Persist the fanout entry before a later ref can depend on it,
+            # including when this directory predates the current import.
+            os.fsync(root_descriptor)
             yield fanout_descriptor, fanout
         except SupervisorError:
             raise

@@ -11,6 +11,7 @@ import pytest
 from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.result_import import (
     CandidateTree,
+    _object_fanout,
     build_candidate_tree,
     candidate_commit_object,
     candidate_commit_payload,
@@ -284,6 +285,53 @@ def test_result_object_promotion_rejects_symlink_stage_directory(tmp_path: Path)
         promote_candidate_objects(repository, linked_stage, [], import_id=str(uuid.uuid4()))
 
     assert raised.value.code == "result_import_ambiguous"
+
+
+def test_existing_result_object_fanout_fsyncs_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dir_fd_functions = (os.open, os.mkdir, os.stat, os.unlink, os.link)
+    if os.name == "nt" or not all(function in os.supports_dir_fd for function in dir_fd_functions):
+        pytest.skip("safe dir-fd fanout operations are unavailable")
+
+    repository = _repository(tmp_path / "repo")
+    (repository / "tracked.txt").write_text("baseline\n")
+    _commit_initial(repository)
+    common = Path(
+        os.fsdecode(
+            _git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        )
+    )
+    object_directory = common / "objects"
+    prefix = next(
+        candidate
+        for candidate in "0123456789abcdef"
+        if not (object_directory / (candidate * 2)).exists()
+    )
+    (object_directory / (prefix * 2)).mkdir()
+    object_root_stat = object_directory.stat()
+    real_fsync = os.fsync
+    parent_syncs: list[int] = []
+
+    def record_fsync(descriptor: int) -> None:
+        descriptor_stat = os.fstat(descriptor)
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) == (
+            object_root_stat.st_dev,
+            object_root_stat.st_ino,
+        ):
+            parent_syncs.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    with _object_fanout(
+        object_directory,
+        prefix * 2 + "0" * 38,
+        create=True,
+        error_code="result_import_ambiguous",
+    ):
+        pass
+
+    assert len(parent_syncs) == 1
 
 
 def test_result_object_helpers_reject_symlink_fanout_without_touching_target(
