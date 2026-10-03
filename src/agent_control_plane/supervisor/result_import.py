@@ -84,7 +84,9 @@ def build_candidate_tree(
 
     with tempfile.TemporaryDirectory(prefix="acp-candidate-index-") as temporary_directory:
         index_path = Path(temporary_directory) / "index"
-        environment = _git_environment(index_path)
+        hooks_path = Path(temporary_directory) / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(index_path, hooks_path)
         raw_top_level = _run_git(
             executable,
             resolved_repository,
@@ -341,7 +343,7 @@ def _assert_snapshot_matches_tree(
         )
 
 
-def _git_environment(index_path: Path) -> dict[str, str]:
+def _git_environment(index_path: Path, hooks_path: Path) -> dict[str, str]:
     environment = os.environ.copy()
     for name in tuple(environment):
         if name == "GIT" or name.startswith("GIT_"):
@@ -349,13 +351,23 @@ def _git_environment(index_path: Path) -> dict[str, str]:
     environment.update(
         {
             "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_CONFIG_COUNT": "0",
+            "GIT_CONFIG_COUNT": "4",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(hooks_path),
+            "GIT_CONFIG_KEY_1": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_CONFIG_KEY_2": "maintenance.auto",
+            "GIT_CONFIG_VALUE_2": "false",
+            "GIT_CONFIG_KEY_3": "gc.auto",
+            "GIT_CONFIG_VALUE_3": "0",
             "GIT_INDEX_FILE": str(index_path),
             "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_PAGER": "cat",
             "GIT_TERMINAL_PROMPT": "0",
+            "PAGER": "cat",
         }
     )
     return environment

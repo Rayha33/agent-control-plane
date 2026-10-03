@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -65,6 +66,13 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
     (repository / "node").write_text("old node\n")
     (repository / "keep.txt").write_text("unchanged\n")
     _commit_initial(repository)
+    hook_directory = tmp_path / "host-hooks"
+    hook_directory.mkdir()
+    hook_marker = tmp_path / "host-hook-ran"
+    post_index_hook = hook_directory / "post-index-change"
+    post_index_hook.write_text(f"#!/bin/sh\nprintf x > {shlex.quote(str(hook_marker))}\n")
+    post_index_hook.chmod(0o700)
+    _git(repository, "config", "core.hooksPath", str(hook_directory))
 
     baseline = copy_snapshot(repository, tmp_path / "baseline")
     output = copy_snapshot(repository, tmp_path / "worker-output").root
@@ -90,6 +98,7 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
         )
     )
     index_before = index_path.read_bytes()
+    hook_marker.unlink(missing_ok=True)
 
     base_sha = os.fsdecode(_git(repository, "rev-parse", "HEAD").strip())
     candidate = build_candidate_tree(
@@ -99,6 +108,7 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
         base_sha=base_sha,
         write_set_rules=_all_paths(),
     )
+    assert not hook_marker.exists()
 
     assert candidate.baseline_digest == baseline.manifest.digest
     assert candidate.base_sha == base_sha
