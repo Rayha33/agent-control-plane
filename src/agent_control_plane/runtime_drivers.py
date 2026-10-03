@@ -284,13 +284,15 @@ def run_trusted(
     expected_owners: set[int] | None = None,
     process_runner: ContainedProcessRunner | None = None,
     pass_fds: Sequence[int] = (),
+    create_cwd: bool = True,
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
 
     ``guard_fd`` is a supervisor-owned lifetime lock. A contained process
     runner retains it in its trusted monitor but closes it before executing the
     external command, so recovery remains fenced without giving the command an
-    unlock capability.
+    unlock capability. Read-only diagnostics set ``create_cwd=False`` so a
+    missing attempt directory is refused instead of recreated.
     """
 
     if not argv:
@@ -311,12 +313,22 @@ def run_trusted(
             "untrusted_driver",
             f"driver executable could not be resolved: {requested_executable}",
         ) from error
-    try:
-        cwd.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise DriverError(
-            "driver_staging_failed", "driver runtime directory is unavailable"
-        ) from error
+    if create_cwd:
+        try:
+            cwd.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise DriverError(
+                "driver_staging_failed", "driver runtime directory is unavailable"
+            ) from error
+    else:
+        try:
+            cwd_info = cwd.stat(follow_symlinks=False)
+        except OSError as error:
+            raise DriverError(
+                "driver_staging_failed", "driver runtime directory is unavailable"
+            ) from error
+        if not stat.S_ISDIR(cwd_info.st_mode):
+            raise DriverError("driver_staging_failed", "driver runtime directory is unavailable")
     # Re-check immediately before exec. Validation at config load proves nothing
     # about the file we are about to run.
     if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -1593,8 +1605,12 @@ class NamespaceRuntimeDriver(ResourceDriver):
             "--property=Result",
             "--property=ExecMainStatus",
             "--property=TasksMax",
+            "--property=TasksCurrent",
             "--property=MemoryMax",
             "--property=MemoryCurrent",
+            "--property=CPUAccounting",
+            "--property=CPUUsageNSec",
+            "--property=CPUQuotaPerSecUSec",
         ]
         result = runner(
             argv,
@@ -1627,15 +1643,48 @@ class NamespaceRuntimeDriver(ResourceDriver):
         finding = self._quota_finding(result.get("stdout", ""))
         if finding:
             result = {**result, "quota_violation": finding}
-        memory_current = self._show_value(result.get("stdout", ""), "MemoryCurrent")
+
+        def numeric_property(name: str) -> tuple[int | None, bool | None]:
+            raw = self._show_value(result.get("stdout", ""), name).strip().casefold()
+            if raw == "infinity" or raw == str((1 << 64) - 1):
+                return None, True
+            if raw.isdigit():
+                return int(raw), False
+            return None, None
+
+        tasks_current, _tasks_current_unbounded = numeric_property("TasksCurrent")
+        tasks_max, tasks_max_unbounded = numeric_property("TasksMax")
+        memory_current, _memory_current_unbounded = numeric_property("MemoryCurrent")
+        memory_max, memory_max_unbounded = numeric_property("MemoryMax")
+        cpu_quota_per_sec, cpu_quota_unbounded = numeric_property("CPUQuotaPerSecUSec")
+        cpu_accounting_raw = self._show_value(result.get("stdout", ""), "CPUAccounting")
+        cpu_accounting_enabled = (
+            True
+            if cpu_accounting_raw.casefold() in {"yes", "true"}
+            else False
+            if cpu_accounting_raw.casefold() in {"no", "false"}
+            else None
+        )
+        cpu_usage, _cpu_usage_unbounded = numeric_property("CPUUsageNSec")
         result = {
             **result,
+            "active_state": state or None,
             # The writable tmpfs exists only inside the unit's mount namespace.
             # Reporting the old host staging directory as its usage was false
             # evidence, so probe states the accounting boundary explicitly.
             "writable_layer_bytes": None,
             "writable_layer_accounting": "kernel-enforced-tmpfs-cap",
-            "memory_current_bytes": int(memory_current) if memory_current.isdigit() else None,
+            "tasks_current": tasks_current,
+            "tasks_max": tasks_max,
+            "tasks_max_unbounded": tasks_max_unbounded,
+            "memory_current_bytes": memory_current,
+            "memory_max_bytes": memory_max,
+            "memory_max_unbounded": memory_max_unbounded,
+            "cpu_accounting_enabled": cpu_accounting_enabled,
+            # CPUUsageNSec is a cumulative counter, not an instantaneous rate.
+            "cpu_usage_ns": cpu_usage if cpu_accounting_enabled else None,
+            "cpu_quota_per_sec_usec": cpu_quota_per_sec,
+            "cpu_quota_unbounded": cpu_quota_unbounded,
         }
         return present, result
 

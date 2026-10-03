@@ -535,9 +535,21 @@ Inspect or retry cleanup:
 
 ~~~bash
 uv run --extra dev acp environment ATTEMPT_ID
+uv run --extra dev acp runtime-resources ATTEMPT_ID --fresh
+uv run --extra dev acp runtime-resources ATTEMPT_ID --fresh --format text
 uv run --extra dev acp runtime-down ATTEMPT_ID
 uv run --extra dev acp runtime-restart ATTEMPT_ID --recover
 ~~~
+
+<code>runtime-resources</code> normally shows the last persisted lifecycle
+proof. <code>--fresh</code> adds an on-demand, read-only sample for a configured
+Linux namespace runtime, separate from that older proof. It reports cgroup task
+and memory counters/limits, and cumulative CPU time only when systemd accounting
+is available. Missing counters remain <code>null</code>; the sample neither
+changes ACP state nor measures provider tokens, billing, AI-agent count, or
+model work. A task count is a kernel cgroup count, not a count of agents. JSON
+is the default; <code>--format text</code> renders the same sample for operators.
+Unknown or unrecognized active state is reported as unknown, not as absence.
 
 Use <code>--force</code> only to recover a cleanup left in-progress by a crashed
 ACP process. Setup and teardown commands must be idempotent. Prefer trusted

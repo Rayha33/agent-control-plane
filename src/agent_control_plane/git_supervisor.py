@@ -787,6 +787,8 @@ class GitSupervisor(
         only_drivers: set[str] | None = None,
         restart_token: str | None = None,
         restart_guard_fd: int | None = None,
+        persist_evidence: bool = True,
+        read_only: bool = False,
     ) -> list[PhaseEvidence]:
         """Run *phase* for every configured driver.
 
@@ -795,7 +797,28 @@ class GitSupervisor(
         immediately before exec.
         """
 
-        pin = self._verify_attempt_trust(attempt_id)
+        if not persist_evidence and not read_only:
+            raise SupervisorError(
+                "runtime_probe_mode_invalid",
+                "non-persisted driver probes must use the read-only path",
+            )
+        if read_only and (
+            phase != "verify"
+            or persist_evidence
+            or restart_token is not None
+            or restart_guard_fd is not None
+            or only_drivers is None
+        ):
+            raise SupervisorError(
+                "runtime_probe_mode_invalid",
+                "read-only driver probes may only verify without persistence",
+            )
+
+        pin = (
+            self._verify_attempt_trust_read_only(attempt_id)
+            if read_only
+            else self._verify_attempt_trust(attempt_id)
+        )
         stored_rows = self._stored_driver_rows(attempt_id)
         stored_by_name = {row["driver"]: row for row in stored_rows}
         if stored_rows:
@@ -804,10 +827,11 @@ class GitSupervisor(
                     self._driver_definition_from_json(row["definition_json"]) for row in stored_rows
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                self._quarantine_driver_attempt(attempt_id, "runtime_driver_definition_missing")
+                if not read_only:
+                    self._quarantine_driver_attempt(attempt_id, "runtime_driver_definition_missing")
                 raise SupervisorError(
                     "runtime_driver_definition_missing",
-                    "stored driver definition is unavailable; cleanup is quarantined",
+                    "stored driver definition is unavailable",
                 ) from error
         else:
             definitions = self._driver_definitions_for_pin(pin)
@@ -815,14 +839,25 @@ class GitSupervisor(
             definitions = tuple(
                 definition for definition in definitions if definition.name in only_drivers
             )
+        if read_only and any(definition.kind != "namespace_runtime" for definition in definitions):
+            raise SupervisorError(
+                "runtime_probe_mode_invalid",
+                "read-only resource sampling only supports namespace runtime drivers",
+            )
         if not definitions:
             return []
-        registry = CredentialRegistry(self.config.credentials, self.root, self._driver_secret())
+        secret = self._driver_secret_read_only() if read_only else self._driver_secret()
+        registry = CredentialRegistry(self.config.credentials, self.root, secret)
         handles: dict[str, CredentialHandle] = {}
         handle_errors: dict[str, DriverError] = {}
         for definition in definitions:
             credential_name = definition.option("credential")
             if not credential_name:
+                continue
+            if read_only and phase == "verify" and definition.kind == "namespace_runtime":
+                # A cgroup usage probe only asks systemd for its owned unit's
+                # accounting properties; it must never materialize payload
+                # credentials merely to inspect process/resource counters.
                 continue
             stored = stored_by_name.get(definition.name)
             use_stored = stored is not None and not (
@@ -866,6 +901,7 @@ class GitSupervisor(
             phase=phase,
             prior_driver_states=prior_driver_states,
             prior_driver_evidence=prior_driver_evidence,
+            read_only=read_only,
         )
         evidence: list[PhaseEvidence] = []
         definitions_by_name = {definition.name: definition for definition in definitions}
@@ -880,6 +916,8 @@ class GitSupervisor(
             if trusted_owners is not None:
                 execution_options["expected_owners"] = trusted_owners
             execution_options["process_runner"] = self._run_trusted_contained
+            if read_only:
+                execution_options["create_cwd"] = False
             return run_trusted(
                 argv,
                 cwd,
@@ -953,14 +991,15 @@ class GitSupervisor(
                         credential_handle=handles.get(definition.name),
                     )
                 )
-        self._record_driver_evidence(
-            attempt_id,
-            phase,
-            evidence,
-            definitions_by_name,
-            environment=environment,
-            restart_token=restart_token,
-        )
+        if persist_evidence:
+            self._record_driver_evidence(
+                attempt_id,
+                phase,
+                evidence,
+                definitions_by_name,
+                environment=environment,
+                restart_token=restart_token,
+            )
         return evidence
 
     @staticmethod
