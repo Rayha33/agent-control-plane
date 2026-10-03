@@ -338,6 +338,77 @@ def test_v10_read_only_open_requires_completion_receipt_migration(repo: Path) ->
     }
 
 
+def test_v11_read_only_open_requires_result_import_journal_migration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("DROP TABLE result_imports")
+        connection.execute("UPDATE meta SET value = '11' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    before = fingerprint(repo)
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+    assert "version 11" in str(error.value)
+    assert fingerprint(repo) == before
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 11
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with migrated.connect() as connection:
+        migration = dict(MIGRATIONS)[12]
+        migration(connection)
+        migration(connection)
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(result_imports)")}
+    assert {
+        "attempt_id",
+        "claim_token",
+        "worker_pid",
+        "worker_identity",
+        "worker_exit_receipt_json",
+        "result_digest",
+        "tree_sha",
+        "commit_sha",
+        "result_ref",
+        "phase",
+        "submission_id",
+    } <= columns
+
+
+def test_v12_read_only_open_requires_result_object_staging_migration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        for column in (
+            "staging_path",
+            "object_ids_json",
+            "promote_object_ids_json",
+        ):
+            connection.execute(f"ALTER TABLE result_imports DROP COLUMN {column}")
+        connection.execute("UPDATE meta SET value = '12' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    before = fingerprint(repo)
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+    assert "version 12" in str(error.value)
+    assert fingerprint(repo) == before
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 12
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with migrated.connect() as connection:
+        columns = {
+            row["name"]: row for row in connection.execute("PRAGMA table_info(result_imports)")
+        }
+        migration = dict(MIGRATIONS)[13]
+        migration(connection)
+        migration(connection)
+    assert columns["staging_path"]["type"] == "TEXT"
+    assert columns["staging_path"]["notnull"] == 1
+    assert columns["staging_path"]["dflt_value"] == "''"
+    assert columns["object_ids_json"]["dflt_value"] == "'[]'"
+    assert columns["promote_object_ids_json"]["dflt_value"] == "'[]'"
+
+
 def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:
     """A live old process cannot create a new marker-less attempt after upgrade."""
 

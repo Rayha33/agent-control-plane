@@ -271,8 +271,49 @@ an interactive diagnostic, Codex `/status` reports writable roots and `/debug-co
 shows config-layer precedence and managed requirements. Use a noninteractive approval
 policy already appropriate for the job. Do not add `--add-dir`, disable sandboxing, or
 use dangerous bypass flags. ACP worktrees are source isolation, not a general filesystem
-sandbox: keep Codex's own sandbox enabled. Codex Desktop, ordinary local chats, and
-non-Linux `acp run` remain outside this integration.
+sandbox: keep Codex's own sandbox enabled. The writable-root overrides in this legacy
+`workspace-write` recipe constrain writes; they do not establish an independent read
+allowlist. Reads remain governed by Codex's effective sandbox/platform policy, and the
+documented workspace can include temporary directories such as `/tmp`. These overrides
+alone do not prove that the base checkout, sibling worktrees, home, or unrelated projects
+are unreadable. Codex Desktop, ordinary local chats, and non-Linux `acp run` remain
+outside this integration.
+
+### Outer sandbox status
+
+ACP's `namespace_runtime` is a resource driver, not the supervised worker's
+execution boundary. It launches a configured payload in a transient systemd user
+service and mounts the registered worktree read-only at `/workspace`. The supervised
+`run_worker` path instead launches ACP's packaged `worker_trampoline.py` with the
+registered worktree as its current working directory; it does not enter that runtime.
+The bounded no-model probe ran source-generated setup, probe, and teardown commands
+against a synthetic fixture; it did not run an installed ACP supervisor or a registered
+ACP worker. Do not treat the driver's private root, quotas, or a separate attempt
+worktree as proof that a worker cannot read the host.
+
+On Linux, trusted `systemd-run` and `systemctl` calls receive `XDG_RUNTIME_DIR` only
+when `/run/user/<euid>` and its parent directories pass owner and mode checks. Other
+inherited bus variables remain scrubbed from the trusted client invocation. The added
+locator is not included in the resource payload's explicit `--setenv` allow-list (the
+systemd user manager may still provide its own default environment). If the private
+per-user runtime directory is absent or unsafe, the trusted systemd operation fails
+before launch.
+
+The driver's `egress = "deny"` option creates a private network namespace, while
+`egress = "allow"` does not create that namespace or apply destination filtering.
+Neither mode currently provides a provider-connected worker with both model access and
+independently enforced, destination-restricted egress.
+
+Codex App Server's `sandboxPolicy.type = "externalSandbox"` tells Codex to skip its
+own command sandbox because an outer sandbox is already in force. It does not create
+or select an ACP namespace. Do not use this mode for an ACP worker until every
+untrusted command-execution path is routed through a separately enforced boundary.
+An implementation still needs an isolated mutable attempt root, private Git metadata
+and validated result transfer, least-privilege credentials, bounded provider egress,
+and cancellation/recovery tied to the registered worker lifecycle. Until those are
+proven, ACP's supervised Codex integration does not claim OS-enforced read isolation.
+See [Codex App Server](https://learn.chatgpt.com/docs/app-server) and
+[Agent approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security).
 
 Why there is no Codex hook installer yet:
 
@@ -291,6 +332,11 @@ Why there is no Codex hook installer yet:
   defines `sandbox_workspace_write.writable_roots` as extra writable paths;
   [developer settings](https://learn.chatgpt.com/docs/developer-settings) documents
   one-run CLI override precedence and ways to inspect effective roots.
+- [Codex's sandboxing guide](https://learn.chatgpt.com/docs/sandboxing) describes
+  `workspace-write` as allowing reads and edits within the workspace.
+- [Codex's approvals and security guide](https://learn.chatgpt.com/docs/agent-approvals-security)
+  says the workspace can include the current directory and temporary directories such as
+  `/tmp`, and that `/status` reports the workspace directories.
 
 Until the current supported releases pass a disposable live denial/worktree test, do not
 describe Codex PreToolUse hooks as an ACP safety boundary.

@@ -15,6 +15,7 @@ import fcntl
 import hmac
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -636,24 +637,36 @@ class RuntimeMixin:
                         stamp,
                     ),
                 )
+                event_payload = {
+                    "attempt_id": attempt_id,
+                    "driver": item.driver,
+                    "kind": item.kind,
+                    "resource_id": item.resource_id,
+                    "state": state,
+                    "exit_code": item.exit_code,
+                    "present": item.present,
+                    "cleanup_proved": item.proof.get("cleanup_proved"),
+                    "environment_exports": dict(item.environment_exports),
+                    "environment_removed": sorted(allowed_exports.get(item.kind, set()))
+                    if phase == "teardown" and item.proof.get("cleanup_proved")
+                    else [],
+                }
+                observation = item.proof.get("observation")
+                invocation_id = (
+                    observation.get("systemd_unit_invocation_id")
+                    if item.kind == "namespace_runtime" and isinstance(observation, dict)
+                    else None
+                )
+                if isinstance(invocation_id, str) and re.fullmatch(r"[0-9a-f]{32}", invocation_id):
+                    # Preserve this identity in the append-only audit chain: the
+                    # latest resource evidence row is intentionally upserted by
+                    # teardown and can no longer retain setup-only observations.
+                    event_payload["systemd_unit_invocation_id"] = invocation_id
                 self._event(
                     connection,
                     f"runtime.driver.{phase}",
                     "supervisor",
-                    {
-                        "attempt_id": attempt_id,
-                        "driver": item.driver,
-                        "kind": item.kind,
-                        "resource_id": item.resource_id,
-                        "state": state,
-                        "exit_code": item.exit_code,
-                        "present": item.present,
-                        "cleanup_proved": item.proof.get("cleanup_proved"),
-                        "environment_exports": dict(item.environment_exports),
-                        "environment_removed": sorted(allowed_exports.get(item.kind, set()))
-                        if phase == "teardown" and item.proof.get("cleanup_proved")
-                        else [],
-                    },
+                    event_payload,
                 )
             if environment is not None and (exports or removals):
                 connection.execute(

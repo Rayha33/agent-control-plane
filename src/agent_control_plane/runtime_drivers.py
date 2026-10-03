@@ -75,6 +75,37 @@ SENSITIVE_ENV_NAMES = {
 }
 
 
+def _validated_private_runtime_directory(path: Path, owner_uid: int) -> str | None:
+    """Return a private, owner-controlled systemd runtime directory, if safe."""
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != owner_uid
+        or stat.S_IMODE(info.st_mode) & 0o700 != 0o700
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        return None
+    return str(path)
+
+
+def _systemd_user_runtime_directory() -> str | None:
+    """Resolve only the canonical per-UID runtime directory used by systemd."""
+    if not sys.platform.startswith("linux"):
+        return None
+    uid = os.geteuid()
+    for parent in (Path("/run"), Path("/run/user")):
+        try:
+            info = parent.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            return None
+    return _validated_private_runtime_directory(Path(f"/run/user/{uid}"), uid)
+
+
 class DriverError(Exception):
     """Raised for driver configuration and execution faults."""
 
@@ -338,6 +369,25 @@ def run_trusted(
         )
     expected = _validate_trusted_path(executable, expected_owners)
 
+    safe_env = {
+        "PATH": TRUSTED_DRIVER_PATH,
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    if sys.platform.startswith("linux") and requested_executable.name in {
+        "systemd-run",
+        "systemctl",
+    }:
+        runtime_directory = _systemd_user_runtime_directory()
+        if runtime_directory is None:
+            raise DriverError(
+                "systemd_user_runtime_unavailable",
+                "trusted systemd command needs a private /run/user/<uid> directory",
+            )
+        # The user bus locator is needed by trusted systemd clients but must not
+        # be inherited by the payload launched through NamespaceRuntimeDriver.
+        safe_env["XDG_RUNTIME_DIR"] = runtime_directory
+
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         executable_fd = os.open(executable, flags)
@@ -350,11 +400,6 @@ def run_trusted(
         os.close(executable_fd)
         raise DriverError("untrusted_driver", "driver executable changed while it was being opened")
 
-    safe_env = {
-        "PATH": TRUSTED_DRIVER_PATH,
-        "LANG": "C",
-        "LC_ALL": "C",
-    }
     for name, value in env.items():
         if name != "ACP_RUNNER_CREDENTIAL" and (
             name.startswith("ACP_") or name in SENSITIVE_ENV_NAMES
@@ -489,6 +534,10 @@ class ResourceDriver:
     def teardown(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         raise NotImplementedError
 
+    def cleanup_is_proven(self, present: bool | None, observation: dict[str, Any]) -> bool:
+        """Whether a successful probe positively proves that the resource is gone."""
+        return present is False and observation.get("exit_code", 0) == 0
+
     # -- shared ------------------------------------------------------------
     def _env(self, context: DriverContext) -> dict[str, str]:
         env = {
@@ -571,17 +620,18 @@ class ResourceDriver:
 
         result = self.teardown(context, runner)
         present, observation = self.probe(context, runner)
+        cleanup_proved = self.cleanup_is_proven(present, observation)
         proof: dict[str, Any] = {
             "action": result,
             "observation": observation,
-            "cleanup_proved": present is False and observation.get("exit_code", 0) == 0,
+            "cleanup_proved": cleanup_proved,
         }
         # THE central rule: exit code 0 is not cleanup. Absence is cleanup.
         if present:
             proof["error"] = "teardown reported success but resource is still present"
-        exit_code = result.get("exit_code", 0)
-        if exit_code == 0 and not proof["cleanup_proved"]:
-            exit_code = 1
+        elif not cleanup_proved:
+            proof["error"] = "resource absence is not positively proved"
+        exit_code = 0 if proof["cleanup_proved"] else result.get("exit_code", 0) or 1
         return PhaseEvidence(
             driver=self.definition.name,
             kind=self.kind,
@@ -1602,6 +1652,7 @@ class NamespaceRuntimeDriver(ResourceDriver):
             self._unit(context),
             "--property=LoadState",
             "--property=ActiveState",
+            "--property=InvocationID",
             "--property=Result",
             "--property=ExecMainStatus",
             "--property=TasksMax",
@@ -1640,6 +1691,15 @@ class NamespaceRuntimeDriver(ResourceDriver):
             }
         state = self._show_value(result.get("stdout", ""), "ActiveState")
         present = state in {"active", "activating", "deactivating", "reloading"}
+        raw_invocation_id = (
+            self._show_value(result.get("stdout", ""), "InvocationID").strip().casefold()
+        )
+        # systemd invocation IDs are 128-bit IDs rendered as 32 hexadecimal
+        # characters. Treat absent/unsupported/malformed values as unavailable;
+        # callers that need this identity for fencing must fail closed.
+        invocation_id = (
+            raw_invocation_id if re.fullmatch(r"[0-9a-f]{32}", raw_invocation_id) else None
+        )
         finding = self._quota_finding(result.get("stdout", ""))
         if finding:
             result = {**result, "quota_violation": finding}
@@ -1669,6 +1729,7 @@ class NamespaceRuntimeDriver(ResourceDriver):
         result = {
             **result,
             "active_state": state or None,
+            "systemd_unit_invocation_id": invocation_id,
             # The writable tmpfs exists only inside the unit's mount namespace.
             # Reporting the old host staging directory as its usage was false
             # evidence, so probe states the accounting boundary explicitly.
@@ -1687,6 +1748,12 @@ class NamespaceRuntimeDriver(ResourceDriver):
             "cpu_quota_unbounded": cpu_quota_unbounded,
         }
         return present, result
+
+    def cleanup_is_proven(self, present: bool | None, observation: dict[str, Any]) -> bool:
+        return (
+            super().cleanup_is_proven(present, observation)
+            and observation.get("absence_proved_by") == "systemd-unit-not-found"
+        )
 
     def teardown(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         stop = runner(

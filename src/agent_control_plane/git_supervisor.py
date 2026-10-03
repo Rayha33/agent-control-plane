@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 13
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -357,6 +357,56 @@ def _add_submission_result_manifest(connection: sqlite3.Connection) -> None:
         )
 
 
+def _add_result_import_journal(connection: sqlite3.Connection) -> None:
+    """Persist a claim-fenced write-ahead record for host-validated worker results."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS result_imports (
+          id TEXT PRIMARY KEY,
+          attempt_id TEXT NOT NULL REFERENCES attempts(id),
+          claim_token INTEGER NOT NULL,
+          worker_pid INTEGER NOT NULL,
+          worker_identity TEXT NOT NULL,
+          worker_exit_receipt_json TEXT NOT NULL,
+          base_sha TEXT NOT NULL,
+          tree_sha TEXT NOT NULL,
+          baseline_digest TEXT NOT NULL,
+          result_digest TEXT NOT NULL,
+          change_digest TEXT NOT NULL,
+          result_ref TEXT NOT NULL UNIQUE,
+          commit_timestamp INTEGER NOT NULL,
+          commit_sha TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN (
+            'prepared', 'ref_published', 'submitted', 'ambiguous'
+          )),
+          submission_id TEXT REFERENCES submissions(id),
+          error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(attempt_id, claim_token, result_digest)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_result_imports_submission ON result_imports(submission_id)"
+    )
+
+
+def _add_result_import_object_staging(connection: sqlite3.Connection) -> None:
+    """Bind private staged object provenance to each prepared result import."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(result_imports)")}
+    additions = (
+        ("staging_path", "TEXT NOT NULL DEFAULT ''"),
+        ("object_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("promote_object_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE result_imports ADD COLUMN {name} {definition}")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -368,6 +418,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     (9, _add_read_dependency_snapshots),
     (10, _add_qc_acceptance_coverage),
     (11, _add_submission_result_manifest),
+    (12, _add_result_import_journal),
+    (13, _add_result_import_object_staging),
 )
 
 
@@ -470,6 +522,7 @@ class GitSupervisor(
         (self.state_dir / "worktrees").mkdir(exist_ok=True)
         (self.state_dir / "logs").mkdir(exist_ok=True)
         (self.state_dir / "runtime").mkdir(exist_ok=True)
+        (self.state_dir / "result-import-staging").mkdir(mode=0o700, exist_ok=True)
         with self.connect() as connection:
             # Read the stamp before the first CREATE/ALTER. Checking afterwards would be
             # checking a database this binary had already written to.
