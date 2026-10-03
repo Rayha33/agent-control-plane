@@ -25,6 +25,7 @@ from agent_control_plane.editor_hooks import (
     path_from_hook_payload,
 )
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.supervisor import claims as claims_module
 
 
 @pytest.fixture
@@ -50,6 +51,35 @@ def test_a_declared_path_is_allowed(claimed) -> None:
     assert absolute["allow"] is True
     assert relative["allow"] is True
     assert relative["relative_path"] == "alpha.txt"
+
+
+def test_claim_snapshot_ignores_unrelated_parent_directory_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "snapshot-parent"
+    parent.mkdir()
+    repo_path = parent / "repo"
+    repo_path.mkdir()
+    repo = init_repo(repo_path)
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    original_open = claims_module.os.open
+    sibling_created = False
+
+    def open_with_sibling_creation(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal sibling_created
+        if path == "snapshot-parent" and kwargs.get("dir_fd") is not None and not sibling_created:
+            (parent / "unrelated-sibling").mkdir()
+            sibling_created = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(claims_module.os, "open", open_with_sibling_creation)
+
+    attempt = supervisor.claim(created["id"], "worker")
+
+    assert sibling_created
+    assert attempt["id"]
+    assert (repo / "alpha.txt").read_text(encoding="utf-8") == "base\n"
 
 
 def test_an_undeclared_path_in_the_worktree_is_denied(claimed) -> None:

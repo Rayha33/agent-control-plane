@@ -1404,7 +1404,14 @@ class ClaimsMixin:
             f"cannot safely fingerprint base checkout path {display}",
         )
 
-    def _open_snapshot_directory(self, parent_fd: int, name: str, display: bytes) -> int:
+    def _open_snapshot_directory(
+        self,
+        parent_fd: int,
+        name: str,
+        display: bytes,
+        *,
+        within_snapshot_root: bool = True,
+    ) -> int:
         descriptor = -1
         try:
             before_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1427,16 +1434,17 @@ class ClaimsMixin:
             if descriptor >= 0:
                 os.close(descriptor)
             raise self._snapshot_path_error(display) from None
-        if self._stat_identity(before_path) != self._stat_identity(opened) or self._stat_identity(
-            opened
-        ) != self._stat_identity(after_path):
+        identity = (
+            self._stat_identity if within_snapshot_root else self._snapshot_directory_identity
+        )
+        if identity(before_path) != identity(opened) or identity(opened) != identity(after_path):
             os.close(descriptor)
             raise self._snapshot_path_error(display)
         return descriptor
 
     def _open_snapshot_root(
         self, root_real: Path, display: bytes
-    ) -> tuple[int, list[int], list[tuple[int, str, int]]]:
+    ) -> tuple[int, list[int], list[tuple[int, str, int, bool]]]:
         if not root_real.is_absolute():
             raise self._snapshot_path_error(display)
         flags = (
@@ -1450,13 +1458,20 @@ class ClaimsMixin:
         except (OSError, RuntimeError, TypeError, ValueError):
             raise self._snapshot_path_error(display) from None
         descriptors = [descriptor]
-        directories: list[tuple[int, str, int]] = []
+        directories: list[tuple[int, str, int, bool]] = []
         try:
-            for component in root_real.parts[1:]:
+            components = root_real.parts[1:]
+            for index, component in enumerate(components):
+                within_snapshot_root = index == len(components) - 1
                 parent_fd = descriptors[-1]
-                child_fd = self._open_snapshot_directory(parent_fd, component, display)
+                child_fd = self._open_snapshot_directory(
+                    parent_fd,
+                    component,
+                    display,
+                    within_snapshot_root=within_snapshot_root,
+                )
                 descriptors.append(child_fd)
-                directories.append((parent_fd, component, child_fd))
+                directories.append((parent_fd, component, child_fd, within_snapshot_root))
         except Exception:
             for opened_fd in reversed(descriptors):
                 os.close(opened_fd)
@@ -1464,13 +1479,18 @@ class ClaimsMixin:
         return descriptors[-1], descriptors, directories
 
     def _verify_snapshot_directories(
-        self, directories: list[tuple[int, str, int]], display: bytes
+        self, directories: list[tuple[int, str, int, bool]], display: bytes
     ) -> None:
         try:
-            for parent_fd, name, child_fd in directories:
+            for parent_fd, name, child_fd, within_snapshot_root in directories:
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 opened = os.fstat(child_fd)
-                if self._stat_identity(current) != self._stat_identity(opened):
+                identity = (
+                    self._stat_identity
+                    if within_snapshot_root
+                    else self._snapshot_directory_identity
+                )
+                if identity(current) != identity(opened):
                     raise self._snapshot_path_error(display)
         except SupervisorError:
             raise
@@ -1496,7 +1516,7 @@ class ClaimsMixin:
                 parent_fd = descriptors[-1]
                 child_fd = self._open_snapshot_directory(parent_fd, component, display)
                 descriptors.append(child_fd)
-                directories.append((parent_fd, component, child_fd))
+                directories.append((parent_fd, component, child_fd, True))
             parent_fd = descriptors[-1]
             leaf = decoded[-1]
             before_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
@@ -1564,7 +1584,7 @@ class ClaimsMixin:
             if stat.S_ISDIR(before_path.st_mode):
                 child_fd = self._open_snapshot_directory(parent_fd, leaf, display)
                 descriptors.append(child_fd)
-                directories.append((parent_fd, leaf, child_fd))
+                directories.append((parent_fd, leaf, child_fd, True))
                 self._verify_snapshot_directories(directories, display)
                 metadata = os.fstat(child_fd)
                 return {"kind": "directory", "mode": stat.S_IMODE(metadata.st_mode)}
@@ -1582,6 +1602,25 @@ class ClaimsMixin:
             metadata.st_size,
             metadata.st_mtime_ns,
             metadata.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _snapshot_directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+        """Identity of a path-prefix directory outside the checkout snapshot.
+
+        Sibling worktrees and concurrent tests routinely create entries beneath
+        shared temporary-directory ancestors. That changes directory size and
+        timestamps without replacing the path component. Compare stable object
+        and access-control identity there; retain full metadata checks from the
+        checkout root downward, where entry changes can race the snapshot.
+        """
+
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
         )
 
     def _snapshot_checkout_repository(
