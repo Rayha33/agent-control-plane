@@ -273,6 +273,108 @@ def test_run_trusted_scrubs_inherited_path_and_loader_environment(tmp_path: Path
     assert not marker.exists()
 
 
+def test_validated_private_runtime_directory_rejects_unsafe_paths(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+
+    assert runtime_driver_module._validated_private_runtime_directory(runtime, os.geteuid()) == str(
+        runtime
+    )
+    assert runtime_driver_module._validated_private_runtime_directory(runtime, -1) is None
+
+    runtime.chmod(0o750)
+    assert runtime_driver_module._validated_private_runtime_directory(runtime, os.geteuid()) is None
+
+    alias = tmp_path / "runtime-alias"
+    alias.symlink_to(runtime)
+    assert runtime_driver_module._validated_private_runtime_directory(alias, os.geteuid()) is None
+
+
+def test_run_trusted_passes_only_validated_systemd_runtime_locator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    monkeypatch.setattr(runtime_driver_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "_systemd_user_runtime_directory",
+        lambda: str(runtime),
+    )
+    systemd_run = tmp_path / "systemd-run"
+    systemd_run.symlink_to(Path("/bin/sh").resolve())
+    captured: dict[str, object] = {}
+
+    def contained_runner(
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        timeout: int,
+        command_fds: tuple[int, ...],
+        lifecycle_fds: tuple[int, ...],
+    ) -> dict[str, object]:
+        captured["env"] = env
+        captured["argv"] = argv
+        captured["fds"] = command_fds
+        captured["lifecycle_fds"] = lifecycle_fds
+        return {
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 0,
+            "timed_out": False,
+        }
+
+    result = run_trusted(
+        [str(systemd_run), "--user"],
+        tmp_path / "wd",
+        {
+            "XDG_RUNTIME_DIR": "/attacker/selected/runtime",
+            "DBUS_SESSION_BUS_ADDRESS": "must-not-forward",
+            "ACP_ATTEMPT_ID": "attempt-1",
+        },
+        process_runner=contained_runner,
+    )
+
+    assert result["exit_code"] == 0
+    assert captured["env"]["XDG_RUNTIME_DIR"] == str(runtime)  # type: ignore[index]
+    assert "DBUS_SESSION_BUS_ADDRESS" not in captured["env"]  # type: ignore[operator]
+    assert captured["env"]["ACP_ATTEMPT_ID"] == "attempt-1"  # type: ignore[index]
+
+
+def test_run_trusted_fails_closed_without_private_systemd_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime_driver_module.sys, "platform", "linux")
+    monkeypatch.setattr(runtime_driver_module, "_systemd_user_runtime_directory", lambda: None)
+    systemd_run = tmp_path / "systemd-run"
+    systemd_run.symlink_to(Path("/bin/sh").resolve())
+    called = False
+
+    def runner(*_args: object) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 0}
+
+    fd_directory = Path("/proc/self/fd")
+    if not fd_directory.is_dir():
+        fd_directory = Path("/dev/fd")
+    before_fds = set(os.listdir(fd_directory))
+    with pytest.raises(DriverError) as error:
+        run_trusted(
+            [str(systemd_run), "--user"],
+            tmp_path / "wd",
+            {},
+            process_runner=runner,
+        )
+
+    assert error.value.code == "systemd_user_runtime_unavailable"
+    assert called is False
+    assert set(os.listdir(fd_directory)) == before_fds
+
+
 def test_run_trusted_redacts_secret_environment_from_evidence(tmp_path: Path) -> None:
     secret = "postgresql://user:literal-password@localhost/app"
     result = run_trusted(
@@ -2416,6 +2518,14 @@ def test_namespace_runtime_unloaded_transient_unit_is_positive_absence_proof(
                 "stdout": "",
                 "stderr": f"Failed to get properties: Unit {unit} could not be found.\n",
             }
+        if "stop" in argv:
+            unit = next(item for item in argv if item.endswith(".service"))
+            return {
+                "argv": list(argv),
+                "exit_code": 5,
+                "stdout": "",
+                "stderr": f"Failed to stop {unit}: unit not loaded.\n",
+            }
         return {"argv": list(argv), "exit_code": 0, "stdout": "", "stderr": ""}
 
     evidence = driver.run_phase("teardown", context(tmp_path), runner)
@@ -2423,6 +2533,7 @@ def test_namespace_runtime_unloaded_transient_unit_is_positive_absence_proof(
     assert evidence.exit_code == 0
     assert evidence.present is False
     assert evidence.proof["cleanup_proved"] is True
+    assert evidence.proof["action"]["exit_code"] == 5
     observation = evidence.proof["observation"]
     assert observation["exit_code"] == 0
     assert observation["original_exit_code"] == 1
@@ -2462,6 +2573,32 @@ def test_namespace_runtime_teardown_absence_is_the_cleanup_criterion(tmp_path: P
     assert evidence.present is True
     assert evidence.proof["cleanup_proved"] is False
     assert not evidence.ok
+
+
+def test_namespace_runtime_teardown_does_not_accept_a_loaded_failed_unit(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver()
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        if "show" in argv:
+            return {
+                "argv": list(argv),
+                "exit_code": 0,
+                "stdout": "LoadState=loaded\nActiveState=failed\nResult=exit-code\n",
+                "stderr": "",
+            }
+        if "reset-failed" in argv:
+            return {"argv": list(argv), "exit_code": 1, "stdout": "", "stderr": "failed"}
+        return {"argv": list(argv), "exit_code": 0, "stdout": "", "stderr": ""}
+
+    evidence = driver.run_phase("teardown", context(tmp_path), runner)
+
+    assert evidence.present is False
+    assert evidence.proof["cleanup_proved"] is False
+    assert evidence.proof["error"] == "resource absence is not positively proved"
+    assert evidence.proof["action"]["reset_failed"]["exit_code"] == 1
+    assert evidence.exit_code != 0
 
 
 def test_namespace_runtime_resource_id_is_deterministic_and_sanitized(tmp_path: Path) -> None:
@@ -2706,3 +2843,4 @@ def test_namespace_runtime_exports_only_sandbox_paths_to_the_service(tmp_path: P
     assert "--setenv=ACP_REPO_ROOT=/workspace" in argv
     assert "--setenv=ACP_RUNTIME_DIR=/work" in argv
     assert "--setenv=ACP_READ_ONLY_0=/readonly/0" in argv
+    assert not any(arg.startswith("--setenv=XDG_RUNTIME_DIR=") for arg in argv)
