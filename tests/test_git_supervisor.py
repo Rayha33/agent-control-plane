@@ -128,6 +128,13 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture
+def result_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep imported worker snapshots outside the base checkout under test."""
+
+    return tmp_path_factory.mktemp("worker-result")
+
+
 def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change") -> dict:
     return supervisor.create_task(
         title,
@@ -172,14 +179,14 @@ def _result_bundle(attempt: dict, output_root: Path):
 @pytest.mark.parametrize("invalid_token", [True, 1.0, 0, -1])
 def test_import_worker_result_rejects_invalid_claim_token_before_git_writes(
     repo: Path,
-    tmp_path: Path,
+    result_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     invalid_token: int | float | bool,
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "reject malformed result import token")
     attempt = supervisor.claim(created["id"], "worker")
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
 
     def unexpected_build(*args, **kwargs):
         pytest.fail("invalid claim token reached Git candidate construction")
@@ -915,7 +922,7 @@ def test_submit_accepts_an_unchanged_dirty_base_checkout(repo: Path) -> None:
 
 @requires_linux_worker
 def test_import_worker_result_submits_immutable_host_commit_without_checkout_mutation(
-    repo: Path, tmp_path: Path
+    repo: Path, result_root: Path
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "sandbox result import")
@@ -926,7 +933,7 @@ def test_import_worker_result_submits_immutable_host_commit_without_checkout_mut
     host_status = git(repo, "status", "--porcelain=v1", "-z")
     host_index = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     host_index_before = host_index.read_bytes()
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
     _record_test_worker_exit(supervisor, attempt["id"])
 
     submission = supervisor.import_worker_result(
@@ -973,12 +980,12 @@ def test_import_worker_result_submits_immutable_host_commit_without_checkout_mut
 
 @requires_linux_worker
 def test_result_import_recovery_refuses_noncanonical_journal_ref(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "reject corrupt result ref journal")
     attempt = supervisor.claim(created["id"], "worker")
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
     _record_test_worker_exit(supervisor, attempt["id"])
 
     def stop_before_submit(*args, **kwargs):
@@ -1015,12 +1022,12 @@ def test_result_import_recovery_refuses_noncanonical_journal_ref(
 
 @requires_linux_worker
 def test_result_import_recovery_refuses_corrupted_worker_identity(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "reject corrupt worker identity")
     attempt = supervisor.claim(created["id"], "worker")
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
     _record_test_worker_exit(supervisor, attempt["id"])
     with supervisor.connect() as connection:
         worker_identity = connection.execute(
@@ -1062,12 +1069,12 @@ def test_result_import_recovery_refuses_corrupted_worker_identity(
 
 @requires_linux_worker
 def test_result_import_recovery_checks_base_checkout_audit_chain(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "reject damaged audit chain")
     attempt = supervisor.claim(created["id"], "worker")
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
     _record_test_worker_exit(supervisor, attempt["id"])
 
     def stop_before_submit(*args, **kwargs):
@@ -1104,12 +1111,12 @@ def test_result_import_recovery_checks_base_checkout_audit_chain(
 
 @requires_linux_worker
 def test_result_import_recovers_exact_ref_after_crash_before_journal_phase_commit(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "recover result import")
     attempt = supervisor.claim(created["id"], "worker")
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
     _record_test_worker_exit(supervisor, attempt["id"])
     publish = claims_module.publish_candidate_ref
 
@@ -1142,12 +1149,12 @@ def test_result_import_recovers_exact_ref_after_crash_before_journal_phase_commi
 
 @requires_linux_worker
 def test_result_import_recovery_is_idempotent_under_concurrent_submit(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "concurrent result recovery")
     attempt = supervisor.claim(created["id"], "worker")
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
     _record_test_worker_exit(supervisor, attempt["id"])
     original_submit = supervisor._submit
 
@@ -1195,12 +1202,12 @@ def test_result_import_recovery_is_idempotent_under_concurrent_submit(
 
 @requires_linux_worker
 def test_result_import_never_replays_after_claim_fence_changes(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt", "fence stale result import")
     attempt = supervisor.claim(created["id"], "worker")
-    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
     _record_test_worker_exit(supervisor, attempt["id"])
     original_submit = supervisor._submit
 
