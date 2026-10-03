@@ -13,13 +13,15 @@ record binds the attempt ID, claim token, worker PID plus kernel start identity,
 successful supervisor `Popen.wait` audit receipt, base/tree and result digests.
 It does not use the namespace runtime's systemd unit ID as worker identity.
 Recovery adopts only the exact journaled commit/ref; a stale claim, missing
-object, or conflicting ref remains fenced as ambiguous. Result refs are retained
-pending a separate retention/cleanup policy. Candidate blobs and trees are
-written before the prepared journal row, so a stop during tree construction can
-leave unreachable Git objects; ACP does not currently prune those objects,
-though content-addressed retries reuse identical objects. End-to-end worker
-isolation proof remains incomplete. This record does not authorize
-`externalSandbox` for ACP workers.
+object, or conflicting ref remains fenced as ambiguous. Candidate objects are
+constructed in bounded per-import private object stores; the prepared journal
+commits before ACP promotes exact object IDs into the common repository store.
+Unjournaled private stages and ambiguous promotions have scoped reconciliation;
+committed result refs remain retained pending a separate retention policy, and
+ACP does not run repository-wide GC. See
+[`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
+retention, and cleanup contract. End-to-end worker isolation proof remains
+incomplete. This record does not authorize `externalSandbox` for ACP workers.
 
 The namespace runtime probe records a validated
 `systemd_unit_invocation_id` in its runtime-driver evidence and append-only
@@ -72,6 +74,40 @@ Codex App Server `externalSandbox` is a delegation mode: Codex skips its own
 command sandbox. It is safe only after ACP has proved that every untrusted
 command path is already inside the outer boundary. It creates no namespace,
 mount policy, network filter, or worker lifecycle control by itself.
+
+### Provider and executor boundary
+
+The current official Codex integration paths are distinct and neither proves
+ACP's worker boundary:
+
+- App Server is the rich-client protocol; its `command/exec` runs under the
+  server's sandbox, while `externalSandbox` tells Codex to skip that command
+  sandbox because an outer boundary is already in force. If ACP uses App Server
+  later, its process still has to run inside the independently enforced
+  per-attempt sandbox. Keep its control transport local (stdio or Unix socket);
+  the documented WebSocket listener is experimental and unsupported for
+  production. See [Codex App Server](https://learn.chatgpt.com/docs/app-server).
+- The Agents API self-hosted-environment path instead keeps OpenAI's harness
+  outside and runs `codex exec-server` in the supplied environment. The
+  executor receives a separate environment key as `CODEX_API_KEY`; generated
+  code can read that key, but it can only connect environments, while the
+  application's API key stays outside. This is a useful least-privilege
+  reference, not a drop-in replacement for ACP's current local CLI worker: it
+  changes the harness/protocol and requires the Agents API. See [Self-hosted
+  sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted).
+- Running a command with Codex's sandbox bypass inside a container is only as
+  safe as the container mounts and credentials. OpenAI's security guide warns
+  that untrusted code can exfiltrate credentials available inside the
+  container. Do not mount a user's home or Codex authentication state as a
+  shortcut; the future provider adapter needs a separately scoped credential
+  or trusted credential broker plus enforced egress. See [Agent approvals &
+  security](https://learn.chatgpt.com/docs/agent-approvals-security).
+
+The architecture choice remains a provider-neutral `SandboxedWorkerExecutor`
+owned by ACP, separate from `NamespaceRuntimeDriver`'s resource lifecycle. The
+first OS-boundary proof should use a registered no-model fake worker; each
+provider adapter must then prove its own auth and egress contract before launch
+is enabled. No provider adapter or `externalSandbox` opt-in is selected yet.
 
 ## Threat model
 
