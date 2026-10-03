@@ -1,7 +1,9 @@
 # Per-attempt worker sandbox decision
 
-**Status:** proposed architecture; implementation and end-to-end proof are not
-complete. This record does not authorize `externalSandbox` for ACP workers.
+**Status:** proposed end-to-end architecture. Standalone bounded snapshot and
+change-set primitives are implemented, but they are not integrated into a
+worker executor or registered-worktree import. End-to-end proof remains
+incomplete. This record does not authorize `externalSandbox` for ACP workers.
 
 ## Decision
 
