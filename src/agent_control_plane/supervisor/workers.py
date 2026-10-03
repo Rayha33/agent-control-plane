@@ -26,6 +26,24 @@ from typing import Any
 from ..worker_trampoline import LIFECYCLE_FDS_PREFIX, MONITOR_MODE
 from .common import SupervisorError, utc_now
 
+_MAX_WORKER_LOG_BYTES = 8 * 1024 * 1024
+_WORKER_LOG_TRUNCATION_MARKER = b"\n[ACP worker output truncated at 8 MiB]\n"
+_WORKER_OUTPUT_CHUNK_BYTES = 64 * 1024
+
+
+def _read_worker_output_chunk(
+    output_fd: int, log: Any, remaining_bytes: int
+) -> tuple[int, bool, bool]:
+    """Drain one pipe chunk, retaining only the bounded prefix in the host log."""
+
+    chunk = os.read(output_fd, _WORKER_OUTPUT_CHUNK_BYTES)
+    if not chunk:
+        return 0, False, True
+    retained = chunk[:remaining_bytes]
+    written = log.write(retained) if retained else 0
+    written = written or 0
+    return written, written < len(chunk), False
+
 
 class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
@@ -68,6 +86,13 @@ class WorkersMixin:
             target_write = -1
             start_read = -1
             start_write = -1
+            output_fd: int | None = None
+            output_open = False
+            output_bytes_written = 0
+            output_truncated = False
+            log_bytes_existing = os.fstat(log.fileno()).st_size
+            log_bytes_available = max(0, _MAX_WORKER_LOG_BYTES - log_bytes_existing)
+            output_bytes_budget = max(0, log_bytes_available - len(_WORKER_LOG_TRUNCATION_MARKER))
             launch_reserved = False
             try:
                 handshake_read, handshake_write = os.pipe()
@@ -90,12 +115,18 @@ class WorkersMixin:
                     ],
                     cwd=attempt["worktree"],
                     stdin=subprocess.DEVNULL,
-                    stdout=log,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     pass_fds=(handshake_read, target_write, start_read),
                     env=worker_env,
                 )
+                if process.stdout is None:
+                    raise SupervisorError(
+                        "worker_output_unavailable", "worker output pipe was not created"
+                    )
+                output_fd = process.stdout.fileno()
+                output_open = True
                 process_identity = self._process_identity(process.pid)
                 if process_identity is None:
                     raise SupervisorError(
@@ -227,17 +258,53 @@ class WorkersMixin:
                 os.close(start_write)
                 start_write = -1
                 interval = max(2, min(10, self.config.lease_seconds // 3))
-                while True:
-                    try:
-                        process.wait(timeout=interval)
-                        break
-                    except subprocess.TimeoutExpired:
+                heartbeat_at = time.monotonic() + interval
+                while process.poll() is None:
+                    timeout = max(0.0, min(0.1, heartbeat_at - time.monotonic()))
+                    readable, _, _ = select.select(
+                        [output_fd] if output_open and output_fd is not None else [],
+                        [],
+                        [],
+                        timeout,
+                    )
+                    if readable and output_fd is not None:
+                        written, truncated, eof = _read_worker_output_chunk(
+                            output_fd,
+                            log,
+                            output_bytes_budget - output_bytes_written,
+                        )
+                        output_bytes_written += written
+                        output_truncated = output_truncated or truncated
+                        output_open = output_open and not eof
+                    if time.monotonic() >= heartbeat_at:
                         self.heartbeat(
                             attempt_id,
                             claim_token,
                             None,
                             credential=credential,
                         )
+                        heartbeat_at = time.monotonic() + interval
+                process.wait()
+                # Collect any bytes already buffered when the monitor exited,
+                # but do not wait for an escaped writer to close the pipe.
+                drain_until = time.monotonic() + 0.25
+                while output_open and output_fd is not None and time.monotonic() < drain_until:
+                    readable, _, _ = select.select([output_fd], [], [], 0)
+                    if not readable:
+                        break
+                    written, truncated, eof = _read_worker_output_chunk(
+                        output_fd,
+                        log,
+                        output_bytes_budget - output_bytes_written,
+                    )
+                    output_bytes_written += written
+                    output_truncated = output_truncated or truncated
+                    output_open = output_open and not eof
+                if output_truncated and log_bytes_available >= len(_WORKER_LOG_TRUNCATION_MARKER):
+                    log.write(_WORKER_LOG_TRUNCATION_MARKER)
+                log.flush()
+                if process.stdout is not None:
+                    process.stdout.close()
             except BaseException:
                 for descriptor in (
                     handshake_read,
@@ -251,6 +318,8 @@ class WorkersMixin:
                         os.close(descriptor)
                 if process is not None:
                     self._stop_kernel_monitor(process)
+                    if process.stdout is not None:
+                        process.stdout.close()
                 if launch_reserved:
                     self._clear_worker_registration(
                         attempt_id,

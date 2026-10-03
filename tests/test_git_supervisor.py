@@ -5624,3 +5624,47 @@ def test_trust_pin_invalidated_during_qc_cannot_record_approval(repo: Path) -> N
             "SELECT COUNT(*) FROM qc_runs WHERE submission_id = ?", (submission["id"],)
         ).fetchone()[0]
     assert count == 0
+
+
+@requires_linux_worker
+def test_worker_output_uses_pipe_and_host_log_capture_is_bounded(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    log_path = Path(supervisor.state_dir) / "logs" / f"worker-{attempt['id']}.log"
+    command = f"""
+import os
+import pathlib
+import subprocess
+import sys
+
+stdout_target = os.readlink('/proc/self/fd/1')
+log_path = {str(log_path)!r}
+log_fd_present = False
+for descriptor in os.listdir('/proc/self/fd'):
+    try:
+        log_fd_present = log_fd_present or os.readlink(f'/proc/self/fd/{{descriptor}}') == log_path
+    except OSError:
+        pass
+pathlib.Path('alpha.txt').write_text(stdout_target + '\\n' + ('host-log-fd-present' if log_fd_present else 'host-log-fd-absent'))
+subprocess.run(['git', 'add', 'alpha.txt'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.run(['git', 'commit', '-m', 'bounded worker output'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+sys.stdout.buffer.write(stdout_target.encode() + b'\\nvisible-prefix\\n')
+for _ in range(9):
+    sys.stdout.buffer.write(b'x' * (1024 * 1024))
+sys.stdout.flush()
+"""
+
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
+
+    assert submission["status"] == "pending_qc"
+    worker_metadata = git(Path(attempt["worktree"]), "show", "HEAD:alpha.txt")
+    assert "pipe:[" in worker_metadata
+    assert "host-log-fd-absent" in worker_metadata
+    log = log_path.read_bytes()
+    assert log.startswith(b"pipe:[")
+    assert b"visible-prefix\n" in log
+    assert b"[ACP worker output truncated at 8 MiB]" in log
+    assert len(log) <= 8 * 1024 * 1024
