@@ -271,8 +271,13 @@ an interactive diagnostic, Codex `/status` reports writable roots and `/debug-co
 shows config-layer precedence and managed requirements. Use a noninteractive approval
 policy already appropriate for the job. Do not add `--add-dir`, disable sandboxing, or
 use dangerous bypass flags. ACP worktrees are source isolation, not a general filesystem
-sandbox: keep Codex's own sandbox enabled. Codex Desktop, ordinary local chats, and
-non-Linux `acp run` remain outside this integration.
+sandbox: keep Codex's own sandbox enabled. The writable-root overrides in this legacy
+`workspace-write` recipe constrain writes; they do not establish an independent read
+allowlist. Reads remain governed by Codex's effective sandbox/platform policy, and the
+documented workspace can include temporary directories such as `/tmp`. These overrides
+alone do not prove that the base checkout, sibling worktrees, home, or unrelated projects
+are unreadable. Codex Desktop, ordinary local chats, and non-Linux `acp run` remain
+outside this integration.
 
 Why there is no Codex hook installer yet:
 
@@ -291,6 +296,11 @@ Why there is no Codex hook installer yet:
   defines `sandbox_workspace_write.writable_roots` as extra writable paths;
   [developer settings](https://learn.chatgpt.com/docs/developer-settings) documents
   one-run CLI override precedence and ways to inspect effective roots.
+- [Codex's sandboxing guide](https://learn.chatgpt.com/docs/sandboxing) describes
+  `workspace-write` as allowing reads and edits within the workspace.
+- [Codex's approvals and security guide](https://learn.chatgpt.com/docs/agent-approvals-security)
+  says the workspace can include the current directory and temporary directories such as
+  `/tmp`, and that `/status` reports the workspace directories.
 
 Until the current supported releases pass a disposable live denial/worktree test, do not
 describe Codex PreToolUse hooks as an ACP safety boundary.
