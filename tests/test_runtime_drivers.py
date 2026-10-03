@@ -2072,7 +2072,8 @@ def recording_runner(stdout_for: dict[str, str] | None = None):
 TRUSTED_BIN = "/bin/sh"
 
 ACTIVE_SHOW = (
-    "ActiveState=active\nResult=success\nExecMainStatus=0\nTasksMax=16\nTasksCurrent=5\n"
+    "ActiveState=active\nInvocationID=0123456789abcdef0123456789abcdef\n"
+    "Result=success\nExecMainStatus=0\nTasksMax=16\nTasksCurrent=5\n"
     "MemoryMax=67108864\nMemoryCurrent=3145728\nCPUAccounting=yes\n"
     "CPUUsageNSec=123456789\nCPUQuotaPerSecUSec=500000\n"
 )
@@ -2141,6 +2142,7 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     runner, calls = recording_runner({"show": ACTIVE_SHOW})
     present, observation = driver.probe(context(tmp_path), runner)
     assert present is True
+    assert observation["systemd_unit_invocation_id"] == "0123456789abcdef0123456789abcdef"
     assert observation["writable_layer_bytes"] is None
     assert observation["writable_layer_accounting"] == "kernel-enforced-tmpfs-cap"
     assert observation["tasks_current"] == 5
@@ -2152,6 +2154,7 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     assert observation["cpu_quota_per_sec_usec"] == 500000
     assert "--property=TasksCurrent" in calls[0]
     assert "--property=CPUUsageNSec" in calls[0]
+    assert "--property=InvocationID" in calls[0]
 
     runner, _ = recording_runner(
         {
@@ -2173,6 +2176,15 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     assert unavailable["cpu_usage_ns"] is None
     assert unavailable["cpu_quota_per_sec_usec"] is None
     assert unavailable["cpu_quota_unbounded"] is True
+    assert unavailable["systemd_unit_invocation_id"] is None
+
+    runner, _ = recording_runner(
+        {
+            "show": "ActiveState=active\nInvocationID=not-a-systemd-id\n",
+        }
+    )
+    _present, malformed_invocation = driver.probe(context(tmp_path), runner)
+    assert malformed_invocation["systemd_unit_invocation_id"] is None
 
     runner, _ = recording_runner({"show": GONE_SHOW})
     present, _observation = driver.probe(context(tmp_path), runner)
@@ -2182,6 +2194,49 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     present, observation = driver.probe(context(tmp_path), runner)
     assert present is False
     assert observation["absence_proved_by"] == "systemd-unit-not-found"
+
+
+def test_supervisor_persists_namespace_runtime_unit_invocation_id(
+    driver_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    config = (driver_repo / "acp.toml").read_text(encoding="utf-8")
+    config = config.replace(
+        'name = "browser"\nkind = "browser_profile"',
+        'name = "runtime"\nkind = "namespace_runtime"\n'
+        'executable = "/usr/bin/systemd-run"\n'
+        'systemctl_path = "/usr/bin/systemctl"\n'
+        'payload = "/bin/sleep 30"\n'
+        'tasks_max = "16"\n'
+        'memory_max = "64M"\n'
+        'cpu_quota = "50%"\n'
+        'wall_clock_seconds = "120"',
+    )
+    (driver_repo / "acp.toml").write_text(config, encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def fake_run_trusted(argv, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(list(argv))
+        output = ACTIVE_SHOW if Path(argv[0]).name == "systemctl" else ""
+        return {"argv": list(argv), "exit_code": 0, "stdout": output, "stderr": ""}
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+
+    resources = supervisor.driver_resources(attempt["id"])
+
+    assert len(resources) == 1
+    assert resources[0]["state"] == "active"
+    assert (
+        resources[0]["evidence"]["proof"]["observation"]["systemd_unit_invocation_id"]
+        == "0123456789abcdef0123456789abcdef"
+    )
+    assert any(Path(call[0]).name == "systemctl" for call in calls)
 
 
 def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(

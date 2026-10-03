@@ -1652,6 +1652,7 @@ class NamespaceRuntimeDriver(ResourceDriver):
             self._unit(context),
             "--property=LoadState",
             "--property=ActiveState",
+            "--property=InvocationID",
             "--property=Result",
             "--property=ExecMainStatus",
             "--property=TasksMax",
@@ -1690,6 +1691,15 @@ class NamespaceRuntimeDriver(ResourceDriver):
             }
         state = self._show_value(result.get("stdout", ""), "ActiveState")
         present = state in {"active", "activating", "deactivating", "reloading"}
+        raw_invocation_id = (
+            self._show_value(result.get("stdout", ""), "InvocationID").strip().casefold()
+        )
+        # systemd invocation IDs are 128-bit IDs rendered as 32 hexadecimal
+        # characters. Treat absent/unsupported/malformed values as unavailable;
+        # callers that need this identity for fencing must fail closed.
+        invocation_id = (
+            raw_invocation_id if re.fullmatch(r"[0-9a-f]{32}", raw_invocation_id) else None
+        )
         finding = self._quota_finding(result.get("stdout", ""))
         if finding:
             result = {**result, "quota_violation": finding}
@@ -1719,6 +1729,7 @@ class NamespaceRuntimeDriver(ResourceDriver):
         result = {
             **result,
             "active_state": state or None,
+            "systemd_unit_invocation_id": invocation_id,
             # The writable tmpfs exists only inside the unit's mount namespace.
             # Reporting the old host staging directory as its usage was false
             # evidence, so probe states the accounting boundary explicitly.
