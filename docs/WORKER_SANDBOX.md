@@ -70,6 +70,19 @@ separate setup/probe/teardown semantics; it does not own the registered worker
 PID, cancellation, or recovery lifecycle. A `systemd-run` client PID is not a
 durable identity for the service it started.
 
+The direct worker's host-log capture is now bounded separately from sandboxing:
+`run_worker` gives the trampoline a parent-drained stdout/stderr pipe rather
+than the open host log descriptor. The candidate sees a pipe, not that log
+descriptor. ACP caps each attempt log at 8 MiB across retries, reserves space
+for a truncation marker, drains and discards output beyond the cap, and refuses
+launch before process reservation when existing bytes leave insufficient room
+for the marker. Exact-head CI for code commit `aa1e03a` (run
+[`37154338869`](https://github.com/Rayha33/agent-control-plane/actions/runs/37154338869))
+passed Ubuntu/macOS × Python 3.11/3.12; Ubuntu executed the Linux-only output
+and retry-cap cases. This proves bounded capture and removes the inherited log
+descriptor capability only. It does not prove that a candidate cannot open the
+host log path or other host paths, and it is not filesystem read isolation.
+
 Codex App Server `externalSandbox` is a delegation mode: Codex skips its own
 command sandbox. It is safe only after ACP has proved that every untrusted
 command path is already inside the outer boundary. It creates no namespace,
