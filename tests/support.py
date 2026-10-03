@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -10,11 +11,52 @@ from typing import Any
 import pytest
 
 from agent_control_plane.git_supervisor import GitSupervisor
+from agent_control_plane.trust_bundles import install_bundle
 
 
 def python_command(source: str) -> str:
     """Run test code with the interpreter that is running pytest."""
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
+
+
+def passing_critic_script() -> str:
+    """Source for a version-2 critic used by fixtures that need a passing review."""
+    return (
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "packet = json.loads(Path(os.environ['ACP_REVIEW_PACKET']).read_text())\n"
+        "evidence_id = packet['evidence_catalog'][0]['id']\n"
+        "coverage = [\n"
+        "    {'criterion_id': item['id'], 'status': 'pass',\n"
+        "     'rationale': 'Test reviewer covers the fixture criterion.',\n"
+        "     'evidence_refs': [evidence_id]}\n"
+        "    for item in packet['task']['acceptance_criteria']\n"
+        "]\n"
+        "Path(os.environ['ACP_REVIEW_RESULT']).write_text(json.dumps({\n"
+        "    'contract_version': 2, 'verdict': 'pass', 'findings': [],\n"
+        "    'acceptance_coverage': coverage}))\n"
+    )
+
+
+def install_passing_critic(repo: Path) -> tuple[str, Path]:
+    """Install a test-only version-2 reviewer through ACP's pinned trust bundle."""
+    source = repo.parent / f"{repo.name}-pass-critic-source"
+    trust_root = repo.parent / f"{repo.name}-pass-critic-trust"
+    if not trust_root.exists():
+        source.mkdir(mode=0o700)
+        executable = source / "critic"
+        executable.write_text(passing_critic_script(), encoding="utf-8")
+        executable.chmod(0o700)
+        install_bundle(
+            source,
+            trust_root,
+            "test-v1",
+            {"critic": "critic"},
+            owner_uid=os.geteuid(),
+            require_privilege=False,
+        )
+    return "trusted:critic", trust_root
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -31,10 +73,13 @@ def write_config(
     repo: Path,
     qc_commands: list[str] | None = None,
     integration_commands: list[str] | None = None,
-    critic_command: str = "",
+    critic_command: str | None = None,
     require_critic: bool = False,
     timeout_seconds: int = 30,
 ) -> None:
+    trust_root = None
+    if critic_command is None:
+        critic_command, trust_root = install_passing_critic(repo)
     qc = qc_commands if qc_commands is not None else [python_command("pass")]
     integration = integration_commands if integration_commands is not None else qc
     (repo / "acp.toml").write_text(
@@ -53,6 +98,11 @@ def write_config(
         "teardown_commands = []\n",
         encoding="utf-8",
     )
+    if trust_root is not None:
+        with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n[trust]\nroot = {json.dumps(str(trust_root))}\nowner_uid = {os.geteuid()}\n"
+            )
 
 
 def init_repo(root: Path) -> Path:

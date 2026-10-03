@@ -157,6 +157,8 @@ CREATE TABLE IF NOT EXISTS qc_runs (
   bundle_sha256 TEXT NOT NULL DEFAULT '',
   policy_fingerprint TEXT NOT NULL DEFAULT '',
   trust_bundle_json TEXT NOT NULL DEFAULT '{}',
+  acceptance_coverage_json TEXT NOT NULL DEFAULT '[]',
+  acceptance_coverage_contract_version INTEGER NOT NULL DEFAULT 0,
   started_at TEXT NOT NULL,
   finished_at TEXT NOT NULL
 );

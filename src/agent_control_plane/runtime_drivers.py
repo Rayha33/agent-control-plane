@@ -270,10 +270,7 @@ CommandRunner = Callable[
     [Sequence[str], Path, Mapping[str, str], int, CredentialMaterial | None],
     dict[str, Any],
 ]
-ContainedProcessRunner = Callable[
-    [Sequence[str], Path, Mapping[str, str], int, Sequence[int], Sequence[int]],
-    dict[str, Any],
-]
+ContainedProcessRunner = Callable[..., dict[str, Any]]
 
 
 def run_trusted(
@@ -286,6 +283,7 @@ def run_trusted(
     guard_fd: int | None = None,
     expected_owners: set[int] | None = None,
     process_runner: ContainedProcessRunner | None = None,
+    stdin_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
 
@@ -384,7 +382,7 @@ def run_trusted(
             if descriptor_execution:
                 contained_argv[0] = str(descriptor_root / str(executable_fd))
                 command_fds.add(executable_fd)
-            contained = process_runner(
+            process_args = (
                 contained_argv,
                 cwd,
                 safe_env,
@@ -392,6 +390,10 @@ def run_trusted(
                 tuple(sorted(command_fds)),
                 (guard_fd,) if guard_fd is not None else (),
             )
+            if stdin_data is None:
+                contained = process_runner(*process_args)
+            else:
+                contained = process_runner(*process_args, stdin_data=stdin_data)
             return {
                 "argv": [redact(value) for value in execution_argv],
                 "exit_code": int(contained["exit_code"]),
@@ -409,6 +411,8 @@ def run_trusted(
         if descriptor_execution:
             execution_options["executable"] = str(descriptor_root / str(executable_fd))
             command_fds.add(executable_fd)
+        if stdin_data is not None:
+            execution_options["input"] = stdin_data.decode("utf-8")
         process = subprocess.run(
             execution_argv,
             **execution_options,

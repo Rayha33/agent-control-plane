@@ -273,6 +273,35 @@ def test_v8_read_only_open_requires_read_dependency_migration(repo: Path) -> Non
         migration(connection)
 
 
+def test_v9_read_only_open_requires_criterion_coverage_migration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("ALTER TABLE qc_runs DROP COLUMN acceptance_coverage_contract_version")
+        connection.execute("ALTER TABLE qc_runs DROP COLUMN acceptance_coverage_json")
+        connection.execute("UPDATE meta SET value = '9' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    before = fingerprint(repo)
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+    assert "version 9" in str(error.value)
+    assert fingerprint(repo) == before
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 9
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with migrated.connect() as connection:
+        columns = {row["name"]: row for row in connection.execute("PRAGMA table_info(qc_runs)")}
+    assert columns["acceptance_coverage_json"]["type"] == "TEXT"
+    assert columns["acceptance_coverage_json"]["dflt_value"] == "'[]'"
+    assert columns["acceptance_coverage_contract_version"]["type"] == "INTEGER"
+    assert columns["acceptance_coverage_contract_version"]["dflt_value"] == "0"
+    with migrated.connect() as connection:
+        migration = dict(MIGRATIONS)[10]
+        migration(connection)
+        migration(connection)
+
+
 def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:
     """A live old process cannot create a new marker-less attempt after upgrade."""
 

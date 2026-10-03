@@ -1845,7 +1845,8 @@ def test_credential_handle_and_secret_absent_from_qc_reproduction_bundle(
     bundle = supervisor.reproduction_bundle(review["id"])
 
     serialized = json.dumps({"review": review, "bundle": bundle}, sort_keys=True)
-    assert review["verdict"] == "pass"
+    assert review["verdict"] == "human_required"
+    assert {item["status"] for item in review["acceptance_coverage"]} == {"unknown"}
     assert secret not in serialized
     assert "source_reference" not in serialized
     for path in (repo / ".acp" / "bundles").glob("*"):

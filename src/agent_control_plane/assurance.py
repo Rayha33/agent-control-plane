@@ -391,6 +391,8 @@ class Assurance:
         reviewer: Reviewer,
         verdict: str,
         packet_sha256: str,
+        acceptance_coverage: list[dict[str, Any]],
+        acceptance_coverage_contract_version: int,
     ) -> dict[str, Any]:
         """Everything needed to re-run this verdict, and its signature."""
         payload = {
@@ -402,6 +404,8 @@ class Assurance:
             "base_sha": task_base_sha,
             "packet_sha256": packet_sha256,
             "verdict": verdict,
+            "acceptance_coverage": acceptance_coverage,
+            "acceptance_coverage_contract_version": acceptance_coverage_contract_version,
             "commands": commands,
             "reviewer": reviewer.provenance(),
             "policy_fingerprint": self.supervisor.assurance_policy.fingerprint,

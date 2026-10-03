@@ -11,8 +11,10 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +23,11 @@ from typing import Any
 from ..assurance import REJECT_VERDICTS, Assurance, Reviewer
 from ..runner_identity import IdentityError, assert_distinct
 from ..scheduling import declared_resources
+from .acceptance import (
+    ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
+    acceptance_criteria,
+    validate_acceptance_coverage,
+)
 from .common import (
     EVIDENCE_STREAM_BUDGET,
     FORK_DENIED_EXIT_CODE,
@@ -265,6 +272,7 @@ class QcMixin:
         head = self._git_text("rev-parse", "HEAD")
         results: list[dict[str, Any]] = []
         for case in cases:
+            run_id = f"calibration-{uuid.uuid4()}"
             worktree = self.state_dir / "worktrees" / f"golden-{uuid.uuid4().hex}"
             packet_path = self.state_dir / "logs" / f"golden-{uuid.uuid4().hex}.json"
             result_path = self.state_dir / "logs" / f"golden-result-{uuid.uuid4().hex}.json"
@@ -275,10 +283,10 @@ class QcMixin:
                 self._assert_safe_git_execution_config()
                 self._git("worktree", "add", "--detach", str(worktree), head)
                 touched = self.assurance.apply_mutations(worktree, case.mutations)
-                packet_path.write_text(
-                    json.dumps(self._golden_packet(case, head, touched), indent=2),
-                    encoding="utf-8",
-                )
+                packet = self._golden_packet(case, head, touched, worktree, run_id)
+                packet_bytes = json.dumps(packet, indent=2).encode("utf-8")
+                packet_hash = sha256(packet_bytes)
+                packet_path.write_bytes(packet_bytes)
                 critic = self._run_critic(
                     reviewer.command or "builtin",
                     worktree,
@@ -286,21 +294,47 @@ class QcMixin:
                         "ACP_PHASE": "calibration",
                         "ACP_WORKTREE": str(worktree),
                         "ACP_REPO_ROOT": str(self.root),
-                        "ACP_REVIEW_PACKET": str(packet_path),
+                        "ACP_REVIEW_PACKET": "/dev/stdin",
+                        "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
                         "ACP_REVIEW_RESULT": str(result_path),
                     },
+                    stdin_data=packet_bytes,
                 )
                 if critic["exit_code"]:
                     error = f"critic exited {critic['exit_code']}"
                 else:
-                    verdict = self._critic_payload(result_path)["verdict"]
+                    packet_unchanged = (
+                        not packet_path.is_symlink()
+                        and packet_path.is_file()
+                        and sha256(packet_path.read_bytes()) == packet_hash
+                    )
+                    if not packet_unchanged:
+                        raise SupervisorError(
+                            "critic_packet_tampered",
+                            "critic changed the archived calibration packet",
+                        )
+                    verdict = self._critic_payload(result_path, packet)["verdict"]
             except (OSError, subprocess.SubprocessError, SupervisorError, ValueError) as failure:
                 error = str(failure)
             finally:
-                result_path.unlink(missing_ok=True)
-                packet_path.unlink(missing_ok=True)
-                if worktree.exists():
-                    self._remove_worktree(worktree, delete_branch=False, expected_branch=None)
+                cleanup_errors: list[str] = []
+                for artifact_path in (result_path, packet_path):
+                    try:
+                        self._cleanup_calibration_artifact(artifact_path)
+                    except OSError as cleanup_failure:
+                        cleanup_errors.append(
+                            f"could not clean {artifact_path.name}: {cleanup_failure}"
+                        )
+                try:
+                    if worktree.exists() or worktree.is_symlink():
+                        if not self._remove_worktree(
+                            worktree, delete_branch=False, expected_branch=None
+                        ):
+                            cleanup_errors.append("golden worktree cleanup could not be verified")
+                except Exception as cleanup_failure:
+                    cleanup_errors.append(f"golden worktree cleanup failed: {cleanup_failure}")
+                if cleanup_errors:
+                    error = "; ".join(filter(None, (error, *cleanup_errors)))
             results.append(
                 {
                     "name": case.name,
@@ -308,7 +342,7 @@ class QcMixin:
                     "expected": case.expect,
                     "verdict": verdict,
                     "rejected": verdict in REJECT_VERDICTS,
-                    "correct": (verdict in REJECT_VERDICTS) == case.expects_rejection,
+                    "correct": not error and (verdict in REJECT_VERDICTS) == case.expects_rejection,
                     "mutated_paths": touched,
                     "error": error,
                 }
@@ -370,14 +404,28 @@ class QcMixin:
             command=self.config.critic_selector or "builtin",
         )
 
-    def _golden_packet(self, case: Any, head: str, touched: list[str]) -> dict[str, Any]:
+    def _golden_packet(
+        self,
+        case: Any,
+        head: str,
+        touched: list[str],
+        worktree: Path,
+        run_id: str,
+    ) -> dict[str, Any]:
         """A review packet shaped exactly like a real one, for a synthetic candidate."""
+        acceptance = ["the seeded repository state is judged correctly"]
+        synthetic_diff = self._git_text("-C", str(worktree), "diff", "--binary", head).encode(
+            "utf-8"
+        )
         return {
+            "run_id": run_id,
+            "acceptance_coverage_contract_version": ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
             "task": {
                 "id": f"golden:{case.name}",
                 "title": f"calibration case {case.name}",
                 "description": case.description,
-                "acceptance": ["the seeded repository state is judged correctly"],
+                "acceptance": acceptance,
+                "acceptance_criteria": acceptance_criteria(acceptance),
                 "declared_resources": sorted(touched),
                 "base_sha": head,
             },
@@ -391,10 +439,20 @@ class QcMixin:
                 "diff_stat": "",
             },
             "deterministic_results": [],
+            "evidence_catalog": [
+                {
+                    "id": f"{run_id}:synthetic-state",
+                    "kind": "synthetic_calibration_state",
+                    "run_id": run_id,
+                    "commit_sha": head,
+                    "sha256": sha256(synthetic_diff),
+                }
+            ],
             "policy": {
                 "inspect_repository": True,
                 "reproduce_acceptance": True,
                 "worker_conclusions_excluded": True,
+                "calibration": True,
             },
         }
 
@@ -526,15 +584,19 @@ class QcMixin:
                 (operation_until, utc_now(), submission["attempt_id"]),
             )
 
+        qc_id = str(uuid.uuid4())
         qc_dir = self.state_dir / "worktrees" / f"qc-{uuid.uuid4().hex}"
-        packet_path = self.state_dir / "logs" / f"review-{submission_id}.json"
+        packet_path = self.state_dir / "logs" / f"review-{submission_id}-{qc_id}.json"
         results: list[dict[str, Any]] = []
         findings: list[dict[str, str]] = []
+        acceptance_coverage: list[dict[str, Any]] = []
         critic_verdict = "pass"
+        packet: dict[str, Any] | None = None
+        packet_hash = sha256(b"")
         try:
             self._assert_safe_git_execution_config()
             self._git("worktree", "add", "--detach", str(qc_dir), submission["commit_sha"])
-            packet = self._review_packet(task, submission, qc_dir)
+            packet = self._review_packet(task, submission, qc_dir, qc_id)
             packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
             # Fresh services before review. Otherwise QC can pass against an app
             # server the worker left running, which proves the worker's old code
@@ -558,7 +620,7 @@ class QcMixin:
                     raise
                 else:
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
-            for command in self.config.qc_commands:
+            for index, command in enumerate(self.config.qc_commands, start=1):
                 self._restore_candidate(qc_dir, submission["commit_sha"])
                 result = self._run_command(
                     command,
@@ -566,7 +628,25 @@ class QcMixin:
                     self._phase_runtime_env(runtime_env, "qc", qc_dir),
                     pass_fds=(operation_guard_fd,),
                 )
+                evidence_id = f"{qc_id}:command:{index:03d}"
+                result["evidence_id"] = evidence_id
+                result["evidence_sha256"] = sha256(
+                    canonical_json(
+                        {key: value for key, value in result.items() if key != "evidence_sha256"}
+                    ).encode("utf-8")
+                )
                 results.append(result)
+                packet["evidence_catalog"].append(
+                    {
+                        "id": evidence_id,
+                        "kind": "deterministic_command_result",
+                        "run_id": qc_id,
+                        "commit_sha": submission["commit_sha"],
+                        "sha256": result["evidence_sha256"],
+                        "command": command,
+                        "exit_code": result["exit_code"],
+                    }
+                )
                 if result["exit_code"]:
                     findings.append(self._command_finding(command, result))
                 elif not self._worktree_matches(qc_dir, submission["commit_sha"]):
@@ -579,40 +659,69 @@ class QcMixin:
                             "required_fix": "make the command read-only for tracked source",
                         }
                     )
+            packet["deterministic_results"] = results
+            packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+            packet_bytes = packet_path.read_bytes()
+            packet_hash = sha256(packet_bytes)
             if reviewer.command:
-                packet["deterministic_results"] = results
-                packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
                 self._restore_candidate(qc_dir, submission["commit_sha"])
                 if reviewer.command.startswith("trusted:"):
                     trust_pin = self._verify_attempt_trust(submission["attempt_id"])
-                result_path = (
-                    self.state_dir / "logs" / f"critic-{submission_id}-{uuid.uuid4().hex}.json"
-                )
+                result_path = self.state_dir / "logs" / f"critic-{submission_id}-{qc_id}.json"
                 critic = self._run_critic(
                     reviewer.command,
                     qc_dir,
                     self._phase_runtime_env(runtime_env, "critic", qc_dir)
                     | {
-                        "ACP_REVIEW_PACKET": str(packet_path),
+                        "ACP_REVIEW_PACKET": "/dev/stdin",
+                        "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
                         "ACP_REVIEW_RESULT": str(result_path),
                     },
                     trust_pin,
                     pass_fds=(operation_guard_fd,),
+                    stdin_data=packet_bytes,
                 )
                 results.append(critic)
-                if critic["exit_code"] or not self._worktree_matches(
+                try:
+                    packet_is_unchanged = (
+                        not packet_path.is_symlink()
+                        and packet_path.is_file()
+                        and sha256(packet_path.read_bytes()) == packet_hash
+                    )
+                except OSError:
+                    packet_is_unchanged = False
+                if not packet_is_unchanged:
+                    self._restore_review_packet(packet_path, packet_bytes)
+                    acceptance_coverage = self._unassessed_coverage(
+                        packet, "The critic changed the server-generated review packet."
+                    )
+                    findings.append(
+                        {
+                            "severity": "high",
+                            "requirement": "the signed review packet matches the packet evaluated by QC",
+                            "finding": "independent critic modified or removed its review packet",
+                            "evidence": f"expected packet sha256 {packet_hash}",
+                            "required_fix": "use a reviewer that reads but does not modify the review packet",
+                        }
+                    )
+                    critic_verdict = "block"
+                elif critic["exit_code"] or not self._worktree_matches(
                     qc_dir, submission["commit_sha"]
                 ):
                     findings.append(self._command_finding("independent critic", critic))
                     critic_verdict = "block"
                 else:
                     try:
-                        payload = self._critic_payload(result_path)
+                        payload = self._critic_payload(result_path, packet)
                     finally:
                         result_path.unlink(missing_ok=True)
                     critic_verdict = payload["verdict"]
+                    acceptance_coverage = payload["acceptance_coverage"]
                     findings.extend(payload["findings"])
             elif self.config.require_critic:
+                acceptance_coverage = self._unassessed_coverage(
+                    packet, "No independent critic is configured for this QC run."
+                )
                 findings.append(
                     {
                         "severity": "high",
@@ -623,8 +732,26 @@ class QcMixin:
                     }
                 )
                 critic_verdict = "block"
+            else:
+                acceptance_coverage = self._unassessed_coverage(
+                    packet, "No independent critic is configured for this QC run."
+                )
+                findings.append(
+                    {
+                        "severity": "low",
+                        "requirement": "every acceptance criterion receives independent QC",
+                        "finding": "acceptance criteria were not assessed by an independent critic",
+                        "evidence": "; ".join(item["criterion_id"] for item in acceptance_coverage),
+                        "required_fix": "configure an independent reviewer or obtain explicit human review",
+                    }
+                )
+                critic_verdict = "human_required"
         except (OSError, subprocess.SubprocessError, SupervisorError, ValueError) as error:
             critic_verdict = "block"
+            if packet is not None and not acceptance_coverage:
+                acceptance_coverage = self._unassessed_coverage(
+                    packet, "QC did not produce a valid per-criterion reviewer result."
+                )
             findings.append(
                 {
                     "severity": "high",
@@ -640,6 +767,8 @@ class QcMixin:
 
         serious = {"critical", "high", "medium"}
         if any(result["exit_code"] for result in results):
+            verdict = "block"
+        elif critic_verdict == "block":
             verdict = "block"
         elif any(item.get("severity") in serious for item in findings):
             verdict = "revise"
@@ -657,8 +786,6 @@ class QcMixin:
                 }
             )
         finished = utc_now()
-        qc_id = str(uuid.uuid4())
-        packet_hash = sha256(packet_path.read_bytes()) if packet_path.exists() else sha256(b"")
         bundle = self.assurance.bundle(
             qc_id,
             dict(submission),
@@ -667,6 +794,8 @@ class QcMixin:
             reviewer,
             verdict,
             packet_hash,
+            acceptance_coverage,
+            ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
         )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -704,8 +833,9 @@ class QcMixin:
                   (id, submission_id, reviewer_id, commit_sha, verdict,
                    findings_json, results_json, packet_sha256,
                    reviewer_provenance_json, reviewer_signature, bundle_sha256,
-                   policy_fingerprint, trust_bundle_json, started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   policy_fingerprint, trust_bundle_json, acceptance_coverage_json,
+                   acceptance_coverage_contract_version, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     qc_id,
@@ -721,6 +851,8 @@ class QcMixin:
                     bundle["sha256"],
                     self.assurance_policy.fingerprint,
                     canonical_json(trust_pin),
+                    canonical_json(acceptance_coverage),
+                    ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
                     started,
                     finished,
                 ),
@@ -852,6 +984,7 @@ class QcMixin:
         task: sqlite3.Row,
         submission: sqlite3.Row,
         worktree: Path,
+        qc_id: str,
     ) -> dict[str, Any]:
         diff_stat = self._git_text(
             "-C",
@@ -868,12 +1001,100 @@ class QcMixin:
             "--format=%H %s",
             f"{task['base_sha']}..{submission['commit_sha']}",
         )
+        changed_paths = json.loads(submission["changed_paths_json"])
+        catalog: list[dict[str, Any]] = [
+            {
+                "id": f"{qc_id}:diff",
+                "kind": "candidate_diff",
+                "run_id": qc_id,
+                "commit_sha": submission["commit_sha"],
+                "sha256": submission["patch_sha256"],
+            }
+        ]
+
+        def tree_entry(revision: str, path: str) -> tuple[str, str, str] | None:
+            raw = self._git_bytes(
+                "-C",
+                str(worktree),
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                revision,
+                "--",
+                f":(literal){path}",
+            )
+            target = path.encode("utf-8")
+            for entry in raw.split(b"\0"):
+                if not entry:
+                    continue
+                metadata, separator, entry_path = entry.partition(b"\t")
+                if not separator or entry_path != target:
+                    continue
+                fields = metadata.decode("ascii").split(" ", 2)
+                if len(fields) != 3:
+                    raise SupervisorError(
+                        "invalid_git_tree_entry", "Git returned a malformed tree entry"
+                    )
+                return fields[0], fields[1], fields[2]
+            return None
+
+        for index, path in enumerate(changed_paths, start=1):
+            submitted_entry = tree_entry(submission["commit_sha"], path)
+            if submitted_entry is not None:
+                mode, object_type, object_id = submitted_entry
+                catalog.append(
+                    {
+                        "id": f"{qc_id}:file:{index:03d}",
+                        "kind": "submitted_file",
+                        "run_id": qc_id,
+                        "commit_sha": submission["commit_sha"],
+                        "path": path,
+                        "git_object_mode": mode,
+                        "git_object_type": object_type,
+                        "git_object_oid": object_id,
+                    }
+                )
+                continue
+
+            base_entry = tree_entry(task["base_sha"], path)
+            if base_entry is None:
+                raise SupervisorError(
+                    "invalid_submission_path",
+                    f"changed path has no exact entry in either commit: {path}",
+                )
+            mode, object_type, object_id = base_entry
+            deletion = {
+                "commit_sha": submission["commit_sha"],
+                "path": path,
+                "previous_mode": mode,
+                "previous_object_type": object_type,
+                "previous_object_oid": object_id,
+                "state": "absent_from_submitted_commit",
+            }
+            catalog.append(
+                {
+                    "id": f"{qc_id}:deletion:{index:03d}",
+                    "kind": "deleted_path",
+                    "run_id": qc_id,
+                    "commit_sha": submission["commit_sha"],
+                    "path": path,
+                    "previous_git_object_mode": mode,
+                    "previous_git_object_type": object_type,
+                    "previous_git_object_oid": object_id,
+                    "sha256": sha256(canonical_json(deletion).encode("utf-8")),
+                }
+            )
+        acceptance = json.loads(task["acceptance_json"])
         return {
+            "run_id": qc_id,
+            "acceptance_coverage_contract_version": ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
             "task": {
                 "id": task["id"],
                 "title": task["title"],
                 "description": task["description"],
-                "acceptance": json.loads(task["acceptance_json"]),
+                "acceptance": acceptance,
+                "acceptance_criteria": acceptance_criteria(acceptance),
                 # 🔴 #1764: this field is NAMED declared_resources and held the FOLDED set
                 # (pre-existing, blame 8139c743). After #1708 the same name in _task_view
                 # carries the true declared case, so a reviewer reading a QC packet saw
@@ -889,7 +1110,7 @@ class QcMixin:
                 "commit_sha": submission["commit_sha"],
                 "tree_sha": submission["tree_sha"],
                 "patch_sha256": submission["patch_sha256"],
-                "changed_paths": json.loads(submission["changed_paths_json"]),
+                "changed_paths": changed_paths,
                 "commits": commits.splitlines(),
                 "diff_stat": diff_stat,
             },
@@ -898,7 +1119,59 @@ class QcMixin:
                 "reproduce_acceptance": True,
                 "worker_conclusions_excluded": True,
             },
+            "evidence_catalog": catalog,
         }
+
+    @staticmethod
+    def _unassessed_coverage(packet: dict[str, Any], reason: str) -> list[dict[str, Any]]:
+        """Represent a missing/failed independent review explicitly, never as pass."""
+        criteria = packet.get("task", {}).get("acceptance_criteria", [])
+        catalog = packet.get("evidence_catalog", [])
+        references = [catalog[0]["id"]] if catalog else []
+        return [
+            {
+                "criterion_id": item["id"],
+                "criterion": item["text"],
+                "status": "unknown",
+                "rationale": reason,
+                "evidence_refs": references,
+            }
+            for item in criteria
+        ]
+
+    @staticmethod
+    def _restore_review_packet(path: Path, packet_bytes: bytes) -> None:
+        """Replace reviewer-modified packet bytes without following a planted symlink."""
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+            )
+            temporary_path = Path(temporary)
+            with os.fdopen(descriptor, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(packet_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.is_dir() and not path.is_symlink():
+                substituted_directory = path.with_name(f"{path.name}.tampered-{uuid.uuid4().hex}")
+                os.replace(path, substituted_directory)
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _cleanup_calibration_artifact(path: Path) -> None:
+        """Remove reviewer files, but quarantine substituted directories intact."""
+        if path.is_dir() and not path.is_symlink():
+            quarantine = path.with_name(f"{path.name}.tampered-{uuid.uuid4().hex}")
+            os.replace(path, quarantine)
+        elif path.is_symlink():
+            path.unlink()
+        else:
+            path.unlink(missing_ok=True)
 
     @staticmethod
     def _evidence_window(text: str, budget: int = EVIDENCE_STREAM_BUDGET) -> str:
@@ -934,7 +1207,7 @@ class QcMixin:
         )
 
     @staticmethod
-    def _critic_payload(path: Path) -> dict[str, Any]:
+    def _critic_payload(path: Path, packet: dict[str, Any]) -> dict[str, Any]:
         if not path.is_file():
             raise SupervisorError(
                 "invalid_critic_output",
@@ -945,6 +1218,11 @@ class QcMixin:
         verdicts = {"pass", "revise", "block", "human_required"}
         if not isinstance(payload, dict) or payload.get("verdict") not in verdicts:
             raise SupervisorError("invalid_critic_output", "critic verdict is invalid")
+        if payload.get("contract_version") != ACCEPTANCE_COVERAGE_CONTRACT_VERSION:
+            raise SupervisorError(
+                "invalid_critic_output",
+                "critic must use acceptance-coverage contract version 2",
+            )
         findings = payload.get("findings", [])
         required = {
             "severity",
@@ -963,6 +1241,46 @@ class QcMixin:
                 or finding.get("severity") not in severities
             ):
                 raise SupervisorError("invalid_critic_output", "critic finding is invalid")
-        if payload["verdict"] in {"revise", "block"} and not findings:
+        try:
+            coverage = validate_acceptance_coverage(
+                payload.get("acceptance_coverage"),
+                packet["task"]["acceptance_criteria"],
+                packet["evidence_catalog"],
+                run_id=packet["run_id"],
+                commit_sha=packet["submission"]["commit_sha"],
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise SupervisorError("invalid_critic_output", str(error)) from error
+
+        coverage_findings: list[dict[str, str]] = []
+        for item in coverage:
+            if item["status"] == "pass":
+                continue
+            revise = item["status"] == "revise"
+            coverage_findings.append(
+                {
+                    "severity": "high" if revise else "low",
+                    "requirement": f"acceptance criterion {item['criterion_id']} is independently assessed",
+                    "finding": f"criterion disposition is {item['status']}: {item['criterion']}",
+                    "evidence": (f"refs={', '.join(item['evidence_refs'])}; {item['rationale']}"),
+                    "required_fix": (
+                        "address the criterion and rerun QC"
+                        if revise
+                        else "obtain the independent or human evidence needed to resolve this criterion"
+                    ),
+                }
+            )
+        findings = [*findings, *coverage_findings]
+        verdict = payload["verdict"]
+        if verdict == "pass":
+            if any(item["status"] == "revise" for item in coverage):
+                verdict = "revise"
+            elif any(item["status"] != "pass" for item in coverage):
+                verdict = "human_required"
+        if verdict in {"revise", "block"} and not findings:
             raise SupervisorError("invalid_critic_output", "negative verdict requires findings")
-        return {"verdict": payload["verdict"], "findings": findings}
+        return {
+            "verdict": verdict,
+            "findings": findings,
+            "acceptance_coverage": coverage,
+        }

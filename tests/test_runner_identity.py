@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from support import python_command, requires_linux_worker
+from support import install_passing_critic, python_command, requires_linux_worker
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
 from agent_control_plane.runner_identity import (
@@ -60,6 +61,21 @@ def make_task(supervisor: GitSupervisor) -> dict:
         "Change only the declared path.",
         ["The declared content is correct"],
         ["alpha.txt"],
+    )
+
+
+def configure_passing_critic(repo: Path) -> None:
+    command, trust_root = install_passing_critic(repo)
+    config_path = repo / "acp.toml"
+    config = config_path.read_text(encoding="utf-8").replace(
+        'critic_command = ""', f"critic_command = {json.dumps(command)}"
+    )
+    config_path.write_text(
+        config
+        + "\n[trust]\n"
+        + f"root = {json.dumps(str(trust_root))}\n"
+        + f"owner_uid = {os.geteuid()}\n",
+        encoding="utf-8",
     )
 
 
@@ -175,6 +191,7 @@ def test_worker_cannot_review_by_asserting_the_critic_name(repo: Path) -> None:
 
 
 def test_enrolled_critic_can_review(repo: Path) -> None:
+    configure_passing_critic(repo)
     supervisor = GitSupervisor(repo)
     worker = supervisor.enroll_runner("worker-1", "worker")
     critic = supervisor.enroll_runner("independent-qc", "critic")
@@ -234,7 +251,8 @@ def test_empty_registry_keeps_single_host_behaviour(repo: Path) -> None:
     commit_change(attempt, "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     review = supervisor.run_qc(submission["id"], "independent-qc")
-    assert review["verdict"] == "pass"
+    assert review["verdict"] == "human_required"
+    assert {item["status"] for item in review["acceptance_coverage"]} == {"unknown"}
 
 
 def test_one_identity_cannot_hold_both_worker_and_critic_roles(repo: Path) -> None:
@@ -289,6 +307,7 @@ def test_revoked_identity_can_rotate_but_old_attempt_stays_fenced(repo: Path) ->
 
 
 def test_every_privileged_transition_requires_its_role_credential(repo: Path) -> None:
+    configure_passing_critic(repo)
     supervisor = GitSupervisor(repo)
     worker = supervisor.enroll_runner("worker-1", "worker")
     critic = supervisor.enroll_runner("independent-qc", "critic")
@@ -406,8 +425,9 @@ def test_runner_credential_is_scrubbed_from_qc_critic_and_integration(
     config = config.replace(
         f"commands = {json.dumps([python_command('pass')])}",
         'commands = ["test -z \\"${ACP_RUNNER_CREDENTIAL:-}\\""]',
-    ).replace('critic_command = ""', 'critic_command = "builtin"')
+    )
     (repo / "acp.toml").write_text(config, encoding="utf-8")
+    configure_passing_critic(repo)
 
     supervisor = GitSupervisor(repo)
     worker = supervisor.enroll_runner("worker-1", "worker")
@@ -458,6 +478,7 @@ def test_revoked_critic_cannot_finalize_a_running_review(
 def test_revoked_integrator_cannot_finalize_a_running_integration(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    configure_passing_critic(repo)
     supervisor = GitSupervisor(repo)
     worker = supervisor.enroll_runner("worker-1", "worker")
     critic = supervisor.enroll_runner("independent-qc", "critic")

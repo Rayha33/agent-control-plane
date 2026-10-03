@@ -59,6 +59,7 @@ class ProcessMixin:
         timeout_seconds: int | None = None,
         pass_fds: Sequence[int] = (),
         lifecycle_fds: Sequence[int] = (),
+        stdin_data: bytes | None = None,
     ) -> dict[str, Any]:
         if sys.platform == "darwin":
             sandbox = Path("/usr/bin/sandbox-exec")
@@ -109,6 +110,7 @@ class ProcessMixin:
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE if stdin_data is not None else None,
                 text=True,
                 start_new_session=True,
                 pass_fds=inherited_fds,
@@ -158,10 +160,19 @@ class ProcessMixin:
         os.close(start_write)
         timed_out = False
         deadline = time.monotonic() + (timeout_seconds or self.config.timeout_seconds)
+        input_text = stdin_data.decode("utf-8") if stdin_data is not None else None
+        input_pending = stdin_data is not None
         while True:
             remaining = deadline - time.monotonic()
             try:
-                stdout, stderr = process.communicate(timeout=max(0.01, min(0.1, remaining)))
+                if input_pending:
+                    input_pending = False
+                    stdout, stderr = process.communicate(
+                        input=input_text,
+                        timeout=max(0.01, min(0.1, remaining)),
+                    )
+                else:
+                    stdout, stderr = process.communicate(timeout=max(0.01, min(0.1, remaining)))
                 break
             except subprocess.TimeoutExpired:
                 if process.poll() is not None:
@@ -193,6 +204,8 @@ class ProcessMixin:
         timeout_seconds: int,
         pass_fds: Sequence[int],
         lifecycle_fds: Sequence[int],
+        *,
+        stdin_data: bytes | None = None,
     ) -> dict[str, Any]:
         return self._run_process(
             arguments,
@@ -202,6 +215,7 @@ class ProcessMixin:
             timeout_seconds=timeout_seconds,
             pass_fds=pass_fds,
             lifecycle_fds=lifecycle_fds,
+            stdin_data=stdin_data,
         )
 
     @staticmethod

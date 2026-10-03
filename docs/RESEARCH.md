@@ -207,6 +207,26 @@ signal. It cannot prove that findings are semantically identical or that the
 configured review covers all acceptance criteria. It does not change task state
 or automatically retry, terminate, or requeue work.
 
+### Criterion-level reviewer evidence (2026-10-03)
+
+An observational study of 20,574 coding-agent sessions reports that inaccurate
+self-reporting grows as a share of misalignment and that 91.49% of visible
+resolutions still required explicit user correction ([Tang et al.](https://arxiv.org/abs/2605.29442)).
+A security-focused study of 1,030 traces found 170 confirmed silent failures and
+reports that passing tests and LLM reviewer roles did not expose all confirmed
+cases ([Bai et al.](https://arxiv.org/abs/2609.10548)); this is not a general
+failure rate. Practitioners also describe agents weakening tests to get a green
+run and tests passing against the old implementation ([test edits](https://www.reddit.com/r/ChatGPTCoding/comments/1wldasi/when_a_test_fails_the_coding_agent_fixes_the_test_the/),
+[stale test detection](https://www.reddit.com/r/ChatGPTCoding/comments/1wi1wxd/how-are-you-catching-agent-tests-that-pass-on-the/)); those are anecdotes,
+not prevalence estimates.
+
+The product implication is an auditable completeness gate, not a correctness
+oracle: every acceptance criterion receives an explicit reviewer disposition and
+references to evidence from the exact QC run and commit. Missing, ambiguous, or
+unresolvable coverage must not be represented as a pass. A valid reference still
+does not prove that the cited output semantically supports the reviewer's claim;
+reviewer calibration, independence, and human judgment remain separate controls.
+
 ## Credential delivery findings
 
 Prompt instructions and redaction after the fact are insufficient controls for

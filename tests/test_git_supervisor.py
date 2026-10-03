@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import multiprocessing
 import os
@@ -16,7 +17,12 @@ from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
-from support import python_command, requires_linux_worker
+from support import (
+    install_passing_critic,
+    passing_critic_script,
+    python_command,
+    requires_linux_worker,
+)
 
 from agent_control_plane import worker_trampoline
 from agent_control_plane.git_supervisor import (
@@ -43,7 +49,7 @@ def write_config(
     repo: Path,
     qc_commands: list[str] | None = None,
     integration_commands: list[str] | None = None,
-    critic_command: str = "",
+    critic_command: str | None = None,
     require_critic: bool = False,
     timeout_seconds: int = 30,
     runtime_setup_commands: list[str] | None = None,
@@ -52,6 +58,9 @@ def write_config(
     attempts_root: Path | str | None = None,
     min_free_bytes: int | bool | str | None = None,
 ) -> None:
+    trust_root = None
+    if critic_command is None:
+        critic_command, trust_root = install_passing_critic(repo)
     qc = qc_commands if qc_commands is not None else [python_command("pass")]
     integration = integration_commands if integration_commands is not None else qc
     content = {
@@ -77,7 +86,8 @@ def write_config(
         else:
             serialized_min_free = str(min_free_bytes)
         worktree_lines.append(f"min_free_bytes = {serialized_min_free}\n")
-    (repo / "acp.toml").write_text(
+    config_path = repo / "acp.toml"
+    config_path.write_text(
         "[supervisor]\n"
         "lease_seconds = 60\n"
         f"qc_timeout_seconds = {timeout_seconds}\n"
@@ -95,6 +105,11 @@ def write_config(
         f"{port_lines}" + (f"\n[worktrees]\n{''.join(worktree_lines)}" if worktree_lines else ""),
         encoding="utf-8",
     )
+    if trust_root is not None:
+        with config_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n[trust]\nroot = {json.dumps(str(trust_root))}\nowner_uid = {os.geteuid()}\n"
+            )
 
 
 @pytest.fixture
@@ -547,13 +562,11 @@ def install_test_bundle(
 ) -> dict:
     source.mkdir(exist_ok=True)
     executable = source / "critic"
+    default_script = passing_critic_script().replace(
+        "\nimport json, os\n", f"\n# {message}\nimport json, os\n", 1
+    )
     executable.write_text(
-        script
-        or (
-            "#!/bin/sh\n"
-            f"# {message}\n"
-            'printf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n'
-        ),
+        script or default_script,
         encoding="utf-8",
     )
     executable.chmod(0o755)
@@ -568,7 +581,20 @@ def install_test_bundle(
 
 
 def configure_trust(repo: Path, root: Path) -> None:
-    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+    config_path = repo / "acp.toml"
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+    kept: list[str] = []
+    skipping_trust = False
+    for line in lines:
+        if line.strip() == "[trust]":
+            skipping_trust = True
+            continue
+        if skipping_trust and line.lstrip().startswith("["):
+            skipping_trust = False
+        if not skipping_trust:
+            kept.append(line)
+    config_path.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
+    with config_path.open("a", encoding="utf-8") as handle:
         handle.write(f"\n[trust]\nroot = {json.dumps(str(root))}\nowner_uid = {os.geteuid()}\n")
 
 
@@ -1742,9 +1768,152 @@ def test_builtin_independent_critic_runs_as_separate_process(repo: Path) -> None
     commit_change(attempt, "alpha.txt", "candidate\n")
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
     review = supervisor.run_qc(submission["id"], "independent-qc")
-    assert review["verdict"] == "pass"
+    assert review["verdict"] == "human_required"
+    assert {item["status"] for item in review["acceptance_coverage"]} == {"human_required"}
     assert len(review["command_results"]) == 2
     assert review["command_results"][-1]["command"] == "builtin:structural-critic"
+
+
+def test_qc_acceptance_coverage_is_visible_and_signed(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    assert review["verdict"] == "pass"
+    assert review["acceptance_coverage_contract_version"] == 2
+    assert len(review["acceptance_coverage"]) == 2
+    assert {item["status"] for item in review["acceptance_coverage"]} == {"pass"}
+    assert all(item["evidence_refs"] for item in review["acceptance_coverage"])
+    bundle = supervisor.reproduction_bundle(review["id"])
+    assert bundle["signature_valid"] is True
+    assert bundle["bundle"]["acceptance_coverage"] == review["acceptance_coverage"]
+    assert bundle["bundle"]["acceptance_coverage_contract_version"] == 2
+
+
+def test_qc_records_deleted_changed_paths_as_evidence(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    (Path(attempt["worktree"]) / "alpha.txt").unlink()
+    git(Path(attempt["worktree"]), "add", "-A")
+    git(Path(attempt["worktree"]), "commit", "-m", "remove alpha")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    assert review["verdict"] == "pass"
+    packet_path = supervisor.state_dir / "logs" / f"review-{submission['id']}-{review['id']}.json"
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    deletion = next(item for item in packet["evidence_catalog"] if item["kind"] == "deleted_path")
+    assert deletion["path"] == "alpha.txt"
+    assert deletion["commit_sha"] == submission["commit_sha"]
+    assert deletion["previous_git_object_oid"]
+
+
+def test_pass_verdict_cannot_override_unknown_criterion_coverage(repo: Path) -> None:
+    trust_root = repo.parent / f"unknown-coverage-trust-{repo.name}"
+    source = repo.parent / f"unknown-coverage-source-{repo.name}"
+    script = passing_critic_script().replace("'status': 'pass'", "'status': 'unknown'")
+    install_test_bundle(source, trust_root, "v1", "unknown criterion disposition", script)
+    write_config(repo, critic_command="trusted:critic", require_critic=True)
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    assert review["verdict"] == "human_required"
+    assert {item["status"] for item in review["acceptance_coverage"]} == {"unknown"}
+    assert supervisor.task(created["id"])["status"] == "blocked"
+
+
+def test_critic_packet_mutation_is_blocked_and_original_is_restored(repo: Path) -> None:
+    trust_root = repo.parent / f"packet-mutation-trust-{repo.name}"
+    source = repo.parent / f"packet-mutation-source-{repo.name}"
+    script = passing_critic_script().replace(
+        "evidence_id = packet['evidence_catalog'][0]['id']\n",
+        "evidence_id = packet['evidence_catalog'][0]['id']\n"
+        "packet_path = Path(os.environ['ACP_REVIEW_PACKET_ARCHIVE'])\n"
+        "packet_path.unlink()\n"
+        "packet_path.mkdir()\n"
+        "(packet_path / 'tampered').write_text('altered')\n",
+        1,
+    )
+    install_test_bundle(source, trust_root, "v1", "mutates review packet", script)
+    write_config(repo, critic_command="trusted:critic", require_critic=True)
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    packet_path = supervisor.state_dir / "logs" / f"review-{submission['id']}-{review['id']}.json"
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    bundle = supervisor.reproduction_bundle(review["id"])
+    packet_hash = hashlib.sha256(packet_path.read_bytes()).hexdigest()
+    assert review["verdict"] == "block"
+    assert review["acceptance_coverage"]
+    assert "modified or removed" in review["findings"][0]["finding"]
+    assert packet["task"]["acceptance_criteria"]
+    assert packet_hash == review["review_packet_sha256"]
+    assert bundle["bundle"]["packet_sha256"] == packet_hash
+    quarantined = list(packet_path.parent.glob(f"{packet_path.name}.tampered-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "tampered").read_text(encoding="utf-8") == "altered"
+
+
+def test_missing_independent_critic_is_explicitly_unassessed(repo: Path) -> None:
+    write_config(repo, critic_command="")
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    assert review["verdict"] == "human_required"
+    assert {item["status"] for item in review["acceptance_coverage"]} == {"unknown"}
+    assert "not assessed" in review["findings"][0]["finding"]
+    assert supervisor.task(created["id"])["status"] == "blocked"
+
+
+def test_malformed_acceptance_coverage_fails_closed(repo: Path) -> None:
+    trust_root = repo.parent / f"malformed-coverage-trust-{repo.name}"
+    source = repo.parent / f"malformed-coverage-source-{repo.name}"
+    script = passing_critic_script().replace(
+        "Path(os.environ['ACP_REVIEW_RESULT']).write_text(json.dumps({",
+        "coverage[1]['criterion_id'] = coverage[0]['criterion_id']\n"
+        "Path(os.environ['ACP_REVIEW_RESULT']).write_text(json.dumps({",
+        1,
+    )
+    install_test_bundle(source, trust_root, "v1", "duplicate acceptance ID", script)
+    write_config(repo, critic_command="trusted:critic", require_critic=True)
+    configure_trust(repo, trust_root)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    review = supervisor.run_qc(submission["id"], "independent-qc")
+
+    assert review["verdict"] == "block"
+    assert {item["status"] for item in review["acceptance_coverage"]} == {"unknown"}
+    assert any(
+        "duplicate acceptance criterion ID" in item["evidence"] for item in review["findings"]
+    )
+    assert supervisor.task(created["id"])["status"] == "blocked"
 
 
 def test_candidate_cannot_shadow_builtin_critic(repo: Path) -> None:
@@ -1863,7 +2032,7 @@ def test_critic_must_create_fresh_unique_result(repo: Path) -> None:
     stale = supervisor.state_dir / "logs" / f"critic-{submission['id']}.json"
     stale.write_text('{"verdict":"pass","findings":[]}', encoding="utf-8")
     review = supervisor.run_qc(submission["id"], "independent-qc")
-    assert review["verdict"] == "revise"
+    assert review["verdict"] == "block"
     assert review["findings"][0]["finding"] == "QC execution failed"
 
 
@@ -3175,10 +3344,12 @@ def test_trusted_external_critic_cannot_leave_a_detached_child(repo: Path) -> No
     marker = repo / "critic-detached-child"
     trust_root = repo.parent / "critic-containment-trust"
     source = repo.parent / "critic-containment-source"
-    script = (
-        "#!/bin/sh\n"
-        f"(/bin/sleep 1; /usr/bin/touch '{marker}') >/dev/null 2>&1 &\n"
-        'printf \'{"verdict":"pass","findings":[]}\' > "$ACP_REVIEW_RESULT"\n'
+    script = passing_critic_script().replace(
+        "\nimport json, os\n",
+        "\nimport json, os, subprocess\n"
+        f"subprocess.Popen(['/bin/sh', '-c', '/bin/sleep 1; /usr/bin/touch {str(marker)!r}'], "
+        "start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n",
+        1,
     )
     install_test_bundle(source, trust_root, "v1", "daemon critic", script)
     configure_trust(repo, trust_root)

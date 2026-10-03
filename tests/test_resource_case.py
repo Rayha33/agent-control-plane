@@ -451,6 +451,9 @@ def test_the_qc_review_packet_field_holds_what_its_name_says(repo: Path) -> None
     stubbed (it only shells out for a diff and a stat, neither of which this is about).
     """
 
+    (repo / "Makefile").write_text("all:\n\ttrue\n", encoding="utf-8")
+    git(repo, "add", "Makefile")
+    git(repo, "commit", "-m", "add Makefile")
     supervisor = GitSupervisor(repo)
     created = make_task(supervisor, "Makefile")
     with supervisor.connect() as connection:
@@ -461,14 +464,15 @@ def test_the_qc_review_packet_field_holds_what_its_name_says(repo: Path) -> None
             return ""
 
     stub = Stubbed(repo)
+    head = git(repo, "rev-parse", "HEAD")
     submission = {
         "id": "sub-1",
-        "commit_sha": "0" * 40,
-        "tree_sha": "1" * 40,
+        "commit_sha": head,
+        "tree_sha": head,
         "patch_sha256": "2" * 64,
         "changed_paths_json": json.dumps(["Makefile"]),
     }
-    packet = stub._review_packet(task, submission, repo)
+    packet = stub._review_packet(task, submission, repo, "run-1")
 
     # the field says "declared", so it must carry what the operator declared
     assert packet["task"]["declared_resources"] == ["Makefile"]
