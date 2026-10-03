@@ -1,9 +1,19 @@
 # Per-attempt worker sandbox decision
 
 **Status:** proposed end-to-end architecture. Standalone bounded snapshot and
-change-set primitives are implemented, but they are not integrated into a
-worker executor or registered-worktree import. End-to-end proof remains
-incomplete. This record does not authorize `externalSandbox` for ACP workers.
+change-set primitives, including exact host-side manifest replay validation,
+are implemented, but they are not integrated into a worker executor or
+registered-worktree import. End-to-end proof remains incomplete. This record
+does not authorize `externalSandbox` for ACP workers.
+
+The current replay helper reconstructs and compares the complete result
+manifest; it does not write files, create Git objects, mutate a registered
+worktree, or journal/recover an import. Directory changes are represented so
+empty directories affect the result digest. A newly created parent directory
+may inherit authorization only from a directly authorized changed leaf below
+it; a removed directory may inherit it only when every removed descendant leaf
+is directly authorized. Standalone empty-directory changes require an explicit
+write-set grant.
 
 ## Decision
 

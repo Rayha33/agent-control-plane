@@ -12,6 +12,7 @@ import agent_control_plane.supervisor.sandbox_workspace as sandbox_workspace
 from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.sandbox_workspace import (
     SnapshotLimits,
+    apply_changes_to_manifest,
     collect_changes,
     copy_snapshot,
 )
@@ -589,6 +590,137 @@ def test_collect_changes_captures_create_modify_delete_rename_binary_exec_and_sy
     )
     assert changes.digest == repeated.digest
     changes.validate()
+
+
+def test_change_set_replays_directory_only_changes_to_exact_result_manifest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "registered"
+    source.mkdir()
+    (source / "old-empty").mkdir()
+    baseline = copy_snapshot(source, tmp_path / "baseline").manifest
+    output = copy_snapshot(source, tmp_path / "output").root
+    (output / "old-empty").rmdir()
+    (output / "new-empty").mkdir()
+
+    changes = collect_changes(baseline, output, write_set_rules=_all_paths())
+    by_path = {change.path: change for change in changes.changes}
+    assert by_path["old-empty"].action == "delete"
+    assert by_path["old-empty"].kind == "directory"
+    assert by_path["new-empty"].action == "create"
+    assert by_path["new-empty"].kind == "directory"
+    assert (
+        apply_changes_to_manifest(baseline, changes)
+        == copy_snapshot(output, tmp_path / "expected").manifest
+    )
+
+
+def test_manifest_replay_rejects_change_set_missing_empty_directory_operation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "registered"
+    source.mkdir()
+    baseline = copy_snapshot(source, tmp_path / "baseline").manifest
+    output = copy_snapshot(source, tmp_path / "output").root
+    (output / "empty").mkdir()
+    complete = collect_changes(baseline, output, write_set_rules=_all_paths())
+    assert [change.path for change in complete.changes] == ["empty"]
+
+    incomplete = sandbox_workspace._make_change_set(
+        complete.baseline_digest,
+        complete.result_digest,
+        (),
+        0,
+    )
+    assert _codes(apply_changes_to_manifest, baseline, incomplete) == "incomplete_change_set"
+
+
+def test_change_set_replay_applies_directory_type_transitions_bottom_up(
+    tmp_path: Path,
+) -> None:
+    directory_source = tmp_path / "directory-source"
+    directory_source.mkdir()
+    (directory_source / "slot").mkdir()
+    (directory_source / "slot" / "child.txt").write_text("child\n")
+    directory_baseline = copy_snapshot(directory_source, tmp_path / "directory-baseline").manifest
+    file_output = copy_snapshot(directory_source, tmp_path / "file-output").root
+    (file_output / "slot" / "child.txt").unlink()
+    (file_output / "slot").rmdir()
+    (file_output / "slot").write_text("replacement\n")
+    directory_to_file = collect_changes(
+        directory_baseline,
+        file_output,
+        write_set_rules=_all_paths(),
+    )
+    assert [change.path for change in directory_to_file.changes] == ["slot", "slot/child.txt"]
+    assert (
+        apply_changes_to_manifest(directory_baseline, directory_to_file)
+        == copy_snapshot(file_output, tmp_path / "file-expected").manifest
+    )
+
+    file_source = tmp_path / "file-source"
+    file_source.mkdir()
+    (file_source / "slot").write_text("original\n")
+    file_baseline = copy_snapshot(file_source, tmp_path / "file-baseline").manifest
+    directory_output = copy_snapshot(file_source, tmp_path / "directory-output").root
+    (directory_output / "slot").unlink()
+    (directory_output / "slot").mkdir()
+    (directory_output / "slot" / "child.txt").write_text("child\n")
+    file_to_directory = collect_changes(
+        file_baseline,
+        directory_output,
+        write_set_rules=_all_paths(),
+    )
+    assert (
+        apply_changes_to_manifest(file_baseline, file_to_directory)
+        == copy_snapshot(directory_output, tmp_path / "directory-expected").manifest
+    )
+
+
+def test_write_set_allows_only_structural_directories_for_claimed_leaves(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "registered"
+    source.mkdir()
+    baseline = copy_snapshot(source, tmp_path / "baseline").manifest
+    output = copy_snapshot(source, tmp_path / "output").root
+    nested = output / "src" / "generated"
+    nested.mkdir(parents=True)
+    (nested / "result.txt").write_text("claimed result\n")
+    rules = [("src/generated/result.txt", False, False)]
+
+    changes = collect_changes(baseline, output, write_set_rules=rules)
+    assert (
+        apply_changes_to_manifest(baseline, changes)
+        == copy_snapshot(output, tmp_path / "expected").manifest
+    )
+
+    (output / "unclaimed-empty").mkdir()
+    assert _codes(collect_changes, baseline, output, write_set_rules=rules) == "undeclared_write"
+
+
+def test_write_set_allows_directory_removal_only_for_claimed_descendant_deletions(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "registered"
+    source.mkdir()
+    (source / "nested" / "deep").mkdir(parents=True)
+    (source / "nested" / "deep" / "result.txt").write_text("remove me\n")
+    baseline = copy_snapshot(source, tmp_path / "baseline").manifest
+    output = copy_snapshot(source, tmp_path / "output").root
+    (output / "nested" / "deep" / "result.txt").unlink()
+    (output / "nested" / "deep").rmdir()
+    (output / "nested").rmdir()
+
+    changes = collect_changes(
+        baseline,
+        output,
+        write_set_rules=[("nested/deep/result.txt", False, False)],
+    )
+    assert (
+        apply_changes_to_manifest(baseline, changes)
+        == copy_snapshot(output, tmp_path / "expected").manifest
+    )
 
 
 def test_collect_changes_uses_existing_case_sensitive_write_set_rules(tmp_path: Path) -> None:

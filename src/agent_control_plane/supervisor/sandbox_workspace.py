@@ -254,7 +254,7 @@ class ChangeSet:
                 raise SupervisorError("workspace_limit_exceeded", "change path is too deep")
             if change.action not in {"create", "modify", "delete"}:
                 raise SupervisorError("invalid_change_set", "change set action is invalid")
-            if change.kind not in {"file", "symlink"}:
+            if change.kind not in {"file", "directory", "symlink"}:
                 raise SupervisorError("invalid_change_set", "change set node type is invalid")
             if change.action == "delete":
                 if change.content or change.symlink_target or change.mode:
@@ -266,6 +266,11 @@ class ChangeSet:
                     or len(change.content) > limits.max_file_bytes
                 ):
                     raise SupervisorError("invalid_change_set", "file change metadata is invalid")
+            elif change.kind == "directory":
+                if change.content or change.symlink_target or change.mode != 0o755:
+                    raise SupervisorError(
+                        "invalid_change_set", "directory change metadata is invalid"
+                    )
             elif (
                 change.content
                 or change.mode != 0o777
@@ -445,7 +450,7 @@ def collect_changes(
     limits: SnapshotLimits = _DEFAULT_LIMITS,
     path_matches: Callable[..., bool] | None = None,
 ) -> ChangeSet:
-    """Capture bounded output and validate every changed leaf against write-set rules.
+    """Capture bounded output and validate every changed path against write-set rules.
 
     Worker .git metadata at the output root is ignored and never parsed. Worker
     object IDs, configuration, hooks, filters, and hashes are not consumed.
@@ -473,11 +478,8 @@ def collect_changes(
         _assert_source_stable(parent_fd, name, os.fstat(root_fd))
         result_manifest = _make_manifest(tuple(state.entries or ()), state.total_bytes)
         result_manifest.validate(limits)
-
-        after = {
-            entry.path: entry for entry in result_manifest.entries if entry.kind != "directory"
-        }
-        before = {entry.path: entry for entry in baseline.entries if entry.kind != "directory"}
+        after = {entry.path: entry for entry in result_manifest.entries}
+        before = {entry.path: entry for entry in baseline.entries}
         rules = tuple(write_set_rules)
         if any(
             not isinstance(rule, (tuple, list))
@@ -490,15 +492,60 @@ def collect_changes(
             raise SupervisorError("invalid_write_set", "declared write-set rules are invalid")
         matcher = path_matches or _existing_write_set_matcher
         changes: list[Change] = []
-        for path in sorted(set(before) | set(after), key=lambda value: value.encode("utf-8")):
-            previous = before.get(path)
-            current = after.get(path)
-            if previous == current:
-                continue
-            if not any(
+        changed_paths = [
+            path
+            for path in sorted(set(before) | set(after), key=lambda value: value.encode("utf-8"))
+            if before.get(path) != after.get(path)
+        ]
+        directly_authorized = {
+            path: any(
                 matcher(path, resource, fold=fold, is_logical=is_logical)
                 for resource, fold, is_logical in rules
+            )
+            for path in changed_paths
+        }
+        for path in changed_paths:
+            previous = before.get(path)
+            current = after.get(path)
+            authorized = directly_authorized[path]
+            if (
+                not authorized
+                and previous is None
+                and current is not None
+                and current.kind == "directory"
             ):
+                # A new nonempty parent directory is structural when it only
+                # contains a directly authorized changed leaf. Empty directory
+                # creation still needs an explicit write-set grant.
+                authorized = any(
+                    candidate.startswith(path + "/")
+                    and before.get(candidate) is None
+                    and after.get(candidate) is not None
+                    and after[candidate].kind != "directory"
+                    and directly_authorized[candidate]
+                    for candidate in changed_paths
+                )
+            if (
+                not authorized
+                and previous is not None
+                and previous.kind == "directory"
+                and current is None
+            ):
+                # Removing a directory is structural only when every changed
+                # leaf below it is an explicitly authorized deletion. An empty
+                # directory deletion still needs an explicit grant.
+                descendant_leaves = [
+                    candidate
+                    for candidate in changed_paths
+                    if candidate.startswith(path + "/")
+                    and before.get(candidate) is not None
+                    and before[candidate].kind != "directory"
+                ]
+                authorized = bool(descendant_leaves) and all(
+                    after.get(candidate) is None and directly_authorized[candidate]
+                    for candidate in descendant_leaves
+                )
+            if not authorized:
                 raise SupervisorError(
                     "undeclared_write",
                     f"worker result path {path!r} is outside the declared write set",
@@ -506,6 +553,8 @@ def collect_changes(
             action = "create" if previous is None else "delete" if current is None else "modify"
             if current is None:
                 changes.append(Change(path, action, previous.kind))
+            elif current.kind == "directory":
+                changes.append(Change(path, action, "directory", 0o755))
             elif current.kind == "file":
                 content = (state.changed_content or {}).get(path)
                 if content is None or sha256(content) != current.content_sha256:
@@ -529,10 +578,91 @@ def collect_changes(
             state.changed_bytes,
         )
         change_set.validate(limits)
+        reconstructed = apply_changes_to_manifest(baseline, change_set, limits=limits)
+        if reconstructed != result_manifest:
+            raise SupervisorError(
+                "incomplete_change_set", "change set did not reproduce captured worker output"
+            )
         return change_set
     finally:
         os.close(root_fd)
         os.close(parent_fd)
+
+
+def apply_changes_to_manifest(
+    baseline: TreeManifest,
+    change_set: ChangeSet,
+    *,
+    limits: SnapshotLimits = _DEFAULT_LIMITS,
+) -> TreeManifest:
+    """Rebuild and verify the exact result manifest from a baseline and changes.
+
+    This is a host-side validation primitive, not a filesystem or Git importer.
+    It proves that the declared change set is complete enough to reproduce the
+    worker result digest, including directory-only changes.
+    """
+
+    baseline.validate(limits)
+    change_set.validate(limits)
+    if baseline.digest != change_set.baseline_digest:
+        raise SupervisorError("stale_worker_result", "change set baseline does not match")
+
+    entries = {entry.path: entry for entry in baseline.entries}
+    for change in change_set.changes:
+        existing = entries.get(change.path)
+        if change.action == "create" and existing is not None:
+            raise SupervisorError("invalid_change_set", "create change already exists in baseline")
+        if change.action in {"modify", "delete"} and existing is None:
+            raise SupervisorError("invalid_change_set", "change path is absent from baseline")
+
+    # Remove old nodes deepest-first so directory deletions and type changes do
+    # not leave descendants under a non-directory parent during reconstruction.
+    removals = sorted(
+        (change for change in change_set.changes if change.action in {"modify", "delete"}),
+        key=lambda change: (-change.path.count("/"), change.path.encode("utf-8")),
+    )
+    for change in removals:
+        entries.pop(change.path)
+
+    additions = sorted(
+        (change for change in change_set.changes if change.action != "delete"),
+        key=lambda change: (change.path.count("/"), change.path.encode("utf-8")),
+    )
+    for change in additions:
+        if change.kind == "directory":
+            entry = ManifestEntry(change.path, "directory", 0o755)
+        elif change.kind == "file":
+            entry = ManifestEntry(
+                change.path,
+                "file",
+                change.mode,
+                len(change.content),
+                sha256(change.content),
+            )
+        else:
+            entry = ManifestEntry(
+                change.path,
+                "symlink",
+                0o777,
+                len(change.symlink_target.encode("utf-8")),
+                "",
+                change.symlink_target,
+            )
+        if change.path in entries:
+            raise SupervisorError("path_collision", "change set result contains a path collision")
+        entries[change.path] = entry
+
+    ordered = tuple(sorted(entries.values(), key=lambda entry: entry.path.encode("utf-8")))
+    _validate_tree_shape(ordered)
+    _validate_symlink_graph(ordered)
+    total_bytes = sum(entry.size for entry in ordered if entry.kind in {"file", "symlink"})
+    result = _make_manifest(ordered, total_bytes)
+    result.validate(limits)
+    if result.digest != change_set.result_digest:
+        raise SupervisorError(
+            "incomplete_change_set", "change set does not reproduce the declared result digest"
+        )
+    return result
 
 
 def _walk_tree(
