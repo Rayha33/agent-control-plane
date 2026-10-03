@@ -572,6 +572,7 @@ class Scheduler:
                     "priority": task["priority"],
                     "submission_id": submission["id"],
                     "commit_sha": submission["commit_sha"],
+                    "completion_receipt": self.supervisor._completion_receipt_view(submission),
                     "changed_paths": sorted(changed),
                     "conflicts_with": conflicts_with,
                     "predicted_conflict_paths": sorted(conflict_paths),

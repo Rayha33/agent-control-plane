@@ -841,6 +841,316 @@ def test_submit_accepts_an_unchanged_dirty_base_checkout(repo: Path) -> None:
     ) == "pre-existing untracked secret\n"
 
 
+def _commit_result_manifest(
+    supervisor: GitSupervisor,
+    manifest: dict | str,
+    *,
+    artifacts: dict[str, str] | None = None,
+    symlinks: dict[str, str] | None = None,
+    credential: str | None = None,
+) -> tuple[dict, dict]:
+    created = supervisor.create_task(
+        "submit a bounded completion receipt",
+        "Change the candidate and report paths only.",
+        ["The immutable receipt resolves to the submitted commit"],
+        ["beta.txt", "reports/**"],
+    )
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "beta.txt").write_text("candidate\n", encoding="utf-8")
+    for path, content in (artifacts or {}).items():
+        destination = worktree / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    for path, target in (symlinks or {}).items():
+        destination = worktree / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(target)
+    manifest_path = worktree / "reports" / "result-manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(manifest, dict):
+        for artifact in manifest.get("artifacts", []):
+            if (
+                isinstance(artifact, dict)
+                and artifact.get("blob_oid") == "PENDING"
+                and isinstance(artifact.get("path"), str)
+                and (worktree / artifact["path"]).is_file()
+            ):
+                artifact["blob_oid"] = git(worktree, "hash-object", artifact["path"])
+        text_manifest = json.dumps(manifest)
+    else:
+        text_manifest = manifest
+    manifest_path.write_text(text_manifest, encoding="utf-8")
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-m", "submit result manifest")
+    return attempt, {
+        "commit": git(worktree, "rev-parse", "HEAD"),
+        "credential": credential,
+        "task_id": created["id"],
+        "worktree": worktree,
+        "base_sha": created["base_sha"],
+    }
+
+
+def test_completion_receipt_is_commit_pinned_and_survives_worktree_cleanup(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    artifact_content = "The substantive findings stay in this tracked file.\n"
+    attempt, context = _commit_result_manifest(
+        supervisor,
+        {
+            "version": 1,
+            "summary": "Audit complete; see the findings table.",
+            "artifacts": [
+                {
+                    "path": "reports/findings.md",
+                    "blob_oid": "PENDING",
+                }
+            ],
+        },
+        artifacts={"reports/findings.md": artifact_content},
+    )
+    worktree = context["worktree"]
+    expected_oid = git(worktree, "rev-parse", "HEAD:reports/findings.md")
+
+    submission = supervisor.submit(
+        attempt["id"], attempt["claim_token"], result_manifest_path="reports/result-manifest.json"
+    )
+    receipt = submission["completion_receipt"]
+    assert receipt == {
+        "state": "provided",
+        "version": 1,
+        "summary": "Audit complete; see the findings table.",
+        "manifest_path": "reports/result-manifest.json",
+        "manifest_blob_oid": git(
+            repo, "rev-parse", f"{context['commit']}:reports/result-manifest.json"
+        ),
+        "artifacts": [
+            {
+                "path": "reports/findings.md",
+                "blob_oid": expected_oid,
+                "size_bytes": len(artifact_content.encode("utf-8")),
+            }
+        ],
+    }
+    assert artifact_content not in json.dumps(receipt)
+    qc = supervisor.run_qc(submission["id"], "independent-qc")
+    assert qc["verdict"] == "pass"
+    (worktree / "reports/findings.md").write_text("uncommitted replacement\n", encoding="utf-8")
+
+    if worktree.exists():
+        git(repo, "worktree", "remove", "--force", str(worktree))
+    reopened = GitSupervisor(repo)
+    reopened_submission = reopened.submission(submission["id"])
+    assert reopened_submission["completion_receipt"] == receipt
+    task_view = reopened.task(context["task_id"])
+    assert task_view["latest_submission"]["completion_receipt"] == receipt
+    status_entry = next(
+        item for item in reopened.status()["tasks"] if item["task_id"] == context["task_id"]
+    )
+    assert status_entry["completion_receipt"] == receipt
+    assert artifact_content not in json.dumps(status_entry)
+    merge_entry = next(
+        item for item in reopened.merge_plan()["order"] if item["task_id"] == context["task_id"]
+    )
+    assert merge_entry["completion_receipt"] == receipt
+    assert git(repo, "show", f"{context['commit']}:reports/findings.md") == artifact_content.strip()
+
+
+@pytest.mark.parametrize(
+    ("manifest", "artifacts", "credential"),
+    [
+        ('{"version":', {}, None),
+        ("[" * 1500 + "]" * 1500, {}, None),
+        (
+            {
+                "version": 1,
+                "summary": "Traversal must fail.",
+                "artifacts": [{"path": "../outside", "blob_oid": "0" * 40}],
+            },
+            {},
+            None,
+        ),
+        (
+            {
+                "version": 1,
+                "summary": "Path bytes are bounded.",
+                "artifacts": [{"path": "reports/" + "x" * 1025, "blob_oid": "0" * 40}],
+            },
+            {},
+            None,
+        ),
+        (
+            {
+                "version": 1,
+                "summary": "Missing file must fail.",
+                "artifacts": [{"path": "reports/missing.md", "blob_oid": "0" * 40}],
+            },
+            {},
+            None,
+        ),
+        (
+            {
+                "version": 1,
+                "summary": "Digest must match candidate content.",
+                "artifacts": [{"path": "reports/findings.md", "blob_oid": "0" * 40}],
+            },
+            {"reports/findings.md": "actual content\n"},
+            None,
+        ),
+        (
+            {
+                "version": 1,
+                "summary": "Duplicate refs must fail.",
+                "artifacts": [
+                    {"path": "reports/findings.md", "blob_oid": "PENDING"},
+                    {"path": "reports/findings.md", "blob_oid": "PENDING"},
+                ],
+            },
+            {"reports/findings.md": "body\n"},
+            None,
+        ),
+        (
+            {
+                "version": 1,
+                "summary": "secret-token must not be recorded",
+                "artifacts": [{"path": "reports/findings.md", "blob_oid": "0" * 40}],
+            },
+            {"reports/findings.md": "body\n"},
+            "secret-token",
+        ),
+        (
+            {
+                "version": 1,
+                "summary": "x" * (4 * 1024 + 1),
+                "artifacts": [{"path": "reports/findings.md", "blob_oid": "0" * 40}],
+            },
+            {"reports/findings.md": "body\n"},
+            None,
+        ),
+        (
+            {
+                "version": 1,
+                "summary": "Too many references.",
+                "artifacts": [
+                    {"path": f"reports/{index}.md", "blob_oid": "0" * 40} for index in range(17)
+                ],
+            },
+            {},
+            None,
+        ),
+        (" " * (64 * 1024 + 1), {}, None),
+    ],
+)
+def test_completion_receipt_rejects_invalid_or_unbounded_manifests(
+    repo: Path,
+    manifest: dict | str,
+    artifacts: dict[str, str],
+    credential: str | None,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt, context = _commit_result_manifest(
+        supervisor,
+        manifest,
+        artifacts=artifacts,
+        credential=credential,
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(
+            attempt["id"],
+            attempt["claim_token"],
+            context["credential"],
+            result_manifest_path="reports/result-manifest.json",
+        )
+
+    assert error.value.code == "invalid_result_manifest"
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+
+
+def test_ordinary_submit_reports_completion_receipt_as_not_provided(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "beta.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "beta.txt", "candidate\n")
+
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert submission["completion_receipt"] == {"state": "not_provided"}
+
+
+def test_completion_receipt_rejects_symlink_artifacts(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt, _context = _commit_result_manifest(
+        supervisor,
+        {
+            "version": 1,
+            "summary": "Symlinks are not artifacts.",
+            "artifacts": [{"path": "reports/link.md", "blob_oid": "0" * 40}],
+        },
+        symlinks={"reports/link.md": "findings.md"},
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(
+            attempt["id"],
+            attempt["claim_token"],
+            result_manifest_path="reports/result-manifest.json",
+        )
+
+    assert error.value.code == "invalid_result_manifest"
+
+
+@pytest.mark.parametrize(
+    ("artifact_count", "reported_size"),
+    [
+        (1, 64 * 1024 * 1024 + 1),
+        (5, 52 * 1024 * 1024),
+    ],
+)
+def test_completion_receipt_enforces_artifact_size_limits(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_count: int,
+    reported_size: int,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    artifact_paths = [f"reports/findings-{index}.md" for index in range(artifact_count)]
+    attempt, context = _commit_result_manifest(
+        supervisor,
+        {
+            "version": 1,
+            "summary": "Exercise byte limits without materializing large test blobs.",
+            "artifacts": [{"path": path, "blob_oid": "PENDING"} for path in artifact_paths],
+        },
+        artifacts={path: "tiny fixture\n" for path in artifact_paths},
+    )
+    artifact_oids = {
+        git(context["worktree"], "rev-parse", f"HEAD:{path}") for path in artifact_paths
+    }
+    original_git_text = supervisor._git_text
+
+    def synthetic_sizes(*arguments: str) -> str:
+        if len(arguments) == 3 and arguments[:2] == ("cat-file", "-s"):
+            if arguments[2] in artifact_oids:
+                return str(reported_size)
+        return original_git_text(*arguments)
+
+    monkeypatch.setattr(supervisor, "_git_text", synthetic_sizes)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._completion_receipt_json(
+            context["commit"],
+            ["reports/result-manifest.json"],
+            "reports/result-manifest.json",
+            None,
+        )
+
+    assert error.value.code == "invalid_result_manifest"
+    assert supervisor.attempt(attempt["id"])["status"] == "working"
+
+
 @pytest.mark.parametrize("mutation", ["tracked", "staged", "hidden_tracked", "untracked"])
 def test_submit_rejects_base_checkout_source_mutation_without_cleanup(
     repo: Path, mutation: str

@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from support import requires_linux_worker
 
 from agent_control_plane import cli
 from agent_control_plane.trust_bundles import install_bundle
@@ -65,6 +66,177 @@ def test_quarantine_recovery_accepts_only_non_argv_credential_sources() -> None:
                 "plaintext-secret",
             ]
         )
+
+
+def test_cli_submit_and_run_accept_a_result_manifest_path() -> None:
+    submit = cli.parser().parse_args(
+        [
+            "submit",
+            "attempt-1",
+            "--token",
+            "7",
+            "--result-manifest",
+            "reports/result-manifest.json",
+        ]
+    )
+    assert submit.result_manifest == "reports/result-manifest.json"
+
+    run = cli.parser().parse_args(
+        [
+            "run",
+            "--token",
+            "8",
+            "--result-manifest",
+            "reports/result-manifest.json",
+            "attempt-1",
+            "--",
+            "python",
+            "worker.py",
+        ]
+    )
+    assert run.result_manifest == "reports/result-manifest.json"
+    assert run.command == ["python", "worker.py"]
+
+
+def test_cli_submit_persists_a_bounded_completion_receipt(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "CLI completion receipt", "owned.txt", "--resource", "reports/**")
+    claimed = json.loads(run_cli(repo, "claim", task["id"], "--agent", "cli-worker").stdout)
+    worktree = Path(claimed["worktree"])
+    report = worktree / "reports" / "findings.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("Keep this complete report out of the receipt.\n", encoding="utf-8")
+    report_oid = subprocess.run(
+        ["git", "-C", str(worktree), "hash-object", str(report)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    manifest = worktree / "reports" / "result-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "summary": "CLI task complete.",
+                "artifacts": [{"path": "reports/findings.md", "blob_oid": report_oid}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(worktree), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(worktree), "commit", "-m", "complete report"], check=True)
+
+    completed = run_cli(
+        repo,
+        "submit",
+        claimed["id"],
+        "--token",
+        str(claimed["claim_token"]),
+        "--result-manifest",
+        "reports/result-manifest.json",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    receipt = json.loads(completed.stdout)["completion_receipt"]
+    assert receipt["state"] == "provided"
+    assert receipt["summary"] == "CLI task complete."
+    assert receipt["artifacts"][0]["blob_oid"] == report_oid
+    assert "Keep this complete report" not in completed.stdout
+
+
+@requires_linux_worker
+def test_cli_run_passes_result_manifest_to_supervised_submit(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "Supervised completion receipt", "owned.txt", "--resource", "reports/**")
+    claimed = json.loads(run_cli(repo, "claim", task["id"], "--agent", "cli-worker").stdout)
+    worker_script = (
+        "import json, subprocess\n"
+        "from pathlib import Path\n"
+        "report = Path('reports/findings.md')\n"
+        "report.parent.mkdir(parents=True, exist_ok=True)\n"
+        "report.write_text('Persist this report in the commit.\\n', encoding='utf-8')\n"
+        "blob_oid = subprocess.check_output(['git', 'hash-object', str(report)], text=True).strip()\n"
+        "Path('reports/result-manifest.json').write_text(json.dumps({\n"
+        "  'version': 1, 'summary': 'Supervised task complete.',\n"
+        "  'artifacts': [{'path': 'reports/findings.md', 'blob_oid': blob_oid}]\n"
+        "}), encoding='utf-8')\n"
+        "subprocess.run(['git', 'add', '-A'], check=True)\n"
+        "subprocess.run(['git', 'commit', '-m', 'write supervised result'], check=True)\n"
+    )
+
+    completed = run_cli(
+        repo,
+        "run",
+        "--token",
+        str(claimed["claim_token"]),
+        "--result-manifest",
+        "reports/result-manifest.json",
+        claimed["id"],
+        "--",
+        sys.executable,
+        "-c",
+        worker_script,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    receipt = json.loads(completed.stdout)["completion_receipt"]
+    assert receipt["state"] == "provided"
+    assert receipt["summary"] == "Supervised task complete."
+    assert receipt["artifacts"][0]["path"] == "reports/findings.md"
+
+
+def test_cli_run_forwards_result_manifest_to_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = _repo(tmp_path)
+    observed: dict = {}
+
+    def fake_run_worker(
+        _supervisor,
+        attempt_id: str,
+        claim_token: int,
+        command: list[str],
+        credential: str | None = None,
+        result_manifest_path: str | None = None,
+    ) -> dict:
+        observed.update(
+            {
+                "attempt_id": attempt_id,
+                "claim_token": claim_token,
+                "command": command,
+                "credential": credential,
+                "result_manifest_path": result_manifest_path,
+            }
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(cli.GitSupervisor, "run_worker", fake_run_worker)
+
+    result = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "run",
+            "--token",
+            "8",
+            "--result-manifest",
+            "reports/result-manifest.json",
+            "attempt-1",
+            "--",
+            "python",
+            "worker.py",
+        ]
+    )
+    capsys.readouterr()
+
+    assert result == 0
+    assert observed == {
+        "attempt_id": "attempt-1",
+        "claim_token": 8,
+        "command": ["python", "worker.py"],
+        "credential": None,
+        "result_manifest_path": "reports/result-manifest.json",
+    }
 
 
 def test_cli_init_create_claim_and_doctor(tmp_path: Path) -> None:
