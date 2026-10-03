@@ -9,7 +9,11 @@ import pytest
 
 from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.result_import import build_candidate_tree
-from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
+from agent_control_plane.supervisor.sandbox_workspace import (
+    SnapshotLimits,
+    collect_changes,
+    copy_snapshot,
+)
 
 
 def _git(repository: Path, *arguments: str) -> bytes:
@@ -56,6 +60,13 @@ def _all_paths() -> list[tuple[str, bool, bool]]:
     return [("**", True, False)]
 
 
+def _shared_index_snapshot(repository: Path) -> dict[str, bytes]:
+    git_directory = Path(
+        os.fsdecode(_git(repository, "rev-parse", "--path-format=absolute", "--git-dir").strip())
+    )
+    return {path.name: path.read_bytes() for path in git_directory.glob("sharedindex.*")}
+
+
 @pytest.mark.parametrize("object_format", ["sha1", "sha256"])
 def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
     tmp_path: Path, object_format: str
@@ -66,6 +77,8 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
     (repository / "node").write_text("old node\n")
     (repository / "keep.txt").write_text("unchanged\n")
     _commit_initial(repository)
+    _git(repository, "update-index", "--split-index")
+    _git(repository, "config", "core.splitIndex", "true")
     hook_directory = tmp_path / "host-hooks"
     hook_directory.mkdir()
     hook_marker = tmp_path / "host-hook-ran"
@@ -98,6 +111,9 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
         )
     )
     index_before = index_path.read_bytes()
+    shared_indexes_before = _shared_index_snapshot(repository)
+    assert shared_indexes_before
+    _git(repository, "config", "splitIndex.sharedIndexExpire", "now")
     hook_marker.unlink(missing_ok=True)
 
     base_sha = os.fsdecode(_git(repository, "rev-parse", "HEAD").strip())
@@ -109,6 +125,7 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
         write_set_rules=_all_paths(),
     )
     assert not hook_marker.exists()
+    assert _shared_index_snapshot(repository) == shared_indexes_before
 
     assert candidate.baseline_digest == baseline.manifest.digest
     assert candidate.base_sha == base_sha
@@ -130,6 +147,92 @@ def test_candidate_tree_is_host_built_and_does_not_mutate_worktree(
     assert _git(repository, "rev-parse", "HEAD") == head_before
     assert _git(repository, "status", "--porcelain=v1", "-z") == status_before == b""
     assert index_path.read_bytes() == index_before
+
+
+def test_candidate_tree_fails_closed_on_git_without_config_environment_support(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path / "repo")
+    (repository / "owned.txt").write_text("baseline\n")
+    _commit_initial(repository)
+    baseline = copy_snapshot(repository, tmp_path / "baseline")
+    output = copy_snapshot(repository, tmp_path / "worker-output").root
+    (output / "owned.txt").write_text("result\n")
+    change_set = collect_changes(baseline.manifest, output, write_set_rules=_all_paths())
+
+    invoked_marker = tmp_path / "old-git-command-ran"
+    old_git = tmp_path / "old-git"
+    old_git.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        "  printf '%s\\n' 'git version 2.31.9'\n"
+        "  exit 0\n"
+        "fi\n"
+        f"printf x > {shlex.quote(str(invoked_marker))}\n"
+        "exit 99\n"
+    )
+    old_git.chmod(0o700)
+
+    with pytest.raises(SupervisorError) as raised:
+        build_candidate_tree(
+            repository,
+            baseline,
+            change_set,
+            base_sha=os.fsdecode(_git(repository, "rev-parse", "HEAD").strip()),
+            write_set_rules=_all_paths(),
+            git_executable=old_git,
+        )
+
+    assert raised.value.code == "git_version_unsupported"
+    assert not invoked_marker.exists()
+    assert _git(repository, "status", "--porcelain=v1", "-z") == b""
+
+
+@pytest.mark.parametrize("bound", ["entries", "path"])
+def test_candidate_tree_bounds_base_tree_enumeration(tmp_path: Path, bound: str) -> None:
+    limits = (
+        SnapshotLimits(max_entries=2, max_total_bytes=1024, max_file_bytes=1024)
+        if bound == "entries"
+        else SnapshotLimits(
+            max_entries=4,
+            max_total_bytes=1024,
+            max_file_bytes=1024,
+            max_path_bytes=8,
+        )
+    )
+    repository = _repository(tmp_path / "repo")
+    (repository / "one.txt").write_text("one\n")
+    (repository / "two.txt").write_text("two\n")
+    extra_path = "extra.txt" if bound == "entries" else "long-extra-name.txt"
+    (repository / extra_path).write_text("not in the bounded snapshot\n")
+    _commit_initial(repository)
+
+    snapshot_source = tmp_path / "snapshot-source"
+    snapshot_source.mkdir()
+    (snapshot_source / "one.txt").write_text("one\n")
+    (snapshot_source / "two.txt").write_text("two\n")
+    baseline = copy_snapshot(snapshot_source, tmp_path / "baseline", limits=limits)
+    output = copy_snapshot(baseline.root, tmp_path / "out", limits=limits).root
+    (output / "one.txt").write_text("changed\n")
+    change_set = collect_changes(
+        baseline.manifest,
+        output,
+        write_set_rules=_all_paths(),
+        limits=limits,
+    )
+
+    with pytest.raises(SupervisorError) as raised:
+        build_candidate_tree(
+            repository,
+            baseline,
+            change_set,
+            base_sha=os.fsdecode(_git(repository, "rev-parse", "HEAD").strip()),
+            write_set_rules=_all_paths(),
+            limits=limits,
+        )
+
+    assert raised.value.code == "workspace_limit_exceeded"
+    assert _git(repository, "status", "--porcelain=v1", "-z") == b""
 
 
 def test_candidate_tree_rejects_snapshot_drift_before_writing_objects(tmp_path: Path) -> None:

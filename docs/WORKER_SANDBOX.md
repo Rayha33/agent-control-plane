@@ -19,9 +19,12 @@ binds the operation to the exact current base commit, and rejects any snapshot
 whose tracked paths, modes, blob bytes, or directory shape differ from that Git
 tree (including ignored or untracked local files). It hashes host-generated
 blob bytes with Git filters disabled and uses a temporary `GIT_INDEX_FILE` to
-create a candidate tree. It ignores empty directories, as Git trees do. It does
-not import the tree into a registered worktree, create a commit, or
-journal/recover a crash. A newly created parent directory may inherit
+create a candidate tree. Git 2.32 or newer is required so the command-scope
+configuration isolation is honored; split-index and other repo-local side
+effects are disabled, and base-tree enumeration is bounded by snapshot entry
+and path limits. It ignores empty directories, as Git trees do. It does not
+import the tree into a registered worktree, create a commit, or journal/recover
+a crash. A newly created parent directory may inherit
 authorization only from a directly authorized changed leaf below it; a removed
 directory may inherit it only when every removed descendant leaf is directly
 authorized. Standalone empty-directory changes require an explicit write-set
