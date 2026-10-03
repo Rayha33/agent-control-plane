@@ -196,11 +196,16 @@ def review(packet: dict[str, Any], root: Path) -> dict[str, Any]:
 
 
 def main() -> int:
-    packet_path = os.environ.get("ACP_REVIEW_PACKET")
+    packet_descriptor = os.environ.get("ACP_REVIEW_PACKET_FD")
     result_path = os.environ.get("ACP_REVIEW_RESULT")
-    if not packet_path or not result_path:
-        raise SystemExit("ACP_REVIEW_PACKET and ACP_REVIEW_RESULT are required")
-    packet = json.loads(Path(packet_path).read_text(encoding="utf-8"))
+    if not packet_descriptor or not result_path:
+        raise SystemExit("ACP_REVIEW_PACKET_FD and ACP_REVIEW_RESULT are required")
+    try:
+        packet_fd = int(packet_descriptor)
+    except ValueError as error:
+        raise SystemExit("ACP_REVIEW_PACKET_FD must be an inherited descriptor number") from error
+    with os.fdopen(os.dup(packet_fd), "r", encoding="utf-8") as packet_stream:
+        packet = json.load(packet_stream)
     result = review(packet, Path.cwd())
     Path(result_path).write_text(json.dumps(result, indent=2), encoding="utf-8")
     return 0

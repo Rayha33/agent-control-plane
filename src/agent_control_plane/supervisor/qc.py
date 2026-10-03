@@ -299,7 +299,7 @@ class QcMixin:
                             "ACP_PHASE": "calibration",
                             "ACP_WORKTREE": str(worktree),
                             "ACP_REPO_ROOT": str(self.root),
-                            "ACP_REVIEW_PACKET": f"/dev/fd/{packet_fd}",
+                            "ACP_REVIEW_PACKET_FD": str(packet_fd),
                             "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
                             "ACP_REVIEW_RESULT": str(result_path),
                         },
@@ -679,7 +679,7 @@ class QcMixin:
                         qc_dir,
                         self._phase_runtime_env(runtime_env, "critic", qc_dir)
                         | {
-                            "ACP_REVIEW_PACKET": f"/dev/fd/{packet_fd}",
+                            "ACP_REVIEW_PACKET_FD": str(packet_fd),
                             "ACP_REVIEW_PACKET_ARCHIVE": str(packet_path),
                             "ACP_REVIEW_RESULT": str(result_path),
                         },

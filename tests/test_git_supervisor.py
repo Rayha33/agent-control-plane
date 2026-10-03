@@ -3365,7 +3365,7 @@ def test_trusted_external_critic_cannot_leave_a_detached_child(repo: Path) -> No
     if sys.platform == "darwin":
         assert review["verdict"] != "pass", "Darwin must deny critic forks"
     else:
-        assert review["verdict"] == "pass"
+        assert review["verdict"] == "pass", review
     time.sleep(1.2)
     assert not marker.exists()
 

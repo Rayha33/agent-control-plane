@@ -426,7 +426,7 @@ def test_review_packet_fd_is_an_immutable_read_only_pipe() -> None:
         assert stat.S_ISFIFO(os.fstat(packet_fd).st_mode)
         with pytest.raises(OSError):
             os.write(packet_fd, b"attempted mutation")
-        with Path(f"/dev/fd/{packet_fd}").open("rb") as packet_stream:
+        with os.fdopen(os.dup(packet_fd), "rb") as packet_stream:
             while chunk := packet_stream.read(65536):
                 received.append(chunk)
 

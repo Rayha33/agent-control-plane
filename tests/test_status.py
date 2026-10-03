@@ -75,7 +75,10 @@ def _install_revising_critic(supervisor: GitSupervisor, monkeypatch: pytest.Monk
                     }
                 ],
             }
-        packet = json.loads(Path(environment["ACP_REVIEW_PACKET"]).read_text(encoding="utf-8"))
+        with os.fdopen(
+            os.dup(int(environment["ACP_REVIEW_PACKET_FD"])), "r", encoding="utf-8"
+        ) as packet_stream:
+            packet = json.load(packet_stream)
         evidence_id = packet["evidence_catalog"][0]["id"]
         payload["contract_version"] = 2
         payload["acceptance_coverage"] = [
