@@ -485,14 +485,22 @@ class WorkersMixin:
                     "worker_registration_lost",
                     "worker PID ownership changed before submission",
                 )
+            if not attempt["pid_identity"]:
+                raise SupervisorError(
+                    "worker_identity_unavailable",
+                    "worker exit cannot be tied to a recorded kernel identity",
+                )
             self._event(
                 connection,
                 "worker.exited",
                 attempt["agent_id"],
                 {
                     "attempt_id": attempt_id,
+                    "claim_token": attempt["claim_token"],
                     "pid": pid,
+                    "pid_identity": attempt["pid_identity"],
                     "exit_code": exit_code,
+                    "observed_by": "supervisor_popen_wait",
                 },
             )
 

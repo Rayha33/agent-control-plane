@@ -3,12 +3,22 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
 
 from agent_control_plane.supervisor.common import SupervisorError
-from agent_control_plane.supervisor.result_import import build_candidate_tree
+from agent_control_plane.supervisor.result_import import (
+    CandidateTree,
+    build_candidate_tree,
+    candidate_commit_object,
+    candidate_commit_payload,
+    candidate_ref_target,
+    publish_candidate_ref,
+    result_ref_name,
+    verify_candidate_objects,
+)
 from agent_control_plane.supervisor.sandbox_workspace import (
     SnapshotLimits,
     collect_changes,
@@ -358,3 +368,53 @@ def test_candidate_tree_rejects_worktree_advanced_past_worker_base(tmp_path: Pat
         )
 
     assert raised.value.code == "stale_worker_result"
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_host_result_commit_uses_immutable_compare_and_swap_ref(
+    tmp_path: Path, object_format: str
+) -> None:
+    repository = _repository(tmp_path / "repo", object_format=object_format)
+    (repository / "tracked.txt").write_text("base\n")
+    _commit_initial(repository)
+    base_sha = os.fsdecode(_git(repository, "rev-parse", "HEAD").strip())
+    tree_sha = os.fsdecode(_git(repository, "rev-parse", "HEAD^{tree}").strip())
+    attempt_id = str(uuid.uuid4())
+    result_digest = "d" * 64
+    candidate = CandidateTree(
+        tree_sha=tree_sha,
+        base_sha=base_sha,
+        baseline_digest="a" * 64,
+        result_digest="b" * 64,
+        change_digest="c" * 64,
+    )
+    payload = candidate_commit_payload(
+        candidate,
+        attempt_id=attempt_id,
+        claim_token=7,
+        result_digest=result_digest,
+        committed_at=123456,
+    )
+    reference = result_ref_name(attempt_id, 7, result_digest)
+
+    commit_sha = candidate_commit_object(repository, payload, write=False)
+    assert candidate_ref_target(repository, reference) is None
+    assert candidate_commit_object(repository, payload, write=True) == commit_sha
+    verify_candidate_objects(repository, candidate, commit_sha=commit_sha)
+    publish_candidate_ref(repository, reference, commit_sha)
+    publish_candidate_ref(repository, reference, commit_sha)
+    assert candidate_ref_target(repository, reference) == commit_sha
+
+    conflicting_payload = candidate_commit_payload(
+        candidate,
+        attempt_id=attempt_id,
+        claim_token=7,
+        result_digest=result_digest,
+        committed_at=123457,
+    )
+    conflicting_sha = candidate_commit_object(repository, conflicting_payload, write=True)
+    with pytest.raises(SupervisorError) as raised:
+        publish_candidate_ref(repository, reference, conflicting_sha)
+    assert raised.value.code == "result_import_ambiguous"
+    assert os.fsdecode(_git(repository, "rev-parse", "HEAD").strip()) == base_sha
+    assert _git(repository, "status", "--porcelain=v1", "-z") == b""

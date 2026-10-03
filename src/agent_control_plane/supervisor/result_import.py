@@ -1,8 +1,9 @@
-"""Host-built Git candidate trees for validated worker result deltas.
+"""Host-built Git trees and immutable refs for validated worker result deltas.
 
-This module writes only content-addressed objects and a temporary index. It
-does not read worker Git metadata, create commits or refs, or mutate a
-registered worktree. Durable import/recovery remains a separate requirement.
+This module never reads worker Git metadata or mutates a registered worktree.
+It constructs candidate trees from host-validated bytes, creates deterministic
+host-authored commits, and publishes only absent-only refs in ACP's result
+namespace. The supervisor owns the durable journal and submission transaction.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,319 @@ class CandidateTree:
     baseline_digest: str
     result_digest: str
     change_digest: str
+
+
+def result_ref_name(attempt_id: str, claim_token: int, result_digest: str) -> str:
+    """Return the immutable, attempt-fenced ref for one imported result."""
+
+    try:
+        if str(uuid.UUID(attempt_id)) != attempt_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise SupervisorError("invalid_worker_result", "attempt ID is invalid") from None
+    if type(claim_token) is not int or claim_token < 1:
+        raise SupervisorError("invalid_worker_result", "claim token is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", result_digest) is None:
+        raise SupervisorError("invalid_worker_result", "result digest is invalid")
+    return f"refs/acp/worker-results/{attempt_id}/{claim_token}/{result_digest}"
+
+
+def _validate_result_ref(reference: str) -> None:
+    if not isinstance(reference, str):
+        raise SupervisorError("invalid_worker_result", "result ref is invalid")
+    parts = reference.split("/")
+    if len(parts) != 6 or parts[:3] != ["refs", "acp", "worker-results"]:
+        raise SupervisorError("invalid_worker_result", "result ref namespace is invalid")
+    try:
+        claim_token = int(parts[4])
+    except ValueError:
+        raise SupervisorError(
+            "invalid_worker_result", "result ref claim token is invalid"
+        ) from None
+    if result_ref_name(parts[3], claim_token, parts[5]) != reference:
+        raise SupervisorError("invalid_worker_result", "result ref is not canonical")
+
+
+def candidate_commit_payload(
+    candidate: CandidateTree,
+    *,
+    attempt_id: str,
+    claim_token: int,
+    result_digest: str,
+    committed_at: int,
+) -> bytes:
+    """Serialize a deterministic host-authored commit from a validated tree."""
+
+    result_ref_name(attempt_id, claim_token, result_digest)
+    if type(candidate) is not CandidateTree:
+        raise SupervisorError("invalid_worker_result", "candidate tree is invalid")
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in (
+            candidate.baseline_digest,
+            candidate.result_digest,
+            candidate.change_digest,
+            result_digest,
+        )
+    ):
+        raise SupervisorError("invalid_worker_result", "candidate result digests are invalid")
+    object_id_length = len(candidate.base_sha)
+    if object_id_length not in {40, 64} or len(candidate.tree_sha) != object_id_length:
+        raise SupervisorError("invalid_worker_result", "candidate Git object IDs are invalid")
+    if any(
+        re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", object_id) is None
+        for object_id in (candidate.base_sha, candidate.tree_sha)
+    ):
+        raise SupervisorError("invalid_worker_result", "candidate Git object IDs are invalid")
+    if type(committed_at) is not int or committed_at < 0:
+        raise SupervisorError("invalid_worker_result", "candidate commit timestamp is invalid")
+    identity = f"Agent Control Plane <acp-worker-result@invalid> {committed_at} +0000"
+    message = (
+        "Agent Control Plane worker result\n\n"
+        f"Attempt: {attempt_id}\n"
+        f"Claim-Token: {claim_token}\n"
+        f"Result-SHA256: {result_digest}\n"
+        f"Baseline-SHA256: {candidate.baseline_digest}\n"
+        f"Change-SHA256: {candidate.change_digest}\n"
+    )
+    return (
+        f"tree {candidate.tree_sha}\nparent {candidate.base_sha}\n"
+        f"author {identity}\ncommitter {identity}\n\n{message}"
+    ).encode()
+
+
+def candidate_commit_object(
+    repository: str | Path,
+    payload: bytes,
+    *,
+    write: bool,
+    git_executable: str | Path = "git",
+) -> str:
+    """Compute or write a commit object using isolated, trusted Git settings."""
+
+    try:
+        resolved_repository = Path(repository).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SupervisorError(
+            "invalid_git_repository", "registered repository path is invalid"
+        ) from error
+    executable = shutil.which(os.fspath(git_executable))
+    if executable is None or not os.access(executable, os.X_OK):
+        raise SupervisorError("git_unavailable", "trusted Git executable is unavailable")
+
+    with tempfile.TemporaryDirectory(prefix="acp-result-commit-") as temporary_directory:
+        index_path = Path(temporary_directory) / "index"
+        hooks_path = Path(temporary_directory) / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(index_path, hooks_path)
+        _assert_supported_git_version(executable, environment)
+        arguments = ("hash-object", *(("-w",) if write else ()), "-t", "commit", "--stdin")
+        object_id = (
+            _run_git(
+                executable,
+                resolved_repository,
+                arguments,
+                environment,
+                input_bytes=payload,
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+    object_id_length = 40 if len(object_id) == 40 else 64 if len(object_id) == 64 else 0
+    if object_id_length == 0 or re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", object_id) is None:
+        raise SupervisorError("candidate_tree_failed", "Git returned an invalid commit object ID")
+    return object_id
+
+
+def verify_candidate_objects(
+    repository: str | Path,
+    candidate: CandidateTree,
+    *,
+    commit_sha: str | None = None,
+    git_executable: str | Path = "git",
+) -> None:
+    """Verify the exact base/tree objects, and optionally the host commit's edges."""
+
+    if type(candidate) is not CandidateTree:
+        raise SupervisorError("invalid_worker_result", "candidate tree is invalid")
+    try:
+        resolved_repository = Path(repository).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SupervisorError(
+            "invalid_git_repository", "registered repository path is invalid"
+        ) from error
+    executable = shutil.which(os.fspath(git_executable))
+    if executable is None or not os.access(executable, os.X_OK):
+        raise SupervisorError("git_unavailable", "trusted Git executable is unavailable")
+
+    with tempfile.TemporaryDirectory(prefix="acp-result-verify-") as temporary_directory:
+        index_path = Path(temporary_directory) / "index"
+        hooks_path = Path(temporary_directory) / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(index_path, hooks_path)
+        _assert_supported_git_version(executable, environment)
+        base_type = (
+            _run_git(
+                executable,
+                resolved_repository,
+                ("cat-file", "-t", candidate.base_sha),
+                environment,
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+        tree_type = (
+            _run_git(
+                executable,
+                resolved_repository,
+                ("cat-file", "-t", candidate.tree_sha),
+                environment,
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+        if base_type != "commit" or tree_type != "tree":
+            raise SupervisorError(
+                "result_import_ambiguous", "candidate base or tree object is invalid"
+            )
+        if commit_sha is None:
+            return
+        commit_type = (
+            _run_git(
+                executable,
+                resolved_repository,
+                ("cat-file", "-t", commit_sha),
+                environment,
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+        if commit_type != "commit":
+            raise SupervisorError("result_import_ambiguous", "result ref does not name a commit")
+        commit_tree = (
+            _run_git(
+                executable,
+                resolved_repository,
+                ("rev-parse", "--verify", f"{commit_sha}^{{tree}}"),
+                environment,
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+        parent = (
+            _run_git(
+                executable,
+                resolved_repository,
+                ("rev-parse", "--verify", f"{commit_sha}^"),
+                environment,
+            )
+            .decode("ascii", errors="strict")
+            .strip()
+        )
+        if commit_tree != candidate.tree_sha or parent != candidate.base_sha:
+            raise SupervisorError(
+                "result_import_ambiguous", "host result commit edges do not match"
+            )
+
+
+def candidate_ref_target(
+    repository: str | Path,
+    reference: str,
+    *,
+    git_executable: str | Path = "git",
+) -> str | None:
+    """Read the exact result ref, rejecting unexpected nested or duplicate refs."""
+
+    _validate_result_ref(reference)
+    try:
+        resolved_repository = Path(repository).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SupervisorError(
+            "invalid_git_repository", "registered repository path is invalid"
+        ) from error
+    executable = shutil.which(os.fspath(git_executable))
+    if executable is None or not os.access(executable, os.X_OK):
+        raise SupervisorError("git_unavailable", "trusted Git executable is unavailable")
+
+    with tempfile.TemporaryDirectory(prefix="acp-result-ref-") as temporary_directory:
+        index_path = Path(temporary_directory) / "index"
+        hooks_path = Path(temporary_directory) / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(index_path, hooks_path)
+        _assert_supported_git_version(executable, environment)
+        raw = _run_git(
+            executable,
+            resolved_repository,
+            ("for-each-ref", "--format=%(refname) %(objectname)", reference),
+            environment,
+        )
+    rows = [line.split() for line in raw.splitlines() if line]
+    if not rows:
+        return None
+    if len(rows) != 1 or len(rows[0]) != 2:
+        raise SupervisorError("result_import_ambiguous", "result ref namespace is ambiguous")
+    try:
+        row_reference = rows[0][0].decode("ascii")
+        object_id = rows[0][1].decode("ascii")
+    except UnicodeDecodeError:
+        raise SupervisorError(
+            "result_import_ambiguous", "result ref target is unreadable"
+        ) from None
+    if row_reference != reference:
+        raise SupervisorError("result_import_ambiguous", "result ref namespace is ambiguous")
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id) is None:
+        raise SupervisorError("result_import_ambiguous", "result ref target is invalid")
+    return object_id
+
+
+def publish_candidate_ref(
+    repository: str | Path,
+    reference: str,
+    commit_sha: str,
+    *,
+    git_executable: str | Path = "git",
+) -> None:
+    """Publish an immutable result ref with an absent-only compare-and-swap."""
+
+    _validate_result_ref(reference)
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha) is None:
+        raise SupervisorError("invalid_worker_result", "candidate commit ID is invalid")
+    current = candidate_ref_target(repository, reference, git_executable=git_executable)
+    if current == commit_sha:
+        return
+    if current is not None:
+        raise SupervisorError("result_import_ambiguous", "result ref already names another commit")
+
+    try:
+        resolved_repository = Path(repository).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SupervisorError(
+            "invalid_git_repository", "registered repository path is invalid"
+        ) from error
+    executable = shutil.which(os.fspath(git_executable))
+    if executable is None or not os.access(executable, os.X_OK):
+        raise SupervisorError("git_unavailable", "trusted Git executable is unavailable")
+    zero = "0" * len(commit_sha)
+    with tempfile.TemporaryDirectory(prefix="acp-result-ref-write-") as temporary_directory:
+        index_path = Path(temporary_directory) / "index"
+        hooks_path = Path(temporary_directory) / "empty-hooks"
+        hooks_path.mkdir(mode=0o700)
+        environment = _git_environment(index_path, hooks_path)
+        _assert_supported_git_version(executable, environment)
+        try:
+            _run_git(
+                executable,
+                resolved_repository,
+                ("update-ref", reference, commit_sha, zero),
+                environment,
+            )
+        except SupervisorError:
+            if (
+                candidate_ref_target(resolved_repository, reference, git_executable=executable)
+                == commit_sha
+            ):
+                return
+            raise
 
 
 def build_candidate_tree(

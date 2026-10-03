@@ -28,6 +28,17 @@ from typing import Any
 
 from ..scheduling import declared_read_resources, declared_resources, normalize_artifact
 from .common import SUBMISSION_OBJECT_CONTRACT, SupervisorError, canonical_json, sha256, utc_now
+from .result_import import (
+    CandidateTree,
+    build_candidate_tree,
+    candidate_commit_object,
+    candidate_commit_payload,
+    candidate_ref_target,
+    publish_candidate_ref,
+    result_ref_name,
+    verify_candidate_objects,
+)
+from .sandbox_workspace import ChangeSet, Snapshot
 from .schema import META_CASE_SENSITIVE
 
 _READ_RESOURCE_MAX_PATHS = 10_000
@@ -1943,6 +1954,637 @@ class ClaimsMixin:
             result_manifest_path=result_manifest_path,
         )
 
+    @staticmethod
+    def _worker_exit_receipt_in(
+        connection: sqlite3.Connection,
+        attempt: sqlite3.Row,
+        expected_pid: int,
+    ) -> str:
+        """Return the hash-chained supervisor wait receipt for this exact worker."""
+
+        identity = attempt["pid_identity"]
+        if (
+            attempt["pid"] != expected_pid
+            or expected_pid < 1
+            or re.fullmatch(rf"linux:{expected_pid}:[0-9]+", identity or "") is None
+        ):
+            raise SupervisorError(
+                "worker_registration_lost",
+                "result import has no exact registered worker process identity",
+            )
+        try:
+            row = connection.execute(
+                """
+                SELECT id, event_hash, created_at, payload_json FROM events
+                WHERE event_type = 'worker.exited'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.claim_token') = ?
+                  AND json_extract(payload_json, '$.pid') = ?
+                  AND json_extract(payload_json, '$.pid_identity') = ?
+                  AND json_extract(payload_json, '$.observed_by') = 'supervisor_popen_wait'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (attempt["id"], attempt["claim_token"], expected_pid, identity),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            raise SupervisorError(
+                "worker_exit_receipt_invalid", "worker exit audit record is unreadable"
+            ) from None
+        if row is None:
+            raise SupervisorError(
+                "worker_not_exited", "supervisor has no wait receipt for this worker identity"
+            )
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            raise SupervisorError(
+                "worker_exit_receipt_invalid", "worker exit audit record is malformed"
+            ) from None
+        if type(payload.get("exit_code")) is not int or payload["exit_code"] != 0:
+            raise SupervisorError("worker_failed", "worker did not exit successfully")
+        return canonical_json(
+            {
+                "event_id": row["id"],
+                "event_hash": row["event_hash"],
+                "created_at": row["created_at"],
+                "payload": payload,
+            }
+        )
+
+    def _assert_result_import_worktree_base_locked(
+        self, attempt: sqlite3.Row, base_sha: str
+    ) -> None:
+        """Prove the exact registered attempt worktree is still clean at its base."""
+
+        worktree = Path(attempt["worktree"])
+        root = (
+            Path(attempt["worktree_root"])
+            if attempt["worktree_root"]
+            else (self.state_dir / "worktrees").resolve(strict=False)
+        )
+        if (
+            not self._attempt_worktree_is_managed(attempt["id"], worktree, root)
+            or worktree.is_symlink()
+        ):
+            raise SupervisorError(
+                "result_import_worktree_invalid", "registered attempt worktree identity is invalid"
+            )
+        try:
+            canonical = str(worktree.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            raise SupervisorError(
+                "result_import_worktree_invalid", "registered attempt worktree is unavailable"
+            ) from None
+
+        def git(*arguments: str) -> str:
+            result = self._run_git_while_locked(*arguments)
+            if result.returncode:
+                raise SupervisorError(
+                    "result_import_worktree_invalid", "registered attempt Git state is unreadable"
+                )
+            return result.stdout.decode("utf-8", errors="strict").rstrip("\r\n")
+
+        registered = self._parse_registered_worktrees(git("worktree", "list", "--porcelain", "-z"))
+        if registered.get(canonical) != attempt["branch"]:
+            raise SupervisorError(
+                "result_import_worktree_invalid", "attempt path is not registered to its branch"
+            )
+        top = Path(git("-C", canonical, "rev-parse", "--show-toplevel")).resolve(strict=True)
+        common = Path(
+            git("-C", canonical, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ).resolve(strict=True)
+        expected_common = Path(self._git_common_dir).resolve(strict=True)
+        branch = git("-C", canonical, "branch", "--show-current")
+        head = git("-C", canonical, "rev-parse", "--verify", "HEAD")
+        status = self._run_git_while_locked("-C", canonical, "status", "--porcelain=v1", "-z")
+        if (
+            top != Path(canonical)
+            or common != expected_common
+            or branch != attempt["branch"]
+            or head != base_sha
+            or status.returncode != 0
+            or status.stdout
+        ):
+            raise SupervisorError(
+                "stale_worker_result",
+                "registered attempt worktree is not clean at the recorded base",
+            )
+
+    def import_worker_result(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        baseline: Snapshot,
+        change_set: ChangeSet,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Journal and submit a host-validated result without mutating the checkout.
+
+        Worker identity is the supervisor-registered PID plus its kernel start
+        identity and successful ``Popen.wait`` event. Runtime-driver unit IDs are
+        intentionally not used as worker identity.
+        """
+
+        if type(baseline) is not Snapshot or type(change_set) is not ChangeSet:
+            raise SupervisorError("invalid_worker_result", "snapshot or change set is invalid")
+        baseline.manifest.validate()
+        change_set.validate()
+        if change_set.baseline_digest != baseline.manifest.digest:
+            raise SupervisorError(
+                "invalid_worker_result", "change set is not bound to the supplied baseline"
+            )
+        result_digest = sha256(
+            canonical_json(
+                {
+                    "baseline_digest": baseline.manifest.digest,
+                    "result_digest": change_set.result_digest,
+                    "change_digest": change_set.digest,
+                }
+            ).encode("utf-8")
+        )
+        import_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"acp-worker-result:{attempt_id}:{claim_token}:{result_digest}",
+            )
+        )
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM result_imports WHERE attempt_id = ? "
+                "AND claim_token = ? AND result_digest = ?",
+                (attempt_id, claim_token, result_digest),
+            ).fetchone()
+        if existing is not None:
+            if existing["id"] != import_id:
+                self._mark_result_import_ambiguous(
+                    existing["id"], "result journal ID is not its deterministic identity"
+                )
+                raise SupervisorError(
+                    "result_import_ambiguous", "result journal identity is inconsistent"
+                )
+            return self.recover_worker_result_import(import_id, credential=credential)
+
+        self._assert_safe_git_execution_config()
+        self._assert_no_git_grafts()
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            if not attempt["base_checkout_snapshot_required"]:
+                raise SupervisorError(
+                    "base_checkout_snapshot_invalid",
+                    "result import requires a claim-time checkout snapshot",
+                )
+            task = self._task_row(connection, attempt["task_id"])
+            worker_pid = attempt["pid"]
+            if worker_pid is None or worker_pid < 1:
+                raise SupervisorError(
+                    "worker_registration_lost", "result import has no registered worker PID"
+                )
+            exit_receipt = self._worker_exit_receipt_in(connection, attempt, worker_pid)
+            self._assert_base_checkout_unchanged(
+                connection,
+                attempt_id,
+                attempt["base_checkout_snapshot_json"],
+                bool(attempt["base_checkout_snapshot_required"]),
+            )
+            rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
+            attempt_snapshot = dict(attempt)
+            base_sha = task["base_sha"]
+
+        git_executable = self._system_git_executable(self.root)
+        with self._git_operation_guard():
+            self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
+            candidate = build_candidate_tree(
+                attempt_snapshot["worktree"],
+                baseline,
+                change_set,
+                base_sha=base_sha,
+                write_set_rules=rules,
+                git_executable=git_executable,
+            )
+            self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
+            reference = result_ref_name(attempt_id, claim_token, result_digest)
+            journal_id = import_id
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT * FROM result_imports WHERE attempt_id = ? "
+                    "AND claim_token = ? AND result_digest = ?",
+                    (attempt_id, claim_token, result_digest),
+                ).fetchone()
+                if existing:
+                    if any(
+                        existing[column] != expected
+                        for column, expected in (
+                            ("id", import_id),
+                            ("worker_pid", worker_pid),
+                            ("worker_identity", attempt_snapshot["pid_identity"]),
+                            ("worker_exit_receipt_json", exit_receipt),
+                            ("base_sha", base_sha),
+                            ("tree_sha", candidate.tree_sha),
+                            ("baseline_digest", candidate.baseline_digest),
+                            ("change_digest", candidate.change_digest),
+                            ("result_ref", reference),
+                        )
+                    ):
+                        self._mark_result_import_ambiguous_in(
+                            connection,
+                            existing["id"],
+                            "same result digest resolved to different import evidence",
+                        )
+                        connection.commit()
+                        raise SupervisorError(
+                            "result_import_ambiguous",
+                            "existing result journal conflicts with output",
+                        )
+                    if existing["phase"] == "ambiguous":
+                        raise SupervisorError(
+                            "result_import_ambiguous", "result import is fenced as ambiguous"
+                        )
+                    journal_id = existing["id"]
+                else:
+                    current = self._active_attempt(
+                        connection, attempt_id, claim_token, int(time.time())
+                    )
+                    self._authenticate_attempt(connection, current, credential)
+                    current_receipt = self._worker_exit_receipt_in(connection, current, worker_pid)
+                    if (
+                        current["pid_identity"] != attempt_snapshot["pid_identity"]
+                        or current_receipt != exit_receipt
+                        or self._task_row(connection, current["task_id"])["base_sha"] != base_sha
+                    ):
+                        raise SupervisorError(
+                            "stale_worker_result",
+                            "worker or task fence changed during result import",
+                        )
+                    committed_at = int(time.time())
+                    payload = candidate_commit_payload(
+                        candidate,
+                        attempt_id=attempt_id,
+                        claim_token=claim_token,
+                        result_digest=result_digest,
+                        committed_at=committed_at,
+                    )
+                    commit_sha = candidate_commit_object(
+                        attempt_snapshot["worktree"],
+                        payload,
+                        write=False,
+                        git_executable=git_executable,
+                    )
+                    stamp = utc_now()
+                    connection.execute(
+                        """
+                        INSERT INTO result_imports
+                          (id, attempt_id, claim_token, worker_pid, worker_identity,
+                           worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+                           result_digest, change_digest, result_ref, commit_timestamp,
+                           commit_sha, phase, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
+                        """,
+                        (
+                            import_id,
+                            attempt_id,
+                            claim_token,
+                            worker_pid,
+                            current["pid_identity"],
+                            exit_receipt,
+                            base_sha,
+                            candidate.tree_sha,
+                            candidate.baseline_digest,
+                            result_digest,
+                            candidate.change_digest,
+                            reference,
+                            committed_at,
+                            commit_sha,
+                            stamp,
+                            stamp,
+                        ),
+                    )
+                    self._event(
+                        connection,
+                        "worker.result_import_prepared",
+                        current["agent_id"],
+                        {
+                            "import_id": import_id,
+                            "attempt_id": attempt_id,
+                            "claim_token": claim_token,
+                            "worker_pid": worker_pid,
+                            "worker_identity": current["pid_identity"],
+                            "result_digest": result_digest,
+                            "tree_sha": candidate.tree_sha,
+                            "commit_sha": commit_sha,
+                            "result_ref": reference,
+                        },
+                    )
+
+        return self.recover_worker_result_import(journal_id, credential=credential)
+
+    @staticmethod
+    def _mark_result_import_ambiguous_in(
+        connection: sqlite3.Connection, import_id: str, error: str
+    ) -> None:
+        connection.execute(
+            "UPDATE result_imports SET phase = 'ambiguous', error = ?, updated_at = ? "
+            "WHERE id = ? AND phase != 'submitted'",
+            (error[:1000], utc_now(), import_id),
+        )
+
+    def _mark_result_import_ambiguous(self, import_id: str, error: str) -> None:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt_id, claim_token, result_digest, phase FROM result_imports "
+                "WHERE id = ?",
+                (import_id,),
+            ).fetchone()
+            if not row or row["phase"] == "submitted":
+                return
+            self._mark_result_import_ambiguous_in(connection, import_id, error)
+            self._event(
+                connection,
+                "worker.result_import_ambiguous",
+                "recovery",
+                {
+                    "import_id": import_id,
+                    "attempt_id": row["attempt_id"],
+                    "claim_token": row["claim_token"],
+                    "result_digest": row["result_digest"],
+                    "error": error[:1000],
+                },
+            )
+
+    def recover_worker_result_import(
+        self,
+        import_id: str,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Reconcile only the exact journaled commit/ref; stale claims stay fenced."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM result_imports WHERE id = ?", (import_id,)
+            ).fetchone()
+            if row is None:
+                raise SupervisorError("result_import_not_found", "result import journal is missing")
+            attempt_row = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (row["attempt_id"],)
+            ).fetchone()
+            if attempt_row is None:
+                self._mark_result_import_ambiguous(import_id, "journal attempt is missing")
+                raise SupervisorError(
+                    "result_import_ambiguous", "journal attempt is missing; result remains fenced"
+                )
+            self._authenticate_attempt(connection, attempt_row, credential)
+            try:
+                expected_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        "acp-worker-result:"
+                        f"{row['attempt_id']}:{row['claim_token']}:{row['result_digest']}",
+                    )
+                )
+                expected_ref = result_ref_name(
+                    row["attempt_id"], row["claim_token"], row["result_digest"]
+                )
+            except (SupervisorError, TypeError, ValueError) as error:
+                self._mark_result_import_ambiguous(import_id, "journal identity fields are invalid")
+                raise SupervisorError(
+                    "result_import_ambiguous", "result journal identity is invalid"
+                ) from error
+            if row["id"] != expected_id or row["result_ref"] != expected_ref:
+                self._mark_result_import_ambiguous(
+                    import_id, "journal identity or result ref is not canonical"
+                )
+                raise SupervisorError(
+                    "result_import_ambiguous", "result journal identity or ref is inconsistent"
+                )
+            if row["phase"] == "submitted":
+                if not row["submission_id"]:
+                    self._mark_result_import_ambiguous(
+                        import_id, "submitted journal lacks submission ID"
+                    )
+                    raise SupervisorError(
+                        "result_import_ambiguous", "submitted journal has no linked submission"
+                    )
+                submission_row = connection.execute(
+                    "SELECT attempt_id, commit_sha FROM submissions WHERE id = ?",
+                    (row["submission_id"],),
+                ).fetchone()
+                if (
+                    submission_row is None
+                    or submission_row["attempt_id"] != row["attempt_id"]
+                    or submission_row["commit_sha"] != row["commit_sha"]
+                    or attempt_row["status"] != "submitted"
+                    or attempt_row["latest_sha"] != row["commit_sha"]
+                ):
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "submitted result journal does not match its submission",
+                    )
+                return self.submission(row["submission_id"])
+            if row["phase"] == "ambiguous":
+                raise SupervisorError(
+                    "result_import_ambiguous", "result import is fenced as ambiguous"
+                )
+
+            try:
+                attempt = self._active_attempt(
+                    connection, row["attempt_id"], row["claim_token"], int(time.time())
+                )
+                receipt = self._worker_exit_receipt_in(connection, attempt, row["worker_pid"])
+                if (
+                    attempt["pid_identity"] != row["worker_identity"]
+                    or receipt != row["worker_exit_receipt_json"]
+                ):
+                    raise SupervisorError(
+                        "worker_registration_lost", "journal no longer matches its worker identity"
+                    )
+                task = self._task_row(connection, attempt["task_id"])
+                if task["base_sha"] != row["base_sha"]:
+                    raise SupervisorError(
+                        "stale_worker_result", "task base changed since result was journaled"
+                    )
+                self._assert_base_checkout_unchanged(
+                    connection,
+                    row["attempt_id"],
+                    attempt["base_checkout_snapshot_json"],
+                    bool(attempt["base_checkout_snapshot_required"]),
+                )
+            except SupervisorError as error:
+                if error.code not in {"invalid_runner_credential", "runner_auth_required"}:
+                    self._mark_result_import_ambiguous(import_id, str(error))
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "worker or claim fence changed; result remains retained and unsubmitted",
+                    ) from error
+                raise
+            journal = dict(row)
+            attempt_snapshot = dict(attempt)
+
+        candidate = CandidateTree(
+            tree_sha=journal["tree_sha"],
+            base_sha=journal["base_sha"],
+            baseline_digest=journal["baseline_digest"],
+            result_digest=journal["result_digest"],
+            change_digest=journal["change_digest"],
+        )
+        payload = candidate_commit_payload(
+            candidate,
+            attempt_id=journal["attempt_id"],
+            claim_token=journal["claim_token"],
+            result_digest=journal["result_digest"],
+            committed_at=journal["commit_timestamp"],
+        )
+        git_executable = self._system_git_executable(self.root)
+        try:
+            with self._git_operation_guard():
+                self._assert_result_import_worktree_base_locked(
+                    attempt_snapshot, journal["base_sha"]
+                )
+                expected_commit = candidate_commit_object(
+                    attempt_snapshot["worktree"],
+                    payload,
+                    write=False,
+                    git_executable=git_executable,
+                )
+                if expected_commit != journal["commit_sha"]:
+                    raise SupervisorError(
+                        "result_import_ambiguous", "deterministic result commit hash changed"
+                    )
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        "SELECT * FROM result_imports WHERE id = ?", (import_id,)
+                    ).fetchone()
+                    if current is None or current["phase"] not in {"prepared", "ref_published"}:
+                        raise SupervisorError(
+                            "result_import_ambiguous", "result journal changed during recovery"
+                        )
+                    active = self._active_attempt(
+                        connection,
+                        current["attempt_id"],
+                        current["claim_token"],
+                        int(time.time()),
+                    )
+                    self._authenticate_attempt(connection, active, credential)
+                    current_receipt = self._worker_exit_receipt_in(
+                        connection, active, current["worker_pid"]
+                    )
+                    if (
+                        active["pid_identity"] != current["worker_identity"]
+                        or current_receipt != current["worker_exit_receipt_json"]
+                    ):
+                        raise SupervisorError(
+                            "result_import_ambiguous", "worker fence changed during recovery"
+                        )
+                    target = candidate_ref_target(
+                        attempt_snapshot["worktree"],
+                        current["result_ref"],
+                        git_executable=git_executable,
+                    )
+                    verify_candidate_objects(
+                        attempt_snapshot["worktree"],
+                        candidate,
+                        commit_sha=target,
+                        git_executable=git_executable,
+                    )
+                    if target is None:
+                        if current["phase"] != "prepared":
+                            raise SupervisorError(
+                                "result_import_ambiguous",
+                                "published result ref disappeared; automatic replay refused",
+                            )
+                        written = candidate_commit_object(
+                            attempt_snapshot["worktree"],
+                            payload,
+                            write=True,
+                            git_executable=git_executable,
+                        )
+                        if written != expected_commit:
+                            raise SupervisorError(
+                                "result_import_ambiguous",
+                                "written result commit differs from journal",
+                            )
+                        publish_candidate_ref(
+                            attempt_snapshot["worktree"],
+                            current["result_ref"],
+                            expected_commit,
+                            git_executable=git_executable,
+                        )
+                    elif target != expected_commit:
+                        raise SupervisorError(
+                            "result_import_ambiguous", "result ref names an unjournaled commit"
+                        )
+                    verify_candidate_objects(
+                        attempt_snapshot["worktree"],
+                        candidate,
+                        commit_sha=expected_commit,
+                        git_executable=git_executable,
+                    )
+                    if current["phase"] == "prepared":
+                        connection.execute(
+                            "UPDATE result_imports SET phase = 'ref_published', updated_at = ? "
+                            "WHERE id = ? AND phase = 'prepared'",
+                            (utc_now(), import_id),
+                        )
+                        self._event(
+                            connection,
+                            "worker.result_import_ref_published",
+                            "recovery",
+                            {
+                                "import_id": import_id,
+                                "attempt_id": current["attempt_id"],
+                                "claim_token": current["claim_token"],
+                                "result_digest": current["result_digest"],
+                                "commit_sha": expected_commit,
+                                "result_ref": current["result_ref"],
+                            },
+                        )
+        except SupervisorError as error:
+            if error.code in {
+                "result_import_ambiguous",
+                "worker_registration_lost",
+                "claim_inactive",
+                "stale_fencing_token",
+                "lease_expired",
+                "stale_worker_result",
+                "result_import_worktree_invalid",
+                "worker_not_exited",
+            }:
+                self._mark_result_import_ambiguous(import_id, str(error))
+                raise SupervisorError(
+                    "result_import_ambiguous", "recovery could not prove the exact result fence"
+                ) from error
+            raise
+
+        try:
+            return self._submit(
+                journal["attempt_id"],
+                journal["claim_token"],
+                expected_worker_pid=journal["worker_pid"],
+                credential=credential,
+                imported_result_id=import_id,
+            )
+        except SupervisorError as error:
+            if error.code in {
+                "claim_inactive",
+                "stale_fencing_token",
+                "lease_expired",
+                "worker_registration_lost",
+                "stale_worker_result",
+                "base_checkout_mutated",
+                "dirty_worktree",
+                "reservation_lost",
+                "stale_reservation",
+            }:
+                self._mark_result_import_ambiguous(import_id, str(error))
+                raise SupervisorError(
+                    "result_import_ambiguous", "submission lost its claim fence; result is retained"
+                ) from error
+            raise
+
     def _submit(
         self,
         attempt_id: str,
@@ -1950,6 +2592,7 @@ class ClaimsMixin:
         expected_worker_pid: int | None,
         credential: str | None,
         result_manifest_path: str | None = None,
+        imported_result_id: str | None = None,
     ) -> dict[str, Any]:
         self._assert_safe_git_execution_config()
         self._assert_no_git_grafts()
@@ -1976,9 +2619,84 @@ class ClaimsMixin:
                 bool(attempt["base_checkout_snapshot_required"]),
             )
             worktree = Path(attempt["worktree"])
-            if self._git_bytes("-C", str(worktree), "status", "--porcelain=v1", "-z"):
-                raise SupervisorError("dirty_worktree", "submission requires committed work")
-            commit = self._git_text("-C", str(worktree), "rev-parse", "HEAD")
+            import_row = None
+            if imported_result_id is not None:
+                if expected_worker_pid is None:
+                    raise SupervisorError(
+                        "worker_registration_lost",
+                        "imported submission requires a worker PID fence",
+                    )
+                import_row = connection.execute(
+                    "SELECT * FROM result_imports WHERE id = ?", (imported_result_id,)
+                ).fetchone()
+                if (
+                    import_row is None
+                    or import_row["phase"] != "ref_published"
+                    or import_row["attempt_id"] != attempt_id
+                    or import_row["claim_token"] != claim_token
+                    or import_row["worker_pid"] != expected_worker_pid
+                    or attempt["pid"] != import_row["worker_pid"]
+                    or attempt["pid_identity"] != import_row["worker_identity"]
+                    or task["base_sha"] != import_row["base_sha"]
+                ):
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "result journal does not match this exact attempt",
+                    )
+                receipt = self._worker_exit_receipt_in(connection, attempt, expected_worker_pid)
+                if receipt != import_row["worker_exit_receipt_json"]:
+                    raise SupervisorError(
+                        "result_import_ambiguous", "result journal worker exit receipt changed"
+                    )
+                candidate = CandidateTree(
+                    tree_sha=import_row["tree_sha"],
+                    base_sha=import_row["base_sha"],
+                    baseline_digest=import_row["baseline_digest"],
+                    result_digest=import_row["result_digest"],
+                    change_digest=import_row["change_digest"],
+                )
+                payload = candidate_commit_payload(
+                    candidate,
+                    attempt_id=attempt_id,
+                    claim_token=claim_token,
+                    result_digest=import_row["result_digest"],
+                    committed_at=import_row["commit_timestamp"],
+                )
+                with self._git_operation_guard():
+                    self._assert_result_import_worktree_base_locked(attempt, task["base_sha"])
+                    expected_ref = result_ref_name(
+                        attempt_id, claim_token, import_row["result_digest"]
+                    )
+                    target = candidate_ref_target(
+                        worktree,
+                        expected_ref,
+                        git_executable=self._system_git_executable(self.root),
+                    )
+                    expected_commit = candidate_commit_object(
+                        worktree,
+                        payload,
+                        write=False,
+                        git_executable=self._system_git_executable(self.root),
+                    )
+                    verify_candidate_objects(
+                        worktree,
+                        candidate,
+                        commit_sha=target,
+                        git_executable=self._system_git_executable(self.root),
+                    )
+                if (
+                    import_row["result_ref"] != expected_ref
+                    or target != import_row["commit_sha"]
+                    or expected_commit != import_row["commit_sha"]
+                ):
+                    raise SupervisorError(
+                        "result_import_ambiguous", "published ref differs from durable journal"
+                    )
+                commit = import_row["commit_sha"]
+            else:
+                if self._git_bytes("-C", str(worktree), "status", "--porcelain=v1", "-z"):
+                    raise SupervisorError("dirty_worktree", "submission requires committed work")
+                commit = self._git_text("-C", str(worktree), "rev-parse", "HEAD")
             if self._git_text("cat-file", "-t", commit) != "commit":
                 raise SupervisorError(
                     "invalid_submission_object", "submission HEAD is not a commit object"
@@ -2083,6 +2801,24 @@ class ClaimsMixin:
                     stamp,
                 ),
             )
+            if import_row is not None:
+                changed_import = connection.execute(
+                    "UPDATE result_imports SET phase = 'submitted', submission_id = ?, "
+                    "updated_at = ? WHERE id = ? AND phase = 'ref_published' "
+                    "AND attempt_id = ? AND claim_token = ? AND commit_sha = ?",
+                    (
+                        submission_id,
+                        stamp,
+                        imported_result_id,
+                        attempt_id,
+                        claim_token,
+                        commit,
+                    ),
+                ).rowcount
+                if changed_import != 1:
+                    raise SupervisorError(
+                        "result_import_ambiguous", "result journal changed before submission commit"
+                    )
             connection.execute(
                 """
                 UPDATE attempts SET status = 'submitted', latest_sha = ?,
@@ -2122,6 +2858,10 @@ class ClaimsMixin:
                     "commit_sha": commit,
                     "patch_sha256": sha256(patch),
                     "resource_tokens": tokens,
+                    "result_import_id": imported_result_id,
+                    "result_digest": import_row["result_digest"]
+                    if import_row is not None
+                    else None,
                 },
             )
         return self.submission(submission_id)

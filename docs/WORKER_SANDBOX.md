@@ -2,12 +2,19 @@
 
 **Status:** proposed end-to-end architecture. Standalone bounded snapshot and
 change-set primitives, exact host-side manifest replay validation, secure
-snapshot readback, and an isolated-index candidate-tree builder are implemented.
-They are not integrated into a worker executor or registered-worktree import.
-The candidate builder writes host-generated blobs and a tree into the trusted
-repository's object store but does not create a commit/ref or modify the
-registered worktree or its real index; without a durable import journal those
-objects are provisional and must not be treated as imported. End-to-end proof
+snapshot readback, an isolated-index candidate-tree builder, and a claim-fenced
+result-import journal/recovery path are implemented. The import API consumes
+host-captured `Snapshot` and `ChangeSet` objects; it is not wired into a worker
+executor, CLI transport, or the existing `run_worker` path. It writes a
+deterministic host-authored commit to an immutable per-attempt ref in
+`refs/acp/worker-results/`, then uses ACP's ordinary submission checks. It does
+not mutate the registered attempt worktree or its real index. Its write-ahead
+record binds the attempt ID, claim token, worker PID plus kernel start identity,
+successful supervisor `Popen.wait` audit receipt, base/tree and result digests.
+It does not use the namespace runtime's systemd unit ID as worker identity.
+Recovery adopts only the exact journaled commit/ref; a stale claim, missing
+object, or conflicting ref remains fenced as ambiguous. Result refs are retained
+pending a separate retention/cleanup policy. End-to-end worker isolation proof
 remains incomplete. This record does not authorize `externalSandbox` for ACP
 workers.
 
@@ -105,10 +112,12 @@ assumptions, not properties proved by a namespace test.
    suitable unchanged for workers. Test that a host-readable `/etc` sentinel
    is absent and that only reviewed toolchain/configuration files are visible.
    Keep `KillMode=control-group` and a finite runtime bound. Persist the service
-   identity/invocation evidence with the attempt; recover, heartbeat, cancel,
-   and reap via that unit identity rather than assuming the `systemd-run`
-   client PID is the worker. Do not release the attempt or runtime reservations
-   until the unit is positively absent.
+   identity/invocation evidence with the attempt, and separately bind the
+   registered worker PID plus kernel start identity to that service's cgroup.
+   Use the unit identity to recover, heartbeat, cancel, and reap the service;
+   use the bound PID/start identity as the worker identity. A systemd unit ID is
+   not itself a worker-process identity. Do not release the attempt or runtime
+   reservations until the unit is positively absent.
 4. **Credential and network boundary.** Do not mount host home, Codex config,
    SSH agents, D-Bus sockets, or inherited provider variables. A future provider
    adapter must grant a named, short-lived credential through the existing
@@ -121,15 +130,17 @@ assumptions, not properties proved by a namespace test.
    write set, rejects unsafe paths/types/size/count and final-tree path
    collisions, and computes changed file contents and modes. Validate every
    symlink target and every destination parent before mutating the registered
-   worktree. Prefer constructing a candidate tree with a temporary trusted Git
-   index and host-generated objects, then materialize only that validated tree;
-   alternatively use descriptor-relative `openat`/`O_NOFOLLOW` writes with
-   parent-identity checks. A post-import `_submit` symlink check is too late to
-   prevent a redirected host write. Ignore worker `.git` state and
-   worker-reported hashes. Before import, persist a write-ahead journal keyed
-   by attempt ID, claim/fencing epoch, systemd unit invocation ID, and result
-   digest. Recovery must recognize the exact already-imported tree/commit,
-   refuse replay into a later claim, and retain the fence on ambiguous state.
+   worktree. Prefer keeping the result as a host-built commit on an immutable
+   attempt ref and avoid checkout mutation entirely; if a future implementation
+   materializes files, it must first persist intent and use descriptor-relative
+   `openat`/`O_NOFOLLOW` writes with parent-identity checks. A post-import
+   `_submit` symlink check is too late to prevent a redirected host write.
+   Ignore worker `.git` state and worker-reported hashes. The import journal is
+   keyed by attempt ID, claim/fencing token, the exact worker PID/start identity,
+   successful supervisor exit receipt, and result digest. The systemd unit ID is
+   supplemental service evidence only, never worker identity. Recovery must
+   recognize the exact already-imported tree/commit, refuse replay into a later
+   claim, and retain the fence on ambiguous state.
 
 This design separates the OS containment identity from the worker's
 untrusted Git metadata and from ACP's submission authority. It also changes

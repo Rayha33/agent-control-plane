@@ -33,6 +33,7 @@ from agent_control_plane.git_supervisor import (
 )
 from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import process as process_module
+from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
 from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
 
 
@@ -134,6 +135,37 @@ def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change"
         ["The declared content is correct", "QC passes"],
         [resource],
     )
+
+
+def _record_test_worker_exit(supervisor: GitSupervisor, attempt_id: str) -> int:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.1)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    identity = supervisor._process_identity(process.pid)
+    assert identity is not None
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = ?, pid_identity = ? WHERE id = ?",
+            (process.pid, identity, attempt_id),
+        )
+    exit_code = process.wait(timeout=5)
+    supervisor._record_worker_exit(attempt_id, process.pid, exit_code)
+    return process.pid
+
+
+def _result_bundle(attempt: dict, output_root: Path):
+    worktree = Path(attempt["worktree"])
+    baseline = copy_snapshot(worktree, output_root / "baseline")
+    output = copy_snapshot(worktree, output_root / "worker-output").root
+    (output / "alpha.txt").write_text("imported result\n", encoding="utf-8")
+    changes = collect_changes(
+        baseline.manifest,
+        output,
+        write_set_rules=[("alpha.txt", True, False)],
+    )
+    return baseline, changes
 
 
 def test_external_attempt_worktree_root_rejects_relative_repository_and_symlink_paths(
@@ -839,6 +871,214 @@ def test_submit_accepts_an_unchanged_dirty_base_checkout(repo: Path) -> None:
     assert (repo / "preexisting.txt").read_text(
         encoding="utf-8"
     ) == "pre-existing untracked secret\n"
+
+
+@requires_linux_worker
+def test_import_worker_result_submits_immutable_host_commit_without_checkout_mutation(
+    repo: Path, tmp_path: Path
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox result import")
+    attempt = supervisor.claim(created["id"], "worker")
+    base_sha = git(Path(attempt["worktree"]), "rev-parse", "HEAD")
+    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+
+    submission = supervisor.import_worker_result(
+        attempt["id"], attempt["claim_token"], baseline, changes
+    )
+
+    assert submission["status"] == "pending_qc"
+    repeated = supervisor.import_worker_result(
+        attempt["id"], attempt["claim_token"], baseline, changes
+    )
+    assert repeated["id"] == submission["id"]
+    assert git(Path(attempt["worktree"]), "rev-parse", "HEAD") == base_sha
+    assert git(Path(attempt["worktree"]), "status", "--porcelain=v1") == ""
+    assert git(repo, "show", f"{submission['commit_sha']}:alpha.txt") == "imported result"
+    assert git(repo, "rev-parse", f"{submission['commit_sha']}^") == base_sha
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()[0]
+            == 1
+        )
+        assert imported["phase"] == "submitted"
+        assert imported["submission_id"] == submission["id"]
+        assert imported["worker_exit_receipt_json"]
+        assert git(repo, "rev-parse", imported["result_ref"]) == submission["commit_sha"]
+    assert supervisor.verify_event_chain()["ok"]
+
+
+@requires_linux_worker
+def test_result_import_recovery_refuses_noncanonical_journal_ref(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject corrupt result ref journal")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        connection.execute(
+            "UPDATE result_imports SET result_ref = 'refs/heads/main' WHERE id = ?",
+            (imported["id"],),
+        )
+        connection.commit()
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert rejected.value.code == "result_import_ambiguous"
+    with supervisor.connect() as connection:
+        phase = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()["phase"]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert phase == "ambiguous"
+
+
+@requires_linux_worker
+def test_result_import_recovery_checks_base_checkout_audit_chain(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject damaged audit chain")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        connection.execute(
+            "UPDATE events SET event_hash = ? WHERE sequence = (SELECT MIN(sequence) FROM events)",
+            ("0" * 64,),
+        )
+        connection.commit()
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert rejected.value.code == "result_import_ambiguous"
+    with supervisor.connect() as connection:
+        phase = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()["phase"]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert phase == "ambiguous"
+
+
+@requires_linux_worker
+def test_result_import_recovers_exact_ref_after_crash_before_journal_phase_commit(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "recover result import")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    publish = claims_module.publish_candidate_ref
+
+    def publish_then_crash(*args, **kwargs):
+        publish(*args, **kwargs)
+        raise SupervisorError("test_crash_injected", "simulated process stop after ref update")
+
+    monkeypatch.setattr(claims_module, "publish_candidate_ref", publish_then_crash)
+    with pytest.raises(SupervisorError) as injected:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    assert injected.value.code == "test_crash_injected"
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert imported["phase"] == "prepared"
+        assert git(repo, "rev-parse", imported["result_ref"]) == imported["commit_sha"]
+
+    monkeypatch.setattr(claims_module, "publish_candidate_ref", publish)
+    submission = supervisor.recover_worker_result_import(imported["id"])
+    assert submission["status"] == "pending_qc"
+    with supervisor.connect() as connection:
+        recovered = connection.execute(
+            "SELECT phase, submission_id FROM result_imports WHERE id = ?",
+            (imported["id"],),
+        ).fetchone()
+    assert recovered["phase"] == "submitted"
+    assert recovered["submission_id"] == submission["id"]
+
+
+@requires_linux_worker
+def test_result_import_never_replays_after_claim_fence_changes(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "fence stale result import")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, tmp_path / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    original_submit = supervisor._submit
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        connection.execute(
+            "UPDATE attempts SET claim_token = claim_token + 1 WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.commit()
+
+    monkeypatch.setattr(supervisor, "_submit", original_submit)
+    with pytest.raises(SupervisorError) as stale:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert stale.value.code == "result_import_ambiguous"
+    with supervisor.connect() as connection:
+        phase = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()["phase"]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert phase == "ambiguous"
+    assert git(repo, "rev-parse", imported["result_ref"]) == imported["commit_sha"]
 
 
 def _commit_result_manifest(
