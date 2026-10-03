@@ -270,10 +270,7 @@ CommandRunner = Callable[
     [Sequence[str], Path, Mapping[str, str], int, CredentialMaterial | None],
     dict[str, Any],
 ]
-ContainedProcessRunner = Callable[
-    [Sequence[str], Path, Mapping[str, str], int, Sequence[int], Sequence[int]],
-    dict[str, Any],
-]
+ContainedProcessRunner = Callable[..., dict[str, Any]]
 
 
 def run_trusted(
@@ -286,6 +283,7 @@ def run_trusted(
     guard_fd: int | None = None,
     expected_owners: set[int] | None = None,
     process_runner: ContainedProcessRunner | None = None,
+    pass_fds: Sequence[int] = (),
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
 
@@ -377,14 +375,19 @@ def run_trusted(
     started = time.monotonic()
     try:
         command_fds = {
-            fd for fd in (credential.fd if credential is not None else None,) if fd is not None
+            fd
+            for fd in (
+                credential.fd if credential is not None else None,
+                *pass_fds,
+            )
+            if fd is not None
         }
         if process_runner is not None:
             contained_argv = list(execution_argv)
             if descriptor_execution:
                 contained_argv[0] = str(descriptor_root / str(executable_fd))
                 command_fds.add(executable_fd)
-            contained = process_runner(
+            process_args = (
                 contained_argv,
                 cwd,
                 safe_env,
@@ -392,6 +395,7 @@ def run_trusted(
                 tuple(sorted(command_fds)),
                 (guard_fd,) if guard_fd is not None else (),
             )
+            contained = process_runner(*process_args)
             return {
                 "argv": [redact(value) for value in execution_argv],
                 "exit_code": int(contained["exit_code"]),

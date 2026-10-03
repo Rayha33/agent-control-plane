@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
-from support import commit_change, git, init_repo, make_task, python_command
+from support import (
+    commit_change,
+    git,
+    init_repo,
+    install_passing_critic,
+    make_task,
+    python_command,
+)
 
 from agent_control_plane.assurance import wilson_interval
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
@@ -23,15 +32,20 @@ def write_assurance_config(
     require_provider_diversity: bool = False,
     golden_dir: str = "acp-golden",
     qc_commands: list[str] | None = None,
+    critic_command: str | None = None,
 ) -> None:
     commands = json.dumps(qc_commands or [python_command("pass")])
+    trust_root = None
+    if critic_command is None:
+        critic_command, trust_root = install_passing_critic(repo)
     reviewers = reviewers or {}
     blocks = ""
     for identity, entry in sorted(reviewers.items()):
         blocks += f'\n[reviewers."{identity}"]\n'
         for key, value in sorted(entry.items()):
             blocks += f'{key} = "{value}"\n'
-    (repo / "acp.toml").write_text(
+    config_path = repo / "acp.toml"
+    config_path.write_text(
         "[supervisor]\n"
         "lease_seconds = 60\n"
         "qc_timeout_seconds = 30\n"
@@ -39,7 +53,7 @@ def write_assurance_config(
         "require_critic = false\n\n"
         "[qc]\n"
         f"commands = {commands}\n"
-        'critic_command = "builtin"\n\n'
+        f"critic_command = {json.dumps(critic_command)}\n\n"
         "[integration]\n"
         f"commands = {commands}\n\n"
         "[runtime]\n"
@@ -53,6 +67,11 @@ def write_assurance_config(
         f'golden_dir = "{golden_dir}"\n' + blocks,
         encoding="utf-8",
     )
+    if trust_root is not None:
+        with config_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n[trust]\nroot = {json.dumps(str(trust_root))}\nowner_uid = {os.geteuid()}\n"
+            )
 
 
 def golden_case(
@@ -399,8 +418,23 @@ def test_provider_diversity_config_needs_two_providers(repo: Path) -> None:
 # ------------------------------------------------------------------- calibration
 
 
+def test_review_packet_fd_is_an_immutable_read_only_pipe() -> None:
+    packet = b"frozen review packet\n" * 65536
+    received: list[bytes] = []
+
+    with GitSupervisor._read_only_review_packet_fd(packet) as packet_fd:
+        assert stat.S_ISFIFO(os.fstat(packet_fd).st_mode)
+        with pytest.raises(OSError):
+            os.write(packet_fd, b"attempted mutation")
+        with os.fdopen(os.dup(packet_fd), "rb") as packet_stream:
+            while chunk := packet_stream.read(65536):
+                received.append(chunk)
+
+    assert b"".join(received) == packet
+
+
 def test_calibration_catches_a_seeded_defect_and_reports_intervals(repo: Path) -> None:
-    write_assurance_config(repo)
+    write_assurance_config(repo, critic_command="builtin")
     golden_case(
         repo,
         "conflict-markers",
@@ -436,7 +470,7 @@ def test_calibration_catches_a_seeded_defect_and_reports_intervals(repo: Path) -
 
 
 def test_calibration_reports_a_missed_defect_as_a_false_pass(repo: Path) -> None:
-    write_assurance_config(repo)
+    write_assurance_config(repo, critic_command="builtin")
     golden_case(
         repo,
         "subtle-logic-bug",
@@ -453,7 +487,7 @@ def test_calibration_reports_a_missed_defect_as_a_false_pass(repo: Path) -> None
 
 
 def test_calibration_leaves_no_worktrees_behind(repo: Path) -> None:
-    write_assurance_config(repo)
+    write_assurance_config(repo, critic_command="builtin")
     golden_case(
         repo,
         "clean",
@@ -468,6 +502,47 @@ def test_calibration_leaves_no_worktrees_behind(repo: Path) -> None:
     assert not list((repo / ".acp" / "worktrees").glob("golden-*"))
     # the calibration mutated beta.txt inside a throwaway worktree, never here
     assert (repo / "beta.txt").read_text(encoding="utf-8") == "base\n"
+
+
+def test_calibration_quarantines_substituted_artifacts_and_removes_worktree(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_assurance_config(repo, critic_command="builtin")
+    golden_case(
+        repo,
+        "clean",
+        "pass",
+        mutations='[[mutations]]\npath = "beta.txt"\ncontent = "edit\\n"\n',
+    )
+    supervisor = GitSupervisor(repo)
+
+    def substitute_artifacts(
+        _command: str,
+        _cwd: Path,
+        environment: dict[str, str],
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        for key in ("ACP_REVIEW_PACKET_ARCHIVE", "ACP_REVIEW_RESULT"):
+            artifact = Path(environment[key])
+            artifact.unlink(missing_ok=True)
+            artifact.mkdir()
+            (artifact / "preserve.txt").write_text("reviewer data", encoding="utf-8")
+        return {"exit_code": 1, "stdout": "", "stderr": "review failed"}
+
+    monkeypatch.setattr(supervisor, "_run_critic", substitute_artifacts)
+
+    report = supervisor.calibrate()
+
+    assert report["results"][0]["correct"] is False
+    assert "critic exited 1" in report["results"][0]["error"]
+    assert "golden-" not in git(repo, "worktree", "list")
+    assert not list((repo / ".acp" / "worktrees").glob("golden-*"))
+    quarantined = list((repo / ".acp" / "logs").glob("*.tampered-*"))
+    assert len(quarantined) == 2
+    assert all(
+        (path / "preserve.txt").read_text(encoding="utf-8") == "reviewer data"
+        for path in quarantined
+    )
 
 
 def test_calibration_without_golden_cases_is_an_explicit_error(repo: Path) -> None:

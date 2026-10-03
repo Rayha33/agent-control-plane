@@ -193,7 +193,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -332,6 +332,21 @@ def _add_read_dependency_snapshots(connection: sqlite3.Connection) -> None:
         )
 
 
+def _add_qc_acceptance_coverage(connection: sqlite3.Connection) -> None:
+    """Persist criterion-level QC outcomes and fence pre-contract binaries."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(qc_runs)")}
+    if "acceptance_coverage_json" not in columns:
+        connection.execute(
+            "ALTER TABLE qc_runs ADD COLUMN acceptance_coverage_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "acceptance_coverage_contract_version" not in columns:
+        connection.execute(
+            "ALTER TABLE qc_runs ADD COLUMN acceptance_coverage_contract_version "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -341,6 +356,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (7, _add_attempt_worktree_root),
     (8, _add_qc_runs_latest_lookup_index),
     (9, _add_read_dependency_snapshots),
+    (10, _add_qc_acceptance_coverage),
 )
 
 
@@ -1154,6 +1170,7 @@ class GitSupervisor(
         extra_env: dict[str, str],
         trust_pin: dict[str, Any] | None = None,
         pass_fds: Sequence[int] = (),
+        review_packet_fd: int | None = None,
     ) -> dict[str, Any]:
         if command != "builtin":
             env = self._child_env(extra_env)
@@ -1172,6 +1189,7 @@ class GitSupervisor(
                     ),
                     guard_fd=pass_fds[0] if pass_fds else None,
                     process_runner=self._run_trusted_contained,
+                    pass_fds=(review_packet_fd,) if review_packet_fd is not None else (),
                 )
             except DriverError as error:
                 raise SupervisorError(error.code, error.message) from error
@@ -1183,6 +1201,7 @@ class GitSupervisor(
             "builtin:structural-critic",
             cwd,
             env,
+            pass_fds=(review_packet_fd,) if review_packet_fd is not None else (),
             lifecycle_fds=pass_fds,
         )
 

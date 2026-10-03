@@ -172,6 +172,10 @@ class ViewsMixin:
             "verdict": row["verdict"],
             "findings": json.loads(row["findings_json"]),
             "command_results": json.loads(row["results_json"]),
+            "acceptance_coverage": json.loads(row["acceptance_coverage_json"] or "[]"),
+            "acceptance_coverage_contract_version": int(
+                row["acceptance_coverage_contract_version"] or 0
+            ),
             "review_packet_sha256": row["packet_sha256"],
             "reviewer_provenance": json.loads(row["reviewer_provenance_json"] or "{}"),
             "reviewer_signature": row["reviewer_signature"],

@@ -661,21 +661,45 @@ critic_command = "/absolute/path/outside/the/repository/critic-wrapper"
 
 ACP starts the critic itself in the detached candidate worktree. It provides:
 
-- <code>ACP_REVIEW_PACKET</code>: task specification and Git-derived evidence;
+- <code>ACP_REVIEW_PACKET_FD</code>: decimal number of an inherited read-only pipe
+  descriptor carrying the exact frozen JSON packet for this QC run and candidate
+  commit. Read it with <code>os.fdopen(os.dup(int(os.environ["ACP_REVIEW_PACKET_FD"])),
+  "rb")</code>; do not open it as a pathname or use stdin. The pipe cannot be rewritten
+  through the reviewer FD and is independent of the diagnostic archive;
+- <code>ACP_REVIEW_PACKET_ARCHIVE</code>: persisted diagnostic copy of that packet. ACP
+  hash-checks and restores this archive if the reviewer modifies it; it is not the
+  authoritative input stream;
 - <code>ACP_REVIEW_RESULT</code>: destination for structured JSON.
 
-The worker's conclusion is deliberately excluded. The critic must emit:
+The worker's conclusion is deliberately excluded. Critic output uses contract
+version 2 and must account for every criterion. A criterion may be <code>pass</code>,
+<code>revise</code>, <code>unknown</code>, or <code>human_required</code>; every result
+needs a rationale and one or more IDs from the packet's <code>evidence_catalog</code>.
+Missing/duplicate criteria, unsupported contract versions, or evidence refs that do
+not resolve to this exact QC run and commit cannot pass. A top-level pass is accepted
+only when every criterion is independently marked pass. Example:
 
 ~~~json
 {
+  "contract_version": 2,
   "verdict": "pass",
-  "findings": []
+  "findings": [],
+  "acceptance_coverage": [
+    {
+      "criterion_id": "AC-001-<stable-hash>",
+      "status": "pass",
+      "rationale": "The submitted behavior is demonstrated by the cited check.",
+      "evidence_refs": ["<qc-run-id>:command:001"]
+    }
+  ]
 }
 ~~~
 
 Negative verdicts require findings with severity, requirement, finding,
-evidence, and required fix. Use a different provider/model in the wrapper when
-correlated model bias is unacceptable.
+evidence, and required fix. A missing or invalid coverage result fails QC closed;
+legacy critic wrappers must be upgraded rather than silently treated as verified.
+Use a different provider/model in the wrapper when correlated model bias is
+unacceptable.
 
 External critic configuration is deliberately strict: it must be a single
 absolute executable path outside the repository with a root-owned,
@@ -684,9 +708,12 @@ through the candidate's shell or import path. Put model/provider arguments and
 credentials inside that trusted wrapper.
 
 The built-in critic checks review scope, regression-test signals, sensitive
-paths, conflict markers, and deterministic results. It is an independent
-process, but it is rule-based—not a substitute for a separately credentialed AI
-or human reviewer when semantic judgment matters.
+paths, conflict markers, and deterministic results. For ordinary work it marks
+semantic acceptance <code>human_required</code>, because those structural checks
+cannot prove arbitrary free-text criteria. It is an independent process, but it
+is rule-based—not a substitute for a separately credentialed AI or human reviewer
+when semantic judgment matters. This coverage ledger makes omissions visible; it
+does not prove an LLM's semantic judgment is correct.
 
 ## Reviewer provenance and calibration
 

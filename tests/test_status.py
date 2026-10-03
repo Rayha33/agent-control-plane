@@ -75,6 +75,21 @@ def _install_revising_critic(supervisor: GitSupervisor, monkeypatch: pytest.Monk
                     }
                 ],
             }
+        with os.fdopen(
+            os.dup(int(environment["ACP_REVIEW_PACKET_FD"])), "r", encoding="utf-8"
+        ) as packet_stream:
+            packet = json.load(packet_stream)
+        evidence_id = packet["evidence_catalog"][0]["id"]
+        payload["contract_version"] = 2
+        payload["acceptance_coverage"] = [
+            {
+                "criterion_id": criterion["id"],
+                "status": "pass",
+                "rationale": "The test reviewer covers the criterion.",
+                "evidence_refs": [evidence_id],
+            }
+            for criterion in packet["task"]["acceptance_criteria"]
+        ]
         Path(environment["ACP_REVIEW_RESULT"]).write_text(json.dumps(payload), encoding="utf-8")
         return {
             "command": command,
