@@ -2218,10 +2218,13 @@ def test_supervisor_persists_namespace_runtime_unit_invocation_id(
     )
     (driver_repo / "acp.toml").write_text(config, encoding="utf-8")
     calls: list[list[str]] = []
+    tearing_down = False
 
     def fake_run_trusted(argv, *_args, **_kwargs):  # type: ignore[no-untyped-def]
         calls.append(list(argv))
-        output = ACTIVE_SHOW if Path(argv[0]).name == "systemctl" else ""
+        output = ""
+        if Path(argv[0]).name == "systemctl" and argv[2] == "show":
+            output = NOT_FOUND_SHOW if tearing_down else ACTIVE_SHOW
         return {"argv": list(argv), "exit_code": 0, "stdout": output, "stderr": ""}
 
     monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
@@ -2237,6 +2240,28 @@ def test_supervisor_persists_namespace_runtime_unit_invocation_id(
         == "0123456789abcdef0123456789abcdef"
     )
     assert any(Path(call[0]).name == "systemctl" for call in calls)
+
+    tearing_down = True
+    released = supervisor.runtime_down(attempt["id"], _allow_active=True)
+
+    assert released["state"] == "released"
+    current = supervisor.driver_resources(attempt["id"])[0]
+    assert current["state"] == "released"
+    assert current["evidence"]["proof"]["observation"]["systemd_unit_invocation_id"] is None
+    with supervisor.connect() as connection:
+        events = connection.execute(
+            "SELECT event_type, payload_json FROM events "
+            "WHERE event_type IN ('runtime.driver.setup', 'runtime.driver.teardown') "
+            "AND json_extract(payload_json, '$.attempt_id') = ? ORDER BY sequence",
+            (attempt["id"],),
+        ).fetchall()
+    setup_payload = next(
+        json.loads(event["payload_json"])
+        for event in events
+        if event["event_type"] == "runtime.driver.setup"
+    )
+    assert setup_payload["systemd_unit_invocation_id"] == "0123456789abcdef0123456789abcdef"
+    assert supervisor.verify_event_chain()["ok"] is True
 
 
 def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(

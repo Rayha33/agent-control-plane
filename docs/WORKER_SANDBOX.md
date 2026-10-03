@@ -12,12 +12,14 @@ remains incomplete. This record does not authorize `externalSandbox` for ACP
 workers.
 
 The namespace runtime probe records a validated
-`systemd_unit_invocation_id` in its runtime-driver evidence when systemd
-provides one. This is the identity of the runtime driver's transient unit only:
-the current supervised worker launcher still uses a direct process/trampoline
-path, and no evidence shows that worker is executing inside that unit. Do not
-use this runtime-unit ID as a worker fence or result-import receipt until the
-executor binds the worker to that exact unit and persists the binding.
+`systemd_unit_invocation_id` in its runtime-driver evidence and append-only
+runtime audit event when systemd provides one, so a later teardown sample cannot
+erase the setup identity. This is the identity of the runtime driver's transient
+unit only: the current supervised worker launcher still uses a direct
+process/trampoline path, and no evidence shows that worker is executing inside
+that unit. Do not use this runtime-unit ID as a worker fence or result-import
+receipt until the executor binds the worker to that exact unit and persists the
+binding.
 
 The replay helper reconstructs and compares the complete result manifest;
 directory changes are represented so empty directories affect the result
