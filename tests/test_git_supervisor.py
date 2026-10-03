@@ -1471,10 +1471,19 @@ def test_persistent_write_racing_a_claim_snapshot_is_blocked_before_qc(
     secret = "root-write-during-snapshot"
 
     def write_after_path_was_fingerprinted(
-        root_real: Path, relative: bytes, display: bytes
+        root_real: Path,
+        relative: bytes,
+        display: bytes,
+        *,
+        expected_root_identity: tuple[int, int, int, int, int] | None = None,
     ) -> dict:
         nonlocal changed
-        result = original(root_real, relative, display)
+        result = original(
+            root_real,
+            relative,
+            display,
+            expected_root_identity=expected_root_identity,
+        )
         if relative == b"alpha.txt" and not changed:
             changed = True
             (repo / "alpha.txt").write_text(secret + "\n", encoding="utf-8")

@@ -1443,7 +1443,11 @@ class ClaimsMixin:
         return descriptor
 
     def _open_snapshot_root(
-        self, root_real: Path, display: bytes
+        self,
+        root_real: Path,
+        display: bytes,
+        *,
+        expected_root_identity: tuple[int, int, int, int, int] | None = None,
     ) -> tuple[int, list[int], list[tuple[int, str, int, bool]]]:
         if not root_real.is_absolute():
             raise self._snapshot_path_error(display)
@@ -1472,6 +1476,12 @@ class ClaimsMixin:
                 )
                 descriptors.append(child_fd)
                 directories.append((parent_fd, component, child_fd, within_snapshot_root))
+            if (
+                expected_root_identity is not None
+                and self._snapshot_directory_identity(os.fstat(descriptors[-1]))
+                != expected_root_identity
+            ):
+                raise self._snapshot_path_error(display)
         except Exception:
             for opened_fd in reversed(descriptors):
                 os.close(opened_fd)
@@ -1498,7 +1508,12 @@ class ClaimsMixin:
             raise self._snapshot_path_error(display) from None
 
     def _fingerprint_base_path(
-        self, root_real: Path, relative: bytes, display: bytes
+        self,
+        root_real: Path,
+        relative: bytes,
+        display: bytes,
+        *,
+        expected_root_identity: tuple[int, int, int, int, int] | None = None,
     ) -> dict[str, Any]:
         components = relative.split(b"/")
         if not components or any(part in {b"", b".", b".."} for part in components):
@@ -1510,7 +1525,11 @@ class ClaimsMixin:
             raise self._snapshot_path_error(display)
         if os.path.isabs(decoded[0]) or os.path.splitdrive(decoded[0])[0]:
             raise self._snapshot_path_error(display)
-        _root_fd, descriptors, directories = self._open_snapshot_root(root_real, display)
+        if expected_root_identity is None:
+            expected_root_identity = self._snapshot_root_identity(root_real, display)
+        _root_fd, descriptors, directories = self._open_snapshot_root(
+            root_real, display, expected_root_identity=expected_root_identity
+        )
         try:
             for component in decoded[:-1]:
                 parent_fd = descriptors[-1]
@@ -1623,6 +1642,26 @@ class ClaimsMixin:
             metadata.st_gid,
         )
 
+    def _snapshot_root_identity(
+        self, root_real: Path, display: bytes
+    ) -> tuple[int, int, int, int, int]:
+        try:
+            metadata = os.stat(root_real, follow_symlinks=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise self._snapshot_path_error(display) from None
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise self._snapshot_path_error(display)
+        return self._snapshot_directory_identity(metadata)
+
+    def _verify_snapshot_root_identity(
+        self,
+        root_real: Path,
+        expected: tuple[int, int, int, int, int],
+        display: bytes,
+    ) -> None:
+        if self._snapshot_root_identity(root_real, display) != expected:
+            raise self._snapshot_path_error(display)
+
     def _snapshot_checkout_repository(
         self,
         root: Path,
@@ -1640,6 +1679,7 @@ class ClaimsMixin:
                     "base_checkout_uninspectable", "nested Git checkout depth exceeds the limit"
                 )
             ancestors = ancestors | {real_root}
+            root_identity = self._snapshot_root_identity(real_root, os.fsencode(real_root))
             self._assert_safe_git_execution_config(real_root, snapshot_only=True)
             reported_root = self._git_bytes(
                 "-C",
@@ -1656,6 +1696,7 @@ class ClaimsMixin:
                     "base_checkout_uninspectable",
                     "nested Git checkout root does not match its source path",
                 )
+            self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
             status_raw = self._git_bytes(
                 "-C",
                 str(root),
@@ -1665,7 +1706,9 @@ class ClaimsMixin:
                 "--untracked-files=all",
                 "--ignore-submodules=none",
             )
+            self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
             index_raw = self._git_bytes("-C", str(root), "ls-files", "--stage", "-z")
+            self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
         except SupervisorError as error:
             if error.code in {
                 "base_checkout_uninspectable",
@@ -1744,7 +1787,12 @@ class ClaimsMixin:
         entries: dict[str, str] = {}
         for path in sorted(set(index) | set(status)):
             display = prefix + path
-            fingerprint = self._fingerprint_base_path(real_root, path, display)
+            fingerprint = self._fingerprint_base_path(
+                real_root,
+                path,
+                display,
+                expected_root_identity=root_identity,
+            )
             index_entries = sorted(index.get(path, []))
             modes = {entry.split(" ", 1)[0] for entry in index_entries}
             target = root.joinpath(*(os.fsdecode(part) for part in path.split(b"/")))
@@ -1770,7 +1818,8 @@ class ClaimsMixin:
             }
             entries[self._snapshot_path_key(display)] = sha256(canonical_json(entry).encode())
 
-        return {"format": 1, "entries": entries}
+        self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
+        return {"format": 2, "root_identity": list(root_identity), "entries": entries}
 
     def _capture_base_checkout_snapshot(self) -> dict[str, Any]:
         return self._snapshot_checkout_repository(self.root)
@@ -1827,11 +1876,28 @@ class ClaimsMixin:
             raise SupervisorError(
                 "base_checkout_snapshot_invalid", "claim-time base checkout snapshot is unreadable"
             ) from None
-        if not isinstance(baseline, dict) or baseline.get("format") != 1:
+        snapshot_format = baseline.get("format") if isinstance(baseline, dict) else None
+        if not isinstance(baseline, dict) or snapshot_format not in {1, 2}:
             raise SupervisorError(
                 "base_checkout_snapshot_invalid", "claim-time base checkout snapshot is unsupported"
             )
         current = self._capture_base_checkout_snapshot()
+        if snapshot_format == 2:
+            root_identity = baseline.get("root_identity")
+            if (
+                not isinstance(root_identity, list)
+                or len(root_identity) != 5
+                or any(type(value) is not int for value in root_identity)
+            ):
+                raise SupervisorError(
+                    "base_checkout_snapshot_invalid",
+                    "claim-time base checkout root identity is unreadable",
+                )
+            if root_identity != current.get("root_identity"):
+                raise SupervisorError(
+                    "base_checkout_mutated",
+                    "base checkout root identity changed since attempt claim",
+                )
         old_entries = baseline.get("entries")
         new_entries = current["entries"]
         if not isinstance(old_entries, dict):

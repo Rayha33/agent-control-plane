@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -80,6 +81,65 @@ def test_claim_snapshot_ignores_unrelated_parent_directory_updates(
     assert sibling_created
     assert attempt["id"]
     assert (repo / "alpha.txt").read_text(encoding="utf-8") == "base\n"
+
+
+def test_snapshot_rejects_identical_checkout_replacement(tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    repo = init_repo(repo_path)
+    supervisor = GitSupervisor(repo)
+    replacement = tmp_path / "identical-replacement"
+    shutil.copytree(repo, replacement)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    original = tmp_path / "original-checkout"
+
+    with supervisor.connect() as connection:
+        snapshot_json = connection.execute(
+            "SELECT base_checkout_snapshot_json FROM attempts WHERE id = ?",
+            (attempt["id"],),
+        ).fetchone()[0]
+        repo.rename(original)
+        replacement.rename(repo)
+
+        with pytest.raises(SupervisorError) as error:
+            supervisor._assert_base_checkout_unchanged(
+                connection, attempt["id"], snapshot_json, True
+            )
+
+    assert error.value.code == "base_checkout_mutated"
+    assert "root identity changed" in str(error.value)
+
+
+def test_snapshot_rejects_checkout_replaced_during_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    repo = init_repo(repo_path)
+    supervisor = GitSupervisor(repo)
+    replacement = tmp_path / "identical-replacement"
+    shutil.copytree(repo, replacement)
+    original = tmp_path / "original-checkout"
+    original_fingerprint = supervisor._fingerprint_base_path
+    replaced = False
+
+    def fingerprint_then_replace(root_real, relative, display, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal replaced
+        result = original_fingerprint(root_real, relative, display, **kwargs)
+        if not replaced:
+            repo.rename(original)
+            replacement.rename(repo)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(supervisor, "_fingerprint_base_path", fingerprint_then_replace)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._capture_base_checkout_snapshot()
+
+    assert replaced
+    assert error.value.code == "base_checkout_uninspectable"
 
 
 def test_an_undeclared_path_in_the_worktree_is_denied(claimed) -> None:
