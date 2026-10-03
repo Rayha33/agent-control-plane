@@ -3365,7 +3365,20 @@ def test_trusted_external_critic_cannot_leave_a_detached_child(repo: Path) -> No
     if sys.platform == "darwin":
         assert review["verdict"] != "pass", "Darwin must deny critic forks"
     else:
-        assert review["verdict"] == "pass", review
+        diagnostic = {
+            "verdict": review.get("verdict"),
+            "findings": review.get("findings"),
+            "acceptance_coverage": review.get("acceptance_coverage"),
+            "command_results": [
+                {
+                    key: value[:2_000] if isinstance(value, str) else value
+                    for key, value in result.items()
+                    if key in {"command", "exit_code", "stdout", "stderr"}
+                }
+                for result in review.get("command_results", [])
+            ],
+        }
+        assert review["verdict"] == "pass", json.dumps(diagnostic, indent=2)
     time.sleep(1.2)
     assert not marker.exists()
 
