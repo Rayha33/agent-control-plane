@@ -4392,7 +4392,7 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
-    marker = repo / "payload-started"
+    marker = Path(supervisor.state_dir) / f"payload-started-{attempt['id']}"
     ready_entered = Event()
     release_ready = Event()
     original_record = supervisor._record_worker_command_ready
@@ -4551,7 +4551,7 @@ def test_worker_receipt_digest_uses_frozen_caller_argv(
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
-    marker = Path(attempt["worktree"]) / "argv-snapshot"
+    marker = Path(supervisor.state_dir) / f"argv-snapshot-{attempt['id']}"
     command = [
         sys.executable,
         "-c",
