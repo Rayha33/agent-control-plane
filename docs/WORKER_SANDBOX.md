@@ -242,6 +242,34 @@ assumptions, not properties proved by a namespace test.
    plus the bounded NAS fixture above; it is an implementation contract, not
    proof that ACP currently performs these steps.
 
+### Durable execution-journal slice (2026-10-04)
+
+Schema 14 adds a private, per-attempt `sandbox_executions` journal. Reservation
+binds the current claim token, an ACP-generated container ID, attempt-specific
+bundle/state paths, the bundle and rootfs digests, and exact runc/OCI versions.
+The transition contract keeps the ACP monitor, attached runc client, and
+container-init PID/start identities separate, and also records the wrapper and
+scope unit names plus InvocationIDs and exact cgroup path. SQLite prevents edits
+to recorded reservation/runtime evidence, illegal phase jumps, and row deletion.
+Supervisor lifecycle methods pair their transitions with ACP hash-chained event
+entries. Direct database writes are outside the supported API and threat model;
+these constraints are not a defense against a writer who can alter the database.
+
+This slice deliberately adds no launcher, command route, OCI feature flag, or
+trusted cleanup verifier. A cleanup report has an exact schema and must match
+the recorded identities, but its observations are caller-supplied claims, not
+host readback. `cleanup_reported` is therefore not `cleanup_verified`. Existing
+reaper, worker-finalization, and runtime-teardown paths refuse to release a
+journaled attempt until a future trusted verifier records `cleanup_verified`.
+This is only a fail-closed hold: the reaper does not stop a live container or
+perform cancellation/restart recovery for this journal-only slice. Ambiguous
+journal state moves the attempt to quarantine and extends its resource fences.
+No application method currently writes `cleanup_verified`, so this work cannot
+enable or complete an OCI worker sandbox; attempts with such journal rows remain
+intentionally fenced pending separate executor, targeted-stop, recovery, and
+verifier work. The legacy `attempts.pid` slot remains reserved for direct workers;
+a future sandbox monitor must use a distinct journal-backed registration path.
+
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
    measured host was Debian 12,

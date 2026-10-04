@@ -37,6 +37,7 @@ from .common import (
     sha256,
     utc_now,
 )
+from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
 
 
 class RuntimeMixin:
@@ -1246,6 +1247,11 @@ class RuntimeMixin:
     ) -> dict[str, Any]:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if not _sandbox_execution_cleanup_is_verified(connection, attempt_id):
+                raise SupervisorError(
+                    "sandbox_cleanup_unverified",
+                    "OCI execution cleanup is not independently verified; runtime teardown is fenced",
+                )
             row = connection.execute(
                 "SELECT * FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()

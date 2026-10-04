@@ -167,6 +167,7 @@ from .supervisor.process import ProcessMixin
 from .supervisor.qc import QcMixin
 from .supervisor.reaper import ReaperMixin
 from .supervisor.runtime import RuntimeMixin
+from .supervisor.sandbox_execution_journal import SandboxExecutionJournalMixin
 
 # Board #1630: the table definitions, the idempotent column upgrade and the
 # case-sensitivity probe now live in `supervisor.schema`. They are imported back into this
@@ -193,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -407,6 +408,234 @@ def _add_result_import_object_staging(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE result_imports ADD COLUMN {name} {definition}")
 
 
+def _add_sandbox_execution_journal(connection: sqlite3.Connection) -> None:
+    """Persist OCI worker identities before adding any launch integration.
+
+    A cleanup report is intentionally distinct from independently verified cleanup.
+    The reaper only accepts ``cleanup_verified``; no launcher or verifier advances
+    that phase in this migration.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sandbox_executions (
+          attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+          claim_token INTEGER NOT NULL CHECK (claim_token > 0),
+          execution_id TEXT NOT NULL UNIQUE,
+          backend TEXT NOT NULL CHECK (backend = 'oci-runc'),
+          container_id TEXT NOT NULL UNIQUE,
+          bundle_digest TEXT NOT NULL CHECK (length(bundle_digest) = 64),
+          rootfs_digest TEXT NOT NULL CHECK (length(rootfs_digest) = 64),
+          runtime_version TEXT NOT NULL,
+          oci_version TEXT NOT NULL,
+          bundle_path TEXT NOT NULL,
+          state_path TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN (
+            'reserved', 'launched', 'running', 'stopping', 'exited',
+            'cleanup_reported', 'cleanup_verified', 'ambiguous'
+          )),
+          monitor_pid INTEGER,
+          monitor_identity TEXT NOT NULL DEFAULT '',
+          runc_client_pid INTEGER,
+          runc_client_identity TEXT NOT NULL DEFAULT '',
+          init_pid INTEGER,
+          init_identity TEXT NOT NULL DEFAULT '',
+          wrapper_unit TEXT NOT NULL DEFAULT '',
+          wrapper_invocation_id TEXT NOT NULL DEFAULT '',
+          scope_unit TEXT NOT NULL DEFAULT '',
+          scope_invocation_id TEXT NOT NULL DEFAULT '',
+          cgroup_path TEXT NOT NULL DEFAULT '',
+          stop_reason TEXT NOT NULL DEFAULT '',
+          runc_exit_code INTEGER,
+          runc_exit_observed_by TEXT NOT NULL DEFAULT '',
+          cleanup_receipt_json TEXT NOT NULL DEFAULT '{}',
+          failure_reason TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (attempt_id, claim_token),
+          CHECK (
+            phase NOT IN (
+              'launched', 'running', 'stopping', 'exited',
+              'cleanup_reported', 'cleanup_verified'
+            ) OR (
+              monitor_pid IS NOT NULL AND monitor_pid > 0 AND monitor_identity != ''
+              AND runc_client_pid IS NOT NULL AND runc_client_pid > 0
+              AND runc_client_identity != ''
+              AND wrapper_unit != '' AND wrapper_invocation_id != ''
+              AND scope_unit != '' AND scope_invocation_id != '' AND cgroup_path != ''
+            )
+          ),
+          CHECK (
+            phase NOT IN (
+              'running', 'stopping', 'exited', 'cleanup_reported', 'cleanup_verified'
+            ) OR (init_pid IS NOT NULL AND init_pid > 0 AND init_identity != '')
+          ),
+          CHECK (phase != 'stopping' OR stop_reason != ''),
+          CHECK (
+            phase NOT IN ('exited', 'cleanup_reported', 'cleanup_verified')
+            OR runc_exit_code IS NOT NULL
+          ),
+          CHECK (
+            phase NOT IN ('exited', 'cleanup_reported', 'cleanup_verified')
+            OR runc_exit_observed_by = 'runc_client_popen_wait'
+          ),
+          CHECK (
+            phase NOT IN ('cleanup_reported', 'cleanup_verified')
+            OR cleanup_receipt_json != '{}'
+          )
+        )
+        """
+    )
+    # Re-running the migration repairs trigger definitions while schema v14 is
+    # still unreleased. Dropping only these names keeps the migration idempotent.
+    for trigger in (
+        "sandbox_execution_insert_reserved",
+        "sandbox_execution_identity_immutable",
+        "sandbox_execution_evidence_immutable",
+        "sandbox_execution_evidence_phase_guard",
+        "sandbox_execution_phase_transition",
+        "sandbox_execution_no_delete",
+        "attempts_no_direct_worker_with_sandbox",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sandbox_executions_phase "
+        "ON sandbox_executions(phase, updated_at)"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_insert_reserved
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.phase != 'reserved'
+          OR NEW.monitor_pid IS NOT NULL OR NEW.monitor_identity != ''
+          OR NEW.runc_client_pid IS NOT NULL OR NEW.runc_client_identity != ''
+          OR NEW.init_pid IS NOT NULL OR NEW.init_identity != ''
+          OR NEW.wrapper_unit != '' OR NEW.wrapper_invocation_id != ''
+          OR NEW.scope_unit != '' OR NEW.scope_invocation_id != '' OR NEW.cgroup_path != ''
+          OR NEW.stop_reason != '' OR NEW.runc_exit_code IS NOT NULL
+          OR NEW.runc_exit_observed_by != '' OR NEW.cleanup_receipt_json != '{}'
+          OR NEW.failure_reason != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_must_start_reserved');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_identity_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.attempt_id IS NOT NEW.attempt_id
+          OR OLD.claim_token IS NOT NEW.claim_token
+          OR OLD.execution_id IS NOT NEW.execution_id
+          OR OLD.backend IS NOT NEW.backend
+          OR OLD.container_id IS NOT NEW.container_id
+          OR OLD.bundle_digest IS NOT NEW.bundle_digest
+          OR OLD.rootfs_digest IS NOT NEW.rootfs_digest
+          OR OLD.runtime_version IS NOT NEW.runtime_version
+          OR OLD.oci_version IS NOT NEW.oci_version
+          OR OLD.bundle_path IS NOT NEW.bundle_path
+          OR OLD.state_path IS NOT NEW.state_path
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_identity_immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_evidence_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN (OLD.monitor_pid IS NOT NULL AND NEW.monitor_pid IS NOT OLD.monitor_pid)
+          OR (OLD.monitor_identity != '' AND NEW.monitor_identity IS NOT OLD.monitor_identity)
+          OR (OLD.runc_client_pid IS NOT NULL AND NEW.runc_client_pid IS NOT OLD.runc_client_pid)
+          OR (OLD.runc_client_identity != '' AND NEW.runc_client_identity IS NOT OLD.runc_client_identity)
+          OR (OLD.init_pid IS NOT NULL AND NEW.init_pid IS NOT OLD.init_pid)
+          OR (OLD.init_identity != '' AND NEW.init_identity IS NOT OLD.init_identity)
+          OR (OLD.wrapper_unit != '' AND NEW.wrapper_unit IS NOT OLD.wrapper_unit)
+          OR (OLD.wrapper_invocation_id != '' AND NEW.wrapper_invocation_id IS NOT OLD.wrapper_invocation_id)
+          OR (OLD.scope_unit != '' AND NEW.scope_unit IS NOT OLD.scope_unit)
+          OR (OLD.scope_invocation_id != '' AND NEW.scope_invocation_id IS NOT OLD.scope_invocation_id)
+          OR (OLD.cgroup_path != '' AND NEW.cgroup_path IS NOT OLD.cgroup_path)
+          OR (OLD.stop_reason != '' AND NEW.stop_reason IS NOT OLD.stop_reason)
+          OR (OLD.runc_exit_code IS NOT NULL AND NEW.runc_exit_code IS NOT OLD.runc_exit_code)
+          OR (OLD.runc_exit_observed_by != '' AND NEW.runc_exit_observed_by IS NOT OLD.runc_exit_observed_by)
+          OR (OLD.cleanup_receipt_json != '{}' AND NEW.cleanup_receipt_json IS NOT OLD.cleanup_receipt_json)
+          OR (OLD.failure_reason != '' AND NEW.failure_reason IS NOT OLD.failure_reason)
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_evidence_immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_evidence_phase_guard
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.phase = NEW.phase AND (
+          OLD.monitor_pid IS NOT NEW.monitor_pid
+          OR OLD.monitor_identity IS NOT NEW.monitor_identity
+          OR OLD.runc_client_pid IS NOT NEW.runc_client_pid
+          OR OLD.runc_client_identity IS NOT NEW.runc_client_identity
+          OR OLD.init_pid IS NOT NEW.init_pid
+          OR OLD.init_identity IS NOT NEW.init_identity
+          OR OLD.wrapper_unit IS NOT NEW.wrapper_unit
+          OR OLD.wrapper_invocation_id IS NOT NEW.wrapper_invocation_id
+          OR OLD.scope_unit IS NOT NEW.scope_unit
+          OR OLD.scope_invocation_id IS NOT NEW.scope_invocation_id
+          OR OLD.cgroup_path IS NOT NEW.cgroup_path
+          OR OLD.stop_reason IS NOT NEW.stop_reason
+          OR OLD.runc_exit_code IS NOT NEW.runc_exit_code
+          OR OLD.runc_exit_observed_by IS NOT NEW.runc_exit_observed_by
+          OR OLD.cleanup_receipt_json IS NOT NEW.cleanup_receipt_json
+          OR OLD.failure_reason IS NOT NEW.failure_reason
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_evidence_requires_phase_transition');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_phase_transition
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase != NEW.phase AND NOT (
+          (OLD.phase = 'reserved' AND NEW.phase IN ('launched', 'ambiguous'))
+          OR (OLD.phase = 'launched' AND NEW.phase IN ('running', 'stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'running' AND NEW.phase IN ('stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'stopping' AND NEW.phase IN ('exited', 'ambiguous'))
+          OR (OLD.phase = 'exited' AND NEW.phase IN ('cleanup_reported', 'ambiguous'))
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'ambiguous')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_phase_transition_invalid');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_no_delete
+        BEFORE DELETE ON sandbox_executions
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_journal_retained');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS attempts_no_direct_worker_with_sandbox
+        BEFORE UPDATE OF pid ON attempts
+        WHEN NEW.pid IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM sandbox_executions
+            WHERE attempt_id = NEW.id
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_owns_attempt_slot');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -420,6 +649,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (11, _add_submission_result_manifest),
     (12, _add_result_import_journal),
     (13, _add_result_import_object_staging),
+    (14, _add_sandbox_execution_journal),
 )
 
 
@@ -456,6 +686,7 @@ class GitSupervisor(
     ViewsMixin,
     ProcessMixin,
     WorkersMixin,
+    SandboxExecutionJournalMixin,
     RuntimeMixin,
     QcMixin,
     ClaimsMixin,

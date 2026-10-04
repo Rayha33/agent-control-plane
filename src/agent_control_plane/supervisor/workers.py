@@ -25,6 +25,7 @@ from typing import Any
 
 from ..worker_trampoline import LIFECYCLE_FDS_PREFIX, MONITOR_MODE
 from .common import SupervisorError, utc_now
+from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
 
 _MAX_WORKER_LOG_BYTES = 8 * 1024 * 1024
 _WORKER_LOG_TRUNCATION_MARKER = b"\n[ACP worker output truncated at 8 MiB]\n"
@@ -403,6 +404,13 @@ class WorkersMixin:
                     "worker_already_running",
                     "this attempt already has a launching or running worker",
                 )
+            if connection.execute(
+                "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone():
+                raise SupervisorError(
+                    "sandbox_execution_reserved",
+                    "a journaled sandbox execution owns this attempt slot",
+                )
             changed = connection.execute(
                 """
                 UPDATE attempts SET pid = -1, pid_identity = '', termination_proof = '',
@@ -565,6 +573,11 @@ class WorkersMixin:
 
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if not _sandbox_execution_cleanup_is_verified(connection, attempt_id):
+                raise SupervisorError(
+                    "sandbox_cleanup_unverified",
+                    "OCI execution cleanup is not independently verified; worker identity remains fenced",
+                )
             attempt = connection.execute(
                 "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
             ).fetchone()

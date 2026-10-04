@@ -1,0 +1,451 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+from support import init_repo, make_task
+
+from agent_control_plane.git_supervisor import (
+    CLEANUP_FENCE_EPOCH,
+    MIGRATIONS,
+    SCHEMA_VERSION,
+    GitSupervisor,
+    SupervisorError,
+)
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    return init_repo(tmp_path)
+
+
+def claimed(supervisor: GitSupervisor) -> dict:
+    task = make_task(supervisor, "alpha.txt", title="sandbox journal test")
+    return supervisor.claim(task["id"], "sandbox-worker")
+
+
+def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
+    return supervisor._sandbox_execution_reserve(
+        attempt["id"],
+        attempt["claim_token"],
+        "a" * 64,
+        rootfs_digest="b" * 64,
+        runtime_version="runc 1.3.5",
+        oci_version="1.2.1",
+    )
+
+
+def record_launch(supervisor: GitSupervisor, attempt: dict) -> dict:
+    return supervisor._sandbox_execution_record_launch(
+        attempt["id"],
+        attempt["claim_token"],
+        monitor_pid=101,
+        monitor_identity="monitor-start-101",
+        runc_client_pid=202,
+        runc_client_identity="runc-start-202",
+        wrapper_unit="acp-worker.service",
+        wrapper_invocation_id="1" * 32,
+        scope_unit="acp-container.scope",
+        scope_invocation_id="2" * 32,
+        cgroup_path=("/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope"),
+    )
+
+
+def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
+    with supervisor.connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+    assert row is not None
+    return supervisor._sandbox_cleanup_receipt(row)
+
+
+def test_schema_v14_installs_append_only_fenced_execution_journal(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+
+    assert SCHEMA_VERSION == 14
+    assert row["phase"] == "reserved"
+    assert row["claim_token"] == attempt["claim_token"]
+    assert row["backend"] == "oci-runc"
+    assert row["runtime_version"] == "runc 1.3.5"
+    assert row["oci_version"] == "1.2.1"
+    assert row["rootfs_digest"] == "b" * 64
+    assert row["bundle_path"].startswith(str((repo / ".acp" / "sandbox-executions").resolve()))
+    assert row["state_path"].endswith("/state")
+
+    with supervisor.connect() as connection:
+        migration = dict(MIGRATIONS)[14]
+        migration(connection)
+        migration(connection)
+        with pytest.raises(sqlite3.IntegrityError, match="phase_transition_invalid"):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="must_start_reserved"):
+            connection.execute(
+                """
+                INSERT INTO sandbox_executions
+                  (attempt_id, claim_token, execution_id, backend, container_id,
+                   bundle_digest, rootfs_digest, runtime_version, oci_version,
+                   bundle_path, state_path, phase, created_at, updated_at)
+                SELECT attempt_id, claim_token, 'direct-insert', backend, 'direct-container',
+                       bundle_digest, rootfs_digest, runtime_version, oci_version,
+                       bundle_path, state_path, 'cleanup_verified', created_at, updated_at
+                FROM sandbox_executions WHERE attempt_id = ?
+                """,
+                (attempt["id"],),
+            )
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="identity_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET claim_token = claim_token + 1 WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="journal_retained"):
+            connection.execute(
+                "DELETE FROM sandbox_executions WHERE attempt_id = ?", (attempt["id"],)
+            )
+    assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_schema_13_read_only_open_refuses_until_journal_migration(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("DROP TABLE sandbox_executions")
+        connection.execute("UPDATE meta SET value = '13' WHERE key = 'schema_version'")
+
+    with pytest.raises(SupervisorError) as error:
+        GitSupervisor(repo, read_only=True)
+    assert error.value.code == "schema_upgrade_required"
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 13
+    with migrated.connect() as connection:
+        tables = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    assert "sandbox_executions" in tables
+
+
+def test_reservation_requires_exact_live_fence_and_no_registered_direct_worker(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+
+    with pytest.raises(SupervisorError) as stale:
+        supervisor._sandbox_execution_reserve(
+            attempt["id"],
+            attempt["claim_token"] + 1,
+            "a" * 64,
+            rootfs_digest="b" * 64,
+            runtime_version="runc 1.3.5",
+            oci_version="1.2.1",
+        )
+    assert stale.value.code == "stale_fencing_token"
+    with pytest.raises(SupervisorError) as invalid:
+        supervisor._sandbox_execution_reserve(
+            attempt["id"],
+            attempt["claim_token"],
+            "not-a-digest",
+            rootfs_digest="b" * 64,
+            runtime_version="runc 1.3.5",
+            oci_version="1.2.1",
+        )
+    assert invalid.value.code == "sandbox_execution_invalid"
+
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = 12345, pid_identity = 'direct-worker' WHERE id = ?",
+            (attempt["id"],),
+        )
+    with pytest.raises(SupervisorError) as registered:
+        reserve(supervisor, attempt)
+    assert registered.value.code == "worker_already_running"
+    assert supervisor._sandbox_execution_get(attempt["id"]) is None
+
+
+def test_journal_reservation_prevents_later_direct_worker_launch(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+
+    with pytest.raises(SupervisorError) as launch:
+        supervisor._reserve_worker_launch(
+            attempt["id"], attempt["claim_token"], ".acp/logs/direct.log", None
+        )
+    assert launch.value.code == "sandbox_execution_reserved"
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+
+
+def test_concurrent_reservations_have_one_winner(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    barrier = threading.Barrier(2)
+
+    def try_reserve() -> dict | str:
+        barrier.wait(timeout=5)
+        try:
+            return reserve(supervisor, attempt)
+        except SupervisorError as error:
+            return error.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: try_reserve(), range(2)))
+
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(result == "sandbox_execution_exists" for result in results) == 1
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_concurrent_direct_and_sandbox_reservations_serialize(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    barrier = threading.Barrier(2)
+
+    def reserve_sandbox() -> str:
+        barrier.wait(timeout=5)
+        try:
+            reserve(supervisor, attempt)
+        except SupervisorError as error:
+            return error.code
+        return "sandbox"
+
+    def reserve_direct() -> str:
+        barrier.wait(timeout=5)
+        try:
+            supervisor._reserve_worker_launch(
+                attempt["id"], attempt["claim_token"], ".acp/logs/direct.log", None
+            )
+        except SupervisorError as error:
+            return error.code
+        return "direct"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sandbox_result, direct_result = list(
+            pool.map(lambda function: function(), (reserve_sandbox, reserve_direct))
+        )
+
+    assert (sandbox_result, direct_result) in {
+        ("sandbox", "sandbox_execution_reserved"),
+        ("worker_already_running", "direct"),
+    }
+    journal = supervisor._sandbox_execution_get(attempt["id"])
+    direct_pid = supervisor.attempt(attempt["id"])["pid"]
+    if sandbox_result == "sandbox":
+        assert journal is not None
+        assert direct_pid is None
+    else:
+        assert journal is None
+        assert direct_pid == -1
+
+
+def test_sql_phase_checks_reject_nullable_process_identities(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    launch_fields = (
+        "monitor_identity = 'monitor-start-101', runc_client_pid = 202, "
+        "runc_client_identity = 'runc-start-202', wrapper_unit = 'acp-worker.service', "
+        "wrapper_invocation_id = '11111111111111111111111111111111', "
+        "scope_unit = 'acp-container.scope', "
+        "scope_invocation_id = '22222222222222222222222222222222', "
+        "cgroup_path = '/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope'"
+    )
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"UPDATE sandbox_executions SET phase = 'launched', monitor_pid = NULL, "
+                f"{launch_fields} WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"UPDATE sandbox_executions SET phase = 'launched', monitor_pid = 101, "
+                f"{launch_fields.replace('runc_client_pid = 202', 'runc_client_pid = NULL')} "
+                "WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+
+    record_launch(supervisor, attempt)
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'running', init_pid = NULL, "
+                "init_identity = 'init-start-303' WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+
+
+def test_recorded_execution_evidence_is_immutable(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    supervisor._sandbox_execution_record_running(
+        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+    )
+
+    mutations = (
+        "monitor_pid = 404",
+        "monitor_identity = 'replacement-monitor'",
+        "scope_invocation_id = '33333333333333333333333333333333'",
+        "cgroup_path = '/different/scope'",
+        "init_pid = 505",
+    )
+    for mutation in mutations:
+        with supervisor.connect() as connection:
+            with pytest.raises(sqlite3.IntegrityError, match="sandbox_execution_evidence"):
+                connection.execute(
+                    f"UPDATE sandbox_executions SET {mutation} WHERE attempt_id = ?",
+                    (attempt["id"],),
+                )
+
+    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_execution_evidence"):
+            connection.execute(
+                "UPDATE sandbox_executions SET runc_exit_code = 1 WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+
+    receipt = cleanup_receipt(supervisor, attempt["id"])
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], receipt
+    )
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_execution_evidence"):
+            connection.execute(
+                "UPDATE sandbox_executions SET cleanup_receipt_json = '{}' WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+
+
+def test_transition_order_keeps_monitor_runc_and_init_identities_distinct(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+
+    with pytest.raises(SupervisorError) as out_of_order:
+        supervisor._sandbox_execution_record_running(
+            attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+        )
+    assert out_of_order.value.code == "sandbox_execution_transition_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+    row = record_launch(supervisor, attempt)
+    assert row["phase"] == "launched"
+    with pytest.raises(SupervisorError) as pid_alias:
+        supervisor._sandbox_execution_record_running(
+            attempt["id"], attempt["claim_token"], init_pid=202, init_identity="runc-start-202"
+        )
+    assert pid_alias.value.code == "sandbox_execution_invalid"
+
+    row = supervisor._sandbox_execution_record_running(
+        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+    )
+    assert row["phase"] == "running"
+    row = supervisor._sandbox_execution_request_stop(
+        attempt["id"], attempt["claim_token"], "attempt cancellation"
+    )
+    assert row["phase"] == "stopping"
+    assert (
+        supervisor._sandbox_execution_request_stop(
+            attempt["id"], attempt["claim_token"], "attempt cancellation"
+        )["phase"]
+        == "stopping"
+    )
+
+    row = supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    assert row["phase"] == "exited"
+    assert row["runc_exit_code"] == 0
+    assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    supervisor._sandbox_execution_record_running(
+        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+    )
+    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+
+    receipt = cleanup_receipt(supervisor, attempt["id"])
+    counterfeit = json.loads(json.dumps(receipt))
+    counterfeit["observations"]["runc_delete_exit_code"] = True
+    with pytest.raises(SupervisorError) as invalid:
+        supervisor._sandbox_execution_record_cleanup_report(
+            attempt["id"], attempt["claim_token"], counterfeit
+        )
+    assert invalid.value.code == "sandbox_cleanup_report_invalid"
+
+    row = supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], receipt
+    )
+    assert row["phase"] == "cleanup_reported"
+
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="phase_transition_invalid"):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+    with pytest.raises(SupervisorError) as unavailable:
+        supervisor._sandbox_execution_transition(
+            attempt["id"],
+            attempt["claim_token"],
+            expected_phase="cleanup_reported",
+            next_phase="cleanup_verified",
+            updates={},
+            event_type="sandbox.execution_cleanup_verified",
+            event_payload={},
+        )
+    assert unavailable.value.code == "sandbox_execution_transition_invalid"
+
+    with pytest.raises(SupervisorError) as teardown:
+        supervisor.runtime_down(attempt["id"], force=True)
+    assert teardown.value.code == "sandbox_cleanup_unverified"
+
+    result = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+    assert result["terminated_workers"] == []
+    assert result["runtime_cleanup"] == []
+    assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
+    assert supervisor.task(attempt["task_id"])["status"] == "cleanup_pending"
+    with supervisor.connect() as connection:
+        with pytest.raises(SupervisorError) as task_cleanup:
+            supervisor._complete_task_cleanup(connection, attempt["task_id"], attempt["id"], "test")
+    assert task_cleanup.value.code == "sandbox_cleanup_unverified"
+    with supervisor.connect() as connection:
+        lease = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "cleanup_reported"
+
+
+def test_ambiguous_execution_is_durably_quarantined(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+
+    row = supervisor._sandbox_execution_mark_ambiguous(
+        attempt["id"], attempt["claim_token"], "runc state readback disagreed"
+    )
+    assert row["phase"] == "ambiguous"
+    assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
+    assert supervisor.task(attempt["task_id"])["status"] == "cleanup_pending"
+    result = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+    assert result["terminated_workers"] == []
+    assert result["runtime_cleanup"] == []
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "ambiguous"
