@@ -14,10 +14,18 @@ import re
 import sqlite3
 import time
 import uuid
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .common import CLEANUP_FENCE_EPOCH, SupervisorError, canonical_json, utc_now
+from .sandbox_workspace import (
+    _MAX_DURABLE_MANIFEST_BYTES,
+    _restore_snapshot_from_record,
+    _verify_directory_identity,
+)
+from .sandbox_workspace import Snapshot as _Snapshot
+from .sandbox_workspace import _snapshot_origin as _snapshot_origin
+from .sandbox_workspace import collect_changes as _collect_changes
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
@@ -255,6 +263,286 @@ class SandboxExecutionJournalMixin:
             ).fetchone()
         return self._sandbox_execution_view(row)
 
+    def _sandbox_execution_bind_workspace(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        baseline: _Snapshot,
+        workspace: _Snapshot,
+        *,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably bind the immutable baseline and mutable workspace before launch.
+
+        Both roots must be host-copier-minted, disjoint siblings of the reserved
+        execution directory and initially reproduce the same manifest. This
+        records their inode identities and the canonical baseline manifest so a
+        later process can re-establish the binding without the copier's
+        process-local weak-reference registry. It does not launch a worker or
+        authorize result import.
+        """
+
+        self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        if type(baseline) is not _Snapshot or type(workspace) is not _Snapshot:
+            raise SupervisorError(
+                "sandbox_workspace_invalid", "workspace binding needs host-created snapshots"
+            )
+        if baseline.manifest != workspace.manifest:
+            raise SupervisorError(
+                "sandbox_workspace_invalid", "baseline and mutable workspace differ before launch"
+            )
+        baseline_root, baseline_device, baseline_inode = _snapshot_origin(baseline)
+        workspace_root, workspace_device, workspace_inode = _snapshot_origin(workspace)
+        if (
+            baseline_root == workspace_root
+            or baseline_root in workspace_root.parents
+            or workspace_root in baseline_root.parents
+        ):
+            raise SupervisorError(
+                "sandbox_workspace_invalid", "baseline and mutable workspace must be disjoint"
+            )
+        baseline.manifest.validate()
+
+        # Authenticate and pin the expected per-execution paths before walking
+        # any caller-supplied snapshot tree. Recheck transactionally below
+        # before writing the immutable binding.
+        with self.connect() as connection:
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            reserved = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if reserved is None or reserved["claim_token"] != claim_token:
+            raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
+        execution_root = Path(reserved["bundle_path"]).parent
+        if (
+            baseline_root != execution_root / "baseline"
+            or workspace_root != execution_root / "workspace"
+        ):
+            raise SupervisorError(
+                "sandbox_workspace_invalid",
+                "workspace roots must be the reserved execution directory's exact children",
+            )
+        _verify_directory_identity(
+            baseline_root,
+            expected_device=baseline_device,
+            expected_inode=baseline_inode,
+        )
+        _verify_directory_identity(
+            workspace_root,
+            expected_device=workspace_device,
+            expected_inode=workspace_inode,
+        )
+        manifest_json = canonical_json(baseline.manifest.as_json())
+        if len(manifest_json.encode("utf-8")) > _MAX_DURABLE_MANIFEST_BYTES:
+            raise SupervisorError(
+                "workspace_limit_exceeded", "durable baseline manifest exceeds its storage limit"
+            )
+        baseline_check = _collect_changes(baseline.manifest, baseline_root, write_set_rules=[])
+        workspace_check = _collect_changes(workspace.manifest, workspace_root, write_set_rules=[])
+        if (
+            baseline_check.changes
+            or workspace_check.changes
+            or baseline_check.result_digest != baseline.manifest.digest
+            or workspace_check.result_digest != baseline.manifest.digest
+        ):
+            raise SupervisorError(
+                "sandbox_workspace_invalid", "workspace changed while its baseline was bound"
+            )
+        _verify_directory_identity(
+            baseline_root,
+            expected_device=baseline_device,
+            expected_inode=baseline_inode,
+        )
+        _verify_directory_identity(
+            workspace_root,
+            expected_device=workspace_device,
+            expected_inode=workspace_inode,
+        )
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if attempt["status"] != "working":
+                raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+            self._authenticate_attempt(connection, attempt, credential)
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None or row["claim_token"] != claim_token:
+                raise SupervisorError(
+                    "sandbox_execution_not_found", "execution reservation is missing"
+                )
+            execution_root = Path(row["bundle_path"]).parent
+            expected_baseline = execution_root / "baseline"
+            expected_workspace = execution_root / "workspace"
+            if baseline_root != expected_baseline or workspace_root != expected_workspace:
+                raise SupervisorError(
+                    "sandbox_workspace_invalid",
+                    "workspace roots must be the reserved execution directory's exact children",
+                )
+            values = (
+                str(baseline_root),
+                baseline_device,
+                baseline_inode,
+                str(workspace_root),
+                workspace_device,
+                workspace_inode,
+                manifest_json,
+                baseline.manifest.digest,
+            )
+            if row["workspace_binding_version"] == 1:
+                recorded = (
+                    row["baseline_root_path"],
+                    row["baseline_root_dev"],
+                    row["baseline_root_ino"],
+                    row["workspace_root_path"],
+                    row["workspace_root_dev"],
+                    row["workspace_root_ino"],
+                    row["baseline_manifest_json"],
+                    row["baseline_manifest_digest"],
+                )
+                if recorded != values:
+                    raise SupervisorError(
+                        "sandbox_workspace_conflict", "workspace binding conflicts with its journal"
+                    )
+                return self._sandbox_execution_view(row)
+            if row["phase"] != "reserved":
+                raise SupervisorError(
+                    "sandbox_execution_transition_invalid",
+                    "workspace binding must be recorded before runtime launch",
+                )
+            changed = connection.execute(
+                """
+                UPDATE sandbox_executions SET
+                  workspace_binding_version = 1,
+                  baseline_root_path = ?, baseline_root_dev = ?, baseline_root_ino = ?,
+                  workspace_root_path = ?, workspace_root_dev = ?, workspace_root_ino = ?,
+                  baseline_manifest_json = ?, baseline_manifest_digest = ?, updated_at = ?
+                WHERE attempt_id = ? AND claim_token = ? AND phase = 'reserved'
+                  AND workspace_binding_version = 0
+                """,
+                (*values, utc_now(), attempt_id, claim_token),
+            ).rowcount
+            if changed != 1:
+                raise SupervisorError(
+                    "sandbox_workspace_conflict", "workspace binding changed concurrently"
+                )
+            self._event(
+                connection,
+                "sandbox.workspace_bound",
+                attempt["agent_id"],
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "execution_id": row["execution_id"],
+                    "workspace_binding_version": 1,
+                    "baseline_manifest_digest": baseline.manifest.digest,
+                    "baseline_root_dev": baseline_device,
+                    "baseline_root_ino": baseline_inode,
+                    "workspace_root_dev": workspace_device,
+                    "workspace_root_ino": workspace_inode,
+                    "entry_count": len(baseline.manifest.entries),
+                    "total_bytes": baseline.manifest.total_bytes,
+                },
+            )
+            updated = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        return self._sandbox_execution_view(updated)
+
+    def _sandbox_execution_restore_workspace_binding(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        *,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Restore the baseline and re-check both roots after a supervisor restart."""
+
+        self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        with self.connect() as connection:
+            connection.execute("BEGIN")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if row is None or row["claim_token"] != claim_token:
+            raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
+        if row["workspace_binding_version"] != 1:
+            raise SupervisorError(
+                "sandbox_workspace_unbound", "execution has no durable workspace binding"
+            )
+        if row["phase"] == "ambiguous":
+            raise SupervisorError(
+                "sandbox_execution_ambiguous", "ambiguous sandbox cannot restore a result workspace"
+            )
+        execution_root = Path(row["bundle_path"]).parent
+        baseline_path = execution_root / "baseline"
+        workspace_path = execution_root / "workspace"
+        if (
+            Path(row["baseline_root_path"]) != baseline_path
+            or Path(row["workspace_root_path"]) != workspace_path
+        ):
+            raise SupervisorError(
+                "sandbox_workspace_invalid", "journaled workspace paths do not match execution root"
+            )
+        baseline = _restore_snapshot_from_record(
+            baseline_path,
+            row["baseline_manifest_json"],
+            expected_device=row["baseline_root_dev"],
+            expected_inode=row["baseline_root_ino"],
+            expected_digest=row["baseline_manifest_digest"],
+        )
+        current_workspace = _verify_directory_identity(
+            workspace_path,
+            expected_device=row["workspace_root_dev"],
+            expected_inode=row["workspace_root_ino"],
+        )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            current = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            binding_columns = (
+                "execution_id",
+                "claim_token",
+                "bundle_path",
+                "workspace_binding_version",
+                "baseline_root_path",
+                "baseline_root_dev",
+                "baseline_root_ino",
+                "workspace_root_path",
+                "workspace_root_dev",
+                "workspace_root_ino",
+                "baseline_manifest_json",
+                "baseline_manifest_digest",
+            )
+            if current is None or any(current[name] != row[name] for name in binding_columns):
+                raise SupervisorError(
+                    "sandbox_workspace_conflict", "durable workspace binding changed during restore"
+                )
+            if current["phase"] == "ambiguous":
+                raise SupervisorError(
+                    "sandbox_execution_ambiguous",
+                    "ambiguous sandbox cannot restore a result workspace",
+                )
+        return {
+            "version": 1,
+            "execution_id": row["execution_id"],
+            "attempt_id": attempt_id,
+            "claim_token": claim_token,
+            "baseline": baseline,
+            "workspace_root": current_workspace,
+            "workspace_device": row["workspace_root_dev"],
+            "workspace_inode": row["workspace_root_ino"],
+        }
+
     def _sandbox_execution_transition(
         self,
         attempt_id: str,
@@ -297,6 +585,12 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_transition_invalid",
                     f"expected phase {expected_phase}, found {row['phase']}; fence retained",
                 )
+            if expected_phase == "reserved" and next_phase == "launched":
+                if row["workspace_binding_version"] != 1:
+                    raise SupervisorError(
+                        "sandbox_workspace_unbound",
+                        "sandbox launch requires a durable baseline/workspace binding",
+                    )
             fields = ", ".join(f"{name} = ?" for name in updates)
             changed = connection.execute(
                 f"UPDATE sandbox_executions SET {fields}, phase = ?, updated_at = ? "

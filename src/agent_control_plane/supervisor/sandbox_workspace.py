@@ -8,6 +8,7 @@ been proved.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 import unicodedata
@@ -24,6 +25,10 @@ from .common import SupervisorError, canonical_json, sha256
 _COPY_CHUNK_BYTES = 64 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _SAFE_OPEN_FLAGS = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+# The default snapshot limits allow 10,000 entries with 1 KiB paths and 4 KiB
+# symlink targets. JSON escaping can at most double string bytes, so 128 MiB
+# leaves headroom for the largest valid tree's durable manifest.
+_MAX_DURABLE_MANIFEST_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -704,6 +709,181 @@ def collect_changes(
     finally:
         os.close(root_fd)
         os.close(parent_fd)
+
+
+def _restore_snapshot_from_record(
+    root: str | Path,
+    manifest_json: str,
+    *,
+    expected_device: int,
+    expected_inode: int,
+    expected_digest: str,
+    limits: SnapshotLimits = _DEFAULT_LIMITS,
+) -> Snapshot:
+    """Reconstitute a baseline handle from an immutable supervisor journal row.
+
+    Unlike a normal :class:`Snapshot`, the returned handle is minted after a
+    process restart. The caller must obtain all expected values from trusted,
+    append-only supervisor state; this function then checks canonical encoding,
+    manifest validity, the exact root inode, and the complete unchanged tree
+    before registering the handle for host-side consumers.
+    """
+
+    manifest = _tree_manifest_from_json(manifest_json, limits=limits)
+    if manifest.digest != expected_digest:
+        raise SupervisorError(
+            "invalid_snapshot_manifest", "durable snapshot digest does not match its journal"
+        )
+    if type(expected_device) is not int or expected_device < 0:
+        raise SupervisorError("invalid_snapshot", "durable snapshot device is invalid")
+    if type(expected_inode) is not int or expected_inode < 1:
+        raise SupervisorError("invalid_snapshot", "durable snapshot inode is invalid")
+    path = Path(root)
+    if not path.is_absolute() or path.as_posix() != str(root):
+        raise SupervisorError("invalid_snapshot", "durable snapshot path is not canonical")
+
+    parent_fd, name, root_fd = _open_existing_directory(path)
+    try:
+        root_stat = os.fstat(root_fd)
+        if (root_stat.st_dev, root_stat.st_ino) != (expected_device, expected_inode):
+            raise SupervisorError(
+                "invalid_snapshot", "durable snapshot root no longer has its journaled identity"
+            )
+        snapshot = Snapshot(path, manifest)
+        _register_snapshot_origin(snapshot, root_stat)
+        try:
+            observed = collect_changes(manifest, path, write_set_rules=[])
+        except SupervisorError as error:
+            raise SupervisorError(
+                "snapshot_changed", "durable baseline no longer matches its captured manifest"
+            ) from error
+        if observed.changes or observed.result_digest != manifest.digest:
+            raise SupervisorError(
+                "snapshot_changed", "durable baseline no longer matches its captured manifest"
+            )
+        _verify_directory_identity(
+            path,
+            expected_device=expected_device,
+            expected_inode=expected_inode,
+        )
+        return snapshot
+    finally:
+        os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _verify_directory_identity(
+    root: str | Path,
+    *,
+    expected_device: int,
+    expected_inode: int,
+) -> Path:
+    """Open a private workspace root without following links and check its inode."""
+
+    if type(expected_device) is not int or expected_device < 0:
+        raise SupervisorError("invalid_snapshot", "durable workspace device is invalid")
+    if type(expected_inode) is not int or expected_inode < 1:
+        raise SupervisorError("invalid_snapshot", "durable workspace inode is invalid")
+    path = Path(root)
+    if not path.is_absolute() or path.as_posix() != str(root):
+        raise SupervisorError("invalid_snapshot", "durable workspace path is not canonical")
+    parent_fd, name, root_fd = _open_existing_directory(path)
+    try:
+        root_stat = os.fstat(root_fd)
+        if (root_stat.st_dev, root_stat.st_ino) != (expected_device, expected_inode):
+            raise SupervisorError(
+                "invalid_snapshot", "durable workspace root no longer has its journaled identity"
+            )
+        mode = stat.S_IMODE(root_stat.st_mode)
+        if root_stat.st_uid != os.geteuid() or mode & 0o077 or mode & 0o700 != 0o700:
+            raise SupervisorError(
+                "invalid_snapshot", "durable workspace root is not private to this user"
+            )
+        return path
+    finally:
+        os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _tree_manifest_from_json(
+    value: str, *, limits: SnapshotLimits = _DEFAULT_LIMITS
+) -> TreeManifest:
+    if not isinstance(value, str):
+        raise SupervisorError("invalid_snapshot_manifest", "durable snapshot manifest is invalid")
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise SupervisorError(
+            "invalid_snapshot_manifest", "durable snapshot manifest is invalid"
+        ) from None
+    if encoded_size > _MAX_DURABLE_MANIFEST_BYTES:
+        raise SupervisorError("invalid_snapshot_manifest", "durable snapshot manifest is invalid")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+
+    try:
+        payload = json.loads(value, object_pairs_hook=reject_duplicate_keys)
+    except (TypeError, ValueError):
+        raise SupervisorError(
+            "invalid_snapshot_manifest", "durable snapshot manifest is malformed"
+        ) from None
+    if (
+        type(payload) is not dict
+        or set(payload) != {"version", "total_bytes", "entries", "sha256"}
+        or type(payload["version"]) is not int
+        or payload["version"] != 1
+        or type(payload["entries"]) is not list
+    ):
+        raise SupervisorError(
+            "invalid_snapshot_manifest", "durable snapshot manifest fields are invalid"
+        )
+    entries: list[ManifestEntry] = []
+    try:
+        for item in payload["entries"]:
+            if type(item) is not dict:
+                raise ValueError("manifest entry is not an object")
+            kind = item.get("kind")
+            if kind == "file" and set(item) == {"path", "kind", "mode", "size", "sha256"}:
+                entries.append(
+                    ManifestEntry(
+                        path=item["path"],
+                        kind=kind,
+                        mode=item["mode"],
+                        size=item["size"],
+                        content_sha256=item["sha256"],
+                    )
+                )
+            elif kind == "symlink" and set(item) == {"path", "kind", "mode", "size", "target"}:
+                entries.append(
+                    ManifestEntry(
+                        path=item["path"],
+                        kind=kind,
+                        mode=item["mode"],
+                        size=item["size"],
+                        symlink_target=item["target"],
+                    )
+                )
+            elif kind == "directory" and set(item) == {"path", "kind", "mode"}:
+                entries.append(ManifestEntry(path=item["path"], kind=kind, mode=item["mode"]))
+            else:
+                raise ValueError("manifest entry fields do not match its kind")
+        manifest = TreeManifest(tuple(entries), payload["total_bytes"], payload["sha256"])
+        manifest.validate(limits)
+    except (KeyError, TypeError, ValueError, SupervisorError) as error:
+        raise SupervisorError(
+            "invalid_snapshot_manifest", "durable snapshot manifest entries are invalid"
+        ) from error
+    if canonical_json(payload) != value:
+        raise SupervisorError(
+            "invalid_snapshot_manifest", "durable snapshot manifest is not canonically encoded"
+        )
+    return manifest
 
 
 def apply_changes_to_manifest(

@@ -274,7 +274,7 @@ assumptions, not properties proved by a namespace test.
 
 ### Durable execution-journal slice (2026-10-04)
 
-Schema 14 adds a private, per-attempt `sandbox_executions` journal. Reservation
+Schema 14 introduced a private, per-attempt `sandbox_executions` journal. Reservation
 binds the current claim token, an ACP-generated container ID, attempt-specific
 bundle/state paths, the bundle and rootfs digests, and exact runc/OCI versions.
 The transition contract keeps the ACP monitor, attached runc client, and
@@ -307,6 +307,31 @@ Result import, import recovery, and submission also fail closed for a journaled
 attempt unless the recorded runc exit code is zero and cleanup is independently
 verified. A caller-supplied cleanup report is not sufficient; legacy attempts
 without a sandbox journal retain their existing direct-worker result path.
+
+**Durable workspace-binding slice (schema 15; still not an executor).** Before
+the journal can advance from `reserved` to `launched`, ACP now requires a
+version-1 binding made from two host-copier-minted, initially identical
+snapshots: an immutable baseline and a separate mutable workspace. The
+durable journal stores both canonical root paths and device/inode identities
+plus the canonical baseline manifest and its digest. SQLite rejects launch
+without the binding and prevents rewriting it after capture. A restore method
+reconstructs the baseline handle after process restart from that durable row,
+then reopens the exact baseline and workspace roots without following the root
+symlink, checks their saved inode identities, and verifies the complete
+baseline tree. After that filesystem work it revalidates the live claim,
+credential, and exact persisted binding fields in a serialized transaction before returning;
+any later result capture or import must still perform its own transactional
+fence check. The restore step checks only the workspace root identity;
+future result capture must recheck that identity and still pass the mutable
+tree through `collect_changes` as hostile output. This closes the process-local
+`Snapshot`-provenance gap for baseline recovery; it does not close same-UID path
+races, impose an aggregate workspace disk quota, produce a worker-exit/cleanup
+attestation, or enable result import. No worker launch route, trusted cleanup
+verifier, or sandbox result-import contract is added here, and direct-worker
+behavior is unchanged. The SQLite triggers enforce ordinary journal transition
+and write-once invariants; they are not an adversarial boundary against a
+same-UID process with raw database-write access. A future executor must keep the
+supervisor database outside the worker's mount namespace.
 
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The

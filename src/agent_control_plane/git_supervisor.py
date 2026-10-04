@@ -194,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -636,6 +636,102 @@ def _add_sandbox_execution_journal(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_sandbox_workspace_binding(connection: sqlite3.Connection) -> None:
+    """Persist the workspace inode and baseline manifest before OCI launch."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    additions = (
+        ("workspace_binding_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("baseline_root_path", "TEXT NOT NULL DEFAULT ''"),
+        ("baseline_root_dev", "INTEGER"),
+        ("baseline_root_ino", "INTEGER"),
+        ("workspace_root_path", "TEXT NOT NULL DEFAULT ''"),
+        ("workspace_root_dev", "INTEGER"),
+        ("workspace_root_ino", "INTEGER"),
+        ("baseline_manifest_json", "TEXT NOT NULL DEFAULT ''"),
+        ("baseline_manifest_digest", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_execution_workspace_binding_insert_guard",
+        "sandbox_execution_workspace_binding_write_once",
+        "sandbox_execution_launch_requires_workspace",
+        "sandbox_execution_phase_transition",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_workspace_binding_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.workspace_binding_version != 0
+          OR NEW.baseline_root_path != '' OR NEW.baseline_root_dev IS NOT NULL
+          OR NEW.baseline_root_ino IS NOT NULL OR NEW.workspace_root_path != ''
+          OR NEW.workspace_root_dev IS NOT NULL OR NEW.workspace_root_ino IS NOT NULL
+          OR NEW.baseline_manifest_json != '' OR NEW.baseline_manifest_digest != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_workspace_binding_must_be_recorded');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_workspace_binding_write_once
+        BEFORE UPDATE OF workspace_binding_version, baseline_root_path, baseline_root_dev,
+          baseline_root_ino, workspace_root_path, workspace_root_dev, workspace_root_ino,
+          baseline_manifest_json, baseline_manifest_digest ON sandbox_executions
+        WHEN NOT (
+          OLD.workspace_binding_version = 0
+          AND NEW.workspace_binding_version = 1
+          AND OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND NEW.baseline_root_path != '' AND NEW.workspace_root_path != ''
+          AND NEW.baseline_root_dev IS NOT NULL AND NEW.baseline_root_dev >= 0
+          AND NEW.baseline_root_ino IS NOT NULL AND NEW.baseline_root_ino > 0
+          AND NEW.workspace_root_dev IS NOT NULL AND NEW.workspace_root_dev >= 0
+          AND NEW.workspace_root_ino IS NOT NULL AND NEW.workspace_root_ino > 0
+          AND length(NEW.baseline_manifest_json) > 0
+          AND length(NEW.baseline_manifest_digest) = 64
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_workspace_binding_immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_workspace
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND NEW.workspace_binding_version != 1
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_workspace_binding_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_phase_transition
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase != NEW.phase AND NOT (
+          (OLD.phase = 'reserved' AND NEW.phase = 'launched'
+            AND NEW.workspace_binding_version = 1)
+          OR (OLD.phase = 'reserved' AND NEW.phase = 'ambiguous')
+          OR (OLD.phase = 'launched' AND NEW.phase IN ('running', 'stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'running' AND NEW.phase IN ('stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'stopping' AND NEW.phase IN ('exited', 'ambiguous'))
+          OR (OLD.phase = 'exited' AND NEW.phase IN ('cleanup_reported', 'ambiguous'))
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'ambiguous')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_phase_transition_invalid');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -650,6 +746,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (12, _add_result_import_journal),
     (13, _add_result_import_object_staging),
     (14, _add_sandbox_execution_journal),
+    (15, _add_sandbox_workspace_binding),
 )
 
 

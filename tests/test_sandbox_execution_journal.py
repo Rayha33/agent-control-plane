@@ -18,8 +18,16 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
 )
 from agent_control_plane.supervisor import claims as claims_module
+from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
 from agent_control_plane.supervisor.common import canonical_json
-from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
+from agent_control_plane.supervisor.sandbox_workspace import (
+    ManifestEntry,
+    _make_manifest,
+    _tree_manifest_from_json,
+    collect_changes,
+    copy_snapshot,
+    read_snapshot_files,
+)
 
 
 @pytest.fixture
@@ -33,13 +41,20 @@ def claimed(supervisor: GitSupervisor) -> dict:
 
 
 def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
-    return supervisor._sandbox_execution_reserve(
+    row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
         "a" * 64,
         rootfs_digest="b" * 64,
         runtime_version="runc 1.3.5",
         oci_version="1.2.1",
+    )
+    execution_root = Path(row["bundle_path"]).parent
+    execution_root.mkdir(mode=0o700, parents=True)
+    baseline = copy_snapshot(attempt["worktree"], execution_root / "baseline")
+    workspace = copy_snapshot(baseline.root, execution_root / "workspace")
+    return supervisor._sandbox_execution_bind_workspace(
+        attempt["id"], attempt["claim_token"], baseline, workspace
     )
 
 
@@ -80,13 +95,17 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v14_installs_append_only_fenced_execution_journal(repo: Path) -> None:
+def test_schema_v15_requires_durable_workspace_binding_before_launch(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 14
+    assert SCHEMA_VERSION == 15
     assert row["phase"] == "reserved"
+    assert row["workspace_binding_version"] == 1
+    assert row["baseline_manifest_digest"]
+    assert row["baseline_root_path"].endswith("/baseline")
+    assert row["workspace_root_path"].endswith("/workspace")
     assert row["claim_token"] == attempt["claim_token"]
     assert row["backend"] == "oci-runc"
     assert row["runtime_version"] == "runc 1.3.5"
@@ -96,7 +115,7 @@ def test_schema_v14_installs_append_only_fenced_execution_journal(repo: Path) ->
     assert row["state_path"].endswith("/state")
 
     with supervisor.connect() as connection:
-        migration = dict(MIGRATIONS)[14]
+        migration = dict(MIGRATIONS)[15]
         migration(connection)
         migration(connection)
         with pytest.raises(sqlite3.IntegrityError, match="phase_transition_invalid"):
@@ -130,6 +149,149 @@ def test_schema_v14_installs_append_only_fenced_execution_journal(repo: Path) ->
                 "DELETE FROM sandbox_executions WHERE attempt_id = ?", (attempt["id"],)
             )
     assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = supervisor._sandbox_execution_reserve(
+        attempt["id"],
+        attempt["claim_token"],
+        "a" * 64,
+        rootfs_digest="b" * 64,
+        runtime_version="runc 1.3.5",
+        oci_version="1.2.1",
+    )
+    assert row["workspace_binding_version"] == 0
+
+    with pytest.raises(SupervisorError) as error:
+        record_launch(supervisor, attempt)
+    assert error.value.code == "sandbox_workspace_unbound"
+
+    with (
+        supervisor.connect() as connection,
+        pytest.raises(
+            sqlite3.IntegrityError, match="workspace_binding_required|phase_transition_invalid"
+        ),
+    ):
+        connection.execute(
+            "UPDATE sandbox_executions SET phase = 'launched' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+
+
+def test_workspace_binding_restores_after_process_local_snapshot_registry_is_lost(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    assert row["workspace_binding_version"] == 1
+
+    with (
+        supervisor.connect() as connection,
+        pytest.raises(sqlite3.IntegrityError, match="workspace_binding_immutable"),
+    ):
+        replacement = "0" * 64
+        if replacement == row["baseline_manifest_digest"]:
+            replacement = "1" * 64
+        connection.execute(
+            "UPDATE sandbox_executions SET baseline_manifest_digest = ? WHERE attempt_id = ?",
+            (replacement, attempt["id"]),
+        )
+
+    from agent_control_plane.supervisor import sandbox_workspace
+
+    # Simulate a fresh process: durable journal values, not the in-memory weak
+    # reference registry, must re-establish the baseline handle.
+    sandbox_workspace._SNAPSHOT_ORIGINS.clear()
+    restored = supervisor._sandbox_execution_restore_workspace_binding(
+        attempt["id"], attempt["claim_token"]
+    )
+    assert restored["version"] == 1
+    assert restored["execution_id"] == row["execution_id"]
+    assert restored["baseline"].manifest.digest == row["baseline_manifest_digest"]
+    assert read_snapshot_files(restored["baseline"])["alpha.txt"] == b"base\n"
+    assert restored["workspace_root"] == Path(row["workspace_root_path"])
+
+    (restored["workspace_root"] / "alpha.txt").write_text("sandbox result\n", encoding="utf-8")
+    changes = collect_changes(
+        restored["baseline"].manifest,
+        restored["workspace_root"],
+        write_set_rules=[("alpha.txt", True, False)],
+    )
+    assert changes.baseline_digest == restored["baseline"].manifest.digest
+    assert [change.path for change in changes.changes] == ["alpha.txt"]
+
+
+def test_workspace_binding_restore_rejects_replaced_output_root(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    workspace_root = Path(row["workspace_root_path"])
+    saved_root = workspace_root.with_name("workspace-saved")
+    workspace_root.rename(saved_root)
+    workspace_root.mkdir(mode=0o700)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._sandbox_execution_restore_workspace_binding(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert error.value.code == "invalid_snapshot"
+
+
+def test_workspace_binding_restore_rejects_changed_baseline_content(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    (Path(row["baseline_root_path"]) / "alpha.txt").write_text("forged\n", encoding="utf-8")
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._sandbox_execution_restore_workspace_binding(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert error.value.code == "snapshot_changed"
+
+
+def test_workspace_binding_restore_rechecks_claim_fence_after_baseline_scan(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    restore = journal_module._restore_snapshot_from_record
+
+    def expire_claim_during_restore(*args, **kwargs):
+        snapshot = restore(*args, **kwargs)
+        with supervisor.connect() as connection:
+            connection.execute(
+                "UPDATE attempts SET lease_expires_at = 0 WHERE id = ?", (attempt["id"],)
+            )
+        return snapshot
+
+    monkeypatch.setattr(
+        journal_module, "_restore_snapshot_from_record", expire_claim_during_restore
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._sandbox_execution_restore_workspace_binding(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert error.value.code == "lease_expired"
+
+
+def test_durable_manifest_parser_accepts_valid_manifest_above_old_32_mib_cap() -> None:
+    target = "a" * 4_096
+    count = 8_500
+    entries = tuple(
+        ManifestEntry(f"link-{index:05d}", "symlink", 0o777, len(target), symlink_target=target)
+        for index in range(count)
+    )
+    manifest = _make_manifest(entries, count * len(target))
+    encoded = canonical_json(manifest.as_json())
+    assert len(encoded.encode("utf-8")) > 32 * 1024 * 1024
+
+    assert _tree_manifest_from_json(encoded) == manifest
 
 
 def test_schema_13_read_only_open_refuses_until_journal_migration(repo: Path) -> None:
