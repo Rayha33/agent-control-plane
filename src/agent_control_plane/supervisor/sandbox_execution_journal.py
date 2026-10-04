@@ -81,6 +81,20 @@ def _sandbox_execution_cleanup_is_verified(connection: Any, attempt_id: str) -> 
     return row is None or row["phase"] == "cleanup_verified"
 
 
+def _require_sandbox_execution_result_eligible(connection: Any, attempt_id: str) -> None:
+    """Fence result import/submission until a journaled worker exited cleanly."""
+
+    row = connection.execute(
+        "SELECT phase, runc_exit_code FROM sandbox_executions WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    if row is not None and not (row["phase"] == "cleanup_verified" and row["runc_exit_code"] == 0):
+        raise SupervisorError(
+            "sandbox_result_unverified",
+            "sandbox result requires successful runc exit and independently verified cleanup",
+        )
+
+
 class SandboxExecutionJournalMixin:
     """Private persistence API; no worker-launch or user-facing route is wired yet."""
 

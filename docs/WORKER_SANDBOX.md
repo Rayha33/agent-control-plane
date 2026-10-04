@@ -269,6 +269,10 @@ enable or complete an OCI worker sandbox; attempts with such journal rows remain
 intentionally fenced pending separate executor, targeted-stop, recovery, and
 verifier work. The legacy `attempts.pid` slot remains reserved for direct workers;
 a future sandbox monitor must use a distinct journal-backed registration path.
+Result import, import recovery, and submission also fail closed for a journaled
+attempt unless the recorded runc exit code is zero and cleanup is independently
+verified. A caller-supplied cleanup report is not sufficient; legacy attempts
+without a sandbox journal retain their existing direct-worker result path.
 
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The

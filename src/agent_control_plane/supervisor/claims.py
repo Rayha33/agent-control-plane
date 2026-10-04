@@ -44,6 +44,7 @@ from .result_import import (
     result_ref_name,
     verify_candidate_objects,
 )
+from .sandbox_execution_journal import _require_sandbox_execution_result_eligible
 from .sandbox_workspace import ChangeSet, Snapshot
 from .schema import META_CASE_SENSITIVE
 
@@ -2660,6 +2661,7 @@ class ClaimsMixin:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
             self._authenticate_attempt(connection, attempt, credential)
+            _require_sandbox_execution_result_eligible(connection, attempt_id)
             if not attempt["base_checkout_snapshot_required"]:
                 raise SupervisorError(
                     "base_checkout_snapshot_invalid",
@@ -2780,6 +2782,7 @@ class ClaimsMixin:
                         connection, attempt_id, claim_token, int(time.time())
                     )
                     self._authenticate_attempt(connection, current, credential)
+                    _require_sandbox_execution_result_eligible(connection, attempt_id)
                     current_receipt = self._worker_exit_receipt_in(connection, current, worker_pid)
                     if (
                         current["pid_identity"] != attempt_snapshot["pid_identity"]
@@ -2893,6 +2896,22 @@ class ClaimsMixin:
 
         self._assert_safe_git_execution_config()
         self._assert_no_git_grafts()
+        with self.connect() as connection:
+            preflight_row = connection.execute(
+                "SELECT attempt_id FROM result_imports WHERE id = ?", (import_id,)
+            ).fetchone()
+            if preflight_row is None:
+                raise SupervisorError("result_import_not_found", "result import journal is missing")
+            preflight_attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (preflight_row["attempt_id"],)
+            ).fetchone()
+            if preflight_attempt is None:
+                self._mark_result_import_ambiguous(import_id, "journal attempt is missing")
+                raise SupervisorError(
+                    "result_import_ambiguous", "journal attempt is missing; result remains fenced"
+                )
+            self._authenticate_attempt(connection, preflight_attempt, credential)
+            _require_sandbox_execution_result_eligible(connection, preflight_row["attempt_id"])
         with self._git_operation_guard():
             self._cleanup_result_import_staging_locked()
         with self.connect() as connection:
@@ -2910,6 +2929,7 @@ class ClaimsMixin:
                     "result_import_ambiguous", "journal attempt is missing; result remains fenced"
                 )
             self._authenticate_attempt(connection, attempt_row, credential)
+            _require_sandbox_execution_result_eligible(connection, row["attempt_id"])
             try:
                 expected_id = str(
                     uuid.uuid5(
@@ -3085,6 +3105,7 @@ class ClaimsMixin:
                         int(time.time()),
                     )
                     self._authenticate_attempt(connection, active, credential)
+                    _require_sandbox_execution_result_eligible(connection, current["attempt_id"])
                     current_receipt = self._worker_exit_receipt_in(
                         connection, active, current["worker_pid"]
                     )
@@ -3302,6 +3323,7 @@ class ClaimsMixin:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, epoch)
             self._authenticate_attempt(connection, attempt, credential)
+            _require_sandbox_execution_result_eligible(connection, attempt_id)
             if expected_worker_pid is None and attempt["pid"] is not None:
                 raise SupervisorError(
                     "worker_still_running",

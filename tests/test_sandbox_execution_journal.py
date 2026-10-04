@@ -16,6 +16,8 @@ from agent_control_plane.git_supervisor import (
     GitSupervisor,
     SupervisorError,
 )
+from agent_control_plane.supervisor import claims as claims_module
+from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
 
 
 @pytest.fixture
@@ -62,6 +64,18 @@ def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
         ).fetchone()
     assert row is not None
     return supervisor._sandbox_cleanup_receipt(row)
+
+
+def result_fixture(attempt: dict, tmp_path: Path):
+    baseline = copy_snapshot(attempt["worktree"], tmp_path / "baseline")
+    output = copy_snapshot(attempt["worktree"], tmp_path / "worker-output").root
+    (output / "alpha.txt").write_text("sandbox result\n", encoding="utf-8")
+    change_set = collect_changes(
+        baseline.manifest,
+        output,
+        write_set_rules=[("alpha.txt", True, False)],
+    )
+    return baseline, change_set
 
 
 def test_schema_v14_installs_append_only_fenced_execution_journal(repo: Path) -> None:
@@ -183,6 +197,133 @@ def test_journal_reservation_prevents_later_direct_worker_launch(repo: Path) -> 
         )
     assert launch.value.code == "sandbox_execution_reserved"
     assert supervisor.attempt(attempt["id"])["pid"] is None
+
+
+def test_journaled_result_import_and_manual_submission_fail_closed(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    result_root = tmp_path_factory.mktemp("worker-result")
+    baseline, change_set = result_fixture(attempt, result_root)
+
+    with pytest.raises(SupervisorError) as imported:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, change_set)
+    assert imported.value.code == "sandbox_result_unverified"
+
+    with pytest.raises(SupervisorError) as submitted:
+        supervisor._submit(
+            attempt["id"],
+            attempt["claim_token"],
+            expected_worker_pid=None,
+            credential=None,
+        )
+    assert submitted.value.code == "sandbox_result_unverified"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_result_import_rechecks_journal_at_result_write_boundary(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    worker_pid = 9876
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET pid = ?, pid_identity = ? WHERE id = ?",
+            (worker_pid, "synthetic-worker-identity", attempt["id"]),
+        )
+    monkeypatch.setattr(
+        supervisor,
+        "_worker_exit_receipt_in",
+        lambda connection, current, expected_pid: "synthetic-exit-receipt",
+    )
+    result_root = tmp_path_factory.mktemp("worker-result")
+    baseline, change_set = result_fixture(attempt, result_root)
+    original_guard = claims_module._require_sandbox_execution_result_eligible
+    guard_calls = 0
+
+    def add_journal_before_second_check(connection, attempt_id: str) -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == 2:
+            stamp = "2026-10-04T00:00:00Z"
+            connection.execute(
+                """
+                INSERT INTO sandbox_executions
+                  (attempt_id, claim_token, execution_id, backend, container_id,
+                   bundle_digest, rootfs_digest, runtime_version, oci_version,
+                   bundle_path, state_path, phase, created_at, updated_at)
+                VALUES (?, ?, 'race-execution', 'oci-runc', 'race-container', ?, ?,
+                        'test-runc', '1.2.1', '/bundle', '/state', 'reserved', ?, ?)
+                """,
+                (attempt_id, attempt["claim_token"], "a" * 64, "b" * 64, stamp, stamp),
+            )
+        original_guard(connection, attempt_id)
+
+    monkeypatch.setattr(
+        claims_module,
+        "_require_sandbox_execution_result_eligible",
+        add_journal_before_second_check,
+    )
+    with pytest.raises(SupervisorError) as imported:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, change_set)
+
+    assert imported.value.code == "sandbox_result_unverified"
+    assert guard_calls == 2
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM sandbox_executions").fetchone()[0] == 0
+
+
+def test_journaled_result_recovery_is_fenced_before_staging_cleanup(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    import_id = "untrusted-result-import"
+    stamp = "2026-10-04T00:00:00Z"
+    with supervisor.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, worker_pid, worker_identity,
+               worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp,
+               commit_sha, phase, created_at, updated_at)
+            VALUES (?, ?, ?, 41, 'worker-identity', '{}', 'base', 'tree', 'baseline',
+                    'result', 'changes', 'refs/acp/result', 0, 'commit',
+                    'prepared', ?, ?)
+            """,
+            (
+                import_id,
+                attempt["id"],
+                attempt["claim_token"],
+                stamp,
+                stamp,
+            ),
+        )
+    cleanup_called = False
+
+    def record_cleanup() -> None:
+        nonlocal cleanup_called
+        cleanup_called = True
+
+    monkeypatch.setattr(supervisor, "_cleanup_result_import_staging_locked", record_cleanup)
+    with pytest.raises(SupervisorError) as recovered:
+        supervisor.recover_worker_result_import(import_id)
+
+    assert recovered.value.code == "sandbox_result_unverified"
+    assert cleanup_called is False
+    with supervisor.connect() as connection:
+        row = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (import_id,)
+        ).fetchone()
+    assert row["phase"] == "prepared"
 
 
 def test_concurrent_reservations_have_one_winner(repo: Path) -> None:
