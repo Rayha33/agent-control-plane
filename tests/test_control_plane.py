@@ -42,13 +42,15 @@ def issue_root_mandate(client, admin_headers, agent_id, max_descendant_mandates=
     return response.json()
 
 
-def issue_child_mandate(client, parent_mandate, child_agent_id, max_descendant_mandates=None):
+def issue_child_mandate(
+    client, parent_mandate, child_agent_id, max_descendant_mandates=None, *, ttl_seconds=1800
+):
     body = {
         "agent_id": child_agent_id,
         "subject": "parent-agent",
         "parent_mandate_id": parent_mandate["id"],
         "scopes": [{"action": "payments.charge", "resource": "merchant:acme"}],
-        "ttl_seconds": 1800,
+        "ttl_seconds": ttl_seconds,
         "max_amount_cents": 5_000,
     }
     if max_descendant_mandates is not None:
@@ -85,10 +87,14 @@ def test_mandate_descendant_cap_counts_nested_issuance_and_stops_at_boundary(
     child_mandate = child_response.json()
     assert child_mandate["max_descendant_mandates"] == 1
 
-    grandchild_response = issue_child_mandate(client, child_mandate, grandchild_agent["id"])
+    grandchild_response = issue_child_mandate(
+        client, child_mandate, grandchild_agent["id"], ttl_seconds=900
+    )
     assert grandchild_response.status_code == 201, grandchild_response.text
 
-    local_cap_denial = issue_child_mandate(client, child_mandate, other_grandchild_agent["id"])
+    local_cap_denial = issue_child_mandate(
+        client, child_mandate, other_grandchild_agent["id"], ttl_seconds=900
+    )
     assert local_cap_denial.status_code == 403
     assert local_cap_denial.json()["error"] == "mandate_fanout_exhausted"
 
