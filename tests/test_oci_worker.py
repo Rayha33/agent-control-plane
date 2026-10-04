@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -97,6 +98,296 @@ def compile_config(bundle: Path, workspace: Snapshot) -> dict:
 
 def pinned_runc(repo_root: Path) -> oci_worker._TrustedRuncExecutable:
     return oci_worker._pin_trusted_runc_executable("/bin/sh", repo_root)
+
+
+def test_runc_version_probe_requires_the_exact_release_and_uses_a_clean_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin = pinned_runc(tmp_path)
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(argv: list[str], **kwargs) -> tuple[int, str]:
+        calls.append((argv, kwargs))
+        return 0, "runc version 1.3.5\nspec: 1.2.1\n"
+
+    monkeypatch.setattr(oci_worker, "_run_bounded_command", fake_run)
+
+    assert oci_worker._probe_trusted_runc_version(pin, "1.3.5") == "1.3.5"
+    argv, kwargs = calls[0]
+    assert argv == [str(pin.path), "--version"]
+    assert kwargs["env"] == {
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+    assert kwargs["cwd"] == "/"
+    assert kwargs["timeout_seconds"] == 5.0
+    assert kwargs["max_output_bytes"] == 8192
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected_version"),
+    [
+        ("runc version 1.3.5\nspec: 1.2.1", 0, "1.3.4"),
+        ("runc version 1.3.5-rc1", 0, "1.3.5"),
+        ("not runc", 0, "1.3.5"),
+        ("runc version 1.3.5", 1, "1.3.5"),
+    ],
+)
+def test_runc_version_probe_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    returncode: int,
+    expected_version: str,
+) -> None:
+    pin = pinned_runc(tmp_path)
+    monkeypatch.setattr(
+        oci_worker,
+        "_run_bounded_command",
+        lambda argv, **kwargs: (returncode, stdout),
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        oci_worker._probe_trusted_runc_version(pin, expected_version)
+
+    assert error.value.code == "invalid_oci_runtime_version"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_probe_kills_descendants_that_hold_pipes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kill_groups: list[tuple[int, int]] = []
+    real_killpg = oci_worker.os.killpg
+
+    def record_killpg(process_group: int, sig: int) -> None:
+        kill_groups.append((process_group, sig))
+        real_killpg(process_group, sig)
+
+    monkeypatch.setattr(oci_worker.os, "killpg", record_killpg)
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        oci_worker._run_bounded_command(
+            ["/bin/sh", "-c", "sleep 30 & exit 0"],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=0.2,
+            max_output_bytes=1024,
+        )
+
+    assert time.monotonic() - started < 2
+    assert len(kill_groups) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_probe_caps_combined_stdout_and_stderr() -> None:
+    with pytest.raises(ValueError, match="output limit"):
+        oci_worker._run_bounded_command(
+            ["/bin/sh", "-c", "exec /usr/bin/yes probe-output"],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=2,
+            max_output_bytes=128,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_runc_version_probe_terminates_child_that_closes_pipes_before_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "runc-probe-fixture"
+    executable.write_text("#!/bin/sh\nexec 1>&- 2>&-\nsleep 30\n", encoding="utf-8")
+    executable.chmod(0o700)
+    monkeypatch.setattr(oci_worker, "_verify_trusted_runc_executable", lambda _pin: executable)
+    monkeypatch.setattr(oci_worker, "_RUNC_VERSION_PROBE_TIMEOUT_SECONDS", 0.2)
+    started = time.monotonic()
+
+    with pytest.raises(SupervisorError) as error:
+        oci_worker._probe_trusted_runc_version(object(), "1.3.5")  # type: ignore[arg-type]
+
+    assert error.value.code == "invalid_oci_runtime_version"
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_probe_invalid_utf8_kills_process_group_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_calls: list[int] = []
+    real_cleanup = oci_worker._kill_process_group
+
+    def record_cleanup(process) -> int:
+        cleanup_calls.append(process.pid)
+        return real_cleanup(process)
+
+    monkeypatch.setattr(oci_worker, "_kill_process_group", record_cleanup)
+
+    with pytest.raises(UnicodeDecodeError):
+        oci_worker._run_bounded_command(
+            ["/bin/sh", "-c", "printf '\\377'"],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=2,
+            max_output_bytes=16,
+        )
+
+    assert len(cleanup_calls) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_probe_releases_live_guardian_after_command_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kill_groups: list[tuple[int, int]] = []
+    real_killpg = oci_worker.os.killpg
+
+    def record_killpg(process_group: int, sig: int) -> None:
+        kill_groups.append((process_group, sig))
+        real_killpg(process_group, sig)
+
+    monkeypatch.setattr(oci_worker.os, "killpg", record_killpg)
+
+    returncode, stdout = oci_worker._run_bounded_command(
+        ["/bin/sh", "-c", "printf 'probe complete'"],
+        cwd="/",
+        env={"PATH": "/usr/bin:/bin"},
+        timeout_seconds=2,
+        max_output_bytes=32,
+    )
+
+    assert returncode == 0
+    assert stdout == "probe complete"
+    assert len(kill_groups) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_probe_kills_descendants_that_redirect_both_pipes() -> None:
+    returncode, stdout = oci_worker._run_bounded_command(
+        ["/bin/sh", "-c", 'sleep 30 </dev/null >/dev/null 2>&1 & echo "$!"; exit 0'],
+        cwd="/",
+        env={"PATH": "/usr/bin:/bin"},
+        timeout_seconds=2,
+        max_output_bytes=32,
+    )
+    descendant_pid = int(stdout.strip())
+
+    def descendant_is_running() -> bool:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(descendant_pid)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        ).stdout.strip()
+        return bool(status) and not status.startswith("Z")
+
+    deadline = time.monotonic() + 2
+    while descendant_is_running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert returncode == 0
+    assert not descendant_is_running(), f"probe descendant {descendant_pid} is still running"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_guardian_watchdog_reaps_when_parent_cleanup_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guardian_waits: list[int] = []
+
+    def defer_parent_cleanup(process) -> int:
+        guardian_waits.append(process.pid)
+        try:
+            return process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A failed watchdog must not strand the guardian. The wait timeout
+            # proves it is still unreaped, so its process-group ID is reserved.
+            try:
+                os.killpg(process.pid, oci_worker.signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.kill()
+            process.wait(timeout=1)
+            raise
+
+    monkeypatch.setattr(oci_worker, "_kill_process_group", defer_parent_cleanup)
+    returncode, stdout = oci_worker._run_bounded_command(
+        ["/bin/sh", "-c", "printf 'guardian proof'"],
+        cwd="/",
+        env={"PATH": "/usr/bin:/bin"},
+        timeout_seconds=1,
+        max_output_bytes=32,
+    )
+
+    assert returncode == 0
+    assert stdout == "guardian proof"
+    assert len(guardian_waits) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_probe_selector_failure_precedes_child_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launches: list[bool] = []
+
+    def fail_selector():
+        raise OSError("injected selector exhaustion")
+
+    def record_launch(*args, **kwargs):
+        launches.append(True)
+        raise AssertionError("selector must be created before launching the child")
+
+    monkeypatch.setattr(oci_worker.selectors, "DefaultSelector", fail_selector)
+    monkeypatch.setattr(oci_worker.subprocess, "Popen", record_launch)
+
+    with pytest.raises(OSError, match="selector exhaustion"):
+        oci_worker._run_bounded_command(
+            ["/bin/sh", "-c", "exit 0"],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=2,
+            max_output_bytes=16,
+        )
+
+    assert not launches
+
+
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
+def test_bounded_runc_probe_post_launch_setup_failure_reaps_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_calls: list[int] = []
+    real_cleanup = oci_worker._kill_process_group
+
+    def record_cleanup(process):
+        cleanup_calls.append(process.pid)
+        return real_cleanup(process)
+
+    real_set_blocking = oci_worker.os.set_blocking
+    set_blocking_calls = 0
+
+    def fail_on_output_set_blocking(descriptor: int, blocking: bool) -> None:
+        nonlocal set_blocking_calls
+        set_blocking_calls += 1
+        if set_blocking_calls == 2:
+            raise OSError("injected nonblocking setup failure")
+        real_set_blocking(descriptor, blocking)
+
+    monkeypatch.setattr(oci_worker, "_kill_process_group", record_cleanup)
+    monkeypatch.setattr(oci_worker.os, "set_blocking", fail_on_output_set_blocking)
+
+    with pytest.raises(OSError, match="nonblocking setup failure"):
+        oci_worker._run_bounded_command(
+            ["/bin/sh", "-c", "exec sleep 30"],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=2,
+            max_output_bytes=16,
+        )
+
+    assert len(cleanup_calls) == 1
 
 
 def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) -> None:
@@ -848,6 +1139,75 @@ def test_runc_pin_rejects_candidate_owned_executable(tmp_path: Path) -> None:
         oci_worker._pin_trusted_runc_executable(candidate_tool, repository)
 
     assert error.value.code == "untrusted_driver"
+
+
+@pytest.mark.parametrize("setid_bit", [stat.S_ISUID, stat.S_ISGID])
+def test_runc_pin_rejects_setid_mode_bits(monkeypatch: pytest.MonkeyPatch, setid_bit: int) -> None:
+    executable = Path("/bin/sh").resolve(strict=True)
+    real_fstat = os.fstat
+
+    def setid_fstat(descriptor: int):
+        info = real_fstat(descriptor)
+        fields = {
+            name: getattr(info, name)
+            for name in (
+                "st_dev",
+                "st_ino",
+                "st_size",
+                "st_uid",
+                "st_mode",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        }
+        fields["st_mode"] |= setid_bit
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(oci_worker.os, "fstat", setid_fstat)
+
+    with pytest.raises(SupervisorError, match="non-set-id") as error:
+        oci_worker._trusted_executable_identity(executable)
+
+    assert error.value.code == "invalid_oci_runtime"
+
+
+@pytest.mark.parametrize("capability_state", ["present", "unknown"])
+def test_runc_pin_rejects_linux_file_capabilities_or_unknown_state(
+    monkeypatch: pytest.MonkeyPatch, capability_state: str
+) -> None:
+    executable = Path("/bin/sh").resolve(strict=True)
+    monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
+
+    def fake_getxattr(descriptor: int, name: str) -> bytes:
+        assert name == "security.capability"
+        if capability_state == "present":
+            return b"capability-data"
+        raise OSError(oci_worker.errno.EOPNOTSUPP, "xattr state unavailable")
+
+    monkeypatch.setattr(oci_worker.os, "getxattr", fake_getxattr, raising=False)
+
+    with pytest.raises(SupervisorError, match="capabilit") as error:
+        oci_worker._trusted_executable_identity(executable)
+
+    assert error.value.code == "invalid_oci_runtime"
+
+
+def test_runc_pin_allows_linux_binary_without_capability_xattr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = Path("/bin/sh").resolve(strict=True)
+    monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
+
+    def missing_xattr(descriptor: int, name: str) -> bytes:
+        assert name == "security.capability"
+        raise OSError(oci_worker.errno.ENODATA, "no such attribute")
+
+    monkeypatch.setattr(oci_worker.os, "getxattr", missing_xattr, raising=False)
+
+    digest, identity = oci_worker._trusted_executable_identity(executable)
+
+    assert len(digest) == 64
+    assert identity[1] > 0
 
 
 @pytest.mark.parametrize("acl_target", ["binary", "parent"])

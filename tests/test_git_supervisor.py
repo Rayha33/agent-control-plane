@@ -32,6 +32,7 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
 )
 from agent_control_plane.supervisor import claims as claims_module
+from agent_control_plane.supervisor import oci_worker as oci_worker_module
 from agent_control_plane.supervisor import process as process_module
 from agent_control_plane.supervisor import result_import as result_import_module
 from agent_control_plane.supervisor import workers as workers_module
@@ -325,6 +326,69 @@ def test_external_attempt_worktree_root_rejects_relative_repository_and_symlink_
     with pytest.raises(SupervisorError) as symlink_escape:
         GitSupervisor(repo)
     assert symlink_escape.value.code == "invalid_config"
+
+
+def test_oci_runc_config_pins_executable_and_records_verified_version(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+    pin = object()
+    calls: list[tuple[str, str]] = []
+
+    def fake_pin(executable: str, root: Path):
+        calls.append((executable, str(root)))
+        return pin
+
+    def fake_probe(executable, expected_version: str) -> str:
+        assert executable is pin
+        assert expected_version == "1.3.5"
+        return "1.3.5"
+
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", fake_pin)
+    monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", fake_probe)
+
+    supervisor = GitSupervisor(repo)
+
+    assert supervisor.config.oci_runc_executable is pin
+    assert supervisor.config.oci_runc_version == "1.3.5"
+    assert calls == [("/usr/bin/runc", str(repo.resolve()))]
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ('runc_executable = "runc"\nrunc_version = "1.3.5"', "absolute path"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "latest"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-01"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a..b"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5+meta."', "release version"),
+        (
+            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\nextra = true',
+            "only runc_executable",
+        ),
+    ],
+)
+def test_oci_runc_config_rejects_ambiguous_values(repo: Path, entry: str, message: str) -> None:
+    write_config(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[sandbox.oci]\n{entry}\n")
+
+    with pytest.raises(SupervisorError, match=message) as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
+
+
+def test_oci_runc_config_is_opt_in(repo: Path) -> None:
+    write_config(repo)
+
+    supervisor = GitSupervisor(repo)
+
+    assert supervisor.config.oci_runc_executable is None
+    assert supervisor.config.oci_runc_version is None
 
 
 def test_external_attempt_worktree_root_rejects_linked_worktree_git_common_dir(

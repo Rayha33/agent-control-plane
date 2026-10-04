@@ -209,6 +209,16 @@ is then injected into the supervised worker, deterministic QC, the critic, and
 integration commands. This prevents a verifier from accidentally testing
 another attempt's localhost service or database configuration.
 
+The opt-in `[sandbox.oci]` setting can pin a root-owned, non-set-id `runc`
+executable (with no Linux file capabilities) and compare its reported release
+with an exact configured version. This currently
+validates configuration and captures a process-local pin only: `run_worker`
+still launches a host process, and no worker consumes this OCI setting. It does
+not prove runc enforcement or authorize sandbox launch. An executor must still
+execute the held file descriptor, record runtime provenance durably, and
+independently verify cancellation and cleanup before this configuration can
+authorize a worker.
+
 Runtime teardown is triggered by negative QC, completed integration, or lease
 expiry. Port values are released only after every teardown command passes and
 the OS confirms that the ports can be rebound. Failed cleanup remains durable

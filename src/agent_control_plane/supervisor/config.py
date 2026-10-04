@@ -57,6 +57,8 @@ class Config:
     trust_owner_uid: int
     attempts_root: Path | None
     min_free_bytes: int | None
+    oci_runc_executable: Any | None
+    oci_runc_version: str | None
 
 
 class ConfigMixin:
@@ -113,6 +115,42 @@ class ConfigMixin:
         qc = raw.get("qc", {})
         integration = raw.get("integration", {})
         runtime = raw.get("runtime", {})
+        sandbox = raw.get("sandbox", {})
+        if not isinstance(sandbox, dict) or set(sandbox) - {"oci"}:
+            raise SupervisorError(
+                "invalid_config", "sandbox must contain only a supported oci table"
+            )
+        sandbox_oci = sandbox.get("oci")
+        if sandbox_oci is not None and not isinstance(sandbox_oci, dict):
+            raise SupervisorError("invalid_config", "sandbox.oci must be a table")
+        oci_runc_executable: Any | None = None
+        oci_runc_version: str | None = None
+        if sandbox_oci is not None:
+            from . import oci_worker
+
+            if set(sandbox_oci) != {"runc_executable", "runc_version"}:
+                raise SupervisorError(
+                    "invalid_config",
+                    "sandbox.oci requires only runc_executable and runc_version",
+                )
+            raw_runc_path = sandbox_oci["runc_executable"]
+            requested_runc_version = sandbox_oci["runc_version"]
+            if not isinstance(raw_runc_path, str) or not raw_runc_path.strip():
+                raise SupervisorError(
+                    "invalid_config", "sandbox.oci.runc_executable must be an absolute path"
+                )
+            if not Path(raw_runc_path).expanduser().is_absolute():
+                raise SupervisorError(
+                    "invalid_config", "sandbox.oci.runc_executable must be an absolute path"
+                )
+            if not oci_worker._is_runc_release_version(requested_runc_version):
+                raise SupervisorError(
+                    "invalid_config", "sandbox.oci.runc_version must be an exact release version"
+                )
+            oci_runc_executable = oci_worker._pin_trusted_runc_executable(raw_runc_path, self.root)
+            oci_runc_version = oci_worker._probe_trusted_runc_version(
+                oci_runc_executable, requested_runc_version
+            )
         trust = raw.get("trust")
         if trust is not None and not isinstance(trust, dict):
             raise SupervisorError("invalid_config", "trust must be a table")
@@ -364,6 +402,8 @@ class ConfigMixin:
             trust_owner_uid=trust_owner_uid,
             attempts_root=attempts_root,
             min_free_bytes=min_free_bytes,
+            oci_runc_executable=oci_runc_executable,
+            oci_runc_version=oci_runc_version,
         )
 
     @staticmethod

@@ -22,11 +22,17 @@ ancestors, control same-UID writers, and reserve launch metadata safely.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import platform
 import re
+import selectors
+import signal
 import stat
+import subprocess
+import sys
+import time
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -46,6 +52,45 @@ _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
+_BOUNDED_COMMAND_GUARDIAN = """\
+import os
+import signal
+import subprocess
+import sys
+
+def _expire_group(_signum=None, _frame=None):
+    try:
+        os.killpg(0, signal.SIGKILL)
+    finally:
+        os._exit(125)
+
+try:
+    timeout_seconds = float(sys.argv[1])
+    status_fd = int(sys.argv[2])
+    signal.signal(signal.SIGALRM, _expire_group)
+    signal.alarm(max(1, int(timeout_seconds) + 2))
+    try:
+        command = subprocess.Popen(sys.argv[3:], stdin=subprocess.DEVNULL, close_fds=True)
+    except OSError:
+        command_status = 125
+    else:
+        command_status = command.wait()
+    status_bytes = str(command_status).encode("ascii")
+    offset = 0
+    while offset < len(status_bytes):
+        offset += os.write(status_fd, status_bytes[offset:])
+    os.close(status_fd)
+    os.close(1)
+    os.close(2)
+    while True:
+        signal.pause()
+except BaseException:
+    _expire_group()
+"""
+_RUNC_RELEASE_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
+_RUNC_VERSION_LINE = re.compile(r"runc version ([^\s]+)\Z")
+_RUNC_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
+_RUNC_VERSION_PROBE_MAX_OUTPUT_BYTES = 8192
 _SUPPORTED_SECCOMP_MACHINES = frozenset({"x86_64", "amd64", "aarch64", "arm64"})
 _HAS_EFFECTIVE_ID_ACCESS = os.access in os.supports_effective_ids
 _TRUSTED_RUNC_PINS: dict[
@@ -343,7 +388,7 @@ class _TrustedRuncExecutable:
 def _trusted_executable_identity(
     path: Path,
 ) -> tuple[str, tuple[int, int, int, int, int, int, int]]:
-    """Hash one root-owned executable through a no-follow descriptor."""
+    """Hash one root-owned, non-set-id executable through a no-follow descriptor."""
 
     if not _HAS_EFFECTIVE_ID_ACCESS:
         raise SupervisorError(
@@ -376,13 +421,33 @@ def _trusted_executable_identity(
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != 0
-            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
             or not before.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         ):
             raise SupervisorError(
                 "invalid_oci_runtime",
-                "runc executable must be a root-owned, non-group/world-writable regular file",
+                "runc executable must be root-owned, non-set-id, and non-group/world-writable",
             )
+        if platform.system() == "Linux":
+            getxattr = getattr(os, "getxattr", None)
+            if getxattr is None:
+                raise SupervisorError(
+                    "invalid_oci_runtime", "Linux runc file-capability checks are unavailable"
+                )
+            try:
+                getxattr(descriptor, "security.capability")
+            except OSError as error:
+                if error.errno not in {
+                    errno.ENODATA,
+                    getattr(errno, "ENOATTR", errno.ENODATA),
+                }:
+                    raise SupervisorError(
+                        "invalid_oci_runtime", "Linux runc file-capability state is unknown"
+                    ) from error
+            else:
+                raise SupervisorError(
+                    "invalid_oci_runtime", "runc executable must not carry Linux file capabilities"
+                )
         digest = hashlib.sha256()
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
@@ -417,15 +482,14 @@ def _trusted_executable_identity(
 def _pin_trusted_runc_executable(
     executable: str | Path, repo_root: str | Path
 ) -> _TrustedRuncExecutable:
-    """Create a sealed handle for a root-owned executable.
+    """Create a sealed handle for a root-owned, non-privilege-bearing executable.
 
     The resolved executable and every parent must be root-owned and not
-    replaceable by group/other users. Candidate-controlled executables are
-    rejected even when they happen to be executable and outside the attempt
-    workspace. This helper is not currently wired into supervisor configuration
-    or a worker launch path. It does not verify a desired runc version; a future
-    executor must compare the pinned binary's version with operator
-    configuration before launch.
+    replaceable by group/other users; set-id bits and Linux file capabilities
+    are rejected. Candidate-controlled executables are rejected even when they
+    happen to be executable and outside the attempt workspace. The process-local
+    pin is used by optional supervisor configuration, but no worker launch path
+    consumes it.
     """
 
     if os.geteuid() == 0:
@@ -494,6 +558,206 @@ def _verify_trusted_runc_executable(pin: _TrustedRuncExecutable) -> Path:
     ):
         raise SupervisorError("invalid_oci_runtime", "runc executable no longer matches its pin")
     return current_path
+
+
+def _probe_trusted_runc_version(pin: _TrustedRuncExecutable, expected_version: str) -> str:
+    """Run the pinned runc version probe and require the configured release.
+
+    This is a supervisor configuration check, not launch authorization. The
+    later executor must still revalidate the pin at launch and execute the held
+    file descriptor rather than trusting a path checked earlier.
+    """
+
+    if not _is_runc_release_version(expected_version):
+        raise SupervisorError(
+            "invalid_oci_runtime_version", "expected runc version must be an exact release version"
+        )
+    binary = _verify_trusted_runc_executable(pin)
+    try:
+        returncode, stdout = _run_bounded_command(
+            [str(binary), "--version"],
+            cwd="/",
+            env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+            timeout_seconds=_RUNC_VERSION_PROBE_TIMEOUT_SECONDS,
+            max_output_bytes=_RUNC_VERSION_PROBE_MAX_OUTPUT_BYTES,
+        )
+    except (
+        OSError,
+        TimeoutError,
+        ValueError,
+        UnicodeDecodeError,
+        subprocess.TimeoutExpired,
+    ) as error:
+        raise SupervisorError(
+            "invalid_oci_runtime_version", "trusted runc --version probe failed"
+        ) from error
+    if returncode != 0:
+        raise SupervisorError(
+            "invalid_oci_runtime_version", "trusted runc --version exited unsuccessfully"
+        )
+    lines = stdout.splitlines()
+    match = _RUNC_VERSION_LINE.fullmatch(lines[0].strip() if lines else "")
+    if match is None:
+        raise SupervisorError(
+            "invalid_oci_runtime_version", "trusted runc returned an unrecognized version"
+        )
+    observed_version = match.group(1)
+    if (
+        not _RUNC_RELEASE_VERSION.fullmatch(observed_version)
+        or observed_version != expected_version
+    ):
+        raise SupervisorError(
+            "invalid_oci_runtime_version", "trusted runc version does not match configuration"
+        )
+    return observed_version
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> int:
+    """Kill the private group and reap its direct child within a bounded wait."""
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as error:
+        raise OSError("could not terminate the bounded command process group") from error
+    try:
+        return process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            return process.wait(timeout=1)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError("bounded command child could not be reaped") from error
+
+
+def _run_bounded_command(
+    argv: Sequence[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout_seconds: float,
+    max_output_bytes: int,
+) -> tuple[int, str]:
+    """Capture a small command result with a hard deadline and output ceiling.
+
+    Both pipes are drained concurrently. The process starts a fresh session so
+    timeout/output overflow can kill its process group, including descendants
+    that inherit either pipe and would otherwise prevent EOF after the parent
+    exits.
+    """
+
+    if os.name != "posix":
+        raise OSError("bounded OCI runtime probes require POSIX process groups")
+    if not argv:
+        raise ValueError("bounded command requires a nonempty argument vector")
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    status_reader: int | None = None
+    status_writer: int | None = None
+    cleanup_started = False
+    try:
+        # Allocate probe state before launching the child. Any setup that must
+        # happen after Popen stays under this same cleanup-protected try block.
+        selector = selectors.DefaultSelector()
+        stdout = bytearray()
+        stderr = bytearray()
+        status = bytearray()
+        status_reader, status_writer = os.pipe()
+        os.set_blocking(status_reader, False)
+        selector.register(status_reader, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        if not sys.executable:
+            raise OSError("bounded command guardian requires the current Python executable")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                _BOUNDED_COMMAND_GUARDIAN,
+                str(timeout_seconds),
+                str(status_writer),
+                *argv,
+            ],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(status_writer,),
+            start_new_session=True,
+        )
+        parent_status_writer = status_writer
+        status_writer = None
+        os.close(parent_status_writer)
+        if process.stdout is None or process.stderr is None:
+            raise OSError("bounded command pipes were not created")
+        streams = {process.stdout: stdout, process.stderr: stderr}
+        for stream in streams:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("bounded command exceeded its deadline")
+            for key, _ in selector.select(remaining):
+                try:
+                    chunk = os.read(key.fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.fileobj == status_reader:
+                    if len(status) + len(chunk) > 16:
+                        raise ValueError("bounded command guardian returned oversized status")
+                    status.extend(chunk)
+                    continue
+                captured = streams[key.fileobj]
+                if len(stdout) + len(stderr) + len(chunk) > max_output_bytes:
+                    raise ValueError("bounded command exceeded its output limit")
+                captured.extend(chunk)
+        if deadline - time.monotonic() <= 0:
+            raise TimeoutError("bounded command exceeded its deadline")
+        # The guardian stays alive after the command exits, keeping its process
+        # group ID reserved while the result and all output pipes drain. Killing
+        # the group now also removes descendants that closed or redirected both
+        # output streams before their parent exited.
+        decoded_stdout = stdout.decode("utf-8")
+        if not status:
+            raise OSError("bounded command guardian omitted its exit status")
+        try:
+            returncode = int(status.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise OSError("bounded command guardian returned an invalid exit status") from error
+        cleanup_started = True
+        _kill_process_group(process)
+        return returncode, decoded_stdout
+    except BaseException:
+        if process is not None and not cleanup_started:
+            cleanup_started = True
+            _kill_process_group(process)
+        raise
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        if status_reader is not None:
+            os.close(status_reader)
+        if status_writer is not None:
+            os.close(status_writer)
+
+
+def _is_runc_release_version(value: Any) -> bool:
+    """Whether a configured version is canonical stable major.minor.patch."""
+
+    return isinstance(value, str) and _RUNC_RELEASE_VERSION.fullmatch(value) is not None
 
 
 def build_oci_worker_config(
