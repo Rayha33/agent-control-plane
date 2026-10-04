@@ -272,6 +272,28 @@ assumptions, not properties proved by a namespace test.
    plus the bounded NAS fixture above; it is an implementation contract, not
    proof that ACP currently performs these steps.
 
+### Trusted runc executable pin helper (2026-10-04)
+
+`build_runc_run_argv` now requires a process-local sealed handle minted by
+`_pin_trusted_runc_executable`; a raw path, caller-constructed handle, or
+modified handle is rejected. Pinning uses the trusted-executable path/parent
+checks, requires a root-owned non-group/world-writable regular file, hashes it
+through a no-follow descriptor, records its canonical path and file identity
+(device, inode, size, owner, mode, mtime, ctime), and repeats those checks
+before building argv. It also checks effective-ID write access to the binary
+and every parent directory, failing closed if the platform cannot perform that
+check; this covers ACL grants that mode bits do not show. Regression tests
+cover untrusted paths, forged or modified handles, simulated ACL write grants,
+and a simulated changed binary identity.
+
+This is a compiler prerequisite only: no supervisor configuration currently
+creates or passes the handle, and no worker launch path calls this argv builder.
+It does not check the operator-requested runc version, hold an executable file
+descriptor through `exec`, persist runtime path/digest in the execution
+journal, or prove that runc enforces the OCI policy. A future executor must
+wire the pin from trusted configuration, compare the configured version, and
+persist the exact runtime provenance before any launch can be enabled.
+
 ### Durable execution-journal slice (2026-10-04)
 
 Schema 14 introduced a private, per-attempt `sandbox_executions` journal. Reservation

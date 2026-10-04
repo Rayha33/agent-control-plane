@@ -22,11 +22,14 @@ ancestors, control same-UID writers, and reserve launch metadata safely.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import re
 import stat
+import weakref
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +47,14 @@ _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
 _SUPPORTED_SECCOMP_MACHINES = frozenset({"x86_64", "amd64", "aarch64", "arm64"})
+_HAS_EFFECTIVE_ID_ACCESS = os.access in os.supports_effective_ids
+_TRUSTED_RUNC_PINS: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[Any],
+        tuple[Path, Path, str, int, int, int, int, int, int, int],
+    ],
+] = {}
 _SECCOMP_DENIED_SYSCALLS = (
     "add_key",
     "bpf",
@@ -312,6 +323,179 @@ def _mapped_mode_allows(
     return bool(mode & other_bit)
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _TrustedRuncExecutable:
+    """Process-local provenance handle for one trusted, root-owned runc binary.
+
+    A path string is not an executable trust pin: it can be replaced between
+    configuration validation and invocation. The origin registry below binds
+    this exact object to a canonical path, inode, size and content digest. A
+    hand-constructed or copied handle is not accepted.
+    """
+
+    path: Path
+    sha256: str
+    device: int
+    inode: int
+    size: int
+
+
+def _trusted_executable_identity(
+    path: Path,
+) -> tuple[str, tuple[int, int, int, int, int, int, int]]:
+    """Hash one root-owned executable through a no-follow descriptor."""
+
+    if not _HAS_EFFECTIVE_ID_ACCESS:
+        raise SupervisorError(
+            "invalid_oci_runtime",
+            "effective-identity write checks are unavailable for the runc path",
+        )
+    for candidate in (path, *path.parents):
+        try:
+            writable = os.access(candidate, os.W_OK, effective_ids=True)
+        except (OSError, NotImplementedError, TypeError) as error:
+            raise SupervisorError(
+                "invalid_oci_runtime",
+                "effective-identity write check failed for the runc path",
+            ) from error
+        if writable:
+            raise SupervisorError(
+                "invalid_oci_runtime",
+                "runc executable or parent path is writable by the supervisor user",
+            )
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_runtime", "runc executable cannot be opened safely"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or not before.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        ):
+            raise SupervisorError(
+                "invalid_oci_runtime",
+                "runc executable must be a root-owned, non-group/world-writable regular file",
+            )
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_runtime", "runc executable changed while being pinned"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+    def identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_uid,
+            stat.S_IMODE(info.st_mode),
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    if identity(before) != identity(after) or identity(after) != identity(current):
+        raise SupervisorError("invalid_oci_runtime", "runc executable changed while being pinned")
+    return digest.hexdigest(), identity(after)
+
+
+def _pin_trusted_runc_executable(
+    executable: str | Path, repo_root: str | Path
+) -> _TrustedRuncExecutable:
+    """Create a sealed handle for a root-owned executable.
+
+    The resolved executable and every parent must be root-owned and not
+    replaceable by group/other users. Candidate-controlled executables are
+    rejected even when they happen to be executable and outside the attempt
+    workspace. This helper is not currently wired into supervisor configuration
+    or a worker launch path. It does not verify a desired runc version; a future
+    executor must compare the pinned binary's version with operator
+    configuration before launch.
+    """
+
+    if os.geteuid() == 0:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "OCI worker runtime must be invoked by a non-root caller"
+        )
+    try:
+        root = Path(repo_root).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise SupervisorError(
+            "invalid_oci_runtime", "supervisor repository is unavailable"
+        ) from error
+    try:
+        from ..runtime_drivers import DriverError, resolve_trusted_executable
+
+        resolved = resolve_trusted_executable(str(executable), root, expected_owners={0})
+    except DriverError as error:
+        raise SupervisorError(error.code, error.message) from error
+    digest, identity = _trusted_executable_identity(resolved)
+    pin = _TrustedRuncExecutable(
+        path=resolved,
+        sha256=digest,
+        device=identity[0],
+        inode=identity[1],
+        size=identity[2],
+    )
+    key = id(pin)
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        current = _TRUSTED_RUNC_PINS.get(key)
+        if current is not None and current[0] is reference:
+            _TRUSTED_RUNC_PINS.pop(key, None)
+
+    reference = weakref.ref(pin, discard)
+    _TRUSTED_RUNC_PINS[key] = (reference, (root, resolved, digest, *identity))
+    return pin
+
+
+def _verify_trusted_runc_executable(pin: _TrustedRuncExecutable) -> Path:
+    """Revalidate a sealed pin before constructing the runtime command."""
+
+    sealed = _TRUSTED_RUNC_PINS.get(id(pin)) if type(pin) is _TrustedRuncExecutable else None
+    if sealed is None or sealed[0]() is not pin:
+        raise SupervisorError(
+            "invalid_oci_runtime", "runc executable must come from trusted supervisor configuration"
+        )
+    root, expected_path, expected_digest, *expected_identity = sealed[1]
+    if (
+        pin.path != expected_path
+        or pin.sha256 != expected_digest
+        or (pin.device, pin.inode, pin.size)
+        != (expected_identity[0], expected_identity[1], expected_identity[2])
+    ):
+        raise SupervisorError("invalid_oci_runtime", "runc executable pin was modified")
+    try:
+        from ..runtime_drivers import DriverError, resolve_trusted_executable
+
+        current_path = resolve_trusted_executable(str(expected_path), root, expected_owners={0})
+    except DriverError as error:
+        raise SupervisorError(error.code, error.message) from error
+    current_digest, current_identity = _trusted_executable_identity(current_path)
+    if (
+        current_path != expected_path
+        or current_digest != expected_digest
+        or current_identity != tuple(expected_identity)
+    ):
+        raise SupervisorError("invalid_oci_runtime", "runc executable no longer matches its pin")
+    return current_path
+
+
 def build_oci_worker_config(
     bundle_root: str | Path,
     workspace_snapshot: Snapshot,
@@ -514,7 +698,7 @@ def build_oci_worker_config(
 
 
 def build_runc_run_argv(
-    executable: str | Path,
+    executable: _TrustedRuncExecutable,
     state_root: str | Path,
     bundle_root: str | Path,
     workspace_root: str | Path,
@@ -527,6 +711,11 @@ def build_runc_run_argv(
     caller must map the read end to fd 3, sanitize runc activation environment,
     pass exactly that one descriptor to ``subprocess.Popen``, and keep its
     paired writer private until it has durably authorized launch.
+    ``executable`` must be a process-local pin minted by
+    ``_pin_trusted_runc_executable``. Its root-owned file identity and SHA-256
+    are rechecked here; a caller-supplied path or forged pin is refused. No
+    supervisor config currently creates or passes this handle, and this helper
+    does not verify the desired runc version or prove that runc applies policy.
     ``--keep`` preserves runc state/cgroup for an eventual supervised cleanup;
     the caller must not release its attempt fence until it separately proves
     that the init process, cgroup, and runc state are gone. The PID-path check
@@ -538,15 +727,7 @@ def build_runc_run_argv(
         raise SupervisorError(
             "invalid_oci_worker_policy", "OCI worker runtime must be invoked by a non-root caller"
         )
-    binary = Path(executable).expanduser()
-    if not binary.is_absolute():
-        raise SupervisorError("invalid_oci_runtime", "runc executable must be absolute")
-    try:
-        binary = binary.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise SupervisorError("invalid_oci_runtime", "runc executable is unavailable") from error
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise SupervisorError("invalid_oci_runtime", "runc executable is not executable")
+    binary = _verify_trusted_runc_executable(executable)
     state = _private_directory(state_root, code="invalid_oci_state", label="runc state root")
     bundle = _private_directory(bundle_root, code="invalid_oci_bundle", label="OCI bundle root")
     workspace = _private_directory(

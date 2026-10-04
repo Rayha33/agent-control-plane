@@ -95,6 +95,10 @@ def compile_config(bundle: Path, workspace: Snapshot) -> dict:
     )
 
 
+def pinned_runc(repo_root: Path) -> oci_worker._TrustedRuncExecutable:
+    return oci_worker._pin_trusted_runc_executable("/bin/sh", repo_root)
+
+
 def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) -> None:
     bundle, workspace = oci_fixture(tmp_path)
     config = compile_config(bundle, workspace)
@@ -728,7 +732,7 @@ def test_runc_command_is_attached_and_names_explicit_bundle_state_and_pid_file(
     pid_file = metadata / "container.pid"
 
     argv = build_runc_run_argv(
-        "/bin/sh",
+        pinned_runc(tmp_path),
         state,
         bundle,
         workspace.root,
@@ -764,7 +768,9 @@ def test_runc_command_rejects_existing_pid_file(tmp_path: Path) -> None:
     pid_file.touch()
 
     with pytest.raises(SupervisorError) as error:
-        build_runc_run_argv("/bin/sh", state, bundle, workspace.root, pid_file, "acp-worker-123")
+        build_runc_run_argv(
+            pinned_runc(tmp_path), state, bundle, workspace.root, pid_file, "acp-worker-123"
+        )
 
     assert error.value.code == "invalid_oci_pid_file"
 
@@ -776,7 +782,9 @@ def test_runc_pid_file_must_be_outside_candidate_workspace(tmp_path: Path) -> No
     pid_file = workspace.root / "container.pid"
 
     with pytest.raises(SupervisorError) as error:
-        build_runc_run_argv("/bin/sh", state, bundle, workspace.root, pid_file, "acp-worker-123")
+        build_runc_run_argv(
+            pinned_runc(tmp_path), state, bundle, workspace.root, pid_file, "acp-worker-123"
+        )
 
     assert error.value.code == "invalid_oci_pid_file"
 
@@ -790,7 +798,7 @@ def test_runc_pid_parent_must_be_private(tmp_path: Path) -> None:
 
     with pytest.raises(SupervisorError) as error:
         build_runc_run_argv(
-            "/bin/sh",
+            pinned_runc(tmp_path),
             state,
             bundle,
             workspace.root,
@@ -799,3 +807,171 @@ def test_runc_pid_parent_must_be_private(tmp_path: Path) -> None:
         )
 
     assert error.value.code == "invalid_oci_pid_file"
+
+
+def test_runc_command_rejects_a_raw_path_and_a_forged_pin(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    state = tmp_path / "attempt" / "runc-state"
+    state.mkdir(mode=0o700)
+    metadata = state / "metadata"
+    metadata.mkdir(mode=0o700)
+    pid_file = metadata / "container.pid"
+
+    with pytest.raises(SupervisorError, match="trusted supervisor configuration") as raw_error:
+        build_runc_run_argv(
+            "/bin/sh",
+            state,
+            bundle,
+            workspace.root,
+            pid_file,
+            "acp-worker-123",  # type: ignore[arg-type]
+        )
+    assert raw_error.value.code == "invalid_oci_runtime"
+
+    pin = pinned_runc(tmp_path)
+    forged = oci_worker._TrustedRuncExecutable(
+        pin.path, pin.sha256, pin.device, pin.inode, pin.size
+    )
+    with pytest.raises(SupervisorError, match="trusted supervisor configuration") as forged_error:
+        build_runc_run_argv(forged, state, bundle, workspace.root, pid_file, "acp-worker-123")
+    assert forged_error.value.code == "invalid_oci_runtime"
+
+
+def test_runc_pin_rejects_candidate_owned_executable(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    candidate_tool = tmp_path / "runc"
+    candidate_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    candidate_tool.chmod(0o700)
+
+    with pytest.raises(SupervisorError) as error:
+        oci_worker._pin_trusted_runc_executable(candidate_tool, repository)
+
+    assert error.value.code == "untrusted_driver"
+
+
+@pytest.mark.parametrize("acl_target", ["binary", "parent"])
+def test_runc_pin_rejects_effective_user_acl_write_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, acl_target: str
+) -> None:
+    resolved = Path("/bin/sh").resolve(strict=True)
+    acl_writable_path = resolved if acl_target == "binary" else resolved.parent
+    original_access = os.access
+
+    def access_with_acl(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+        effective_ids: bool = False,
+        follow_symlinks: bool = True,
+    ) -> bool:
+        if effective_ids and mode == os.W_OK and Path(path) == acl_writable_path:
+            return True
+        return original_access(
+            path,
+            mode,
+            dir_fd=dir_fd,
+            effective_ids=effective_ids,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(oci_worker.os, "access", access_with_acl)
+
+    with pytest.raises(SupervisorError, match="writable by the supervisor user") as error:
+        oci_worker._pin_trusted_runc_executable("/bin/sh", tmp_path)
+
+    assert error.value.code == "invalid_oci_runtime"
+
+
+def test_runc_pin_fails_closed_without_effective_id_access_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oci_worker, "_HAS_EFFECTIVE_ID_ACCESS", False)
+
+    with pytest.raises(
+        SupervisorError, match="effective-identity write checks are unavailable"
+    ) as error:
+        oci_worker._pin_trusted_runc_executable("/bin/sh", tmp_path)
+
+    assert error.value.code == "invalid_oci_runtime"
+
+
+def test_runc_command_rechecks_effective_user_acl_write_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    state = tmp_path / "attempt" / "runc-state"
+    state.mkdir(mode=0o700)
+    metadata = state / "metadata"
+    metadata.mkdir(mode=0o700)
+    pid_file = metadata / "container.pid"
+    pin = pinned_runc(tmp_path)
+    original_access = os.access
+
+    def access_with_acl(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+        effective_ids: bool = False,
+        follow_symlinks: bool = True,
+    ) -> bool:
+        if effective_ids and mode == os.W_OK:
+            return True
+        return original_access(
+            path,
+            mode,
+            dir_fd=dir_fd,
+            effective_ids=effective_ids,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(oci_worker.os, "access", access_with_acl)
+
+    with pytest.raises(SupervisorError, match="writable by the supervisor user") as error:
+        build_runc_run_argv(pin, state, bundle, workspace.root, pid_file, "acp-worker-123")
+
+    assert error.value.code == "invalid_oci_runtime"
+
+
+def test_runc_pin_rejects_modified_seal(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    state = tmp_path / "attempt" / "runc-state"
+    state.mkdir(mode=0o700)
+    metadata = state / "metadata"
+    metadata.mkdir(mode=0o700)
+    pid_file = metadata / "container.pid"
+    pin = pinned_runc(tmp_path)
+    object.__setattr__(pin, "sha256", "0" * 64)
+
+    with pytest.raises(SupervisorError, match="pin was modified") as error:
+        build_runc_run_argv(pin, state, bundle, workspace.root, pid_file, "acp-worker-123")
+
+    assert error.value.code == "invalid_oci_runtime"
+
+
+def test_runc_pin_rejects_simulated_executable_identity_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    state = tmp_path / "attempt" / "runc-state"
+    state.mkdir(mode=0o700)
+    metadata = state / "metadata"
+    metadata.mkdir(mode=0o700)
+    pid_file = metadata / "container.pid"
+    pin = pinned_runc(tmp_path)
+
+    monkeypatch.setattr(
+        oci_worker,
+        "_trusted_executable_identity",
+        lambda _path: (
+            "0" * 64,
+            (pin.device, pin.inode, pin.size, 0, 0o755, 1, 1),
+        ),
+    )
+
+    with pytest.raises(SupervisorError, match="no longer matches its pin") as error:
+        build_runc_run_argv(pin, state, bundle, workspace.root, pid_file, "acp-worker-123")
+
+    assert error.value.code == "invalid_oci_runtime"
