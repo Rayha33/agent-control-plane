@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import copy
 import fcntl
+import hashlib
+import json
 import os
 import stat
 import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urljoin
 
 import pytest
+from jsonschema import Draft4Validator
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT4
 
 import agent_control_plane.supervisor.oci_worker as oci_worker
 from agent_control_plane.supervisor.common import SupervisorError
@@ -17,6 +24,44 @@ from agent_control_plane.supervisor.oci_worker import (
     build_runc_run_argv,
 )
 from agent_control_plane.supervisor.sandbox_workspace import Snapshot, copy_snapshot
+
+_OCI_SCHEMA_DIR = Path(__file__).parent / "data" / "oci-runtime-spec-v1.2.1"
+_OCI_SCHEMA_FILES = (
+    "config-schema.json",
+    "config-linux.json",
+    "defs.json",
+    "defs-linux.json",
+)
+_OCI_SCHEMA_SHA256 = {
+    "config-schema.json": "2fd3af83c22f3d1420d42c139462b7f35012ceea402a9a47f090695a5aea84e2",
+    "config-linux.json": "ca172a5dbe1242ddde4316cea5568130c552649569b0cc65860910949d529737",
+    "defs.json": "9b2420b3f02970e14533f9506b6590f5b405aad8c45dd8871bd129574ee316bb",
+    "defs-linux.json": "bb1c6346f7bd683e38389ea489b730e94ad92c3030113d28499ce76bd6e5e73a",
+}
+
+
+def _pinned_oci_schema_validator() -> Draft4Validator:
+    schema_dir = _OCI_SCHEMA_DIR.resolve()
+    base_uri = schema_dir.as_uri() + "/"
+    documents: dict[str, dict] = {}
+    resources = []
+    for name in _OCI_SCHEMA_FILES:
+        schema_bytes = (schema_dir / name).read_bytes()
+        digest = hashlib.sha256(schema_bytes).hexdigest()
+        assert digest == _OCI_SCHEMA_SHA256[name], f"pinned OCI schema digest mismatch: {name}"
+        document = json.loads(schema_bytes)
+        # The upstream platform schemas omit an identifier. Anchor their local
+        # references to this vendored directory without changing validation rules.
+        document.setdefault("id", urljoin(base_uri, name))
+        documents[name] = document
+        resources.append(
+            (
+                urljoin(base_uri, name),
+                Resource.from_contents(document, default_specification=DRAFT4),
+            )
+        )
+    registry = Registry().with_resources(resources)
+    return Draft4Validator(documents["config-schema.json"], registry=registry)
 
 
 def oci_fixture(tmp_path: Path) -> tuple[Path, Snapshot]:
@@ -48,6 +93,24 @@ def compile_config(bundle: Path, workspace: Snapshot) -> dict:
         pids_limit=32,
         cpu_quota_us=100_000,
     )
+
+
+def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    config = compile_config(bundle, workspace)
+    validator = _pinned_oci_schema_validator()
+
+    errors = sorted(
+        validator.iter_errors(config),
+        key=lambda error: (tuple(str(part) for part in error.absolute_path), error.message),
+    )
+    assert not errors, "\n".join(
+        f"/{'/'.join(map(str, error.absolute_path))}: {error.message}" for error in errors
+    )
+
+    invalid = copy.deepcopy(config)
+    invalid["linux"]["resources"]["memory"]["limit"] = "256 MiB"
+    assert list(validator.iter_errors(invalid))
 
 
 def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(

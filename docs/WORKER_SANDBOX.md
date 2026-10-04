@@ -576,13 +576,17 @@ The device-cgroup deny entry is only a request: OCI requires default device
 nodes and runc/rootless cgroup behavior needs exact-runtime readback before any
 device-isolation claim ([OCI Linux configuration](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md),
 [runc cgroup v2 guide](https://github.com/opencontainers/runc/blob/v1.3.5/docs/cgroup-v2.md)).
-The emitted config fields and bounds were reviewed against the pinned
-[OCI 1.2.1 schema](https://github.com/opencontainers/runtime-spec/tree/v1.2.1/schema),
-but this change contains no reproducible schema-validator invocation or
-validation receipt. Focused tests exercise policy compilation and argv
-construction, not full schema validation. None of these checks is a Linux
-launch, syscall/device/cgroup enforcement, nor per-attempt worker-isolation
-proof.
+The emitted config is now checked by
+tests/test_oci_worker.py::test_compiled_oci_worker_config_matches_pinned_oci_schema
+against the unmodified OCI Runtime Specification v1.2.1 Draft 4 schemas, pinned
+to upstream commit 524fc0e1b8ab0180e2fc9abd31837a0f4ed1fd6b. The four test-only
+schema files include the core and Linux schemas plus their transitive
+definitions; validation resolves references only from a local registry and has
+no network fallback. Reproduce with
+uv run pytest tests/test_oci_worker.py -k pinned_oci_schema (the test name
+contains pinned_oci_schema). It also confirms an invalid memory-limit type is
+rejected. This proves schema conformance of the emitted JSON only, not a Linux
+launch, syscall/device/cgroup enforcement, or per-attempt worker-isolation.
 
 This does not prove that ACP persists either systemd invocation, captures an
 attached runc exit receipt, coordinates cancellation/recovery across supervisor
