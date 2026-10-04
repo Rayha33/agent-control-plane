@@ -23,6 +23,7 @@ from agent_control_plane.supervisor import sandbox_execution_journal as journal_
 from agent_control_plane.supervisor.common import canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
+    running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
 )
 from agent_control_plane.supervisor.sandbox_workspace import (
@@ -842,6 +843,21 @@ def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Pa
             attempt["id"], attempt["claim_token"], attestation=tampered
         )
     assert invalid.value.code == "sandbox_runtime_attestation_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+
+    stale = replace(receipt, container_id="different-container")
+    stale_payload = stale.audit_payload()
+    stale_payload.pop("evidence_sha256")
+    stale = replace(
+        stale,
+        evidence_sha256=hashlib.sha256(canonical_json(stale_payload).encode("utf-8")).hexdigest(),
+    )
+    assert running_attestation_is_self_consistent(stale)
+    with pytest.raises(SupervisorError) as mismatched_launch:
+        supervisor._sandbox_execution_record_running(
+            attempt["id"], attempt["claim_token"], attestation=stale
+        )
+    assert mismatched_launch.value.code == "sandbox_runtime_attestation_stale"
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
 
     running = supervisor._sandbox_execution_record_running(
