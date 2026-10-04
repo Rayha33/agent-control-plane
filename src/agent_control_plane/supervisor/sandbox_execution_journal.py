@@ -18,6 +18,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .common import CLEANUP_FENCE_EPOCH, SupervisorError, canonical_json, utc_now
+from .sandbox_attestation import (
+    RunningRuntimeAttestation,
+    running_attestation_is_self_consistent,
+)
 from .sandbox_workspace import (
     _MAX_DURABLE_MANIFEST_BYTES,
     _restore_snapshot_from_record,
@@ -1033,20 +1037,47 @@ class SandboxExecutionJournalMixin:
         attempt_id: str,
         claim_token: int,
         *,
-        init_pid: int,
-        init_identity: str,
+        attestation: RunningRuntimeAttestation,
         credential: str | None = None,
     ) -> dict[str, Any]:
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
-        init_pid = self._sandbox_pid(init_pid, "init_pid")
-        init_identity = self._sandbox_process_identity(init_identity, "init_identity")
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
         if not row or row["claim_token"] != claim_token:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
+        if row["phase"] != "launched":
+            raise SupervisorError(
+                "sandbox_execution_transition_invalid",
+                f"cannot record running from phase {row['phase']}; fence retained",
+            )
+        if not running_attestation_is_self_consistent(attestation):
+            raise SupervisorError(
+                "sandbox_runtime_attestation_invalid",
+                "running transition requires a self-consistent typed receipt",
+            )
+        expected = {
+            "container_id": row["container_id"],
+            "bundle_path": row["bundle_path"],
+            "monitor_pid": row["monitor_pid"],
+            "monitor_identity": row["monitor_identity"],
+            "runc_client_pid": row["runc_client_pid"],
+            "runc_client_identity": row["runc_client_identity"],
+            "wrapper_unit": row["wrapper_unit"],
+            "wrapper_invocation_id": row["wrapper_invocation_id"],
+            "scope_unit": row["scope_unit"],
+            "scope_invocation_id": row["scope_invocation_id"],
+            "cgroup_path": row["cgroup_path"],
+        }
+        if any(getattr(attestation, key) != value for key, value in expected.items()):
+            raise SupervisorError(
+                "sandbox_runtime_attestation_stale",
+                "runtime evidence does not match the durable launch identities",
+            )
+        init_pid = self._sandbox_pid(attestation.init_pid, "init_pid")
+        init_identity = self._sandbox_process_identity(attestation.init_identity, "init_identity")
         if init_pid in {row["monitor_pid"], row["runc_client_pid"]}:
             raise SupervisorError(
                 "sandbox_execution_invalid", "container init must have a distinct host PID"
@@ -1058,7 +1089,7 @@ class SandboxExecutionJournalMixin:
             next_phase="running",
             updates={"init_pid": init_pid, "init_identity": init_identity},
             event_type="sandbox.execution_running",
-            event_payload={"init_pid": init_pid, "init_identity": init_identity},
+            event_payload={"attestation": attestation.audit_payload()},
             credential=credential,
         )
 

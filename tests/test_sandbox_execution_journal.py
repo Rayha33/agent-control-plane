@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,10 @@ from agent_control_plane.git_supervisor import (
 from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
 from agent_control_plane.supervisor.common import canonical_json
+from agent_control_plane.supervisor.sandbox_attestation import (
+    ProcessSnapshot,
+    validate_running_runtime_attestation,
+)
 from agent_control_plane.supervisor.sandbox_workspace import (
     ManifestEntry,
     _make_manifest,
@@ -63,14 +68,87 @@ def record_launch(supervisor: GitSupervisor, attempt: dict) -> dict:
         attempt["id"],
         attempt["claim_token"],
         monitor_pid=101,
-        monitor_identity="monitor-start-101",
+        monitor_identity="linux:101:1101",
         runc_client_pid=202,
-        runc_client_identity="runc-start-202",
+        runc_client_identity="linux:202:1202",
         wrapper_unit="acp-worker.service",
         wrapper_invocation_id="1" * 32,
         scope_unit="acp-container.scope",
         scope_invocation_id="2" * 32,
         cgroup_path=("/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope"),
+    )
+
+
+def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int = 303):
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    assert row is not None and row["phase"] == "launched"
+    init_start = 1303
+    wrapper_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-worker.service"
+    scope_cgroup = row["cgroup_path"]
+
+    def stat(pid: int, start: int) -> bytes:
+        fields = [b"S", *([b"0"] * 18), str(start).encode("ascii")]
+        return f"{pid} (worker (gate)) ".encode("ascii") + b" ".join(fields) + b"\n"
+
+    snapshots = {
+        row["monitor_pid"]: ProcessSnapshot(
+            stat(row["monitor_pid"], 1101),
+            f"0::{wrapper_cgroup}\n".encode("ascii"),
+            stat(row["monitor_pid"], 1101),
+        ),
+        row["runc_client_pid"]: ProcessSnapshot(
+            stat(row["runc_client_pid"], 1202),
+            f"0::{wrapper_cgroup}\n".encode("ascii"),
+            stat(row["runc_client_pid"], 1202),
+        ),
+        init_pid: ProcessSnapshot(
+            stat(init_pid, init_start),
+            f"0::{scope_cgroup}\n".encode("ascii"),
+            stat(init_pid, init_start),
+        ),
+    }
+    return validate_running_runtime_attestation(
+        runc_state=json.dumps(
+            {
+                "id": row["container_id"],
+                "status": "running",
+                "pid": init_pid,
+                "bundle": row["bundle_path"],
+            }
+        ).encode("utf-8"),
+        pid_file=f"{init_pid}\n".encode("ascii"),
+        process_snapshots=snapshots,
+        wrapper_properties=(
+            "ActiveState=active\n"
+            f"ControlGroup={wrapper_cgroup}\n"
+            f"Id={row['wrapper_unit']}\n"
+            f"InvocationID={row['wrapper_invocation_id']}\n"
+        ).encode("ascii"),
+        scope_properties=(
+            "ActiveState=active\n"
+            f"ControlGroup={scope_cgroup}\n"
+            f"Id={row['scope_unit']}\n"
+            f"InvocationID={row['scope_invocation_id']}\n"
+        ).encode("ascii"),
+        expected_container_id=row["container_id"],
+        expected_bundle_path=row["bundle_path"],
+        expected_monitor_pid=row["monitor_pid"],
+        expected_monitor_identity=row["monitor_identity"],
+        expected_runc_client_pid=row["runc_client_pid"],
+        expected_runc_client_identity=row["runc_client_identity"],
+        expected_wrapper_unit=row["wrapper_unit"],
+        expected_wrapper_invocation_id=row["wrapper_invocation_id"],
+        expected_scope_unit=row["scope_unit"],
+        expected_scope_invocation_id=row["scope_invocation_id"],
+        expected_cgroup_path=scope_cgroup,
+    )
+
+
+def record_running(supervisor: GitSupervisor, attempt: dict) -> dict:
+    return supervisor._sandbox_execution_record_running(
+        attempt["id"],
+        attempt["claim_token"],
+        attestation=running_attestation(supervisor, attempt),
     )
 
 
@@ -628,8 +706,8 @@ def test_sql_phase_checks_reject_nullable_process_identities(repo: Path) -> None
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
     launch_fields = (
-        "monitor_identity = 'monitor-start-101', runc_client_pid = 202, "
-        "runc_client_identity = 'runc-start-202', wrapper_unit = 'acp-worker.service', "
+        "monitor_identity = 'linux:101:1101', runc_client_pid = 202, "
+        "runc_client_identity = 'linux:202:1202', wrapper_unit = 'acp-worker.service', "
         "wrapper_invocation_id = '11111111111111111111111111111111', "
         "scope_unit = 'acp-container.scope', "
         "scope_invocation_id = '22222222222222222222222222222222', "
@@ -655,7 +733,7 @@ def test_sql_phase_checks_reject_nullable_process_identities(repo: Path) -> None
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "UPDATE sandbox_executions SET phase = 'running', init_pid = NULL, "
-                "init_identity = 'init-start-303' WHERE attempt_id = ?",
+                "init_identity = 'linux:303:1303' WHERE attempt_id = ?",
                 (attempt["id"],),
             )
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
@@ -666,9 +744,7 @@ def test_recorded_execution_evidence_is_immutable(repo: Path) -> None:
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
     record_launch(supervisor, attempt)
-    supervisor._sandbox_execution_record_running(
-        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
-    )
+    record_running(supervisor, attempt)
 
     mutations = (
         "monitor_pid = 404",
@@ -712,7 +788,7 @@ def test_transition_order_keeps_monitor_runc_and_init_identities_distinct(repo: 
 
     with pytest.raises(SupervisorError) as out_of_order:
         supervisor._sandbox_execution_record_running(
-            attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+            attempt["id"], attempt["claim_token"], attestation=None
         )
     assert out_of_order.value.code == "sandbox_execution_transition_invalid"
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
@@ -721,13 +797,13 @@ def test_transition_order_keeps_monitor_runc_and_init_identities_distinct(repo: 
     assert row["phase"] == "launched"
     with pytest.raises(SupervisorError) as pid_alias:
         supervisor._sandbox_execution_record_running(
-            attempt["id"], attempt["claim_token"], init_pid=202, init_identity="runc-start-202"
+            attempt["id"],
+            attempt["claim_token"],
+            attestation=replace(running_attestation(supervisor, attempt), init_pid=202),
         )
-    assert pid_alias.value.code == "sandbox_execution_invalid"
+    assert pid_alias.value.code == "sandbox_runtime_attestation_invalid"
 
-    row = supervisor._sandbox_execution_record_running(
-        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
-    )
+    row = record_running(supervisor, attempt)
     assert row["phase"] == "running"
     row = supervisor._sandbox_execution_request_stop(
         attempt["id"], attempt["claim_token"], "attempt cancellation"
@@ -746,14 +822,42 @@ def test_transition_order_keeps_monitor_runc_and_init_identities_distinct(repo: 
     assert supervisor.verify_event_chain()["ok"] is True
 
 
+def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+
+    with pytest.raises(SupervisorError) as untyped:
+        supervisor._sandbox_execution_record_running(
+            attempt["id"], attempt["claim_token"], attestation={"init_pid": 303}
+        )
+    assert untyped.value.code == "sandbox_runtime_attestation_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+
+    receipt = running_attestation(supervisor, attempt)
+    tampered = replace(receipt, init_identity="linux:303:9999")
+    with pytest.raises(SupervisorError) as invalid:
+        supervisor._sandbox_execution_record_running(
+            attempt["id"], attempt["claim_token"], attestation=tampered
+        )
+    assert invalid.value.code == "sandbox_runtime_attestation_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+
+    running = supervisor._sandbox_execution_record_running(
+        attempt["id"], attempt["claim_token"], attestation=receipt
+    )
+    assert running["phase"] == "running"
+    assert running["init_pid"] == 303
+    assert running["init_identity"] == "linux:303:1303"
+
+
 def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
     record_launch(supervisor, attempt)
-    supervisor._sandbox_execution_record_running(
-        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
-    )
+    record_running(supervisor, attempt)
     supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
 
     receipt = cleanup_receipt(supervisor, attempt["id"])
@@ -826,9 +930,7 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
     row = reserve(supervisor, attempt)
     workspace = Path(row["workspace_root_path"])
     record_launch(supervisor, attempt)
-    supervisor._sandbox_execution_record_running(
-        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
-    )
+    record_running(supervisor, attempt)
     (workspace / "alpha.txt").write_text("candidate result\n", encoding="utf-8")
     supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
     supervisor._sandbox_execution_record_cleanup_report(
@@ -907,9 +1009,7 @@ def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> No
     row = reserve(supervisor, attempt)
     workspace = Path(row["workspace_root_path"])
     record_launch(supervisor, attempt)
-    supervisor._sandbox_execution_record_running(
-        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
-    )
+    record_running(supervisor, attempt)
     (workspace / "alpha.txt").write_text("candidate v1\n", encoding="utf-8")
     supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
     supervisor._sandbox_execution_record_cleanup_report(
@@ -943,9 +1043,7 @@ def test_persisted_v1_cleanup_receipt_replays_read_only_but_never_proves_cleanup
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
     record_launch(supervisor, attempt)
-    supervisor._sandbox_execution_record_running(
-        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
-    )
+    record_running(supervisor, attempt)
     supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
 
     legacy_receipt = cleanup_receipt(supervisor, attempt["id"])

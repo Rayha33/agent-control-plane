@@ -415,6 +415,29 @@ so a journaled candidate still cannot create or submit a result. Direct-worker
 behavior remains unchanged. Same-UID raw database writers, workspace path
 races, and runtime cleanup are not proved safe by this receipt.
 
+**Runtime-attestation validator (2026-10-04; still no launcher).** The new
+`sandbox_attestation` module accepts bounded observations from a future trusted
+executor and binds them into one typed receipt: unique-key `runc state` JSON,
+the private PID-file value, before/after `/proc/<pid>/stat` samples around each
+process cgroup read, and exact systemd wrapper/scope `Id`, `InvocationID`,
+`ActiveState`, and `ControlGroup` properties. It requires runc's container ID,
+bundle, running status, state PID, and PID-file PID to match; the monitor and
+runc client must remain in the wrapper cgroup, while a live, non-zombie init
+must remain in the exact recorded scope cgroup. The journal accepts only a
+self-consistent normalized receipt matching its durable launch identities and
+appends the normalized evidence plus its digest to the hash-chained running
+event.
+
+This is a validator, not an evidence collector: it does not invoke runc or
+systemd, open the pid file, or read `/proc` itself except for the bounded helper
+that brackets process samples. No worker executor currently calls it, no gate
+is released, and only synthetic observations are tested. The Python receipt
+type and unkeyed digest can detect accidental inconsistency only; an in-process
+caller can construct a receipt and recompute its digest. They do not prove the
+observations' provenance, provide a signature, or form a boundary against a
+compromised supervisor process. The feature remains fail-closed and no runtime
+enforcement or real-host attestation is claimed.
+
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
    measured host was Debian 12,
