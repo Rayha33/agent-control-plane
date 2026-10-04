@@ -11,6 +11,7 @@ import hashlib
 import os
 import stat
 import unicodedata
+import weakref
 from bisect import bisect_left
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -177,8 +178,52 @@ class TreeManifest:
 
 @dataclass(frozen=True)
 class Snapshot:
+    """Snapshot handle minted by the host copier for one stable root inode."""
+
     root: Path
     manifest: TreeManifest
+
+
+_SNAPSHOT_ORIGINS: dict[
+    int, tuple[weakref.ReferenceType[Any], Path, int, int, TreeManifest, str]
+] = {}
+
+
+def _register_snapshot_origin(snapshot: Snapshot, root_stat: os.stat_result) -> None:
+    key = id(snapshot)
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        current = _SNAPSHOT_ORIGINS.get(key)
+        if current is not None and current[0] is reference:
+            _SNAPSHOT_ORIGINS.pop(key, None)
+
+    reference = weakref.ref(snapshot, discard)
+    _SNAPSHOT_ORIGINS[key] = (
+        reference,
+        snapshot.root,
+        root_stat.st_dev,
+        root_stat.st_ino,
+        snapshot.manifest,
+        snapshot.manifest.digest,
+    )
+
+
+def _snapshot_origin(snapshot: Snapshot) -> tuple[Path, int, int]:
+    current = _SNAPSHOT_ORIGINS.get(id(snapshot))
+    if current is None or current[0]() is not snapshot:
+        raise SupervisorError(
+            "invalid_snapshot", "snapshot handle was not minted by the host snapshot copier"
+        )
+    _reference, origin_path, device, inode, manifest, manifest_digest = current
+    if snapshot.root != origin_path:
+        raise SupervisorError(
+            "invalid_snapshot", "snapshot handle no longer names its host-created path"
+        )
+    if snapshot.manifest is not manifest or snapshot.manifest.digest != manifest_digest:
+        raise SupervisorError(
+            "invalid_snapshot", "snapshot manifest no longer matches its host-captured value"
+        )
+    return origin_path, device, inode
 
 
 @dataclass(frozen=True)
@@ -328,6 +373,8 @@ def copy_snapshot(
     The source root's top-level .git entry is omitted. Nested Git administration,
     unsafe links, special nodes, unstable reads, and limit overflow fail closed.
     Files are copied into new inodes; hard-link relationships are never retained.
+    The returned handle is registered to the host-created destination path and
+    inode; hand-constructed or retargeted handles are not accepted by readers.
     """
 
     destination_path = Path(destination)
@@ -423,7 +470,9 @@ def copy_snapshot(
             created_stat,
         )
         canonical_destination = destination_parent / destination_name
-        return Snapshot(canonical_destination, manifest)
+        snapshot = Snapshot(canonical_destination, manifest)
+        _register_snapshot_origin(snapshot, created_stat)
+        return snapshot
     except BaseException:
         if created_stat is not None:
             if destination_parent_fd is not None:
@@ -458,9 +507,15 @@ def read_snapshot_files(
 
     if type(snapshot) is not Snapshot:
         raise SupervisorError("invalid_snapshot", "snapshot handle is invalid")
+    origin_path, origin_device, origin_inode = _snapshot_origin(snapshot)
     snapshot.manifest.validate(limits)
-    parent_fd, name, root_fd = _open_existing_directory(snapshot.root)
+    parent_fd, name, root_fd = _open_existing_directory(origin_path)
     try:
+        opened_root = os.fstat(root_fd)
+        if (opened_root.st_dev, opened_root.st_ino) != (origin_device, origin_inode):
+            raise SupervisorError(
+                "invalid_snapshot", "snapshot root no longer names its host-created directory"
+            )
         state = _CaptureState(limits, baseline={}, entries=[], changed_content={})
         _walk_tree(
             root_fd,

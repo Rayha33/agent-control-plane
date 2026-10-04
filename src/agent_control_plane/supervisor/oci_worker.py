@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import SupervisorError
+from .sandbox_workspace import Snapshot, read_snapshot_files
 
 _CONTAINER_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
 _MIN_MEMORY_BYTES = 16 * 1024 * 1024
@@ -215,7 +216,7 @@ def _mapped_mode_allows(
 
 def build_oci_worker_config(
     bundle_root: str | Path,
-    workspace_root: str | Path,
+    workspace_snapshot: Snapshot,
     command: Sequence[str],
     *,
     container_id: str,
@@ -231,15 +232,21 @@ def build_oci_worker_config(
     """Build an OCI 1.2 config with one mutable workspace and no host secrets.
 
     ``bundle_root/rootfs`` must already be a trusted, audited rootfs produced
-    outside candidate control. ``workspace_root`` must be a separate owner-only
-    snapshot with no top-level Git metadata. Those inputs are checked here, but
-    rootfs provenance, mount setup, runtime preflight/readback, and process
-    lifecycle remain the responsibility of the integrating executor.
+    outside candidate control. ``workspace_snapshot`` must be a separate
+    host-created snapshot with no Git metadata. Its complete tree is reopened
+    and checked against the captured manifest immediately before the bind source
+    is selected. Rootfs provenance, mount setup, runtime preflight/readback, and
+    process lifecycle remain the responsibility of the integrating executor.
     """
 
     if os.geteuid() == 0:
         raise SupervisorError(
             "invalid_oci_worker_policy", "OCI worker config must be built by a non-root caller"
+        )
+    if type(workspace_snapshot) is not Snapshot:
+        raise SupervisorError(
+            "invalid_oci_workspace",
+            "OCI worker workspace must be a host-validated snapshot",
         )
     bundle = _private_directory(bundle_root, code="invalid_oci_bundle", label="OCI bundle root")
     rootfs = bundle / "rootfs"
@@ -250,7 +257,9 @@ def build_oci_worker_config(
     if stat.S_ISLNK(rootfs_info.st_mode) or not stat.S_ISDIR(rootfs_info.st_mode):
         raise SupervisorError("invalid_oci_rootfs", "OCI bundle rootfs must be a real directory")
     workspace = _private_directory(
-        workspace_root, code="invalid_oci_workspace", label="OCI worker workspace"
+        workspace_snapshot.root,
+        code="invalid_oci_workspace",
+        label="OCI worker workspace",
     )
     if bundle == workspace or bundle in workspace.parents or workspace in bundle.parents:
         raise SupervisorError(
@@ -260,6 +269,10 @@ def build_oci_worker_config(
         raise SupervisorError(
             "invalid_oci_workspace", "OCI worker workspace must not expose Git metadata"
         )
+    # The mount source must still be the exact host-captured baseline. Merely
+    # checking that the directory is private does not establish that it is the
+    # intended attempt snapshot or that it was not changed after capture.
+    read_snapshot_files(workspace_snapshot)
 
     if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
         raise SupervisorError("invalid_oci_worker_policy", "OCI container ID is invalid")

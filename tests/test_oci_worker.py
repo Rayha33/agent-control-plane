@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,9 +14,10 @@ from agent_control_plane.supervisor.oci_worker import (
     build_oci_worker_config,
     build_runc_run_argv,
 )
+from agent_control_plane.supervisor.sandbox_workspace import Snapshot, copy_snapshot
 
 
-def oci_fixture(tmp_path: Path) -> tuple[Path, Path]:
+def oci_fixture(tmp_path: Path) -> tuple[Path, Snapshot]:
     bundle = tmp_path / "attempt" / "bundle"
     rootfs = bundle / "rootfs"
     bundle.mkdir(parents=True, mode=0o700)
@@ -27,10 +29,11 @@ def oci_fixture(tmp_path: Path) -> tuple[Path, Path]:
     executable.chmod(0o700)
     workspace = tmp_path / "attempt" / "workspace"
     workspace.mkdir(mode=0o700)
-    return bundle, workspace
+    snapshot = copy_snapshot(workspace, tmp_path / "attempt" / "validated-workspace")
+    return bundle, snapshot
 
 
-def compile_config(bundle: Path, workspace: Path) -> dict:
+def compile_config(bundle: Path, workspace: Snapshot) -> dict:
     return build_oci_worker_config(
         bundle,
         workspace,
@@ -81,7 +84,7 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
         "/home/agent",
     }
     workspace_mount = next(mount for mount in mounts if mount["destination"] == "/workspace")
-    assert workspace_mount["source"] == str(workspace.resolve())
+    assert workspace_mount["source"] == str(workspace.root.resolve())
     assert "rw" in workspace_mount["options"]
     assert "bind" in workspace_mount["options"]
     assert "rprivate" in workspace_mount["options"]
@@ -177,12 +180,70 @@ def test_oci_policy_rejects_ambiguous_or_host_relative_commands(
 
 def test_oci_policy_rejects_workspace_with_shared_git_metadata(tmp_path: Path) -> None:
     bundle, workspace = oci_fixture(tmp_path)
-    (workspace / ".git").write_text("gitdir: /shared/repo/.git/worktrees/attempt\n")
+    (workspace.root / ".git").write_text("gitdir: /shared/repo/.git/worktrees/attempt\n")
 
     with pytest.raises(SupervisorError, match="Git metadata") as error:
         compile_config(bundle, workspace)
 
     assert error.value.code == "invalid_oci_workspace"
+
+
+def test_oci_policy_requires_snapshot_handle_not_an_arbitrary_private_path(
+    tmp_path: Path,
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+
+    with pytest.raises(SupervisorError, match="host-validated snapshot") as error:
+        build_oci_worker_config(
+            bundle,
+            workspace.root,
+            ("/usr/bin/busybox",),
+            container_id="acp-worker-123",
+            memory_bytes=256 * 1024 * 1024,
+            pids_limit=32,
+            cpu_quota_us=100_000,
+        )
+
+    assert error.value.code == "invalid_oci_workspace"
+
+
+def test_oci_policy_rejects_forged_snapshot_for_an_ordinary_private_source(
+    tmp_path: Path,
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    source = workspace.root.parent / "workspace"
+    forged = Snapshot(source, workspace.manifest)
+    copied_provenance = replace(workspace, root=source)
+
+    for handle in (forged, copied_provenance):
+        with pytest.raises(SupervisorError, match="snapshot handle") as error:
+            compile_config(bundle, handle)
+
+        assert error.value.code == "invalid_snapshot"
+
+
+def test_oci_policy_rejects_forced_snapshot_manifest_substitution(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    (workspace.root / "candidate.py").write_text("changed after capture\n")
+    changed_snapshot = copy_snapshot(workspace.root, tmp_path / "changed-workspace")
+    object.__setattr__(workspace, "manifest", changed_snapshot.manifest)
+
+    with pytest.raises(SupervisorError, match="manifest") as error:
+        compile_config(bundle, workspace)
+
+    assert error.value.code == "invalid_snapshot"
+
+
+def test_oci_policy_rechecks_snapshot_contents_before_selecting_bind_source(
+    tmp_path: Path,
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    (workspace.root / "candidate.py").write_text("unexpected = True\n")
+
+    with pytest.raises(SupervisorError) as error:
+        compile_config(bundle, workspace)
+
+    assert error.value.code == "snapshot_changed"
 
 
 def test_oci_policy_rejects_mount_destination_symlink_escape(tmp_path: Path) -> None:
@@ -200,10 +261,13 @@ def test_oci_policy_rejects_mount_destination_symlink_escape(tmp_path: Path) -> 
 def test_oci_policy_rejects_workspace_inside_bundle_or_rootfs(tmp_path: Path) -> None:
     bundle, _workspace = oci_fixture(tmp_path)
     workspace = bundle / "rootfs" / "workspace"
-    workspace.chmod(0o700)
+    workspace.rmdir()
+    source = tmp_path / "workspace-source"
+    source.mkdir(mode=0o700)
+    snapshot = copy_snapshot(source, workspace)
 
     with pytest.raises(SupervisorError, match="disjoint") as error:
-        compile_config(bundle, workspace)
+        compile_config(bundle, snapshot)
 
     assert error.value.code == "invalid_oci_workspace"
 
@@ -216,7 +280,7 @@ def test_oci_policy_requires_owner_only_bundle_and_workspace(
     tmp_path: Path, target: str, mode: int, code: str
 ) -> None:
     bundle, workspace = oci_fixture(tmp_path)
-    (bundle if target == "bundle" else workspace).chmod(mode)
+    (bundle if target == "bundle" else workspace.root).chmod(mode)
 
     with pytest.raises(SupervisorError) as error:
         compile_config(bundle, workspace)
@@ -384,7 +448,7 @@ def test_runc_command_is_attached_and_names_explicit_bundle_state_and_pid_file(
         "/bin/sh",
         state,
         bundle,
-        workspace,
+        workspace.root,
         pid_file,
         "acp-worker-123",
     )
@@ -415,7 +479,7 @@ def test_runc_command_rejects_existing_pid_file(tmp_path: Path) -> None:
     pid_file.touch()
 
     with pytest.raises(SupervisorError) as error:
-        build_runc_run_argv("/bin/sh", state, bundle, workspace, pid_file, "acp-worker-123")
+        build_runc_run_argv("/bin/sh", state, bundle, workspace.root, pid_file, "acp-worker-123")
 
     assert error.value.code == "invalid_oci_pid_file"
 
@@ -424,10 +488,10 @@ def test_runc_pid_file_must_be_outside_candidate_workspace(tmp_path: Path) -> No
     bundle, workspace = oci_fixture(tmp_path)
     state = tmp_path / "attempt" / "runc-state"
     state.mkdir(mode=0o700)
-    pid_file = workspace / "container.pid"
+    pid_file = workspace.root / "container.pid"
 
     with pytest.raises(SupervisorError) as error:
-        build_runc_run_argv("/bin/sh", state, bundle, workspace, pid_file, "acp-worker-123")
+        build_runc_run_argv("/bin/sh", state, bundle, workspace.root, pid_file, "acp-worker-123")
 
     assert error.value.code == "invalid_oci_pid_file"
 
@@ -441,7 +505,12 @@ def test_runc_pid_parent_must_be_private(tmp_path: Path) -> None:
 
     with pytest.raises(SupervisorError) as error:
         build_runc_run_argv(
-            "/bin/sh", state, bundle, workspace, metadata / "container.pid", "acp-worker-123"
+            "/bin/sh",
+            state,
+            bundle,
+            workspace.root,
+            metadata / "container.pid",
+            "acp-worker-123",
         )
 
     assert error.value.code == "invalid_oci_pid_file"
