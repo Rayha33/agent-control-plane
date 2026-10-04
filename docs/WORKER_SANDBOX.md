@@ -520,12 +520,25 @@ identity. The argument builder specifies the bundle, state root and PID-file
 paths, retains runc state with `--keep`, and remains attached (no `--detach`).
 These are compile-time checks and requested settings, not runtime observations.
 
+The 2026-10-04 snapshot-provenance follow-up changes the workspace input from
+an arbitrary path to the host copier's `Snapshot` handle. A process-local
+weak-reference registry binds that exact handle to its host path, directory
+device/inode, original manifest object and manifest digest. Before selecting
+the bind source, the builder reopens and checks the complete tree against that
+captured manifest. Regression tests reject raw paths, forged or retargeted
+handles, post-capture content changes, and forced manifest substitution. This
+proves input provenance at config-compilation time only.
+
 Important gaps are intentional and must remain launch gates: the module does
 not create/provenance-check a rootfs, launch or supervise a worker, reserve the
 PID path atomically, bind execution to the claim fence, enforce egress or
 credentials, read back cgroups/devices, or integrate result import and
 recovery. Owner-only path modes do not isolate untrusted processes sharing the
-same host UID, and the host-backed workspace has no aggregate disk quota. No
+same host UID. The config still names the workspace by host path, so this
+check-then-bind sequence does not stop a same-UID process from changing or
+replacing the source before `runc` opens it. The executor must close that race
+with per-attempt host identity isolation or an equivalently pinned mount and
+prove the result. The host-backed workspace also has no aggregate disk quota. No
 `linux.seccomp` profile is emitted; the pinned runc 1.3.5 specification leaves
 the default seccomp policy as TODO, so syscall filtering remains unverified
 and a launch gate ([upstream security specification](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/SPEC.md)).
