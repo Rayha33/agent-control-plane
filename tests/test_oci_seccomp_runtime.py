@@ -133,9 +133,10 @@ if not ctx:
     raise RuntimeError("seccomp_init failed")
 try:
     for rule in profile["syscalls"]:
-        action = errno_action | (
-            13 if mode == "marker" else int(rule["errnoRet"])
-        )
+        rule_errno = int(rule["errnoRet"])
+        if mode == "marker":
+            rule_errno = 13
+        action = errno_action | rule_errno
         args = rule.get("args", [])
         comparisons_for_rule = (ArgCompare * len(args))(
             *(
@@ -217,18 +218,20 @@ if mode == "marker":
     _, wait_status = os.waitpid(child, 0)
     if wait_status != 0:
         raise AssertionError(f"ordinary fork exited with wait status {wait_status}")
+    checked = len(probe_args) + len(clone_flags)
+    thread_smoke = False
+else:
+    check_syscall("clone3", probe_args["clone3"], 38)  # ENOSYS for libc fallback.
     completed = []
     worker = threading.Thread(target=lambda: completed.append(True))
     worker.start()
     worker.join(timeout=5)
     if worker.is_alive() or completed != [True]:
         raise AssertionError("ordinary thread creation failed")
-    checked = len(probe_args) + len(clone_flags)
-else:
-    check_syscall("clone3", probe_args["clone3"], 38)  # ENOSYS for libc fallback.
     checked = 1
+    thread_smoke = True
 
-print(json.dumps({"seccomp": seccomp_mode, "checked": checked, "mode": mode}))
+print(json.dumps({"seccomp": seccomp_mode, "checked": checked, "mode": mode, "thread_smoke": thread_smoke}))
 """
 
 
@@ -295,3 +298,4 @@ def test_generated_oci_seccomp_profile_resolves_and_enforces_rules(tmp_path: Pat
         assert receipt["checked"] == (
             1 if mode == "production" else len(_SYSCALL_PROBES) + len(clone_flags)
         )
+        assert receipt["thread_smoke"] is (mode == "production")
