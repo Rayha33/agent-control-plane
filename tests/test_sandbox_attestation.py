@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import replace
 
 import pytest
 
+from agent_control_plane.supervisor import sandbox_attestation
 from agent_control_plane.supervisor.common import SupervisorError, canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
+    collect_running_runtime_attestation,
+    read_private_runc_pid_file,
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
 )
@@ -77,6 +81,19 @@ def _validate(**overrides):
     return validate_running_runtime_attestation(**observations)
 
 
+def _private_pid_file(tmp_path, content: bytes = b"303\n"):
+    state_root = tmp_path / "runc-state"
+    state_root.mkdir(mode=0o700)
+    state_root.chmod(0o700)
+    metadata = state_root / "metadata"
+    metadata.mkdir(mode=0o700)
+    metadata.chmod(0o700)
+    pid_file = metadata / "init.pid"
+    pid_file.write_bytes(content)
+    pid_file.chmod(0o600)
+    return state_root, pid_file
+
+
 def test_attestation_binds_runtime_state_pid_start_identities_and_cgroups() -> None:
     receipt = _validate()
 
@@ -88,6 +105,153 @@ def test_attestation_binds_runtime_state_pid_start_identities_and_cgroups() -> N
     assert len(receipt.runc_state_sha256) == 64
     assert len(receipt.evidence_sha256) == 64
     assert receipt.audit_payload()["init_identity"] == "linux:303:1303"
+
+
+def test_private_runc_pid_file_reader_accepts_stable_file(tmp_path) -> None:
+    state_root, pid_file = _private_pid_file(tmp_path)
+
+    assert read_private_runc_pid_file(pid_file, state_root) == b"303\n"
+
+
+@pytest.mark.parametrize("content", [b"", b"0303\n", b"0\n", b"303\n304\n", b"1" * 12])
+def test_private_runc_pid_file_reader_rejects_noncanonical_or_oversized_content(
+    tmp_path, content: bytes
+) -> None:
+    state_root, pid_file = _private_pid_file(tmp_path, content)
+
+    with pytest.raises(SupervisorError) as invalid:
+        read_private_runc_pid_file(pid_file, state_root)
+
+    assert invalid.value.code == "sandbox_runtime_attestation_invalid"
+
+
+def test_private_runc_pid_file_reader_rejects_group_or_other_writable_file(tmp_path) -> None:
+    state_root, pid_file = _private_pid_file(tmp_path)
+    pid_file.chmod(0o620)
+
+    with pytest.raises(SupervisorError, match="single-link regular file"):
+        read_private_runc_pid_file(pid_file, state_root)
+
+
+def test_private_runc_pid_file_reader_rejects_symlinks_and_hardlinks(tmp_path) -> None:
+    state_root, pid_file = _private_pid_file(tmp_path)
+    outside = tmp_path / "outside.pid"
+    outside.write_bytes(b"303\n")
+    pid_file.unlink()
+    pid_file.symlink_to(outside)
+
+    with pytest.raises(SupervisorError, match="single-link regular file"):
+        read_private_runc_pid_file(pid_file, state_root)
+    assert outside.read_bytes() == b"303\n"
+
+    pid_file.unlink()
+    pid_file.write_bytes(b"303\n")
+    pid_file.chmod(0o600)
+    os.link(pid_file, pid_file.with_name("alias.pid"))
+    with pytest.raises(SupervisorError, match="single-link regular file"):
+        read_private_runc_pid_file(pid_file, state_root)
+
+
+def test_private_runc_pid_file_reader_rejects_writable_parent_and_external_path(tmp_path) -> None:
+    state_root, pid_file = _private_pid_file(tmp_path)
+    pid_file.parent.chmod(0o755)
+    with pytest.raises(SupervisorError, match="accessible only to that user"):
+        read_private_runc_pid_file(pid_file, state_root)
+
+    pid_file.parent.chmod(0o700)
+    outside_root = tmp_path / "other-state"
+    outside_root.mkdir(mode=0o700)
+    outside_root.chmod(0o700)
+    outside_pid = outside_root / "init.pid"
+    outside_pid.write_bytes(b"303\n")
+    outside_pid.chmod(0o600)
+    with pytest.raises(SupervisorError, match="inside the private state root"):
+        read_private_runc_pid_file(outside_pid, state_root)
+
+
+def test_private_runc_pid_file_reader_detects_replacement_after_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, pid_file = _private_pid_file(tmp_path)
+    read_descriptor = sandbox_attestation._read_pid_file_bytes
+
+    def replace_after_read(descriptor: int) -> bytes:
+        raw = read_descriptor(descriptor)
+        pid_file.unlink()
+        pid_file.write_bytes(b"404\n")
+        pid_file.chmod(0o600)
+        return raw
+
+    monkeypatch.setattr(sandbox_attestation, "_read_pid_file_bytes", replace_after_read)
+    with pytest.raises(SupervisorError, match="changed while it was read"):
+        read_private_runc_pid_file(pid_file, state_root)
+
+
+def test_private_runc_pid_file_reader_opens_nonblocking_after_fifo_swap(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, pid_file = _private_pid_file(tmp_path)
+    real_open = os.open
+    swapped = False
+
+    def swap_to_fifo(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if os.fspath(path) == str(pid_file) and not swapped:
+            swapped = True
+            pid_file.unlink()
+            os.mkfifo(pid_file, 0o600)
+            assert flags & os.O_NONBLOCK
+            assert flags & os.O_NOFOLLOW
+            assert flags & os.O_CLOEXEC
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sandbox_attestation.os, "open", swap_to_fifo)
+    with pytest.raises(SupervisorError, match="changed while it was opened"):
+        read_private_runc_pid_file(pid_file, state_root)
+    assert swapped
+
+
+def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch) -> None:
+    observations = _valid_observations()
+    state_root, pid_file = _private_pid_file(tmp_path)
+    proc_observations = {
+        101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
+        202: (_proc_stat(202, "S", 1202), _WRAPPER_CGROUP.encode("ascii")),
+        303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
+    }
+
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+
+    def read_proc(path: str) -> bytes:
+        parts = path.split("/")
+        pid = int(parts[2])
+        before_or_after_stat, cgroup = proc_observations[pid]
+        return b"0::" + cgroup + b"\n" if parts[-1] == "cgroup" else before_or_after_stat
+
+    monkeypatch.setattr(sandbox_attestation, "_read_proc_file", read_proc)
+    receipt = collect_running_runtime_attestation(
+        runc_state=observations["runc_state"],
+        pid_file_path=pid_file,
+        state_root=state_root,
+        wrapper_properties=observations["wrapper_properties"],
+        scope_properties=observations["scope_properties"],
+        expected_container_id=observations["expected_container_id"],
+        expected_bundle_path=observations["expected_bundle_path"],
+        expected_monitor_pid=observations["expected_monitor_pid"],
+        expected_monitor_identity=observations["expected_monitor_identity"],
+        expected_runc_client_pid=observations["expected_runc_client_pid"],
+        expected_runc_client_identity=observations["expected_runc_client_identity"],
+        expected_wrapper_unit=observations["expected_wrapper_unit"],
+        expected_wrapper_invocation_id=observations["expected_wrapper_invocation_id"],
+        expected_scope_unit=observations["expected_scope_unit"],
+        expected_scope_invocation_id=observations["expected_scope_invocation_id"],
+        expected_cgroup_path=observations["expected_cgroup_path"],
+    )
+
+    assert receipt.init_pid == 303
+    assert receipt.init_identity == "linux:303:1303"
 
 
 def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:

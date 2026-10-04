@@ -13,14 +13,16 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .common import SupervisorError, canonical_json
 
 _MAX_OBSERVATION_BYTES = 64 * 1024
+_MAX_PID_FILE_BYTES = 11
 _MAX_PID = (1 << 31) - 1
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope)\Z")
@@ -95,6 +97,167 @@ def read_linux_process_snapshot(pid: int) -> ProcessSnapshot:
     cgroup = _read_proc_file(cgroup_path)
     after = _read_proc_file(stat_path)
     return ProcessSnapshot(stat_before=before, cgroup=cgroup, stat_after=after)
+
+
+def read_private_runc_pid_file(pid_file_path: str | Path, state_root: str | Path) -> bytes:
+    """Read one stable PID file below a private runc state directory.
+
+    The worker path must not treat a path-existence check as a reservation.
+    runc writes its PID file via an exclusive temporary sibling and rename, so
+    the executor must protect the directory and read the resulting inode with
+    no-follow and before/after identity checks.
+    """
+
+    if os.geteuid() == 0:
+        raise _invalid("runc PID observations require a non-root supervisor")
+    raw_path = os.fspath(pid_file_path)
+    raw_root = os.fspath(state_root)
+    path_text = _absolute_path(raw_path, "runc pid file path")
+    root_text = _absolute_path(raw_root, "runc state root")
+    path = Path(path_text)
+    root = Path(root_text)
+    if any(not getattr(os, flag, 0) for flag in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC")):
+        raise _invalid("safe runc PID file open flags are unavailable")
+
+    # Reuse the OCI path policy: every ancestor must be non-replaceable by an
+    # untrusted host identity, and each directory must be owner-private.
+    from .oci_worker import _private_directory
+
+    private_root = _private_directory(
+        root, code="sandbox_runtime_attestation_invalid", label="runc state root"
+    )
+    private_parent = _private_directory(
+        path.parent,
+        code="sandbox_runtime_attestation_invalid",
+        label="runc PID file parent",
+    )
+    if private_root != root or private_parent != path.parent:
+        raise _invalid("runc PID file paths must not contain symlinked ancestors")
+    try:
+        private_parent.relative_to(private_root)
+    except ValueError as error:
+        raise _invalid("runc PID file must be inside the private state root") from error
+
+    descriptor: int | None = None
+    try:
+        before_path = path.lstat()
+        if not _valid_private_pid_file(before_path):
+            raise _invalid("runc PID file is not a private, single-link regular file")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not _valid_private_pid_file(opened) or _pid_file_identity(opened) != _pid_file_identity(
+            before_path
+        ):
+            raise _invalid("runc PID file changed while it was opened")
+        raw = _read_pid_file_bytes(descriptor)
+        after_fd = os.fstat(descriptor)
+        after_path = path.lstat()
+        identity = _pid_file_identity(opened)
+        if identity != _pid_file_identity(after_fd) or identity != _pid_file_identity(after_path):
+            raise _invalid("runc PID file changed while it was read")
+        _parse_pid_file(raw)
+        return raw
+    except SupervisorError:
+        raise
+    except OSError as error:
+        raise _invalid("runc PID file could not be read safely") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def collect_running_runtime_attestation(
+    *,
+    runc_state: bytes,
+    pid_file_path: str | Path,
+    state_root: str | Path,
+    wrapper_properties: bytes,
+    scope_properties: bytes,
+    expected_container_id: str,
+    expected_bundle_path: str,
+    expected_monitor_pid: int,
+    expected_monitor_identity: str,
+    expected_runc_client_pid: int,
+    expected_runc_client_identity: str,
+    expected_wrapper_unit: str,
+    expected_wrapper_invocation_id: str,
+    expected_scope_unit: str,
+    expected_scope_invocation_id: str,
+    expected_cgroup_path: str,
+) -> RunningRuntimeAttestation:
+    """Collect PID-file and live procfs evidence, then bind command outputs.
+
+    ``runc_state`` and the systemd property bytes must be bounded outputs from
+    the trusted executor's pinned commands. This function opens the PID file
+    and reads the three host process snapshots itself; it does not execute
+    runc/systemctl or authenticate the caller that supplied their output.
+    """
+
+    pid_file = read_private_runc_pid_file(pid_file_path, state_root)
+    init_pid = _parse_pid_file(pid_file)
+    pids = (
+        _pid(expected_monitor_pid, "monitor PID"),
+        _pid(expected_runc_client_pid, "runc client PID"),
+        init_pid,
+    )
+    if len(set(pids)) != 3:
+        raise _invalid("monitor, runc client, and container init PIDs must be distinct")
+    process_snapshots = {pid: read_linux_process_snapshot(pid) for pid in pids}
+    return validate_running_runtime_attestation(
+        runc_state=runc_state,
+        pid_file=pid_file,
+        process_snapshots=process_snapshots,
+        wrapper_properties=wrapper_properties,
+        scope_properties=scope_properties,
+        expected_container_id=expected_container_id,
+        expected_bundle_path=expected_bundle_path,
+        expected_monitor_pid=expected_monitor_pid,
+        expected_monitor_identity=expected_monitor_identity,
+        expected_runc_client_pid=expected_runc_client_pid,
+        expected_runc_client_identity=expected_runc_client_identity,
+        expected_wrapper_unit=expected_wrapper_unit,
+        expected_wrapper_invocation_id=expected_wrapper_invocation_id,
+        expected_scope_unit=expected_scope_unit,
+        expected_scope_invocation_id=expected_scope_invocation_id,
+        expected_cgroup_path=expected_cgroup_path,
+    )
+
+
+def _valid_private_pid_file(info: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and info.st_nlink == 1
+        and not stat.S_IMODE(info.st_mode) & 0o022
+        and 0 < info.st_size <= _MAX_PID_FILE_BYTES
+    )
+
+
+def _pid_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_pid_file_bytes(descriptor: int) -> bytes:
+    data = bytearray()
+    while len(data) <= _MAX_PID_FILE_BYTES:
+        chunk = os.read(descriptor, _MAX_PID_FILE_BYTES + 1 - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if not data or len(data) > _MAX_PID_FILE_BYTES:
+        raise _invalid("runc PID file is empty or exceeds its byte limit")
+    return bytes(data)
 
 
 def _read_proc_file(path: str) -> bytes:

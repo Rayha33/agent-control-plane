@@ -415,25 +415,41 @@ so a journaled candidate still cannot create or submit a result. Direct-worker
 behavior remains unchanged. Same-UID raw database writers, workspace path
 races, and runtime cleanup are not proved safe by this receipt.
 
-**Runtime-attestation validator (2026-10-04; still no launcher).** The new
-`sandbox_attestation` module accepts bounded observations from a future trusted
-executor and binds them into one typed receipt: unique-key `runc state` JSON,
-the private PID-file value, before/after `/proc/<pid>/stat` samples around each
-process cgroup read, and exact systemd wrapper/scope `Id`, `InvocationID`,
-`ActiveState`, and `ControlGroup` properties. It requires runc's container ID,
-bundle, running status, state PID, and PID-file PID to match; the monitor and
-runc client must remain in the wrapper cgroup, while a live, non-zombie init
-must remain in the exact recorded scope cgroup. The journal accepts only a
-self-consistent normalized receipt matching its durable launch identities and
-appends the normalized evidence plus its digest to the hash-chained running
-event.
+**Runtime-attestation validator and partial host collector (2026-10-04; still
+no launcher).** The `sandbox_attestation` module binds bounded observations into
+one typed receipt: unique-key `runc state` JSON, the private PID-file value,
+before/after `/proc/<pid>/stat` samples around each process cgroup read, and
+exact systemd wrapper/scope `Id`, `InvocationID`, `ActiveState`, and
+`ControlGroup` properties. `collect_running_runtime_attestation` reads the PID
+file itself and gathers all three live process snapshots from procfs; the
+future executor must still obtain and supply the bounded runc/systemd command
+outputs. The validator requires runc's container ID, bundle, running status,
+state PID, and PID-file PID to match; the monitor and runc client must remain in
+the wrapper cgroup, while a live, non-zombie init must remain in the exact
+recorded scope cgroup. The journal accepts only a self-consistent normalized
+receipt matching its durable launch identities and appends the normalized
+evidence plus its digest to the hash-chained running event.
 
-This is a validator, not an evidence collector: it does not invoke runc or
-systemd, open the pid file, or read `/proc` itself except for the bounded helper
-that brackets process samples. No worker executor currently calls it, no gate
-is released, and only synthetic observations are tested. The Python receipt
-type and unkeyed digest can detect accidental inconsistency only; an in-process
-caller can construct a receipt and recompute its digest. They do not prove the
+The PID reader requires the state root and parent to pass the private OCI
+directory policy, rejects symlinked ancestors, and opens only a single-link
+regular file with `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`. It checks owner/mode/size
+and the same device, inode, and metadata before open, after open, and after the
+bounded read. The executor must use a restrictive umask; group/other-writable
+PID files are rejected. These path-based checks are not directory-FD-anchored,
+so replacement by another process with the same UID remains outside this
+helper's guarantee. Likewise, the collector reads process snapshots
+sequentially: they are observations over an interval, not an atomic snapshot.
+Before using this receipt as a live gate, an executor must revalidate the
+identities and cgroups at the end. This is observation hardening, not an atomic
+launch reservation: upstream runc 1.3.5 creates a hidden sibling PID file with
+`O_EXCL` and then renames it to the requested path ([pinned implementation](https://github.com/opencontainers/runc/blob/v1.3.5/utils_linux.go#L149-L169)); Go's `os.Rename` replaces an existing non-directory target ([API contract](https://go.dev/src/os/file.go#L431-L435)).
+The executor therefore needs a fresh, private state/metadata directory before
+launch; pre-creating the final PID path is not a substitute.
+
+No worker executor currently calls the collector, no gate is released, and
+only synthetic runc/systemd outputs are tested. The Python receipt type and
+unkeyed digest can detect accidental inconsistency only; an in-process caller
+can construct a receipt and recompute its digest. They do not prove the
 observations' provenance, provide a signature, or form a boundary against a
 compromised supervisor process. The feature remains fail-closed and no runtime
 enforcement or real-host attestation is claimed.
