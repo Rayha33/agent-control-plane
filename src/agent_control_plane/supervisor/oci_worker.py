@@ -40,6 +40,7 @@ _MAX_INT64 = (1 << 63) - 1
 _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
+_LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
 
 
 def _plain_directory(path: str | Path, *, code: str, label: str) -> Path:
@@ -235,8 +236,12 @@ def build_oci_worker_config(
     outside candidate control. ``workspace_snapshot`` must be a separate
     host-created snapshot with no Git metadata. Its complete tree is reopened
     and checked against the captured manifest immediately before the bind source
-    is selected. Rootfs provenance, mount setup, runtime preflight/readback, and
-    process lifecycle remain the responsibility of the integrating executor.
+    is selected. The configured init blocks on inherited descriptor 3 before
+    execing candidate code. The runc caller must map the trusted pipe read end
+    to fd 3, pass exactly that descriptor with ``--preserve-fds 1``, and release
+    its paired writer only after durable journal and runtime identity checks.
+    This compiler does not release the gate or prove that the runtime applies
+    the requested policy.
     """
 
     if os.geteuid() == 0:
@@ -273,11 +278,11 @@ def build_oci_worker_config(
     # checking that the directory is private does not establish that it is the
     # intended attempt snapshot or that it was not changed after capture.
     read_snapshot_files(workspace_snapshot)
-
     if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
         raise SupervisorError("invalid_oci_worker_policy", "OCI container ID is invalid")
     args = _validate_command(command)
     _validate_rootfs_executable(rootfs, args[0])
+    _validate_rootfs_executable(rootfs, "/bin/sh")
     memory = _positive_int(memory_bytes, name="memory_bytes", maximum=_MAX_INT64)
     if memory < _MIN_MEMORY_BYTES:
         raise SupervisorError(
@@ -338,7 +343,13 @@ def build_oci_worker_config(
         "process": {
             "terminal": False,
             "user": {"uid": 0, "gid": 0, "additionalGids": []},
-            "args": args,
+            "args": [
+                "/bin/sh",
+                "-c",
+                _LAUNCH_GATE_SCRIPT,
+                "acp-launch-gate",
+                *args,
+            ],
             "env": env,
             "cwd": "/workspace",
             "noNewPrivileges": True,
@@ -414,6 +425,10 @@ def build_runc_run_argv(
 ) -> list[str]:
     """Return an attached runc command with explicit state root and bundle.
 
+    The OCI init requires one inherited launch-gate descriptor at fd 3. The
+    caller must map the read end to fd 3, sanitize runc activation environment,
+    pass exactly that one descriptor to ``subprocess.Popen``, and keep its
+    paired writer private until it has durably authorized launch.
     ``--keep`` preserves runc state/cgroup for an eventual supervised cleanup;
     the caller must not release its attempt fence until it separately proves
     that the init process, cgroup, and runc state are gone. The PID-path check
@@ -476,6 +491,8 @@ def build_runc_run_argv(
         str(bundle),
         "--pid-file",
         str(pid_path),
+        "--preserve-fds",
+        "1",
         "--keep",
         container_id,
     ]

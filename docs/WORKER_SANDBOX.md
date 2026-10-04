@@ -21,7 +21,9 @@ committed result refs remain retained pending a separate retention policy, and
 ACP does not run repository-wide GC. See
 [`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
 retention, and cleanup contract. End-to-end worker isolation proof remains
-incomplete. This record does not authorize `externalSandbox` for ACP workers.
+incomplete. The OCI policy compiler now stages init behind an inherited pipe
+descriptor, but no supervisor executor passes or releases that descriptor. This
+record does not authorize `externalSandbox` for ACP workers.
 
 The namespace runtime probe records a validated
 `systemd_unit_invocation_id` in its runtime-driver evidence and append-only
@@ -202,12 +204,25 @@ assumptions, not properties proved by a namespace test.
    unavailable or differs. No resource quota is proven by this composition
    probe.
 
-   **Executor lifecycle contract (candidate; not integrated).** Keep runc
-   attached in the foreground with `runc --systemd-cgroup --root <state-root>
-   run --bundle <bundle-path> --keep --pid-file <host-only-pid-file>
-   <container-id>`. The explicit bundle path avoids relying on runc's
-   current-working-directory default. The OCI init must block at a
-   host-controlled launch gate. `runc run --keep` preserves stopped
+   **Executor lifecycle contract (gate compiler implemented; executor not
+   integrated).** Keep runc attached in the foreground with `runc
+   --systemd-cgroup --root <state-root> run --bundle <bundle-path> --keep
+   --pid-file <host-only-pid-file> --preserve-fds 1 <container-id>`. The
+   explicit bundle path avoids relying on runc's current-working-directory
+   default. The OCI policy compiler requires a real `/bin/sh` in the audited
+   rootfs and places a fixed shell trampoline at PID 1. It blocks reading fd 3,
+   exits 125 on EOF, closes fd 3, then `exec`s the candidate's original argv
+   without interpolating it into shell source. Runc's `--preserve-fds` option
+   passes extra descriptors after stdio and any `LISTEN_FDS` descriptors ([runc
+   1.3.5 run manual](https://github.com/opencontainers/runc/blob/v1.3.5/man/runc-run.8.md)).
+   The future executor must sanitize activation variables, map exactly the
+   launch-pipe read end to fd 3, pass only that descriptor, and keep its paired
+   writer private. It may write a newline-terminated release value and close
+   the writer only after matching `runc state` to the host PID, checking its
+   start identity and exact cgroup/scope, persisting the journal, and
+   revalidating the attempt fence. No executor
+   currently maps, passes, or releases this descriptor, so the compiler output
+   is not yet a worker launch route. `runc run --keep` preserves stopped
    state/cgroup for post-exit inspection and requires a later manual
    `runc delete`; the pid file identifies the initial container process. The
    `runc` client PID, ACP's supervisor/monitor PID, and container-init PID are

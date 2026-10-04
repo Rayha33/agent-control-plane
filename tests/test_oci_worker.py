@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import stat
+import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,8 +24,11 @@ def oci_fixture(tmp_path: Path) -> tuple[Path, Snapshot]:
     bundle = tmp_path / "attempt" / "bundle"
     rootfs = bundle / "rootfs"
     bundle.mkdir(parents=True, mode=0o700)
-    for relative in ("proc", "workspace", "tmp", "home/agent"):
+    for relative in ("bin", "proc", "workspace", "tmp", "home/agent"):
         (rootfs / relative).mkdir(parents=True, exist_ok=True)
+    shell = rootfs / "bin" / "sh"
+    shell.write_text("fixture shell\n")
+    shell.chmod(0o700)
     executable = rootfs / "usr" / "bin" / "busybox"
     executable.parent.mkdir(parents=True)
     executable.write_text("fixture executable\n")
@@ -54,7 +60,16 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
 
     assert config["ociVersion"] == "1.2.0"
     assert config["root"] == {"path": "rootfs", "readonly": True}
-    assert config["process"]["args"][0] == "/usr/bin/busybox"
+    assert config["process"]["args"] == [
+        "/bin/sh",
+        "-c",
+        oci_worker._LAUNCH_GATE_SCRIPT,
+        "acp-launch-gate",
+        "/usr/bin/busybox",
+        "sh",
+        "-c",
+        "printf ready > /workspace/result.txt",
+    ]
     assert config["process"]["cwd"] == "/workspace"
     assert config["process"]["noNewPrivileges"] is True
     assert config["process"]["rlimits"] == [
@@ -115,6 +130,130 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
     assert "seccomp" not in linux
     assert linux["uidMappings"][0] == {"containerID": 0, "hostID": os.geteuid(), "size": 1}
     assert linux["gidMappings"][0] == {"containerID": 0, "hostID": os.getegid(), "size": 1}
+
+
+def test_oci_policy_launch_gate_fails_closed_and_closes_fd_before_candidate_exec(
+    tmp_path: Path,
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+
+    config = compile_config(bundle, workspace)
+    process_args = config["process"]["args"]
+
+    assert process_args[:4] == [
+        "/bin/sh",
+        "-c",
+        oci_worker._LAUNCH_GATE_SCRIPT,
+        "acp-launch-gate",
+    ]
+    assert process_args[4:] == [
+        "/usr/bin/busybox",
+        "sh",
+        "-c",
+        "printf ready > /workspace/result.txt",
+    ]
+    assert "|| exit 125" in process_args[2]
+    assert "exec 3<&-" in process_args[2]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="launch gate requires POSIX inherited descriptors")
+def test_launch_gate_waits_for_pipe_release_then_execs_exact_argv(tmp_path: Path) -> None:
+    marker = tmp_path / "candidate-started"
+    read_fd, write_fd = os.pipe()
+    child_read_fd = fcntl.fcntl(read_fd, fcntl.F_DUPFD, 10)
+    os.close(read_fd)
+    candidate = [
+        sys.executable,
+        "-c",
+        "import os,pathlib,sys; "
+        'exec("try:\\n os.fstat(3)\\nexcept OSError:\\n pass\\nelse:\\n raise SystemExit(17)"); '
+        "pathlib.Path(sys.argv[1]).write_text('started')",
+        str(marker),
+    ]
+    argv = [
+        "/bin/sh",
+        "-c",
+        oci_worker._LAUNCH_GATE_SCRIPT,
+        "acp-launch-gate",
+        *candidate,
+    ]
+    pid = os.posix_spawn(
+        "/bin/sh",
+        argv,
+        {"PATH": os.environ.get("PATH", "")},
+        file_actions=[
+            (os.POSIX_SPAWN_DUP2, child_read_fd, 3),
+            (os.POSIX_SPAWN_CLOSE, child_read_fd),
+            (os.POSIX_SPAWN_CLOSE, write_fd),
+        ],
+    )
+    os.close(child_read_fd)
+
+    finished_status: int | None = None
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline and not marker.exists():
+        finished, status = os.waitpid(pid, os.WNOHANG)
+        if finished == pid:
+            finished_status = status
+            break
+        time.sleep(0.005)
+    started_before_release = marker.exists()
+    if finished_status is None:
+        os.write(write_fd, b"release\n")
+        os.close(write_fd)
+        _, finished_status = os.waitpid(pid, 0)
+    else:
+        os.close(write_fd)
+
+    assert not started_before_release
+    assert os.WIFEXITED(finished_status)
+    assert os.WEXITSTATUS(finished_status) == 0
+    assert marker.read_text() == "started"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="launch gate requires POSIX inherited descriptors")
+def test_launch_gate_eof_never_execs_candidate(tmp_path: Path) -> None:
+    marker = tmp_path / "candidate-started"
+    read_fd, write_fd = os.pipe()
+    child_read_fd = fcntl.fcntl(read_fd, fcntl.F_DUPFD, 10)
+    os.close(read_fd)
+    argv = [
+        "/bin/sh",
+        "-c",
+        oci_worker._LAUNCH_GATE_SCRIPT,
+        "acp-launch-gate",
+        sys.executable,
+        "-c",
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('started')",
+        str(marker),
+    ]
+    pid = os.posix_spawn(
+        "/bin/sh",
+        argv,
+        {"PATH": os.environ.get("PATH", "")},
+        file_actions=[
+            (os.POSIX_SPAWN_DUP2, child_read_fd, 3),
+            (os.POSIX_SPAWN_CLOSE, child_read_fd),
+            (os.POSIX_SPAWN_CLOSE, write_fd),
+        ],
+    )
+    os.close(child_read_fd)
+    os.close(write_fd)
+    _, status = os.waitpid(pid, 0)
+
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 125
+    assert not marker.exists()
+
+
+def test_oci_policy_requires_trusted_shell_in_pinned_rootfs(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    (bundle / "rootfs" / "bin" / "sh").unlink()
+
+    with pytest.raises(SupervisorError, match="worker executable is absent") as error:
+        compile_config(bundle, workspace)
+
+    assert error.value.code == "invalid_oci_executable"
 
 
 @pytest.mark.parametrize(
@@ -463,6 +602,8 @@ def test_runc_command_is_attached_and_names_explicit_bundle_state_and_pid_file(
         str(bundle.resolve()),
         "--pid-file",
         str(pid_file),
+        "--preserve-fds",
+        "1",
         "--keep",
         "acp-worker-123",
     ]
