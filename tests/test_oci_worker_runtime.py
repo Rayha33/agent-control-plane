@@ -282,6 +282,158 @@ def _audit_worker_init_fd_table(
     return first
 
 
+_WORKER_CAPABILITY_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+_WORKER_SECURITY_STATUS_FIELDS = (*_WORKER_CAPABILITY_FIELDS, "NoNewPrivs")
+_MAX_WORKER_STATUS_BYTES = 1024 * 1024
+_MAX_WORKER_MOUNTINFO_BYTES = 16 * 1024 * 1024
+
+
+def _parse_worker_security_status(raw: bytes) -> dict[str, int | bool]:
+    """Parse effective Linux capability and no_new_privs fields strictly."""
+
+    if len(raw) > _MAX_WORKER_STATUS_BYTES or not raw.endswith(b"\n"):
+        raise AssertionError("worker status is malformed or exceeds its read limit")
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise AssertionError("worker status is not ASCII") from error
+    fields: dict[str, str] = {}
+    for line in lines:
+        name, separator, value = line.partition(":")
+        if not separator:
+            raise AssertionError("worker status contains a malformed line")
+        if name in _WORKER_SECURITY_STATUS_FIELDS:
+            if name in fields:
+                raise AssertionError(f"worker status contains duplicate {name}")
+            fields[name] = value.strip()
+    missing = set(_WORKER_SECURITY_STATUS_FIELDS) - fields.keys()
+    if missing:
+        raise AssertionError(f"worker status omits security fields: {sorted(missing)}")
+    parsed: dict[str, int | bool] = {}
+    for name in _WORKER_CAPABILITY_FIELDS:
+        value = fields[name]
+        if not value or any(character not in "0123456789abcdefABCDEF" for character in value):
+            raise AssertionError(f"worker status has an invalid {name} value")
+        parsed[name] = int(value, 16)
+    if fields["NoNewPrivs"] not in {"0", "1"}:
+        raise AssertionError("worker status has an invalid NoNewPrivs value")
+    parsed["NoNewPrivs"] = fields["NoNewPrivs"] == "1"
+    if any(parsed[name] != 0 for name in _WORKER_CAPABILITY_FIELDS):
+        raise AssertionError("worker init has non-empty effective or bounding capabilities")
+    if parsed["NoNewPrivs"] is not True:
+        raise AssertionError("worker init does not have NoNewPrivs enabled")
+    return parsed
+
+
+def _parse_worker_mountinfo(raw: bytes) -> dict[str, tuple[str, frozenset[str]]]:
+    """Return a strict mountpoint-to-filesystem/options map from target procfs."""
+
+    if len(raw) > _MAX_WORKER_MOUNTINFO_BYTES or not raw.endswith(b"\n"):
+        raise AssertionError("worker mountinfo is malformed or exceeds its read limit")
+    result: dict[str, tuple[str, frozenset[str]]] = {}
+    for line in raw.splitlines():
+        before_separator, separator, after_separator = line.partition(b" - ")
+        before = before_separator.split()
+        after = after_separator.split()
+        if not separator or len(before) < 6 or len(after) < 3:
+            raise AssertionError("worker mountinfo contains a malformed entry")
+        if not before[0].isdigit() or not before[1].isdigit():
+            raise AssertionError("worker mountinfo contains an invalid mount identity")
+        try:
+            mountpoint = os.fsdecode(oci_worker._decode_mountinfo_path(before[4]))
+            filesystem = after[0].decode("ascii")
+            options = frozenset(option.decode("ascii") for option in before[5].split(b","))
+        except (UnicodeDecodeError, oci_worker.SupervisorError) as error:
+            raise AssertionError("worker mountinfo contains invalid path or option data") from error
+        if not mountpoint.startswith("/") or ".." in Path(mountpoint).parts:
+            raise AssertionError("worker mountinfo contains a non-canonical mountpoint")
+        normalized = os.path.normpath(mountpoint)
+        if normalized != mountpoint or normalized in result:
+            raise AssertionError(
+                "worker mountinfo contains a non-canonical or duplicate mountpoint"
+            )
+        result[normalized] = (filesystem, options)
+    if not result:
+        raise AssertionError("worker mountinfo contains no mounts")
+    return result
+
+
+def _validate_worker_mount_policy(
+    mounts: dict[str, tuple[str, frozenset[str]]],
+) -> list[dict[str, Any]]:
+    expected_mounts = {
+        "/": (None, "ro"),
+        "/proc": ("proc", "ro"),
+        "/workspace": (None, "rw"),
+        "/tmp": ("tmpfs", "rw"),
+        "/home/agent": ("tmpfs", "rw"),
+    }
+    observed_mounts: list[dict[str, Any]] = []
+    for target, (expected_filesystem, access) in expected_mounts.items():
+        observed = mounts.get(target)
+        if observed is None:
+            raise AssertionError(f"worker mountinfo omits configured mount {target}")
+        filesystem, options = observed
+        if expected_filesystem is not None and filesystem != expected_filesystem:
+            raise AssertionError(f"worker mount {target} has unexpected filesystem {filesystem!r}")
+        if access not in options or ({"ro", "rw"} - {access}) & options:
+            raise AssertionError(
+                f"worker mount {target} has unexpected access options {sorted(options)}"
+            )
+        if target != "/" and not {"nosuid", "nodev"}.issubset(options):
+            raise AssertionError(f"worker mount {target} is missing nosuid/nodev protection")
+        observed_mounts.append(
+            {"target": target, "filesystem": filesystem, "options": sorted(options)}
+        )
+    for target in mounts:
+        if (
+            target == "/etc"
+            or target.startswith("/etc/")
+            or target == "/usr"
+            or target.startswith("/usr/")
+        ):
+            raise AssertionError(
+                f"worker mountinfo exposes an unexpected broad host path: {target}"
+            )
+    return observed_mounts
+
+
+def _audit_worker_init_runtime_policy(
+    pid: int,
+    *,
+    expected_start_time: bytes,
+    expected_cgroup_path: Path,
+) -> dict[str, Any]:
+    """Read effective privilege and mount policy from the host before gate release."""
+
+    expected_cgroup = expected_cgroup_path.resolve(strict=True)
+
+    def verify_identity() -> None:
+        snapshot = read_linux_process_snapshot(pid)
+        if _snapshot_start_time(snapshot, pid, require_live=True) != expected_start_time:
+            raise AssertionError("worker init PID/start-time changed during runtime policy audit")
+        if _snapshot_cgroup_path(snapshot).resolve(strict=True) != expected_cgroup:
+            raise AssertionError("worker init cgroup changed during runtime policy audit")
+
+    def read_bounded(path: Path, limit: int, label: str) -> bytes:
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise AssertionError(f"worker {label} exceeds its read limit")
+        return raw
+
+    process_root = Path(f"/proc/{pid}")
+    verify_identity()
+    status = _parse_worker_security_status(
+        read_bounded(process_root / "status", _MAX_WORKER_STATUS_BYTES, "status")
+    )
+    mounts = _parse_worker_mountinfo(
+        read_bounded(process_root / "mountinfo", _MAX_WORKER_MOUNTINFO_BYTES, "mountinfo")
+    )
+    verify_identity()
+    return {"status": status, "mounts": _validate_worker_mount_policy(mounts)}
+
+
 def _runc_environment(*, marker: str | None = None) -> dict[str, str]:
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
     bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
@@ -541,6 +693,70 @@ def test_snapshot_start_identity_checks_both_sides_of_cgroup_read() -> None:
     )
     with pytest.raises(AssertionError, match="was not live"):
         _snapshot_start_time(exited, pid, require_live=True)
+
+
+def test_worker_security_status_requires_empty_capabilities_and_no_new_privs() -> None:
+    status = b"""Name:\tsh
+CapInh:\t0000000000000000
+CapPrm:\t0000000000000000
+CapEff:\t0000000000000000
+CapBnd:\t0000000000000000
+CapAmb:\t0000000000000000
+NoNewPrivs:\t1
+"""
+    observed = _parse_worker_security_status(status)
+    assert observed == {
+        "CapInh": 0,
+        "CapPrm": 0,
+        "CapEff": 0,
+        "CapBnd": 0,
+        "CapAmb": 0,
+        "NoNewPrivs": True,
+    }
+
+    with pytest.raises(AssertionError, match="non-empty"):
+        _parse_worker_security_status(status.replace(b"CapEff:\t0000000000000000", b"CapEff:\t1"))
+    with pytest.raises(AssertionError, match="NoNewPrivs"):
+        _parse_worker_security_status(status.replace(b"NoNewPrivs:\t1", b"NoNewPrivs:\t0"))
+    with pytest.raises(AssertionError, match="duplicate CapEff"):
+        _parse_worker_security_status(status + b"CapEff:\t0000000000000000\n")
+
+
+def test_worker_mountinfo_parser_decodes_mountpoint_and_rejects_duplicates() -> None:
+    raw = (
+        b"1 0 0:1 / / ro,nosuid,nodev - rootfs rootfs ro\n"
+        b"2 1 0:2 / /workspace rw,nosuid,nodev - ext4 /dev/attempt rw\n"
+        b"3 1 0:3 / /home/agent\\040private rw,nosuid,nodev - tmpfs tmpfs rw,size=1024\n"
+    )
+    observed = _parse_worker_mountinfo(raw)
+    assert observed["/"] == ("rootfs", frozenset({"ro", "nosuid", "nodev"}))
+    assert observed["/workspace"] == ("ext4", frozenset({"rw", "nosuid", "nodev"}))
+    assert observed["/home/agent private"][0] == "tmpfs"
+    with pytest.raises(AssertionError, match="duplicate"):
+        _parse_worker_mountinfo(raw + raw.splitlines()[1] + b"\n")
+    with pytest.raises(AssertionError, match="malformed"):
+        _parse_worker_mountinfo(b"not mountinfo\n")
+
+
+def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
+    mounts = {
+        "/": ("rootfs", frozenset({"ro"})),
+        "/proc": ("proc", frozenset({"ro", "nosuid", "nodev", "noexec"})),
+        "/workspace": ("ext4", frozenset({"rw", "nosuid", "nodev"})),
+        "/tmp": ("tmpfs", frozenset({"rw", "nosuid", "nodev"})),
+        "/home/agent": ("tmpfs", frozenset({"rw", "nosuid", "nodev"})),
+    }
+    observed = _validate_worker_mount_policy(mounts)
+    assert {mount["target"] for mount in observed} == set(mounts)
+
+    with pytest.raises(AssertionError, match="unexpected access"):
+        _validate_worker_mount_policy({**mounts, "/": ("rootfs", frozenset({"rw"}))})
+    with pytest.raises(AssertionError, match="omits configured mount /home/agent"):
+        _validate_worker_mount_policy(
+            {key: value for key, value in mounts.items() if key != "/home/agent"}
+        )
+    with pytest.raises(AssertionError, match="broad host path"):
+        _validate_worker_mount_policy({**mounts, "/etc/credentials": ("bind", frozenset({"ro"}))})
 
 
 def test_worker_init_fd_audit_brackets_stable_non_socket_stdio(
@@ -985,6 +1201,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     systemd_unit = f"acp-{container_id}.scope"
     cleanup_errors: list[str] = []
     controls: dict[str, str] = {}
+    runtime_policy: dict[str, Any] | None = None
     config: dict[str, Any] = {}
     try:
         if os.path.lexists(checkout_probe_directory):
@@ -1171,6 +1388,14 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         if controls["cpu.max"] != f"{_CONTAINER_CPU_QUOTA_US} {_CONTAINER_CPU_PERIOD_US}":
             pytest.fail("live cgroup cpu.max did not match the OCI policy")
 
+        # Read kernel-applied privilege and mount state through the host's
+        # procfs while the trusted fd3 launcher still blocks candidate code.
+        runtime_policy = _audit_worker_init_runtime_policy(
+            init_pid,
+            expected_start_time=init_start,
+            expected_cgroup_path=cgroup_path,
+        )
+
         # The launch gate is the proof boundary: the init and policy readbacks
         # are live, but the first candidate instruction has not written output.
         time.sleep(0.1)
@@ -1258,6 +1483,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     ),
                     "rootfs_sha256": rootfs_digest,
                     "mount_destinations": [mount["destination"] for mount in config["mounts"]],
+                    "effective_runtime_policy": runtime_policy,
                     "cgroup_controls": controls,
                     "cgroup_path": str(cgroup_path),
                     "init_file_descriptors": [

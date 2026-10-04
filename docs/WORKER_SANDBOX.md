@@ -698,6 +698,60 @@ real-provider egress, generated-diff transfer, worker cancellation/crash
 recovery, or complete task #2370 acceptance. The feature remains unintegrated
 and `externalSandbox` remains disabled.
 
+### Host-side effective privilege and mount readback (2026-10-05; one NAS host)
+
+The same opt-in, no-model direct-runc fixture was extended to inspect the
+running init through host procfs while the trusted fd-3 launcher was still
+blocked, before candidate code ran. Exact test-source SHA-256:
+`5869d7785595576c28a9d402cc7e5f968d29ab16d878e69a178d94ed47586313`; the
+unchanged `oci_worker.py` source matched SHA-256
+`de4493632ced1877b6aee6e28d5b385b73a448a7de20d19f252a3f9f09b2ae10`. The
+host brackets the `/proc/<pid>/status` and `/proc/<pid>/mountinfo` reads with
+live PID/start-time/cgroup snapshots and requires the exact previously recorded
+identity.
+
+On uid 1000, Linux 6.18.15, rootless runc 1.3.5, and BusyBox 1.35.0, the
+host-read status showed `CapInh=0`, `CapPrm=0`, `CapEff=0`, `CapBnd=0`,
+`CapAmb=0`, and `NoNewPrivs=1`. The selected mountinfo entries reported:
+
+- `/`: `tmpfs`, `ro`, `noatime`;
+- `/proc`: `proc`, `ro`, `nosuid`, `nodev`, `noexec`, `relatime`;
+- `/workspace`: `tmpfs`, `rw`, `nosuid`, `nodev`, `noatime`;
+- `/tmp` and `/home/agent`: `tmpfs`, `rw`, `nosuid`, `nodev`, `relatime`.
+
+The host-side assertion requires read-only `/` and `/proc`, writable
+`/workspace`, `/tmp`, and `/home/agent`, the configured `proc`/`tmpfs` types,
+`nosuid`/`nodev` on non-root mounts, and no mountpoint at or below `/etc` or
+`/usr`. `/workspace` reported its backing filesystem as `tmpfs` because the
+test snapshot resides below host `/tmp`; this readback does not establish bind
+source identity. Although `/proc` reported `noexec`, the assertion does not
+require it. This follow-up supersedes the prior run's “not read back” statement
+only for these selected status and mount properties on this one host.
+
+The scope was
+`acp-acp-live-638dd00a8f504f25bdb8b28037181bd7.scope`, with cgroup
+readbacks `memory.max=134217728`, `pids.max=16`, and `cpu.max=50000 100000`.
+The fixture exited 0; its selected host-path, symlink, process-marker, and
+network probes passed (`interfaces=lo`, no default route, host-NIC probe exit
+1, test listener not reached). Internal cleanup checks passed. Independent
+postflight found the exact systemd unit `LoadState=not-found`, the cgroup path
+absent, no checkout canary, and two user processes in D state (below the
+stop threshold of five).
+
+An independent read-only reviewer gave GO on the exact current readback
+code/docs diff after the live run; that reviewer did not run tests or access
+the NAS. The measurements above come from the separately recorded exact-hash
+live execution. This is not complete OCI mount-policy attestation: the
+validator requires the five listed mountpoints and rejects extra mountpoints
+at or below `/etc` and `/usr`, but does not reject every other additional
+mountpoint. It also does not assert mount-propagation tags, bind-source
+identity, tmpfs super-options or sizes, or read-only `/proc/sys` submounts.
+The test remains direct `runc` with a fixed no-model fixture—not the registered
+supervised worker executor. It does not prove real-provider authentication or
+egress, arbitrary hostile-worker behavior, result transfer, cancellation,
+crash recovery, concurrency, or task #2370 acceptance. Worker execution stays
+unintegrated and `externalSandbox` remains disabled.
+
 ### systemd/runc cgroup composition probe (2026-10-03)
 
 The first wrapper-only test used rootless runc under a transient service with
