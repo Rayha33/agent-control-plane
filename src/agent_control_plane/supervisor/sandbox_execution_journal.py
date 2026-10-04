@@ -59,6 +59,18 @@ _TRANSITION_FIELDS = {
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
 }
 _CLEANUP_OBSERVATIONS = {
+    "runc_delete_exit_code": None,
+    "runc_state_absent": None,
+    "bundle_absent": None,
+    "state_directory_absent": None,
+    "wrapper_unit_absent": None,
+    "scope_unit_absent": None,
+    "cgroup_absent": None,
+    "monitor_identity_absent": None,
+    "runc_client_identity_absent": None,
+    "container_init_identity_absent": None,
+}
+_LEGACY_CLEANUP_OBSERVATIONS = {
     "runc_delete_exit_code": 0,
     "runc_state_absent": True,
     "bundle_absent": True,
@@ -530,8 +542,7 @@ class SandboxExecutionJournalMixin:
             ).fetchone()
         if not row or row["claim_token"] != claim_token:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
-        expected = self._sandbox_cleanup_receipt(row)
-        if not isinstance(receipt, dict) or canonical_json(receipt) != canonical_json(expected):
+        if not isinstance(receipt, dict):
             raise SupervisorError(
                 "sandbox_cleanup_report_invalid",
                 "cleanup report is incomplete or is not bound to the recorded identities",
@@ -539,8 +550,27 @@ class SandboxExecutionJournalMixin:
         encoded = canonical_json(receipt)
         if len(encoded.encode("utf-8")) > 64 * 1024:
             raise SupervisorError("sandbox_cleanup_report_invalid", "cleanup report is too large")
-        if row["phase"] == "cleanup_reported" and row["cleanup_receipt_json"] == encoded:
-            return self._sandbox_execution_view(row)
+        expected = self._sandbox_cleanup_receipt(row)
+        expected_encoded = canonical_json(expected)
+        if row["phase"] == "cleanup_reported":
+            persisted = row["cleanup_receipt_json"]
+            legacy_encoded = canonical_json(self._sandbox_cleanup_receipt_v1(row))
+            if encoded == persisted and persisted in {expected_encoded, legacy_encoded}:
+                return self._sandbox_execution_view(row)
+            if encoded != expected_encoded:
+                raise SupervisorError(
+                    "sandbox_cleanup_report_invalid",
+                    "cleanup report is incomplete or is not bound to the recorded identities",
+                )
+            raise SupervisorError(
+                "sandbox_execution_transition_conflict",
+                "cleanup receipt is already recorded and cannot be replaced",
+            )
+        if encoded != expected_encoded:
+            raise SupervisorError(
+                "sandbox_cleanup_report_invalid",
+                "cleanup report is incomplete or is not bound to the recorded identities",
+            )
         return self._sandbox_execution_transition(
             attempt_id,
             claim_token,
@@ -554,7 +584,8 @@ class SandboxExecutionJournalMixin:
 
     def _sandbox_cleanup_receipt(self, row: Any) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
+            "verification_status": "unverified",
             "attempt_id": row["attempt_id"],
             "claim_token": row["claim_token"],
             "execution_id": row["execution_id"],
@@ -583,6 +614,15 @@ class SandboxExecutionJournalMixin:
             "paths": {"bundle": row["bundle_path"], "state": row["state_path"]},
             "observations": dict(_CLEANUP_OBSERVATIONS),
         }
+
+    def _sandbox_cleanup_receipt_v1(self, row: Any) -> dict[str, Any]:
+        """Reconstruct the historical receipt solely for immutable replay checks."""
+
+        receipt = self._sandbox_cleanup_receipt(row)
+        receipt["version"] = 1
+        receipt.pop("verification_status")
+        receipt["observations"] = dict(_LEGACY_CLEANUP_OBSERVATIONS)
+        return receipt
 
     def _sandbox_execution_mark_ambiguous(
         self,

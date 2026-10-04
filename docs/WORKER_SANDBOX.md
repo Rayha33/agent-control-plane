@@ -256,11 +256,15 @@ entries. Direct database writes are outside the supported API and threat model;
 these constraints are not a defense against a writer who can alter the database.
 
 This slice deliberately adds no launcher, command route, OCI feature flag, or
-trusted cleanup verifier. A cleanup report has an exact schema and must match
-the recorded identities, but its observations are caller-supplied claims, not
-host readback. `cleanup_reported` is therefore not `cleanup_verified`. Existing
-reaper, worker-finalization, and runtime-teardown paths refuse to release a
-journaled attempt until a future trusted verifier records `cleanup_verified`.
+trusted cleanup verifier. Its version-2 cleanup receipt binds the recorded
+identities but labels every cleanup observation `null` and the verification
+status `unverified`: no runtime readback has occurred. A new version-2 report
+cannot supply positive observations. An exact persisted version-1 receipt may
+replay for retry compatibility, but its historical claims remain unverified
+and cannot be replaced. `cleanup_reported` is therefore not
+`cleanup_verified`. Existing reaper, worker-finalization, and runtime-teardown
+paths refuse to release a journaled attempt until a future trusted verifier
+records `cleanup_verified`.
 This is only a fail-closed hold: the reaper does not stop a live container or
 perform cancellation/restart recovery for this journal-only slice. Ambiguous
 journal state moves the attempt to quarantine and extends its resource fences.

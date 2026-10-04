@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -17,6 +18,7 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
 )
 from agent_control_plane.supervisor import claims as claims_module
+from agent_control_plane.supervisor.common import canonical_json
 from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
 
 
@@ -535,13 +537,23 @@ def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: P
     supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
 
     receipt = cleanup_receipt(supervisor, attempt["id"])
+    assert receipt["version"] == 2
+    assert receipt["verification_status"] == "unverified"
+    assert all(observation is None for observation in receipt["observations"].values())
     counterfeit = json.loads(json.dumps(receipt))
-    counterfeit["observations"]["runc_delete_exit_code"] = True
+    counterfeit["observations"]["runc_delete_exit_code"] = 0
     with pytest.raises(SupervisorError) as invalid:
         supervisor._sandbox_execution_record_cleanup_report(
             attempt["id"], attempt["claim_token"], counterfeit
         )
     assert invalid.value.code == "sandbox_cleanup_report_invalid"
+    forged_status = json.loads(json.dumps(receipt))
+    forged_status["verification_status"] = "verified"
+    with pytest.raises(SupervisorError) as invalid_status:
+        supervisor._sandbox_execution_record_cleanup_report(
+            attempt["id"], attempt["claim_token"], forged_status
+        )
+    assert invalid_status.value.code == "sandbox_cleanup_report_invalid"
 
     row = supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], receipt
@@ -586,6 +598,63 @@ def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: P
         ).fetchone()
     assert lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "cleanup_reported"
+
+
+def test_persisted_v1_cleanup_receipt_replays_read_only_but_never_proves_cleanup(
+    repo: Path, tmp_path: Path
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    supervisor._sandbox_execution_record_running(
+        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+    )
+    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+
+    legacy_receipt = cleanup_receipt(supervisor, attempt["id"])
+    legacy_receipt["version"] = 1
+    legacy_receipt.pop("verification_status")
+    legacy_receipt["observations"] = {
+        "runc_delete_exit_code": 0,
+        "runc_state_absent": True,
+        "bundle_absent": True,
+        "state_directory_absent": True,
+        "wrapper_unit_absent": True,
+        "scope_unit_absent": True,
+        "cgroup_absent": True,
+        "monitor_identity_absent": True,
+        "runc_client_identity_absent": True,
+        "container_init_identity_absent": True,
+    }
+    encoded = canonical_json(legacy_receipt)
+    supervisor._sandbox_execution_transition(
+        attempt["id"],
+        attempt["claim_token"],
+        expected_phase="exited",
+        next_phase="cleanup_reported",
+        updates={"cleanup_receipt_json": encoded},
+        event_type="sandbox.execution_cleanup_reported",
+        event_payload={"receipt_sha256": hashlib.sha256(encoded.encode()).hexdigest()},
+    )
+
+    replayed = supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], legacy_receipt
+    )
+    assert replayed["phase"] == "cleanup_reported"
+    assert replayed["cleanup_receipt"]["version"] == 1
+
+    current_receipt = cleanup_receipt(supervisor, attempt["id"])
+    with pytest.raises(SupervisorError) as replace_legacy:
+        supervisor._sandbox_execution_record_cleanup_report(
+            attempt["id"], attempt["claim_token"], current_receipt
+        )
+    assert replace_legacy.value.code == "sandbox_execution_transition_conflict"
+
+    baseline, change_set = result_fixture(attempt, tmp_path)
+    with pytest.raises(SupervisorError) as import_unverified:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, change_set)
+    assert import_unverified.value.code == "sandbox_result_unverified"
 
 
 def test_ambiguous_execution_is_durably_quarantined(repo: Path) -> None:
