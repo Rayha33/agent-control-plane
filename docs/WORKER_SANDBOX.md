@@ -292,11 +292,13 @@ the descriptor's content and file identity, and uses Linux fd-based `execve`
 through the timeout guardian. Only the held executable descriptor is passed to
 the probe child, then closed. Non-Linux hosts fail closed because `/dev/fd`
 existence does not establish that it is executable. This removes the
-path-replacement window for the configuration probe only. The argv builder
-still returns a path-based command and no worker-launch path calls it; no held
-descriptor spans an actual `runc run`, no runtime path/digest is persisted in
-the execution journal, and no OCI enforcement is established. These slices
-do not authorize launching candidate code.
+path-replacement window for the configuration probe only. When `[sandbox.oci]`
+is configured, `run_worker` now fails before heartbeat or process reservation
+with `sandbox_executor_unavailable`; it cannot silently fall back to host
+execution. The argv builder still returns a path-based command and no worker-
+launch path calls it; no held descriptor spans an actual `runc run`, no runtime
+path/digest is persisted in the execution journal, and no OCI enforcement is
+established. These slices do not authorize launching candidate code.
 
 ### Durable execution-journal slice (2026-10-04)
 

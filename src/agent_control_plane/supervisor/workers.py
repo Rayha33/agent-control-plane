@@ -65,6 +65,11 @@ class WorkersMixin:
         command = tuple(command)
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
+        if self.config.oci_runc_executable is not None:
+            raise SupervisorError(
+                "sandbox_executor_unavailable",
+                "sandbox.oci is configured but supervised OCI worker execution is unavailable; refusing host fallback",
+            )
         attempt = self.heartbeat(
             attempt_id,
             claim_token,

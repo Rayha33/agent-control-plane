@@ -356,6 +356,49 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     assert calls == [("/usr/bin/runc", str(repo.resolve()))]
 
 
+def test_oci_configured_worker_fails_closed_before_host_fallback(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "host-fallback-worker-ran"
+
+    def heartbeat_must_not_run(*_args, **_kwargs):
+        pytest.fail("configured OCI fallback must fail before worker heartbeat")
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("configured OCI fallback must not reserve or spawn a host worker")
+
+    monkeypatch.setattr(supervisor, "heartbeat", heartbeat_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+    ]
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert error.value.code == "sandbox_executor_unavailable"
+    assert "refusing host fallback" in str(error.value)
+    assert not marker.exists()
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+
+
 @pytest.mark.parametrize(
     ("entry", "message"),
     [
