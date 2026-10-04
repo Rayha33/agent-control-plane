@@ -447,6 +447,39 @@ positive state-root, PID-identity, and systemd-scope absence checks. This is
 cleanup evidence for that disposable fixture only, not supervisor-managed
 crash/cancel recovery or release of an ACP execution fence.
 
+**OCI policy compiler slice (2026-10-04; not integrated).** The new
+`supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
+argv for a future executor. It encodes a readonly root, a single non-recursive
+private workspace bind, private tmpfs mounts, an empty capability set,
+`noNewPrivileges`, a non-root effective UID/GID mapping, and finite requested
+memory/CPU/PID/tmpfs values. It rejects non-private or replaceable-by-other-UID
+path ancestors, non-canonical or mount-shadowed executable paths, and binaries
+or parent directories that are not executable/searchable by the mapped
+identity. The argument builder specifies the bundle, state root and PID-file
+paths, retains runc state with `--keep`, and remains attached (no `--detach`).
+These are compile-time checks and requested settings, not runtime observations.
+
+Important gaps are intentional and must remain launch gates: the module does
+not create/provenance-check a rootfs, launch or supervise a worker, reserve the
+PID path atomically, bind execution to the claim fence, enforce egress or
+credentials, read back cgroups/devices, or integrate result import and
+recovery. Owner-only path modes do not isolate untrusted processes sharing the
+same host UID, and the host-backed workspace has no aggregate disk quota. No
+`linux.seccomp` profile is emitted; the pinned runc 1.3.5 specification leaves
+the default seccomp policy as TODO, so syscall filtering remains unverified
+and a launch gate ([upstream security specification](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/SPEC.md)).
+The device-cgroup deny entry is only a request: OCI requires default device
+nodes and runc/rootless cgroup behavior needs exact-runtime readback before any
+device-isolation claim ([OCI Linux configuration](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md),
+[runc cgroup v2 guide](https://github.com/opencontainers/runc/blob/v1.3.5/docs/cgroup-v2.md)).
+The emitted config fields and bounds were reviewed against the pinned
+[OCI 1.2.1 schema](https://github.com/opencontainers/runtime-spec/tree/v1.2.1/schema),
+but this change contains no reproducible schema-validator invocation or
+validation receipt. Focused tests exercise policy compilation and argv
+construction, not full schema validation. None of these checks is a Linux
+launch, syscall/device/cgroup enforcement, nor per-attempt worker-isolation
+proof.
+
 This does not prove that ACP persists either systemd invocation, captures an
 attached runc exit receipt, coordinates cancellation/recovery across supervisor
 restart, or safely releases its execution/result-import fences. It also does
