@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -31,6 +32,48 @@ two lifecycles — the service database is created by `create_app`, the control 
 by `acp init` — and coupling their numbers would force a version bump on one whenever
 the other changed.
 """
+
+_SERVICE_DB_BUSY_TIMEOUT_MS = 10_000
+_SERVICE_DB_WAL_RETRY_SECONDS = 10.0
+
+
+def _enable_service_wal_mode(connection: sqlite3.Connection) -> None:
+    """Set WAL mode despite concurrent initializers racing the first migration."""
+
+    deadline = time.monotonic() + _SERVICE_DB_WAL_RETRY_SECONDS
+    backoff = 0.005
+    # PRAGMA journal_mode can fail immediately while another initializer is
+    # changing the journal mode or holding the schema-migration write lock. Use
+    # one bounded retry loop here, then restore the normal write busy timeout.
+    connection.execute("PRAGMA busy_timeout = 0")
+    try:
+        while True:
+            try:
+                current_mode = connection.execute("PRAGMA journal_mode").fetchone()
+                if current_mode and str(current_mode[0]).casefold() == "wal":
+                    return
+                selected_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+                if not selected_mode or str(selected_mode[0]).casefold() != "wal":
+                    raise sqlite3.OperationalError(
+                        "service database did not accept WAL journal mode"
+                    )
+                return
+            except sqlite3.OperationalError as error:
+                code = getattr(error, "sqlite_errorcode", None)
+                sqlite_contention = isinstance(code, int) and (code & 0xFF) in {
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                }
+                message = str(error).casefold()
+                if not sqlite_contention and "locked" not in message and "busy" not in message:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(backoff, remaining))
+                backoff = min(backoff * 2, 0.1)
+    finally:
+        connection.execute(f"PRAGMA busy_timeout = {_SERVICE_DB_BUSY_TIMEOUT_MS}")
 
 
 def _add_mandate_descendant_cap(connection: sqlite3.Connection) -> None:
@@ -331,7 +374,7 @@ class Database:
             if self.path != ":memory:":
                 # Validate the schema before changing the file's journal mode.
                 # WAL lets readers continue while another connection holds a claim.
-                connection.execute("PRAGMA journal_mode = WAL")
+                _enable_service_wal_mode(connection)
             # Serialize all schema work. Re-read only after obtaining the write lock:
             # another process may have completed this migration after our first read.
             # This explicit transaction also makes the ledger stamp atomic with its
@@ -373,7 +416,7 @@ class Database:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = sqlite3.connect(self.path, timeout=_SERVICE_DB_BUSY_TIMEOUT_MS / 1000)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:

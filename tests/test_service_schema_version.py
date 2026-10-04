@@ -20,7 +20,11 @@ from threading import Barrier
 import pytest
 
 from agent_control_plane import __version__
-from agent_control_plane.database import SERVICE_SCHEMA_VERSION, Database
+from agent_control_plane.database import (
+    SERVICE_SCHEMA_VERSION,
+    Database,
+    _enable_service_wal_mode,
+)
 from agent_control_plane.git_supervisor import SCHEMA_VERSION as CONTROL_SCHEMA_VERSION
 from agent_control_plane.schema_version import (
     SCHEMA_VERSION_KEY,
@@ -249,6 +253,41 @@ def test_an_already_running_v1_writer_cannot_bypass_the_fanout_cap(
         assert count == 1
     finally:
         connection.close()
+
+
+def test_wal_setup_retries_contention_and_restores_the_write_timeout() -> None:
+    class Cursor:
+        def __init__(self, value: str):
+            self.value = value
+
+        def fetchone(self) -> tuple[str]:
+            return (self.value,)
+
+    class ContendedConnection:
+        def __init__(self) -> None:
+            self.busy_timeouts: list[int] = []
+            self.mode_reads = 0
+            self.wal_changes = 0
+
+        def execute(self, sql: str) -> Cursor:
+            if sql.startswith("PRAGMA busy_timeout = "):
+                self.busy_timeouts.append(int(sql.rsplit(" ", maxsplit=1)[1]))
+                return Cursor("0")
+            if sql == "PRAGMA journal_mode":
+                self.mode_reads += 1
+                return Cursor("delete" if self.mode_reads == 1 else "wal")
+            if sql == "PRAGMA journal_mode = WAL":
+                self.wal_changes += 1
+                raise sqlite3.OperationalError("database is locked")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+    connection = ContendedConnection()
+
+    _enable_service_wal_mode(connection)  # type: ignore[arg-type]
+
+    assert connection.busy_timeouts == [0, 10_000]
+    assert connection.mode_reads == 2
+    assert connection.wal_changes == 1
 
 
 def test_concurrent_v1_initializers_serialize_the_schema_migration(
