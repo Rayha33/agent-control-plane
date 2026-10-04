@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -105,8 +106,12 @@ def test_runc_version_probe_requires_the_exact_release_and_uses_a_clean_environm
 ) -> None:
     pin = pinned_runc(tmp_path)
     calls: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(oci_worker, "_supports_runc_fd_exec", lambda: True)
 
     def fake_run(argv: list[str], **kwargs) -> tuple[int, str]:
+        descriptor = kwargs["exec_fd"]
+        os.fstat(descriptor)
+        assert argv == [str(pin.path), "--version"]
         calls.append((argv, kwargs))
         return 0, "runc version 1.3.5\nspec: 1.2.1\n"
 
@@ -114,7 +119,9 @@ def test_runc_version_probe_requires_the_exact_release_and_uses_a_clean_environm
 
     assert oci_worker._probe_trusted_runc_version(pin, "1.3.5") == "1.3.5"
     argv, kwargs = calls[0]
-    assert argv == [str(pin.path), "--version"]
+    assert argv[1] == "--version"
+    assert len(kwargs["pass_fds"]) == 1
+    assert kwargs["exec_fd"] == kwargs["pass_fds"][0]
     assert kwargs["env"] == {
         "LC_ALL": "C",
         "LANG": "C",
@@ -142,6 +149,7 @@ def test_runc_version_probe_fails_closed(
     expected_version: str,
 ) -> None:
     pin = pinned_runc(tmp_path)
+    monkeypatch.setattr(oci_worker, "_supports_runc_fd_exec", lambda: True)
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
@@ -181,6 +189,151 @@ def test_bounded_runc_probe_kills_descendants_that_hold_pipes(
     assert len(kill_groups) == 1
 
 
+@pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX file descriptors")
+def test_bounded_command_passes_only_requested_fds_through_guardian() -> None:
+    trusted_fd = os.open("/bin/sh", os.O_RDONLY)
+    unrequested_fd = os.open("/bin/echo", os.O_RDONLY)
+    try:
+        returncode, stdout = oci_worker._run_bounded_command(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                "import os, sys; os.fstat(int(sys.argv[1])); "
+                "exec('try:\\n os.fstat(int(sys.argv[2]))\\nexcept OSError:\\n print(\"only-requested-fd\")')",
+                str(trusted_fd),
+                str(unrequested_fd),
+            ],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=2,
+            max_output_bytes=128,
+            pass_fds=(trusted_fd,),
+        )
+    finally:
+        os.close(trusted_fd)
+        os.close(unrequested_fd)
+
+    assert returncode == 0
+    assert stdout.strip() == "only-requested-fd"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="fd-based execve is supported by the Linux OCI lane",
+)
+def test_guardian_execs_held_inode_after_its_path_is_replaced(tmp_path: Path) -> None:
+    executable = tmp_path / "probe"
+    replacement = tmp_path / "replacement"
+    executable.write_text("#!/bin/sh\nprintf original-inode\n", encoding="utf-8")
+    replacement.write_text("#!/bin/sh\nprintf replacement-path\n", encoding="utf-8")
+    executable.chmod(0o700)
+    replacement.chmod(0o700)
+    descriptor = os.open(executable, os.O_RDONLY)
+    os.replace(replacement, executable)
+    try:
+        returncode, stdout = oci_worker._run_bounded_command(
+            [str(executable)],
+            cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=2,
+            max_output_bytes=128,
+            pass_fds=(descriptor,),
+            exec_fd=descriptor,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert returncode == 0
+    assert stdout == "original-inode"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="fd-based execve is supported by the Linux OCI lane",
+)
+def test_guardian_fd_exec_preserves_nonzero_exit_status(tmp_path: Path) -> None:
+    executable = tmp_path / "nonzero-probe"
+    executable.write_text("#!/bin/sh\nprintf nonzero-status\nexit 23\n", encoding="utf-8")
+    executable.chmod(0o700)
+    descriptor = os.open(executable, os.O_RDONLY)
+    try:
+        returncode, stdout = oci_worker._run_bounded_command(
+            [str(executable)],
+            cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=2,
+            max_output_bytes=128,
+            pass_fds=(descriptor,),
+            exec_fd=descriptor,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert returncode == 23
+    assert stdout == "nonzero-status"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="fd-based execve is supported by the Linux OCI lane",
+)
+def test_guardian_fd_exec_timeout_kills_and_reaps_the_group(tmp_path: Path) -> None:
+    executable = tmp_path / "timeout-probe"
+    executable.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+    executable.chmod(0o700)
+    descriptor = os.open(executable, os.O_RDONLY)
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="deadline"):
+            oci_worker._run_bounded_command(
+                [str(executable)],
+                cwd=str(tmp_path),
+                env={"PATH": "/usr/bin:/bin"},
+                timeout_seconds=0.2,
+                max_output_bytes=128,
+                pass_fds=(descriptor,),
+                exec_fd=descriptor,
+            )
+    finally:
+        os.close(descriptor)
+
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("linux"), reason="Linux supports descriptor-based OCI probes"
+)
+def test_runc_version_probe_fails_closed_without_linux_fd_exec(tmp_path: Path) -> None:
+    pin = pinned_runc(tmp_path)
+
+    with pytest.raises(SupervisorError, match="require Linux fd-based execve") as error:
+        oci_worker._probe_trusted_runc_version(pin, "1.3.5")
+
+    assert error.value.code == "invalid_oci_runtime_version"
+
+
+def test_open_runc_fd_rejects_inode_replaced_after_initial_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin = pinned_runc(tmp_path)
+    real_open = os.open
+
+    def replaced_open(path, flags, *args, **kwargs):
+        if Path(path) == pin.path:
+            return real_open("/bin/echo", flags, *args, **kwargs)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(oci_worker, "_verify_trusted_runc_executable", lambda _pin: pin.path)
+    monkeypatch.setattr(oci_worker.os, "open", replaced_open)
+
+    with pytest.raises(SupervisorError, match="changed while being pinned") as error:
+        oci_worker._open_verified_runc_executable(pin)
+
+    assert error.value.code == "invalid_oci_runtime"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
 def test_bounded_runc_probe_caps_combined_stdout_and_stderr() -> None:
     with pytest.raises(ValueError, match="output limit"):
@@ -194,20 +347,18 @@ def test_bounded_runc_probe_caps_combined_stdout_and_stderr() -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="OCI runtime probes require POSIX process groups")
-def test_runc_version_probe_terminates_child_that_closes_pipes_before_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    executable = tmp_path / "runc-probe-fixture"
-    executable.write_text("#!/bin/sh\nexec 1>&- 2>&-\nsleep 30\n", encoding="utf-8")
-    executable.chmod(0o700)
-    monkeypatch.setattr(oci_worker, "_verify_trusted_runc_executable", lambda _pin: executable)
-    monkeypatch.setattr(oci_worker, "_RUNC_VERSION_PROBE_TIMEOUT_SECONDS", 0.2)
+def test_bounded_command_terminates_child_that_closes_pipes_before_exit() -> None:
     started = time.monotonic()
 
-    with pytest.raises(SupervisorError) as error:
-        oci_worker._probe_trusted_runc_version(object(), "1.3.5")  # type: ignore[arg-type]
+    with pytest.raises(TimeoutError, match="deadline"):
+        oci_worker._run_bounded_command(
+            ["/bin/sh", "-c", "exec 1>&- 2>&-; sleep 30"],
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=0.2,
+            max_output_bytes=128,
+        )
 
-    assert error.value.code == "invalid_oci_runtime_version"
     assert time.monotonic() - started < 2
 
 

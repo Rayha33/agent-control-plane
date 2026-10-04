@@ -272,7 +272,7 @@ assumptions, not properties proved by a namespace test.
    plus the bounded NAS fixture above; it is an implementation contract, not
    proof that ACP currently performs these steps.
 
-### Trusted runc executable pin helper (2026-10-04)
+### Trusted runc pin and version-probe slices (2026-10-04)
 
 `build_runc_run_argv` now requires a process-local sealed handle minted by
 `_pin_trusted_runc_executable`; a raw path, caller-constructed handle, or
@@ -286,13 +286,17 @@ check; this covers ACL grants that mode bits do not show. Regression tests
 cover untrusted paths, forged or modified handles, simulated ACL write grants,
 and a simulated changed binary identity.
 
-This is a compiler prerequisite only: no supervisor configuration currently
-creates or passes the handle, and no worker launch path calls this argv builder.
-It does not check the operator-requested runc version, hold an executable file
-descriptor through `exec`, persist runtime path/digest in the execution
-journal, or prove that runc enforces the OCI policy. A future executor must
-wire the pin from trusted configuration, compare the configured version, and
-persist the exact runtime provenance before any launch can be enabled.
+The optional `[sandbox.oci]` config now consumes the pin for an exact stable
+release-version check. That bounded probe opens the checked inode, revalidates
+the descriptor's content and file identity, and uses Linux fd-based `execve`
+through the timeout guardian. Only the held executable descriptor is passed to
+the probe child, then closed. Non-Linux hosts fail closed because `/dev/fd`
+existence does not establish that it is executable. This removes the
+path-replacement window for the configuration probe only. The argv builder
+still returns a path-based command and no worker-launch path calls it; no held
+descriptor spans an actual `runc run`, no runtime path/digest is persisted in
+the execution journal, and no OCI enforcement is established. These slices
+do not authorize launching candidate code.
 
 ### Durable execution-journal slice (2026-10-04)
 

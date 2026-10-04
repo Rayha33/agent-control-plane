@@ -67,14 +67,51 @@ def _expire_group(_signum=None, _frame=None):
 try:
     timeout_seconds = float(sys.argv[1])
     status_fd = int(sys.argv[2])
+    inherited_count = int(sys.argv[3])
+    raw_exec_fd = sys.argv[4]
+    exec_fd = int(raw_exec_fd) if raw_exec_fd else None
+    inherited_fds = tuple(int(value) for value in sys.argv[5:5 + inherited_count])
+    command_argv = sys.argv[5 + inherited_count:]
+    if (
+        inherited_count < 0
+        or len(inherited_fds) != inherited_count
+        or not command_argv
+        or (exec_fd is not None and exec_fd not in inherited_fds)
+    ):
+        raise ValueError("invalid bounded command arguments")
     signal.signal(signal.SIGALRM, _expire_group)
     signal.alarm(max(1, int(timeout_seconds) + 2))
-    try:
-        command = subprocess.Popen(sys.argv[3:], stdin=subprocess.DEVNULL, close_fds=True)
-    except OSError:
-        command_status = 125
+    if exec_fd is None:
+        try:
+            command = subprocess.Popen(
+                command_argv,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+                pass_fds=inherited_fds,
+            )
+        except OSError:
+            command_status = 125
+        else:
+            command_status = command.wait()
     else:
-        command_status = command.wait()
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                os.close(status_fd)
+                for descriptor in inherited_fds:
+                    if descriptor != exec_fd:
+                        os.close(descriptor)
+                os.set_inheritable(exec_fd, True)
+                os.execve(exec_fd, command_argv, os.environ)
+            except BaseException:
+                os._exit(125)
+        while True:
+            try:
+                _, child_status = os.waitpid(child_pid, 0)
+                break
+            except InterruptedError:
+                continue
+        command_status = os.waitstatus_to_exitcode(child_status)
     status_bytes = str(command_status).encode("ascii")
     offset = 0
     while offset < len(status_bytes):
@@ -387,8 +424,15 @@ class _TrustedRuncExecutable:
 
 def _trusted_executable_identity(
     path: Path,
+    *,
+    descriptor: int | None = None,
 ) -> tuple[str, tuple[int, int, int, int, int, int, int]]:
-    """Hash one root-owned, non-set-id executable through a no-follow descriptor."""
+    """Hash one root-owned, non-set-id executable through a no-follow descriptor.
+
+    A supplied descriptor remains open for its caller. This lets an executor
+    carry the exact validated inode into a child instead of reopening a checked
+    path after validation.
+    """
 
     if not _HAS_EFFECTIVE_ID_ACCESS:
         raise SupervisorError(
@@ -409,14 +453,18 @@ def _trusted_executable_identity(
                 "runc executable or parent path is writable by the supervisor user",
             )
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    owns_descriptor = descriptor is None
+    if descriptor is None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise SupervisorError(
+                "invalid_oci_runtime", "runc executable cannot be opened safely"
+            ) from error
+    assert descriptor is not None
     try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise SupervisorError(
-            "invalid_oci_runtime", "runc executable cannot be opened safely"
-        ) from error
-    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
@@ -456,12 +504,14 @@ def _trusted_executable_identity(
             digest.update(chunk)
         after = os.fstat(descriptor)
         current = os.stat(path, follow_symlinks=False)
+        os.lseek(descriptor, 0, os.SEEK_SET)
     except OSError as error:
         raise SupervisorError(
             "invalid_oci_runtime", "runc executable changed while being pinned"
         ) from error
     finally:
-        os.close(descriptor)
+        if owns_descriptor:
+            os.close(descriptor)
 
     def identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
         return (
@@ -560,6 +610,48 @@ def _verify_trusted_runc_executable(pin: _TrustedRuncExecutable) -> Path:
     return current_path
 
 
+def _open_verified_runc_executable(pin: _TrustedRuncExecutable) -> int:
+    """Open the exact trusted runc inode and leave its verified FD held."""
+
+    binary = _verify_trusted_runc_executable(pin)
+    sealed = _TRUSTED_RUNC_PINS.get(id(pin)) if type(pin) is _TrustedRuncExecutable else None
+    if sealed is None or sealed[0]() is not pin:
+        raise SupervisorError(
+            "invalid_oci_runtime", "runc executable must come from trusted supervisor configuration"
+        )
+    _root, expected_path, expected_digest, *expected_identity = sealed[1]
+    if binary != expected_path:
+        raise SupervisorError(
+            "invalid_oci_runtime", "runc executable path no longer matches its pin"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(binary, flags)
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_runtime", "runc executable cannot be opened safely"
+        ) from error
+    try:
+        digest, identity = _trusted_executable_identity(binary, descriptor=descriptor)
+        if digest != expected_digest or identity != tuple(expected_identity):
+            raise SupervisorError(
+                "invalid_oci_runtime", "opened runc executable no longer matches its pin"
+            )
+        return descriptor
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _supports_runc_fd_exec() -> bool:
+    """Whether this host exposes Linux execve-by-descriptor semantics."""
+
+    return sys.platform.startswith("linux") and os.execve in os.supports_fd
+
+
 def _probe_trusted_runc_version(pin: _TrustedRuncExecutable, expected_version: str) -> str:
     """Run the pinned runc version probe and require the configured release.
 
@@ -572,14 +664,21 @@ def _probe_trusted_runc_version(pin: _TrustedRuncExecutable, expected_version: s
         raise SupervisorError(
             "invalid_oci_runtime_version", "expected runc version must be an exact release version"
         )
-    binary = _verify_trusted_runc_executable(pin)
+    if not _supports_runc_fd_exec():
+        raise SupervisorError(
+            "invalid_oci_runtime_version",
+            "held-descriptor runc probes require Linux fd-based execve support",
+        )
+    descriptor = _open_verified_runc_executable(pin)
     try:
         returncode, stdout = _run_bounded_command(
-            [str(binary), "--version"],
+            [str(pin.path), "--version"],
             cwd="/",
             env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
             timeout_seconds=_RUNC_VERSION_PROBE_TIMEOUT_SECONDS,
             max_output_bytes=_RUNC_VERSION_PROBE_MAX_OUTPUT_BYTES,
+            pass_fds=(descriptor,),
+            exec_fd=descriptor,
         )
     except (
         OSError,
@@ -591,6 +690,8 @@ def _probe_trusted_runc_version(pin: _TrustedRuncExecutable, expected_version: s
         raise SupervisorError(
             "invalid_oci_runtime_version", "trusted runc --version probe failed"
         ) from error
+    finally:
+        os.close(descriptor)
     if returncode != 0:
         raise SupervisorError(
             "invalid_oci_runtime_version", "trusted runc --version exited unsuccessfully"
@@ -638,6 +739,8 @@ def _run_bounded_command(
     env: dict[str, str],
     timeout_seconds: float,
     max_output_bytes: int,
+    pass_fds: Sequence[int] = (),
+    exec_fd: int | None = None,
 ) -> tuple[int, str]:
     """Capture a small command result with a hard deadline and output ceiling.
 
@@ -651,6 +754,19 @@ def _run_bounded_command(
         raise OSError("bounded OCI runtime probes require POSIX process groups")
     if not argv:
         raise ValueError("bounded command requires a nonempty argument vector")
+    inherited_fds = tuple(pass_fds)
+    if any(type(descriptor) is not int or descriptor < 3 for descriptor in inherited_fds) or len(
+        set(inherited_fds)
+    ) != len(inherited_fds):
+        raise ValueError(
+            "bounded command file descriptors must be unique open descriptors above stdio"
+        )
+    for descriptor in inherited_fds:
+        os.fstat(descriptor)
+    if exec_fd is not None and (
+        type(exec_fd) is not int or exec_fd not in inherited_fds or not _supports_runc_fd_exec()
+    ):
+        raise ValueError("bounded command exec_fd must be an inherited Linux executable descriptor")
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
     status_reader: int | None = None
@@ -678,6 +794,9 @@ def _run_bounded_command(
                 _BOUNDED_COMMAND_GUARDIAN,
                 str(timeout_seconds),
                 str(status_writer),
+                str(len(inherited_fds)),
+                "" if exec_fd is None else str(exec_fd),
+                *(str(descriptor) for descriptor in inherited_fds),
                 *argv,
             ],
             cwd=cwd,
@@ -686,7 +805,7 @@ def _run_bounded_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-            pass_fds=(status_writer,),
+            pass_fds=(status_writer, *inherited_fds),
             start_new_session=True,
         )
         parent_status_writer = status_writer
