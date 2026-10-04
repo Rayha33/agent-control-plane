@@ -633,9 +633,10 @@ syscall names it cannot resolve
 If the runtime cannot install the profile, fail closed rather than silently
 running without it.
 
-**Paired exact-profile runc observation (2026-10-04; one NAS host).** A
-hash-verified copy of commit `17e6bba` generated the config for the same fixed,
-no-model BusyBox fixture in two sequential `runc --systemd-cgroup run`
+**Paired exact-profile runc observation (2026-10-04; one NAS host).**
+On NAS, hash-verified copies of the relevant source files from commit
+`17e6bba` generated the config for the same fixed, no-model BusyBox fixture in
+two sequential `runc --systemd-cgroup run`
 launches on x86_64/Linux 6.18.15 with runc 1.3.5. The configs were identical
 except for `linux.seccomp`: the generated profile versus an explicit
 `SCMP_ACT_ALLOW` default with no syscall rules. Both init processes reported
