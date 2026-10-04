@@ -3,7 +3,6 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
-import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -163,11 +162,10 @@ def test_launch_gate_waits_for_pipe_release_then_execs_exact_argv(tmp_path: Path
     child_read_fd = fcntl.fcntl(read_fd, fcntl.F_DUPFD, 10)
     os.close(read_fd)
     candidate = [
-        sys.executable,
+        "/bin/sh",
         "-c",
-        "import os,pathlib,sys; "
-        'exec("try:\\n os.fstat(3)\\nexcept OSError:\\n pass\\nelse:\\n raise SystemExit(17)"); '
-        "pathlib.Path(sys.argv[1]).write_text('started')",
+        'if ( : <&3 ) 2>/dev/null; then exit 17; fi; printf started > "$1"',
+        "marker-writer",
         str(marker),
     ]
     argv = [
@@ -190,22 +188,34 @@ def test_launch_gate_waits_for_pipe_release_then_execs_exact_argv(tmp_path: Path
     os.close(child_read_fd)
 
     finished_status: int | None = None
-    deadline = time.monotonic() + 0.25
-    while time.monotonic() < deadline and not marker.exists():
-        finished, status = os.waitpid(pid, os.WNOHANG)
-        if finished == pid:
-            finished_status = status
-            break
-        time.sleep(0.005)
-    started_before_release = marker.exists()
-    if finished_status is None:
-        os.write(write_fd, b"release\n")
-        os.close(write_fd)
-        _, finished_status = os.waitpid(pid, 0)
-    else:
-        os.close(write_fd)
+    started_before_release = False
+    release_failed = False
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not marker.exists():
+            finished, status = os.waitpid(pid, os.WNOHANG)
+            if finished == pid:
+                finished_status = status
+                break
+            time.sleep(0.005)
+        started_before_release = marker.exists()
+        if finished_status is None and not started_before_release:
+            try:
+                release = b"release\n"
+                release_failed = os.write(write_fd, release) != len(release)
+            except BrokenPipeError:
+                # Reap below, then fail: a private gate must still be waiting
+                # for this authorized release before candidate execution.
+                release_failed = True
+    finally:
+        try:
+            os.close(write_fd)
+        finally:
+            if finished_status is None:
+                _, finished_status = os.waitpid(pid, 0)
 
     assert not started_before_release
+    assert not release_failed
     assert os.WIFEXITED(finished_status)
     assert os.WEXITSTATUS(finished_status) == 0
     assert marker.read_text() == "started"
@@ -217,15 +227,19 @@ def test_launch_gate_eof_never_execs_candidate(tmp_path: Path) -> None:
     read_fd, write_fd = os.pipe()
     child_read_fd = fcntl.fcntl(read_fd, fcntl.F_DUPFD, 10)
     os.close(read_fd)
+    candidate = [
+        "/bin/sh",
+        "-c",
+        'printf started > "$1"',
+        "marker-writer",
+        str(marker),
+    ]
     argv = [
         "/bin/sh",
         "-c",
         oci_worker._LAUNCH_GATE_SCRIPT,
         "acp-launch-gate",
-        sys.executable,
-        "-c",
-        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('started')",
-        str(marker),
+        *candidate,
     ]
     pid = os.posix_spawn(
         "/bin/sh",
