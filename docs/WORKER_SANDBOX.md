@@ -633,6 +633,23 @@ syscall names it cannot resolve
 If the runtime cannot install the profile, fail closed rather than silently
 running without it.
 
+**Paired exact-profile runc observation (2026-10-04; one NAS host).** A
+hash-verified copy of commit `17e6bba` generated the config for the same fixed,
+no-model BusyBox fixture in two sequential `runc --systemd-cgroup run`
+launches on x86_64/Linux 6.18.15 with runc 1.3.5. The configs were identical
+except for `linux.seccomp`: the generated profile versus an explicit
+`SCMP_ACT_ALLOW` default with no syscall rules. Both init processes reported
+`Seccomp: 2`. The generated-profile `nc -l -p 49152` probe failed at socket
+creation with `EPERM`; the allow-all control created and bound the same local
+listener until its one-second timeout (exit 143). No connection was attempted.
+Exact `runc delete --force` succeeded after each run, the
+unique state root listed no container, both sampled init PIDs were absent, and
+the leased scratch tree was removed. This paired observation attributes that
+single listener socket-creation denial to the generated profile in this setup;
+it does not establish broader egress control, other syscall rules, cgroup or
+device enforcement, or worker isolation. The integrated-worker and per-rule
+runtime gates below remain open.
+
 This does not prove that ACP persists either systemd invocation, captures an
 attached runc exit receipt, coordinates cancellation/recovery across supervisor
 restart, or safely releases its execution/result-import fences. It also does
