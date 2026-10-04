@@ -606,8 +606,21 @@ are covered by
 `tests/test_oci_worker.py::test_oci_worker_seccomp_profile_is_native_only_and_denies_high_risk_syscalls`
 and
 `test_oci_worker_seccomp_profile_rejects_unsupported_native_architecture`.
-These are structural tests, not runtime tests. Before launch is enabled, run
-the exact emitted profile on each supported Linux architecture/runtime; verify
+These are structural tests, not runtime tests. Linux CI also runs
+`tests/test_oci_seccomp_runtime.py`: it resolves every emitted syscall name
+through libseccomp, loads the generated argument rules into the kernel, and
+checks each denylisted syscall with inert arguments. For deny rules, the test
+uses `EACCES` as a distinctive marker so a kernel-side `EPERM` cannot look like
+a filter hit; it separately loads the production action and checks `clone3`
+returns `ENOSYS`. It also checks every namespace flag, non-`AF_UNIX` socket
+denials, permitted local `AF_UNIX` socket/socketpair, ordinary fork/thread
+creation, and `/proc/self/status` reporting `Seccomp: 2`. Reproduce with
+`uv run pytest tests/test_oci_seccomp_runtime.py` on Linux with libseccomp.
+This exercises the profile's syscall names, comparisons, and kernel behavior
+through libseccomp; it does not parse the OCI JSON through runc and is not a
+container-launch or integrated-worker proof. Before launch is enabled, run the
+exact emitted profile through the pinned runc version on each supported Linux
+architecture/runtime; verify
 `/proc/self/status` reports `Seccomp: 2`, ordinary process/thread behavior
 still works, every configured syscall name resolves on the target runtime, and
 each required deny rule is individually behavior-tested: namespace-creating
