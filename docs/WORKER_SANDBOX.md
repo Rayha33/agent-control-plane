@@ -721,12 +721,15 @@ host-read status showed `CapInh=0`, `CapPrm=0`, `CapEff=0`, `CapBnd=0`,
 
 The host-side assertion requires read-only `/` and `/proc`, writable
 `/workspace`, `/tmp`, and `/home/agent`, the configured `proc`/`tmpfs` types,
-`nosuid`/`nodev` on non-root mounts, and no mountpoint at or below `/etc` or
-`/usr`. `/workspace` reported its backing filesystem as `tmpfs` because the
-test snapshot resides below host `/tmp`; this readback does not establish bind
-source identity. Although `/proc` reported `noexec`, the assertion does not
-require it. This follow-up supersedes the prior run's “not read back” statement
-only for these selected status and mount properties on this one host.
+`nosuid`/`nodev` on non-root mounts, and exactly those five mountpoints: every
+additional mountpoint is rejected before the fd-3 candidate gate is released.
+The parser retains mount root, source, propagation tags, mount options, and
+super-options for diagnostics. `/workspace` reported its backing filesystem
+as `tmpfs` because the test snapshot resides below host `/tmp`; this readback
+does not establish bind-source identity. Although `/proc` reported `noexec`,
+the assertion does not require it. This follow-up supersedes the prior run's
+“not read back” statement only for these selected status and mount properties
+on this one host.
 
 The scope was
 `acp-acp-live-638dd00a8f504f25bdb8b28037181bd7.scope`, with cgroup
@@ -741,16 +744,62 @@ stop threshold of five).
 An independent read-only reviewer gave GO on the exact current readback
 code/docs diff after the live run; that reviewer did not run tests or access
 the NAS. The measurements above come from the separately recorded exact-hash
-live execution. This is not complete OCI mount-policy attestation: the
-validator requires the five listed mountpoints and rejects extra mountpoints
-at or below `/etc` and `/usr`, but does not reject every other additional
-mountpoint. It also does not assert mount-propagation tags, bind-source
-identity, tmpfs super-options or sizes, or read-only `/proc/sys` submounts.
-The test remains direct `runc` with a fixed no-model fixture—not the registered
+execution. The current validator now requires exactly the five configured
+mountpoints; it does not assert their propagation tags, bind-source identity,
+tmpfs super-options or sizes, and rejects `/proc/sys` submounts as extra mounts
+rather than validating their read-only state. The test remains direct `runc`
+with a fixed no-model fixture—not the registered
 supervised worker executor. It does not prove real-provider authentication or
 egress, arbitrary hostile-worker behavior, result transfer, cancellation,
 crash recovery, concurrency, or task #2370 acceptance. Worker execution stays
 unintegrated and `externalSandbox` remains disabled.
+
+### Strict runtime-added mount diagnostic (2026-10-05; fail-closed)
+
+The exact test source SHA-256
+`97c0bb16870253258c0a62fcc052eeb8de15a07f65f0708723841f1bea626e3b` was
+copied to the leased NAS scratch checkout and run once with rootless runc
+1.3.5. The host-side mount allowlist rejected the runtime-created additions
+before writing the trusted fd-3 release value; the candidate command did not
+run and no model/provider was invoked. The observed additions were:
+
+- `/dev/full`, `/dev/null`, `/dev/random`, `/dev/tty`, `/dev/urandom`, and
+  `/dev/zero`: `devtmpfs`, source `udev`, each with a corresponding device path
+  as its mount root, `rw,nosuid,relatime`, and optional propagation tag
+  `master:10`;
+- `/proc/kcore` and `/proc/keys`: `devtmpfs`, source `udev`, mount root
+  `/null`, with the same mount options and propagation tag;
+- `/proc/sys` and `/proc/sysrq-trigger`: `proc` submounts rooted at `/sys` and
+  `/sysrq-trigger`, respectively, each `ro,nodev,noexec,nosuid,relatime` with
+  read-only super-options.
+
+These are not safe to accept solely by destination name or `mountinfo`'s
+major:minor field: that field identifies the backing filesystem device, not a
+character device's `st_rdev`. The [OCI v1.2.1 default-device
+requirements](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md#default-devices)
+explain why the six `/dev` nodes are created; [runc v1.3.5's rootfs
+implementation](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/rootfs_linux.go#L952-L964)
+uses host-device bind mounts for user-namespace operation. Its [default device
+rules](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/specconv/spec_linux.go#L174-L324)
+are [appended to the configured resource rules](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/specconv/spec_linux.go#L938-L941),
+so an OCI deny-all device list alone does not prove runc-added `mknod`
+permissions are absent.
+
+Before any future allowlist expansion, host-side checks must bind the readback
+to the exact init PID/start identity and verify device file type, `st_rdev`,
+owner/mode and inode identity; prove `/proc/kcore` and `/proc/keys` are the
+intended `/dev/null` masks; verify `/proc/sys` and sysrq mount roots/options;
+and account for propagation. `master:10` identifies a slave mount: mount and
+unmount events can propagate inward from its master shared peer group, while
+events under the slave do not propagate back. Whether such inbound events can
+alter the worker's effective device mounts, or how to sever them reliably,
+remains unverified; keep rejecting the extra mounts until that is resolved
+([Linux mount-namespace propagation semantics](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html)).
+If any property is unsupported or ambiguous, keep rejecting the extra mount.
+Postflight after this failed diagnostic found no matching runc scope, cgroup,
+process, or checkout canary; the user's default target remained active, the
+non-helper D-state count was zero, and `/tmp` remained at 19%. This diagnostic
+is not a worker-executor or sandbox-acceptance result.
 
 ### systemd/runc cgroup composition probe (2026-10-03)
 

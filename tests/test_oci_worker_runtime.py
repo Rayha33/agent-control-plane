@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from shlex import quote as shell_quote
 from typing import Any
@@ -288,6 +289,16 @@ _MAX_WORKER_STATUS_BYTES = 1024 * 1024
 _MAX_WORKER_MOUNTINFO_BYTES = 16 * 1024 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkerMountInfo:
+    root: str
+    filesystem: str
+    source: str
+    mount_options: frozenset[str]
+    optional_fields: tuple[str, ...]
+    super_options: frozenset[str]
+
+
 def _parse_worker_security_status(raw: bytes) -> dict[str, int | bool]:
     """Parse effective Linux capability and no_new_privs fields strictly."""
 
@@ -325,41 +336,82 @@ def _parse_worker_security_status(raw: bytes) -> dict[str, int | bool]:
     return parsed
 
 
-def _parse_worker_mountinfo(raw: bytes) -> dict[str, tuple[str, frozenset[str]]]:
-    """Return a strict mountpoint-to-filesystem/options map from target procfs."""
+def _parse_worker_mountinfo(raw: bytes) -> dict[str, _WorkerMountInfo]:
+    """Parse complete mountinfo records from target procfs with strict framing."""
 
     if len(raw) > _MAX_WORKER_MOUNTINFO_BYTES or not raw.endswith(b"\n"):
         raise AssertionError("worker mountinfo is malformed or exceeds its read limit")
-    result: dict[str, tuple[str, frozenset[str]]] = {}
+    result: dict[str, _WorkerMountInfo] = {}
+
+    def decode_canonical_absolute_path(raw_path: bytes, label: str) -> str:
+        try:
+            path = os.fsdecode(oci_worker._decode_mountinfo_path(raw_path))
+        except oci_worker.SupervisorError as error:
+            raise AssertionError(f"worker mountinfo has an invalid {label} path") from error
+        if (
+            not path.startswith("/")
+            or path.startswith("//")
+            or ".." in Path(path).parts
+            or os.path.normpath(path) != path
+        ):
+            raise AssertionError(f"worker mountinfo has a non-canonical {label} path")
+        return path
+
+    def parse_options(raw_options: bytes, label: str) -> frozenset[str]:
+        raw_values = raw_options.split(b",")
+        if not raw_options or any(not value for value in raw_values):
+            raise AssertionError(f"worker mountinfo has empty {label}")
+        try:
+            values = tuple(value.decode("ascii") for value in raw_values)
+        except UnicodeDecodeError as error:
+            raise AssertionError(f"worker mountinfo has non-ASCII {label}") from error
+        if len(values) != len(set(values)):
+            raise AssertionError(f"worker mountinfo has duplicate {label}")
+        return frozenset(values)
+
     for line in raw.splitlines():
         before_separator, separator, after_separator = line.partition(b" - ")
         before = before_separator.split()
         after = after_separator.split()
-        if not separator or len(before) < 6 or len(after) < 3:
+        if not separator or len(before) < 6 or len(after) != 3:
             raise AssertionError("worker mountinfo contains a malformed entry")
         if not before[0].isdigit() or not before[1].isdigit():
             raise AssertionError("worker mountinfo contains an invalid mount identity")
+        major, device_separator, minor = before[2].partition(b":")
+        if not device_separator or not major.isdigit() or not minor.isdigit():
+            raise AssertionError("worker mountinfo contains an invalid device identity")
         try:
-            mountpoint = os.fsdecode(oci_worker._decode_mountinfo_path(before[4]))
+            root = decode_canonical_absolute_path(before[3], "root")
+            mountpoint = decode_canonical_absolute_path(before[4], "mountpoint")
             filesystem = after[0].decode("ascii")
-            options = frozenset(option.decode("ascii") for option in before[5].split(b","))
+            source = os.fsdecode(oci_worker._decode_mountinfo_path(after[1]))
+            optional_fields = tuple(field.decode("ascii") for field in before[6:])
+            options = parse_options(before[5], "mount options")
+            super_options = parse_options(after[2], "super options")
         except (UnicodeDecodeError, oci_worker.SupervisorError) as error:
             raise AssertionError("worker mountinfo contains invalid path or option data") from error
-        if not mountpoint.startswith("/") or ".." in Path(mountpoint).parts:
-            raise AssertionError("worker mountinfo contains a non-canonical mountpoint")
+        if not filesystem or not source or any(not field for field in optional_fields):
+            raise AssertionError("worker mountinfo contains an empty filesystem or source field")
         normalized = os.path.normpath(mountpoint)
         if normalized != mountpoint or normalized in result:
             raise AssertionError(
                 "worker mountinfo contains a non-canonical or duplicate mountpoint"
             )
-        result[normalized] = (filesystem, options)
+        result[normalized] = _WorkerMountInfo(
+            root=root,
+            filesystem=filesystem,
+            source=source,
+            mount_options=options,
+            optional_fields=optional_fields,
+            super_options=super_options,
+        )
     if not result:
         raise AssertionError("worker mountinfo contains no mounts")
     return result
 
 
 def _validate_worker_mount_policy(
-    mounts: dict[str, tuple[str, frozenset[str]]],
+    mounts: dict[str, _WorkerMountInfo],
 ) -> list[dict[str, Any]]:
     expected_mounts = {
         "/": (None, "ro"),
@@ -368,12 +420,27 @@ def _validate_worker_mount_policy(
         "/tmp": ("tmpfs", "rw"),
         "/home/agent": ("tmpfs", "rw"),
     }
+    unexpected_mountpoints = sorted(set(mounts) - expected_mounts.keys())
+    if unexpected_mountpoints:
+        unexpected = {
+            target: {
+                "root": mounts[target].root,
+                "filesystem": mounts[target].filesystem,
+                "source": mounts[target].source,
+                "mount_options": sorted(mounts[target].mount_options),
+                "optional_fields": list(mounts[target].optional_fields),
+                "super_options": sorted(mounts[target].super_options),
+            }
+            for target in unexpected_mountpoints
+        }
+        raise AssertionError(f"worker mountinfo contains unexpected mountpoints: {unexpected}")
     observed_mounts: list[dict[str, Any]] = []
     for target, (expected_filesystem, access) in expected_mounts.items():
         observed = mounts.get(target)
         if observed is None:
             raise AssertionError(f"worker mountinfo omits configured mount {target}")
-        filesystem, options = observed
+        filesystem = observed.filesystem
+        options = observed.mount_options
         if expected_filesystem is not None and filesystem != expected_filesystem:
             raise AssertionError(f"worker mount {target} has unexpected filesystem {filesystem!r}")
         if access not in options or ({"ro", "rw"} - {access}) & options:
@@ -383,18 +450,16 @@ def _validate_worker_mount_policy(
         if target != "/" and not {"nosuid", "nodev"}.issubset(options):
             raise AssertionError(f"worker mount {target} is missing nosuid/nodev protection")
         observed_mounts.append(
-            {"target": target, "filesystem": filesystem, "options": sorted(options)}
+            {
+                "target": target,
+                "filesystem": filesystem,
+                "source": observed.source,
+                "root": observed.root,
+                "options": sorted(options),
+                "optional_fields": list(observed.optional_fields),
+                "super_options": sorted(observed.super_options),
+            }
         )
-    for target in mounts:
-        if (
-            target == "/etc"
-            or target.startswith("/etc/")
-            or target == "/usr"
-            or target.startswith("/usr/")
-        ):
-            raise AssertionError(
-                f"worker mountinfo exposes an unexpected broad host path: {target}"
-            )
     return observed_mounts
 
 
@@ -431,7 +496,11 @@ def _audit_worker_init_runtime_policy(
         read_bounded(process_root / "mountinfo", _MAX_WORKER_MOUNTINFO_BYTES, "mountinfo")
     )
     verify_identity()
-    return {"status": status, "mounts": _validate_worker_mount_policy(mounts)}
+    return {
+        "status": status,
+        "mounts": _validate_worker_mount_policy(mounts),
+        "mountpoints": sorted(mounts),
+    }
 
 
 def _runc_environment(*, marker: str | None = None) -> dict[str, str]:
@@ -727,36 +796,70 @@ def test_worker_mountinfo_parser_decodes_mountpoint_and_rejects_duplicates() -> 
         b"1 0 0:1 / / ro,nosuid,nodev - rootfs rootfs ro\n"
         b"2 1 0:2 / /workspace rw,nosuid,nodev - ext4 /dev/attempt rw\n"
         b"3 1 0:3 / /home/agent\\040private rw,nosuid,nodev - tmpfs tmpfs rw,size=1024\n"
+        b"4 1 0:4 /root\\040dir /mnt/agent\\040files rw,nosuid,nodev shared:4 - "
+        b"ext4 /dev/worker\\040volume rw,relatime\n"
     )
     observed = _parse_worker_mountinfo(raw)
-    assert observed["/"] == ("rootfs", frozenset({"ro", "nosuid", "nodev"}))
-    assert observed["/workspace"] == ("ext4", frozenset({"rw", "nosuid", "nodev"}))
-    assert observed["/home/agent private"][0] == "tmpfs"
+    assert observed["/"].filesystem == "rootfs"
+    assert observed["/"].mount_options == frozenset({"ro", "nosuid", "nodev"})
+    assert observed["/workspace"].filesystem == "ext4"
+    assert observed["/workspace"].source == "/dev/attempt"
+    assert observed["/home/agent private"].filesystem == "tmpfs"
+    assert observed["/home/agent private"].super_options == frozenset({"rw", "size=1024"})
+    assert observed["/mnt/agent files"].root == "/root dir"
+    assert observed["/mnt/agent files"].source == "/dev/worker volume"
+    assert observed["/mnt/agent files"].optional_fields == ("shared:4",)
     with pytest.raises(AssertionError, match="duplicate"):
         _parse_worker_mountinfo(raw + raw.splitlines()[1] + b"\n")
     with pytest.raises(AssertionError, match="malformed"):
         _parse_worker_mountinfo(b"not mountinfo\n")
+    with pytest.raises(AssertionError, match="malformed"):
+        _parse_worker_mountinfo(
+            raw.replace(b" - rootfs rootfs ro\n", b" - rootfs rootfs ro extra\n", 1)
+        )
+    with pytest.raises(AssertionError, match="device identity"):
+        _parse_worker_mountinfo(raw.replace(b"0:1", b"not-a-device", 1))
+    with pytest.raises(AssertionError, match="non-canonical root"):
+        _parse_worker_mountinfo(raw.replace(b"0:1 / / ", b"0:1 /../outside / ", 1))
+    with pytest.raises(AssertionError, match="non-canonical root"):
+        _parse_worker_mountinfo(raw.replace(b"0:1 / / ", b"0:1 // / ", 1))
+    with pytest.raises(AssertionError, match="non-canonical mountpoint"):
+        _parse_worker_mountinfo(raw.replace(b"0:1 / / ", b"0:1 / // ", 1))
+    with pytest.raises(AssertionError, match="duplicate mount options"):
+        _parse_worker_mountinfo(raw.replace(b"ro,nosuid,nodev", b"ro,ro,nosuid,nodev", 1))
 
 
 def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
+    def mount(filesystem: str, options: set[str]) -> _WorkerMountInfo:
+        return _WorkerMountInfo(
+            root="/",
+            filesystem=filesystem,
+            source=filesystem,
+            mount_options=frozenset(options),
+            optional_fields=(),
+            super_options=frozenset(options),
+        )
+
     mounts = {
-        "/": ("rootfs", frozenset({"ro"})),
-        "/proc": ("proc", frozenset({"ro", "nosuid", "nodev", "noexec"})),
-        "/workspace": ("ext4", frozenset({"rw", "nosuid", "nodev"})),
-        "/tmp": ("tmpfs", frozenset({"rw", "nosuid", "nodev"})),
-        "/home/agent": ("tmpfs", frozenset({"rw", "nosuid", "nodev"})),
+        "/": mount("rootfs", {"ro"}),
+        "/proc": mount("proc", {"ro", "nosuid", "nodev", "noexec"}),
+        "/workspace": mount("ext4", {"rw", "nosuid", "nodev"}),
+        "/tmp": mount("tmpfs", {"rw", "nosuid", "nodev"}),
+        "/home/agent": mount("tmpfs", {"rw", "nosuid", "nodev"}),
     }
     observed = _validate_worker_mount_policy(mounts)
     assert {mount["target"] for mount in observed} == set(mounts)
 
     with pytest.raises(AssertionError, match="unexpected access"):
-        _validate_worker_mount_policy({**mounts, "/": ("rootfs", frozenset({"rw"}))})
+        _validate_worker_mount_policy({**mounts, "/": mount("rootfs", {"rw"})})
     with pytest.raises(AssertionError, match="omits configured mount /home/agent"):
         _validate_worker_mount_policy(
             {key: value for key, value in mounts.items() if key != "/home/agent"}
         )
-    with pytest.raises(AssertionError, match="broad host path"):
-        _validate_worker_mount_policy({**mounts, "/etc/credentials": ("bind", frozenset({"ro"}))})
+    with pytest.raises(AssertionError, match="unexpected mountpoints"):
+        _validate_worker_mount_policy({**mounts, "/etc/credentials": mount("bind", {"ro"})})
+    with pytest.raises(AssertionError, match="unexpected mountpoints"):
+        _validate_worker_mount_policy({**mounts, "/var/agent-data": mount("tmpfs", {"rw"})})
 
 
 def test_worker_init_fd_audit_brackets_stable_non_socket_stdio(
