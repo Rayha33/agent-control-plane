@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -86,15 +88,381 @@ def oci_fixture(tmp_path: Path) -> tuple[Path, Snapshot]:
 
 
 def compile_config(bundle: Path, workspace: Snapshot) -> dict:
+    rootfs = bundle / "rootfs"
+    rootfs_pin = oci_worker._pin_trusted_rootfs(rootfs, oci_worker.rootfs_tree_sha256(rootfs))
     return build_oci_worker_config(
         bundle,
         workspace,
         ("/usr/bin/busybox", "sh", "-c", "printf ready > /workspace/result.txt"),
+        rootfs_pin=rootfs_pin,
         container_id="acp-worker-123",
         memory_bytes=256 * 1024 * 1024,
         pids_limit=32,
         cpu_quota_us=100_000,
     )
+
+
+def test_rootfs_tree_digest_is_deterministic_and_binds_file_content(tmp_path: Path) -> None:
+    bundle, _workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+
+    first = oci_worker.rootfs_tree_sha256(rootfs)
+    assert first == oci_worker.rootfs_tree_sha256(rootfs)
+
+    executable = rootfs / "usr" / "bin" / "busybox"
+    executable.write_text("changed fixture executable\n", encoding="ascii")
+    assert oci_worker.rootfs_tree_sha256(rootfs) != first
+
+
+def test_rootfs_tree_digest_binds_mode_and_symlink_target(tmp_path: Path) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    first_file = rootfs / "first"
+    second_file = rootfs / "second"
+    first_file.write_text("one\n", encoding="ascii")
+    second_file.write_text("two\n", encoding="ascii")
+    link = rootfs / "current"
+    link.symlink_to("first")
+
+    original = oci_worker.rootfs_tree_sha256(rootfs)
+    first_file.chmod(0o600)
+    changed_mode = oci_worker.rootfs_tree_sha256(rootfs)
+    assert changed_mode != original
+
+    link.unlink()
+    link.symlink_to("second")
+    assert oci_worker.rootfs_tree_sha256(rootfs) != changed_mode
+
+
+def test_rootfs_digest_enforces_byte_depth_and_path_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "large").write_bytes(b"12")
+    monkeypatch.setattr(oci_worker, "_MAX_ROOTFS_BYTES", 1)
+    with pytest.raises(SupervisorError, match="byte limit"):
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    (rootfs / "large").unlink()
+    (rootfs / "long").mkdir()
+    monkeypatch.setattr(oci_worker, "_MAX_ROOTFS_BYTES", 8 * 1024 * 1024 * 1024)
+    monkeypatch.setattr(oci_worker, "_MAX_ROOTFS_PATH_BYTES", 3)
+    with pytest.raises(SupervisorError, match="path exceeds its limit"):
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    monkeypatch.setattr(oci_worker, "_MAX_ROOTFS_PATH_BYTES", 4096)
+    monkeypatch.setattr(oci_worker, "_MAX_ROOTFS_DEPTH", 0)
+    with pytest.raises(SupervisorError, match="nesting exceeds its limit"):
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+
+@pytest.mark.parametrize(
+    ("state", "message"),
+    (("present", "file capabilities"), ("unknown", "capability state is unknown")),
+)
+def test_rootfs_file_capability_check_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, state: str, message: str
+) -> None:
+    monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
+
+    def getxattr(_descriptor: int, attribute: str) -> bytes:
+        assert attribute == "security.capability"
+        if state == "present":
+            return b"capability"
+        raise OSError(errno.EIO, "capability state unavailable")
+
+    monkeypatch.setattr(oci_worker.os, "getxattr", getxattr, raising=False)
+
+    with pytest.raises(SupervisorError, match=message) as error:
+        oci_worker._check_rootfs_file_capability(123)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_entry_limit_aborts_scandir_before_materializing_extra_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    names_read = 0
+
+    class Entry:
+        @property
+        def name(self) -> str:
+            nonlocal names_read
+            names_read += 1
+            return f"entry-{names_read:06d}"
+
+    class Scandir:
+        def __enter__(self) -> Scandir:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def __iter__(self):
+            return (Entry() for _ in range(oci_worker._MAX_ROOTFS_ENTRIES + 1))
+
+    monkeypatch.setattr(oci_worker.os, "scandir", lambda _directory: Scandir())
+
+    with pytest.raises(SupervisorError, match="too many entries"):
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    assert names_read == oci_worker._MAX_ROOTFS_ENTRIES
+
+
+def test_rootfs_mountinfo_rejects_same_device_nested_bind_mount_and_decodes_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rootfs = tmp_path / "root fs"
+    nested = rootfs / "usr mount"
+    nested.mkdir(parents=True)
+
+    def escape_mountpoint(path: Path) -> bytes:
+        return os.fsencode(path).replace(b"\\", b"\\134").replace(b" ", b"\\040")
+
+    root_mount = escape_mountpoint(rootfs)
+    nested_mount = escape_mountpoint(nested)
+    mountinfo = (
+        b"36 25 0:42 / " + root_mount + b" rw - ext4 /dev/loop0 rw\n"
+        b"37 36 0:42 /usr " + nested_mount + b" rw - ext4 /dev/loop0 rw\n"
+    )
+    monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(oci_worker, "_read_linux_mountinfo", lambda: mountinfo)
+
+    with pytest.raises(SupervisorError, match="nested mount") as error:
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_mount_table_change_during_scan_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    root_mount = os.fsencode(rootfs)
+    first = b"36 25 0:42 / " + root_mount + b" rw - ext4 /dev/loop0 rw\n"
+    second = first.replace(b"36 25", b"37 25", 1)
+    snapshots = iter((first, second))
+    monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(oci_worker, "_read_linux_mountinfo", lambda: next(snapshots))
+    monkeypatch.setattr(oci_worker, "_check_rootfs_posix_acl", lambda _descriptor: None)
+    monkeypatch.setattr(oci_worker, "_check_rootfs_file_capability", lambda _descriptor: None)
+
+    with pytest.raises(SupervisorError, match="mount table changed") as error:
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_digest_rejects_directory_default_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle, _workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    acl_directory = rootfs / "home"
+    acl_inode = acl_directory.stat().st_ino
+    monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
+    mountinfo = (
+        b"36 25 0:42 / "
+        + os.fsencode(rootfs).replace(b"\\", b"\\134").replace(b" ", b"\\040")
+        + b" rw - ext4 /dev/loop0 rw\n"
+    )
+    monkeypatch.setattr(oci_worker, "_read_linux_mountinfo", lambda: mountinfo)
+
+    def getxattr(descriptor: int, attribute: str) -> bytes:
+        if attribute == "system.posix_acl_default" and os.fstat(descriptor).st_ino == acl_inode:
+            return b"acl"
+        if attribute == "security.capability":
+            raise OSError(errno.ENODATA, "no file capability")
+        raise OSError(errno.ENODATA, "no POSIX ACL")
+
+    monkeypatch.setattr(oci_worker.os, "getxattr", getxattr, raising=False)
+
+    with pytest.raises(SupervisorError, match="POSIX ACL") as error:
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_pin_retains_inode_observed_by_tree_scan_when_path_is_swapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "image.txt").write_text("trusted image\n", encoding="ascii")
+    digest = oci_worker.rootfs_tree_sha256(rootfs)
+    original_measure = oci_worker._measure_rootfs_tree
+    scanned_device, scanned_inode = original_measure(rootfs)[1:]
+    swapped = False
+
+    def measure_then_swap(path: str | Path) -> tuple[str, int, int]:
+        nonlocal swapped
+        measurement = original_measure(path)
+        if not swapped:
+            backup = tmp_path / "rootfs-original"
+            os.rename(rootfs, backup)
+            shutil.copytree(backup, rootfs)
+            swapped = True
+        return measurement
+
+    monkeypatch.setattr(oci_worker, "_measure_rootfs_tree", measure_then_swap)
+    pin = oci_worker._pin_trusted_rootfs(rootfs, digest)
+
+    assert (pin.device, pin.inode) == (scanned_device, scanned_inode)
+    assert pin.inode != rootfs.stat().st_ino
+    with pytest.raises(SupervisorError, match="no longer matches its pin"):
+        oci_worker._verify_trusted_rootfs(pin)
+
+
+def test_rootfs_verification_rejects_path_swap_between_resolution_and_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "image.txt").write_text("trusted image\n", encoding="ascii")
+    digest = oci_worker.rootfs_tree_sha256(rootfs)
+    pin = oci_worker._pin_trusted_rootfs(rootfs, digest)
+    original_measure = oci_worker._measure_rootfs_tree
+    swapped = False
+
+    def swap_then_measure(path: str | Path) -> tuple[str, int, int]:
+        nonlocal swapped
+        if not swapped:
+            backup = tmp_path / "rootfs-original"
+            os.rename(rootfs, backup)
+            shutil.copytree(backup, rootfs)
+            swapped = True
+        return original_measure(path)
+
+    monkeypatch.setattr(oci_worker, "_measure_rootfs_tree", swap_then_measure)
+
+    with pytest.raises(SupervisorError, match="no longer matches its pin") as error:
+        oci_worker._verify_trusted_rootfs(pin)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_tree_digest_rejects_escaping_symlinks(tmp_path: Path) -> None:
+    bundle, _workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    (rootfs / "etc").mkdir()
+    (rootfs / "etc" / "escape").symlink_to("../../outside")
+
+    with pytest.raises(SupervisorError, match="escaping symlink") as error:
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_tree_digest_rejects_hardlinks_and_special_files(tmp_path: Path) -> None:
+    bundle, _workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    linked = rootfs / "usr" / "bin" / "linked-busybox"
+    os.link(rootfs / "usr" / "bin" / "busybox", linked)
+    with pytest.raises(SupervisorError, match="hard-linked file"):
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    linked.unlink()
+    fifo = rootfs / "usr" / "bin" / "worker-fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(SupervisorError, match="special file") as error:
+        oci_worker.rootfs_tree_sha256(rootfs)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_pin_rejects_digest_mismatch_and_repository_path(tmp_path: Path) -> None:
+    bundle, _workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    digest = oci_worker.rootfs_tree_sha256(rootfs)
+
+    with pytest.raises(SupervisorError, match="digest does not match"):
+        oci_worker._pin_trusted_rootfs(rootfs, "0" * 64)
+
+    with pytest.raises(SupervisorError, match="outside the repository"):
+        oci_worker._pin_trusted_rootfs(rootfs, digest, tmp_path)
+
+
+def test_rootfs_pin_rejects_a_path_that_contains_the_repository(tmp_path: Path) -> None:
+    rootfs = tmp_path / "container-root"
+    repository = rootfs / "project"
+    repository.mkdir(parents=True)
+    (rootfs / "image.txt").write_text("image\n", encoding="ascii")
+    digest = oci_worker.rootfs_tree_sha256(rootfs)
+
+    with pytest.raises(SupervisorError, match="disjoint") as error:
+        oci_worker._pin_trusted_rootfs(rootfs, digest, repository)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_pin_revalidates_content_before_bundle_compilation(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    pin = oci_worker._pin_trusted_rootfs(rootfs, oci_worker.rootfs_tree_sha256(rootfs))
+    (rootfs / "usr" / "bin" / "busybox").write_text("substituted\n", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="no longer matches its pin") as error:
+        build_oci_worker_config(
+            bundle,
+            workspace,
+            ("/usr/bin/busybox",),
+            rootfs_pin=pin,
+            container_id="acp-worker-123",
+            memory_bytes=256 * 1024 * 1024,
+            pids_limit=32,
+            cpu_quota_us=100_000,
+        )
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_pin_rejects_a_caller_constructed_handle(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    pin = oci_worker._pin_trusted_rootfs(rootfs, oci_worker.rootfs_tree_sha256(rootfs))
+    forged = oci_worker._TrustedRootfs(pin.path, pin.sha256, pin.device, pin.inode)
+
+    with pytest.raises(SupervisorError, match="trusted supervisor configuration") as error:
+        build_oci_worker_config(
+            bundle,
+            workspace,
+            ("/usr/bin/busybox",),
+            rootfs_pin=forged,
+            container_id="acp-worker-123",
+            memory_bytes=256 * 1024 * 1024,
+            pids_limit=32,
+            cpu_quota_us=100_000,
+        )
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_bundle_rootfs_copy_must_match_configured_rootfs_pin(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    source = tmp_path / "trusted-rootfs"
+    shutil.copytree(bundle / "rootfs", source)
+    pin = oci_worker._pin_trusted_rootfs(source, oci_worker.rootfs_tree_sha256(source))
+    (bundle / "rootfs" / "usr" / "bin" / "busybox").write_text(
+        "substituted copy\n", encoding="ascii"
+    )
+
+    with pytest.raises(SupervisorError, match="does not match the configured rootfs pin") as error:
+        build_oci_worker_config(
+            bundle,
+            workspace,
+            ("/usr/bin/busybox",),
+            rootfs_pin=pin,
+            container_id="acp-worker-123",
+            memory_bytes=256 * 1024 * 1024,
+            pids_limit=32,
+            cpu_quota_us=100_000,
+        )
+
+    assert error.value.code == "invalid_oci_rootfs"
 
 
 def pinned_runc(repo_root: Path) -> oci_worker._TrustedRuncExecutable:
@@ -898,6 +1266,9 @@ def test_oci_policy_rejects_ambiguous_or_host_relative_commands(
             bundle,
             workspace,
             command,
+            rootfs_pin=oci_worker._pin_trusted_rootfs(
+                bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
+            ),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -927,6 +1298,9 @@ def test_oci_policy_requires_snapshot_handle_not_an_arbitrary_private_path(
             bundle,
             workspace.root,
             ("/usr/bin/busybox",),
+            rootfs_pin=oci_worker._pin_trusted_rootfs(
+                bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
+            ),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -1063,6 +1437,9 @@ def test_oci_policy_rejects_executable_shadowed_by_runtime_mount(
             bundle,
             workspace,
             (destination + "/tool",),
+            rootfs_pin=oci_worker._pin_trusted_rootfs(
+                rootfs, oci_worker.rootfs_tree_sha256(rootfs)
+            ),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -1080,6 +1457,9 @@ def test_oci_policy_rejects_root_directory_as_executable(tmp_path: Path) -> None
             bundle,
             workspace,
             ("/",),
+            rootfs_pin=oci_worker._pin_trusted_rootfs(
+                bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
+            ),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -1113,6 +1493,9 @@ def test_oci_policy_rejects_unsafe_resource_and_identity_values(
 ) -> None:
     bundle, workspace = oci_fixture(tmp_path)
     args = {
+        "rootfs_pin": oci_worker._pin_trusted_rootfs(
+            bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
+        ),
         "container_id": "acp-worker-123",
         "memory_bytes": 256 * 1024 * 1024,
         "pids_limit": 32,
@@ -1136,6 +1519,7 @@ def test_oci_policy_rejects_root_caller_before_path_checks(
             tmp_path / "missing-bundle",
             tmp_path / "missing-workspace",
             ("/usr/bin/busybox",),
+            rootfs_pin=None,
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,

@@ -15,15 +15,17 @@ The generated ``linux.seccomp`` profile is a denylist defense-in-depth layer,
 not a complete syscall allowlist or a substitute for the namespace/mount
 boundary. Runtime application and behavioral denial still require exact-host
 verification before worker launch is enabled.
-Path checks are not atomic and do not protect against an untrusted process with
-the same host UID; the integrating executor must provision beneath trusted
-ancestors, control same-UID writers, and reserve launch metadata safely.
+Path checks are not atomic and do not protect against a concurrent writer with
+access to the rootfs path (including a same-UID writer); the integrating
+executor must provision beneath trusted ancestors, control writers, and
+reserve launch metadata safely.
 """
 
 from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import platform
 import re
@@ -48,6 +50,11 @@ _MAX_PIDS = 65_536
 _MAX_UINT32 = (1 << 32) - 1
 _MAX_UINT64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
+_MAX_ROOTFS_ENTRIES = 200_000
+_MAX_ROOTFS_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_ROOTFS_PATH_BYTES = 4096
+_MAX_ROOTFS_DEPTH = 256
+_MAX_MOUNTINFO_BYTES = 16 * 1024 * 1024
 _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
@@ -135,6 +142,13 @@ _TRUSTED_RUNC_PINS: dict[
     tuple[
         weakref.ReferenceType[Any],
         tuple[Path, Path, str, int, int, int, int, int, int, int],
+    ],
+] = {}
+_TRUSTED_ROOTFS_PINS: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[Any],
+        tuple[Path, str, int, int],
     ],
 ] = {}
 _SECCOMP_DENIED_SYSCALLS = (
@@ -420,6 +434,481 @@ class _TrustedRuncExecutable:
     device: int
     inode: int
     size: int
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _TrustedRootfs:
+    """Process-local pin for an operator-digested OCI root filesystem tree."""
+
+    path: Path
+    sha256: str
+    device: int
+    inode: int
+
+
+def _rootfs_stat_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _rootfs_link_stays_inside(relative_path: bytes, target: bytes) -> bool:
+    """Check lexical symlink resolution stays below the container root."""
+
+    if not target:
+        return False
+    parts = [] if target.startswith(b"/") else relative_path.split(b"/")[:-1]
+    for component in target.split(b"/"):
+        if component in {b"", b"."}:
+            continue
+        if component == b"..":
+            if not parts:
+                return False
+            parts.pop()
+        else:
+            parts.append(component)
+    return True
+
+
+def _read_linux_mountinfo() -> bytes:
+    """Read a bounded snapshot of the current Linux mount namespace."""
+
+    try:
+        with open("/proc/self/mountinfo", "rb") as mountinfo:
+            content = mountinfo.read(_MAX_MOUNTINFO_BYTES + 1)
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "Linux mount table cannot be read safely"
+        ) from error
+    if len(content) > _MAX_MOUNTINFO_BYTES or not content.endswith(b"\n"):
+        raise SupervisorError(
+            "invalid_oci_rootfs", "Linux mount table is invalid or exceeds its limit"
+        )
+    return content
+
+
+def _decode_mountinfo_path(field: bytes) -> bytes:
+    """Decode the four octal escapes used for path fields in mountinfo."""
+
+    escapes = {b"040": b" ", b"011": b"\t", b"012": b"\n", b"134": b"\\"}
+    decoded = bytearray()
+    index = 0
+    while index < len(field):
+        if field[index] != ord("\\"):
+            decoded.append(field[index])
+            index += 1
+            continue
+        replacement = escapes.get(field[index + 1 : index + 4])
+        if replacement is None:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "Linux mount table contains an invalid path escape"
+            )
+        decoded.extend(replacement)
+        index += 4
+    if b"\0" in decoded:
+        raise SupervisorError("invalid_oci_rootfs", "Linux mount table contains an invalid path")
+    return bytes(decoded)
+
+
+def _reject_nested_linux_mounts(root: Path, mountinfo: bytes) -> None:
+    """Reject any mountpoint strictly below root, including same-device binds."""
+
+    root = Path(os.path.normpath(os.fspath(root)))
+    if not mountinfo or not mountinfo.endswith(b"\n"):
+        raise SupervisorError("invalid_oci_rootfs", "Linux mount table is invalid")
+    for line in mountinfo.splitlines():
+        before_separator, separator, after_separator = line.partition(b" - ")
+        fields = before_separator.split()
+        if (
+            not separator
+            or len(fields) < 6
+            or len(after_separator.split()) < 3
+            or not fields[0].isdigit()
+            or not fields[1].isdigit()
+            or re.fullmatch(rb"[0-9]+:[0-9]+", fields[2]) is None
+        ):
+            raise SupervisorError(
+                "invalid_oci_rootfs", "Linux mount table contains a malformed entry"
+            )
+        mountpoint_bytes = _decode_mountinfo_path(fields[4])
+        try:
+            mountpoint_text = os.fsdecode(mountpoint_bytes)
+            if not os.path.isabs(mountpoint_text) or ".." in Path(mountpoint_text).parts:
+                raise ValueError("non-canonical mountpoint")
+            mountpoint = Path(os.path.normpath(mountpoint_text))
+        except (TypeError, ValueError) as error:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "Linux mount table contains an invalid mountpoint"
+            ) from error
+        if mountpoint != root and root in mountpoint.parents:
+            raise SupervisorError("invalid_oci_rootfs", "OCI rootfs contains a nested mount")
+
+
+def _check_rootfs_posix_acl(descriptor: int) -> None:
+    """Reject POSIX ACLs so the digest's mode bits cannot hide access grants."""
+
+    if platform.system() != "Linux":
+        return
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        raise SupervisorError("invalid_oci_rootfs", "Linux rootfs ACL checks are unavailable")
+    missing = {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}
+    unsupported = {errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}
+    for attribute in ("system.posix_acl_access", "system.posix_acl_default"):
+        try:
+            getxattr(descriptor, attribute)
+        except OSError as error:
+            if error.errno in missing or error.errno in unsupported:
+                continue
+            raise SupervisorError(
+                "invalid_oci_rootfs", "Linux rootfs ACL state is unknown"
+            ) from error
+        raise SupervisorError("invalid_oci_rootfs", "OCI rootfs contains a POSIX ACL")
+
+
+def _check_rootfs_file_capability(descriptor: int) -> None:
+    if platform.system() != "Linux":
+        return
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "Linux rootfs file-capability checks are unavailable"
+        )
+    try:
+        getxattr(descriptor, "security.capability")
+    except OSError as error:
+        unsupported = {
+            errno.ENODATA,
+            getattr(errno, "ENOATTR", errno.ENODATA),
+            errno.ENOTSUP,
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        }
+        if error.errno not in unsupported:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "rootfs file-capability state is unknown"
+            ) from error
+    else:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "OCI worker rootfs must not contain file capabilities"
+        )
+
+
+def _measure_rootfs_tree(path: str | Path) -> tuple[str, int, int]:
+    """Return a canonical tree digest and the inode opened for that scan.
+
+    The digest binds relative names, entry types, permission/ownership metadata,
+    regular-file contents, and symlink targets. Devices, sockets, FIFOs,
+    cross-device or nested mounts, hard-linked files, Linux POSIX ACLs,
+    escaping symlinks, set-id entries, Linux file capabilities, and trees above fixed
+    limits fail closed. This is an integrity measurement, not evidence that an
+    image was audited.
+    """
+
+    root = _plain_directory(path, code="invalid_oci_rootfs", label="OCI rootfs")
+    is_linux = platform.system() == "Linux"
+    mountinfo_before = _read_linux_mountinfo() if is_linux else None
+    if mountinfo_before is not None:
+        _reject_nested_linux_mounts(root, mountinfo_before)
+    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    try:
+        root_fd = os.open(root, root_flags | nofollow | cloexec)
+    except OSError as error:
+        raise SupervisorError("invalid_oci_rootfs", "OCI rootfs cannot be opened safely") from error
+
+    digest = hashlib.sha256(b"ACP-OCI-ROOTFS-TREE-V1\0")
+    entries_seen = 0
+    entries_pending = 0
+    bytes_seen = 0
+
+    def record(relative_path: bytes, kind: str, info: os.stat_result, payload: str) -> None:
+        fields = [
+            relative_path.hex(),
+            kind,
+            stat.S_IMODE(info.st_mode),
+            info.st_uid,
+            info.st_gid,
+            info.st_size if kind in {"file", "symlink"} else 0,
+            payload,
+        ]
+        encoded = json.dumps(fields, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+    def visit(directory: Path, directory_fd: int, prefix: bytes, depth: int) -> None:
+        nonlocal entries_seen, entries_pending, bytes_seen
+        if depth > _MAX_ROOTFS_DEPTH:
+            raise SupervisorError("invalid_oci_rootfs", "OCI rootfs nesting exceeds its limit")
+        before_directory = os.fstat(directory_fd)
+        try:
+            with os.scandir(directory_fd) as iterator:
+                names = []
+                for entry in iterator:
+                    if entries_seen + entries_pending >= _MAX_ROOTFS_ENTRIES:
+                        raise SupervisorError(
+                            "invalid_oci_rootfs", "OCI rootfs contains too many entries"
+                        )
+                    names.append(entry.name)
+                    entries_pending += 1
+                names.sort(key=os.fsencode)
+        except OSError as error:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "OCI rootfs directory is unreadable"
+            ) from error
+        for name in names:
+            entries_pending -= 1
+            entries_seen += 1
+            name_bytes = os.fsencode(name)
+            relative_path = name_bytes if not prefix else prefix + b"/" + name_bytes
+            if len(relative_path) > _MAX_ROOTFS_PATH_BYTES:
+                raise SupervisorError("invalid_oci_rootfs", "OCI rootfs path exceeds its limit")
+            child = directory / name
+            try:
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as error:
+                raise SupervisorError(
+                    "invalid_oci_rootfs", "OCI rootfs changed while being read"
+                ) from error
+            if info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                raise SupervisorError("invalid_oci_rootfs", "OCI rootfs contains a set-id entry")
+            if info.st_dev != before_directory.st_dev:
+                raise SupervisorError(
+                    "invalid_oci_rootfs", "OCI rootfs crosses a filesystem boundary"
+                )
+            if stat.S_ISDIR(info.st_mode):
+                if not is_linux and os.path.ismount(child):
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs contains a nested mount"
+                    )
+                try:
+                    child_fd = os.open(name, root_flags | nofollow | cloexec, dir_fd=directory_fd)
+                except OSError as error:
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs directory changed while being read"
+                    ) from error
+                try:
+                    opened = os.fstat(child_fd)
+                    if _rootfs_stat_identity(info) != _rootfs_stat_identity(opened):
+                        raise SupervisorError(
+                            "invalid_oci_rootfs", "OCI rootfs changed while being read"
+                        )
+                    _check_rootfs_posix_acl(child_fd)
+                    record(relative_path, "directory", info, "")
+                    visit(child, child_fd, relative_path, depth + 1)
+                    if _rootfs_stat_identity(opened) != _rootfs_stat_identity(os.fstat(child_fd)):
+                        raise SupervisorError(
+                            "invalid_oci_rootfs", "OCI rootfs changed while being read"
+                        )
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1:
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs contains a hard-linked file"
+                    )
+                bytes_seen += info.st_size
+                if bytes_seen > _MAX_ROOTFS_BYTES:
+                    raise SupervisorError("invalid_oci_rootfs", "OCI rootfs exceeds its byte limit")
+                try:
+                    file_fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=directory_fd)
+                except OSError as error:
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs file changed while being read"
+                    ) from error
+                try:
+                    opened = os.fstat(file_fd)
+                    if _rootfs_stat_identity(info) != _rootfs_stat_identity(opened):
+                        raise SupervisorError(
+                            "invalid_oci_rootfs", "OCI rootfs changed while being read"
+                        )
+                    _check_rootfs_posix_acl(file_fd)
+                    _check_rootfs_file_capability(file_fd)
+                    file_digest = hashlib.sha256()
+                    size = 0
+                    while True:
+                        chunk = os.read(file_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        file_digest.update(chunk)
+                    after = os.fstat(file_fd)
+                    if size != info.st_size or _rootfs_stat_identity(
+                        opened
+                    ) != _rootfs_stat_identity(after):
+                        raise SupervisorError(
+                            "invalid_oci_rootfs", "OCI rootfs changed while being read"
+                        )
+                    record(relative_path, "file", info, file_digest.hexdigest())
+                finally:
+                    os.close(file_fd)
+            elif stat.S_ISLNK(info.st_mode):
+                try:
+                    target = os.fsencode(os.readlink(name, dir_fd=directory_fd))
+                    after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as error:
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs symlink changed while being read"
+                    ) from error
+                if _rootfs_stat_identity(info) != _rootfs_stat_identity(after):
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs changed while being read"
+                    )
+                if not _rootfs_link_stays_inside(relative_path, target):
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs contains an escaping symlink"
+                    )
+                bytes_seen += len(target)
+                if bytes_seen > _MAX_ROOTFS_BYTES:
+                    raise SupervisorError("invalid_oci_rootfs", "OCI rootfs exceeds its byte limit")
+                record(relative_path, "symlink", info, hashlib.sha256(target).hexdigest())
+            else:
+                raise SupervisorError("invalid_oci_rootfs", "OCI rootfs contains a special file")
+        if _rootfs_stat_identity(before_directory) != _rootfs_stat_identity(os.fstat(directory_fd)):
+            raise SupervisorError("invalid_oci_rootfs", "OCI rootfs changed while being read")
+
+    try:
+        opened_root = os.fstat(root_fd)
+        if opened_root.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            raise SupervisorError("invalid_oci_rootfs", "OCI rootfs contains a set-id root")
+        _check_rootfs_posix_acl(root_fd)
+        record(b"", "directory", opened_root, "")
+        visit(root, root_fd, b"", 0)
+        current_root = os.stat(root, follow_symlinks=False)
+        if _rootfs_stat_identity(opened_root) != _rootfs_stat_identity(current_root):
+            raise SupervisorError("invalid_oci_rootfs", "OCI rootfs changed while being read")
+        if mountinfo_before is not None and _read_linux_mountinfo() != mountinfo_before:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "Linux mount table changed while rootfs was read"
+            )
+    except SupervisorError:
+        raise
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "OCI rootfs cannot be verified safely"
+        ) from error
+    finally:
+        os.close(root_fd)
+    return digest.hexdigest(), opened_root.st_dev, opened_root.st_ino
+
+
+def rootfs_tree_sha256(path: str | Path) -> str:
+    """Return a canonical rootfs digest without following links.
+
+    Linux POSIX ACLs and nested Linux mounts are rejected. Other extended
+    attributes and non-Linux ACL mechanisms are not included in this digest;
+    Linux file capabilities are separately rejected.
+    """
+
+    return _measure_rootfs_tree(path)[0]
+
+
+def _is_rootfs_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _pin_trusted_rootfs(
+    path: str | Path,
+    expected_sha256: str,
+    repo_root: str | Path | None = None,
+) -> _TrustedRootfs:
+    """Pin an operator-selected rootfs by path, root inode, and tree digest."""
+
+    if os.geteuid() == 0:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "OCI worker rootfs must be configured by a non-root caller"
+        )
+    if not _is_rootfs_sha256(expected_sha256):
+        raise SupervisorError("invalid_oci_rootfs", "configured OCI rootfs digest is invalid")
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise SupervisorError("invalid_oci_rootfs", "configured OCI rootfs path must be absolute")
+    root = _plain_directory(candidate, code="invalid_oci_rootfs", label="configured OCI rootfs")
+    if root == Path(root.anchor):
+        raise SupervisorError(
+            "invalid_oci_rootfs", "filesystem root cannot be used as the OCI rootfs"
+        )
+    repository = None
+    if repo_root is not None:
+        try:
+            repository = Path(repo_root).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "supervisor repository is unavailable"
+            ) from error
+        if root == repository or root in repository.parents or repository in root.parents:
+            raise SupervisorError(
+                "invalid_oci_rootfs",
+                "configured OCI rootfs must be outside the repository and disjoint from it",
+            )
+    try:
+        observed, device, inode = _measure_rootfs_tree(root)
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "configured OCI rootfs cannot be verified"
+        ) from error
+    if observed != expected_sha256:
+        raise SupervisorError("invalid_oci_rootfs", "configured OCI rootfs digest does not match")
+    pin = _TrustedRootfs(root, observed, device, inode)
+    key = id(pin)
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        current = _TRUSTED_ROOTFS_PINS.get(key)
+        if current is not None and current[0] is reference:
+            _TRUSTED_ROOTFS_PINS.pop(key, None)
+
+    reference = weakref.ref(pin, discard)
+    _TRUSTED_ROOTFS_PINS[key] = (
+        reference,
+        (root, observed, device, inode),
+    )
+    return pin
+
+
+def _verify_trusted_rootfs(pin: _TrustedRootfs) -> Path:
+    sealed = _TRUSTED_ROOTFS_PINS.get(id(pin)) if type(pin) is _TrustedRootfs else None
+    if sealed is None or sealed[0]() is not pin:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "OCI rootfs must come from trusted supervisor configuration"
+        )
+    expected_path, expected_digest, expected_device, expected_inode = sealed[1]
+    if (
+        pin.path != expected_path
+        or pin.sha256 != expected_digest
+        or (pin.device, pin.inode) != (expected_device, expected_inode)
+    ):
+        raise SupervisorError("invalid_oci_rootfs", "OCI rootfs pin was modified")
+    current = _plain_directory(
+        expected_path, code="invalid_oci_rootfs", label="configured OCI rootfs"
+    )
+    try:
+        observed, device, inode = _measure_rootfs_tree(current)
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "configured OCI rootfs cannot be verified"
+        ) from error
+    if (
+        current != expected_path
+        or device != expected_device
+        or inode != expected_inode
+        or observed != expected_digest
+    ):
+        raise SupervisorError(
+            "invalid_oci_rootfs", "configured OCI rootfs no longer matches its pin"
+        )
+    return current
 
 
 def _trusted_executable_identity(
@@ -884,6 +1373,7 @@ def build_oci_worker_config(
     workspace_snapshot: Snapshot,
     command: Sequence[str],
     *,
+    rootfs_pin: _TrustedRootfs,
     container_id: str,
     memory_bytes: int,
     pids_limit: int,
@@ -896,8 +1386,11 @@ def build_oci_worker_config(
 ) -> dict[str, Any]:
     """Build an OCI 1.2 config with one mutable workspace and no host secrets.
 
-    ``bundle_root/rootfs`` must already be a trusted, audited rootfs produced
-    outside candidate control. ``workspace_snapshot`` must be a separate
+    rootfs_pin must come from strict supervisor configuration and bind an
+    operator-selected rootfs tree digest. The bundle's rootfs must either be
+    that exact pinned directory or have the same tree digest. The digest proves
+    integrity against the operator's pin, not that the image has been audited.
+    workspace_snapshot must be a separate
     host-created snapshot with no Git metadata. Its complete tree is reopened
     and checked against the captured manifest immediately before the bind source
     is selected. The configured init blocks on inherited descriptor 3 before
@@ -918,6 +1411,7 @@ def build_oci_worker_config(
             "OCI worker workspace must be a host-validated snapshot",
         )
     bundle = _private_directory(bundle_root, code="invalid_oci_bundle", label="OCI bundle root")
+    trusted_rootfs = _verify_trusted_rootfs(rootfs_pin)
     rootfs = bundle / "rootfs"
     try:
         rootfs_info = rootfs.lstat()
@@ -925,6 +1419,14 @@ def build_oci_worker_config(
         raise SupervisorError("invalid_oci_rootfs", "OCI bundle rootfs is unavailable") from error
     if stat.S_ISLNK(rootfs_info.st_mode) or not stat.S_ISDIR(rootfs_info.st_mode):
         raise SupervisorError("invalid_oci_rootfs", "OCI bundle rootfs must be a real directory")
+    if rootfs.resolve(strict=True) != trusted_rootfs or (
+        rootfs_info.st_dev,
+        rootfs_info.st_ino,
+    ) != (rootfs_pin.device, rootfs_pin.inode):
+        if rootfs_tree_sha256(rootfs) != rootfs_pin.sha256:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "OCI bundle rootfs does not match the configured rootfs pin"
+            )
     workspace = _private_directory(
         workspace_snapshot.root,
         code="invalid_oci_workspace",

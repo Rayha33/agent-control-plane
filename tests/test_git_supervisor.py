@@ -119,6 +119,29 @@ def write_config(
             )
 
 
+def _create_test_oci_rootfs(repo: Path) -> tuple[Path, str]:
+    rootfs = repo.parent / f"{repo.name}-oci-rootfs"
+    for relative in ("bin", "etc", "proc", "tmp", "home/agent", "usr/bin"):
+        (rootfs / relative).mkdir(parents=True, exist_ok=True, mode=0o755)
+    for relative in ("bin/sh", "usr/bin/busybox"):
+        executable = rootfs / relative
+        executable.write_text("test rootfs only\n", encoding="ascii")
+        executable.chmod(0o755)
+    return rootfs, oci_worker_module.rootfs_tree_sha256(rootfs)
+
+
+def append_oci_config(repo: Path, body: str) -> tuple[Path, str]:
+    rootfs, digest = _create_test_oci_rootfs(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n[sandbox.oci]\n"
+            f"{body}\n"
+            f"rootfs_path = {json.dumps(str(rootfs))}\n"
+            f"rootfs_sha256 = {json.dumps(digest)}\n"
+        )
+    return rootfs, digest
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     git(tmp_path, "init", "-b", "main")
@@ -332,8 +355,9 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(repo)
-    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
-        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+    rootfs, rootfs_digest = append_oci_config(
+        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"'
+    )
     pin = object()
     calls: list[tuple[str, str]] = []
 
@@ -353,15 +377,45 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
 
     assert supervisor.config.oci_runc_executable is pin
     assert supervisor.config.oci_runc_version == "1.3.5"
+    assert supervisor.config.oci_rootfs_pin.path == rootfs.resolve()
+    assert supervisor.config.oci_rootfs_pin.sha256 == rootfs_digest
     assert calls == [("/usr/bin/runc", str(repo.resolve()))]
+
+
+def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> None:
+    write_config(repo)
+    rootfs, digest = _create_test_oci_rootfs(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
+            'runc_version = "1.3.5"\n'
+            f"rootfs_path = {json.dumps(str(rootfs))}\n"
+            f"rootfs_sha256 = {json.dumps(digest)}\n"
+        )
+    (rootfs / "usr" / "bin" / "busybox").write_text("unreviewed change\n", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="digest does not match") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_oci_config_requires_a_rootfs_path_and_digest(repo: Path) -> None:
+    write_config(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+
+    with pytest.raises(SupervisorError, match="requires runc_executable.*rootfs_sha256") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
 
 
 def test_oci_configured_worker_fails_closed_before_host_fallback(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(repo)
-    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
-        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"')
     pin = object()
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
     monkeypatch.setattr(
@@ -410,14 +464,13 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
         ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5+meta."', "release version"),
         (
             'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\nextra = true',
-            "only runc_executable",
+            "requires runc_executable",
         ),
     ],
 )
 def test_oci_runc_config_rejects_ambiguous_values(repo: Path, entry: str, message: str) -> None:
     write_config(repo)
-    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
-        handle.write(f"\n[sandbox.oci]\n{entry}\n")
+    append_oci_config(repo, entry)
 
     with pytest.raises(SupervisorError, match=message) as error:
         GitSupervisor(repo)
@@ -432,6 +485,7 @@ def test_oci_runc_config_is_opt_in(repo: Path) -> None:
 
     assert supervisor.config.oci_runc_executable is None
     assert supervisor.config.oci_runc_version is None
+    assert supervisor.config.oci_rootfs_pin is None
 
 
 def test_external_attempt_worktree_root_rejects_linked_worktree_git_common_dir(

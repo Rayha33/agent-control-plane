@@ -256,6 +256,7 @@ def _compiled_seccomp_profile(tmp_path: Path) -> dict:
         bundle,
         snapshot,
         ("/usr/bin/busybox", "true"),
+        rootfs_pin=oci_worker._pin_trusted_rootfs(rootfs, oci_worker.rootfs_tree_sha256(rootfs)),
         container_id="acp-seccomp-runtime-test",
         memory_bytes=64 * 1024 * 1024,
         pids_limit=8,

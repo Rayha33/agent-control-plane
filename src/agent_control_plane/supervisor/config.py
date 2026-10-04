@@ -59,6 +59,7 @@ class Config:
     min_free_bytes: int | None
     oci_runc_executable: Any | None
     oci_runc_version: str | None
+    oci_rootfs_pin: Any | None
 
 
 class ConfigMixin:
@@ -125,16 +126,24 @@ class ConfigMixin:
             raise SupervisorError("invalid_config", "sandbox.oci must be a table")
         oci_runc_executable: Any | None = None
         oci_runc_version: str | None = None
+        oci_rootfs_pin: Any | None = None
         if sandbox_oci is not None:
             from . import oci_worker
 
-            if set(sandbox_oci) != {"runc_executable", "runc_version"}:
+            if set(sandbox_oci) != {
+                "runc_executable",
+                "runc_version",
+                "rootfs_path",
+                "rootfs_sha256",
+            }:
                 raise SupervisorError(
                     "invalid_config",
-                    "sandbox.oci requires only runc_executable and runc_version",
+                    "sandbox.oci requires runc_executable, runc_version, rootfs_path, and rootfs_sha256",
                 )
             raw_runc_path = sandbox_oci["runc_executable"]
             requested_runc_version = sandbox_oci["runc_version"]
+            raw_rootfs_path = sandbox_oci["rootfs_path"]
+            expected_rootfs_sha256 = sandbox_oci["rootfs_sha256"]
             if not isinstance(raw_runc_path, str) or not raw_runc_path.strip():
                 raise SupervisorError(
                     "invalid_config", "sandbox.oci.runc_executable must be an absolute path"
@@ -147,6 +156,22 @@ class ConfigMixin:
                 raise SupervisorError(
                     "invalid_config", "sandbox.oci.runc_version must be an exact release version"
                 )
+            if not isinstance(raw_rootfs_path, str) or not raw_rootfs_path.strip():
+                raise SupervisorError(
+                    "invalid_config", "sandbox.oci.rootfs_path must be an absolute path"
+                )
+            if not Path(raw_rootfs_path).expanduser().is_absolute():
+                raise SupervisorError(
+                    "invalid_config", "sandbox.oci.rootfs_path must be an absolute path"
+                )
+            if not oci_worker._is_rootfs_sha256(expected_rootfs_sha256):
+                raise SupervisorError(
+                    "invalid_config",
+                    "sandbox.oci.rootfs_sha256 must be 64 lowercase hex characters",
+                )
+            oci_rootfs_pin = oci_worker._pin_trusted_rootfs(
+                raw_rootfs_path, expected_rootfs_sha256, self.root
+            )
             oci_runc_executable = oci_worker._pin_trusted_runc_executable(raw_runc_path, self.root)
             oci_runc_version = oci_worker._probe_trusted_runc_version(
                 oci_runc_executable, requested_runc_version
@@ -404,6 +429,7 @@ class ConfigMixin:
             min_free_bytes=min_free_bytes,
             oci_runc_executable=oci_runc_executable,
             oci_runc_version=oci_runc_version,
+            oci_rootfs_pin=oci_rootfs_pin,
         )
 
     @staticmethod

@@ -286,6 +286,38 @@ check; this covers ACL grants that mode bits do not show. Regression tests
 cover untrusted paths, forged or modified handles, simulated ACL write grants,
 and a simulated changed binary identity.
 
+The same opt-in configuration now requires an operator-selected
+`rootfs_path` and `rootfs_sha256`. Generate the digest on the target Linux host,
+against the final provisioned rootfs. It includes host UID/GID metadata, so a
+digest generated on macOS or before copying/chowning the image may differ:
+
+```sh
+uv run python -c 'from agent_control_plane.supervisor.oci_worker import rootfs_tree_sha256; import sys; print(rootfs_tree_sha256(sys.argv[1]))' /absolute/path/to/rootfs
+```
+
+The version-1 tree digest binds relative paths, entry types, mode bits, UID/GID,
+regular-file contents, and symlink targets. Linux POSIX access/default ACLs
+are rejected so they cannot silently add permission grants. Nested Linux mounts
+are checked using `/proc/self/mountinfo` (including same-device bind mounts), with
+mount-table snapshots required to match before and after the scan. The verifier
+also rejects special files, cross-device trees, hard-linked files, escaping
+symlinks, set-id entries, Linux file capabilities, and trees over its fixed
+entry/byte limits; directory enumeration stops before collecting an entry
+beyond the global count limit. Other extended attributes and non-Linux ACL
+mechanisms are not part of the digest. The configured rootfs and repository
+paths must be disjoint. Configuration load
+seals the canonical path, the device/inode actually opened by the scan, and
+the digest in a process-local handle; verification repeats those checks before
+OCI config compilation and checks that any per-attempt bundle copy has the
+same digest. This detects substitution in the fields and content bound by this
+digest relative to the operator's configured value; changes only to excluded
+extended attributes are not detected. It does not establish image provenance,
+prove the contents are safe, make a writable source immutable, detect a
+transient mount that appears and disappears between identical mount-table
+snapshots, or close a concurrent writer/path-replacement race (including
+same-UID writers) at a future path-based runc handoff. Use an independently
+audited, controlled, read-only provisioned rootfs before enabling execution.
+
 The optional `[sandbox.oci]` config now consumes the pin for an exact stable
 release-version check. That bounded probe opens the checked inode, revalidates
 the descriptor's content and file identity, and uses Linux fd-based `execve`
