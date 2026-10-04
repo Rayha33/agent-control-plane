@@ -326,6 +326,19 @@ def test_journaled_result_recovery_is_fenced_before_staging_cleanup(
     assert row["phase"] == "prepared"
 
 
+def test_missing_result_journal_still_cleans_unowned_staging(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    import_id = "00000000-0000-4000-8000-000000000001"
+    stage = supervisor._result_import_stage_path(import_id, create=True)
+    (stage / "objects" / "orphan-marker").write_text("orphan", encoding="utf-8")
+
+    with pytest.raises(SupervisorError) as recovered:
+        supervisor.recover_worker_result_import(import_id)
+
+    assert recovered.value.code == "result_import_not_found"
+    assert not stage.exists()
+
+
 def test_concurrent_reservations_have_one_winner(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)

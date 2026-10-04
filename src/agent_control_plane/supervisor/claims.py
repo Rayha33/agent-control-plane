@@ -2900,18 +2900,17 @@ class ClaimsMixin:
             preflight_row = connection.execute(
                 "SELECT attempt_id FROM result_imports WHERE id = ?", (import_id,)
             ).fetchone()
-            if preflight_row is None:
-                raise SupervisorError("result_import_not_found", "result import journal is missing")
-            preflight_attempt = connection.execute(
-                "SELECT * FROM attempts WHERE id = ?", (preflight_row["attempt_id"],)
-            ).fetchone()
-            if preflight_attempt is None:
-                self._mark_result_import_ambiguous(import_id, "journal attempt is missing")
-                raise SupervisorError(
-                    "result_import_ambiguous", "journal attempt is missing; result remains fenced"
-                )
-            self._authenticate_attempt(connection, preflight_attempt, credential)
-            _require_sandbox_execution_result_eligible(connection, preflight_row["attempt_id"])
+            if preflight_row is not None:
+                preflight_attempt = connection.execute(
+                    "SELECT * FROM attempts WHERE id = ?", (preflight_row["attempt_id"],)
+                ).fetchone()
+                if preflight_attempt is not None:
+                    self._authenticate_attempt(connection, preflight_attempt, credential)
+                    _require_sandbox_execution_result_eligible(
+                        connection, preflight_row["attempt_id"]
+                    )
+        # Missing/corrupt journals still need bounded orphan-stage cleanup before
+        # the existing not-found/ambiguous checks below.
         with self._git_operation_guard():
             self._cleanup_result_import_staging_locked()
         with self.connect() as connection:
