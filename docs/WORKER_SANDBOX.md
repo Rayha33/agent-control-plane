@@ -568,10 +568,23 @@ same host UID. The config still names the workspace by host path, so this
 check-then-bind sequence does not stop a same-UID process from changing or
 replacing the source before `runc` opens it. The executor must close that race
 with per-attempt host identity isolation or an equivalently pinned mount and
-prove the result. The host-backed workspace also has no aggregate disk quota. No
-`linux.seccomp` profile is emitted; the pinned runc 1.3.5 specification leaves
-the default seccomp policy as TODO, so syscall filtering remains unverified
-and a launch gate ([upstream security specification](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/SPEC.md)).
+prove the result. The host-backed workspace also has no aggregate disk quota.
+The compiler now emits a native-ABI seccomp denylist as defense in depth. It
+returns `EPERM` for mount/namespace-management, module, keyring, tracing,
+process-memory, io_uring and related high-risk syscalls; denies `clone` when
+any namespace flag is set; returns `ENOSYS` for `clone3` so libc can fall back
+to the filtered `clone`; and returns `EPERM` when `socket` or `socketpair`
+requests a family other than `AF_UNIX`. It uses `SCMP_ACT_ALLOW` by default,
+so it is not a complete syscall allowlist or sandbox. The profile omits OCI's
+optional `architectures` field: runc permits the native ABI by default and
+treats listed architectures as additional ABIs; compat ABIs are intentionally
+not enabled ([runc 1.3.5 seccomp setup](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/seccomp/seccomp_linux.go),
+[OCI seccomp configuration](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md#seccomp)).
+This compiler change is not runtime proof: exact-host filter installation and
+behavior remain launch gates. The socket rules do not restrict inherited file
+descriptors or AF_UNIX paths that a future executor exposes. The pinned runc
+1.3.5 specification states that it supplies no default filter
+([runc security specification](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/SPEC.md)).
 The device-cgroup deny entry is only a request: OCI requires default device
 nodes and runc/rootless cgroup behavior needs exact-runtime readback before any
 device-isolation claim ([OCI Linux configuration](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md),
@@ -587,6 +600,25 @@ uv run pytest tests/test_oci_worker.py -k pinned_oci_schema (the test name
 contains pinned_oci_schema). It also confirms an invalid memory-limit type is
 rejected. This proves schema conformance of the emitted JSON only, not a Linux
 launch, syscall/device/cgroup enforcement, or per-attempt worker-isolation.
+
+The compiler's denylist shape and unsupported-native-architecture rejection
+are covered by
+`tests/test_oci_worker.py::test_oci_worker_seccomp_profile_is_native_only_and_denies_high_risk_syscalls`
+and
+`test_oci_worker_seccomp_profile_rejects_unsupported_native_architecture`.
+These are structural tests, not runtime tests. Before launch is enabled, run
+the exact emitted profile on each supported Linux architecture/runtime; verify
+`/proc/self/status` reports `Seccomp: 2`, ordinary process/thread behavior
+still works, every configured syscall name resolves on the target runtime, and
+each required deny rule is individually behavior-tested: namespace-creating
+`clone` flags are denied, `clone3` returns `ENOSYS`, and non-`AF_UNIX` socket
+families are denied. Also verify an approved local AF_UNIX use case works
+without exposing host sockets or inherited network-capable descriptors. A
+`Seccomp: 2` readback alone is insufficient because runc may silently ignore
+syscall names it cannot resolve
+([runc 1.3.5 rule handling](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/seccomp/seccomp_linux.go#L1364-L1373)).
+If the runtime cannot install the profile, fail closed rather than silently
+running without it.
 
 This does not prove that ACP persists either systemd invocation, captures an
 attached runc exit receipt, coordinates cancellation/recovery across supervisor

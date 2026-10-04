@@ -189,9 +189,76 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
     }
     assert linux["cgroupsPath"] == "user.slice:acp:acp-worker-123"
     assert linux["rootfsPropagation"] == "private"
-    assert "seccomp" not in linux
+    assert "architectures" not in linux["seccomp"]
     assert linux["uidMappings"][0] == {"containerID": 0, "hostID": os.geteuid(), "size": 1}
     assert linux["gidMappings"][0] == {"containerID": 0, "hostID": os.getegid(), "size": 1}
+
+
+def test_oci_worker_seccomp_profile_is_native_only_and_denies_high_risk_syscalls() -> None:
+    profile = oci_worker._worker_seccomp_profile()
+
+    assert profile["defaultAction"] == "SCMP_ACT_ALLOW"
+    # The OCI architectures property adds compat ABIs; leaving it absent keeps
+    # the runtime's native-only default and avoids re-adding the native ABI.
+    assert "architectures" not in profile
+    rules = profile["syscalls"]
+    denied = next(
+        rule for rule in rules if set(rule["names"]) == set(oci_worker._SECCOMP_DENIED_SYSCALLS)
+    )
+    assert denied["action"] == "SCMP_ACT_ERRNO"
+    assert denied["errnoRet"] == 1
+    assert {
+        "mount",
+        "mount_setattr",
+        "move_mount",
+        "open_tree",
+        "pivot_root",
+        "setns",
+        "unshare",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+    } <= set(denied["names"])
+
+    clone3 = next(rule for rule in rules if rule["names"] == ["clone3"])
+    assert clone3["action"] == "SCMP_ACT_ERRNO"
+    assert clone3["errnoRet"] == 38
+
+    clone_rules = [rule for rule in rules if rule["names"] == ["clone"]]
+    assert {rule["args"][0]["value"] for rule in clone_rules} == set(
+        oci_worker._CLONE_NEW_NAMESPACE_FLAGS
+    )
+    assert set(oci_worker._CLONE_NEW_NAMESPACE_FLAGS) == {
+        0x00000080,  # CLONE_NEWTIME
+        0x00020000,  # CLONE_NEWNS
+        0x02000000,  # CLONE_NEWCGROUP
+        0x04000000,  # CLONE_NEWUTS
+        0x08000000,  # CLONE_NEWIPC
+        0x10000000,  # CLONE_NEWUSER
+        0x20000000,  # CLONE_NEWPID
+        0x40000000,  # CLONE_NEWNET
+    }
+    assert {(rule["args"][0]["value"], rule["args"][0]["valueTwo"]) for rule in clone_rules} == {
+        (flag, flag) for flag in oci_worker._CLONE_NEW_NAMESPACE_FLAGS
+    }
+    assert all(rule["args"][0]["op"] == "SCMP_CMP_MASKED_EQ" for rule in clone_rules)
+    assert all(rule["args"][0]["index"] == 0 for rule in clone_rules)
+
+    sockets = next(rule for rule in rules if set(rule["names"]) == {"socket", "socketpair"})
+    assert sockets["action"] == "SCMP_ACT_ERRNO"
+    assert sockets["errnoRet"] == 1
+    assert sockets["args"] == [{"index": 0, "value": 1, "op": "SCMP_CMP_NE"}]
+
+
+def test_oci_worker_seccomp_profile_rejects_unsupported_native_architecture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oci_worker.platform, "machine", lambda: "riscv64")
+
+    with pytest.raises(SupervisorError, match="does not support this target architecture") as error:
+        oci_worker._worker_seccomp_profile()
+
+    assert error.value.code == "invalid_oci_worker_policy"
 
 
 def test_oci_policy_launch_gate_fails_closed_and_closes_fd_before_candidate_exec(

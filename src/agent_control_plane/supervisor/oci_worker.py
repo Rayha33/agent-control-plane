@@ -11,9 +11,10 @@ memory, CPU, process-count, and tmpfs limits, but no aggregate quota for the
 host-backed workspace. The device-cgroup deny entry is a requested rule, not
 device isolation evidence: OCI runtimes provide default device nodes and may
 apply additional device rules, while rootless cgroup setup may be unavailable.
-No ``linux.seccomp`` profile is emitted. The pinned runc specification leaves
-the default seccomp policy as TODO, so syscall filtering is unverified and
-remains a launch gate.
+The generated ``linux.seccomp`` profile is a denylist defense-in-depth layer,
+not a complete syscall allowlist or a substitute for the namespace/mount
+boundary. Runtime application and behavioral denial still require exact-host
+verification before worker launch is enabled.
 Path checks are not atomic and do not protect against an untrusted process with
 the same host UID; the integrating executor must provision beneath trusted
 ancestors, control same-UID writers, and reserve launch metadata safely.
@@ -22,6 +23,7 @@ ancestors, control same-UID writers, and reserve launch metadata safely.
 from __future__ import annotations
 
 import os
+import platform
 import re
 import stat
 from collections.abc import Sequence
@@ -41,6 +43,101 @@ _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
+_SUPPORTED_SECCOMP_MACHINES = frozenset({"x86_64", "amd64", "aarch64", "arm64"})
+_SECCOMP_DENIED_SYSCALLS = (
+    "add_key",
+    "bpf",
+    "chroot",
+    "delete_module",
+    "finit_module",
+    "fsconfig",
+    "fsmount",
+    "fsopen",
+    "init_module",
+    "io_uring_enter",
+    "io_uring_register",
+    "io_uring_setup",
+    "keyctl",
+    "kexec_file_load",
+    "kexec_load",
+    "mount",
+    "mount_setattr",
+    "move_mount",
+    "name_to_handle_at",
+    "open_by_handle_at",
+    "open_tree",
+    "perf_event_open",
+    "pidfd_getfd",
+    "pivot_root",
+    "process_vm_readv",
+    "process_vm_writev",
+    "ptrace",
+    "reboot",
+    "request_key",
+    "setns",
+    "swapon",
+    "swapoff",
+    "umount2",
+    "unshare",
+    "userfaultfd",
+)
+_CLONE_NEW_NAMESPACE_FLAGS = (
+    0x00020000,  # CLONE_NEWNS
+    0x00000080,  # CLONE_NEWTIME
+    0x02000000,  # CLONE_NEWCGROUP
+    0x04000000,  # CLONE_NEWUTS
+    0x08000000,  # CLONE_NEWIPC
+    0x10000000,  # CLONE_NEWUSER
+    0x20000000,  # CLONE_NEWPID
+    0x40000000,  # CLONE_NEWNET
+)
+
+
+def _worker_seccomp_profile() -> dict[str, Any]:
+    machine = platform.machine().casefold()
+    if machine not in _SUPPORTED_SECCOMP_MACHINES:
+        raise SupervisorError(
+            "invalid_oci_worker_policy",
+            "OCI worker seccomp profile does not support this target architecture",
+        )
+    denied = {
+        "names": list(_SECCOMP_DENIED_SYSCALLS),
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1,
+    }
+    # classic seccomp cannot dereference clone3's flags pointer. ENOSYS is the
+    # compatibility signal for libc to use clone, whose namespace bits are
+    # filtered below while ordinary thread/fork bits remain available.
+    clone3 = {"names": ["clone3"], "action": "SCMP_ACT_ERRNO", "errnoRet": 38}
+    clone_namespace_rules = [
+        {
+            "names": ["clone"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1,
+            "args": [
+                {
+                    "index": 0,
+                    "value": flag,
+                    "valueTwo": flag,
+                    "op": "SCMP_CMP_MASKED_EQ",
+                }
+            ],
+        }
+        for flag in _CLONE_NEW_NAMESPACE_FLAGS
+    ]
+    non_unix_sockets = {
+        "names": ["socket", "socketpair"],
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 1,
+        "args": [{"index": 0, "value": 1, "op": "SCMP_CMP_NE"}],
+    }
+    return {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        # OCI runtimes permit only the native ABI by default. `architectures`
+        # adds ABIs, so repeating the native ABI can make runc reject the
+        # filter as a duplicate. Compat ABIs are intentionally not enabled.
+        "syscalls": [denied, clone3, *clone_namespace_rules, non_unix_sockets],
+    }
 
 
 def _plain_directory(path: str | Path, *, code: str, label: str) -> Path:
@@ -401,6 +498,7 @@ def build_oci_worker_config(
                 "pids": {"limit": pids},
                 "devices": [{"allow": False, "access": "rwm"}],
             },
+            "seccomp": _worker_seccomp_profile(),
             "cgroupsPath": f"user.slice:acp:{container_id}",
             "rootfsPropagation": "private",
             "maskedPaths": [
