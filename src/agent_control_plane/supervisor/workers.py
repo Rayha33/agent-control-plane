@@ -23,7 +23,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from ..worker_trampoline import LIFECYCLE_FDS_PREFIX, MONITOR_MODE
+from ..worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
+from ..worker_trampoline import MONITOR_MODE as MONITOR_MODE
 from .common import SupervisorError, utc_now
 from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
 
@@ -57,6 +58,8 @@ class WorkersMixin:
         credential: str | None = None,
         result_manifest_path: str | None = None,
     ) -> dict[str, Any]:
+        from ..worker_trampoline import _monitor_argv_prefix
+
         # Freeze caller-owned mutable argv before it is logged, expanded into
         # Popen, or hashed for the pre-exec receipt.
         command = tuple(command)
@@ -112,11 +115,7 @@ class WorkersMixin:
                         sys.executable,
                         "-I",
                         str(trampoline),
-                        str(handshake_read),
-                        str(target_write),
-                        str(start_read),
-                        MONITOR_MODE,
-                        LIFECYCLE_FDS_PREFIX,
+                        *_monitor_argv_prefix(handshake_read, target_write, start_read, (), None),
                         *command,
                     ],
                     cwd=attempt["worktree"],

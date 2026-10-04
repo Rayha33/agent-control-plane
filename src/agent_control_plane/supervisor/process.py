@@ -26,7 +26,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from ..worker_trampoline import LIFECYCLE_FDS_PREFIX, MONITOR_MODE
+from ..worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
+from ..worker_trampoline import MONITOR_MODE as MONITOR_MODE
 from .common import FORK_DENIED_EXIT_CODE, FORK_DENIED_SIGNATURE, SupervisorError
 
 
@@ -59,7 +60,27 @@ class ProcessMixin:
         timeout_seconds: int | None = None,
         pass_fds: Sequence[int] = (),
         lifecycle_fds: Sequence[int] = (),
+        fd3_source: int | None = None,
     ) -> dict[str, Any]:
+        from ..worker_trampoline import _monitor_argv_prefix
+
+        if fd3_source is not None:
+            if type(fd3_source) is not int or fd3_source < 3 or fd3_source in set(lifecycle_fds):
+                raise SupervisorError(
+                    "invalid_fd3_source",
+                    "command fd 3 must come from an open, non-lifecycle descriptor >= 3",
+                )
+            if fd3_source != 3 and ({fd3_source, 3} & set(pass_fds)):
+                raise SupervisorError(
+                    "invalid_fd3_source",
+                    "fd 3 and its distinct source are reserved and must not also be in pass_fds",
+                )
+            try:
+                fcntl.fcntl(fd3_source, fcntl.F_GETFD)
+            except OSError as error:
+                raise SupervisorError(
+                    "invalid_fd3_source", "command fd 3 source is not open"
+                ) from error
         if sys.platform == "darwin":
             sandbox = Path("/usr/bin/sandbox-exec")
             if not sandbox.is_file():
@@ -86,23 +107,19 @@ class ProcessMixin:
         target_read, target_write = os.pipe()
         start_read, start_write = os.pipe()
         trampoline = Path(__file__).parent.with_name("worker_trampoline.py").resolve()
-        inherited_fds = tuple(
-            sorted({handshake_read, target_write, start_read, *pass_fds, *lifecycle_fds})
-        )
-        lifecycle_argument = LIFECYCLE_FDS_PREFIX + ",".join(
-            str(descriptor) for descriptor in sorted(set(lifecycle_fds))
-        )
+        inherited_fd_set = {handshake_read, target_write, start_read, *pass_fds, *lifecycle_fds}
+        if fd3_source is not None:
+            inherited_fd_set.add(fd3_source)
+        inherited_fds = tuple(sorted(inherited_fd_set))
         try:
             process = subprocess.Popen(
                 [
                     sys.executable,
                     "-I",
                     str(trampoline),
-                    str(handshake_read),
-                    str(target_write),
-                    str(start_read),
-                    MONITOR_MODE,
-                    lifecycle_argument,
+                    *_monitor_argv_prefix(
+                        handshake_read, target_write, start_read, lifecycle_fds, fd3_source
+                    ),
                     *arguments,
                 ],
                 cwd=cwd,

@@ -25,6 +25,21 @@ incomplete. The OCI policy compiler now stages init behind an inherited pipe
 descriptor, but no supervisor executor passes or releases that descriptor. This
 record does not authorize `externalSandbox` for ACP workers.
 
+**Descriptor transport primitive (2026-10-04; not integrated).** The trusted
+process trampoline now accepts an internal `fd3_source` and maps that open
+descriptor to fd 3 only in the command child, after ACP records the target PID
+identity and releases its existing start gate. When the source is distinct from
+fd 3, the child closes the original source descriptor after remapping; if the
+source is already fd 3, it keeps that descriptor inheritable. The monitor
+parent closes its duplicate. A behavioral test verifies fd-3 delivery, no
+source-descriptor leak, and closure of the monitor's duplicate. When remapping a
+different descriptor, fd 3 and the source are reserved and cannot also be
+requested through `pass_fds`. This remains process plumbing, not an executor:
+the existing `run_worker` path does not launch runc, `_run_process` is
+synchronous, and no code reads back runtime state before releasing the OCI init
+gate. It proves no namespace, mount, credential, egress, cancellation, or
+result-import property.
+
 The namespace runtime probe records a validated
 `systemd_unit_invocation_id` in its runtime-driver evidence and append-only
 runtime audit event when systemd provides one, so a later teardown sample cannot

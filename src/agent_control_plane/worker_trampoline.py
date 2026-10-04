@@ -5,9 +5,34 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Sequence
 
-MONITOR_MODE = "__ACP_MONITOR_PROCESS_TREE_V1__"
+MONITOR_MODE = "__ACP_MONITOR_PROCESS_TREE_V2__"
 LIFECYCLE_FDS_PREFIX = "__ACP_LIFECYCLE_FDS_V1__="
+_FD3_SOURCE_PREFIX = "__ACP_FD3_SOURCE_V1__="
+
+
+def _monitor_argv_prefix(
+    handshake_fd: int,
+    target_fd: int,
+    start_fd: int,
+    lifecycle_fds: Sequence[int],
+    fd3_source: int | None,
+) -> list[str]:
+    """Build the versioned monitor header shared by both supervisor launch paths."""
+
+    lifecycle_argument = LIFECYCLE_FDS_PREFIX + ",".join(
+        str(descriptor) for descriptor in sorted(set(lifecycle_fds))
+    )
+    fd3_source_argument = _FD3_SOURCE_PREFIX + ("" if fd3_source is None else str(fd3_source))
+    return [
+        str(handshake_fd),
+        str(target_fd),
+        str(start_fd),
+        MONITOR_MODE,
+        lifecycle_argument,
+        fd3_source_argument,
+    ]
 
 
 def _close_lifecycle_fds(lifecycle_fds: tuple[int, ...]) -> None:
@@ -34,6 +59,16 @@ def _await_target_release(start_fd: int) -> bool:
         return os.read(start_fd, 1) == b"G"
     finally:
         os.close(start_fd)
+
+
+def _map_fd3_source(fd3_source: int | None) -> None:
+    if fd3_source is None:
+        return
+    if fd3_source == 3:
+        os.set_inheritable(3, True)
+        return
+    os.dup2(fd3_source, 3, inheritable=True)
+    os.close(fd3_source)
 
 
 def _linux_children() -> list[int] | None:
@@ -90,7 +125,11 @@ def _kill_adopted_processes() -> None:
 
 
 def _monitor_linux(
-    command: list[str], lifecycle_fds: tuple[int, ...], target_fd: int, start_fd: int
+    command: list[str],
+    lifecycle_fds: tuple[int, ...],
+    fd3_source: int | None,
+    target_fd: int,
+    start_fd: int,
 ) -> int:
     # PR_SET_CHILD_SUBREAPER makes double-fork/setsid daemons reparent here,
     # not to PID 1. The monitor does not return the command's exit status until
@@ -115,6 +154,10 @@ def _monitor_linux(
         _close_lifecycle_fds(lifecycle_fds)
         if not _await_target_release(start_fd):
             os._exit(125)
+        try:
+            _map_fd3_source(fd3_source)
+        except OSError:
+            os._exit(125)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         # If a same-UID command kills its direct monitor, the kernel must kill
@@ -128,6 +171,8 @@ def _monitor_linux(
             os.execvp(command[0], command)
         except OSError:
             os._exit(126)
+    if fd3_source is not None:
+        _close_lifecycle_fds((fd3_source,))
     if start_fd >= 0:
         os.close(start_fd)
     _report_target(target_fd, child)
@@ -156,7 +201,11 @@ def _monitor_linux(
 
 
 def _monitor_single_process(
-    command: list[str], lifecycle_fds: tuple[int, ...], target_fd: int, start_fd: int
+    command: list[str],
+    lifecycle_fds: tuple[int, ...],
+    fd3_source: int | None,
+    target_fd: int,
+    start_fd: int,
 ) -> int:
     """Retain lifecycle FDs while a no-fork Darwin sandbox runs one PID."""
 
@@ -175,12 +224,18 @@ def _monitor_single_process(
         _close_lifecycle_fds(lifecycle_fds)
         if not _await_target_release(start_fd):
             os._exit(125)
+        try:
+            _map_fd3_source(fd3_source)
+        except OSError:
+            os._exit(125)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         try:
             os.execvp(command[0], command)
         except OSError:
             os._exit(126)
+    if fd3_source is not None:
+        _close_lifecycle_fds((fd3_source,))
     if start_fd >= 0:
         os.close(start_fd)
     _report_target(target_fd, child)
@@ -216,15 +271,31 @@ def main() -> int:
     start_fd = int(sys.argv[3])
     monitor = sys.argv[4] == MONITOR_MODE
     lifecycle_fds: tuple[int, ...] = ()
+    fd3_source: int | None = None
     if monitor:
-        if len(sys.argv) < 6 or not sys.argv[5].startswith(LIFECYCLE_FDS_PREFIX):
+        if (
+            len(sys.argv) < 7
+            or not sys.argv[5].startswith(LIFECYCLE_FDS_PREFIX)
+            or not sys.argv[6].startswith(_FD3_SOURCE_PREFIX)
+        ):
             return 125
         raw_lifecycle_fds = sys.argv[5].removeprefix(LIFECYCLE_FDS_PREFIX)
         try:
             lifecycle_fds = tuple(int(value) for value in raw_lifecycle_fds.split(",") if value)
         except ValueError:
             return 125
-        command = sys.argv[6:]
+        raw_fd3_source = sys.argv[6].removeprefix(_FD3_SOURCE_PREFIX)
+        if raw_fd3_source:
+            if not raw_fd3_source.isdecimal():
+                return 125
+            fd3_source = int(raw_fd3_source)
+            if (
+                fd3_source < 3
+                or fd3_source in lifecycle_fds
+                or fd3_source in {handshake_fd, target_fd, start_fd}
+            ):
+                return 125
+        command = sys.argv[7:]
     else:
         command = sys.argv[5:]
     if not command:
@@ -236,9 +307,9 @@ def main() -> int:
     if permission != b"G":
         return 125
     if monitor and sys.platform.startswith("linux"):
-        return _monitor_linux(command, lifecycle_fds, target_fd, start_fd)
+        return _monitor_linux(command, lifecycle_fds, fd3_source, target_fd, start_fd)
     if monitor and sys.platform == "darwin":
-        return _monitor_single_process(command, lifecycle_fds, target_fd, start_fd)
+        return _monitor_single_process(command, lifecycle_fds, fd3_source, target_fd, start_fd)
     if monitor:
         return 125
     try:

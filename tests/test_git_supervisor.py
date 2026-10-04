@@ -3471,6 +3471,112 @@ def test_command_cannot_escape_by_terminating_its_monitor(repo: Path, close_stdi
     assert not marker.exists()
 
 
+def test_process_maps_fd3_only_into_command_and_closes_monitor_copy(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    marker = repo / "fd3-mapping-source-state"
+    gate_read, gate_write = os.pipe()
+    if gate_read == 3:
+        moved_read = os.dup(gate_read)
+        os.close(gate_read)
+        gate_read = moved_read
+    gate_identity = os.fstat(gate_read)
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            "import os, pathlib, sys, time\n"
+            "source = int(sys.argv[2])\n"
+            "try:\n    os.fstat(source)\n"
+            "except OSError:\n    state = 'closed'\n"
+            "else:\n    state = 'leaked'\n"
+            "mapped = os.fstat(3)\n"
+            "state += ':correct' if (mapped.st_dev, mapped.st_ino) == "
+            "(int(sys.argv[3]), int(sys.argv[4])) else ':wrong'\n"
+            "os.close(3)\n"
+            "pathlib.Path(sys.argv[1]).write_text(state)\n"
+            "time.sleep(0.4)\n"
+        ),
+        str(marker),
+        str(gate_read),
+        str(gate_identity.st_dev),
+        str(gate_identity.st_ino),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            supervisor._run_process,
+            command,
+            "fd3 mapping containment test",
+            repo,
+            supervisor._child_env(),
+            fd3_source=gate_read,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and not future.done() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.read_text(encoding="utf-8") == "closed:correct"
+            os.close(gate_read)
+            gate_read = -1
+            with pytest.raises(BrokenPipeError):
+                os.write(gate_write, b"G")
+            result = future.result(timeout=5)
+            assert result["exit_code"] == 0
+        finally:
+            if gate_read >= 0:
+                os.close(gate_read)
+            os.close(gate_write)
+
+
+def test_monitor_protocol_header_always_has_fd3_field() -> None:
+    assert worker_trampoline._monitor_argv_prefix(10, 11, 12, (15, 14, 15), None) == [
+        "10",
+        "11",
+        "12",
+        worker_trampoline.MONITOR_MODE,
+        f"{worker_trampoline.LIFECYCLE_FDS_PREFIX}14,15",
+        f"{worker_trampoline._FD3_SOURCE_PREFIX}",
+    ]
+
+
+def test_process_rejects_standard_stream_as_fd3_source(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with pytest.raises(SupervisorError) as captured:
+        supervisor._run_process(
+            [sys.executable, "-c", "pass"],
+            "invalid fd3 mapping",
+            repo,
+            supervisor._child_env(),
+            fd3_source=2,
+        )
+    assert captured.value.code == "invalid_fd3_source"
+
+
+@pytest.mark.parametrize("pass_fd", [3, "source"])
+def test_process_rejects_fd3_source_passthrough_collisions(repo: Path, pass_fd: int | str) -> None:
+    supervisor = GitSupervisor(repo)
+    gate_read, gate_write = os.pipe()
+    if gate_read == 3:
+        moved_read = os.dup(gate_read)
+        os.close(gate_read)
+        gate_read = moved_read
+    try:
+        passthrough = gate_read if pass_fd == "source" else pass_fd
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "conflicting fd3 mapping",
+                repo,
+                supervisor._child_env(),
+                pass_fds=(passthrough,),
+                fd3_source=gate_read,
+            )
+        assert captured.value.code == "invalid_fd3_source"
+    finally:
+        os.close(gate_read)
+        os.close(gate_write)
+
+
 def test_integration_merge_disables_detached_and_blocking_repository_hooks(repo: Path) -> None:
     marker = repo / "post-merge-hook-escaped"
     hook = repo / ".git" / "hooks" / "post-merge"
