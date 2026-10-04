@@ -402,6 +402,31 @@ only; it did not launch an installed ACP worker or Codex/App Server. See
 [integration limits](INTEGRATIONS.md#outer-sandbox-status) and
 [PR #40](https://github.com/Rayha33/agent-control-plane/pull/40).
 
+### Read-only preflight recheck (2026-10-04)
+
+A read-only SSH check around 02:47 UTC returned Linux 6.18.15 x86_64, rootless
+`runc` 1.3.5 (OCI runtime spec 1.2.1), `cgroup2fs`, and
+`/proc/sys/user/max_user_namespaces=62761`. The command
+below succeeded, confirming those namespaces can be created for a short-lived
+no-op on this host:
+
+```sh
+unshare --user --map-root-user --mount --pid --fork --ipc --uts --net /bin/true
+```
+
+Around 02:52 UTC, the user manager reported `degraded`; the only failed unit
+listed by `systemctl --user --failed` was `hermes-search-lint.service`. A
+uniquely named transient user service was configured with
+`KillMode=control-group` and `UMask=0077`; `systemd-run --wait --collect`
+reported success for `/usr/bin/true` in 146 ms. A subsequent readback returned
+`LoadState=not-found`. Thus the degraded summary did not prevent this bounded
+service operation. The probe did not exercise descendant termination or verify
+cgroup ownership/placement.
+
+These no-op probes establish namespace/service-manager preconditions only;
+they do not test OCI mounts, cgroup-controller delegation, worker containment,
+cancellation, credentials, egress, or result import.
+
 ### Rootless OCI feasibility probe (2026-10-03)
 
 A separate disposable no-model probe on that NAS used rootless `runc` 1.3.5
