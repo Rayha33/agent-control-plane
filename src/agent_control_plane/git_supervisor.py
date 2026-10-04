@@ -194,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -732,6 +732,72 @@ def _add_sandbox_workspace_binding(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_sandbox_result_candidate_evidence(connection: sqlite3.Connection) -> None:
+    """Persist a versioned candidate-result receipt without authorizing import."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    additions = (
+        (
+            "result_candidate_version",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (result_candidate_version IN (0, 1))",
+        ),
+        ("result_candidate_json", "TEXT NOT NULL DEFAULT ''"),
+        ("result_candidate_digest", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_result_candidate_insert_guard")
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_result_candidate_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_result_candidate_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.result_candidate_version != 0
+          OR NEW.result_candidate_json != '' OR NEW.result_candidate_digest != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_result_candidate_must_be_host_captured');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_result_candidate_write_once
+        BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+          result_candidate_digest ON sandbox_executions
+        WHEN (
+          OLD.result_candidate_version = 0 AND NOT (
+            NEW.result_candidate_version = 1
+            AND NEW.result_candidate_json != ''
+            AND length(NEW.result_candidate_json) <= 65536
+            AND length(NEW.result_candidate_digest) = 64
+            AND OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_reported'
+            AND NEW.runc_exit_code = 0
+            AND NEW.runc_exit_observed_by = 'runc_client_popen_wait'
+            AND NEW.workspace_binding_version = 1
+            AND NEW.baseline_manifest_digest != ''
+            AND NEW.workspace_root_path != ''
+            AND NEW.workspace_root_dev IS NOT NULL
+            AND NEW.workspace_root_ino IS NOT NULL
+            AND NEW.cleanup_receipt_json != '{}'
+            AND instr(NEW.result_candidate_json, '"authorization":"none"') > 0
+            AND instr(NEW.result_candidate_json, '"status":"unverified"') > 0
+          )
+        ) OR (
+          OLD.result_candidate_version != 0 AND (
+            NEW.result_candidate_version IS NOT OLD.result_candidate_version
+            OR NEW.result_candidate_json IS NOT OLD.result_candidate_json
+            OR NEW.result_candidate_digest IS NOT OLD.result_candidate_digest
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_result_candidate_immutable');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -747,6 +813,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (13, _add_result_import_object_staging),
     (14, _add_sandbox_execution_journal),
     (15, _add_sandbox_workspace_binding),
+    (16, _add_sandbox_result_candidate_evidence),
 )
 
 

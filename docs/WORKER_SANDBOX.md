@@ -327,11 +327,33 @@ tree through `collect_changes` as hostile output. This closes the process-local
 `Snapshot`-provenance gap for baseline recovery; it does not close same-UID path
 races, impose an aggregate workspace disk quota, produce a worker-exit/cleanup
 attestation, or enable result import. No worker launch route, trusted cleanup
-verifier, or sandbox result-import contract is added here, and direct-worker
-behavior is unchanged. The SQLite triggers enforce ordinary journal transition
+verifier, or sandbox result-import route is added here, and direct-worker
+behavior is unchanged. Schema 16 adds a separate non-authorizing candidate
+receipt, described below. The SQLite triggers enforce ordinary journal transition
 and write-once invariants; they are not an adversarial boundary against a
 same-UID process with raw database-write access. A future executor must keep the
 supervisor database outside the worker's mount namespace.
+
+**Versioned result-candidate evidence (schema 16; non-authorizing).** After a
+successful recorded runc-client exit and an exact `cleanup_reported` row, the
+host can reopen the durable workspace binding, scan the mutable tree through
+`collect_changes` against the task's current write set, and recheck the saved
+workspace root device/inode. The write-once version-1 receipt binds the
+attempt, claim token, execution ID, baseline and workspace paths/device/inode,
+baseline manifest digest, resulting tree digest, change-set digest, the
+deterministic result-import digest, the recorded runc-client wait identity, and
+the digest of the cleanup report. It explicitly records `authorization: none`
+and `cleanup.status: unverified`; its SHA-256 is an integrity checksum, not a
+signature, independent attestation, or import authority. An identical retry is
+idempotent; a changed workspace result conflicts with the stored candidate
+instead of replacing it.
+
+For journaled sandbox attempts, import, recovery, and submission require a
+matching candidate receipt in addition to the existing `cleanup_verified` gate.
+This schema adds no trusted cleanup verifier and no sandbox result-import route,
+so a journaled candidate still cannot create or submit a result. Direct-worker
+behavior remains unchanged. Same-UID raw database writers, workspace path
+races, and runtime cleanup are not proved safe by this receipt.
 
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The

@@ -543,6 +543,341 @@ class SandboxExecutionJournalMixin:
             "workspace_inode": row["workspace_root_ino"],
         }
 
+    def _sandbox_execution_capture_result_candidate(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Host-scan and write once a non-authorizing result-candidate receipt."""
+
+        self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        binding = self._sandbox_execution_restore_workspace_binding(
+            attempt_id, claim_token, credential=credential
+        )
+        baseline_root, baseline_device, baseline_inode = _snapshot_origin(binding["baseline"])
+        with self.connect() as connection:
+            connection.execute("BEGIN")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if attempt["status"] != "working":
+                raise SupervisorError(
+                    "claim_inactive", "sandbox result attempt is no longer working"
+                )
+            self._authenticate_attempt(connection, attempt, credential)
+            execution = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if (
+                execution is None
+                or execution["execution_id"] != binding["execution_id"]
+                or execution["phase"] != "cleanup_reported"
+                or execution["runc_exit_code"] != 0
+                or execution["runc_exit_observed_by"] != "runc_client_popen_wait"
+                or execution["baseline_root_path"] != str(baseline_root)
+                or execution["baseline_root_dev"] != baseline_device
+                or execution["baseline_root_ino"] != baseline_inode
+                or execution["workspace_root_path"] != str(binding["workspace_root"])
+                or execution["workspace_root_dev"] != binding["workspace_device"]
+                or execution["workspace_root_ino"] != binding["workspace_inode"]
+            ):
+                raise SupervisorError(
+                    "sandbox_result_evidence_unverified",
+                    "candidate capture requires the exact exited, cleanup-reported workspace",
+                )
+            task = self._task_row(connection, attempt["task_id"])
+            write_set_rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
+
+        change_set = _collect_changes(
+            binding["baseline"].manifest,
+            binding["workspace_root"],
+            write_set_rules=write_set_rules,
+        )
+        change_set.validate()
+        _verify_directory_identity(
+            binding["workspace_root"],
+            expected_device=binding["workspace_device"],
+            expected_inode=binding["workspace_inode"],
+        )
+        workspace_path = str(binding["workspace_root"])
+        workspace_device = binding["workspace_device"]
+        workspace_inode = binding["workspace_inode"]
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if attempt["status"] != "working":
+                raise SupervisorError(
+                    "claim_inactive", "sandbox result attempt is no longer working"
+                )
+            self._authenticate_attempt(connection, attempt, credential)
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None or row["claim_token"] != claim_token:
+                raise SupervisorError(
+                    "sandbox_execution_not_found", "execution reservation is missing"
+                )
+            if (
+                row["phase"] != "cleanup_reported"
+                or row["runc_exit_code"] != 0
+                or row["runc_exit_observed_by"] != "runc_client_popen_wait"
+                or row["workspace_binding_version"] != 1
+                or row["baseline_root_path"] != str(baseline_root)
+                or row["baseline_root_dev"] != baseline_device
+                or row["baseline_root_ino"] != baseline_inode
+                or row["workspace_root_path"] != workspace_path
+                or row["workspace_root_dev"] != workspace_device
+                or row["workspace_root_ino"] != workspace_inode
+                or row["baseline_manifest_digest"] != change_set.baseline_digest
+            ):
+                raise SupervisorError(
+                    "sandbox_result_evidence_unverified",
+                    "candidate result is not bound to the exited execution workspace",
+                )
+            task = self._task_row(connection, attempt["task_id"])
+            current_write_set_rules = self._write_set_rules(
+                task, self._case_sensitive_paths(connection)
+            )
+            if current_write_set_rules != write_set_rules:
+                raise SupervisorError(
+                    "sandbox_result_evidence_conflict",
+                    "task write set changed while the candidate was captured",
+                )
+
+            cleanup_json = row["cleanup_receipt_json"]
+            if cleanup_json not in {
+                canonical_json(self._sandbox_cleanup_receipt(row)),
+                canonical_json(self._sandbox_cleanup_receipt_v1(row)),
+            }:
+                raise SupervisorError(
+                    "sandbox_result_evidence_unverified",
+                    "cleanup report is not the exact unverified journal receipt",
+                )
+            import_digest = hashlib.sha256(
+                canonical_json(
+                    {
+                        "baseline_digest": change_set.baseline_digest,
+                        "result_digest": change_set.result_digest,
+                        "change_digest": change_set.digest,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            candidate = {
+                "version": 1,
+                "authorization": "none",
+                "attempt_id": attempt_id,
+                "claim_token": claim_token,
+                "execution_id": row["execution_id"],
+                "workspace_binding": {
+                    "version": row["workspace_binding_version"],
+                    "baseline": {
+                        "path": row["baseline_root_path"],
+                        "device": row["baseline_root_dev"],
+                        "inode": row["baseline_root_ino"],
+                        "manifest_digest": row["baseline_manifest_digest"],
+                    },
+                    "workspace": {
+                        "path": row["workspace_root_path"],
+                        "device": row["workspace_root_dev"],
+                        "inode": row["workspace_root_ino"],
+                    },
+                },
+                "result": {
+                    "baseline_digest": change_set.baseline_digest,
+                    "tree_digest": change_set.result_digest,
+                    "change_digest": change_set.digest,
+                    "import_digest": import_digest,
+                },
+                "exit": {
+                    "code": row["runc_exit_code"],
+                    "observed_by": row["runc_exit_observed_by"],
+                    "runc_client_pid": row["runc_client_pid"],
+                    "runc_client_identity": row["runc_client_identity"],
+                },
+                "cleanup": {
+                    "status": "unverified",
+                    "report_digest": hashlib.sha256(cleanup_json.encode("utf-8")).hexdigest(),
+                },
+            }
+            encoded = canonical_json(candidate)
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if row["result_candidate_version"] == 1:
+                if (
+                    row["result_candidate_json"] != encoded
+                    or row["result_candidate_digest"] != digest
+                ):
+                    raise SupervisorError(
+                        "sandbox_result_evidence_conflict",
+                        "captured candidate differs from the immutable journal receipt",
+                    )
+                return {
+                    "candidate": candidate,
+                    "candidate_digest": digest,
+                    "change_set": change_set,
+                }
+            if row["result_candidate_version"] != 0:
+                raise SupervisorError(
+                    "sandbox_result_evidence_invalid", "candidate receipt version is unsupported"
+                )
+            changed = connection.execute(
+                """
+                UPDATE sandbox_executions
+                SET result_candidate_version = 1, result_candidate_json = ?,
+                    result_candidate_digest = ?, updated_at = ?
+                WHERE attempt_id = ? AND claim_token = ? AND phase = 'cleanup_reported'
+                  AND result_candidate_version = 0
+                """,
+                (encoded, digest, utc_now(), attempt_id, claim_token),
+            ).rowcount
+            if changed != 1:
+                raise SupervisorError(
+                    "sandbox_result_evidence_conflict", "candidate receipt changed concurrently"
+                )
+            self._event(
+                connection,
+                "sandbox.result_candidate_captured",
+                "supervisor",
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "execution_id": row["execution_id"],
+                    "candidate_digest": digest,
+                    "import_digest": import_digest,
+                    "authorization": "none",
+                    "cleanup_status": "unverified",
+                },
+            )
+        return {"candidate": candidate, "candidate_digest": digest, "change_set": change_set}
+
+    def _sandbox_execution_require_result_candidate_matches(
+        self,
+        connection: Any,
+        attempt_id: str,
+        *,
+        baseline_digest: str,
+        import_digest: str,
+        change_digest: str,
+    ) -> None:
+        """Match a sandbox import to its immutable, still non-authorizing capture."""
+
+        row = connection.execute(
+            "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            return
+        if row["result_candidate_version"] != 1 or not row["result_candidate_json"]:
+            raise SupervisorError(
+                "sandbox_result_evidence_missing", "sandbox import has no captured result candidate"
+            )
+        encoded = row["result_candidate_json"]
+        if not isinstance(encoded, str):
+            raise SupervisorError(
+                "sandbox_result_evidence_invalid", "sandbox result candidate is not bounded text"
+            )
+        try:
+            encoded_bytes = encoded.encode("utf-8")
+        except UnicodeEncodeError:
+            raise SupervisorError(
+                "sandbox_result_evidence_invalid", "sandbox result candidate is not valid UTF-8"
+            ) from None
+        if len(encoded_bytes) > 65536:
+            raise SupervisorError(
+                "sandbox_result_evidence_invalid", "sandbox result candidate is not bounded text"
+            )
+        try:
+            candidate = json.loads(encoded)
+        except (TypeError, ValueError):
+            candidate = None
+        digest = hashlib.sha256(encoded_bytes).hexdigest()
+        if (
+            not isinstance(candidate, dict)
+            or set(candidate)
+            != {
+                "version",
+                "authorization",
+                "attempt_id",
+                "claim_token",
+                "execution_id",
+                "workspace_binding",
+                "result",
+                "exit",
+                "cleanup",
+            }
+            or canonical_json(candidate) != encoded
+            or row["result_candidate_digest"] != digest
+        ):
+            raise SupervisorError(
+                "sandbox_result_evidence_invalid", "sandbox result candidate digest is invalid"
+            )
+        result = candidate.get("result")
+        tree_digest = result.get("tree_digest") if isinstance(result, dict) else ""
+        if not all(
+            isinstance(value, str) and _DIGEST.fullmatch(value) is not None
+            for value in (baseline_digest, import_digest, change_digest, tree_digest)
+        ):
+            raise SupervisorError(
+                "sandbox_result_evidence_invalid", "sandbox result candidate digest is invalid"
+            )
+        expected_import_digest = hashlib.sha256(
+            canonical_json(
+                {
+                    "baseline_digest": baseline_digest,
+                    "result_digest": tree_digest,
+                    "change_digest": change_digest,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        expected_binding = {
+            "version": row["workspace_binding_version"],
+            "baseline": {
+                "path": row["baseline_root_path"],
+                "device": row["baseline_root_dev"],
+                "inode": row["baseline_root_ino"],
+                "manifest_digest": row["baseline_manifest_digest"],
+            },
+            "workspace": {
+                "path": row["workspace_root_path"],
+                "device": row["workspace_root_dev"],
+                "inode": row["workspace_root_ino"],
+            },
+        }
+        expected_exit = {
+            "code": row["runc_exit_code"],
+            "observed_by": row["runc_exit_observed_by"],
+            "runc_client_pid": row["runc_client_pid"],
+            "runc_client_identity": row["runc_client_identity"],
+        }
+        expected_cleanup = {
+            "status": "unverified",
+            "report_digest": hashlib.sha256(
+                row["cleanup_receipt_json"].encode("utf-8")
+            ).hexdigest(),
+        }
+        if (
+            candidate.get("version") != 1
+            or type(candidate.get("version")) is not int
+            or candidate.get("authorization") != "none"
+            or candidate.get("attempt_id") != attempt_id
+            or type(candidate.get("claim_token")) is not int
+            or candidate.get("claim_token") != row["claim_token"]
+            or candidate.get("execution_id") != row["execution_id"]
+            or candidate.get("workspace_binding") != expected_binding
+            or candidate.get("exit") != expected_exit
+            or candidate.get("cleanup") != expected_cleanup
+            or baseline_digest != row["baseline_manifest_digest"]
+            or not isinstance(result, dict)
+            or set(result) != {"baseline_digest", "tree_digest", "change_digest", "import_digest"}
+            or result.get("baseline_digest") != row["baseline_manifest_digest"]
+            or result.get("change_digest") != change_digest
+            or result.get("import_digest") != import_digest
+            or expected_import_digest != import_digest
+        ):
+            raise SupervisorError(
+                "sandbox_result_evidence_mismatch",
+                "sandbox import does not match its captured execution candidate",
+            )
+
     def _sandbox_execution_transition(
         self,
         attempt_id: str,
@@ -1016,6 +1351,11 @@ class SandboxExecutionJournalMixin:
             value["cleanup_receipt"] = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
             value["cleanup_receipt"] = {"state": "unavailable"}
+        raw_candidate = value.pop("result_candidate_json", "")
+        try:
+            value["result_candidate"] = json.loads(raw_candidate) if raw_candidate else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value["result_candidate"] = {"state": "unavailable"}
         return value
 
     @staticmethod

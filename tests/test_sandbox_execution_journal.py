@@ -95,12 +95,12 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v15_requires_durable_workspace_binding_before_launch(repo: Path) -> None:
+def test_schema_v16_requires_durable_workspace_binding_before_launch(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 15
+    assert SCHEMA_VERSION == 16
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["baseline_manifest_digest"]
@@ -111,6 +111,7 @@ def test_schema_v15_requires_durable_workspace_binding_before_launch(repo: Path)
     assert row["runtime_version"] == "runc 1.3.5"
     assert row["oci_version"] == "1.2.1"
     assert row["rootfs_digest"] == "b" * 64
+    assert row["result_candidate_version"] == 0
     assert row["bundle_path"].startswith(str((repo / ".acp" / "sandbox-executions").resolve()))
     assert row["state_path"].endswith("/state")
 
@@ -118,6 +119,15 @@ def test_schema_v15_requires_durable_workspace_binding_before_launch(repo: Path)
         migration = dict(MIGRATIONS)[15]
         migration(connection)
         migration(connection)
+        result_migration = dict(MIGRATIONS)[16]
+        result_migration(connection)
+        result_migration(connection)
+        with pytest.raises(sqlite3.IntegrityError, match="result_candidate_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET result_candidate_version = 1, "
+                "result_candidate_json = '{}', result_candidate_digest = ? WHERE attempt_id = ?",
+                ("c" * 64, attempt["id"]),
+            )
         with pytest.raises(sqlite3.IntegrityError, match="phase_transition_invalid"):
             connection.execute(
                 "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
@@ -149,6 +159,54 @@ def test_schema_v15_requires_durable_workspace_binding_before_launch(repo: Path)
                 "DELETE FROM sandbox_executions WHERE attempt_id = ?", (attempt["id"],)
             )
     assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_v15_to_v16_migration_adds_non_authorizing_candidate_fields() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("CREATE TABLE attempts (id TEXT PRIMARY KEY, pid INTEGER)")
+        connection.execute("INSERT INTO attempts (id, pid) VALUES ('attempt-1', NULL)")
+        migrations = dict(MIGRATIONS)
+        migrations[14](connection)
+        migrations[15](connection)
+
+        v15_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")
+        }
+        candidate_columns = {
+            "result_candidate_version",
+            "result_candidate_json",
+            "result_candidate_digest",
+        }
+        assert candidate_columns.isdisjoint(v15_columns)
+        connection.execute(
+            """
+            INSERT INTO sandbox_executions
+              (attempt_id, claim_token, execution_id, backend, container_id,
+               bundle_digest, rootfs_digest, runtime_version, oci_version,
+               bundle_path, state_path, phase, created_at, updated_at)
+            VALUES (?, 1, 'execution-1', 'oci-runc', 'container-1', ?, ?,
+                    'runc 1.3.5', '1.2.1', '/bundle', '/state', 'reserved', 'now', 'now')
+            """,
+            ("attempt-1", "a" * 64, "b" * 64),
+        )
+
+        migrations[16](connection)
+        migrations[16](connection)
+        v16_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")
+        }
+        assert candidate_columns.issubset(v16_columns)
+        migrated = connection.execute(
+            "SELECT result_candidate_version, result_candidate_json, result_candidate_digest "
+            "FROM sandbox_executions WHERE attempt_id = 'attempt-1'"
+        ).fetchone()
+        assert migrated["result_candidate_version"] == 0
+        assert migrated["result_candidate_json"] == ""
+        assert migrated["result_candidate_digest"] == ""
+    finally:
+        connection.close()
 
 
 def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
@@ -760,6 +818,122 @@ def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: P
         ).fetchone()
     assert lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "cleanup_reported"
+
+
+def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    workspace = Path(row["workspace_root_path"])
+    record_launch(supervisor, attempt)
+    supervisor._sandbox_execution_record_running(
+        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+    )
+    (workspace / "alpha.txt").write_text("candidate result\n", encoding="utf-8")
+    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+    )
+
+    captured = supervisor._sandbox_execution_capture_result_candidate(
+        attempt["id"], attempt["claim_token"]
+    )
+    candidate = captured["candidate"]
+    change_set = captured["change_set"]
+    assert candidate["version"] == 1
+    assert candidate["authorization"] == "none"
+    assert candidate["attempt_id"] == attempt["id"]
+    assert candidate["claim_token"] == attempt["claim_token"]
+    assert candidate["execution_id"] == row["execution_id"]
+    assert candidate["workspace_binding"]["baseline"]["manifest_digest"] == (
+        change_set.baseline_digest
+    )
+    assert candidate["workspace_binding"]["workspace"]["path"] == str(workspace)
+    assert candidate["workspace_binding"]["workspace"]["device"] == row["workspace_root_dev"]
+    assert candidate["workspace_binding"]["workspace"]["inode"] == row["workspace_root_ino"]
+    assert candidate["result"]["tree_digest"] == change_set.result_digest
+    assert candidate["result"]["change_digest"] == change_set.digest
+    assert candidate["result"]["import_digest"]
+    recorded = supervisor._sandbox_execution_get(attempt["id"])
+    assert candidate["exit"] == {
+        "code": 0,
+        "observed_by": "runc_client_popen_wait",
+        "runc_client_pid": recorded["runc_client_pid"],
+        "runc_client_identity": recorded["runc_client_identity"],
+    }
+    assert candidate["cleanup"]["status"] == "unverified"
+    assert (
+        captured["candidate_digest"]
+        == hashlib.sha256(canonical_json(candidate).encode("utf-8")).hexdigest()
+    )
+
+    binding = supervisor._sandbox_execution_restore_workspace_binding(
+        attempt["id"], attempt["claim_token"]
+    )
+    with supervisor.connect() as connection:
+        supervisor._sandbox_execution_require_result_candidate_matches(
+            connection,
+            attempt["id"],
+            baseline_digest=change_set.baseline_digest,
+            import_digest=candidate["result"]["import_digest"],
+            change_digest=change_set.digest,
+        )
+        with pytest.raises(SupervisorError) as mismatch:
+            supervisor._sandbox_execution_require_result_candidate_matches(
+                connection,
+                attempt["id"],
+                baseline_digest=change_set.baseline_digest,
+                import_digest="0" * 64,
+                change_digest=change_set.digest,
+            )
+    assert mismatch.value.code == "sandbox_result_evidence_mismatch"
+
+    with pytest.raises(SupervisorError) as imported:
+        supervisor.import_worker_result(
+            attempt["id"], attempt["claim_token"], binding["baseline"], change_set
+        )
+    assert imported.value.code == "sandbox_result_unverified"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
+    reopened = GitSupervisor(repo)
+    persisted = reopened._sandbox_execution_get(attempt["id"])
+    assert persisted["result_candidate"] == candidate
+    assert persisted["result_candidate_digest"] == captured["candidate_digest"]
+
+
+def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    workspace = Path(row["workspace_root_path"])
+    record_launch(supervisor, attempt)
+    supervisor._sandbox_execution_record_running(
+        attempt["id"], attempt["claim_token"], init_pid=303, init_identity="init-start-303"
+    )
+    (workspace / "alpha.txt").write_text("candidate v1\n", encoding="utf-8")
+    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+    )
+
+    first = supervisor._sandbox_execution_capture_result_candidate(
+        attempt["id"], attempt["claim_token"]
+    )
+    replay = supervisor._sandbox_execution_capture_result_candidate(
+        attempt["id"], attempt["claim_token"]
+    )
+    assert replay["candidate"] == first["candidate"]
+    assert replay["candidate_digest"] == first["candidate_digest"]
+
+    (workspace / "alpha.txt").write_text("candidate v2\n", encoding="utf-8")
+    with pytest.raises(SupervisorError) as conflict:
+        supervisor._sandbox_execution_capture_result_candidate(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert conflict.value.code == "sandbox_result_evidence_conflict"
+    persisted = supervisor._sandbox_execution_get(attempt["id"])
+    assert persisted["result_candidate"] == first["candidate"]
+    assert persisted["result_candidate_digest"] == first["candidate_digest"]
 
 
 def test_persisted_v1_cleanup_receipt_replays_read_only_but_never_proves_cleanup(

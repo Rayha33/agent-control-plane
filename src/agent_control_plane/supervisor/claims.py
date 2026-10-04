@@ -2662,6 +2662,13 @@ class ClaimsMixin:
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
             self._authenticate_attempt(connection, attempt, credential)
             _require_sandbox_execution_result_eligible(connection, attempt_id)
+            self._sandbox_execution_require_result_candidate_matches(
+                connection,
+                attempt_id,
+                baseline_digest=baseline.manifest.digest,
+                import_digest=result_digest,
+                change_digest=change_set.digest,
+            )
             if not attempt["base_checkout_snapshot_required"]:
                 raise SupervisorError(
                     "base_checkout_snapshot_invalid",
@@ -2783,6 +2790,13 @@ class ClaimsMixin:
                     )
                     self._authenticate_attempt(connection, current, credential)
                     _require_sandbox_execution_result_eligible(connection, attempt_id)
+                    self._sandbox_execution_require_result_candidate_matches(
+                        connection,
+                        attempt_id,
+                        baseline_digest=baseline.manifest.digest,
+                        import_digest=result_digest,
+                        change_digest=change_set.digest,
+                    )
                     current_receipt = self._worker_exit_receipt_in(connection, current, worker_pid)
                     if (
                         current["pid_identity"] != attempt_snapshot["pid_identity"]
@@ -2898,7 +2912,9 @@ class ClaimsMixin:
         self._assert_no_git_grafts()
         with self.connect() as connection:
             preflight_row = connection.execute(
-                "SELECT attempt_id FROM result_imports WHERE id = ?", (import_id,)
+                "SELECT attempt_id, baseline_digest, result_digest, change_digest "
+                "FROM result_imports WHERE id = ?",
+                (import_id,),
             ).fetchone()
             if preflight_row is not None:
                 preflight_attempt = connection.execute(
@@ -2908,6 +2924,13 @@ class ClaimsMixin:
                     self._authenticate_attempt(connection, preflight_attempt, credential)
                     _require_sandbox_execution_result_eligible(
                         connection, preflight_row["attempt_id"]
+                    )
+                    self._sandbox_execution_require_result_candidate_matches(
+                        connection,
+                        preflight_row["attempt_id"],
+                        baseline_digest=preflight_row["baseline_digest"],
+                        import_digest=preflight_row["result_digest"],
+                        change_digest=preflight_row["change_digest"],
                     )
         # Missing/corrupt journals still need bounded orphan-stage cleanup before
         # the existing not-found/ambiguous checks below.
@@ -2929,6 +2952,13 @@ class ClaimsMixin:
                 )
             self._authenticate_attempt(connection, attempt_row, credential)
             _require_sandbox_execution_result_eligible(connection, row["attempt_id"])
+            self._sandbox_execution_require_result_candidate_matches(
+                connection,
+                row["attempt_id"],
+                baseline_digest=row["baseline_digest"],
+                import_digest=row["result_digest"],
+                change_digest=row["change_digest"],
+            )
             try:
                 expected_id = str(
                     uuid.uuid5(
@@ -3105,6 +3135,13 @@ class ClaimsMixin:
                     )
                     self._authenticate_attempt(connection, active, credential)
                     _require_sandbox_execution_result_eligible(connection, current["attempt_id"])
+                    self._sandbox_execution_require_result_candidate_matches(
+                        connection,
+                        current["attempt_id"],
+                        baseline_digest=current["baseline_digest"],
+                        import_digest=current["result_digest"],
+                        change_digest=current["change_digest"],
+                    )
                     current_receipt = self._worker_exit_receipt_in(
                         connection, active, current["worker_pid"]
                     )
@@ -3323,6 +3360,14 @@ class ClaimsMixin:
             attempt = self._active_attempt(connection, attempt_id, claim_token, epoch)
             self._authenticate_attempt(connection, attempt, credential)
             _require_sandbox_execution_result_eligible(connection, attempt_id)
+            sandbox_execution = connection.execute(
+                "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if sandbox_execution is not None and imported_result_id is None:
+                raise SupervisorError(
+                    "sandbox_result_evidence_missing",
+                    "journaled sandbox submission requires a matching imported result",
+                )
             if expected_worker_pid is None and attempt["pid"] is not None:
                 raise SupervisorError(
                     "worker_still_running",
@@ -3365,6 +3410,13 @@ class ClaimsMixin:
                         "result_import_ambiguous",
                         "result journal does not match this exact attempt",
                     )
+                self._sandbox_execution_require_result_candidate_matches(
+                    connection,
+                    attempt_id,
+                    baseline_digest=import_row["baseline_digest"],
+                    import_digest=import_row["result_digest"],
+                    change_digest=import_row["change_digest"],
+                )
                 receipt = self._worker_exit_receipt_in(connection, attempt, expected_worker_pid)
                 if receipt != import_row["worker_exit_receipt_json"]:
                     raise SupervisorError(
