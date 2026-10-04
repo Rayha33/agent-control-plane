@@ -653,6 +653,51 @@ concurrent attempts, or the host-validated result-import path. Worker
 execution remains direct-host with bounded log capture only; no filesystem
 isolation is integrated, and `externalSandbox` remains disabled.
 
+### Bounded direct-runc descriptor and isolation rerun (2026-10-04; one NAS host)
+
+The opt-in no-model fixture was rerun from a disposable `/tmp` checkout using
+the exact `tests/test_oci_worker_runtime.py` SHA-256
+`69a8b60d240a89630f9482498fb16d90750850fb33b672031bb8c9736c3afdaa`. Preflight
+observed uid 1000, Linux 6.18.15, rootless runc 1.3.5, active user systemd,
+two user processes in D state (below the stop threshold of five), and a `/tmp`
+tmpfs at 19% use. The host-provided BusyBox was 1.35.0; the copied rootfs tree
+SHA-256 was
+`0fd9d84bf185648243c7734df37a43ab3d3f74e50eef7526b49c1e764179b6cc`.
+
+The generated OCI configuration requested a read-only rootfs, empty capability
+sets, and `noNewPrivileges`; its configured mount destinations were only
+`/proc`, `/workspace`, `/tmp`, and `/home/agent`. The run verified the specific
+write and path denials below, but did not read back effective capabilities,
+`NoNewPrivs`, or runtime mountinfo. Immediately before release, the exact init
+PID's host-side descriptor table was read twice, bracketed before/between/after
+by live PID/start-time and cgroup checks. It was stable and contained exactly
+fd 0/1/2, each a pipe; no non-stdio or socket descriptor was present. The
+fixture's path probes denied
+the source checkout, sibling attempt, unrelated project, host home/config,
+synthetic credential marker, host `/tmp` sentinel, host `/etc/os-release`, and
+absolute/relative symlink escapes. It also confirmed the assigned workspace,
+private tmpfs, and private home were writable. The candidate-visible interfaces
+were only `lo`, no default route was present, the host-NIC connection probe
+returned 1, and the test-owned host listener was not reached.
+
+The exact attempt scope was
+`acp-acp-live-b59dfca6b2e6415387c3f52e1fc61300.scope`; its cgroup readbacks
+were `memory.max=134217728`, `pids.max=16`, and `cpu.max=50000 100000`. The
+test completed with exit 0 after exact-ID runtime teardown and verified the
+container PID/start identity, state, cgroup, and systemd scope absent; an
+independent postflight also found no matching process/scope or checkout write
+canary. This rerun supplies the explicit cleanup evidence missing from the
+earlier feasibility note.
+
+The second workspace-file marker only synchronizes this fixed BusyBox fixture;
+because the worker-writable workspace contains it, hostile candidate code could
+release itself. This is not a host-owned gate for an arbitrary worker. The
+test still launches direct `runc` from a no-model harness, not the registered
+supervised worker executor. It does not prove Codex/App Server authentication,
+real-provider egress, generated-diff transfer, worker cancellation/crash
+recovery, or complete task #2370 acceptance. The feature remains unintegrated
+and `externalSandbox` remains disabled.
+
 ### systemd/runc cgroup composition probe (2026-10-03)
 
 The first wrapper-only test used rootless runc under a transient service with
