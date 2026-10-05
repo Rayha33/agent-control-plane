@@ -40,6 +40,23 @@ synchronous, and no code reads back runtime state before releasing the OCI init
 gate. It proves no namespace, mount, credential, egress, cancellation, or
 result-import property.
 
+**Private Git bootstrap policy (compiler only; not integrated).** The OCI
+policy compiler now has an opt-in `private_git` mode for a rootfs that includes
+Git. Its fixed PID-1 script waits on the inherited launch gate, then initializes
+a new repository inside the mutable `/workspace` before starting the candidate
+command. It disables system/global Git config and system attributes, disables
+terminal prompts and hooks, and passes an explicitly empty template directory
+on the attempt's private `/tmp` tmpfs so Git's installed or user-selected
+templates cannot seed refs, alternates, hooks, or config. Before candidate exec,
+the script rejects unexpected alternates, remotes, refs, or baseline history and
+creates one fresh input-snapshot commit without host repository history. The
+host snapshot is copied without `.git`; after execution, result capture ignores
+only the root `.git` entry and derives changes from captured file bytes, never
+from worker Git metadata. This does not yet provide an execution route: no
+supervisor passes or releases fd 3, and configured `run_worker` remains
+fail-closed. The private repository is untrusted worker state, not a submission
+receipt or authorization source.
+
 The namespace runtime probe records a validated
 `systemd_unit_invocation_id` in its runtime-driver evidence and append-only
 runtime audit event when systemd provides one, so a later teardown sample cannot
@@ -170,7 +187,10 @@ assumptions, not properties proved by a namespace test.
    wholly inside the private attempt root with an isolated `HOME`, empty hooks,
    scrubbed system/global config, and no alternates, shared object directory,
    worktree pointer, credential helper, or host repository path. A private
-   sandbox commit is input convenience, not submission authority.
+   sandbox commit is input convenience, not submission authority. The current
+   OCI compiler's opt-in post-gate bootstrap implements this Git policy inside
+   `/workspace`; it is not yet connected to the supervisor's `run_worker`
+   lifecycle or result-import route.
 3. **Proposed OS-owned lifecycle (partial composition evidence; ACP integration
    unproven).** The feasibility
    result makes a rootless OCI boundary the leading model/provider-independent

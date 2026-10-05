@@ -28,7 +28,11 @@ from agent_control_plane.supervisor.oci_worker import (
     build_oci_worker_config,
     build_runc_run_argv,
 )
-from agent_control_plane.supervisor.sandbox_workspace import Snapshot, copy_snapshot
+from agent_control_plane.supervisor.sandbox_workspace import (
+    Snapshot,
+    collect_changes,
+    copy_snapshot,
+)
 
 _OCI_SCHEMA_DIR = Path(__file__).parent / "data" / "oci-runtime-spec-v1.2.1"
 _OCI_SCHEMA_FILES = (
@@ -97,7 +101,7 @@ def _pin_test_rootfs(rootfs: Path) -> oci_worker._TrustedRootfs:
     )
 
 
-def compile_config(bundle: Path, workspace: Snapshot) -> dict:
+def compile_config(bundle: Path, workspace: Snapshot, *, private_git: bool = False) -> dict:
     rootfs = bundle / "rootfs"
     rootfs_pin = _pin_test_rootfs(rootfs)
     return build_oci_worker_config(
@@ -109,6 +113,7 @@ def compile_config(bundle: Path, workspace: Snapshot) -> dict:
         memory_bytes=256 * 1024 * 1024,
         pids_limit=32,
         cpu_quota_us=100_000,
+        private_git=private_git,
     )
 
 
@@ -1211,6 +1216,211 @@ def test_oci_policy_launch_gate_fails_closed_and_closes_fd_before_candidate_exec
     ]
     assert "|| exit 125" in process_args[2]
     assert "exec 3<&-" in process_args[2]
+
+
+def test_private_git_policy_requires_git_in_the_pinned_rootfs(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+
+    with pytest.raises(SupervisorError, match="private Git mode requires") as error:
+        compile_config(bundle, workspace, private_git=True)
+
+    assert error.value.code == "invalid_oci_executable"
+    for executable in ("git", "mkdir", "rmdir"):
+        path = bundle / "rootfs" / "usr" / "bin" / executable
+        path.write_text(f"pinned {executable} placeholder\n", encoding="ascii")
+        path.chmod(0o700)
+    config = compile_config(bundle, workspace, private_git=True)
+
+    assert config["process"]["args"][2] == oci_worker._render_private_git_launch_script(
+        git_path="/usr/bin/git",
+        mkdir_path="/usr/bin/mkdir",
+        rmdir_path="/usr/bin/rmdir",
+    )
+    assert set(config["process"]["env"]) >= {
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_ATTR_NOSYSTEM=1",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_CEILING_DIRECTORIES=/workspace",
+    }
+    assert (
+        '/usr/bin/git init --quiet --template="$_acp_git_template" . || exit 125'
+        in config["process"]["args"][2]
+    )
+    assert (
+        "unset GIT_TEMPLATE_DIR GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE"
+        in config["process"]["args"][2]
+    )
+    assert "core.hooksPath /dev/null || exit 125" in config["process"]["args"][2]
+    assert "/usr/bin/git add --all --force -- . || exit 125" in config["process"]["args"][2]
+    assert '/usr/bin/git rev-list --all --count)" = 1 || exit 125' in config["process"]["args"][2]
+    assert 'exec "$@"' in config["process"]["args"][2]
+    assert "/shared/repo" not in config["process"]["args"][2]
+
+
+def test_private_git_policy_invokes_validated_absolute_tools_not_shadowed_path(
+    tmp_path: Path,
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    rootfs = bundle / "rootfs"
+    (rootfs / "usr" / "bin" / "git").symlink_to("/workspace/attacker-git")
+    for executable in ("git", "mkdir", "rmdir"):
+        path = rootfs / "bin" / executable
+        path.write_text(f"pinned {executable} placeholder\n", encoding="ascii")
+        path.chmod(0o700)
+
+    config = compile_config(bundle, workspace, private_git=True)
+    script = config["process"]["args"][2]
+
+    assert "/bin/git init --quiet --template=" in script
+    assert "/bin/git rev-list --all --count" in script
+    assert '/bin/mkdir "$_acp_git_template"' in script
+    assert '/bin/rmdir "$_acp_git_template"' in script
+    assert "/usr/bin/git " not in script
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private Git bootstrap needs POSIX descriptors")
+def test_private_git_bootstrap_waits_for_release_and_host_import_ignores_git_metadata(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("host Git is unavailable for the bounded bootstrap behavior test")
+    git_path = shutil.which("git")
+    mkdir_path = shutil.which("mkdir")
+    rmdir_path = shutil.which("rmdir")
+    if git_path is None or mkdir_path is None or rmdir_path is None:
+        pytest.skip("host Git bootstrap utilities are unavailable")
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "input.txt").write_text("original\n", encoding="utf-8")
+    hostile_template = tmp_path / "hostile-template"
+    hostile_alternates = hostile_template / "objects" / "info" / "alternates"
+    hostile_alternates.parent.mkdir(parents=True)
+    external_objects = tmp_path / "external-objects"
+    external_objects.mkdir()
+    hostile_alternates.write_text(f"{external_objects}\n", encoding="utf-8")
+    hostile_ref = hostile_template / "refs" / "heads" / "injected"
+    hostile_ref.parent.mkdir(parents=True)
+    hostile_ref.write_text(f"{'1' * 40}\n", encoding="ascii")
+    hostile_probe = tmp_path / "hostile-probe"
+    hostile_env = {
+        **os.environ,
+        "GIT_TEMPLATE_DIR": str(hostile_template),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+    }
+    subprocess.run(
+        ["git", "init", "--quiet", str(hostile_probe)],
+        check=True,
+        env=hostile_env,
+        capture_output=True,
+        text=True,
+    )
+    assert (hostile_probe / ".git" / "objects" / "info" / "alternates").read_text(
+        encoding="utf-8"
+    ) == f"{external_objects}\n"
+    assert (hostile_probe / ".git" / "refs" / "heads" / "injected").exists()
+
+    baseline = copy_snapshot(source, tmp_path / "baseline")
+    workspace = copy_snapshot(source, tmp_path / "workspace")
+    read_fd, write_fd = os.pipe()
+    child_read_fd = fcntl.fcntl(read_fd, fcntl.F_DUPFD, 10)
+    os.close(read_fd)
+    candidate = (
+        "test -d .git && test ! -L .git && "
+        'test "$(git rev-parse --is-inside-work-tree)" = true && '
+        'test "$(git symbolic-ref --short HEAD)" = acp-worker && '
+        'test -z "$(git remote)" && '
+        "test ! -e .git/objects/info/alternates && "
+        "test ! -e .git/objects/info/http-alternates && "
+        "test ! -e .git/commondir && "
+        "test \"$(git for-each-ref --format='%(refname)')\" = refs/heads/acp-worker && "
+        'test "$(git rev-list --all --count)" = 1 && '
+        'test -z "${GIT_TEMPLATE_DIR-}" && '
+        'test -z "${GIT_DIR-}" && '
+        'test -z "${GIT_COMMON_DIR-}" && '
+        'test -z "${GIT_WORK_TREE-}" && '
+        'test -z "${GIT_OBJECT_DIRECTORY-}" && '
+        'test -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES-}" && '
+        'test -z "${GIT_INDEX_FILE-}" && '
+        'test "$(git config --local --get core.hooksPath)" = /dev/null && '
+        'test "$GIT_CONFIG_NOSYSTEM" = 1 && '
+        'test "$GIT_CONFIG_GLOBAL" = /dev/null && '
+        'test "$(git show HEAD:input.txt)" = original && '
+        'printf "result\\n" > result.txt'
+    )
+    launch_script = oci_worker._render_private_git_launch_script(
+        git_path=git_path,
+        mkdir_path=mkdir_path,
+        rmdir_path=rmdir_path,
+    )
+    script = 'cd "$1" || exit 125; shift\n' + launch_script
+    argv = [
+        "/bin/sh",
+        "-c",
+        script,
+        "acp-launch-gate-test",
+        str(workspace.root),
+        "/bin/sh",
+        "-c",
+        candidate,
+    ]
+    pid = os.posix_spawn(
+        "/bin/sh",
+        argv,
+        {
+            "HOME": str(tmp_path),
+            "PATH": "/usr/bin:/bin",
+            "GIT_TEMPLATE_DIR": str(hostile_template),
+            "GIT_DIR": str(hostile_probe / ".git"),
+            "GIT_COMMON_DIR": str(hostile_probe / ".git"),
+            "GIT_WORK_TREE": str(hostile_probe),
+            "GIT_OBJECT_DIRECTORY": str(hostile_probe / ".git" / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(external_objects),
+            "GIT_INDEX_FILE": str(tmp_path / "hostile-index"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "init.templateDir",
+            "GIT_CONFIG_VALUE_0": str(hostile_template),
+        },
+        file_actions=[
+            (os.POSIX_SPAWN_DUP2, child_read_fd, 3),
+            (os.POSIX_SPAWN_CLOSE, child_read_fd),
+            (os.POSIX_SPAWN_CLOSE, write_fd),
+        ],
+    )
+    os.close(child_read_fd)
+
+    status: int | None = None
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            finished, observed_status = os.waitpid(pid, os.WNOHANG)
+            if finished == pid:
+                status = observed_status
+                break
+            if (workspace.root / ".git").exists():
+                break
+            time.sleep(0.005)
+        assert status is None, "private Git initialization ran before gate release"
+        assert not (workspace.root / ".git").exists()
+        assert os.write(write_fd, b"release\n") == len(b"release\n")
+    finally:
+        os.close(write_fd)
+        if status is None:
+            _, status = os.waitpid(pid, 0)
+
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 0
+    assert (workspace.root / ".git").is_dir()
+    assert not (workspace.root / ".git").is_symlink()
+    assert not (source / ".git").exists()
+    changes = collect_changes(
+        baseline.manifest,
+        workspace.root,
+        write_set_rules=(("result.txt", False, False),),
+    )
+    assert [change.path for change in changes.changes] == ["result.txt"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="launch gate requires POSIX inherited descriptors")

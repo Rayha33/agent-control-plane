@@ -60,6 +60,59 @@ _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
+_LAUNCH_GATE_PRIVATE_GIT_SCRIPT = """\
+IFS= read -r _ <&3 || exit 125
+exec 3<&-
+umask 077 || exit 125
+unset GIT_TEMPLATE_DIR GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE \\
+  GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE \\
+  GIT_NAMESPACE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_REPLACE_REF_BASE \\
+  GIT_SHALLOW_FILE GIT_GRAFT_FILE GIT_ATTR_SOURCE || exit 125
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_ATTR_NOSYSTEM=1
+export GIT_TERMINAL_PROMPT=0
+export GIT_CEILING_DIRECTORIES=/workspace
+test ! -e .git && test ! -L .git || exit 125
+_acp_git_template=/tmp/acp-git-template-$$
+@ACP_MKDIR@ "$_acp_git_template" || exit 125
+@ACP_GIT@ init --quiet --template="$_acp_git_template" . || exit 125
+@ACP_RMDIR@ "$_acp_git_template" || exit 125
+test ! -e .git/objects/info/alternates && \\
+  test ! -L .git/objects/info/alternates || exit 125
+test ! -e .git/objects/info/http-alternates && \\
+  test ! -L .git/objects/info/http-alternates || exit 125
+test ! -e .git/commondir && test ! -L .git/commondir || exit 125
+test ! -e .git/info/grafts && test ! -L .git/info/grafts || exit 125
+test ! -e .git/shallow && test ! -L .git/shallow || exit 125
+@ACP_GIT@ symbolic-ref HEAD refs/heads/acp-worker || exit 125
+@ACP_GIT@ config --local core.hooksPath /dev/null || exit 125
+@ACP_GIT@ config --local core.fsmonitor false || exit 125
+@ACP_GIT@ config --local core.excludesFile /dev/null || exit 125
+@ACP_GIT@ add --all --force -- . || exit 125
+@ACP_GIT@ -c 'user.name=ACP Worker' -c user.email=acp-worker@localhost \\
+  -c commit.gpgsign=false commit --quiet --allow-empty --no-verify \\
+  -m 'ACP isolated input snapshot' || exit 125
+test -z "$(@ACP_GIT@ remote)" || exit 125
+test "$(@ACP_GIT@ for-each-ref --format='%(refname)')" = refs/heads/acp-worker || exit 125
+test "$(@ACP_GIT@ rev-list --all --count)" = 1 || exit 125
+exec "$@"
+"""
+
+
+def _render_private_git_launch_script(*, git_path: str, mkdir_path: str, rmdir_path: str) -> str:
+    script = _LAUNCH_GATE_PRIVATE_GIT_SCRIPT
+    for token, path in (
+        ("@ACP_GIT@", git_path),
+        ("@ACP_MKDIR@", mkdir_path),
+        ("@ACP_RMDIR@", rmdir_path),
+    ):
+        script = script.replace(token, path)
+    if "@ACP_" in script:
+        raise ValueError("private Git launch script has an unresolved executable")
+    return script
+
+
 _BOUNDED_COMMAND_GUARDIAN = """\
 import os
 import signal
@@ -1468,6 +1521,7 @@ def build_oci_worker_config(
     cpu_period_us: int = 100_000,
     tmpfs_bytes: int = _DEFAULT_TMPFS_BYTES,
     home_bytes: int = _DEFAULT_HOME_BYTES,
+    private_git: bool = False,
     host_uid: int | None = None,
     host_gid: int | None = None,
 ) -> dict[str, Any]:
@@ -1537,11 +1591,34 @@ def build_oci_worker_config(
     # checking that the directory is private does not establish that it is the
     # intended attempt snapshot or that it was not changed after capture.
     read_snapshot_files(workspace_snapshot)
+    if type(private_git) is not bool:
+        raise SupervisorError("invalid_oci_worker_policy", "private_git must be a boolean")
+    private_git_paths: dict[str, str] = {}
     if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
         raise SupervisorError("invalid_oci_worker_policy", "OCI container ID is invalid")
     args = _validate_command(command)
     _validate_rootfs_executable(rootfs, args[0])
     _validate_rootfs_executable(rootfs, "/bin/sh")
+    if private_git:
+        for executable, label, candidates in (
+            ("git", "Git", ("/usr/bin/git", "/bin/git")),
+            ("mkdir", "mkdir", ("/usr/bin/mkdir", "/bin/mkdir")),
+            ("rmdir", "rmdir", ("/usr/bin/rmdir", "/bin/rmdir")),
+        ):
+            selected_path = None
+            for candidate in candidates:
+                try:
+                    _validate_rootfs_executable(rootfs, candidate)
+                except SupervisorError:
+                    continue
+                selected_path = candidate
+                break
+            if selected_path is None:
+                raise SupervisorError(
+                    "invalid_oci_executable",
+                    f"private Git mode requires an executable {label} in the pinned rootfs",
+                )
+            private_git_paths[executable] = selected_path
     memory = _positive_int(memory_bytes, name="memory_bytes", maximum=_MAX_INT64)
     if memory < _MIN_MEMORY_BYTES:
         raise SupervisorError(
@@ -1594,7 +1671,24 @@ def build_oci_worker_config(
         "PATH=/usr/bin:/bin",
         "TMPDIR=/tmp",
     ]
+    if private_git:
+        env.extend(
+            (
+                "GIT_CONFIG_NOSYSTEM=1",
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "GIT_ATTR_NOSYSTEM=1",
+                "GIT_TERMINAL_PROMPT=0",
+                "GIT_CEILING_DIRECTORIES=/workspace",
+            )
+        )
     namespace_types = ("user", "pid", "mount", "ipc", "uts", "cgroup", "network")
+    launch_gate_script = _LAUNCH_GATE_SCRIPT
+    if private_git:
+        launch_gate_script = _render_private_git_launch_script(
+            git_path=private_git_paths["git"],
+            mkdir_path=private_git_paths["mkdir"],
+            rmdir_path=private_git_paths["rmdir"],
+        )
     return {
         "ociVersion": "1.2.0",
         "hostname": "acp-worker",
@@ -1605,7 +1699,7 @@ def build_oci_worker_config(
             "args": [
                 "/bin/sh",
                 "-c",
-                _LAUNCH_GATE_SCRIPT,
+                launch_gate_script,
                 "acp-launch-gate",
                 *args,
             ],
