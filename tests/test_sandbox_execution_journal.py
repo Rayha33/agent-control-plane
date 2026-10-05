@@ -680,7 +680,9 @@ def test_sandbox_reservation_binds_claims_to_configured_runtime_pins(
     assert supervisor._sandbox_execution_get(attempt["id"]) is None
 
 
-def test_journal_reservation_prevents_later_direct_worker_launch(repo: Path) -> None:
+def test_journal_reservation_prevents_later_direct_worker_launch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
@@ -691,6 +693,30 @@ def test_journal_reservation_prevents_later_direct_worker_launch(repo: Path) -> 
         )
     assert launch.value.code == "sandbox_execution_reserved"
     assert supervisor.attempt(attempt["id"])["pid"] is None
+
+    before = supervisor.attempt(attempt["id"])
+    # Exercise a later configuration downgrade/restart: the journal survives,
+    # but the current process no longer has an OCI pin and must not touch the
+    # attempt through the direct-worker path.
+    supervisor.config = replace(
+        supervisor.config,
+        oci_rootfs_pin=None,
+        oci_runc_executable=None,
+        oci_runc_version=None,
+    )
+
+    def direct_launch_must_not_start(*_args, **_kwargs):
+        pytest.fail("a journaled sandbox reservation must stop direct worker setup")
+
+    monkeypatch.setattr(supervisor, "heartbeat", direct_launch_must_not_start)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", direct_launch_must_not_start)
+    with pytest.raises(SupervisorError) as worker:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], ["/bin/true"])
+
+    assert worker.value.code == "sandbox_execution_reserved"
+    after = supervisor.attempt(attempt["id"])
+    assert after["pid"] is None
+    assert after["updated_at"] == before["updated_at"]
 
 
 def test_journaled_result_import_and_manual_submission_fail_closed(

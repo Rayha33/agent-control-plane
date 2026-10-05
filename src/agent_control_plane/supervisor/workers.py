@@ -70,6 +70,12 @@ class WorkersMixin:
                 "sandbox_executor_unavailable",
                 "sandbox.oci is configured but supervised OCI worker execution is unavailable; refusing host fallback",
             )
+        # A journaled OCI reservation can survive a supervisor restart or a
+        # configuration change. Reject it before heartbeat/log setup so an
+        # unavailable executor cannot mutate that attempt while refusing it.
+        # This is only a side-effect-free preflight: _reserve_worker_launch
+        # retains the transactional check that arbitrates concurrent claims.
+        self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
         attempt = self.heartbeat(
             attempt_id,
             claim_token,
@@ -384,6 +390,30 @@ class WorkersMixin:
                 process.returncode,
             )
             raise
+
+    def _preflight_direct_worker_launch(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None,
+    ) -> None:
+        """Reject an existing sandbox reservation before direct-launch side effects.
+
+        This does not reserve the attempt slot: a concurrent sandbox reservation
+        may still win after this read. `_reserve_worker_launch` remains the
+        authoritative atomic check immediately before host process creation.
+        """
+
+        with self.connect() as connection:
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            if connection.execute(
+                "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone():
+                raise SupervisorError(
+                    "sandbox_execution_reserved",
+                    "a journaled sandbox execution owns this attempt slot",
+                )
 
     def _reserve_worker_launch(
         self,
