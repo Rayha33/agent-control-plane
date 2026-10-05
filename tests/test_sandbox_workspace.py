@@ -56,6 +56,19 @@ def test_snapshot_is_private_bounded_copy_and_excludes_only_root_git(tmp_path: P
     snapshot.manifest.validate()
 
 
+def test_snapshot_accepts_relative_source_path_from_real_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "relative-source"
+    source.mkdir()
+    (source / "owned.txt").write_text("source bytes")
+    monkeypatch.chdir(tmp_path)
+
+    snapshot = copy_snapshot("relative-source", tmp_path / "private-copy")
+
+    assert (snapshot.root / "owned.txt").read_text() == "source bytes"
+
+
 def test_read_snapshot_files_verifies_and_returns_only_regular_file_bytes(tmp_path: Path) -> None:
     source = tmp_path / "registered"
     source.mkdir()
@@ -412,6 +425,46 @@ def test_parent_open_rejects_intermediate_symlink_substitution(
             ancestor.unlink()
         if saved.exists():
             saved.rename(ancestor)
+
+
+@pytest.mark.parametrize("relative_path", [False, True])
+def test_existing_directory_open_rejects_preexisting_symlink_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative_path: bool
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir(mode=0o700)
+    root = real_parent / "private-root"
+    root.mkdir(mode=0o700)
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    if relative_path:
+        monkeypatch.chdir(tmp_path)
+        candidate = Path(alias_parent.name) / root.name
+    else:
+        candidate = alias_parent / root.name
+    assert _codes(sandbox_workspace._open_existing_directory, candidate) == "unsafe_workspace_root"
+
+
+def test_existing_directory_open_rejects_parent_traversal_components(tmp_path: Path) -> None:
+    parent = tmp_path / "private-parent"
+    root = parent / "private-root"
+    root.mkdir(parents=True, mode=0o700)
+    candidate = parent / ".." / parent.name / root.name
+
+    assert _codes(sandbox_workspace._open_existing_directory, candidate) == "unsafe_workspace_root"
+
+
+@pytest.mark.parametrize("relative_path", [False, True])
+def test_existing_directory_open_rejects_terminal_parent_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative_path: bool
+) -> None:
+    if relative_path:
+        monkeypatch.chdir(tmp_path)
+        candidate = Path("..")
+    else:
+        candidate = tmp_path / ".."
+
+    assert _codes(sandbox_workspace._open_existing_directory, candidate) == "unsafe_workspace_root"
 
 
 def test_open_child_directory_closes_descriptor_when_fstat_fails(

@@ -1516,10 +1516,17 @@ def _validate_component(name: str, *, max_bytes: int) -> None:
 
 
 def _open_existing_directory(path: str | Path) -> tuple[int, str, int]:
+    """Open a real directory without following links in its name or ancestors."""
+
     value = Path(path)
+    if not value.is_absolute():
+        value = Path.cwd() / value
     name = value.name
-    parent = value.parent.resolve(strict=True)
-    parent_fd = _open_directory_path(parent)
+    if name in {"", ".", ".."}:
+        raise SupervisorError("unsafe_workspace_root", "workspace root component is not canonical")
+    # Resolving the parent first would canonicalize through an existing symlink
+    # and hide that component from the no-follow walk.
+    parent_fd = _open_directory_path(value.parent)
     root_fd = -1
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)

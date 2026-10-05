@@ -427,9 +427,11 @@ durable journal stores both canonical root paths and device/inode identities
 plus the canonical baseline manifest and its digest. SQLite rejects launch
 without the binding and prevents rewriting it after capture. A restore method
 reconstructs the baseline handle after process restart from that durable row,
-then reopens the exact baseline and workspace roots without following the root
-symlink, checks their saved inode identities, and verifies the complete
-baseline tree. After that filesystem work it revalidates the live claim,
+then reopens the exact baseline and workspace roots by walking every path
+component without following symlinks, checks their saved inode identities, and
+verifies the complete baseline tree. Directory opening rejects lexical `..`
+components; relative source paths are anchored to the current directory without
+resolving symlinked ancestors. After that filesystem work it revalidates the live claim,
 credential, and exact persisted binding fields in a serialized transaction
 before returning; any later result capture or import must still perform its own
 transactional fence check. The restore step also reopens the exact execution, bundle, and
@@ -489,9 +491,9 @@ and the configured-OCI path continues to fail before heartbeat or host fallback.
 reserved-to-bound workspace transaction now also records device/inode identities
 for the private execution root, OCI bundle root, and runc state root. The
 launcher transition and post-restart workspace restore reopen these exact
-directories without following a root symlink and reject a replacement at the
-same pathname. Legacy rows have unknown path identities and are not backfilled;
-they cannot advance to launch or produce a new candidate. This enables a future
+directories without following symlinks in any path component and reject a
+replacement at the same pathname. Legacy rows have unknown path identities and
+are not backfilled; they cannot advance to launch or produce a new candidate. This enables a future
 cleanup collector to address only the paths created for its exact attempt. It
 does not remove those paths, verify runtime teardown, close same-UID races
 between check and use, or write `cleanup_verified`. `run_worker` remains
