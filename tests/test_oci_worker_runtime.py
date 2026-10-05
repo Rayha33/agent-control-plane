@@ -1974,9 +1974,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             item.split("=", 1)[0] for item in config["process"]["env"]
         }:
             pytest.fail("host credential or agent environment reached the OCI worker")
-        # The bound launcher writes the exact sealed config bytes and derives
-        # argv and the held-FD executable from the same immutable pin object.
-        run_handle = oci_worker.spawn_pinned_runc(
+        # This exact-host diagnostic writes sealed bytes but does not establish
+        # same-UID bundle ownership; production launch remains fail-closed.
+        run_handle = oci_worker._spawn_pinned_runc_for_unisolated_diagnostic(
             worker_config,
             state_root,
             bundle_root,

@@ -42,11 +42,13 @@ no supervisor call path reads back runtime state and durably validates it before
 releasing the OCI init gate. It proves no namespace, mount, credential, egress,
 cancellation, or result-import property.
 
-**Held-FD runc launch primitive (2026-10-05; not lifecycle-integrated).**
-`spawn_pinned_runc()` accepts the immutable policy/runtime binding, derives the
-argv and held-FD launch from that same runc pin, writes the sealed config bytes,
-and returns a handle whose gate must be explicitly released or closed. Its
-private `_spawn_pinned_runc()` primitive revalidates the configured runc inode,
+**Held-FD runc diagnostic primitive (2026-10-05; not a supported worker launch).**
+The public `spawn_pinned_runc()` API validates the immutable policy/runtime
+binding, then fails closed with `sandbox_bundle_ownership_unverified` before
+writing `config.json` or spawning runc. Only the private
+`_spawn_pinned_runc_for_unisolated_diagnostic()` test helper can exercise the
+held-FD launch primitive while bundle ownership remains unproved. Its private
+`_spawn_pinned_runc()` primitive revalidates the configured runc inode,
 passes its held file descriptor to an isolated launcher, and executes that
 exact inode rather than reopening a pathname. The launcher maps one private
 pipe reader to fd 3, closes the executable descriptor across exec, and starts
@@ -59,9 +61,10 @@ and does not release any supervisor fence. If payload delivery may have begun
 but the handle cannot be returned, `sandbox_launch_submission_unverified` tells
 the caller to retain attempt ownership and reconcile the exact OCI state. FD
 ownership is cleared before each close so an interrupted close is never retried
-against a possibly reused descriptor. The opt-in live rootless-runc test
-now uses this production helper and checks runtime policy before gate release.
-This does not bind the handle to `sandbox_executions`, attest the
+against a possibly reused descriptor. The opt-in no-model rootless-runc test
+uses only the private diagnostic helper; it does not test the supported public
+API or prove bundle ownership. No launch handle is returned through the public
+API. This does not bind a diagnostic handle to `sandbox_executions`, attest the
 process/cgroup tuple, supervise cancellation or crash recovery, verify cleanup,
 or authorize result import; `run_worker` remains fail-closed for configured
 OCI.
@@ -387,9 +390,11 @@ the descriptor's content and file identity, and uses Linux fd-based `execve`
 through the timeout guardian. Only the held executable descriptor is passed to
 the probe child, then closed. Non-Linux hosts fail closed because `/dev/fd`
 existence does not establish that it is executable. This removes the
-path-replacement window for the configuration probe. The new
-`spawn_pinned_runc` helper also carries the held descriptor through an actual
-attached launch and keeps fd 3 private behind a caller-controlled gate. It is
+path-replacement window for the configuration probe. The private
+`_spawn_pinned_runc_for_unisolated_diagnostic` helper can carry the held
+descriptor through an attached no-model diagnostic launch and keep fd 3 private
+behind a caller-controlled gate. The public `spawn_pinned_runc()` refuses to
+launch until exclusive bundle ownership is proven. The diagnostic helper is
 not called by `run_worker`, and no runtime path/digest is durably tied to that
 launch before candidate exec; the attempt journal still cannot reach
 `cleanup_verified`. When `[sandbox.oci]` is configured, `run_worker` continues
@@ -1262,24 +1267,28 @@ the OCI v1.2.1 enum does not include rprivate
 [OCI field](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md#configlinuxrootfsmountpropagation)).
 
 The generic OCI compiler therefore keeps emitting the standards-listed
-"private" value. A separate compatibility adapter now returns a sealed,
-immutable config-byte binding to the exact root-owned runc executable pin. It
-re-probes that pin, changes only linux.rootfsPropagation to "rprivate", and
-rejects other releases or an input that does not retain the compiler's
-"private" baseline. The worker launch helper derives both argv and held-FD
-execution from this same binding, creates config.json exclusively with the
-sealed bytes, and revalidates the pin/version before launch. A different
-executable pin is rejected. This runc-specific output must not be passed to a
-generic OCI runtime. The adapter checks basic shape and the portable
-propagation baseline, but does not prove that its input came from
-`build_oci_worker_config` or validate the complete worker policy; it assumes
-compiler-produced input in the current diagnostic test. Exclusive creation
-does not stop another same-UID process from replacing the file before runc
-opens it, so an integrating executor must prove an exclusive-writer boundary.
-Do not integrate this path into `run_worker` until policy provenance/full
-validation and trusted bundle-writer ownership are enforced. This slice also
-does not establish lifecycle, cleanup, result-import, credential, or
-provider-egress safety.
+"private" value. A separate compatibility adapter requires the exact live
+compiler-issued config object, checks its process-local identity and canonical
+digest, rejects copies/forgeries/mutations, validates the complete supported
+worker-policy shape, and then derives the runc-specific `rprivate` bytes from
+the sealed compiler snapshot. The compiler output is checked against the
+vendored OCI v1.2.1 JSON schema in the test suite. The adapter re-probes the
+same root-owned executable pin and rejects other releases or any policy outside
+ACP's narrow OCI subset. This runc-specific output must not be passed to a
+generic OCI runtime.
+
+This closes the input-provenance/full-policy gap for the adapter, but not the
+filesystem handoff race. `O_EXCL`, no-follow creation, mode 0600, and a private
+directory do not stop another process with the same UID from replacing
+`config.json` before runc opens it. Accordingly, the supported
+`spawn_pinned_runc()` API now fails closed with
+`sandbox_bundle_ownership_unverified`. The underscored
+`_spawn_pinned_runc_for_unisolated_diagnostic()` is retained only for explicit
+no-model exact-host policy tests; it is not a supported or safe worker launch
+path. Do not connect either helper to `run_worker` until a per-launch outer
+ownership boundary is independently implemented and verified. Lifecycle,
+runtime attestation, cleanup, result-import, credential, and provider-egress
+safety remain separate open gates.
 
 Exact-pushed-source Linux replay, independent review, and full CI evidence for
 this adapter are recorded in the task notes; the remaining supervised worker

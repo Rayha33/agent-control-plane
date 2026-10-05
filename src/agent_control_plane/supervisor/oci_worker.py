@@ -24,7 +24,6 @@ reserve launch metadata safely.
 
 from __future__ import annotations
 
-import copy
 import errno
 import hashlib
 import json
@@ -248,6 +247,10 @@ _PINNED_RUNC_WORKER_CONFIGS: dict[
         weakref.ReferenceType[Any],
         tuple[_TrustedRuncExecutable, str, bytes, str],
     ],
+] = {}
+_COMPILER_ISSUED_OCI_WORKER_CONFIGS: dict[
+    int,
+    tuple[weakref.ReferenceType[Any], bytes, str],
 ] = {}
 _TRUSTED_ROOTFS_PINS: dict[
     int,
@@ -549,6 +552,10 @@ class _PinnedRuncWorkerConfig:
     version: str
     config_json: bytes = field(repr=False)
     sha256: str
+
+
+class _CompilerIssuedOciWorkerConfig(dict[str, Any]):
+    """Dict-compatible OCI config whose compiler provenance is process-local."""
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -1569,6 +1576,71 @@ def _is_runc_release_version(value: Any) -> bool:
     return isinstance(value, str) and _RUNC_RELEASE_VERSION.fullmatch(value) is not None
 
 
+def _canonical_oci_worker_config(config: dict[str, Any]) -> bytes:
+    try:
+        return (
+            json.dumps(
+                config,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii")
+            + b"\n"
+        )
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "OCI worker config is not canonical JSON"
+        ) from error
+
+
+def _issue_compiler_oci_worker_config(config: dict[str, Any]) -> _CompilerIssuedOciWorkerConfig:
+    issued = _CompilerIssuedOciWorkerConfig(config)
+    config_json = _canonical_oci_worker_config(issued)
+    digest = hashlib.sha256(config_json).hexdigest()
+    key = id(issued)
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        current = _COMPILER_ISSUED_OCI_WORKER_CONFIGS.get(key)
+        if current is not None and current[0] is reference:
+            _COMPILER_ISSUED_OCI_WORKER_CONFIGS.pop(key, None)
+
+    reference = weakref.ref(issued, discard)
+    _COMPILER_ISSUED_OCI_WORKER_CONFIGS[key] = (reference, config_json, digest)
+    return issued
+
+
+def _compiler_issued_oci_worker_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the sealed compiler bytes only when the exact result is intact."""
+
+    sealed = (
+        _COMPILER_ISSUED_OCI_WORKER_CONFIGS.get(id(config))
+        if type(config) is _CompilerIssuedOciWorkerConfig
+        else None
+    )
+    if sealed is None or sealed[0]() is not config:
+        raise SupervisorError(
+            "invalid_oci_worker_policy",
+            "runc compatibility adapter requires an exact compiler-issued OCI config",
+        )
+    config_json, digest = sealed[1], sealed[2]
+    if (
+        _canonical_oci_worker_config(config) != config_json
+        or hashlib.sha256(config_json).hexdigest() != digest
+    ):
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "compiler-issued OCI config was mutated after build"
+        )
+    try:
+        decoded = json.loads(config_json)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "sealed compiler OCI config cannot be decoded"
+        ) from error
+    _validate_complete_oci_worker_policy(decoded)
+    return decoded
+
+
 def build_oci_worker_config(
     bundle_root: str | Path,
     workspace_snapshot: Snapshot,
@@ -1750,84 +1822,349 @@ def build_oci_worker_config(
             mkdir_path=private_git_paths["mkdir"],
             rmdir_path=private_git_paths["rmdir"],
         )
-    return {
-        "ociVersion": "1.2.0",
-        "hostname": "acp-worker",
-        "root": {"path": "rootfs", "readonly": True},
-        "process": {
-            "terminal": False,
-            "user": {"uid": 0, "gid": 0, "additionalGids": []},
-            "args": [
-                "/bin/sh",
-                "-c",
-                launch_gate_script,
-                "acp-launch-gate",
-                *args,
+    return _issue_compiler_oci_worker_config(
+        {
+            "ociVersion": "1.2.0",
+            "hostname": "acp-worker",
+            "root": {"path": "rootfs", "readonly": True},
+            "process": {
+                "terminal": False,
+                "user": {"uid": 0, "gid": 0, "additionalGids": []},
+                "args": [
+                    "/bin/sh",
+                    "-c",
+                    launch_gate_script,
+                    "acp-launch-gate",
+                    *args,
+                ],
+                "env": env,
+                "cwd": "/workspace",
+                "noNewPrivileges": True,
+                "rlimits": [
+                    {"type": "RLIMIT_CORE", "hard": 0, "soft": 0},
+                    {"type": "RLIMIT_FSIZE", "hard": 64 * 1024 * 1024, "soft": 64 * 1024 * 1024},
+                ],
+                "capabilities": {
+                    "bounding": [],
+                    "effective": [],
+                    "inheritable": [],
+                    "permitted": [],
+                    "ambient": [],
+                },
+            },
+            "mounts": [
+                {
+                    "destination": "/proc",
+                    "type": "proc",
+                    "source": "proc",
+                    "options": ["nosuid", "nodev", "noexec", "ro"],
+                },
+                {
+                    "destination": "/workspace",
+                    "type": "bind",
+                    "source": str(workspace),
+                    "options": ["bind", "rprivate", "rw", "nosuid", "nodev"],
+                },
+                {
+                    "destination": "/tmp",
+                    "type": "tmpfs",
+                    "source": "tmpfs",
+                    "options": ["nosuid", "nodev", "mode=1777", f"size={tmpfs}"],
+                },
+                {
+                    "destination": "/home/agent",
+                    "type": "tmpfs",
+                    "source": "tmpfs",
+                    "options": ["nosuid", "nodev", "mode=0700", f"size={home}"],
+                },
             ],
-            "env": env,
-            "cwd": "/workspace",
-            "noNewPrivileges": True,
-            "rlimits": [
+            "linux": {
+                "uidMappings": [{"containerID": 0, "hostID": uid, "size": 1}],
+                "gidMappings": [{"containerID": 0, "hostID": gid, "size": 1}],
+                "namespaces": [{"type": namespace} for namespace in namespace_types],
+                "resources": {
+                    "memory": {"limit": memory},
+                    "cpu": {"quota": quota, "period": period},
+                    "pids": {"limit": pids},
+                    "devices": [{"allow": False, "access": "rwm"}],
+                },
+                "seccomp": _worker_seccomp_profile(),
+                "cgroupsPath": f"user.slice:acp:{container_id}",
+                "rootfsPropagation": "private",
+                "maskedPaths": [
+                    "/proc/kcore",
+                    "/proc/keys",
+                    "/proc/latency_stats",
+                    "/proc/timer_stats",
+                    "/proc/sched_debug",
+                ],
+                "readonlyPaths": ["/proc/sys", "/proc/sysrq-trigger"],
+            },
+        }
+    )
+
+
+def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
+    """Reject any compiler document outside ACP's supported, bounded OCI subset."""
+
+    def reject() -> None:
+        raise SupervisorError(
+            "invalid_oci_worker_policy",
+            "compiler-issued OCI config does not satisfy the complete worker policy",
+        )
+
+    def exact(actual: Any, expected: Any) -> bool:
+        """Compare JSON values without Python's bool/int equality aliasing."""
+        if type(actual) is not type(expected):
+            return False
+        if type(expected) is dict:
+            return actual.keys() == expected.keys() and all(
+                exact(actual[key], expected[key]) for key in expected
+            )
+        if type(expected) is list:
+            return len(actual) == len(expected) and all(
+                exact(left, right) for left, right in zip(actual, expected, strict=True)
+            )
+        return actual == expected
+
+    if type(config) is not dict or set(config) != {
+        "ociVersion",
+        "hostname",
+        "root",
+        "process",
+        "mounts",
+        "linux",
+    }:
+        reject()
+    if config.get("ociVersion") != "1.2.0" or config.get("hostname") != "acp-worker":
+        reject()
+
+    root = config.get("root")
+    if not exact(root, {"path": "rootfs", "readonly": True}):
+        reject()
+
+    process = config.get("process")
+    if type(process) is not dict or set(process) != {
+        "terminal",
+        "user",
+        "args",
+        "env",
+        "cwd",
+        "noNewPrivileges",
+        "rlimits",
+        "capabilities",
+    }:
+        reject()
+    if (
+        process.get("terminal") is not False
+        or process.get("cwd") != "/workspace"
+        or process.get("noNewPrivileges") is not True
+        or not exact(process.get("user"), {"uid": 0, "gid": 0, "additionalGids": []})
+        or not exact(
+            process.get("rlimits"),
+            [
                 {"type": "RLIMIT_CORE", "hard": 0, "soft": 0},
-                {"type": "RLIMIT_FSIZE", "hard": 64 * 1024 * 1024, "soft": 64 * 1024 * 1024},
+                {
+                    "type": "RLIMIT_FSIZE",
+                    "hard": 64 * 1024 * 1024,
+                    "soft": 64 * 1024 * 1024,
+                },
             ],
-            "capabilities": {
+        )
+        or not exact(
+            process.get("capabilities"),
+            {
                 "bounding": [],
                 "effective": [],
                 "inheritable": [],
                 "permitted": [],
                 "ambient": [],
             },
+        )
+    ):
+        reject()
+
+    args = process.get("args")
+    if (
+        type(args) is not list
+        or len(args) < 5
+        or args[:2] != ["/bin/sh", "-c"]
+        or args[3] != "acp-launch-gate"
+        or not all(isinstance(value, str) and value and "\x00" not in value for value in args)
+    ):
+        reject()
+    private_git_scripts = {
+        _render_private_git_launch_script(git_path=git, mkdir_path=mkdir, rmdir_path=rmdir)
+        for git in ("/usr/bin/git", "/bin/git")
+        for mkdir in ("/usr/bin/mkdir", "/bin/mkdir")
+        for rmdir in ("/usr/bin/rmdir", "/bin/rmdir")
+    }
+    if args[2] not in ({_LAUNCH_GATE_SCRIPT} | private_git_scripts):
+        reject()
+    try:
+        _validate_command(args[4:])
+    except SupervisorError:
+        reject()
+
+    base_environment = {
+        "ACP_PHASE": "worker",
+        "ACP_REPO_ROOT": "/workspace",
+        "ACP_RUNTIME_DIR": "/tmp/acp-runtime",
+        "ACP_WORKTREE": "/workspace",
+        "HOME": "/home/agent",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+    }
+    git_environment = {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CEILING_DIRECTORIES": "/workspace",
+    }
+    env = process.get("env")
+    if type(env) is not list or not all(isinstance(item, str) for item in env):
+        reject()
+    environment: dict[str, str] = {}
+    for entry in env:
+        name, separator, value = entry.partition("=")
+        if not separator or not name or name in environment:
+            reject()
+        environment[name] = value
+    if environment not in (base_environment, base_environment | git_environment):
+        reject()
+
+    mounts = config.get("mounts")
+    if type(mounts) is not list or len(mounts) != 4:
+        reject()
+    if not exact(
+        mounts[0],
+        {
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc",
+            "options": ["nosuid", "nodev", "noexec", "ro"],
         },
-        "mounts": [
-            {
-                "destination": "/proc",
-                "type": "proc",
-                "source": "proc",
-                "options": ["nosuid", "nodev", "noexec", "ro"],
-            },
-            {
-                "destination": "/workspace",
-                "type": "bind",
-                "source": str(workspace),
-                "options": ["bind", "rprivate", "rw", "nosuid", "nodev"],
-            },
-            {
-                "destination": "/tmp",
-                "type": "tmpfs",
-                "source": "tmpfs",
-                "options": ["nosuid", "nodev", "mode=1777", f"size={tmpfs}"],
-            },
-            {
-                "destination": "/home/agent",
-                "type": "tmpfs",
-                "source": "tmpfs",
-                "options": ["nosuid", "nodev", "mode=0700", f"size={home}"],
-            },
-        ],
-        "linux": {
-            "uidMappings": [{"containerID": 0, "hostID": uid, "size": 1}],
-            "gidMappings": [{"containerID": 0, "hostID": gid, "size": 1}],
-            "namespaces": [{"type": namespace} for namespace in namespace_types],
-            "resources": {
-                "memory": {"limit": memory},
-                "cpu": {"quota": quota, "period": period},
-                "pids": {"limit": pids},
-                "devices": [{"allow": False, "access": "rwm"}],
-            },
-            "seccomp": _worker_seccomp_profile(),
-            "cgroupsPath": f"user.slice:acp:{container_id}",
-            "rootfsPropagation": "private",
-            "maskedPaths": [
+    ):
+        reject()
+    workspace_mount = mounts[1]
+    if (
+        type(workspace_mount) is not dict
+        or set(workspace_mount) != {"destination", "type", "source", "options"}
+        or workspace_mount.get("destination") != "/workspace"
+        or workspace_mount.get("type") != "bind"
+        or not isinstance(workspace_mount.get("source"), str)
+        or not Path(workspace_mount["source"]).is_absolute()
+        or not exact(workspace_mount.get("options"), ["bind", "rprivate", "rw", "nosuid", "nodev"])
+    ):
+        reject()
+    for mount, destination, mode in (
+        (mounts[2], "/tmp", "mode=1777"),
+        (mounts[3], "/home/agent", "mode=0700"),
+    ):
+        if (
+            type(mount) is not dict
+            or set(mount) != {"destination", "type", "source", "options"}
+            or mount.get("destination") != destination
+            or mount.get("type") != "tmpfs"
+            or mount.get("source") != "tmpfs"
+        ):
+            reject()
+        options = mount.get("options")
+        size_match = (
+            re.fullmatch(r"size=([1-9][0-9]*)", options[3])
+            if type(options) is list and len(options) == 4 and isinstance(options[3], str)
+            else None
+        )
+        if (
+            type(options) is not list
+            or len(options) != 4
+            or not exact(options[:3], ["nosuid", "nodev", mode])
+            or size_match is None
+        ):
+            reject()
+        size_text = size_match.group(1)
+        max_size_text = str(_MAX_INT64)
+        if len(size_text) > len(max_size_text) or (
+            len(size_text) == len(max_size_text) and size_text > max_size_text
+        ):
+            reject()
+
+    linux = config.get("linux")
+    if type(linux) is not dict or set(linux) != {
+        "uidMappings",
+        "gidMappings",
+        "namespaces",
+        "resources",
+        "seccomp",
+        "cgroupsPath",
+        "rootfsPropagation",
+        "maskedPaths",
+        "readonlyPaths",
+    }:
+        reject()
+    if (
+        not exact(
+            linux.get("uidMappings"),
+            [{"containerID": 0, "hostID": os.geteuid(), "size": 1}],
+        )
+        or not exact(
+            linux.get("gidMappings"),
+            [{"containerID": 0, "hostID": os.getegid(), "size": 1}],
+        )
+        or not exact(
+            linux.get("namespaces"),
+            [
+                {"type": name}
+                for name in ("user", "pid", "mount", "ipc", "uts", "cgroup", "network")
+            ],
+        )
+        or linux.get("rootfsPropagation") != "private"
+        or not exact(
+            linux.get("maskedPaths"),
+            [
                 "/proc/kcore",
                 "/proc/keys",
                 "/proc/latency_stats",
                 "/proc/timer_stats",
                 "/proc/sched_debug",
             ],
-            "readonlyPaths": ["/proc/sys", "/proc/sysrq-trigger"],
-        },
-    }
+        )
+        or not exact(linux.get("readonlyPaths"), ["/proc/sys", "/proc/sysrq-trigger"])
+        or not exact(linux.get("seccomp"), _worker_seccomp_profile())
+    ):
+        reject()
+    resources = linux.get("resources")
+    if type(resources) is not dict or set(resources) != {"memory", "cpu", "pids", "devices"}:
+        reject()
+    memory = resources.get("memory")
+    cpu = resources.get("cpu")
+    pids = resources.get("pids")
+    if (
+        type(memory) is not dict
+        or set(memory) != {"limit"}
+        or type(memory.get("limit")) is not int
+        or not _MIN_MEMORY_BYTES <= memory["limit"] <= _MAX_INT64
+        or type(cpu) is not dict
+        or set(cpu) != {"quota", "period"}
+        or type(cpu.get("quota")) is not int
+        or not 1 <= cpu["quota"] <= _MAX_INT64
+        or type(cpu.get("period")) is not int
+        or not 1 <= cpu["period"] <= _MAX_UINT64
+        or type(pids) is not dict
+        or set(pids) != {"limit"}
+        or type(pids.get("limit")) is not int
+        or not 1 <= pids["limit"] <= _MAX_PIDS
+        or not exact(resources.get("devices"), [{"allow": False, "access": "rwm"}])
+    ):
+        reject()
+    cgroups_path = linux.get("cgroupsPath")
+    if (
+        not isinstance(cgroups_path, str)
+        or not cgroups_path.startswith("user.slice:acp:")
+        or _CONTAINER_ID.fullmatch(cgroups_path.removeprefix("user.slice:acp:")) is None
+    ):
+        reject()
 
 
 def _apply_pinned_runc_recursive_private_policy(
@@ -1850,29 +2187,16 @@ def _apply_pinned_runc_recursive_private_policy(
             "invalid_oci_runtime_version",
             "recursive rootfs propagation currently requires pinned runc 1.3.5",
         )
-    if type(config) is not dict or type(config.get("linux")) is not dict:
-        raise SupervisorError(
-            "invalid_oci_worker_policy", "runc worker config must contain an OCI linux object"
-        )
-    if config["linux"].get("rootfsPropagation") != "private":
-        raise SupervisorError(
-            "invalid_oci_worker_policy",
-            "runc compatibility requires the portable private propagation baseline",
-        )
+    compiled_config = _compiler_issued_oci_worker_config(config)
     observed_version = _probe_trusted_runc_version(executable, expected_version)
     if observed_version != _RUNC_RECURSIVE_PRIVATE_VERSION:
         raise SupervisorError(
             "invalid_oci_runtime_version",
             "recursive rootfs propagation requires the exact pinned runc release",
         )
-    adapted = copy.deepcopy(config)
+    adapted = compiled_config
     adapted["linux"]["rootfsPropagation"] = "rprivate"
-    config_json = (
-        json.dumps(adapted, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
-            "ascii"
-        )
-        + b"\n"
-    )
+    config_json = _canonical_oci_worker_config(adapted)
     digest = hashlib.sha256(config_json).hexdigest()
     binding = _PinnedRuncWorkerConfig(
         executable=executable,
@@ -1970,10 +2294,11 @@ def build_runc_run_argv(
 ) -> list[str]:
     """Return an attached runc command with explicit state root and bundle.
 
-    The OCI init requires one inherited launch-gate descriptor at fd 3. Worker
-    callers should use :func:`spawn_pinned_runc`, which builds this argv from
-    the immutable policy/runtime binding and delegates fd mapping, environment
-    sanitization, and gate ownership to the private launcher primitive.
+    The OCI init requires one inherited launch-gate descriptor at fd 3. This
+    argv builder is used only by the unisolated diagnostic helper while
+    bundle ownership remains unproved. The public :func:`spawn_pinned_runc`
+    validates its policy binding and fails closed before creating this argv or
+    launching runc; do not use this builder for worker execution.
     ``executable`` must be a process-local pin minted by
     ``_pin_trusted_runc_executable``. Its root-owned file identity and SHA-256
     are rechecked here; a caller-supplied path or forged pin is refused. This
@@ -2138,9 +2463,11 @@ def _spawn_pinned_runc(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
 ) -> RuncLaunchHandle:
-    """Low-level held-FD launcher; worker code must use :func:`spawn_pinned_runc`.
+    """Low-level held-FD primitive used only by the diagnostic helper.
 
-    Start pinned runc with exactly one inherited fd-3 launch gate.
+    Start pinned runc with exactly one inherited fd-3 launch gate. The public
+    worker API fails closed before reaching this primitive until an outer
+    bundle-ownership boundary is independently proven.
 
     The rootless supervisor opens and revalidates the configured runc inode,
     then a tiny isolated Python launcher uses ``execve(fd, ...)`` so a later
@@ -2326,12 +2653,43 @@ def spawn_pinned_runc(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
 ) -> RuncLaunchHandle:
-    """Write and launch one worker with the same sealed config/runtime binding.
+    """Fail closed until runc's filesystem bundle has exclusive ownership.
 
     Callers cannot provide a second executable: the policy binding supplies the
-    exact sealed pin used by argv construction and held-FD spawn. The lower-level
-    argv and launcher primitives remain available for isolated tests, but this
-    is the only helper that launches an adapted worker config.
+    exact sealed pin. However, root-owned mode bits and exclusive creation do
+    not prevent another process with the same UID from replacing config.json
+    before runc opens it. The supported worker-launch API therefore remains
+    disabled until a separately verified per-launch ownership boundary exists.
+    """
+
+    if type(binding) is not _PinnedRuncWorkerConfig:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "worker launch requires a pinned runc config binding"
+        )
+    executable = binding.executable
+    _verify_pinned_runc_worker_config(binding, executable)
+    raise SupervisorError(
+        "sandbox_bundle_ownership_unverified",
+        "runc worker launch is disabled until bundle/config ownership is isolated from same-UID writers",
+    )
+
+
+def _spawn_pinned_runc_for_unisolated_diagnostic(
+    binding: _PinnedRuncWorkerConfig,
+    state_root: str | Path,
+    bundle_root: str | Path,
+    workspace_root: str | Path,
+    pid_file: str | Path,
+    container_id: str,
+    *,
+    stdout: Any = subprocess.DEVNULL,
+    stderr: Any = subprocess.DEVNULL,
+) -> RuncLaunchHandle:
+    """Diagnostic-only launch; never use this for supervised worker execution.
+
+    It is retained for exact-host, no-model runc policy tests. The config is
+    written in the caller's mount namespace, so same-UID bundle replacement
+    remains possible until the outer ownership boundary is implemented.
     """
 
     if type(binding) is not _PinnedRuncWorkerConfig:
