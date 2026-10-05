@@ -43,13 +43,16 @@ releasing the OCI init gate. It proves no namespace, mount, credential, egress,
 cancellation, or result-import property.
 
 **Held-FD runc launch primitive (2026-10-05; not lifecycle-integrated).**
-`spawn_pinned_runc()` revalidates the configured runc inode, passes its held file
-descriptor to an isolated launcher, and executes that exact inode rather than
-reopening a pathname. The launcher maps one private pipe reader to fd 3, closes
-the executable descriptor across exec, starts with a fixed environment that
-excludes provider/Codex/SSH/ACP runner credentials, and returns a handle whose
-gate must be explicitly released or closed. Gate release and cancellation are
-serialized; whichever operation acquires the handle lock first wins. Launch
+`spawn_pinned_runc()` accepts the immutable policy/runtime binding, derives the
+argv and held-FD launch from that same runc pin, writes the sealed config bytes,
+and returns a handle whose gate must be explicitly released or closed. Its
+private `_spawn_pinned_runc()` primitive revalidates the configured runc inode,
+passes its held file descriptor to an isolated launcher, and executes that
+exact inode rather than reopening a pathname. The launcher maps one private
+pipe reader to fd 3, closes the executable descriptor across exec, and starts
+with a fixed environment that excludes provider/Codex/SSH/ACP runner
+credentials. Gate release and cancellation are serialized; whichever
+operation acquires the handle lock first wins. Launch
 failure cleanup uses bounded waits and reports an unverified live client PID
 instead of waiting indefinitely. That error is not a durable cleanup receipt
 and does not release any supervisor fence. If payload delivery may have begun
@@ -1267,10 +1270,16 @@ rejects other releases or an input that does not retain the compiler's
 execution from this same binding, creates config.json exclusively with the
 sealed bytes, and revalidates the pin/version before launch. A different
 executable pin is rejected. This runc-specific output must not be passed to a
-generic OCI runtime; the adapter is only for compiler-produced policy, not a
-validator for arbitrary OCI documents. This does not wire the adapter or
-launcher into run_worker, nor establish lifecycle, cleanup, result-import,
-credential, or provider-egress safety.
+generic OCI runtime. The adapter checks basic shape and the portable
+propagation baseline, but does not prove that its input came from
+`build_oci_worker_config` or validate the complete worker policy; it assumes
+compiler-produced input in the current diagnostic test. Exclusive creation
+does not stop another same-UID process from replacing the file before runc
+opens it, so an integrating executor must prove an exclusive-writer boundary.
+Do not integrate this path into `run_worker` until policy provenance/full
+validation and trusted bundle-writer ownership are enforced. This slice also
+does not establish lifecycle, cleanup, result-import, credential, or
+provider-egress safety.
 
 Exact-pushed-source Linux replay, independent review, and full CI evidence for
 this adapter are recorded in the task notes; the remaining supervised worker

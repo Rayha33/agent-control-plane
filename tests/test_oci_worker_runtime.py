@@ -1976,7 +1976,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             pytest.fail("host credential or agent environment reached the OCI worker")
         # The bound launcher writes the exact sealed config bytes and derives
         # argv and the held-FD executable from the same immutable pin object.
-        run_handle = oci_worker.spawn_pinned_runc_worker(
+        run_handle = oci_worker.spawn_pinned_runc(
             worker_config,
             state_root,
             bundle_root,

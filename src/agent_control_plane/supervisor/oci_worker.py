@@ -1970,10 +1970,10 @@ def build_runc_run_argv(
 ) -> list[str]:
     """Return an attached runc command with explicit state root and bundle.
 
-    The OCI init requires one inherited launch-gate descriptor at fd 3. The
-    caller must use :func:`spawn_pinned_runc` to map the read end to fd 3,
-    sanitize runc's activation environment, and keep its paired writer private
-    until it has durably authorized launch.
+    The OCI init requires one inherited launch-gate descriptor at fd 3. Worker
+    callers should use :func:`spawn_pinned_runc`, which builds this argv from
+    the immutable policy/runtime binding and delegates fd mapping, environment
+    sanitization, and gate ownership to the private launcher primitive.
     ``executable`` must be a process-local pin minted by
     ``_pin_trusted_runc_executable``. Its root-owned file identity and SHA-256
     are rechecked here; a caller-supplied path or forged pin is refused. This
@@ -2131,14 +2131,16 @@ def _reap_failed_runc_launch(process: subprocess.Popen[bytes]) -> None:
         ) from error
 
 
-def spawn_pinned_runc(
+def _spawn_pinned_runc(
     executable: _TrustedRuncExecutable,
     argv: Sequence[str],
     *,
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
 ) -> RuncLaunchHandle:
-    """Start pinned runc by held FD with exactly one inherited fd-3 launch gate.
+    """Low-level held-FD launcher; worker code must use :func:`spawn_pinned_runc`.
+
+    Start pinned runc with exactly one inherited fd-3 launch gate.
 
     The rootless supervisor opens and revalidates the configured runc inode,
     then a tiny isolated Python launcher uses ``execve(fd, ...)`` so a later
@@ -2313,7 +2315,7 @@ def spawn_pinned_runc(
                     pass
 
 
-def spawn_pinned_runc_worker(
+def spawn_pinned_runc(
     binding: _PinnedRuncWorkerConfig,
     state_root: str | Path,
     bundle_root: str | Path,
@@ -2347,4 +2349,4 @@ def spawn_pinned_runc_worker(
         container_id,
     )
     _write_pinned_runc_worker_config(binding, executable, bundle_root)
-    return spawn_pinned_runc(executable, run_argv, stdout=stdout, stderr=stderr)
+    return _spawn_pinned_runc(executable, run_argv, stdout=stdout, stderr=stderr)

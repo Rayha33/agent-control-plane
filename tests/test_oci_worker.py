@@ -703,9 +703,9 @@ def test_pinned_worker_launch_uses_bound_executable_and_exact_config_bytes(
         return object()
 
     monkeypatch.setattr(oci_worker, "build_runc_run_argv", fake_build)
-    monkeypatch.setattr(oci_worker, "spawn_pinned_runc", fake_spawn)
+    monkeypatch.setattr(oci_worker, "_spawn_pinned_runc", fake_spawn)
 
-    result = oci_worker.spawn_pinned_runc_worker(
+    result = oci_worker.spawn_pinned_runc(
         binding,
         state_root,
         bundle_root,
@@ -2074,7 +2074,7 @@ def test_pinned_runc_launcher_maps_only_the_release_gate_to_fd3(
         'test "${SSH_AUTH_SOCK+x}" != x; '
         'printf "%s\\n" "$token"',
     )
-    handle = oci_worker.spawn_pinned_runc(
+    handle = oci_worker._spawn_pinned_runc(
         pin,
         command,
         stdout=subprocess.PIPE,
@@ -2100,7 +2100,7 @@ def test_pinned_runc_launcher_eof_denies_command_exec(tmp_path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("pinned OCI launch requires an unprivileged supervisor")
     pin = pinned_runc(tmp_path)
-    handle = oci_worker.spawn_pinned_runc(
+    handle = oci_worker._spawn_pinned_runc(
         pin,
         (str(pin.path), "-c", "read -r _ <&3 || exit 125; echo SHOULD_NOT_RUN"),
         stdout=subprocess.PIPE,
@@ -2123,7 +2123,7 @@ def test_pinned_runc_launcher_eof_denies_command_exec(tmp_path: Path) -> None:
 def test_pinned_runc_launcher_rejects_unbound_argv_before_spawn(tmp_path: Path) -> None:
     pin = pinned_runc(tmp_path)
     with pytest.raises(SupervisorError) as error:
-        oci_worker.spawn_pinned_runc(pin, ("/bin/other-runc", "run"))
+        oci_worker._spawn_pinned_runc(pin, ("/bin/other-runc", "run"))
 
     assert error.value.code == "invalid_oci_command"
 
@@ -2162,7 +2162,7 @@ def test_runc_launcher_reports_unverified_submission_and_does_not_reclose_reused
     monkeypatch.setattr(oci_worker.os, "close", close_after_releasing_fd)
     try:
         with pytest.raises(SupervisorError) as error:
-            oci_worker.spawn_pinned_runc(
+            oci_worker._spawn_pinned_runc(
                 pin,
                 (str(pin.path), "-c", "read -r _ <&3 || exit 125"),
             )
