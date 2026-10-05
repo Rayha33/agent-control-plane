@@ -239,7 +239,7 @@ def _compiled_seccomp_profile(tmp_path: Path) -> dict:
     bundle = tmp_path / "bundle"
     rootfs = bundle / "rootfs"
     bundle.mkdir(mode=0o700)
-    for relative in ("bin", "usr/bin", "proc", "workspace", "tmp", "home/agent"):
+    for relative in ("bin", "usr/bin", "dev", "proc", "workspace", "tmp", "home/agent"):
         (rootfs / relative).mkdir(parents=True, mode=0o700)
     for relative in ("bin/sh", "usr/bin/busybox"):
         executable = rootfs / relative
