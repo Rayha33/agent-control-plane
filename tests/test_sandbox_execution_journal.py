@@ -846,6 +846,9 @@ def test_missing_result_journal_still_cleans_unowned_staging(repo: Path) -> None
 def test_concurrent_reservations_have_one_winner(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
+    # Provision the shared config once; the race under test is journal
+    # reservation, not concurrent issuance of process-local OCI pin handles.
+    configured_sandbox_claims(supervisor)
     barrier = threading.Barrier(2)
 
     def try_reserve() -> dict | str:
