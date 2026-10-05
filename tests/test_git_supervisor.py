@@ -1797,6 +1797,8 @@ def test_result_import_recovery_refuses_corrupted_worker_identity(
             "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
         ).fetchone()
         assert imported["worker_identity"] == worker_identity
+        # Simulate raw corruption; supported journal writes cannot change source identity.
+        connection.execute("DROP TRIGGER result_import_source_identity_immutable")
         connection.execute(
             "UPDATE result_imports SET worker_identity = ? WHERE id = ?",
             ("tampered-worker-identity", imported["id"]),
