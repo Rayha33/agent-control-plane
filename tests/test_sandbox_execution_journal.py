@@ -745,6 +745,69 @@ def test_journaled_result_import_and_manual_submission_fail_closed(
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
+def test_journaled_sandbox_never_aliases_into_direct_worker_result_receipts(
+    repo: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    result_root = tmp_path_factory.mktemp("worker-result")
+    baseline, change_set = result_fixture(attempt, result_root)
+
+    # Simulate an open eligibility gate to isolate the independent identity
+    # source check. It must reject the direct-worker route before PID or
+    # worker.exit receipts can be consulted, even after a future verifier exists.
+    monkeypatch.setattr(
+        claims_module,
+        "_require_sandbox_execution_result_eligible",
+        lambda _connection, _attempt_id: None,
+    )
+    with pytest.raises(SupervisorError) as imported:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, change_set)
+
+    assert imported.value.code == "sandbox_result_import_route_required"
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
+
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, worker_pid, worker_identity,
+               worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp,
+               commit_sha, phase, created_at, updated_at)
+            VALUES ('untrusted-direct-import', ?, ?, 202, 'synthetic-pid-identity', '{}',
+                    'base', 'tree', 'baseline', 'result', 'change', 'refs/acp/untrusted',
+                    0, 'commit', 'prepared', 'now', 'now')
+            """,
+            (attempt["id"], attempt["claim_token"]),
+        )
+
+    staging_cleanup_called = False
+
+    def record_staging_cleanup() -> None:
+        nonlocal staging_cleanup_called
+        staging_cleanup_called = True
+
+    monkeypatch.setattr(supervisor, "_cleanup_result_import_staging_locked", record_staging_cleanup)
+    with pytest.raises(SupervisorError) as recovered:
+        supervisor.recover_worker_result_import("untrusted-direct-import")
+    assert recovered.value.code == "sandbox_result_import_route_required"
+    assert staging_cleanup_called is False
+
+    with pytest.raises(SupervisorError) as submitted:
+        supervisor._submit(
+            attempt["id"],
+            attempt["claim_token"],
+            expected_worker_pid=202,
+            credential=None,
+            imported_result_id="untrusted-direct-import",
+        )
+    assert submitted.value.code == "sandbox_result_import_route_required"
+
+
 def test_result_import_rechecks_journal_at_result_write_boundary(
     repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

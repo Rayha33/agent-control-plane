@@ -44,7 +44,10 @@ from .result_import import (
     result_ref_name,
     verify_candidate_objects,
 )
-from .sandbox_execution_journal import _require_sandbox_execution_result_eligible
+from .sandbox_execution_journal import (
+    _require_direct_worker_result_source,
+    _require_sandbox_execution_result_eligible,
+)
 from .sandbox_workspace import ChangeSet, Snapshot
 from .schema import META_CASE_SENSITIVE
 
@@ -2662,6 +2665,7 @@ class ClaimsMixin:
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
             self._authenticate_attempt(connection, attempt, credential)
             _require_sandbox_execution_result_eligible(connection, attempt_id)
+            _require_direct_worker_result_source(connection, attempt_id)
             self._sandbox_execution_require_result_candidate_matches(
                 connection,
                 attempt_id,
@@ -2790,6 +2794,7 @@ class ClaimsMixin:
                     )
                     self._authenticate_attempt(connection, current, credential)
                     _require_sandbox_execution_result_eligible(connection, attempt_id)
+                    _require_direct_worker_result_source(connection, attempt_id)
                     self._sandbox_execution_require_result_candidate_matches(
                         connection,
                         attempt_id,
@@ -2925,6 +2930,7 @@ class ClaimsMixin:
                     _require_sandbox_execution_result_eligible(
                         connection, preflight_row["attempt_id"]
                     )
+                    _require_direct_worker_result_source(connection, preflight_row["attempt_id"])
                     self._sandbox_execution_require_result_candidate_matches(
                         connection,
                         preflight_row["attempt_id"],
@@ -2952,6 +2958,7 @@ class ClaimsMixin:
                 )
             self._authenticate_attempt(connection, attempt_row, credential)
             _require_sandbox_execution_result_eligible(connection, row["attempt_id"])
+            _require_direct_worker_result_source(connection, row["attempt_id"])
             self._sandbox_execution_require_result_candidate_matches(
                 connection,
                 row["attempt_id"],
@@ -3135,6 +3142,7 @@ class ClaimsMixin:
                     )
                     self._authenticate_attempt(connection, active, credential)
                     _require_sandbox_execution_result_eligible(connection, current["attempt_id"])
+                    _require_direct_worker_result_source(connection, current["attempt_id"])
                     self._sandbox_execution_require_result_candidate_matches(
                         connection,
                         current["attempt_id"],
@@ -3363,6 +3371,8 @@ class ClaimsMixin:
             sandbox_execution = connection.execute(
                 "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
+            if sandbox_execution is not None:
+                _require_direct_worker_result_source(connection, attempt_id)
             if sandbox_execution is not None and imported_result_id is None:
                 raise SupervisorError(
                     "sandbox_result_evidence_missing",

@@ -139,6 +139,24 @@ def _require_sandbox_execution_result_eligible(connection: Any, attempt_id: str)
         )
 
 
+def _require_direct_worker_result_source(connection: Any, attempt_id: str) -> None:
+    """Keep a journaled sandbox out of the direct-worker PID/receipt protocol.
+
+    This remains a separate fence even after cleanup verification exists: a
+    sandbox execution is identified by its execution journal, not by aliasing
+    its monitor, runc client, or container-init PID into ``attempts.pid``.
+    """
+
+    row = connection.execute(
+        "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+    ).fetchone()
+    if row is not None:
+        raise SupervisorError(
+            "sandbox_result_import_route_required",
+            "journaled sandbox results cannot use the direct-worker PID receipt route",
+        )
+
+
 class SandboxExecutionJournalMixin:
     """Private persistence API; no worker-launch or user-facing route is wired yet."""
 
