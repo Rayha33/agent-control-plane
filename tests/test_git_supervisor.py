@@ -132,12 +132,14 @@ def _create_test_oci_rootfs(repo: Path) -> tuple[Path, str]:
 
 def append_oci_config(repo: Path, body: str) -> tuple[Path, str]:
     rootfs, digest = _create_test_oci_rootfs(repo)
+    closure_digest = oci_worker_module.rootfs_tree_manifest(rootfs)["closure_sha256"]
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write(
             "\n[sandbox.oci]\n"
             f"{body}\n"
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
+            f"rootfs_closure_sha256 = {json.dumps(closure_digest)}\n"
         )
     return rootfs, digest
 
@@ -379,10 +381,34 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     assert supervisor.config.oci_runc_version == "1.3.5"
     assert supervisor.config.oci_rootfs_pin.path == rootfs.resolve()
     assert supervisor.config.oci_rootfs_pin.sha256 == rootfs_digest
+    assert (
+        supervisor.config.oci_rootfs_pin.closure_sha256
+        == oci_worker_module.rootfs_tree_manifest(rootfs)["closure_sha256"]
+    )
     assert calls == [("/usr/bin/runc", str(repo.resolve()))]
 
 
 def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> None:
+    write_config(repo)
+    rootfs, digest = _create_test_oci_rootfs(repo)
+    closure_digest = oci_worker_module.rootfs_tree_manifest(rootfs)["closure_sha256"]
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
+            'runc_version = "1.3.5"\n'
+            f"rootfs_path = {json.dumps(str(rootfs))}\n"
+            f"rootfs_sha256 = {json.dumps(digest)}\n"
+            f"rootfs_closure_sha256 = {json.dumps(closure_digest)}\n"
+        )
+    (rootfs / "usr" / "bin" / "busybox").write_text("unreviewed change\n", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="digest does not match") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
     write_config(repo)
     rootfs, digest = _create_test_oci_rootfs(repo)
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
@@ -391,10 +417,10 @@ def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> Non
             'runc_version = "1.3.5"\n'
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
+            f"rootfs_closure_sha256 = {json.dumps('0' * 64)}\n"
         )
-    (rootfs / "usr" / "bin" / "busybox").write_text("unreviewed change\n", encoding="ascii")
 
-    with pytest.raises(SupervisorError, match="digest does not match") as error:
+    with pytest.raises(SupervisorError, match="closure digest does not match") as error:
         GitSupervisor(repo)
 
     assert error.value.code == "invalid_oci_rootfs"
@@ -405,7 +431,9 @@ def test_oci_config_requires_a_rootfs_path_and_digest(repo: Path) -> None:
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
 
-    with pytest.raises(SupervisorError, match="requires runc_executable.*rootfs_sha256") as error:
+    with pytest.raises(
+        SupervisorError, match="requires runc_executable.*rootfs_sha256.*rootfs_closure_sha256"
+    ) as error:
         GitSupervisor(repo)
 
     assert error.value.code == "invalid_config"

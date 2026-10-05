@@ -98,6 +98,26 @@ def test_cli_submit_and_run_accept_a_result_manifest_path() -> None:
     assert run.command == ["python", "worker.py"]
 
 
+def test_cli_prints_operator_reviewable_rootfs_manifest_without_opening_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "tool").write_text("fixture content", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "GitSupervisor",
+        lambda *_args, **_kwargs: pytest.fail("manifest command must not open supervisor state"),
+    )
+
+    assert cli.main(["oci-rootfs-manifest", "--rootfs", str(rootfs)]) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["schema"] == "acp-oci-rootfs-closure-v1"
+    assert output["closure_sha256"]
+    assert "fixture content" not in json.dumps(output)
+
+
 def test_cli_submit_persists_a_bounded_completion_receipt(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     task = _add(repo, "CLI completion receipt", "owned.txt", "--resource", "reports/**")

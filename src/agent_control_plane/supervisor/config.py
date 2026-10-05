@@ -135,15 +135,18 @@ class ConfigMixin:
                 "runc_version",
                 "rootfs_path",
                 "rootfs_sha256",
+                "rootfs_closure_sha256",
             }:
                 raise SupervisorError(
                     "invalid_config",
-                    "sandbox.oci requires runc_executable, runc_version, rootfs_path, and rootfs_sha256",
+                    "sandbox.oci requires runc_executable, runc_version, rootfs_path, "
+                    "rootfs_sha256, and rootfs_closure_sha256",
                 )
             raw_runc_path = sandbox_oci["runc_executable"]
             requested_runc_version = sandbox_oci["runc_version"]
             raw_rootfs_path = sandbox_oci["rootfs_path"]
             expected_rootfs_sha256 = sandbox_oci["rootfs_sha256"]
+            expected_rootfs_closure_sha256 = sandbox_oci["rootfs_closure_sha256"]
             if not isinstance(raw_runc_path, str) or not raw_runc_path.strip():
                 raise SupervisorError(
                     "invalid_config", "sandbox.oci.runc_executable must be an absolute path"
@@ -169,8 +172,16 @@ class ConfigMixin:
                     "invalid_config",
                     "sandbox.oci.rootfs_sha256 must be 64 lowercase hex characters",
                 )
+            if not oci_worker._is_rootfs_sha256(expected_rootfs_closure_sha256):
+                raise SupervisorError(
+                    "invalid_config",
+                    "sandbox.oci.rootfs_closure_sha256 must be 64 lowercase hex characters",
+                )
             oci_rootfs_pin = oci_worker._pin_trusted_rootfs(
-                raw_rootfs_path, expected_rootfs_sha256, self.root
+                raw_rootfs_path,
+                expected_rootfs_sha256,
+                self.root,
+                expected_closure_sha256=expected_rootfs_closure_sha256,
             )
             oci_runc_executable = oci_worker._pin_trusted_runc_executable(raw_runc_path, self.root)
             oci_runc_version = oci_worker._probe_trusted_runc_version(

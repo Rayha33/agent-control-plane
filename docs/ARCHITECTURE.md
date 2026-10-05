@@ -211,10 +211,15 @@ another attempt's localhost service or database configuration.
 
 The opt-in `[sandbox.oci]` setting requires a root-owned, non-set-id `runc`
 executable (with no Linux file capabilities), an exact configured version, and
-an operator-selected `rootfs_path` plus `rootfs_sha256`. ACP pins the rootfs
-path, the device/inode actually opened by the scan, and a canonical tree digest
-at config load; it rejects Linux POSIX ACLs and uses Linux mountinfo snapshots to
-reject nested mounts, including same-device binds. It revalidates those facts
+an operator-selected `rootfs_path`, `rootfs_sha256`, and
+`rootfs_closure_sha256`. `acp oci-rootfs-manifest --rootfs PATH` emits an
+filesystem path/metadata/content-hash inventory (file bytes omitted), not a
+runtime dependency resolver. The operator must inspect every entry and inspect
+the bytes of generated `etc/` configuration separately before pinning the
+reported closure hash. ACP pins the rootfs path, the
+device/inode actually opened by the scan, and both digests at config load; it
+rejects Linux POSIX ACLs and uses Linux mountinfo snapshots to reject nested
+mounts, including same-device binds. It revalidates those facts
 when compiling an OCI config. Other extended attributes and non-Linux ACL
 mechanisms are outside the digest. Compute the configured digest on the target
 Linux host after provisioning because it binds host UID/GID. It detects

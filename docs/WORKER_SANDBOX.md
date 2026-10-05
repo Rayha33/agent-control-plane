@@ -287,13 +287,30 @@ cover untrusted paths, forged or modified handles, simulated ACL write grants,
 and a simulated changed binary identity.
 
 The same opt-in configuration now requires an operator-selected
-`rootfs_path` and `rootfs_sha256`. Generate the digest on the target Linux host,
-against the final provisioned rootfs. It includes host UID/GID metadata, so a
-digest generated on macOS or before copying/chowning the image may differ:
+`rootfs_path`, `rootfs_sha256`, and `rootfs_closure_sha256`. Generate both on
+the target Linux host against the final provisioned rootfs. The tree digest
+includes host UID/GID metadata, so values generated on macOS or before
+copying/chowning the image may differ. Generate the review artifact with:
 
 ```sh
-uv run python -c 'from agent_control_plane.supervisor.oci_worker import rootfs_tree_sha256; import sys; print(rootfs_tree_sha256(sys.argv[1]))' /absolute/path/to/rootfs
+uv run acp oci-rootfs-manifest --rootfs /absolute/path/to/rootfs
 ```
+
+The command prints a deterministic filesystem inventory: relative path, type,
+mode, UID/GID, size, and either a regular-file content SHA-256 or the literal
+symlink target and its hash. It never prints regular-file contents. Review the
+`entries` list to identify every path available in the rootfs; it is not a
+runtime library/dependency resolver. Inspect the bytes of generated `etc/`
+configuration separately through the trusted image-build/audit process to
+establish that it is minimal and non-secret. Then copy `rootfs_sha256` and
+`closure_sha256` into `[sandbox.oci]` as `rootfs_sha256` and
+`rootfs_closure_sha256`. The closure digest binds the schema and complete
+ordered filesystem inventory, and configuration load recomputes both pins from
+the same secure scan. A missing, malformed, or mismatched closure pin fails
+closed. The manifest makes paths and hashes reviewable and repeatable; it does
+not prove vendor provenance, that a human audit was good, or that `etc/`
+content is non-secret. The output may be large and path names can be sensitive,
+so generate and handle it only for an operator-selected rootfs.
 
 The version-1 tree digest binds relative paths, entry types, mode bits, UID/GID,
 regular-file contents, and symlink targets. Linux POSIX access/default ACLs
@@ -305,12 +322,12 @@ symlinks, set-id entries, Linux file capabilities, and trees over its fixed
 entry/byte limits; directory enumeration stops before collecting an entry
 beyond the global count limit. Other extended attributes and non-Linux ACL
 mechanisms are not part of the digest. The configured rootfs and repository
-paths must be disjoint. Configuration load
-seals the canonical path, the device/inode actually opened by the scan, and
-the digest in a process-local handle; verification repeats those checks before
-OCI config compilation and checks that any per-attempt bundle copy has the
-same digest. This detects substitution in the fields and content bound by this
-digest relative to the operator's configured value; changes only to excluded
+paths must be disjoint. Configuration load seals the canonical path, the
+device/inode actually opened by the scan, and both digests in a process-local
+handle; verification repeats those checks before OCI config compilation and
+checks that any per-attempt bundle copy has the same tree and closure digests.
+This detects substitution in the fields and content bound by these pins
+relative to the operator's configured values; changes only to excluded
 extended attributes are not detected. It does not establish image provenance,
 prove the contents are safe, make a writable source immutable, detect a
 transient mount that appears and disappears between identical mount-table

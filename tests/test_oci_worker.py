@@ -14,6 +14,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import urljoin
 
 import pytest
@@ -87,9 +88,18 @@ def oci_fixture(tmp_path: Path) -> tuple[Path, Snapshot]:
     return bundle, snapshot
 
 
+def _pin_test_rootfs(rootfs: Path) -> oci_worker._TrustedRootfs:
+    manifest = oci_worker.rootfs_tree_manifest(rootfs)
+    return oci_worker._pin_trusted_rootfs(
+        rootfs,
+        manifest["rootfs_sha256"],
+        expected_closure_sha256=manifest["closure_sha256"],
+    )
+
+
 def compile_config(bundle: Path, workspace: Snapshot) -> dict:
     rootfs = bundle / "rootfs"
-    rootfs_pin = oci_worker._pin_trusted_rootfs(rootfs, oci_worker.rootfs_tree_sha256(rootfs))
+    rootfs_pin = _pin_test_rootfs(rootfs)
     return build_oci_worker_config(
         bundle,
         workspace,
@@ -132,6 +142,82 @@ def test_rootfs_tree_digest_binds_mode_and_symlink_target(tmp_path: Path) -> Non
     link.unlink()
     link.symlink_to("second")
     assert oci_worker.rootfs_tree_sha256(rootfs) != changed_mode
+
+
+def test_rootfs_manifest_lists_paths_metadata_and_hashes_not_file_contents(tmp_path: Path) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    secret_like_content = "private sentinel content that must not appear"
+    file_path = rootfs / "bin" / "tool"
+    file_path.parent.mkdir()
+    file_path.write_text(secret_like_content, encoding="utf-8")
+    file_path.chmod(0o755)
+    (rootfs / "tool-current").symlink_to("bin/tool")
+
+    manifest = oci_worker.rootfs_tree_manifest(rootfs)
+    encoded = json.dumps(manifest, ensure_ascii=True, sort_keys=True)
+    entries = {entry["path"]: entry for entry in manifest["entries"]}
+
+    assert manifest["schema"] == "acp-oci-rootfs-closure-v1"
+    assert manifest["rootfs_sha256"] == oci_worker.rootfs_tree_sha256(rootfs)
+    assert (
+        manifest["closure_sha256"]
+        == hashlib.sha256(oci_worker._canonical_rootfs_closure(manifest["entries"])).hexdigest()
+    )
+    assert entries["bin/tool"]["mode"] == 0o755
+    assert (
+        entries["bin/tool"]["content_sha256"]
+        == hashlib.sha256(secret_like_content.encode("utf-8")).hexdigest()
+    )
+    assert entries["tool-current"]["target"] == "bin/tool"
+    assert secret_like_content not in encoded
+
+
+def test_rootfs_manifest_is_stable_across_entry_creation_order(tmp_path: Path) -> None:
+    first = tmp_path / "first-rootfs"
+    second = tmp_path / "second-rootfs"
+    first.mkdir()
+    second.mkdir()
+    for name in ("zeta", "alpha"):
+        (first / name).write_text(name, encoding="ascii")
+    for name in ("alpha", "zeta"):
+        (second / name).write_text(name, encoding="ascii")
+
+    assert oci_worker.rootfs_tree_manifest(first) == oci_worker.rootfs_tree_manifest(second)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="target Linux filesystems permit arbitrary path bytes"
+)
+def test_rootfs_manifest_round_trips_non_utf8_path_bytes(tmp_path: Path) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    raw_name = b"tool-\xff"
+    (rootfs / os.fsdecode(raw_name)).write_text("fixture", encoding="ascii")
+
+    manifest = oci_worker.rootfs_tree_manifest(rootfs)
+    encoded = json.dumps(manifest, ensure_ascii=True)
+    decoded = json.loads(encoded)
+    entry = next(entry for entry in decoded["entries"] if entry["type"] == "file")
+
+    assert os.fsencode(entry["path"]) == raw_name
+    assert decoded["closure_sha256"] == manifest["closure_sha256"]
+
+
+def test_rootfs_pin_requires_the_reviewed_closure_digest(tmp_path: Path) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "tool").write_text("fixture", encoding="ascii")
+    manifest = oci_worker.rootfs_tree_manifest(rootfs)
+
+    with pytest.raises(SupervisorError, match="closure digest does not match") as error:
+        oci_worker._pin_trusted_rootfs(
+            rootfs,
+            manifest["rootfs_sha256"],
+            expected_closure_sha256="0" * 64,
+        )
+
+    assert error.value.code == "invalid_oci_rootfs"
 
 
 def test_rootfs_digest_enforces_byte_depth_and_path_limits(
@@ -294,13 +380,14 @@ def test_rootfs_pin_retains_inode_observed_by_tree_scan_when_path_is_swapped(
     rootfs.mkdir()
     (rootfs / "image.txt").write_text("trusted image\n", encoding="ascii")
     digest = oci_worker.rootfs_tree_sha256(rootfs)
+    manifest = oci_worker.rootfs_tree_manifest(rootfs)
     original_measure = oci_worker._measure_rootfs_tree
     scanned_device, scanned_inode = original_measure(rootfs)[1:]
     swapped = False
 
-    def measure_then_swap(path: str | Path) -> tuple[str, int, int]:
+    def measure_then_swap(path: str | Path, **kwargs: Any) -> tuple[str, int, int]:
         nonlocal swapped
-        measurement = original_measure(path)
+        measurement = original_measure(path, **kwargs)
         if not swapped:
             backup = tmp_path / "rootfs-original"
             os.rename(rootfs, backup)
@@ -309,7 +396,9 @@ def test_rootfs_pin_retains_inode_observed_by_tree_scan_when_path_is_swapped(
         return measurement
 
     monkeypatch.setattr(oci_worker, "_measure_rootfs_tree", measure_then_swap)
-    pin = oci_worker._pin_trusted_rootfs(rootfs, digest)
+    pin = oci_worker._pin_trusted_rootfs(
+        rootfs, digest, expected_closure_sha256=manifest["closure_sha256"]
+    )
 
     assert (pin.device, pin.inode) == (scanned_device, scanned_inode)
     assert pin.inode != rootfs.stat().st_ino
@@ -324,18 +413,21 @@ def test_rootfs_verification_rejects_path_swap_between_resolution_and_scan(
     rootfs.mkdir()
     (rootfs / "image.txt").write_text("trusted image\n", encoding="ascii")
     digest = oci_worker.rootfs_tree_sha256(rootfs)
-    pin = oci_worker._pin_trusted_rootfs(rootfs, digest)
+    manifest = oci_worker.rootfs_tree_manifest(rootfs)
+    pin = oci_worker._pin_trusted_rootfs(
+        rootfs, digest, expected_closure_sha256=manifest["closure_sha256"]
+    )
     original_measure = oci_worker._measure_rootfs_tree
     swapped = False
 
-    def swap_then_measure(path: str | Path) -> tuple[str, int, int]:
+    def swap_then_measure(path: str | Path, **kwargs: Any) -> tuple[str, int, int]:
         nonlocal swapped
         if not swapped:
             backup = tmp_path / "rootfs-original"
             os.rename(rootfs, backup)
             shutil.copytree(backup, rootfs)
             swapped = True
-        return original_measure(path)
+        return original_measure(path, **kwargs)
 
     monkeypatch.setattr(oci_worker, "_measure_rootfs_tree", swap_then_measure)
 
@@ -402,7 +494,7 @@ def test_rootfs_pin_rejects_a_path_that_contains_the_repository(tmp_path: Path) 
 def test_rootfs_pin_revalidates_content_before_bundle_compilation(tmp_path: Path) -> None:
     bundle, workspace = oci_fixture(tmp_path)
     rootfs = bundle / "rootfs"
-    pin = oci_worker._pin_trusted_rootfs(rootfs, oci_worker.rootfs_tree_sha256(rootfs))
+    pin = _pin_test_rootfs(rootfs)
     (rootfs / "usr" / "bin" / "busybox").write_text("substituted\n", encoding="ascii")
 
     with pytest.raises(SupervisorError, match="no longer matches its pin") as error:
@@ -423,7 +515,7 @@ def test_rootfs_pin_revalidates_content_before_bundle_compilation(tmp_path: Path
 def test_rootfs_pin_rejects_a_caller_constructed_handle(tmp_path: Path) -> None:
     bundle, workspace = oci_fixture(tmp_path)
     rootfs = bundle / "rootfs"
-    pin = oci_worker._pin_trusted_rootfs(rootfs, oci_worker.rootfs_tree_sha256(rootfs))
+    pin = _pin_test_rootfs(rootfs)
     forged = oci_worker._TrustedRootfs(pin.path, pin.sha256, pin.device, pin.inode)
 
     with pytest.raises(SupervisorError, match="trusted supervisor configuration") as error:
@@ -445,12 +537,14 @@ def test_bundle_rootfs_copy_must_match_configured_rootfs_pin(tmp_path: Path) -> 
     bundle, workspace = oci_fixture(tmp_path)
     source = tmp_path / "trusted-rootfs"
     shutil.copytree(bundle / "rootfs", source)
-    pin = oci_worker._pin_trusted_rootfs(source, oci_worker.rootfs_tree_sha256(source))
+    pin = _pin_test_rootfs(source)
     (bundle / "rootfs" / "usr" / "bin" / "busybox").write_text(
         "substituted copy\n", encoding="ascii"
     )
 
-    with pytest.raises(SupervisorError, match="does not match the configured rootfs pin") as error:
+    with pytest.raises(
+        SupervisorError, match="does not match the configured rootfs and closure pins"
+    ) as error:
         build_oci_worker_config(
             bundle,
             workspace,
@@ -463,6 +557,26 @@ def test_bundle_rootfs_copy_must_match_configured_rootfs_pin(tmp_path: Path) -> 
         )
 
     assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_bundle_rootfs_copy_accepts_matching_tree_and_closure_pins(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+    source = tmp_path / "trusted-rootfs"
+    shutil.copytree(bundle / "rootfs", source)
+    pin = _pin_test_rootfs(source)
+
+    config = build_oci_worker_config(
+        bundle,
+        workspace,
+        ("/usr/bin/busybox",),
+        rootfs_pin=pin,
+        container_id="acp-worker-123",
+        memory_bytes=256 * 1024 * 1024,
+        pids_limit=32,
+        cpu_quota_us=100_000,
+    )
+
+    assert config["root"] == {"path": "rootfs", "readonly": True}
 
 
 def pinned_runc(repo_root: Path) -> oci_worker._TrustedRuncExecutable:
@@ -1266,9 +1380,7 @@ def test_oci_policy_rejects_ambiguous_or_host_relative_commands(
             bundle,
             workspace,
             command,
-            rootfs_pin=oci_worker._pin_trusted_rootfs(
-                bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
-            ),
+            rootfs_pin=_pin_test_rootfs(bundle / "rootfs"),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -1298,9 +1410,7 @@ def test_oci_policy_requires_snapshot_handle_not_an_arbitrary_private_path(
             bundle,
             workspace.root,
             ("/usr/bin/busybox",),
-            rootfs_pin=oci_worker._pin_trusted_rootfs(
-                bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
-            ),
+            rootfs_pin=_pin_test_rootfs(bundle / "rootfs"),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -1437,9 +1547,7 @@ def test_oci_policy_rejects_executable_shadowed_by_runtime_mount(
             bundle,
             workspace,
             (destination + "/tool",),
-            rootfs_pin=oci_worker._pin_trusted_rootfs(
-                rootfs, oci_worker.rootfs_tree_sha256(rootfs)
-            ),
+            rootfs_pin=_pin_test_rootfs(rootfs),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -1457,9 +1565,7 @@ def test_oci_policy_rejects_root_directory_as_executable(tmp_path: Path) -> None
             bundle,
             workspace,
             ("/",),
-            rootfs_pin=oci_worker._pin_trusted_rootfs(
-                bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
-            ),
+            rootfs_pin=_pin_test_rootfs(bundle / "rootfs"),
             container_id="acp-worker-123",
             memory_bytes=256 * 1024 * 1024,
             pids_limit=32,
@@ -1493,9 +1599,7 @@ def test_oci_policy_rejects_unsafe_resource_and_identity_values(
 ) -> None:
     bundle, workspace = oci_fixture(tmp_path)
     args = {
-        "rootfs_pin": oci_worker._pin_trusted_rootfs(
-            bundle / "rootfs", oci_worker.rootfs_tree_sha256(bundle / "rootfs")
-        ),
+        "rootfs_pin": _pin_test_rootfs(bundle / "rootfs"),
         "container_id": "acp-worker-123",
         "memory_bytes": 256 * 1024 * 1024,
         "pids_limit": 32,

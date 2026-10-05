@@ -54,6 +54,7 @@ _MAX_ROOTFS_ENTRIES = 200_000
 _MAX_ROOTFS_BYTES = 8 * 1024 * 1024 * 1024
 _MAX_ROOTFS_PATH_BYTES = 4096
 _MAX_ROOTFS_DEPTH = 256
+_ROOTFS_CLOSURE_SCHEMA = "acp-oci-rootfs-closure-v1"
 _MAX_MOUNTINFO_BYTES = 16 * 1024 * 1024
 _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
@@ -148,7 +149,7 @@ _TRUSTED_ROOTFS_PINS: dict[
     int,
     tuple[
         weakref.ReferenceType[Any],
-        tuple[Path, str, int, int],
+        tuple[Path, str, str, int, int],
     ],
 ] = {}
 _SECCOMP_DENIED_SYSCALLS = (
@@ -438,12 +439,13 @@ class _TrustedRuncExecutable:
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class _TrustedRootfs:
-    """Process-local pin for an operator-digested OCI root filesystem tree."""
+    """Process-local pin for an operator-digested OCI rootfs and closure."""
 
     path: Path
     sha256: str
     device: int
     inode: int
+    closure_sha256: str | None = None
 
 
 def _rootfs_stat_identity(info: os.stat_result) -> tuple[int, ...]:
@@ -601,7 +603,11 @@ def _check_rootfs_file_capability(descriptor: int) -> None:
         )
 
 
-def _measure_rootfs_tree(path: str | Path) -> tuple[str, int, int]:
+def _measure_rootfs_tree(
+    path: str | Path,
+    *,
+    _manifest_entries: list[dict[str, Any]] | None = None,
+) -> tuple[str, int, int]:
     """Return a canonical tree digest and the inode opened for that scan.
 
     The digest binds relative names, entry types, permission/ownership metadata,
@@ -630,7 +636,14 @@ def _measure_rootfs_tree(path: str | Path) -> tuple[str, int, int]:
     entries_pending = 0
     bytes_seen = 0
 
-    def record(relative_path: bytes, kind: str, info: os.stat_result, payload: str) -> None:
+    def record(
+        relative_path: bytes,
+        kind: str,
+        info: os.stat_result,
+        payload: str,
+        *,
+        symlink_target: bytes | None = None,
+    ) -> None:
         fields = [
             relative_path.hex(),
             kind,
@@ -643,6 +656,25 @@ def _measure_rootfs_tree(path: str | Path) -> tuple[str, int, int]:
         encoded = json.dumps(fields, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
+        if _manifest_entries is not None:
+            entry: dict[str, Any] = {
+                "path": os.fsdecode(relative_path),
+                "type": kind,
+                "mode": stat.S_IMODE(info.st_mode),
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "size": info.st_size if kind in {"file", "symlink"} else 0,
+            }
+            if kind == "file":
+                entry["content_sha256"] = payload
+            elif kind == "symlink":
+                if symlink_target is None:
+                    raise SupervisorError(
+                        "invalid_oci_rootfs", "OCI rootfs symlink target was not recorded"
+                    )
+                entry["target"] = os.fsdecode(symlink_target)
+                entry["target_sha256"] = payload
+            _manifest_entries.append(entry)
 
     def visit(directory: Path, directory_fd: int, prefix: bytes, depth: int) -> None:
         nonlocal entries_seen, entries_pending, bytes_seen
@@ -769,7 +801,13 @@ def _measure_rootfs_tree(path: str | Path) -> tuple[str, int, int]:
                 bytes_seen += len(target)
                 if bytes_seen > _MAX_ROOTFS_BYTES:
                     raise SupervisorError("invalid_oci_rootfs", "OCI rootfs exceeds its byte limit")
-                record(relative_path, "symlink", info, hashlib.sha256(target).hexdigest())
+                record(
+                    relative_path,
+                    "symlink",
+                    info,
+                    hashlib.sha256(target).hexdigest(),
+                    symlink_target=target,
+                )
             else:
                 raise SupervisorError("invalid_oci_rootfs", "OCI rootfs contains a special file")
         if _rootfs_stat_identity(before_directory) != _rootfs_stat_identity(os.fstat(directory_fd)):
@@ -797,6 +835,8 @@ def _measure_rootfs_tree(path: str | Path) -> tuple[str, int, int]:
         ) from error
     finally:
         os.close(root_fd)
+    if _manifest_entries is not None:
+        _manifest_entries.sort(key=lambda entry: os.fsencode(entry["path"]))
     return digest.hexdigest(), opened_root.st_dev, opened_root.st_ino
 
 
@@ -811,6 +851,35 @@ def rootfs_tree_sha256(path: str | Path) -> str:
     return _measure_rootfs_tree(path)[0]
 
 
+def _canonical_rootfs_closure(entries: list[dict[str, Any]]) -> bytes:
+    return json.dumps(
+        {"schema": _ROOTFS_CLOSURE_SCHEMA, "entries": entries},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def rootfs_tree_manifest(path: str | Path) -> dict[str, Any]:
+    """Inventory every filesystem entry without exposing regular-file bytes.
+
+    Paths and metadata are listed, while regular-file contents are represented
+    only by SHA-256. ``closure_sha256`` binds the schema and complete ordered
+    filesystem inventory; it is not runtime dependency resolution or an
+    attestation of provenance, audit quality, or absence of secrets.
+    """
+
+    entries: list[dict[str, Any]] = []
+    tree_sha256, _device, _inode = _measure_rootfs_tree(path, _manifest_entries=entries)
+    closure_sha256 = hashlib.sha256(_canonical_rootfs_closure(entries)).hexdigest()
+    return {
+        "schema": _ROOTFS_CLOSURE_SCHEMA,
+        "rootfs_sha256": tree_sha256,
+        "closure_sha256": closure_sha256,
+        "entries": entries,
+    }
+
+
 def _is_rootfs_sha256(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -823,8 +892,10 @@ def _pin_trusted_rootfs(
     path: str | Path,
     expected_sha256: str,
     repo_root: str | Path | None = None,
+    *,
+    expected_closure_sha256: str | None = None,
 ) -> _TrustedRootfs:
-    """Pin an operator-selected rootfs by path, root inode, and tree digest."""
+    """Pin an operator-selected rootfs by path, inode, tree, and closure digests."""
 
     if os.geteuid() == 0:
         raise SupervisorError(
@@ -854,14 +925,26 @@ def _pin_trusted_rootfs(
                 "configured OCI rootfs must be outside the repository and disjoint from it",
             )
     try:
-        observed, device, inode = _measure_rootfs_tree(root)
+        manifest_entries: list[dict[str, Any]] = []
+        observed, device, inode = _measure_rootfs_tree(root, _manifest_entries=manifest_entries)
     except OSError as error:
         raise SupervisorError(
             "invalid_oci_rootfs", "configured OCI rootfs cannot be verified"
         ) from error
     if observed != expected_sha256:
         raise SupervisorError("invalid_oci_rootfs", "configured OCI rootfs digest does not match")
-    pin = _TrustedRootfs(root, observed, device, inode)
+    if not _is_rootfs_sha256(expected_closure_sha256):
+        raise SupervisorError(
+            "invalid_oci_rootfs", "configured OCI rootfs closure digest is required and invalid"
+        )
+    observed_closure_sha256 = hashlib.sha256(
+        _canonical_rootfs_closure(manifest_entries)
+    ).hexdigest()
+    if observed_closure_sha256 != expected_closure_sha256:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "configured OCI rootfs closure digest does not match"
+        )
+    pin = _TrustedRootfs(root, observed, device, inode, observed_closure_sha256)
     key = id(pin)
 
     def discard(reference: weakref.ReferenceType[Any]) -> None:
@@ -872,7 +955,7 @@ def _pin_trusted_rootfs(
     reference = weakref.ref(pin, discard)
     _TRUSTED_ROOTFS_PINS[key] = (
         reference,
-        (root, observed, device, inode),
+        (root, observed, observed_closure_sha256, device, inode),
     )
     return pin
 
@@ -883,10 +966,11 @@ def _verify_trusted_rootfs(pin: _TrustedRootfs) -> Path:
         raise SupervisorError(
             "invalid_oci_rootfs", "OCI rootfs must come from trusted supervisor configuration"
         )
-    expected_path, expected_digest, expected_device, expected_inode = sealed[1]
+    expected_path, expected_digest, expected_closure, expected_device, expected_inode = sealed[1]
     if (
         pin.path != expected_path
         or pin.sha256 != expected_digest
+        or pin.closure_sha256 != expected_closure
         or (pin.device, pin.inode) != (expected_device, expected_inode)
     ):
         raise SupervisorError("invalid_oci_rootfs", "OCI rootfs pin was modified")
@@ -894,16 +978,19 @@ def _verify_trusted_rootfs(pin: _TrustedRootfs) -> Path:
         expected_path, code="invalid_oci_rootfs", label="configured OCI rootfs"
     )
     try:
-        observed, device, inode = _measure_rootfs_tree(current)
+        manifest_entries: list[dict[str, Any]] = []
+        observed, device, inode = _measure_rootfs_tree(current, _manifest_entries=manifest_entries)
     except OSError as error:
         raise SupervisorError(
             "invalid_oci_rootfs", "configured OCI rootfs cannot be verified"
         ) from error
+    observed_closure = hashlib.sha256(_canonical_rootfs_closure(manifest_entries)).hexdigest()
     if (
         current != expected_path
         or device != expected_device
         or inode != expected_inode
         or observed != expected_digest
+        or observed_closure != expected_closure
     ):
         raise SupervisorError(
             "invalid_oci_rootfs", "configured OCI rootfs no longer matches its pin"
@@ -1387,9 +1474,10 @@ def build_oci_worker_config(
     """Build an OCI 1.2 config with one mutable workspace and no host secrets.
 
     rootfs_pin must come from strict supervisor configuration and bind an
-    operator-selected rootfs tree digest. The bundle's rootfs must either be
-    that exact pinned directory or have the same tree digest. The digest proves
-    integrity against the operator's pin, not that the image has been audited.
+    operator-selected rootfs tree digest and closure digest. The bundle's
+    rootfs must either be that exact pinned directory or have the same tree and
+    closure digests. These digests prove integrity against the operator's pins,
+    not that the image has been audited.
     workspace_snapshot must be a separate
     host-created snapshot with no Git metadata. Its complete tree is reopened
     and checked against the captured manifest immediately before the bind source
@@ -1423,9 +1511,14 @@ def build_oci_worker_config(
         rootfs_info.st_dev,
         rootfs_info.st_ino,
     ) != (rootfs_pin.device, rootfs_pin.inode):
-        if rootfs_tree_sha256(rootfs) != rootfs_pin.sha256:
+        bundle_manifest = rootfs_tree_manifest(rootfs)
+        if (
+            bundle_manifest["rootfs_sha256"] != rootfs_pin.sha256
+            or bundle_manifest["closure_sha256"] != rootfs_pin.closure_sha256
+        ):
             raise SupervisorError(
-                "invalid_oci_rootfs", "OCI bundle rootfs does not match the configured rootfs pin"
+                "invalid_oci_rootfs",
+                "OCI bundle rootfs does not match the configured rootfs and closure pins",
             )
     workspace = _private_directory(
         workspace_snapshot.root,

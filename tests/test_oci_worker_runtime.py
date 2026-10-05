@@ -1875,8 +1875,14 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     state_root = attempt_root / "runc-state"
     state_root.mkdir(mode=0o700)
     pid_file = state_root / "container.pid"
-    rootfs_digest = oci_worker.rootfs_tree_sha256(rootfs)
-    rootfs_pin = oci_worker._pin_trusted_rootfs(rootfs, rootfs_digest, repo_root=repo_root)
+    rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs)
+    rootfs_digest = rootfs_manifest["rootfs_sha256"]
+    rootfs_pin = oci_worker._pin_trusted_rootfs(
+        rootfs,
+        rootfs_digest,
+        repo_root=repo_root,
+        expected_closure_sha256=rootfs_manifest["closure_sha256"],
+    )
 
     fixture_root = attempt_root / "host-fixtures"
     sibling_file = fixture_root / "sibling-attempt" / "private-marker"

@@ -118,6 +118,11 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("init", help="initialize config and local state")
     commands.add_parser("doctor", help="check repository and state integrity")
     commands.add_parser("migrate", help="upgrade the control database schema in place")
+    rootfs_manifest = commands.add_parser(
+        "oci-rootfs-manifest",
+        help="print a path/content-hash inventory for operator review of an OCI rootfs",
+    )
+    rootfs_manifest.add_argument("--rootfs", required=True, help="absolute rootfs directory")
     commands.add_parser(
         "mcp-serve", help="read-only MCP server over stdio (no credential, no writes)"
     )
@@ -815,6 +820,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = _run_trust_helper(args)
             emit(result)
+            return 0
+        if args.action == "oci-rootfs-manifest":
+            from .supervisor.oci_worker import rootfs_tree_manifest
+
+            emit(rootfs_tree_manifest(args.rootfs))
             return 0
         supervisor = GitSupervisor(
             args.repo,
