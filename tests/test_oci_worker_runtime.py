@@ -2243,6 +2243,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                         applets & {"cat", "grep", "ln", "nc", "readlink", "sed", "touch", "tr"}
                     ),
                     "rootfs_sha256": rootfs_digest,
+                    "rootfs_closure_sha256": rootfs_manifest["closure_sha256"],
+                    "rootfs_manifest_entries": len(rootfs_manifest["entries"]),
                     "mount_destinations": [mount["destination"] for mount in config["mounts"]],
                     "effective_runtime_policy": runtime_policy,
                     "cgroup_controls": controls,
