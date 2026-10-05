@@ -573,6 +573,22 @@ does not remove those paths, verify runtime teardown, close same-UID races
 between check and use, or write `cleanup_verified`. `run_worker` remains
 fail-closed for configured OCI.
 
+**Source-discriminated result-import journal (schema 19; still no sandbox
+import).** Existing result-import rows migrate as `direct_worker`, preserving
+their worker PID/receipt and staged-object inventory. New sandbox-source rows
+have no direct-worker PID or worker-exit receipt and are structurally bound to
+the exact `(attempt_id, execution_id)` plus a cleanup-receipt digest. Database
+guards reject direct-worker rows for attempts with a sandbox journal in either
+insertion order and reject ordinary `UPDATE` statements that change persisted
+source identity; a pre-migration mixed-source row stops the upgrade rather than
+being relabeled. The existing direct-worker INSERT shape remains compatible.
+These SQLite triggers are not a boundary against raw database writers; for
+example, replacement-style writes can bypass update-only immutability checks.
+These constraints separate receipt identities but do not produce or authenticate
+a cleanup receipt. No trusted cleanup verifier or sandbox-aware import/recovery
+route exists, `cleanup_verified` is still unwritten, and `run_worker` remains
+fail-closed for configured OCI.
+
 **Runtime-attestation validator and partial host collector (2026-10-04; still
 no launcher).** The `sandbox_attestation` module binds bounded observations into
 one typed receipt: unique-key `runc state` JSON, the private PID-file value,

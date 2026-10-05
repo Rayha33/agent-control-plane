@@ -409,6 +409,221 @@ def test_v12_read_only_open_requires_result_object_staging_migration(repo: Path)
     assert columns["promote_object_ids_json"]["dflt_value"] == "'[]'"
 
 
+def _pre_v19_result_import_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("CREATE TABLE attempts (id TEXT PRIMARY KEY)")
+    connection.execute("CREATE TABLE submissions (id TEXT PRIMARY KEY)")
+    connection.executemany(
+        "INSERT INTO attempts (id) VALUES (?)",
+        [
+            ("attempt-direct",),
+            ("attempt-sandbox",),
+            ("attempt-other",),
+            ("attempt-free",),
+        ],
+    )
+    migrations = dict(MIGRATIONS)
+    migrations[12](connection)
+    migrations[13](connection)
+    connection.execute(
+        """
+        CREATE TABLE sandbox_executions (
+          attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+          execution_id TEXT NOT NULL UNIQUE
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO sandbox_executions (attempt_id, execution_id) VALUES (?, ?)",
+        [("attempt-sandbox", "execution-sandbox"), ("attempt-other", "execution-other")],
+    )
+    return connection
+
+
+def test_result_import_source_migration_is_discriminated_and_pid_safe() -> None:
+    connection = _pre_v19_result_import_connection()
+    try:
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, worker_pid, worker_identity,
+               worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp,
+               commit_sha, phase, created_at, updated_at, staging_path,
+               object_ids_json, promote_object_ids_json)
+            VALUES ('direct-import', 'attempt-direct', 4, 44, 'linux:44:444', '{}',
+                    'base', 'tree', 'baseline', 'result', 'change', 'refs/acp/direct',
+                    5, 'commit', 'prepared', 'now', 'now', '/private/stage',
+                    '["blob","tree"]', '["tree"]')
+            """
+        )
+
+        migration = dict(MIGRATIONS)[19]
+        migration(connection)
+        migration(connection)
+
+        columns = {
+            row["name"]: row for row in connection.execute("PRAGMA table_info(result_imports)")
+        }
+        assert columns["worker_pid"]["notnull"] == 0
+        assert columns["source_kind"]["notnull"] == 1
+        direct = connection.execute(
+            "SELECT * FROM result_imports WHERE id = 'direct-import'"
+        ).fetchone()
+        assert direct["source_kind"] == "direct_worker"
+        assert direct["worker_pid"] == 44
+        assert direct["worker_identity"] == "linux:44:444"
+        assert direct["sandbox_execution_id"] is None
+        assert direct["staging_path"] == "/private/stage"
+        assert direct["object_ids_json"] == '["blob","tree"]'
+        assert direct["promote_object_ids_json"] == '["tree"]'
+
+        index_names = {
+            row["name"] for row in connection.execute("PRAGMA index_list(result_imports)")
+        }
+        assert "idx_result_imports_submission" in index_names
+        foreign_key_tables = {
+            row["table"] for row in connection.execute("PRAGMA foreign_key_list(result_imports)")
+        }
+        assert foreign_key_tables == {"attempts", "submissions", "sandbox_executions"}
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, source_kind, worker_pid, worker_identity,
+               worker_exit_receipt_json, sandbox_execution_id,
+               sandbox_cleanup_receipt_digest, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp, commit_sha,
+               phase, created_at, updated_at)
+            VALUES ('sandbox-import', 'attempt-sandbox', 7, 'sandbox_execution', NULL, '',
+                    '', 'execution-sandbox', ?, 'base', 'tree', 'baseline', 'result',
+                    'change', 'refs/acp/sandbox', 8, 'sandbox-commit', 'prepared',
+                    'now', 'now')
+            """,
+            ("a" * 64,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="result_import_source_identity_immutable"):
+            connection.execute(
+                """
+                UPDATE result_imports
+                SET attempt_id = 'attempt-sandbox', source_kind = 'sandbox_execution',
+                    worker_pid = NULL, worker_identity = '', worker_exit_receipt_json = '',
+                    sandbox_execution_id = 'execution-sandbox',
+                    sandbox_cleanup_receipt_digest = ?
+                WHERE id = 'direct-import'
+                """,
+                ("d" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            connection.execute(
+                """
+                INSERT INTO result_imports
+                  (id, attempt_id, claim_token, source_kind, worker_pid, worker_identity,
+                   worker_exit_receipt_json, sandbox_execution_id,
+                   sandbox_cleanup_receipt_digest, base_sha, tree_sha, baseline_digest,
+                   result_digest, change_digest, result_ref, commit_timestamp, commit_sha,
+                   phase, created_at, updated_at)
+                VALUES ('sandbox-pid-alias', 'attempt-sandbox', 8, 'sandbox_execution',
+                        202, 'linux:202:2020', '{}', 'execution-sandbox', ?, 'base', 'tree',
+                        'baseline2', 'result2', 'change2', 'refs/acp/sandbox-alias', 9,
+                        'alias-commit', 'prepared', 'now', 'now')
+                """,
+                ("b" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+            connection.execute(
+                """
+                INSERT INTO result_imports
+                  (id, attempt_id, claim_token, source_kind, worker_pid, worker_identity,
+                   worker_exit_receipt_json, sandbox_execution_id,
+                   sandbox_cleanup_receipt_digest, base_sha, tree_sha, baseline_digest,
+                   result_digest, change_digest, result_ref, commit_timestamp, commit_sha,
+                   phase, created_at, updated_at)
+                VALUES ('sandbox-wrong-attempt', 'attempt-sandbox', 9, 'sandbox_execution',
+                        NULL, '', '', 'execution-other', ?, 'base', 'tree', 'baseline3',
+                        'result3', 'change3', 'refs/acp/wrong-attempt', 10,
+                        'wrong-attempt-commit', 'prepared', 'now', 'now')
+                """,
+                ("c" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="result_import_source_execution_mismatch"):
+            connection.execute(
+                """
+                INSERT INTO result_imports
+                  (id, attempt_id, claim_token, source_kind, worker_pid, worker_identity,
+                   worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+                   result_digest, change_digest, result_ref, commit_timestamp, commit_sha,
+                   phase, created_at, updated_at)
+                VALUES ('sandbox-mislabeled-direct', 'attempt-sandbox', 10,
+                        'direct_worker', 202, 'linux:202:2020', '{}', 'base', 'tree',
+                        'baseline4', 'result4', 'change4', 'refs/acp/mislabeled', 11,
+                        'mislabeled-commit', 'prepared', 'now', 'now')
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="result_import_source_execution_mismatch"):
+            connection.execute(
+                "INSERT INTO sandbox_executions (attempt_id, execution_id) VALUES (?, ?)",
+                ("attempt-direct", "execution-after-direct-result"),
+            )
+
+        # Historical direct-worker INSERT SQL omits source_kind and sandbox fields.
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, worker_pid, worker_identity,
+               worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp,
+               commit_sha, phase, created_at, updated_at)
+            VALUES ('direct-import-after-migration', 'attempt-free', 1, 55,
+                    'linux:55:555', '{}', 'base2', 'tree2', 'baseline5',
+                    'result5', 'change5', 'refs/acp/direct-after-migration', 12,
+                    'direct-commit-2', 'prepared', 'now', 'now')
+            """
+        )
+        inserted = connection.execute(
+            "SELECT source_kind FROM result_imports WHERE id = 'direct-import-after-migration'"
+        ).fetchone()
+        assert inserted["source_kind"] == "direct_worker"
+    finally:
+        connection.close()
+
+
+def test_result_import_source_migration_refuses_legacy_mixed_source_rows() -> None:
+    connection = _pre_v19_result_import_connection()
+    try:
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, worker_pid, worker_identity,
+               worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp,
+               commit_sha, phase, created_at, updated_at)
+            VALUES ('legacy-mixed-source', 'attempt-sandbox', 1, 202,
+                    'linux:202:2020', '{}', 'base', 'tree', 'baseline',
+                    'result', 'change', 'refs/acp/legacy-mixed', 1,
+                    'legacy-commit', 'prepared', 'now', 'now')
+            """
+        )
+        connection.commit()
+
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.IntegrityError, match="result_import_source_execution_mismatch"):
+            dict(MIGRATIONS)[19](connection)
+        connection.rollback()
+
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(result_imports)")}
+        assert "source_kind" not in columns
+        row = connection.execute(
+            "SELECT worker_pid FROM result_imports WHERE id = 'legacy-mixed-source'"
+        ).fetchone()
+        assert row["worker_pid"] == 202
+    finally:
+        connection.close()
+
+
 def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: Path) -> None:
     """A live old process cannot create a new marker-less attempt after upgrade."""
 

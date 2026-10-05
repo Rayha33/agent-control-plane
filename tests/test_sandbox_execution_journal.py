@@ -216,14 +216,14 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v18_requires_durable_workspace_and_private_path_binding_before_launch(
+def test_schema_v19_requires_durable_workspace_and_private_path_binding_before_launch(
     repo: Path,
 ) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 18
+    assert SCHEMA_VERSION == 19
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -771,6 +771,9 @@ def test_journaled_sandbox_never_aliases_into_direct_worker_result_receipts(
     with supervisor.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
 
+        # Deliberately bypass the new database guard so the application-level
+        # recovery/submit fence also gets exercised against a corrupt legacy row.
+        connection.execute("DROP TRIGGER result_import_direct_source_insert_guard")
         connection.execute(
             """
             INSERT INTO result_imports
@@ -881,6 +884,8 @@ def test_journaled_result_recovery_is_fenced_before_staging_cleanup(
     import_id = "untrusted-result-import"
     stamp = "2026-10-04T00:00:00Z"
     with supervisor.connect() as connection:
+        # Simulate a corrupt pre-v19 database row; current schema writes reject it.
+        connection.execute("DROP TRIGGER result_import_direct_source_insert_guard")
         connection.execute(
             """
             INSERT INTO result_imports

@@ -194,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -406,6 +406,187 @@ def _add_result_import_object_staging(connection: sqlite3.Connection) -> None:
     for name, definition in additions:
         if name not in columns:
             connection.execute(f"ALTER TABLE result_imports ADD COLUMN {name} {definition}")
+
+
+def _add_result_import_source_discriminator(connection: sqlite3.Connection) -> None:
+    """Separate direct-process receipts from future sandbox-execution receipts.
+
+    Existing worker result journals remain ``direct_worker`` rows. Sandbox rows
+    have no worker PID or direct-worker receipt; their durable identity is the
+    exact sandbox execution plus a cleanup-verification receipt digest.
+    """
+
+    columns = {row["name"]: row for row in connection.execute("PRAGMA table_info(result_imports)")}
+    if "source_kind" in columns:
+        return
+    if not columns:
+        raise sqlite3.DatabaseError("result_imports must exist before source migration")
+
+    if connection.execute(
+        """
+        SELECT 1
+        FROM result_imports AS result
+        JOIN sandbox_executions AS execution ON execution.attempt_id = result.attempt_id
+        LIMIT 1
+        """
+    ).fetchone():
+        raise sqlite3.IntegrityError("result_import_source_execution_mismatch")
+
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_execution_attempt_identity "
+        "ON sandbox_executions(attempt_id, execution_id)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE result_imports_source_v19 (
+          id TEXT PRIMARY KEY,
+          attempt_id TEXT NOT NULL REFERENCES attempts(id),
+          claim_token INTEGER NOT NULL,
+          source_kind TEXT NOT NULL DEFAULT 'direct_worker'
+            CHECK (source_kind IN ('direct_worker', 'sandbox_execution')),
+          worker_pid INTEGER,
+          worker_identity TEXT NOT NULL DEFAULT '',
+          worker_exit_receipt_json TEXT NOT NULL DEFAULT '',
+          sandbox_execution_id TEXT,
+          sandbox_cleanup_receipt_digest TEXT,
+          base_sha TEXT NOT NULL,
+          tree_sha TEXT NOT NULL,
+          baseline_digest TEXT NOT NULL,
+          result_digest TEXT NOT NULL,
+          change_digest TEXT NOT NULL,
+          result_ref TEXT NOT NULL UNIQUE,
+          commit_timestamp INTEGER NOT NULL,
+          commit_sha TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN (
+            'prepared', 'ref_published', 'submitted', 'ambiguous'
+          )),
+          submission_id TEXT REFERENCES submissions(id),
+          error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          staging_path TEXT NOT NULL DEFAULT '',
+          object_ids_json TEXT NOT NULL DEFAULT '[]',
+          promote_object_ids_json TEXT NOT NULL DEFAULT '[]',
+          UNIQUE(attempt_id, claim_token, result_digest),
+          UNIQUE(sandbox_execution_id),
+          FOREIGN KEY (attempt_id, sandbox_execution_id)
+            REFERENCES sandbox_executions(attempt_id, execution_id),
+          CHECK (
+            (source_kind = 'direct_worker'
+              AND worker_pid IS NOT NULL
+              AND sandbox_execution_id IS NULL
+              AND sandbox_cleanup_receipt_digest IS NULL)
+            OR
+            (source_kind = 'sandbox_execution'
+              AND worker_pid IS NULL
+              AND worker_identity = ''
+              AND worker_exit_receipt_json = ''
+              AND sandbox_execution_id IS NOT NULL
+              AND sandbox_cleanup_receipt_digest IS NOT NULL
+              AND length(sandbox_cleanup_receipt_digest) = 64
+              AND sandbox_cleanup_receipt_digest NOT GLOB '*[^0-9a-f]*')
+          )
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO result_imports_source_v19 (
+          id, attempt_id, claim_token, source_kind, worker_pid, worker_identity,
+          worker_exit_receipt_json, sandbox_execution_id, sandbox_cleanup_receipt_digest,
+          base_sha, tree_sha, baseline_digest, result_digest, change_digest, result_ref,
+          commit_timestamp, commit_sha, phase, submission_id, error, created_at, updated_at,
+          staging_path, object_ids_json, promote_object_ids_json
+        )
+        SELECT id, attempt_id, claim_token, 'direct_worker', worker_pid, worker_identity,
+          worker_exit_receipt_json, NULL, NULL, base_sha, tree_sha, baseline_digest,
+          result_digest, change_digest, result_ref, commit_timestamp, commit_sha, phase,
+          submission_id, error, created_at, updated_at, staging_path, object_ids_json,
+          promote_object_ids_json
+        FROM result_imports
+        """
+    )
+    # A database rebuilt from a historical schema stamp can still carry these
+    # triggers from an earlier schema shape. They reference the table being
+    # replaced, so remove and recreate them around the transactional table swap.
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_direct_result_guard")
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_direct_result_update_guard")
+    connection.execute("DROP TABLE result_imports")
+    connection.execute("ALTER TABLE result_imports_source_v19 RENAME TO result_imports")
+    connection.execute(
+        "CREATE INDEX idx_result_imports_submission ON result_imports(submission_id)"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS result_import_direct_source_insert_guard
+        BEFORE INSERT ON result_imports
+        WHEN NEW.source_kind = 'direct_worker'
+          AND EXISTS (
+            SELECT 1 FROM sandbox_executions WHERE attempt_id = NEW.attempt_id
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'result_import_source_execution_mismatch');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS result_import_direct_source_update_guard
+        BEFORE UPDATE OF attempt_id, source_kind ON result_imports
+        WHEN NEW.source_kind = 'direct_worker'
+          AND EXISTS (
+            SELECT 1 FROM sandbox_executions WHERE attempt_id = NEW.attempt_id
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'result_import_source_execution_mismatch');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS result_import_source_identity_immutable
+        BEFORE UPDATE OF attempt_id, claim_token, source_kind, worker_pid,
+          worker_identity, worker_exit_receipt_json, sandbox_execution_id,
+          sandbox_cleanup_receipt_digest ON result_imports
+        WHEN OLD.attempt_id IS NOT NEW.attempt_id
+          OR OLD.claim_token IS NOT NEW.claim_token
+          OR OLD.source_kind IS NOT NEW.source_kind
+          OR OLD.worker_pid IS NOT NEW.worker_pid
+          OR OLD.worker_identity IS NOT NEW.worker_identity
+          OR OLD.worker_exit_receipt_json IS NOT NEW.worker_exit_receipt_json
+          OR OLD.sandbox_execution_id IS NOT NEW.sandbox_execution_id
+          OR OLD.sandbox_cleanup_receipt_digest IS NOT NEW.sandbox_cleanup_receipt_digest
+        BEGIN
+          SELECT RAISE(ABORT, 'result_import_source_identity_immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_direct_result_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN EXISTS (
+          SELECT 1 FROM result_imports
+          WHERE attempt_id = NEW.attempt_id AND source_kind = 'direct_worker'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'result_import_source_execution_mismatch');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS sandbox_execution_direct_result_update_guard
+        BEFORE UPDATE OF attempt_id ON sandbox_executions
+        WHEN EXISTS (
+          SELECT 1 FROM result_imports
+          WHERE attempt_id = NEW.attempt_id AND source_kind = 'direct_worker'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'result_import_source_execution_mismatch');
+        END
+        """
+    )
 
 
 def _add_sandbox_execution_journal(connection: sqlite3.Connection) -> None:
@@ -993,6 +1174,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (16, _add_sandbox_result_candidate_evidence),
     (17, _add_sandbox_runtime_content_pins),
     (18, _add_sandbox_execution_private_path_binding),
+    (19, _add_result_import_source_discriminator),
 )
 
 
