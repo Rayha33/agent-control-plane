@@ -24,6 +24,7 @@ reserve launch metadata safely.
 
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
 import json
@@ -62,6 +63,7 @@ _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
 _MAX_RUNC_LAUNCH_PAYLOAD_BYTES = 64 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
+_RUNC_RECURSIVE_PRIVATE_VERSION = "1.3.5"
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
 _RUNC_FD_LAUNCHER = r"""
 import json
@@ -238,6 +240,13 @@ _TRUSTED_RUNC_PINS: dict[
     tuple[
         weakref.ReferenceType[Any],
         tuple[Path, Path, str, int, int, int, int, int, int, int],
+    ],
+] = {}
+_PINNED_RUNC_WORKER_CONFIGS: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[Any],
+        tuple[_TrustedRuncExecutable, str, bytes, str],
     ],
 ] = {}
 _TRUSTED_ROOTFS_PINS: dict[
@@ -530,6 +539,16 @@ class _TrustedRuncExecutable:
     device: int
     inode: int
     size: int
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class _PinnedRuncWorkerConfig:
+    """Immutable worker config bound to one sealed runc executable pin."""
+
+    executable: _TrustedRuncExecutable
+    version: str
+    config_json: bytes = field(repr=False)
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -1811,6 +1830,136 @@ def build_oci_worker_config(
     }
 
 
+def _apply_pinned_runc_recursive_private_policy(
+    config: dict[str, Any],
+    executable: _TrustedRuncExecutable,
+    *,
+    expected_version: str,
+) -> _PinnedRuncWorkerConfig:
+    """Apply the narrowly pinned runc extension needed for recursive isolation.
+
+    The portable OCI compiler emits the standard rootfsPropagation value
+    "private". On the supported runc release, that leaves propagation state on
+    nested runtime mounts. Runc 1.3.5 accepts the implementation-specific
+    spelling "rprivate" and maps it to MS_PRIVATE|MS_REC. Keep that extension
+    out of the generic compiler and refuse it for every other pinned release.
+    """
+
+    if expected_version != _RUNC_RECURSIVE_PRIVATE_VERSION:
+        raise SupervisorError(
+            "invalid_oci_runtime_version",
+            "recursive rootfs propagation currently requires pinned runc 1.3.5",
+        )
+    if type(config) is not dict or type(config.get("linux")) is not dict:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "runc worker config must contain an OCI linux object"
+        )
+    if config["linux"].get("rootfsPropagation") != "private":
+        raise SupervisorError(
+            "invalid_oci_worker_policy",
+            "runc compatibility requires the portable private propagation baseline",
+        )
+    observed_version = _probe_trusted_runc_version(executable, expected_version)
+    if observed_version != _RUNC_RECURSIVE_PRIVATE_VERSION:
+        raise SupervisorError(
+            "invalid_oci_runtime_version",
+            "recursive rootfs propagation requires the exact pinned runc release",
+        )
+    adapted = copy.deepcopy(config)
+    adapted["linux"]["rootfsPropagation"] = "rprivate"
+    config_json = (
+        json.dumps(adapted, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+            "ascii"
+        )
+        + b"\n"
+    )
+    digest = hashlib.sha256(config_json).hexdigest()
+    binding = _PinnedRuncWorkerConfig(
+        executable=executable,
+        version=observed_version,
+        config_json=config_json,
+        sha256=digest,
+    )
+    key = id(binding)
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        current = _PINNED_RUNC_WORKER_CONFIGS.get(key)
+        if current is not None and current[0] is reference:
+            _PINNED_RUNC_WORKER_CONFIGS.pop(key, None)
+
+    reference = weakref.ref(binding, discard)
+    _PINNED_RUNC_WORKER_CONFIGS[key] = (
+        reference,
+        (executable, observed_version, config_json, digest),
+    )
+    return binding
+
+
+def _verify_pinned_runc_worker_config(
+    binding: _PinnedRuncWorkerConfig,
+    executable: _TrustedRuncExecutable,
+) -> None:
+    """Verify the sealed config still names the exact pinned runtime object."""
+
+    sealed = (
+        _PINNED_RUNC_WORKER_CONFIGS.get(id(binding))
+        if type(binding) is _PinnedRuncWorkerConfig
+        else None
+    )
+    if sealed is None or sealed[0]() is not binding:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "runc worker config must come from the pinned adapter"
+        )
+    pinned, version, config_json, digest = sealed[1]
+    if (
+        binding.executable is not executable
+        or pinned is not executable
+        or binding.version != version
+        or binding.config_json != config_json
+        or binding.sha256 != digest
+        or hashlib.sha256(binding.config_json).hexdigest() != digest
+    ):
+        raise SupervisorError(
+            "invalid_oci_worker_policy",
+            "runc worker config is not bound to this exact executable and policy",
+        )
+    if version != _RUNC_RECURSIVE_PRIVATE_VERSION:
+        raise SupervisorError(
+            "invalid_oci_runtime_version", "runc worker config requires pinned runc 1.3.5"
+        )
+    _verify_trusted_runc_executable(executable)
+    observed_version = _probe_trusted_runc_version(executable, version)
+    if observed_version != version:
+        raise SupervisorError(
+            "invalid_oci_runtime_version", "runc worker config runtime version changed"
+        )
+
+
+def _write_pinned_runc_worker_config(
+    binding: _PinnedRuncWorkerConfig,
+    executable: _TrustedRuncExecutable,
+    bundle_root: str | Path,
+) -> Path:
+    """Create config.json from the sealed bytes in a private OCI bundle."""
+
+    _verify_pinned_runc_worker_config(binding, executable)
+    bundle = _private_directory(bundle_root, code="invalid_oci_bundle", label="OCI bundle root")
+    config_path = bundle / "config.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(config_path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(binding.config_json)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_bundle", "could not create the bound runc worker config"
+        ) from error
+    return config_path
+
+
 def build_runc_run_argv(
     executable: _TrustedRuncExecutable,
     state_root: str | Path,
@@ -2162,3 +2311,40 @@ def spawn_pinned_runc(
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+def spawn_pinned_runc_worker(
+    binding: _PinnedRuncWorkerConfig,
+    state_root: str | Path,
+    bundle_root: str | Path,
+    workspace_root: str | Path,
+    pid_file: str | Path,
+    container_id: str,
+    *,
+    stdout: Any = subprocess.DEVNULL,
+    stderr: Any = subprocess.DEVNULL,
+) -> RuncLaunchHandle:
+    """Write and launch one worker with the same sealed config/runtime binding.
+
+    Callers cannot provide a second executable: the policy binding supplies the
+    exact sealed pin used by argv construction and held-FD spawn. The lower-level
+    argv and launcher primitives remain available for isolated tests, but this
+    is the only helper that launches an adapted worker config.
+    """
+
+    if type(binding) is not _PinnedRuncWorkerConfig:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "worker launch requires a pinned runc config binding"
+        )
+    executable = binding.executable
+    _verify_pinned_runc_worker_config(binding, executable)
+    run_argv = build_runc_run_argv(
+        executable,
+        state_root,
+        bundle_root,
+        workspace_root,
+        pid_file,
+        container_id,
+    )
+    _write_pinned_runc_worker_config(binding, executable, bundle_root)
+    return spawn_pinned_runc(executable, run_argv, stdout=stdout, stderr=stderr)

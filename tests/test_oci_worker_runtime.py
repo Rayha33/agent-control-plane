@@ -1731,11 +1731,6 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     expected_version = os.environ.get("ACP_OCI_TEST_RUNC_VERSION")
     if not expected_version:
         pytest.fail("set ACP_OCI_TEST_RUNC_VERSION to the exact approved runc release")
-    rootfs_propagation = os.environ.get("ACP_OCI_TEST_ROOTFS_PROPAGATION", "private")
-    if rootfs_propagation not in {"private", "rprivate"}:
-        pytest.fail("OCI integration rootfs propagation must be private or rprivate")
-    if rootfs_propagation == "rprivate" and expected_version != "1.3.5":
-        pytest.fail("the rprivate diagnostic override is pinned to runc 1.3.5")
 
     repo_root = Path(__file__).resolve().parents[1]
     if not repo_root.is_relative_to(Path("/tmp")):
@@ -1940,10 +1935,11 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             tmpfs_bytes=8 * 1024 * 1024,
             home_bytes=2 * 1024 * 1024,
         )
-        # runc 1.3.5 accepts this implementation-specific recursive spelling;
-        # keep the portable OCI compiler default unchanged and opt in only for
-        # this exact-version, gated diagnostic run.
-        config["linux"]["rootfsPropagation"] = rootfs_propagation
+        worker_config = oci_worker._apply_pinned_runc_recursive_private_policy(
+            config, pin, expected_version=observed_version
+        )
+        config = json.loads(worker_config.config_json)
+        rootfs_propagation = config["linux"]["rootfsPropagation"]
         if config["root"].get("readonly") is not True:
             pytest.fail("OCI rootfs policy is not read-only")
         file_size_limits = [
@@ -1978,24 +1974,15 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             item.split("=", 1)[0] for item in config["process"]["env"]
         }:
             pytest.fail("host credential or agent environment reached the OCI worker")
-        config_path = bundle_root / "config.json"
-        config_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
-        config_path.chmod(0o600)
-
-        run_argv = oci_worker.build_runc_run_argv(
-            pin,
+        # The bound launcher writes the exact sealed config bytes and derives
+        # argv and the held-FD executable from the same immutable pin object.
+        run_handle = oci_worker.spawn_pinned_runc_worker(
+            worker_config,
             state_root,
             bundle_root,
             workspace,
             pid_file,
             container_id,
-        )
-        # Exercise the same held-FD, fd-3 launcher the supervisor executor will
-        # consume. The gate stays closed while live namespace/mount/cgroup state
-        # is inspected from the host.
-        run_handle = oci_worker.spawn_pinned_runc(
-            pin,
-            run_argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

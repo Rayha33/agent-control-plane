@@ -1245,3 +1245,33 @@ integrated, and `externalSandbox` remains disabled.
 Until then, the supported claim is narrower: ACP's resource driver can create a
 constrained systemd unit around a configured payload on the measured NAS; the
 supervised coding worker still executes directly in its registered worktree.
+
+### Pinned runc recursive-propagation adapter (2026-10-05)
+
+The live mountinfo audit established that the portable OCI value "private" is
+not sufficient for the tested rootless runc 1.3.5 runtime: nested /dev and
+/proc mounts retained master:10 propagation metadata, and the test rejected
+that state while the candidate remained behind fd 3. The exact-version
+diagnostic using "rprivate" passed the live policy and isolation checks. Runc
+1.3.5 maps that implementation-specific spelling to MS_PRIVATE|MS_REC, but
+the OCI v1.2.1 enum does not include rprivate
+([runc mapping](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/specconv/spec_linux.go),
+[OCI field](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md#configlinuxrootfsmountpropagation)).
+
+The generic OCI compiler therefore keeps emitting the standards-listed
+"private" value. A separate compatibility adapter now returns a sealed,
+immutable config-byte binding to the exact root-owned runc executable pin. It
+re-probes that pin, changes only linux.rootfsPropagation to "rprivate", and
+rejects other releases or an input that does not retain the compiler's
+"private" baseline. The worker launch helper derives both argv and held-FD
+execution from this same binding, creates config.json exclusively with the
+sealed bytes, and revalidates the pin/version before launch. A different
+executable pin is rejected. This runc-specific output must not be passed to a
+generic OCI runtime; the adapter is only for compiler-produced policy, not a
+validator for arbitrary OCI documents. This does not wire the adapter or
+launcher into run_worker, nor establish lifecycle, cleanup, result-import,
+credential, or provider-egress safety.
+
+Exact-pushed-source Linux replay, independent review, and full CI evidence for
+this adapter are recorded in the task notes; the remaining supervised worker
+lifecycle gates above are still open.
