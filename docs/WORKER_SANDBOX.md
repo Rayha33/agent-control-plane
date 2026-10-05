@@ -21,8 +21,10 @@ committed result refs remain retained pending a separate retention policy, and
 ACP does not run repository-wide GC. See
 [`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
 retention, and cleanup contract. End-to-end worker isolation proof remains
-incomplete. The OCI policy compiler now stages init behind an inherited pipe
-descriptor, but no supervisor executor passes or releases that descriptor. This
+incomplete. The OCI policy compiler stages init behind fd 3, and a reusable
+launcher now starts the pinned runc client through a held executable FD while
+retaining that gate. No `run_worker` path yet connects launch to the durable
+journal, runtime attestation, cleanup verification, or result import. This
 record does not authorize `externalSandbox` for ACP workers.
 
 **Descriptor transport primitive (2026-10-04; not integrated).** The trusted
@@ -35,10 +37,31 @@ parent closes its duplicate. A behavioral test verifies fd-3 delivery, no
 source-descriptor leak, and closure of the monitor's duplicate. When remapping a
 different descriptor, fd 3 and the source are reserved and cannot also be
 requested through `pass_fds`. This remains process plumbing, not an executor:
-the existing `run_worker` path does not launch runc, `_run_process` is
-synchronous, and no code reads back runtime state before releasing the OCI init
-gate. It proves no namespace, mount, credential, egress, cancellation, or
-result-import property.
+the existing `run_worker` path does not use this transport or launch runc, and
+no supervisor call path reads back runtime state and durably validates it before
+releasing the OCI init gate. It proves no namespace, mount, credential, egress,
+cancellation, or result-import property.
+
+**Held-FD runc launch primitive (2026-10-05; not lifecycle-integrated).**
+`spawn_pinned_runc()` revalidates the configured runc inode, passes its held file
+descriptor to an isolated launcher, and executes that exact inode rather than
+reopening a pathname. The launcher maps one private pipe reader to fd 3, closes
+the executable descriptor across exec, starts with a fixed environment that
+excludes provider/Codex/SSH/ACP runner credentials, and returns a handle whose
+gate must be explicitly released or closed. Gate release and cancellation are
+serialized; whichever operation acquires the handle lock first wins. Launch
+failure cleanup uses bounded waits and reports an unverified live client PID
+instead of waiting indefinitely. That error is not a durable cleanup receipt
+and does not release any supervisor fence. If payload delivery may have begun
+but the handle cannot be returned, `sandbox_launch_submission_unverified` tells
+the caller to retain attempt ownership and reconcile the exact OCI state. FD
+ownership is cleared before each close so an interrupted close is never retried
+against a possibly reused descriptor. The opt-in live rootless-runc test
+now uses this production helper and checks runtime policy before gate release.
+This does not bind the handle to `sandbox_executions`, attest the
+process/cgroup tuple, supervise cancellation or crash recovery, verify cleanup,
+or authorize result import; `run_worker` remains fail-closed for configured
+OCI.
 
 **Private Git bootstrap policy (compiler only; not integrated).** The OCI
 policy compiler now has an opt-in `private_git` mode for a rootfs that includes
@@ -52,10 +75,10 @@ the script rejects unexpected alternates, remotes, refs, or baseline history and
 creates one fresh input-snapshot commit without host repository history. The
 host snapshot is copied without `.git`; after execution, result capture ignores
 only the root `.git` entry and derives changes from captured file bytes, never
-from worker Git metadata. This does not yet provide an execution route: no
-supervisor passes or releases fd 3, and configured `run_worker` remains
-fail-closed. The private repository is untrusted worker state, not a submission
-receipt or authorization source.
+from worker Git metadata. This does not yet provide a registered-worker
+execution route: configured `run_worker` does not use the runc launcher and
+remains fail-closed. The private repository is untrusted worker state, not a
+submission receipt or authorization source.
 
 The namespace runtime probe records a validated
 `systemd_unit_invocation_id` in its runtime-driver evidence and append-only
@@ -361,13 +384,16 @@ the descriptor's content and file identity, and uses Linux fd-based `execve`
 through the timeout guardian. Only the held executable descriptor is passed to
 the probe child, then closed. Non-Linux hosts fail closed because `/dev/fd`
 existence does not establish that it is executable. This removes the
-path-replacement window for the configuration probe only. When `[sandbox.oci]`
-is configured, `run_worker` now fails before heartbeat or process reservation
-with `sandbox_executor_unavailable`; it cannot silently fall back to host
-execution. The argv builder still returns a path-based command and no worker-
-launch path calls it; no held descriptor spans an actual `runc run`, no runtime
-path/digest is persisted in the execution journal, and no OCI enforcement is
-established. These slices do not authorize launching candidate code.
+path-replacement window for the configuration probe. The new
+`spawn_pinned_runc` helper also carries the held descriptor through an actual
+attached launch and keeps fd 3 private behind a caller-controlled gate. It is
+not called by `run_worker`, and no runtime path/digest is durably tied to that
+launch before candidate exec; the attempt journal still cannot reach
+`cleanup_verified`. When `[sandbox.oci]` is configured, `run_worker` continues
+to fail before heartbeat or process reservation with
+`sandbox_executor_unavailable`; it cannot silently fall back to host execution.
+The direct live test exercises the helper but is not a supervisor-managed
+attempt and establishes no result-import or crash/cancel recovery claim.
 
 The contained process trampoline now has an opt-in Linux `exec_fd` input: the
 trusted monitor passes a caller-held regular-file descriptor to its blocked
@@ -377,8 +403,8 @@ the opened interpreter before launch, successfully executes it despite the
 missing pathname and nonexistent `argv[0]`, and confirms the descriptor is not
 visible to the target.
 This closes the generic path-substitution gap for a future held-runc launch,
-but no current `run_worker` route opens the configured runc pin and supplies
-`exec_fd`; OCI worker execution remains unavailable and fail-closed.
+but no current `run_worker` route uses the configured runc pin; OCI worker
+execution remains unavailable and fail-closed.
 
 ### Durable execution-journal slice (2026-10-04)
 

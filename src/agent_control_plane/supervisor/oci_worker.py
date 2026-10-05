@@ -1,20 +1,21 @@
-"""Compile an OCI policy request for a future supervised worker executor.
+"""Compile and launch an OCI policy request for a supervised worker executor.
 
-This module deliberately does not launch a worker or claim that ACP currently
-enforces this policy. It produces the narrow OCI config and attached ``runc``
-argv that an integrated executor can consume after it has provisioned and
-verified a private rootfs, snapshot workspace, durable lifecycle journal, and
-cleanup/recovery path. This compiler does not prove that runc applies the
-requested policy. The request is offline-only: it passes no caller environment
-or credentials and creates an unconfigured network namespace. It encodes finite
-memory, CPU, process-count, and tmpfs limits, but no aggregate quota for the
-host-backed workspace. The device-cgroup deny entry is a requested rule, not
-device isolation evidence: OCI runtimes provide default device nodes and may
-apply additional device rules, while rootless cgroup setup may be unavailable.
-The generated ``linux.seccomp`` profile is a denylist defense-in-depth layer,
-not a complete syscall allowlist or a substitute for the namespace/mount
-boundary. Runtime application and behavioral denial still require exact-host
-verification before worker launch is enabled.
+This module compiles the narrow OCI config and attached ``runc`` argv, and
+provides a held-executable-FD launcher that maps one private gate descriptor to
+fd 3. The launcher is not wired into ``run_worker``: it does not reserve the
+supervisor lifecycle journal, attest the live runtime, verify cleanup, recover
+after crashes, or authorize result import. It therefore does not establish
+that ACP currently enforces this policy. The request is offline-only: it passes
+no caller environment or credentials into the OCI process and creates an
+unconfigured network namespace. It encodes finite memory, CPU, process-count,
+and tmpfs limits, but no aggregate quota for the host-backed workspace. The
+device-cgroup deny entry is a requested rule, not device isolation evidence:
+OCI runtimes provide default device nodes and may apply additional device rules,
+while rootless cgroup setup may be unavailable. The generated
+``linux.seccomp`` profile is a denylist defense-in-depth layer, not a complete
+syscall allowlist or a substitute for the namespace/mount boundary. Runtime
+application and behavioral denial still require exact-host verification before
+worker launch is enabled.
 Path checks are not atomic and do not protect against a concurrent writer with
 access to the rootfs path (including a same-UID writer); the integrating
 executor must provision beneath trusted ancestors, control writers, and
@@ -34,10 +35,11 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import weakref
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -58,8 +60,48 @@ _ROOTFS_CLOSURE_SCHEMA = "acp-oci-rootfs-closure-v1"
 _MAX_MOUNTINFO_BYTES = 16 * 1024 * 1024
 _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
+_MAX_RUNC_LAUNCH_PAYLOAD_BYTES = 64 * 1024
 _MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
+_RUNC_FD_LAUNCHER = r"""
+import json
+import os
+import resource
+import sys
+
+start_fd, gate_fd, runc_fd = (int(value) for value in sys.argv[1:4])
+payload_bytes = bytearray()
+while len(payload_bytes) <= 65536:
+    chunk = os.read(start_fd, 65537 - len(payload_bytes))
+    if not chunk:
+        break
+    payload_bytes.extend(chunk)
+os.close(start_fd)
+if not payload_bytes.endswith(b"\n") or len(payload_bytes) > 65536:
+    os._exit(125)
+payload = json.loads(payload_bytes)
+if (
+    not isinstance(payload, dict)
+    or set(payload) != {"argv", "env"}
+    or not isinstance(payload["argv"], list)
+    or not isinstance(payload["env"], dict)
+):
+    os._exit(125)
+# runc is loaded from this exact descriptor, but its executable handle is not
+# passed into runc or the OCI init. Keep it above fd 3 so the gate remap cannot
+# accidentally clobber it.
+os.set_inheritable(runc_fd, False)
+if gate_fd == 3:
+    os.set_inheritable(gate_fd, True)
+else:
+    os.dup2(gate_fd, 3, inheritable=True)
+    os.close(gate_fd)
+resource.setrlimit(
+    resource.RLIMIT_FSIZE,
+    (67108864, 67108864),
+)
+os.execve(runc_fd, payload["argv"], payload["env"])
+"""
 _LAUNCH_GATE_PRIVATE_GIT_SCRIPT = """\
 IFS= read -r _ <&3 || exit 125
 exec 3<&-
@@ -1780,14 +1822,14 @@ def build_runc_run_argv(
     """Return an attached runc command with explicit state root and bundle.
 
     The OCI init requires one inherited launch-gate descriptor at fd 3. The
-    caller must map the read end to fd 3, sanitize runc activation environment,
-    pass exactly that one descriptor to ``subprocess.Popen``, and keep its
-    paired writer private until it has durably authorized launch.
+    caller must use :func:`spawn_pinned_runc` to map the read end to fd 3,
+    sanitize runc's activation environment, and keep its paired writer private
+    until it has durably authorized launch.
     ``executable`` must be a process-local pin minted by
     ``_pin_trusted_runc_executable``. Its root-owned file identity and SHA-256
-    are rechecked here; a caller-supplied path or forged pin is refused. No
-    supervisor config currently creates or passes this handle, and this helper
-    does not verify the desired runc version or prove that runc applies policy.
+    are rechecked here; a caller-supplied path or forged pin is refused. This
+    helper does not verify the desired runc version or prove that runc applies
+    policy.
     ``--keep`` preserves runc state/cgroup for an eventual supervised cleanup;
     the caller must not release its attempt fence until it separately proves
     that the init process, cgroup, and runc state are gone. The PID-path check
@@ -1847,3 +1889,276 @@ def build_runc_run_argv(
         "--keep",
         container_id,
     ]
+
+
+@dataclass
+class RuncLaunchHandle:
+    """One held runc client process and its private OCI-init release gate.
+
+    ``process.pid`` remains the runc client PID after the launcher execs the
+    pinned binary. The handle intentionally has no automatic-release behavior:
+    the caller must persist and attest launch state before calling
+    :meth:`release_gate`. The lock linearizes release against cancellation:
+    whichever operation acquires it first determines whether the gate is
+    released or closed. Closing an unreleased gate denies candidate exec.
+    """
+
+    process: subprocess.Popen[bytes]
+    _gate_writer: int | None
+    _gate_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def release_gate(self) -> None:
+        """Authorize the already-attested OCI init to execute its command once."""
+
+        with self._gate_lock:
+            descriptor = self._gate_writer
+            if descriptor is None:
+                raise SupervisorError(
+                    "sandbox_launch_gate_closed", "OCI init launch gate is already closed"
+                )
+            self._gate_writer = None
+            try:
+                if os.write(descriptor, b"go\n") != 3:
+                    raise OSError("short write to the OCI init launch gate")
+            except OSError as error:
+                raise SupervisorError(
+                    "sandbox_launch_gate_failed",
+                    "OCI init launch gate could not be released",
+                ) from error
+            finally:
+                os.close(descriptor)
+
+    def close_gate(self) -> None:
+        """Close an unreleased gate so the OCI init's fixed trampoline exits."""
+
+        with self._gate_lock:
+            descriptor = self._gate_writer
+            self._gate_writer = None
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close_gate()
+        except OSError:
+            pass
+
+
+def _runc_client_environment() -> dict[str, str]:
+    """Build the small host-side environment needed by rootless systemd runc."""
+
+    runtime_dir = f"/run/user/{os.geteuid()}"
+    return {
+        "HOME": str(Path.home()),
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "XDG_RUNTIME_DIR": runtime_dir,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+    }
+
+
+def _reap_failed_runc_launch(process: subprocess.Popen[bytes]) -> None:
+    """Bound launch-failure cleanup and report when the client cannot be reaped."""
+
+    try:
+        _kill_process_group(process)
+        return
+    except BaseException:
+        if process.poll() is not None:
+            return
+    try:
+        process.kill()
+    except OSError:
+        # The process may have exited between poll() and kill(). A bounded
+        # wait below distinguishes that race from an unreaped live child.
+        pass
+    try:
+        process.wait(timeout=1)
+    except BaseException as error:
+        raise SupervisorError(
+            "sandbox_launch_cleanup_unverified",
+            f"runc launcher pid {process.pid} could not be reaped after launch failure",
+        ) from error
+
+
+def spawn_pinned_runc(
+    executable: _TrustedRuncExecutable,
+    argv: Sequence[str],
+    *,
+    stdout: Any = subprocess.DEVNULL,
+    stderr: Any = subprocess.DEVNULL,
+) -> RuncLaunchHandle:
+    """Start pinned runc by held FD with exactly one inherited fd-3 launch gate.
+
+    The rootless supervisor opens and revalidates the configured runc inode,
+    then a tiny isolated Python launcher uses ``execve(fd, ...)`` so a later
+    pathname replacement cannot substitute another runtime. Only the three
+    protocol FDs are inherited by that launcher; the runc executable FD is
+    close-on-exec, and fd 3 is the sole descriptor intentionally preserved by
+    the OCI runtime. Stdin is closed and runc receives a fixed environment with
+    no provider, Codex, SSH-agent, or ACP runner credentials.
+
+    This starts the runtime client but does not reserve an attempt, verify its
+    version, attest the resulting namespaces/cgroups, or authorize release of
+    the returned gate. The caller must keep the attempt fenced until separate
+    runtime and cleanup evidence is durably verified. If payload delivery begins
+    but this function cannot return the handle, it raises
+    ``sandbox_launch_submission_unverified``; the caller must retain attempt
+    ownership and reconcile the exact runtime state before releasing its fence.
+    """
+
+    if os.geteuid() == 0:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "OCI worker runtime must be invoked by a non-root caller"
+        )
+    if not _supports_runc_fd_exec() or not hasattr(os, "pipe2"):
+        raise SupervisorError(
+            "invalid_oci_runtime",
+            "pinned runc launch requires Linux fd-based exec and close-on-exec pipes",
+        )
+    binary = _verify_trusted_runc_executable(executable)
+    if isinstance(argv, (str, bytes)):
+        raise SupervisorError("invalid_oci_command", "runc command must be an argument sequence")
+    try:
+        command = tuple(argv)
+    except TypeError as error:
+        raise SupervisorError(
+            "invalid_oci_command", "runc command must be an argument sequence"
+        ) from error
+    if (
+        not command
+        or command[0] != str(binary)
+        or any(not isinstance(value, str) or not value or "\x00" in value for value in command)
+    ):
+        raise SupervisorError(
+            "invalid_oci_command", "runc argv must begin with the exact pinned executable path"
+        )
+    if sum(len(os.fsencode(value)) + 1 for value in command) > _MAX_RUNC_LAUNCH_PAYLOAD_BYTES:
+        raise SupervisorError("invalid_oci_command", "runc argument payload exceeds its byte limit")
+
+    runtime_environment = _runc_client_environment()
+    payload = (
+        json.dumps(
+            {"argv": command, "env": runtime_environment},
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    if len(payload) > _MAX_RUNC_LAUNCH_PAYLOAD_BYTES:
+        raise SupervisorError("invalid_oci_command", "runc launch payload exceeds its byte limit")
+
+    import fcntl
+
+    opened_descriptor = _open_verified_runc_executable(executable)
+    runc_descriptor = -1
+    start_read = start_write = gate_read = gate_write = -1
+    process: subprocess.Popen[bytes] | None = None
+    launch_payload_may_have_been_delivered = False
+    try:
+        runc_descriptor = fcntl.fcntl(opened_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
+        descriptor_to_close = opened_descriptor
+        opened_descriptor = -1
+        os.close(descriptor_to_close)
+        start_read, start_write = os.pipe2(os.O_CLOEXEC)
+        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        launcher_environment = {
+            "HOME": runtime_environment["HOME"],
+            "PATH": runtime_environment["PATH"],
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                _RUNC_FD_LAUNCHER,
+                str(start_read),
+                str(gate_read),
+                str(runc_descriptor),
+            ],
+            cwd="/",
+            env=launcher_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            close_fds=True,
+            pass_fds=(start_read, gate_read, runc_descriptor),
+            start_new_session=True,
+        )
+        descriptor_to_close = start_read
+        start_read = -1
+        os.close(descriptor_to_close)
+        descriptor_to_close = gate_read
+        gate_read = -1
+        os.close(descriptor_to_close)
+        descriptor_to_close = runc_descriptor
+        runc_descriptor = -1
+        os.close(descriptor_to_close)
+
+        remaining = memoryview(payload)
+        while remaining:
+            # Treat any attempted write conservatively: interruption after a
+            # successful write but before updating local state must not hide a
+            # possible runtime submission from the caller.
+            launch_payload_may_have_been_delivered = True
+            written = os.write(start_write, remaining)
+            if written <= 0:
+                raise OSError("could not write the bounded runc launch payload")
+            remaining = remaining[written:]
+        descriptor_to_close = start_write
+        start_write = -1
+        os.close(descriptor_to_close)
+        handle = RuncLaunchHandle(process=process, _gate_writer=gate_write)
+        gate_write = -1
+        return handle
+    except BaseException as launch_error:
+        cleanup_error: BaseException | None = None
+        if gate_write >= 0:
+            descriptor_to_close = gate_write
+            gate_write = -1
+            try:
+                os.close(descriptor_to_close)
+            except BaseException as error:
+                cleanup_error = error
+        if process is not None:
+            try:
+                _reap_failed_runc_launch(process)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if launch_payload_may_have_been_delivered:
+            cleanup_status = (
+                "runc client cleanup is also unverified"
+                if cleanup_error is not None
+                else "runc client was reaped"
+            )
+            submission_error = SupervisorError(
+                "sandbox_launch_submission_unverified",
+                "runc launch payload may have been submitted; "
+                f"client_pid={process.pid if process is not None else 'unknown'}; "
+                f"{cleanup_status}; owning attempt must stay fenced until the "
+                "exact runtime state is independently reconciled",
+            )
+            raise submission_error from (cleanup_error or launch_error)
+        if cleanup_error is not None:
+            raise cleanup_error from launch_error
+        raise
+    finally:
+        descriptors_to_close = (
+            opened_descriptor,
+            runc_descriptor,
+            start_read,
+            start_write,
+            gate_read,
+        )
+        opened_descriptor = runc_descriptor = start_read = start_write = gate_read = -1
+        for descriptor in descriptors_to_close:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass

@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -1896,6 +1897,254 @@ def test_runc_command_is_attached_and_names_explicit_bundle_state_and_pid_file(
         "acp-worker-123",
     ]
     assert "--detach" not in argv
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux fd-based exec")
+def test_pinned_runc_launcher_maps_only_the_release_gate_to_fd3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("pinned OCI launch requires an unprivileged supervisor")
+    pin = pinned_runc(tmp_path)
+    for name in (
+        "OPENAI_API_KEY",
+        "CODEX_HOME",
+        "ACP_RUNNER_CREDENTIAL",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "SSH_AUTH_SOCK",
+    ):
+        monkeypatch.setenv(name, "test-only-secret-sentinel")
+    command = (
+        str(pin.path),
+        "-c",
+        "read -r token <&3 || exit 125; "
+        'test "${OPENAI_API_KEY+x}" != x; '
+        'test "${CODEX_HOME+x}" != x; '
+        'test "${ACP_RUNNER_CREDENTIAL+x}" != x; '
+        'test "${ANTHROPIC_API_KEY+x}" != x; '
+        'test "${GEMINI_API_KEY+x}" != x; '
+        'test "${SSH_AUTH_SOCK+x}" != x; '
+        'printf "%s\\n" "$token"',
+    )
+    handle = oci_worker.spawn_pinned_runc(
+        pin,
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert handle.process.poll() is None
+        handle.release_gate()
+        stdout, stderr = handle.process.communicate(timeout=5)
+    finally:
+        handle.close_gate()
+        if handle.process.poll() is None:
+            handle.process.kill()
+            handle.process.wait(timeout=2)
+
+    assert handle.process.returncode == 0, stderr.decode("utf-8", errors="replace")
+    assert stdout == b"go\n"
+    assert stderr == b""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux fd-based exec")
+def test_pinned_runc_launcher_eof_denies_command_exec(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("pinned OCI launch requires an unprivileged supervisor")
+    pin = pinned_runc(tmp_path)
+    handle = oci_worker.spawn_pinned_runc(
+        pin,
+        (str(pin.path), "-c", "read -r _ <&3 || exit 125; echo SHOULD_NOT_RUN"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        handle.close_gate()
+        stdout, stderr = handle.process.communicate(timeout=5)
+    finally:
+        handle.close_gate()
+        if handle.process.poll() is None:
+            handle.process.kill()
+            handle.process.wait(timeout=2)
+
+    assert handle.process.returncode == 125, stderr.decode("utf-8", errors="replace")
+    assert b"SHOULD_NOT_RUN" not in stdout
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux fd-based exec")
+def test_pinned_runc_launcher_rejects_unbound_argv_before_spawn(tmp_path: Path) -> None:
+    pin = pinned_runc(tmp_path)
+    with pytest.raises(SupervisorError) as error:
+        oci_worker.spawn_pinned_runc(pin, ("/bin/other-runc", "run"))
+
+    assert error.value.code == "invalid_oci_command"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux fd-based exec")
+def test_runc_launcher_reports_unverified_submission_and_does_not_reclose_reused_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("pinned OCI launch requires an unprivileged supervisor")
+    pin = pinned_runc(tmp_path)
+    real_pipe2 = os.pipe2
+    real_close = os.close
+    start_pipe_write: list[int] = []
+    replacement_fd: list[int] = []
+    close_injected = False
+
+    def remember_start_pipe(flags: int) -> tuple[int, int]:
+        descriptors = real_pipe2(flags)
+        if not start_pipe_write:
+            start_pipe_write.append(descriptors[1])
+        return descriptors
+
+    def close_after_releasing_fd(descriptor: int) -> None:
+        nonlocal close_injected
+        if start_pipe_write and descriptor == start_pipe_write[0] and not close_injected:
+            close_injected = True
+            real_close(descriptor)
+            replacement = os.open(os.devnull, os.O_RDONLY)
+            replacement_fd.append(replacement)
+            assert replacement == descriptor
+            raise OSError("simulated close interruption after descriptor release")
+        real_close(descriptor)
+
+    monkeypatch.setattr(oci_worker.os, "pipe2", remember_start_pipe)
+    monkeypatch.setattr(oci_worker.os, "close", close_after_releasing_fd)
+    try:
+        with pytest.raises(SupervisorError) as error:
+            oci_worker.spawn_pinned_runc(
+                pin,
+                (str(pin.path), "-c", "read -r _ <&3 || exit 125"),
+            )
+
+        assert error.value.code == "sandbox_launch_submission_unverified"
+        assert "client_pid=" in str(error.value)
+        assert close_injected
+        assert len(replacement_fd) == 1
+        os.fstat(replacement_fd[0])
+    finally:
+        if replacement_fd:
+            real_close(replacement_fd[0])
+
+
+def test_runc_launch_gate_release_is_atomic_with_concurrent_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate_read, gate_write = os.pipe()
+    process = subprocess.Popen([sys.executable, "-I", "-S", "-c", "pass"])
+    handle = oci_worker.RuncLaunchHandle(process=process, _gate_writer=gate_write)
+    original_write = os.write
+    write_entered = threading.Event()
+    allow_write = threading.Event()
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    release_errors: list[BaseException] = []
+    gate_payload = b""
+
+    def block_release_write(descriptor: int, data: bytes) -> int:
+        if descriptor == gate_write:
+            write_entered.set()
+            if not allow_write.wait(timeout=2):
+                raise TimeoutError("test did not release the gate write")
+        return original_write(descriptor, data)
+
+    def release_gate() -> None:
+        try:
+            handle.release_gate()
+        except BaseException as error:
+            release_errors.append(error)
+
+    def close_gate() -> None:
+        close_started.set()
+        handle.close_gate()
+        close_finished.set()
+
+    monkeypatch.setattr(oci_worker.os, "write", block_release_write)
+    release_thread = threading.Thread(target=release_gate)
+    close_thread = threading.Thread(target=close_gate)
+    try:
+        release_thread.start()
+        assert write_entered.wait(timeout=2)
+        close_thread.start()
+        assert close_started.wait(timeout=2)
+        assert not close_finished.wait(timeout=0.05)
+        allow_write.set()
+        release_thread.join(timeout=2)
+        close_thread.join(timeout=2)
+        gate_payload = os.read(gate_read, 3)
+    finally:
+        allow_write.set()
+        if release_thread.ident is not None:
+            release_thread.join(timeout=2)
+        if close_thread.ident is not None:
+            close_thread.join(timeout=2)
+        os.close(gate_read)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+
+    assert not release_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert release_errors == []
+    assert close_finished.is_set()
+    assert gate_payload == b"go\n"
+
+
+def test_runc_launch_gate_close_wins_before_release() -> None:
+    gate_read, gate_write = os.pipe()
+    process = subprocess.Popen([sys.executable, "-I", "-S", "-c", "pass"])
+    handle = oci_worker.RuncLaunchHandle(process=process, _gate_writer=gate_write)
+    try:
+        handle.close_gate()
+        with pytest.raises(SupervisorError) as error:
+            handle.release_gate()
+        assert error.value.code == "sandbox_launch_gate_closed"
+        assert os.read(gate_read, 1) == b""
+    finally:
+        os.close(gate_read)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+
+
+def test_failed_runc_launch_cleanup_reports_bounded_unreaped_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StuckProcess:
+        pid = 4242
+        returncode = None
+
+        def __init__(self) -> None:
+            self.kill_called = False
+            self.wait_timeout: float | None = None
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            self.kill_called = True
+
+        def wait(self, timeout: float | None = None) -> None:
+            self.wait_timeout = timeout
+            raise subprocess.TimeoutExpired("runc", timeout)
+
+    process = StuckProcess()
+
+    def fail_group_kill(_process: subprocess.Popen[bytes]) -> None:
+        raise OSError("group kill failed")
+
+    monkeypatch.setattr(oci_worker, "_kill_process_group", fail_group_kill)
+
+    with pytest.raises(SupervisorError) as error:
+        oci_worker._reap_failed_runc_launch(process)  # type: ignore[arg-type]
+
+    assert error.value.code == "sandbox_launch_cleanup_unverified"
+    assert "4242" in str(error.value)
+    assert process.kill_called
+    assert process.wait_timeout == 1
 
 
 def test_runc_command_rejects_existing_pid_file(tmp_path: Path) -> None:

@@ -57,37 +57,6 @@ _ATTEMPT_ROOT_CHILDREN = {
     "workspace-source",
 }
 
-# This small host-side trampoline waits until the test has written the exact
-# bundle and PID-specific probe, then execs runc by the held executable FD.
-# Descriptor 3 becomes the one launch-gate FD preserved into the OCI process.
-_RUNC_FD_LAUNCHER = """
-import json, os, resource, sys
-start_fd, gate_fd, runc_fd = (int(value) for value in sys.argv[1:4])
-payload_bytes = bytearray()
-while len(payload_bytes) <= 65536:
-    chunk = os.read(start_fd, 65537 - len(payload_bytes))
-    if not chunk:
-        break
-    payload_bytes.extend(chunk)
-os.close(start_fd)
-if not payload_bytes.endswith(b"\\n") or len(payload_bytes) > 65536:
-    os._exit(125)
-payload = json.loads(payload_bytes)
-# The descriptor is needed only to load the pinned executable.  It must not
-# survive exec into runc, and therefore cannot be inherited by the OCI init.
-os.set_inheritable(runc_fd, False)
-if gate_fd == 3:
-    os.set_inheritable(gate_fd, True)
-else:
-    os.dup2(gate_fd, 3, inheritable=True)
-    os.close(gate_fd)
-resource.setrlimit(
-    resource.RLIMIT_FSIZE,
-    (64 * 1024 * 1024, 64 * 1024 * 1024),
-)
-os.execve(runc_fd, payload["argv"], payload["env"])
-"""
-
 
 def _require_root_owned_file(path: Path, label: str) -> Path:
     resolved = path.resolve(strict=True)
@@ -839,23 +808,8 @@ def _audit_worker_init_runtime_policy(
     }
 
 
-def _runc_environment(*, marker: str | None = None) -> dict[str, str]:
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
-    bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus")
-    # Keep only values needed by rootless systemd-cgroup runc. In particular,
-    # no provider, model, Codex, SSH-agent, or supervisor credential variables
-    # cross into this runtime client or the OCI process.
-    env = {
-        "HOME": str(Path.home()),
-        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-        "LANG": "C",
-        "LC_ALL": "C",
-        "XDG_RUNTIME_DIR": runtime_dir,
-        "DBUS_SESSION_BUS_ADDRESS": bus,
-    }
-    if marker is not None:
-        env["ACP_TEST_RUNC_MARKER"] = marker
-    return env
+def _runc_environment() -> dict[str, str]:
+    return oci_worker._runc_client_environment()
 
 
 def _safe_run_pinned_runc(
@@ -1682,15 +1636,11 @@ def _probe_script(
     *,
     host_paths: dict[str, Path],
     host_tmp_relative: str,
-    host_runc_marker: str,
-    host_runc_pid: int,
     host_network_ip: str,
     host_network_port: int,
 ) -> str:
     q = {name: shell_quote(str(path)) for name, path in host_paths.items()}
     host_tmp_rel = shell_quote(host_tmp_relative)
-    marker = shell_quote(host_runc_marker)
-    host_pid = shell_quote(str(host_runc_pid))
     net_ip = shell_quote(host_network_ip)
     net_port = shell_quote(str(host_network_port))
     return f"""set -eu
@@ -1728,13 +1678,6 @@ if /bin/busybox cat /workspace/absolute-host-tmp > /workspace/absolute-link.txt;
 if /bin/busybox cat /workspace/relative-host-tmp > /workspace/relative-link.txt; then exit 43; fi
 if /bin/busybox touch /workspace/absolute-host-tmp; then exit 44; fi
 if /bin/busybox touch {q["checkout_write"]}; then exit 45; fi
-
-# The host runc client has a unique environment marker absent from the worker.
-# Even if a PID number happens to collide, the namespace must not expose it.
-if test -r /proc/{host_pid}/environ; then
-  visible=$(/bin/busybox tr '\\000' ' ' < /proc/{host_pid}/environ)
-  case "$visible" in *{marker}*) exit 46 ;; esac
-fi
 
 # No host network interface/default route, no inherited socket descriptor, and
 # no connection to a test-owned listener on the host's selected NIC address.
@@ -1939,7 +1882,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     listener: socket.socket | None = None
     opened_runc_descriptor: int | None = None
     runc_descriptor: int | None = None
-    start_read = start_write = gate_read = gate_write = -1
+    run_handle: oci_worker.RuncLaunchHandle | None = None
     process: subprocess.Popen[bytes] | None = None
     launch_submitted = False
     init_pid: int | None = None
@@ -1978,47 +1921,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         runc_descriptor = fcntl.fcntl(opened_runc_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
         os.close(opened_runc_descriptor)
         opened_runc_descriptor = None
-        start_read, start_write = os.pipe2(os.O_CLOEXEC)
-        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
-
-        # The launcher waits on start_read so the test can write a payload
-        # containing its exact host PID before runc loads config.json. Standard
-        # streams go only to /dev/null; no host log file is inherited by the worker.
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-I",
-                "-S",
-                "-c",
-                _RUNC_FD_LAUNCHER,
-                str(start_read),
-                str(gate_read),
-                str(runc_descriptor),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            pass_fds=(start_read, gate_read, runc_descriptor),
-            start_new_session=True,
-            env={
-                "HOME": str(Path.home()),
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
-                "LANG": "C",
-                "LC_ALL": "C",
-            },
-        )
-        os.close(start_read)
-        start_read = -1
-        os.close(gate_read)
-        gate_read = -1
-
-        host_runc_marker = f"acp-runc-{uuid.uuid4().hex}"
         script = _probe_script(
             host_paths=host_paths,
             host_tmp_relative=host_tmp_relative,
-            host_runc_marker=host_runc_marker,
-            host_runc_pid=process.pid,
             host_network_ip=host_network_ip,
             host_network_port=host_network_port,
         )
@@ -2061,8 +1966,18 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             pytest.fail("OCI policy contains an unexpected mount destination")
         if any(mount["destination"] in {"/etc", "/usr"} for mount in config["mounts"]):
             pytest.fail("OCI policy mounted broad host configuration or toolchain paths")
-        if "ACP_TEST_RUNC_MARKER" in {item.split("=", 1)[0] for item in config["process"]["env"]}:
-            pytest.fail("host-only runc marker was placed in the OCI worker environment")
+        sensitive_worker_environment = {
+            "OPENAI_API_KEY",
+            "CODEX_HOME",
+            "ACP_RUNNER_CREDENTIAL",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "SSH_AUTH_SOCK",
+        }
+        if sensitive_worker_environment & {
+            item.split("=", 1)[0] for item in config["process"]["env"]
+        }:
+            pytest.fail("host credential or agent environment reached the OCI worker")
         config_path = bundle_root / "config.json"
         config_path.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
         config_path.chmod(0o600)
@@ -2075,34 +1990,26 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             pid_file,
             container_id,
         )
-        payload = (
-            json.dumps(
-                {"argv": run_argv, "env": _runc_environment(marker=host_runc_marker)},
-                separators=(",", ":"),
-            ).encode("utf-8")
-            + b"\n"
+        # Exercise the same held-FD, fd-3 launcher the supervisor executor will
+        # consume. The gate stays closed while live namespace/mount/cgroup state
+        # is inspected from the host.
+        run_handle = oci_worker.spawn_pinned_runc(
+            pin,
+            run_argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        if len(payload) > 4096:
-            pytest.fail("bounded runc launcher payload exceeded the pipe atomicity ceiling")
+        process = run_handle.process
         if process.poll() is not None:
-            pytest.fail("pinned runc launcher exited before receiving its exact invocation")
-        # From this point onward, a partial pipe write may have submitted a
-        # valid launch.  Cleanup must always address this exact unique ID.
+            pytest.fail("pinned runc launcher exited before reaching its fd-3 gate")
         launch_submitted = True
         attempt_cleanup["launch_submitted"] = True
-        if os.write(start_write, payload) != len(payload):
-            pytest.fail("could not deliver the bounded runc invocation to the launcher")
-        os.close(start_write)
-        start_write = -1
 
         deadline = time.monotonic() + 12
         while not pid_file.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
         if process.poll() is not None or not pid_file.exists():
             pytest.fail(f"runc did not reach the launch gate (exit={process.poll()})")
-        host_env = Path(f"/proc/{process.pid}/environ").read_bytes()
-        if host_runc_marker.encode("ascii") not in host_env:
-            pytest.fail("pinned runc client did not retain its host-only marker")
 
         init_pid = int(read_private_runc_pid_file(pid_file, state_root))
         init_snapshot = read_linux_process_snapshot(init_pid)
@@ -2164,9 +2071,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         if (workspace / "result.txt").exists() or (workspace / "isolation-result.txt").exists():
             pytest.fail("candidate wrote workspace output before the gate was released")
 
-        os.write(gate_write, b"go\n")
-        os.close(gate_write)
-        gate_write = -1
+        if run_handle is None:
+            pytest.fail("pinned runc launch handle was not retained")
+        run_handle.release_gate()
         fd_ready = workspace / "fd-audit-ready"
         ready_deadline = time.monotonic() + 5
         while (
@@ -2363,16 +2270,14 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             )
         )
 
-        # Closing the gate writer makes an unapproved launch fail closed.
-        # Close every pipe independently so a single EBADF cannot skip teardown.
-        close_fd("could not close launch-payload writer", start_write)
-        start_write = -1
-        close_fd("could not close launch-payload reader", start_read)
-        start_read = -1
-        close_fd("could not close candidate-gate writer", gate_write)
-        gate_write = -1
-        close_fd("could not close candidate-gate reader", gate_read)
-        gate_read = -1
+        # Closing the gate writer makes an unapproved launch fail closed before
+        # the runtime process group is terminated and exact-ID cleanup runs.
+        if run_handle is not None:
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not close candidate-exec gate",
+                run_handle.close_gate,
+            )
 
         if process_is_running() is True:
             _attempt_cleanup(
