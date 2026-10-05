@@ -42,32 +42,63 @@ no supervisor call path reads back runtime state and durably validates it before
 releasing the OCI init gate. It proves no namespace, mount, credential, egress,
 cancellation, or result-import property.
 
-**Held-FD runc diagnostic primitive (2026-10-05; not a supported worker launch).**
-The public `spawn_pinned_runc()` API validates the immutable policy/runtime
-binding, then fails closed with `sandbox_bundle_ownership_unverified` before
-writing `config.json` or spawning runc. Only the private
-`_spawn_pinned_runc_for_unisolated_diagnostic()` test helper can exercise the
-held-FD launch primitive while bundle ownership remains unproved. Its private
-`_spawn_pinned_runc()` primitive revalidates the configured runc inode,
-passes its held file descriptor to an isolated launcher, and executes that
-exact inode rather than reopening a pathname. The launcher maps one private
-pipe reader to fd 3, closes the executable descriptor across exec, and starts
-with a fixed environment that excludes provider/Codex/SSH/ACP runner
-credentials. Gate release and cancellation are serialized; whichever
-operation acquires the handle lock first wins. Launch
-failure cleanup uses bounded waits and reports an unverified live client PID
-instead of waiting indefinitely. That error is not a durable cleanup receipt
-and does not release any supervisor fence. If payload delivery may have begun
-but the handle cannot be returned, `sandbox_launch_submission_unverified` tells
-the caller to retain attempt ownership and reconcile the exact OCI state. FD
-ownership is cleared before each close so an interrupted close is never retried
-against a possibly reused descriptor. The opt-in no-model rootless-runc test
-uses only the private diagnostic helper; it does not test the supported public
-API or prove bundle ownership. No launch handle is returned through the public
-API. This does not bind a diagnostic handle to `sandbox_executions`, attest the
-process/cgroup tuple, supervise cancellation or crash recovery, verify cleanup,
-or authorize result import; `run_worker` remains fail-closed for configured
-OCI.
+**Private-bundle runc handoff (exact-source NAS replay and independent QC passed; hosted exact-head CI pending).**
+The public `spawn_pinned_runc()` path now validates the sealed policy/runtime
+binding, opens stable descriptors for the bundle and rootfs, and starts an
+isolated helper. The helper maps only the caller's UID/GID to the same host IDs
+in a new user namespace and creates a recursively private mount namespace. It
+creates a bounded detached tmpfs using Linux's fd-based mount API, attaches it
+to the opened bundle directory with empty-path `move_mount`, clones the pinned
+rootfs descriptor as a separate read-only mount, writes the exact
+compiler-sealed config, and marks the bundle read-only. The compiler policy
+also places a `nosuid,noexec` tmpfs at `/dev`, bounded to 1 MiB of data and 64
+inodes: Linux tmpfs enforces `size` and `nr_inodes` as separate limits
+([kernel tmpfs documentation](https://docs.kernel.org/filesystems/tmpfs.html)).
+Runc 1.3.5 creates device mountpoint inodes and its `ptmx` link there during
+bootstrap, before applying the OCI `root.readonly` setting to `/`. This keeps
+those setup writes off the read-only rootfs; the runtime audit verifies the
+actual `/` mount is read-only before the init gate opens. Because mount targets
+must belong to the helper's new mount namespace, it reopens the bundle and
+rootfs there and compares their device/inode identities to the parent's pinned
+descriptors before proceeding. Exact runc 1.3.5
+receives `--bundle /proc/self/fd/N`; a same-UID host-path replacement therefore
+does not redirect its config handoff. The launcher fails closed if the required
+fd-based mount API is unavailable; it has no path-based mount fallback.
+The helper and parent use bounded status/map/exec handshakes, and the OCI init
+still blocks behind fd 3. Setup failures before runc exec kill and reap the
+helper; after the runc-exec acknowledgement, an unavailable handle is reported
+as `sandbox_launch_submission_unverified`, not as proof that no runtime started.
+That exception carries the runc client PID and a separate reap result; unknown
+or negative reap evidence makes the integration harness preserve its bundle and
+state instead of treating the missing process handle as proof of absence.
+
+This is still an implementation slice, not a complete security claim. On
+2026-10-05, two opt-in no-model tests passed on NAS Linux 6.18.15 with runc
+1.3.5: a pre-exec setup failure reaped the helper, and the public
+`spawn_pinned_runc()` path completed the same-UID bundle replacement/rename
+attack before reporting live runc state, cgroup controls, effective mount and
+capability policy. The exact-host replay source hashes were `oci_worker.py`
+`c2025d00a43fcc04661c8f13edaf0f70c166705260bf8d4ec02cf0c6f42927cf`,
+`test_oci_worker.py`
+`38db6651a479dc13baa542e290cc9da5ed81cd9cea94b1491015e6a5957b1013`, and
+`test_oci_worker_runtime.py`
+`e860647fb1e0a13265a09bc4d313ee5b3d9d4f2e355e87d2a11c0a6226eb8b2d`. The
+exact runc client and worker cgroup were absent after teardown; the external
+pytest evidence directory was retained. Two independent reviewers gave GO for
+the bounded launcher and cleanup-guard slice; hosted exact-head CI for the next
+feature-branch head remains pending before task #2417 can close. The test-only
+pre-exec hook exercises same-UID proc-root writes, host config replacement,
+bundle rename/recreation, and `setns`; it is not available through the public
+API. The `_spawn_pinned_runc_for_unisolated_diagnostic()` and its host-path
+`_spawn_pinned_runc()` remain unsafe diagnostic paths and must not be used for
+workers.
+
+The new mount boundary protects the config handoff only. The host-backed rootfs
+source can still be changed by a same-UID process outside the read-only bind
+mount; the workspace, state root, PID file, lifecycle journal, cancellation,
+crash recovery, cleanup verification, credential/egress policy, and result
+import remain separate gates. `run_worker` remains fail-closed and is not
+connected to this low-level launch API.
 
 **Private Git bootstrap policy (compiler only; not integrated).** The OCI
 policy compiler now has an opt-in `private_git` mode for a rootfs that includes
@@ -390,18 +421,23 @@ the descriptor's content and file identity, and uses Linux fd-based `execve`
 through the timeout guardian. Only the held executable descriptor is passed to
 the probe child, then closed. Non-Linux hosts fail closed because `/dev/fd`
 existence does not establish that it is executable. This removes the
-path-replacement window for the configuration probe. The private
-`_spawn_pinned_runc_for_unisolated_diagnostic` helper can carry the held
-descriptor through an attached no-model diagnostic launch and keep fd 3 private
-behind a caller-controlled gate. The public `spawn_pinned_runc()` refuses to
-launch until exclusive bundle ownership is proven. The diagnostic helper is
-not called by `run_worker`, and no runtime path/digest is durably tied to that
-launch before candidate exec; the attempt journal still cannot reach
-`cleanup_verified`. When `[sandbox.oci]` is configured, `run_worker` continues
-to fail before heartbeat or process reservation with
-`sandbox_executor_unavailable`; it cannot silently fall back to host execution.
-The direct live test exercises the helper but is not a supervisor-managed
-attempt and establishes no result-import or crash/cancel recovery claim.
+path-replacement window for the configuration probe. The following describes
+the earlier hold, superseded by the private-bundle implementation above:
+`spawn_pinned_runc()` originally refused to launch while bundle ownership was
+unproved. The current candidate path uses a private read-only tmpfs and
+descriptor-anchored `--bundle`. A direct exact-host adversarial replay for this
+handoff is recorded in the evidence history below. The current runtime/test
+sources passed the exact-host replay, and two independent reviewers gave GO for
+the bounded launcher and cleanup-guard slice; hosted exact-head CI for the next
+feature-branch head remains pending. The
+unisolated diagnostic helper remains unsafe and is not called by `run_worker`.
+No runtime path/digest is durably tied to the attempt journal before candidate
+exec, and the attempt journal still cannot reach `cleanup_verified`. When
+`[sandbox.oci]` is configured, `run_worker` continues to fail before heartbeat
+or process reservation with `sandbox_executor_unavailable`; it cannot silently
+fall back to host execution. The direct live test is not a
+supervisor-managed attempt and establishes no result-import or crash/cancel
+recovery claim.
 
 The contained process trampoline now has an opt-in Linux `exec_fd` input: the
 trusted monitor passes a caller-held regular-file descriptor to its blocked
@@ -1277,19 +1313,14 @@ same root-owned executable pin and rejects other releases or any policy outside
 ACP's narrow OCI subset. This runc-specific output must not be passed to a
 generic OCI runtime.
 
-This closes the input-provenance/full-policy gap for the adapter, but not the
-filesystem handoff race. `O_EXCL`, no-follow creation, mode 0600, and a private
-directory do not stop another process with the same UID from replacing
-`config.json` before runc opens it. Accordingly, the supported
-`spawn_pinned_runc()` API now fails closed with
-`sandbox_bundle_ownership_unverified`. The underscored
-`_spawn_pinned_runc_for_unisolated_diagnostic()` is retained only for explicit
-no-model exact-host policy tests; it is not a supported or safe worker launch
-path. Do not connect either helper to `run_worker` until a per-launch outer
-ownership boundary is independently implemented and verified. Lifecycle,
+The input-provenance/full-policy gap is closed for the adapter. The former
+host-path config race is now addressed in the candidate `spawn_pinned_runc()`
+implementation by the private read-only tmpfs and inherited bundle FD described
+above; task #2417 remains open pending hosted exact-head CI for the updated
+feature-branch head. Exact-source NAS replay and independent QC have passed for
+the bounded launcher/cleanup slice. The
+underscored `_spawn_pinned_runc_for_unisolated_diagnostic()` is retained only
+for explicit no-model host-path diagnostics and is not a safe worker launch
+path. Do not connect either low-level launcher to `run_worker`: lifecycle,
 runtime attestation, cleanup, result-import, credential, and provider-egress
 safety remain separate open gates.
-
-Exact-pushed-source Linux replay, independent review, and full CI evidence for
-this adapter are recorded in the task notes; the remaining supervised worker
-lifecycle gates above are still open.

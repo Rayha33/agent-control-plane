@@ -13,7 +13,9 @@ no mount of the attempt bundle or its parent.
 
 from __future__ import annotations
 
+import errno
 import fcntl
+import hashlib
 import json
 import os
 import select
@@ -295,6 +297,47 @@ class _WorkerMountInfo:
     super_options: frozenset[str]
 
 
+def _tmpfs_size_bytes(super_options: frozenset[str]) -> int | None:
+    """Return the one effective tmpfs size option, including kernel unit suffixes."""
+
+    values = [option.partition("=")[2] for option in super_options if option.startswith("size=")]
+    if len(values) != 1:
+        return None
+    raw_value = values[0]
+    digits = raw_value
+    while digits and digits[-1].isalpha():
+        digits = digits[:-1]
+    suffix = raw_value[len(digits) :].lower()
+    if not digits or not digits.isascii() or not digits.isdigit() or len(suffix) > 1:
+        return None
+    multiplier = {
+        "": 1,
+        "k": 1024,
+        "m": 1024**2,
+        "g": 1024**3,
+        "t": 1024**4,
+        "p": 1024**5,
+        "e": 1024**6,
+    }.get(suffix)
+    if multiplier is None:
+        return None
+    return int(digits) * multiplier
+
+
+def _tmpfs_inode_limit(super_options: frozenset[str]) -> int | None:
+    """Return the one effective tmpfs inode limit when it is canonical decimal."""
+
+    values = [
+        option.partition("=")[2] for option in super_options if option.startswith("nr_inodes=")
+    ]
+    if len(values) != 1:
+        return None
+    raw_value = values[0]
+    if not raw_value.isascii() or not raw_value.isdigit():
+        return None
+    return int(raw_value)
+
+
 def _parse_worker_security_status(raw: bytes) -> dict[str, int | bool]:
     """Parse effective Linux capability and no_new_privs fields strictly."""
 
@@ -448,6 +491,7 @@ def _validate_worker_mount_policy(
     expected_mounts = {
         "/": (None, "ro"),
         "/proc": ("proc", "ro"),
+        "/dev": ("tmpfs", "rw"),
         "/workspace": (None, "rw"),
         "/tmp": ("tmpfs", "rw"),
         "/home/agent": ("tmpfs", "rw"),
@@ -569,7 +613,27 @@ def _validate_worker_mount_policy(
             raise AssertionError(
                 f"worker mount {target} has unexpected access options {sorted(options)}"
             )
-        if target != "/" and not {"nosuid", "nodev"}.issubset(options):
+        if target == "/dev":
+            if not {"nosuid", "noexec"}.issubset(options) or "nodev" in options:
+                raise AssertionError(
+                    "worker /dev tmpfs must be non-executable and permit its device binds"
+                )
+            observed_size = _tmpfs_size_bytes(observed.super_options)
+            if observed_size != oci_worker._DEFAULT_DEV_TMPFS_BYTES:
+                raise AssertionError(
+                    "worker /dev tmpfs does not retain its exact byte limit: "
+                    f"expected={oci_worker._DEFAULT_DEV_TMPFS_BYTES}, observed={observed_size!r}, "
+                    f"observed_super_options={sorted(observed.super_options)!r}"
+                )
+            observed_inodes = _tmpfs_inode_limit(observed.super_options)
+            if observed_inodes != oci_worker._DEFAULT_DEV_TMPFS_INODES:
+                raise AssertionError(
+                    "worker /dev tmpfs does not retain its exact inode limit: "
+                    f"expected={oci_worker._DEFAULT_DEV_TMPFS_INODES}, "
+                    f"observed={observed_inodes!r}, "
+                    f"observed_super_options={sorted(observed.super_options)!r}"
+                )
+        elif target != "/" and not {"nosuid", "nodev"}.issubset(options):
             raise AssertionError(f"worker mount {target} is missing nosuid/nodev protection")
         if target == "/proc" and (observed.root != "/" or observed.source != "proc"):
             raise AssertionError("worker /proc mount is not a fresh procfs rooted at /")
@@ -895,6 +959,34 @@ def _attempt_cleanup(errors: list[str], label: str, action: Any) -> Any | None:
         return None
 
 
+def _run_cleanup_action_if_client_state_known(client_state_known: bool, action: Any) -> Any | None:
+    """Do not mutate runtime artifacts while a submitted client's state is unknown."""
+
+    if not client_state_known:
+        return None
+    return action()
+
+
+def _check_runc_client_after_submission(attempt_cleanup: dict[str, Any], process: Any) -> bool:
+    """Record a returned launch handle before its first fallible process poll."""
+
+    attempt_cleanup["launch_submitted"] = True
+    return process.poll() is None
+
+
+def _attempt_tree_removal_allowed(
+    attempt_cleanup: dict[str, Any], *, client_state_known: bool
+) -> bool:
+    """Retain attempt evidence until every submitted runtime is verified gone."""
+
+    return bool(
+        attempt_cleanup["created"]
+        and not attempt_cleanup["preserve"]
+        and client_state_known
+        and (not attempt_cleanup["launch_submitted"] or attempt_cleanup["runtime_verified"])
+    )
+
+
 def _cleanup_path_exists(errors: list[str], label: str, path: Path) -> bool | None:
     try:
         path.lstat()
@@ -1020,6 +1112,33 @@ def _cleanup_identity_gaps(
     if systemd_cgroup_path is None:
         gaps.append("launch was submitted without the exact systemd scope cgroup path")
     return tuple(gaps)
+
+
+def _runc_client_is_running(
+    process: subprocess.Popen[bytes] | None,
+    *,
+    launch_client_reaped: bool | None,
+) -> bool | None:
+    """Keep absent handles unknown unless the launcher positively reaped its child."""
+
+    if process is None:
+        return False if launch_client_reaped is True else None
+    return process.poll() is None
+
+
+def _launch_client_state_known(
+    *,
+    launch_submitted: bool,
+    client_running_after_cleanup: bool | None,
+    launch_client_reaped: bool | None,
+) -> bool:
+    """Return whether cleanup may mutate runtime state after launch submission."""
+
+    return (
+        not launch_submitted
+        or launch_client_reaped is True
+        or client_running_after_cleanup is False
+    )
 
 
 def _synthetic_proc_stat(
@@ -1167,12 +1286,44 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
     mounts = {
         "/": mount("rootfs", {"ro"}),
         "/proc": mount("proc", {"ro", "nosuid", "nodev", "noexec"}),
+        "/dev": mount(
+            "tmpfs",
+            {"rw", "nosuid", "noexec"},
+            source="tmpfs",
+            super_options={"rw", "size=1024k", "nr_inodes=64"},
+        ),
         "/workspace": mount("ext4", {"rw", "nosuid", "nodev"}),
         "/tmp": mount("tmpfs", {"rw", "nosuid", "nodev"}),
         "/home/agent": mount("tmpfs", {"rw", "nosuid", "nodev"}),
     }
     observed = _validate_worker_mount_policy(mounts)
     assert {mount["target"] for mount in observed} == set(mounts)
+
+    with pytest.raises(AssertionError, match="exact byte limit"):
+        _validate_worker_mount_policy(
+            {
+                **mounts,
+                "/dev": mount(
+                    "tmpfs",
+                    {"rw", "nosuid", "noexec"},
+                    source="tmpfs",
+                    super_options={"rw", "size=1023k"},
+                ),
+            }
+        )
+
+    with pytest.raises(AssertionError, match="exact inode limit"):
+        _validate_worker_mount_policy(
+            {
+                **mounts,
+                "/dev": mount(
+                    "tmpfs",
+                    {"rw", "nosuid", "noexec"},
+                    source="tmpfs",
+                    super_options={"rw", "size=1024k", "nr_inodes=65"},
+                ),
+            }
+        )
 
     with pytest.raises(AssertionError, match="unexpected access"):
         _validate_worker_mount_policy({**mounts, "/": mount("rootfs", {"rw"})})
@@ -1270,6 +1421,55 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
                 "/proc": mount("proc", {"ro", "nosuid", "nodev", "noexec"}, root="/host"),
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("option", "expected_bytes"),
+    [
+        ("size=1048576", 1048576),
+        ("size=1024k", 1048576),
+        ("size=1m", 1048576),
+        ("size=1K", 1024),
+        ("size=2g", 2 * 1024**3),
+    ],
+)
+def test_tmpfs_size_parser_converts_kernel_unit_suffixes(option: str, expected_bytes: int) -> None:
+    assert _tmpfs_size_bytes(frozenset({"rw", option})) == expected_bytes
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        frozenset({"rw"}),
+        frozenset({"rw", "size=1m", "size=1024k"}),
+        frozenset({"rw", "size=1MB"}),
+        frozenset({"rw", "size=-1"}),
+    ],
+)
+def test_tmpfs_size_parser_rejects_missing_ambiguous_or_malformed_limits(
+    options: frozenset[str],
+) -> None:
+    assert _tmpfs_size_bytes(options) is None
+
+
+@pytest.mark.parametrize("raw_value", ["0", "64", "999"])
+def test_tmpfs_inode_parser_accepts_one_decimal_limit(raw_value: str) -> None:
+    assert _tmpfs_inode_limit(frozenset({"rw", f"nr_inodes={raw_value}"})) == int(raw_value)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        frozenset({"rw"}),
+        frozenset({"rw", "nr_inodes=64", "nr_inodes=65"}),
+        frozenset({"rw", "nr_inodes=64k"}),
+        frozenset({"rw", "nr_inodes=-1"}),
+    ],
+)
+def test_tmpfs_inode_parser_rejects_missing_ambiguous_or_malformed_limits(
+    options: frozenset[str],
+) -> None:
+    assert _tmpfs_inode_limit(options) is None
 
 
 def test_worker_default_device_mounts_require_exact_host_inode_identity() -> None:
@@ -1632,6 +1832,137 @@ def test_partial_launch_without_runtime_identity_fails_closed() -> None:
     assert "systemd scope cgroup" in gaps[2]
 
 
+def test_missing_launcher_handle_is_unknown_unless_reap_receipt_is_positive() -> None:
+    assert _runc_client_is_running(None, launch_client_reaped=None) is None
+    assert _runc_client_is_running(None, launch_client_reaped=False) is None
+    assert _runc_client_is_running(None, launch_client_reaped=True) is False
+
+    class RunningProcess:
+        def poll(self) -> None:
+            return None
+
+    class ExitedProcess:
+        def poll(self) -> int:
+            return 0
+
+    assert _runc_client_is_running(RunningProcess(), launch_client_reaped=None) is True
+    assert _runc_client_is_running(ExitedProcess(), launch_client_reaped=None) is False
+
+
+@pytest.mark.parametrize(
+    ("client_running_after_cleanup", "launch_client_reaped"),
+    [(None, None), (True, None), (None, False)],
+)
+def test_unresolved_submitted_client_suppresses_destructive_cleanup_actions(
+    client_running_after_cleanup: bool | None,
+    launch_client_reaped: bool | None,
+) -> None:
+    client_state_known = _launch_client_state_known(
+        launch_submitted=True,
+        client_running_after_cleanup=client_running_after_cleanup,
+        launch_client_reaped=launch_client_reaped,
+    )
+    assert not client_state_known
+
+    attempted: list[str] = []
+    for action_name in (
+        "exact-ID runc delete",
+        "PID file unlink",
+        "checkout probe removal",
+        "bundle restore",
+        "attempt-tree removal",
+    ):
+        result = _run_cleanup_action_if_client_state_known(
+            client_state_known,
+            lambda name=action_name: attempted.append(name),
+        )
+        assert result is None
+
+    assert attempted == []
+
+
+def test_submitted_client_cleanup_requires_positive_exit_or_reap_receipt() -> None:
+    assert not _launch_client_state_known(
+        launch_submitted=True,
+        client_running_after_cleanup=None,
+        launch_client_reaped=None,
+    )
+    assert not _launch_client_state_known(
+        launch_submitted=True,
+        client_running_after_cleanup=True,
+        launch_client_reaped=None,
+    )
+    assert _launch_client_state_known(
+        launch_submitted=True,
+        client_running_after_cleanup=False,
+        launch_client_reaped=None,
+    )
+    assert _launch_client_state_known(
+        launch_submitted=True,
+        client_running_after_cleanup=None,
+        launch_client_reaped=True,
+    )
+
+
+def test_present_but_uninspectable_client_does_not_authorize_cleanup() -> None:
+    class UninspectableProcess:
+        def poll(self) -> None:
+            raise OSError("wait status unavailable")
+
+    errors: list[str] = []
+    running = _attempt_cleanup(
+        errors,
+        "could not inspect runc client after reap attempt",
+        lambda: _runc_client_is_running(
+            UninspectableProcess(),
+            launch_client_reaped=None,  # type: ignore[arg-type]
+        ),
+    )
+    assert running is None
+    assert errors == [
+        "could not inspect runc client after reap attempt: OSError: wait status unavailable"
+    ]
+
+    client_state_known = _launch_client_state_known(
+        launch_submitted=True,
+        client_running_after_cleanup=running,
+        launch_client_reaped=None,
+    )
+    assert not client_state_known
+
+    attempted: list[str] = []
+    result = _run_cleanup_action_if_client_state_known(
+        client_state_known, lambda: attempted.append("exact-ID runc delete")
+    )
+    assert result is None
+    assert attempted == []
+
+
+@pytest.mark.parametrize("poll_raises", [False, True])
+def test_launch_submission_is_recorded_before_initial_client_poll(poll_raises: bool) -> None:
+    attempt_cleanup = {
+        "created": True,
+        "launch_submitted": False,
+        "preserve": False,
+        "runtime_verified": False,
+    }
+
+    class ImmediateClient:
+        def poll(self) -> int:
+            assert attempt_cleanup["launch_submitted"]
+            if poll_raises:
+                raise OSError("initial poll failed")
+            return 1
+
+    if poll_raises:
+        with pytest.raises(OSError, match="initial poll failed"):
+            _check_runc_client_after_submission(attempt_cleanup, ImmediateClient())
+    else:
+        assert not _check_runc_client_after_submission(attempt_cleanup, ImmediateClient())
+    assert attempt_cleanup["launch_submitted"]
+    assert not _attempt_tree_removal_allowed(attempt_cleanup, client_state_known=True)
+
+
 def _probe_script(
     *,
     host_paths: dict[str, Path],
@@ -1715,9 +2046,9 @@ def _kill_runc_group(process: subprocess.Popen[bytes]) -> None:
 
 @pytest.mark.skipif(not _LIVE_TEST_ENABLED, reason=_LIVE_TEST_REASON)
 def test_live_rootless_runc_enforces_minimal_worker_boundary(
-    tmp_path: Path, request: pytest.FixtureRequest
+    tmp_path: Path, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Run one bounded BusyBox payload behind the exact config's launch gate."""
+    """Attack the private bundle handoff, then run a bounded gated BusyBox payload."""
 
     if not sys.platform.startswith("linux"):
         pytest.skip("the live OCI proof requires Linux namespaces and procfs")
@@ -1743,6 +2074,14 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         pytest.fail("runc version probe disagreed with the explicit integration-test pin")
 
     attempt_root = tmp_path / "live-oci-attempt"
+    renamed_bundle_root = attempt_root / "bundle-host-renamed"
+    original_bundle_identity: tuple[int, int] | None = None
+    recreated_bundle_identity: tuple[int, int] | None = None
+    attacker_config = (
+        b'{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":false},'
+        b'"linux":{"rootfsPropagation":"shared"}}\n'
+    )
+    bundle_attack_evidence: dict[str, Any] = {}
     attempt_cleanup = {
         "created": False,
         "identity": None,
@@ -1750,16 +2089,20 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         "runtime_verified": False,
         "preserve": False,
     }
+    cleanup_client_state_known = True
 
     def finalize_attempt_tree() -> None:
-        if not attempt_cleanup["created"] or attempt_cleanup["preserve"]:
-            return
-        if attempt_cleanup["launch_submitted"] and not attempt_cleanup["runtime_verified"]:
+        if not _attempt_tree_removal_allowed(
+            attempt_cleanup, client_state_known=cleanup_client_state_known
+        ):
             return
         identity = attempt_cleanup["identity"]
         if identity is None:
             raise AssertionError("private attempt-tree identity was not recorded")
-        _remove_private_attempt_tree(attempt_root, identity, os.geteuid())
+        _run_cleanup_action_if_client_state_known(
+            cleanup_client_state_known,
+            lambda: _remove_private_attempt_tree(attempt_root, identity, os.geteuid()),
+        )
 
     request.addfinalizer(finalize_attempt_tree)
     if os.path.lexists(attempt_root):
@@ -1777,6 +2120,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     attempt_cleanup["identity"] = (attempt_root_info.st_dev, attempt_root_info.st_ino)
     bundle_root = attempt_root / "bundle"
     bundle_root.mkdir(mode=0o700)
+    bundle_info = bundle_root.lstat()
+    original_bundle_identity = (bundle_info.st_dev, bundle_info.st_ino)
     rootfs = bundle_root / "rootfs"
     rootfs.mkdir(mode=0o755)
     for relative in (
@@ -1880,6 +2225,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     run_handle: oci_worker.RuncLaunchHandle | None = None
     process: subprocess.Popen[bytes] | None = None
     launch_submitted = False
+    launch_client_pid: int | None = None
+    launch_client_reaped: bool | None = None
     init_pid: int | None = None
     init_start: bytes | None = None
     fd_audit: tuple[tuple[int, str], ...] | None = None
@@ -1955,6 +2302,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             pytest.fail("trampoline and OCI worker file-size limits must match exactly")
         if {mount["destination"] for mount in config["mounts"]} != {
             "/proc",
+            "/dev",
             "/workspace",
             "/tmp",
             "/home/agent",
@@ -1974,29 +2322,128 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             item.split("=", 1)[0] for item in config["process"]["env"]
         }:
             pytest.fail("host credential or agent environment reached the OCI worker")
-        # This exact-host diagnostic writes sealed bytes but does not establish
-        # same-UID bundle ownership; production launch remains fail-closed.
-        run_handle = oci_worker._spawn_pinned_runc_for_unisolated_diagnostic(
-            worker_config,
-            state_root,
-            bundle_root,
-            workspace,
-            pid_file,
-            container_id,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+
+        def attack_bundle_before_runc(
+            helper_pid: int, private_bundle: Path, bundle_fd: int
+        ) -> None:
+            nonlocal recreated_bundle_identity
+            proc_root_config = (
+                Path(f"/proc/{helper_pid}/root")
+                / private_bundle.relative_to(Path("/"))
+                / "config.json"
+            )
+            try:
+                descriptor = os.open(proc_root_config, os.O_WRONLY)
+            except OSError as error:
+                if error.errno != errno.EROFS:
+                    raise AssertionError(
+                        "same-UID proc-root writer did not fail with EROFS"
+                    ) from error
+                bundle_attack_evidence["proc_root_write"] = "EROFS"
+            else:
+                os.close(descriptor)
+                raise AssertionError("same-UID writer opened the private config for writing")
+
+            private_fd_config = Path(f"/proc/{helper_pid}/fd/{bundle_fd}/config.json")
+            if private_fd_config.read_bytes() != worker_config.config_json:
+                raise AssertionError("fd-anchored private config was not the sealed compiler bytes")
+            bundle_attack_evidence["private_config_digest"] = hashlib.sha256(
+                private_fd_config.read_bytes()
+            ).hexdigest()
+
+            replacement = private_bundle / "host-replacement.json"
+            replacement.write_bytes(attacker_config)
+            os.replace(replacement, private_bundle / "config.json")
+            os.rename(private_bundle, renamed_bundle_root)
+            private_bundle.mkdir(mode=0o700)
+            recreated_info = private_bundle.lstat()
+            recreated_bundle_identity = (recreated_info.st_dev, recreated_info.st_ino)
+            (private_bundle / "config.json").write_bytes(attacker_config)
+            bundle_attack_evidence["host_config_replaced"] = True
+            bundle_attack_evidence["host_bundle_renamed_and_recreated"] = True
+
+            setns_script = (
+                "import ctypes, os, sys; "
+                "fd=os.open(f'/proc/{sys.argv[1]}/ns/mnt', os.O_RDONLY); "
+                "libc=ctypes.CDLL(None, use_errno=True); "
+                "rc=libc.setns(fd, 0x00020000); "
+                "os.write(1, str(0 if rc == 0 else ctypes.get_errno()).encode())"
+            )
+            setns = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", setns_script, str(helper_pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            )
+            if setns.returncode != 0 or setns.stdout != str(errno.EPERM):
+                raise AssertionError(
+                    f"same-UID setns did not fail with EPERM: {setns.returncode}/{setns.stdout!r}"
+                )
+            bundle_attack_evidence["setns"] = "EPERM"
+            if private_fd_config.read_bytes() != worker_config.config_json:
+                raise AssertionError("host bundle replacement changed the fd-anchored config")
+
+        private_bundle_launcher = oci_worker._spawn_pinned_runc_with_private_bundle
+
+        def inject_same_uid_attack(
+            executable: Any,
+            argv: Any,
+            selected_bundle: Path,
+            config_json: bytes,
+            **kwargs: Any,
+        ) -> Any:
+            return private_bundle_launcher(
+                executable,
+                argv,
+                selected_bundle,
+                config_json,
+                _before_runc_exec=attack_bundle_before_runc,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(
+            oci_worker, "_spawn_pinned_runc_with_private_bundle", inject_same_uid_attack
         )
+        try:
+            run_handle = oci_worker.spawn_pinned_runc(
+                worker_config,
+                state_root,
+                bundle_root,
+                workspace,
+                pid_file,
+                container_id,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except oci_worker.SupervisorError as error:
+            if error.code == "sandbox_launch_submission_unverified":
+                launch_submitted = True
+                attempt_cleanup["launch_submitted"] = True
+                launch_client_pid = getattr(error, "client_pid", None)
+                launch_client_reaped = getattr(error, "client_reaped", None)
+                if launch_client_reaped is not True:
+                    attempt_cleanup["preserve"] = True
+            raise
         process = run_handle.process
-        if process.poll() is not None:
-            pytest.fail("pinned runc launcher exited before reaching its fd-3 gate")
         launch_submitted = True
-        attempt_cleanup["launch_submitted"] = True
+        if not _check_runc_client_after_submission(attempt_cleanup, process):
+            pytest.fail("pinned runc launcher exited before reaching its fd-3 gate")
 
         deadline = time.monotonic() + 12
         while not pid_file.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
         if process.poll() is not None or not pid_file.exists():
-            pytest.fail(f"runc did not reach the launch gate (exit={process.poll()})")
+            runc_stderr = (
+                process.stderr.read().decode("utf-8", errors="replace")
+                if process.stderr is not None and process.poll() is not None
+                else ""
+            )
+            pytest.fail(
+                f"runc did not reach the launch gate (exit={process.poll()}, "
+                f"stderr={runc_stderr[-2048:]!r})"
+            )
 
         init_pid = int(read_private_runc_pid_file(pid_file, state_root))
         init_snapshot = read_linux_process_snapshot(init_pid)
@@ -2015,13 +2462,26 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         if state_code != 0:
             pytest.fail(f"runc state readback failed before gate release: {state_output}")
         state = json.loads(state_output)
+        expected_bundle_path = str(renamed_bundle_root.resolve())
         if (
             state.get("id") != container_id
             or state.get("status") != "running"
             or state.get("pid") != init_pid
-            or Path(state.get("bundle", "")).resolve() != bundle_root.resolve()
+            or state.get("bundle") != expected_bundle_path
         ):
-            pytest.fail("runc state did not match the exact gated OCI attempt")
+            observed_state = tuple(state.get(key) for key in ("id", "status", "pid", "bundle"))
+            expected_state = (container_id, "running", init_pid, expected_bundle_path)
+            pytest.fail(
+                "runc state did not match the exact gated OCI attempt: "
+                f"observed={observed_state!r}, expected={expected_state!r}"
+            )
+        state_bundle_info = Path(state["bundle"]).stat()
+        if (
+            original_bundle_identity is None
+            or (state_bundle_info.st_dev, state_bundle_info.st_ino) != original_bundle_identity
+            or Path(state["bundle"]).resolve() == bundle_root.resolve()
+        ):
+            pytest.fail("runc state bundle path did not resolve to the renamed pinned directory")
 
         controls = {
             "memory.max": cgroup_path.joinpath("memory.max").read_text().strip(),
@@ -2127,8 +2587,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         print(
             json.dumps(
                 {
-                    "proof": "bounded direct runc launch using current ACP OCI config builder",
+                    "proof": "bounded public spawn_pinned_runc launch using compiler-bound OCI config",
                     "worker_executor_integrated": False,
+                    "same_uid_bundle_attack": bundle_attack_evidence,
                     "kernel": Path("/proc/sys/kernel/osrelease").read_text().strip(),
                     "runc_version": observed_version,
                     "rootfs_propagation": rootfs_propagation,
@@ -2167,18 +2628,20 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         )
     finally:
         active_error = sys.exception()
+        launch_submitted = bool(attempt_cleanup["launch_submitted"])
 
         def close_fd(label: str, descriptor: int) -> None:
             if descriptor >= 0:
                 _attempt_cleanup(cleanup_errors, label, lambda: os.close(descriptor))
 
         def process_is_running() -> bool | None:
-            if process is None:
-                return False
             return _attempt_cleanup(
                 cleanup_errors,
                 "could not inspect runc client process state",
-                lambda: process.poll() is None,
+                lambda: _runc_client_is_running(
+                    process,
+                    launch_client_reaped=launch_client_reaped,
+                ),
             )
 
         def capture_process_snapshot(pid: int) -> Any | None:
@@ -2196,8 +2659,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                 return None
 
         # Capture the exact runtime identity before closing the gate or killing
-        # the runc client.  Missing evidence is tolerated only when no launch
-        # was submitted; the unique-ID delete still runs after partial launch.
+        # the runc client. Missing evidence is tolerated only when no launch was
+        # submitted; destructive cleanup also requires a known client state.
         pid_file_present = _cleanup_path_exists(
             cleanup_errors, "could not inspect runc PID file before cleanup", pid_file
         )
@@ -2290,32 +2753,64 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     "could not force-reap the exact runc client process",
                     lambda: (process.kill(), process.wait(timeout=3)),
                 )
+            if process.stderr is not None:
+                _attempt_cleanup(
+                    cleanup_errors,
+                    "could not close runc stderr capture",
+                    process.stderr.close,
+                )
+
+        client_running_after_cleanup = process_is_running()
+        if process is not None:
+            launch_client_reaped = client_running_after_cleanup is False
+        cleanup_client_state_known = _launch_client_state_known(
+            launch_submitted=launch_submitted,
+            client_running_after_cleanup=client_running_after_cleanup,
+            launch_client_reaped=launch_client_reaped,
+        )
+        client_state_unverified = launch_submitted and not cleanup_client_state_known
+        if client_state_unverified:
+            attempt_cleanup["preserve"] = True
+            cleanup_errors.append(
+                "ambiguous launch client status after termination/reap; preserving "
+                f"bundle/state evidence (pid={launch_client_pid!r}, "
+                f"running={client_running_after_cleanup!r}, reaped={launch_client_reaped!r})"
+            )
 
         delete_result: tuple[int, str] | None = None
         if launch_submitted:
-            delete_result = _attempt_cleanup(
-                cleanup_errors,
-                "could not issue exact-ID forced runc deletion",
-                lambda: _safe_run_pinned_runc(
-                    pin, runc_descriptor, state_root, ["delete", "--force", container_id]
+            delete_result = _run_cleanup_action_if_client_state_known(
+                cleanup_client_state_known,
+                lambda: _attempt_cleanup(
+                    cleanup_errors,
+                    "could not issue exact-ID forced runc deletion",
+                    lambda: _safe_run_pinned_runc(
+                        pin, runc_descriptor, state_root, ["delete", "--force", container_id]
+                    ),
                 ),
             )
         pid_file_present = _cleanup_path_exists(
             cleanup_errors, "could not inspect runc PID file after deletion", pid_file
         )
         if pid_file_present is True:
-            recorded_pid = _attempt_cleanup(
-                cleanup_errors,
-                "could not revalidate runc PID file before unlink",
-                lambda: int(read_private_runc_pid_file(pid_file, state_root)),
+            recorded_pid = _run_cleanup_action_if_client_state_known(
+                cleanup_client_state_known,
+                lambda: _attempt_cleanup(
+                    cleanup_errors,
+                    "could not revalidate runc PID file before unlink",
+                    lambda: int(read_private_runc_pid_file(pid_file, state_root)),
+                ),
             )
             if recorded_pid is not None and init_pid is not None and recorded_pid != init_pid:
                 cleanup_errors.append("runc PID file changed before scoped cleanup")
             elif recorded_pid is not None:
-                _attempt_cleanup(
-                    cleanup_errors,
-                    "could not unlink exact private runc PID file",
-                    lambda: pid_file.unlink(),
+                _run_cleanup_action_if_client_state_known(
+                    cleanup_client_state_known,
+                    lambda: _attempt_cleanup(
+                        cleanup_errors,
+                        "could not unlink exact private runc PID file",
+                        lambda: pid_file.unlink(),
+                    ),
                 )
         pid_file_present = _cleanup_path_exists(
             cleanup_errors, "could not verify runc PID file removal", pid_file
@@ -2373,14 +2868,17 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                 cleanup_errors.append("the exact container init PID/start-time survived cleanup")
 
         if checkout_probe_created:
-            _attempt_cleanup(
-                cleanup_errors,
-                "could not remove unique test-owned checkout write probe",
-                lambda: _remove_checkout_write_probe(
-                    checkout_probe_directory,
-                    checkout_write,
-                    checkout_probe_identity,
-                    os.geteuid(),
+            _run_cleanup_action_if_client_state_known(
+                cleanup_client_state_known,
+                lambda: _attempt_cleanup(
+                    cleanup_errors,
+                    "could not remove unique test-owned checkout write probe",
+                    lambda: _remove_checkout_write_probe(
+                        checkout_probe_directory,
+                        checkout_write,
+                        checkout_probe_identity,
+                        os.geteuid(),
+                    ),
                 ),
             )
             probe_directory_present = _cleanup_path_exists(
@@ -2408,6 +2906,47 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             cleanup_errors.append(
                 f"exact-ID runc delete returned {delete_result[0]} with runtime residue: "
                 f"{delete_result[1]}"
+            )
+
+        if os.path.lexists(renamed_bundle_root):
+
+            def restore_attacked_bundle() -> None:
+                if original_bundle_identity is None:
+                    raise AssertionError("original bundle identity was not captured")
+                renamed_info = renamed_bundle_root.lstat()
+                if (renamed_info.st_dev, renamed_info.st_ino) != original_bundle_identity:
+                    raise AssertionError("renamed bundle identity changed during the attack test")
+                if os.path.lexists(bundle_root):
+                    if recreated_bundle_identity is None:
+                        raise AssertionError("recreated bundle identity was not captured")
+                    recreated_info = bundle_root.lstat()
+                    if (
+                        not stat.S_ISDIR(recreated_info.st_mode)
+                        or (recreated_info.st_dev, recreated_info.st_ino)
+                        != recreated_bundle_identity
+                        or recreated_info.st_uid != os.geteuid()
+                        or stat.S_IMODE(recreated_info.st_mode) != 0o700
+                    ):
+                        raise AssertionError("attacker replacement directory identity changed")
+                    entries = list(bundle_root.iterdir())
+                    config_path = bundle_root / "config.json"
+                    if (
+                        [entry.name for entry in entries] != ["config.json"]
+                        or not stat.S_ISREG(config_path.lstat().st_mode)
+                        or config_path.read_bytes() != attacker_config
+                    ):
+                        raise AssertionError("attacker replacement directory contents changed")
+                    config_path.unlink()
+                    bundle_root.rmdir()
+                os.rename(renamed_bundle_root, bundle_root)
+
+            _run_cleanup_action_if_client_state_known(
+                cleanup_client_state_known,
+                lambda: _attempt_cleanup(
+                    cleanup_errors,
+                    "could not restore exact test-owned bundle path after the attack replay",
+                    restore_attacked_bundle,
+                ),
             )
 
         # A failed teardown retains the private evidence tree for diagnosis.

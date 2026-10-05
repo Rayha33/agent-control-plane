@@ -78,7 +78,7 @@ def oci_fixture(tmp_path: Path) -> tuple[Path, Snapshot]:
     bundle = tmp_path / "attempt" / "bundle"
     rootfs = bundle / "rootfs"
     bundle.mkdir(parents=True, mode=0o700)
-    for relative in ("bin", "proc", "workspace", "tmp", "home/agent"):
+    for relative in ("bin", "proc", "dev", "workspace", "tmp", "home/agent"):
         (rootfs / relative).mkdir(parents=True, exist_ok=True)
     shell = rootfs / "bin" / "sh"
     shell.write_text("fixture shell\n")
@@ -723,7 +723,67 @@ def test_pinned_worker_diagnostic_uses_bound_executable_and_exact_config_bytes(
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
 
 
-def test_supported_pinned_worker_launch_fails_closed_without_bundle_ownership(
+def test_private_bundle_launcher_script_is_valid_python() -> None:
+    compile(oci_worker._RUNC_PRIVATE_BUNDLE_LAUNCHER, "<private-runc-bundle-launcher>", "exec")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux namespaces")
+def test_private_bundle_launcher_reaps_client_on_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.environ.get("ACP_RUN_OCI_INTEGRATION") != "1":
+        pytest.skip("the setup-failure replay is enabled only on the qualified Linux host")
+    if os.geteuid() == 0:
+        pytest.skip("private OCI launch requires an unprivileged supervisor")
+
+    pin = pinned_runc(tmp_path)
+    bundle, workspace = oci_fixture(tmp_path)
+    monkeypatch.setattr(oci_worker, "_supports_runc_fd_exec", lambda: True)
+    monkeypatch.setattr(
+        oci_worker,
+        "_run_bounded_command",
+        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+    )
+    binding = oci_worker._apply_pinned_runc_recursive_private_policy(
+        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+    )
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    pid_file = state_root / "worker.pid"
+    argv = build_runc_run_argv(pin, state_root, bundle, workspace.root, pid_file, "acp-worker-123")
+
+    processes: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(oci_worker.subprocess, "Popen", capture_popen)
+    callback_reached = False
+
+    def fail_before_runc_exec(_pid: int, _private_bundle: Path, _bundle_fd: int) -> None:
+        nonlocal callback_reached
+        callback_reached = True
+        raise RuntimeError("injected private-bundle setup failure")
+
+    with pytest.raises(SupervisorError, match="injected private-bundle setup failure") as error:
+        oci_worker._spawn_pinned_runc_with_private_bundle(
+            pin,
+            argv,
+            bundle,
+            binding.config_json,
+            _before_runc_exec=fail_before_runc_exec,
+        )
+
+    assert error.value.code == "sandbox_bundle_setup_failed"
+    assert callback_reached
+    assert len(processes) == 1
+    assert processes[0].returncode is not None
+
+
+def test_supported_pinned_worker_launch_uses_private_bundle_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pin = pinned_runc(tmp_path)
@@ -737,24 +797,39 @@ def test_supported_pinned_worker_launch_fails_closed_without_bundle_ownership(
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
         compile_config(bundle, workspace), pin, expected_version="1.3.5"
     )
-    spawned: list[bool] = []
-    monkeypatch.setattr(
-        oci_worker, "_spawn_pinned_runc", lambda *_args, **_kwargs: spawned.append(True)
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    spawned: list[tuple[object, tuple[str, ...], Path, bytes]] = []
+
+    def private_spawn(
+        executable: object,
+        argv: list[str],
+        bundle_root: Path,
+        config_json: bytes,
+        **_kwargs: Any,
+    ) -> object:
+        spawned.append((executable, tuple(argv), bundle_root, config_json))
+        return object()
+
+    monkeypatch.setattr(oci_worker, "_spawn_pinned_runc_with_private_bundle", private_spawn)
+
+    result = oci_worker.spawn_pinned_runc(
+        binding,
+        state_root,
+        bundle,
+        workspace.root,
+        state_root / "worker.pid",
+        "acp-worker-123",
     )
 
-    with pytest.raises(SupervisorError) as error:
-        oci_worker.spawn_pinned_runc(
-            binding,
-            tmp_path / "state",
-            bundle,
-            workspace.root,
-            tmp_path / "state" / "worker.pid",
-            "acp-worker-123",
-        )
-
-    assert error.value.code == "sandbox_bundle_ownership_unverified"
+    assert result is not None
     assert not (bundle / "config.json").exists()
-    assert not spawned
+    assert len(spawned) == 1
+    executable, argv, launched_bundle, config_json = spawned[0]
+    assert executable is pin
+    assert argv[argv.index("--bundle") + 1] == str(bundle.resolve())
+    assert launched_bundle == bundle.resolve()
+    assert config_json == binding.config_json
 
 
 def test_same_uid_can_replace_diagnostic_bundle_config_after_validation(
@@ -1343,8 +1418,10 @@ def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) ->
         (("process", "rlimits", 0, "hard"), False),
         (("linux", "uidMappings", 0, "size"), True),
         (("linux", "resources", "devices", 0, "allow"), 0),
-        (("mounts", 2, "options", 3), "size=9223372036854775808"),
-        (("mounts", 3, "options", 3), "size=" + ("9" * 5000)),
+        (("mounts", 1, "options", 3), "size=1048577"),
+        (("mounts", 1, "options", 4), "nr_inodes=0"),
+        (("mounts", 3, "options", 3), "size=9223372036854775808"),
+        (("mounts", 4, "options", 3), "size=" + ("9" * 5000)),
     ],
     ids=(
         "root-readonly-int-alias",
@@ -1352,6 +1429,8 @@ def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) ->
         "rlimit-zero-bool-alias",
         "mapping-size-bool-alias",
         "device-allow-int-alias",
+        "dev-tmpfs-not-exactly-bounded",
+        "dev-tmpfs-unbounded-inodes",
         "tmpfs-over-int64",
         "tmpfs-unbounded-decimal",
     ),
@@ -1415,9 +1494,23 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
     mounts = config["mounts"]
     assert {mount["destination"] for mount in mounts} == {
         "/proc",
+        "/dev",
         "/workspace",
         "/tmp",
         "/home/agent",
+    }
+    dev_mount = next(mount for mount in mounts if mount["destination"] == "/dev")
+    assert dev_mount == {
+        "destination": "/dev",
+        "type": "tmpfs",
+        "source": "tmpfs",
+        "options": [
+            "nosuid",
+            "noexec",
+            "mode=0755",
+            "size=1048576",
+            "nr_inodes=64",
+        ],
     }
     workspace_mount = next(mount for mount in mounts if mount["destination"] == "/workspace")
     assert workspace_mount["source"] == str(workspace.root.resolve())
@@ -2067,7 +2160,7 @@ def test_oci_policy_rejects_untrusted_rootfs_executable(
     assert error.value.code == "invalid_oci_executable"
 
 
-@pytest.mark.parametrize("destination", ["/proc", "/workspace", "/tmp", "/home/agent"])
+@pytest.mark.parametrize("destination", ["/proc", "/dev", "/workspace", "/tmp", "/home/agent"])
 def test_oci_policy_rejects_executable_shadowed_by_runtime_mount(
     tmp_path: Path, destination: str
 ) -> None:
@@ -2347,6 +2440,8 @@ def test_runc_launcher_reports_unverified_submission_and_does_not_reclose_reused
 
         assert error.value.code == "sandbox_launch_submission_unverified"
         assert "client_pid=" in str(error.value)
+        assert error.value.client_pid is not None
+        assert error.value.client_reaped is True
         assert close_injected
         assert len(replacement_fd) == 1
         os.fstat(replacement_fd[0])

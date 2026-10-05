@@ -15,11 +15,11 @@ while rootless cgroup setup may be unavailable. The generated
 ``linux.seccomp`` profile is a denylist defense-in-depth layer, not a complete
 syscall allowlist or a substitute for the namespace/mount boundary. Runtime
 application and behavioral denial still require exact-host verification before
-worker launch is enabled.
-Path checks are not atomic and do not protect against a concurrent writer with
-access to the rootfs path (including a same-UID writer); the integrating
-executor must provision beneath trusted ancestors, control writers, and
-reserve launch metadata safely.
+worker launch is enabled. The public low-level runc API now places the sealed
+config in a private, read-only tmpfs addressed through an inherited bundle FD;
+this protects the config handoff, not the host-backed rootfs contents, workspace,
+state, PID file, lifecycle journal, or result-import path. Those remain subject
+to separate integrity, ownership, and supervision gates.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -60,8 +60,11 @@ _ROOTFS_CLOSURE_SCHEMA = "acp-oci-rootfs-closure-v1"
 _MAX_MOUNTINFO_BYTES = 16 * 1024 * 1024
 _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
+_DEFAULT_DEV_TMPFS_BYTES = 1 * 1024 * 1024
+_DEFAULT_DEV_TMPFS_INODES = 64
 _MAX_RUNC_LAUNCH_PAYLOAD_BYTES = 64 * 1024
-_MOUNT_DESTINATIONS = ("/proc", "/workspace", "/tmp", "/home/agent")
+_RUNC_NAMESPACE_SETUP_TIMEOUT_SECONDS = 5.0
+_MOUNT_DESTINATIONS = ("/proc", "/dev", "/workspace", "/tmp", "/home/agent")
 _RUNC_RECURSIVE_PRIVATE_VERSION = "1.3.5"
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
 _RUNC_FD_LAUNCHER = r"""
@@ -102,6 +105,441 @@ resource.setrlimit(
     (67108864, 67108864),
 )
 os.execve(runc_fd, payload["argv"], payload["env"])
+"""
+_RUNC_PRIVATE_BUNDLE_LAUNCHER = r"""
+import ctypes
+import errno
+import json
+import os
+import resource
+import stat
+import sys
+
+start_fd, status_fd, map_ack_fd, exec_ack_fd, gate_fd, runc_fd, bundle_fd, rootfs_fd = (
+    int(value) for value in sys.argv[1:9]
+)
+CLONE_NEWNS = 0x00020000
+CLONE_NEWUSER = 0x10000000
+MS_PRIVATE = 0x00040000
+MS_REC = 0x00004000
+ST_RDONLY = 1
+AT_EMPTY_PATH = 0x1000
+FSOPEN_CLOEXEC = 0x00000001
+FSCONFIG_SET_STRING = 1
+FSCONFIG_CMD_CREATE = 6
+FSMOUNT_CLOEXEC = 0x00000001
+OPEN_TREE_CLONE = 0x00000001
+OPEN_TREE_CLOEXEC = 0x00080000
+MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
+MOVE_MOUNT_T_EMPTY_PATH = 0x00000040
+MOUNT_ATTR_RDONLY = 0x00000001
+MOUNT_ATTR_NOSUID = 0x00000002
+MOUNT_ATTR_NODEV = 0x00000004
+MOUNT_ATTR_NOEXEC = 0x00000008
+os.set_inheritable(status_fd, False)
+os.umask(0o077)
+phase = b"0"
+
+class _MountAttr(ctypes.Structure):
+    _fields_ = [
+        ("attr_set", ctypes.c_uint64),
+        ("attr_clr", ctypes.c_uint64),
+        ("propagation", ctypes.c_uint64),
+        ("userns_fd", ctypes.c_uint64),
+    ]
+
+def _message(value):
+    try:
+        os.write(status_fd, value)
+    except BaseException:
+        pass
+
+def _fail(error_number=0, detail=b""):
+    try:
+        encoded_errno = max(0, min(int(error_number), 255))
+    except BaseException:
+        encoded_errno = 255
+    if isinstance(detail, str):
+        detail = detail.encode("utf-8", errors="replace")
+    _message(b"F" + phase + bytes((encoded_errno,)) + detail[:128])
+    os._exit(125)
+
+def _read_exact(descriptor, expected):
+    result = bytearray()
+    while len(result) < len(expected):
+        part = os.read(descriptor, len(expected) - len(result))
+        if not part:
+            return False
+        result.extend(part)
+    return bytes(result) == expected
+
+def _unshare(flags):
+    libc = ctypes.CDLL(None, use_errno=True)
+    unshare = libc.unshare
+    unshare.argtypes = [ctypes.c_int]
+    unshare.restype = ctypes.c_int
+    if unshare(flags) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+def _make_mounts_private():
+    libc = ctypes.CDLL(None, use_errno=True)
+    mount = libc.mount
+    mount.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_ulong,
+        ctypes.c_char_p,
+    ]
+    mount.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if mount(None, b"/", None, MS_REC | MS_PRIVATE, None) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), "make mount namespace private")
+
+def _mount_api():
+    libc = ctypes.CDLL(None, use_errno=True)
+    fsopen = libc.fsopen
+    fsopen.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    fsopen.restype = ctypes.c_int
+    fsconfig = libc.fsconfig
+    fsconfig.argtypes = [
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    ]
+    fsconfig.restype = ctypes.c_int
+    fsmount = libc.fsmount
+    fsmount.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+    fsmount.restype = ctypes.c_int
+    open_tree = libc.open_tree
+    open_tree.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    open_tree.restype = ctypes.c_int
+    move_mount = libc.move_mount
+    move_mount.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    move_mount.restype = ctypes.c_int
+    mount_setattr = libc.mount_setattr
+    mount_setattr.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+        ctypes.POINTER(_MountAttr),
+        ctypes.c_size_t,
+    ]
+    mount_setattr.restype = ctypes.c_int
+    return fsopen, fsconfig, fsmount, open_tree, move_mount, mount_setattr
+
+def _check_mount_call(result, label):
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), label)
+
+def _check_mount_fd(descriptor, label):
+    if descriptor < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), label)
+    return descriptor
+
+def _set_mount_attributes(mount_setattr, descriptor, attributes):
+    mount_attr = _MountAttr(attributes, 0, 0, 0)
+    _check_mount_call(
+        mount_setattr(
+            descriptor,
+            b"",
+            AT_EMPTY_PATH,
+            ctypes.byref(mount_attr),
+            ctypes.sizeof(mount_attr),
+        ),
+        "mount_setattr",
+    )
+
+try:
+    phase = b"1"
+    payload_bytes = bytearray()
+    while len(payload_bytes) <= 65536:
+        chunk = os.read(start_fd, 65537 - len(payload_bytes))
+        if not chunk:
+            break
+        payload_bytes.extend(chunk)
+    os.close(start_fd)
+    if not payload_bytes.endswith(b"\n") or len(payload_bytes) > 65536:
+        _fail()
+    payload = json.loads(payload_bytes)
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "argv",
+            "env",
+            "config",
+            "bundle",
+            "bundle_device",
+            "bundle_inode",
+            "rootfs_device",
+            "rootfs_inode",
+            "uid",
+            "gid",
+        }
+        or not isinstance(payload["argv"], list)
+        or not isinstance(payload["env"], dict)
+        or not isinstance(payload["config"], str)
+        or not isinstance(payload["bundle"], str)
+        or type(payload["bundle_device"]) is not int
+        or type(payload["bundle_inode"]) is not int
+        or type(payload["rootfs_device"]) is not int
+        or type(payload["rootfs_inode"]) is not int
+        or type(payload["uid"]) is not int
+        or type(payload["gid"]) is not int
+    ):
+        _fail()
+    command = payload["argv"]
+    if (
+        any(not isinstance(value, str) or not value or "\x00" in value for value in command)
+        or sum(len(os.fsencode(value)) + 1 for value in command) > 65536
+    ):
+        _fail()
+
+    # Map the caller's own host identity 1:1 in a new user namespace. This
+    # gives only this helper a private mount namespace; it does not map host
+    # root or change the OCI policy's existing caller-identity mapping.
+    phase = b"2"
+    _unshare(CLONE_NEWUSER)
+    _message(b"U")
+    if not _read_exact(map_ack_fd, b"M"):
+        _fail()
+    os.close(map_ack_fd)
+    phase = b"3"
+    with open("/proc/self/uid_map", "rb") as stream:
+        uid_map = stream.read().split()
+    with open("/proc/self/gid_map", "rb") as stream:
+        gid_map = stream.read().split()
+    if uid_map != [str(payload["uid"]).encode(), str(payload["uid"]).encode(), b"1"]:
+        _fail()
+    if gid_map != [str(payload["gid"]).encode(), str(payload["gid"]).encode(), b"1"]:
+        _fail()
+    if os.getuid() != payload["uid"] or os.getgid() != payload["gid"]:
+        _fail()
+
+    phase = b"4"
+    _unshare(CLONE_NEWNS)
+    phase = b"5"
+    _make_mounts_private()
+    phase = b"6"
+    try:
+        fsopen, fsconfig, fsmount, open_tree, move_mount, mount_setattr = _mount_api()
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "descriptor-based mount API is unavailable") from error
+    # Reopen bundle and rootfs after unshare: inherited descriptors refer to
+    # parent-namespace mount objects and are not targets in this namespace.
+    bundle_target_fd = os.open(
+        payload["bundle"],
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    bundle_target_info = os.fstat(bundle_target_fd)
+    if (
+        not stat.S_ISDIR(bundle_target_info.st_mode)
+        or (bundle_target_info.st_dev, bundle_target_info.st_ino)
+        != (payload["bundle_device"], payload["bundle_inode"])
+        or bundle_target_info.st_uid != payload["uid"]
+        or stat.S_IMODE(bundle_target_info.st_mode) & 0o077
+        or stat.S_IMODE(bundle_target_info.st_mode) & 0o700 != 0o700
+    ):
+        _fail()
+    rootfs_source_fd = os.open(
+        "rootfs",
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=bundle_target_fd,
+    )
+    rootfs_source_open_info = os.fstat(rootfs_source_fd)
+    if (
+        not stat.S_ISDIR(rootfs_source_open_info.st_mode)
+        or (rootfs_source_open_info.st_dev, rootfs_source_open_info.st_ino)
+        != (payload["rootfs_device"], payload["rootfs_inode"])
+    ):
+        _fail()
+    os.close(rootfs_fd)
+    rootfs_fd = rootfs_source_fd
+    filesystem_fd = _check_mount_fd(fsopen(b"tmpfs", FSOPEN_CLOEXEC), "fsopen(tmpfs)")
+    _check_mount_call(
+        fsconfig(filesystem_fd, FSCONFIG_SET_STRING, b"size", b"1m", 0),
+        "tmpfs size",
+    )
+    _check_mount_call(
+        fsconfig(filesystem_fd, FSCONFIG_SET_STRING, b"mode", b"0700", 0),
+        "tmpfs mode",
+    )
+    _check_mount_call(
+        fsconfig(filesystem_fd, FSCONFIG_CMD_CREATE, None, None, 0),
+        "tmpfs create",
+    )
+    bundle_mount_fd = _check_mount_fd(
+        fsmount(
+            filesystem_fd,
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        ),
+        "fsmount(tmpfs)",
+    )
+    os.close(filesystem_fd)
+
+    # Attach the detached tmpfs to the already-open bundle directory itself.
+    # Empty-path move_mount keeps both sides descriptor-anchored and avoids the
+    # EINVAL/race-prone /proc/self/fd mount target used by mount(2).
+    phase = b"7"
+    _check_mount_call(
+        move_mount(
+            bundle_mount_fd,
+            b"",
+            bundle_target_fd,
+            b"",
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ),
+        "attach private bundle tmpfs",
+    )
+    os.dup2(bundle_mount_fd, bundle_fd, inheritable=False)
+    if bundle_target_fd != bundle_fd:
+        os.close(bundle_target_fd)
+    if bundle_mount_fd != bundle_fd:
+        os.close(bundle_mount_fd)
+    bundle_mount_fd = bundle_fd
+
+    phase = b"8"
+    rootfs_source_info = os.fstat(rootfs_fd)
+    rootfs_mount_fd = _check_mount_fd(
+        open_tree(
+            rootfs_fd,
+            b"",
+            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH,
+        ),
+        "open_tree(rootfs)",
+    )
+    _set_mount_attributes(
+        mount_setattr,
+        rootfs_mount_fd,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+    )
+    os.mkdir("rootfs", 0o700, dir_fd=bundle_fd)
+    rootfs_target_fd = os.open(
+        "rootfs",
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=bundle_fd,
+    )
+    _check_mount_call(
+        move_mount(
+            rootfs_mount_fd,
+            b"",
+            rootfs_target_fd,
+            b"",
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ),
+        "attach read-only rootfs",
+    )
+    os.close(rootfs_mount_fd)
+    os.close(rootfs_target_fd)
+    os.close(rootfs_fd)
+
+    config_bytes = payload["config"].encode("ascii")
+    if not config_bytes or len(config_bytes) > 65536:
+        _fail()
+    config_fd = os.open(
+        "config.json",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+        dir_fd=bundle_fd,
+    )
+    try:
+        offset = 0
+        while offset < len(config_bytes):
+            offset += os.write(config_fd, config_bytes[offset:])
+        os.fsync(config_fd)
+    finally:
+        os.close(config_fd)
+    phase = b"9"
+    _set_mount_attributes(
+        mount_setattr,
+        bundle_mount_fd,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+    )
+    if not os.fstatvfs(bundle_mount_fd).f_flag & ST_RDONLY:
+        _fail()
+    config_read_fd = os.open(
+        "config.json",
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=bundle_fd,
+    )
+    try:
+        with os.fdopen(config_read_fd, "rb") as stream:
+            observed_config = stream.read(65537)
+    finally:
+        config_read_fd = -1
+    if observed_config != config_bytes:
+        _fail()
+    rootfs_read_fd = os.open(
+        "rootfs",
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=bundle_fd,
+    )
+    try:
+        rootfs_info = os.fstat(rootfs_read_fd)
+        if (
+            (rootfs_info.st_dev, rootfs_info.st_ino)
+            != (rootfs_source_info.st_dev, rootfs_source_info.st_ino)
+            or not os.fstatvfs(rootfs_read_fd).f_flag & ST_RDONLY
+        ):
+            _fail()
+    finally:
+        os.close(rootfs_read_fd)
+
+    phase = b"A"
+    bundle_args = [index for index, value in enumerate(command) if value == "--bundle"]
+    if (
+        len(bundle_args) != 1
+        or bundle_args[0] + 1 >= len(command)
+        or command[bundle_args[0] + 1] != payload["bundle"]
+    ):
+        _fail()
+    bundle_path = "/proc/self/fd/" + str(bundle_fd)
+    command[bundle_args[0] + 1] = bundle_path
+    os.set_inheritable(bundle_fd, True)
+    phase = b"B"
+    _message(b"R")
+    if not _read_exact(exec_ack_fd, b"X"):
+        _fail()
+    os.close(exec_ack_fd)
+
+    phase = b"C"
+    if gate_fd == 3:
+        os.set_inheritable(gate_fd, True)
+    else:
+        os.dup2(gate_fd, 3, inheritable=True)
+        os.close(gate_fd)
+    os.set_inheritable(runc_fd, False)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (67108864, 67108864))
+    os.execve(runc_fd, command, payload["env"])
+except BaseException as error:
+    error_detail = f"{type(error).__name__}: {error}"
+    _fail(getattr(error, "errno", 0) or 0, error_detail)
 """
 _LAUNCH_GATE_PRIVATE_GIT_SCRIPT = """\
 IFS= read -r _ <&3 || exit 125
@@ -1860,6 +2298,18 @@ def build_oci_worker_config(
                     "options": ["nosuid", "nodev", "noexec", "ro"],
                 },
                 {
+                    "destination": "/dev",
+                    "type": "tmpfs",
+                    "source": "tmpfs",
+                    "options": [
+                        "nosuid",
+                        "noexec",
+                        "mode=0755",
+                        f"size={_DEFAULT_DEV_TMPFS_BYTES}",
+                        f"nr_inodes={_DEFAULT_DEV_TMPFS_INODES}",
+                    ],
+                },
+                {
                     "destination": "/workspace",
                     "type": "bind",
                     "source": str(workspace),
@@ -2035,7 +2485,7 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
         reject()
 
     mounts = config.get("mounts")
-    if type(mounts) is not list or len(mounts) != 4:
+    if type(mounts) is not list or len(mounts) != 5:
         reject()
     if not exact(
         mounts[0],
@@ -2047,7 +2497,23 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
         },
     ):
         reject()
-    workspace_mount = mounts[1]
+    if not exact(
+        mounts[1],
+        {
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": [
+                "nosuid",
+                "noexec",
+                "mode=0755",
+                f"size={_DEFAULT_DEV_TMPFS_BYTES}",
+                f"nr_inodes={_DEFAULT_DEV_TMPFS_INODES}",
+            ],
+        },
+    ):
+        reject()
+    workspace_mount = mounts[2]
     if (
         type(workspace_mount) is not dict
         or set(workspace_mount) != {"destination", "type", "source", "options"}
@@ -2059,8 +2525,8 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
     ):
         reject()
     for mount, destination, mode in (
-        (mounts[2], "/tmp", "mode=1777"),
-        (mounts[3], "/home/agent", "mode=0700"),
+        (mounts[3], "/tmp", "mode=1777"),
+        (mounts[4], "/home/agent", "mode=0700"),
     ):
         if (
             type(mount) is not dict
@@ -2294,11 +2760,10 @@ def build_runc_run_argv(
 ) -> list[str]:
     """Return an attached runc command with explicit state root and bundle.
 
-    The OCI init requires one inherited launch-gate descriptor at fd 3. This
-    argv builder is used only by the unisolated diagnostic helper while
-    bundle ownership remains unproved. The public :func:`spawn_pinned_runc`
-    validates its policy binding and fails closed before creating this argv or
-    launching runc; do not use this builder for worker execution.
+    The OCI init requires one inherited launch-gate descriptor at fd 3. The
+    public :func:`spawn_pinned_runc` replaces the host bundle path with an
+    inherited descriptor path inside a private mount namespace before runc is
+    executed. The diagnostic helper intentionally retains its host-path mode.
     ``executable`` must be a process-local pin minted by
     ``_pin_trusted_runc_executable``. Its root-owned file identity and SHA-256
     are rechecked here; a caller-supplied path or forged pin is refused. This
@@ -2379,7 +2844,14 @@ class RuncLaunchHandle:
 
     process: subprocess.Popen[bytes]
     _gate_writer: int | None
+    _bundle_path: str | None = None
     _gate_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def bundle_path(self) -> str | None:
+        """The exact bundle path handed to this runc process, when descriptor-backed."""
+
+        return self._bundle_path
 
     def release_gate(self) -> None:
         """Authorize the already-attested OCI init to execute its command once."""
@@ -2432,6 +2904,21 @@ def _runc_client_environment() -> dict[str, str]:
     }
 
 
+class _RuncLaunchSubmissionUnverified(SupervisorError):
+    """A launch may have crossed the runtime boundary without returning a handle."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        client_pid: int | None,
+        client_reaped: bool,
+    ) -> None:
+        super().__init__("sandbox_launch_submission_unverified", message)
+        self.client_pid = client_pid
+        self.client_reaped = client_reaped
+
+
 def _reap_failed_runc_launch(process: subprocess.Popen[bytes]) -> None:
     """Bound launch-failure cleanup and report when the client cannot be reaped."""
 
@@ -2463,11 +2950,12 @@ def _spawn_pinned_runc(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
 ) -> RuncLaunchHandle:
-    """Low-level held-FD primitive used only by the diagnostic helper.
+    """Unisolated held-FD primitive used only by the diagnostic helper.
 
     Start pinned runc with exactly one inherited fd-3 launch gate. The public
-    worker API fails closed before reaching this primitive until an outer
-    bundle-ownership boundary is independently proven.
+    API uses :func:`_spawn_pinned_runc_with_private_bundle` instead; this
+    helper intentionally retains host-path bundle semantics for historical
+    no-model diagnostics and must not be used for worker execution.
 
     The rootless supervisor opens and revalidates the configured runc inode,
     then a tiny isolated Python launcher uses ``execve(fd, ...)`` so a later
@@ -2595,6 +3083,7 @@ def _spawn_pinned_runc(
         return handle
     except BaseException as launch_error:
         cleanup_error: BaseException | None = None
+        client_reap_error: BaseException | None = None
         if gate_write >= 0:
             descriptor_to_close = gate_write
             gate_write = -1
@@ -2606,20 +3095,22 @@ def _spawn_pinned_runc(
             try:
                 _reap_failed_runc_launch(process)
             except BaseException as error:
+                client_reap_error = error
                 if cleanup_error is None:
                     cleanup_error = error
         if launch_payload_may_have_been_delivered:
             cleanup_status = (
                 "runc client cleanup is also unverified"
-                if cleanup_error is not None
+                if client_reap_error is not None or process is None
                 else "runc client was reaped"
             )
-            submission_error = SupervisorError(
-                "sandbox_launch_submission_unverified",
+            submission_error = _RuncLaunchSubmissionUnverified(
                 "runc launch payload may have been submitted; "
                 f"client_pid={process.pid if process is not None else 'unknown'}; "
                 f"{cleanup_status}; owning attempt must stay fenced until the "
                 "exact runtime state is independently reconciled",
+                client_pid=process.pid if process is not None else None,
+                client_reaped=process is not None and client_reap_error is None,
             )
             raise submission_error from (cleanup_error or launch_error)
         if cleanup_error is not None:
@@ -2642,6 +3133,430 @@ def _spawn_pinned_runc(
                     pass
 
 
+def _read_private_launcher_message(
+    descriptor: int,
+    process: subprocess.Popen[bytes],
+    *,
+    expected: bytes | None,
+    timeout_seconds: float = _RUNC_NAMESPACE_SETUP_TIMEOUT_SECONDS,
+) -> bytes:
+    """Read one bounded namespace-launcher status byte or exec-close receipt."""
+
+    deadline = time.monotonic() + timeout_seconds
+    with selectors.DefaultSelector() as selector:
+        selector.register(descriptor, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise TimeoutError("private OCI bundle launcher did not complete its handshake")
+            message = os.read(descriptor, 1)
+            if expected is None:
+                if not message:
+                    return b""
+                if message == b"F":
+                    details = os.read(descriptor, 2)
+                    phase = details[:1].decode("ascii", errors="replace")
+                    error_number = details[1] if len(details) > 1 else "unknown"
+                    detail = os.read(descriptor, 128).decode("utf-8", errors="replace")
+                    raise OSError(
+                        "private OCI bundle launcher failed before runc exec "
+                        f"(phase {phase}, errno {error_number})"
+                        f"{': ' + detail if detail else ''}"
+                    )
+                raise OSError("private OCI bundle launcher returned an invalid exec receipt")
+            if message != expected:
+                if message == b"F":
+                    details = os.read(descriptor, 2)
+                    phase = details[:1].decode("ascii", errors="replace")
+                    error_number = details[1] if len(details) > 1 else "unknown"
+                    detail = os.read(descriptor, 128).decode("utf-8", errors="replace")
+                    raise OSError(
+                        "private OCI bundle launcher rejected namespace setup "
+                        f"(phase {phase}, errno {error_number})"
+                        f"{': ' + detail if detail else ''}"
+                    )
+                raise OSError("private OCI bundle launcher exited before its handshake")
+            return message
+
+
+def _write_child_user_namespace_maps(pid: int, uid: int, gid: int) -> None:
+    """Install the minimum caller-to-self maps for a helper's user namespace."""
+
+    if uid == 0 or gid == 0:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "OCI worker runtime must use a non-root caller identity"
+        )
+
+    def write_proc_file(name: str, value: bytes) -> None:
+        descriptor = os.open(
+            f"/proc/{pid}/{name}",
+            os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            remaining = memoryview(value)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError(f"could not write /proc/{pid}/{name}")
+                remaining = remaining[written:]
+        finally:
+            os.close(descriptor)
+
+    write_proc_file("setgroups", b"deny\n")
+    write_proc_file("uid_map", f"{uid} {uid} 1\n".encode("ascii"))
+    write_proc_file("gid_map", f"{gid} {gid} 1\n".encode("ascii"))
+    for name, identity in (("uid_map", uid), ("gid_map", gid)):
+        observed = Path(f"/proc/{pid}/{name}").read_text(encoding="ascii").split()
+        if observed != [str(identity), str(identity), "1"]:
+            raise OSError(f"/proc/{pid}/{name} did not retain the exact one-ID mapping")
+
+
+def _open_private_bundle_fds(bundle_root: str | Path) -> tuple[Path, int, int]:
+    """Open stable directory descriptors for the exact bundle and its rootfs."""
+
+    bundle = _private_directory(bundle_root, code="invalid_oci_bundle", label="OCI bundle root")
+    flags = (
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    bundle_fd = rootfs_fd = -1
+    try:
+        bundle_fd = os.open(bundle, flags)
+        bundle_info = os.fstat(bundle_fd)
+        bundle_path_info = os.stat(bundle, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(bundle_info.st_mode)
+            or (bundle_info.st_dev, bundle_info.st_ino)
+            != (bundle_path_info.st_dev, bundle_path_info.st_ino)
+            or bundle_info.st_uid != os.geteuid()
+            or stat.S_IMODE(bundle_info.st_mode) & 0o077
+            or stat.S_IMODE(bundle_info.st_mode) & 0o700 != 0o700
+        ):
+            raise SupervisorError(
+                "invalid_oci_bundle", "OCI bundle changed while its directory was opened"
+            )
+        rootfs_fd = os.open("rootfs", flags, dir_fd=bundle_fd)
+        rootfs_info = os.fstat(rootfs_fd)
+        rootfs_path_info = os.stat("rootfs", dir_fd=bundle_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(rootfs_info.st_mode) or (rootfs_info.st_dev, rootfs_info.st_ino) != (
+            rootfs_path_info.st_dev,
+            rootfs_path_info.st_ino,
+        ):
+            raise SupervisorError("invalid_oci_rootfs", "OCI bundle rootfs changed during open")
+        return bundle, bundle_fd, rootfs_fd
+    except BaseException:
+        for descriptor in (bundle_fd, rootfs_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        raise
+
+
+def _spawn_pinned_runc_with_private_bundle(
+    executable: _TrustedRuncExecutable,
+    argv: Sequence[str],
+    bundle_root: str | Path,
+    config_json: bytes,
+    *,
+    stdout: Any = subprocess.DEVNULL,
+    stderr: Any = subprocess.DEVNULL,
+    _before_runc_exec: Callable[[int, Path, int], None] | None = None,
+) -> RuncLaunchHandle:
+    """Exec pinned runc only after sealing its bundle in a private mount namespace.
+
+    A mapped user namespace grants the helper mount authority over a private
+    mount namespace without mapping host root. It creates a bounded detached
+    tmpfs and attaches it to the already-open bundle directory with
+    descriptor-based ``move_mount``, then clones and attaches the opened rootfs
+    read-only. The compiler policy supplies a bounded /dev tmpfs so runc can
+    prepare its device nodes without making the rootfs writable. It writes the
+    exact sealed config and marks the bundle read-only.
+    Runc consumes the bundle through its inherited mount FD, never through the
+    mutable host pathname. The optional pre-exec callback is
+    private test instrumentation; the supported public API never supplies it.
+    """
+
+    if os.geteuid() == 0:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "OCI worker runtime must be invoked by a non-root caller"
+        )
+    if not _supports_runc_fd_exec() or not hasattr(os, "pipe2"):
+        raise SupervisorError(
+            "invalid_oci_runtime",
+            "private runc bundle launch requires Linux fd-based exec and close-on-exec pipes",
+        )
+    binary = _verify_trusted_runc_executable(executable)
+    if isinstance(argv, (str, bytes)):
+        raise SupervisorError("invalid_oci_command", "runc command must be an argument sequence")
+    try:
+        command = tuple(argv)
+    except TypeError as error:
+        raise SupervisorError(
+            "invalid_oci_command", "runc command must be an argument sequence"
+        ) from error
+    if (
+        not command
+        or command[0] != str(binary)
+        or any(not isinstance(value, str) or not value or "\x00" in value for value in command)
+        or sum(len(os.fsencode(value)) + 1 for value in command) > _MAX_RUNC_LAUNCH_PAYLOAD_BYTES
+    ):
+        raise SupervisorError("invalid_oci_command", "runc argv is invalid or exceeds its limit")
+    bundle_args = [index for index, value in enumerate(command) if value == "--bundle"]
+    if len(bundle_args) != 1 or bundle_args[0] + 1 >= len(command):
+        raise SupervisorError("invalid_oci_command", "runc argv must contain one bundle path")
+
+    bundle, initial_bundle_fd, initial_rootfs_fd = _open_private_bundle_fds(bundle_root)
+    initial_bundle_info = os.fstat(initial_bundle_fd)
+    initial_rootfs_info = os.fstat(initial_rootfs_fd)
+    import fcntl
+
+    runtime_environment = _runc_client_environment()
+    try:
+        config_text = config_json.decode("ascii")
+    except UnicodeDecodeError as error:
+        os.close(initial_bundle_fd)
+        os.close(initial_rootfs_fd)
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "sealed OCI config is not ASCII"
+        ) from error
+    payload = (
+        json.dumps(
+            {
+                "argv": command,
+                "env": runtime_environment,
+                "config": config_text,
+                "bundle": command[bundle_args[0] + 1],
+                "bundle_device": initial_bundle_info.st_dev,
+                "bundle_inode": initial_bundle_info.st_ino,
+                "rootfs_device": initial_rootfs_info.st_dev,
+                "rootfs_inode": initial_rootfs_info.st_ino,
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+            },
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    if len(payload) > _MAX_RUNC_LAUNCH_PAYLOAD_BYTES:
+        os.close(initial_bundle_fd)
+        os.close(initial_rootfs_fd)
+        raise SupervisorError("invalid_oci_command", "private runc payload exceeds its byte limit")
+
+    try:
+        opened_descriptor = _open_verified_runc_executable(executable)
+    except BaseException:
+        os.close(initial_bundle_fd)
+        os.close(initial_rootfs_fd)
+        raise
+    runc_fd = bundle_fd = rootfs_fd = -1
+    start_read = start_write = status_read = status_write = -1
+    map_ack_read = map_ack_write = exec_ack_read = exec_ack_write = -1
+    gate_read = gate_write = -1
+    process: subprocess.Popen[bytes] | None = None
+    launch_payload_may_have_been_delivered = False
+    try:
+        runc_fd = fcntl.fcntl(opened_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
+        descriptor = opened_descriptor
+        opened_descriptor = -1
+        os.close(descriptor)
+        bundle_fd = fcntl.fcntl(initial_bundle_fd, fcntl.F_DUPFD_CLOEXEC, 64)
+        descriptor = initial_bundle_fd
+        initial_bundle_fd = -1
+        os.close(descriptor)
+        rootfs_fd = fcntl.fcntl(initial_rootfs_fd, fcntl.F_DUPFD_CLOEXEC, 65)
+        descriptor = initial_rootfs_fd
+        initial_rootfs_fd = -1
+        os.close(descriptor)
+        bundle_fd_path = f"/proc/self/fd/{bundle_fd}"
+        bundle_fd_number = bundle_fd
+        if command[bundle_args[0] + 1] != str(bundle):
+            raise SupervisorError(
+                "invalid_oci_bundle", "runc bundle argv does not match its pinned directory"
+            )
+
+        start_read, start_write = os.pipe2(os.O_CLOEXEC)
+        status_read, status_write = os.pipe2(os.O_CLOEXEC)
+        map_ack_read, map_ack_write = os.pipe2(os.O_CLOEXEC)
+        exec_ack_read, exec_ack_write = os.pipe2(os.O_CLOEXEC)
+        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        launcher_environment = {
+            "HOME": runtime_environment["HOME"],
+            "PATH": runtime_environment["PATH"],
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                _RUNC_PRIVATE_BUNDLE_LAUNCHER,
+                str(start_read),
+                str(status_write),
+                str(map_ack_read),
+                str(exec_ack_read),
+                str(gate_read),
+                str(runc_fd),
+                str(bundle_fd),
+                str(rootfs_fd),
+            ],
+            cwd="/",
+            env=launcher_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            close_fds=True,
+            pass_fds=(
+                start_read,
+                status_write,
+                map_ack_read,
+                exec_ack_read,
+                gate_read,
+                runc_fd,
+                bundle_fd,
+                rootfs_fd,
+            ),
+            start_new_session=True,
+        )
+        descriptor = start_read
+        start_read = -1
+        os.close(descriptor)
+        descriptor = status_write
+        status_write = -1
+        os.close(descriptor)
+        descriptor = map_ack_read
+        map_ack_read = -1
+        os.close(descriptor)
+        descriptor = exec_ack_read
+        exec_ack_read = -1
+        os.close(descriptor)
+        descriptor = gate_read
+        gate_read = -1
+        os.close(descriptor)
+        descriptor = runc_fd
+        runc_fd = -1
+        os.close(descriptor)
+        descriptor = bundle_fd
+        bundle_fd = -1
+        os.close(descriptor)
+        descriptor = rootfs_fd
+        rootfs_fd = -1
+        os.close(descriptor)
+
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(start_write, remaining)
+            if written <= 0:
+                raise OSError("could not write the bounded private runc payload")
+            remaining = remaining[written:]
+        descriptor = start_write
+        start_write = -1
+        os.close(descriptor)
+
+        _read_private_launcher_message(status_read, process, expected=b"U")
+        _write_child_user_namespace_maps(process.pid, os.geteuid(), os.getegid())
+        if os.write(map_ack_write, b"M") != 1:
+            raise OSError("could not acknowledge user-namespace maps")
+        descriptor = map_ack_write
+        map_ack_write = -1
+        os.close(descriptor)
+        _read_private_launcher_message(status_read, process, expected=b"R")
+        if _before_runc_exec is not None:
+            _before_runc_exec(process.pid, bundle, bundle_fd_number)
+        # This byte is the runc-submission boundary: after it is attempted the
+        # caller must reconcile exact runtime state if no handle is returned.
+        launch_payload_may_have_been_delivered = True
+        if os.write(exec_ack_write, b"X") != 1:
+            raise OSError("could not authorize pinned runc exec")
+        descriptor = exec_ack_write
+        exec_ack_write = -1
+        os.close(descriptor)
+        _read_private_launcher_message(status_read, process, expected=None)
+        descriptor = status_read
+        status_read = -1
+        os.close(descriptor)
+        handle = RuncLaunchHandle(
+            process=process,
+            _gate_writer=gate_write,
+            _bundle_path=bundle_fd_path,
+        )
+        gate_write = -1
+        return handle
+    except BaseException as launch_error:
+        cleanup_error: BaseException | None = None
+        client_reap_error: BaseException | None = None
+        if gate_write >= 0:
+            descriptor = gate_write
+            gate_write = -1
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_error = error
+        if process is not None:
+            try:
+                _reap_failed_runc_launch(process)
+            except BaseException as error:
+                client_reap_error = error
+                if cleanup_error is None:
+                    cleanup_error = error
+        if launch_payload_may_have_been_delivered:
+            cleanup_status = (
+                "runc client cleanup is also unverified"
+                if client_reap_error is not None or process is None
+                else "runc client was reaped"
+            )
+            raise _RuncLaunchSubmissionUnverified(
+                "private runc exec may have been submitted; "
+                f"client_pid={process.pid if process is not None else 'unknown'}; "
+                f"{cleanup_status}; exact runtime state must be reconciled",
+                client_pid=process.pid if process is not None else None,
+                client_reaped=process is not None and client_reap_error is None,
+            ) from (cleanup_error or launch_error)
+        if cleanup_error is not None:
+            raise cleanup_error from launch_error
+        if isinstance(launch_error, SupervisorError):
+            raise
+        raise SupervisorError(
+            "sandbox_bundle_setup_failed",
+            f"private OCI namespace or bundle setup failed before runc exec: {launch_error}",
+        ) from launch_error
+    finally:
+        descriptors_to_close = (
+            opened_descriptor,
+            initial_bundle_fd,
+            initial_rootfs_fd,
+            runc_fd,
+            bundle_fd,
+            rootfs_fd,
+            start_read,
+            start_write,
+            status_read,
+            status_write,
+            map_ack_read,
+            map_ack_write,
+            exec_ack_read,
+            exec_ack_write,
+            gate_read,
+        )
+        opened_descriptor = initial_bundle_fd = initial_rootfs_fd = -1
+        runc_fd = bundle_fd = rootfs_fd = -1
+        start_read = start_write = status_read = status_write = -1
+        map_ack_read = map_ack_write = exec_ack_read = exec_ack_write = -1
+        gate_read = -1
+        for descriptor in descriptors_to_close:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
 def spawn_pinned_runc(
     binding: _PinnedRuncWorkerConfig,
     state_root: str | Path,
@@ -2653,13 +3568,18 @@ def spawn_pinned_runc(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
 ) -> RuncLaunchHandle:
-    """Fail closed until runc's filesystem bundle has exclusive ownership.
+    """Launch sealed runc policy from a private, descriptor-anchored bundle.
 
     Callers cannot provide a second executable: the policy binding supplies the
-    exact sealed pin. However, root-owned mode bits and exclusive creation do
-    not prevent another process with the same UID from replacing config.json
-    before runc opens it. The supported worker-launch API therefore remains
-    disabled until a separately verified per-launch ownership boundary exists.
+    exact sealed pin. The launcher creates config.json only inside a detached
+    private tmpfs attached to the already-open bundle directory using
+    descriptor-based ``move_mount`` in a mapped user and mount namespace. It
+    clones the pinned rootfs into the bundle as a separate read-only mount.
+    Runc receives the tmpfs mount through an inherited FD, so same-UID host-path
+    replacement cannot redirect the config handoff.
+    This low-level API still does not reserve a supervisor attempt, attest
+    runtime state, supervise cancellation/recovery, prove cleanup, or authorize
+    result import; ``run_worker`` remains fail-closed for configured OCI.
     """
 
     if type(binding) is not _PinnedRuncWorkerConfig:
@@ -2668,9 +3588,21 @@ def spawn_pinned_runc(
         )
     executable = binding.executable
     _verify_pinned_runc_worker_config(binding, executable)
-    raise SupervisorError(
-        "sandbox_bundle_ownership_unverified",
-        "runc worker launch is disabled until bundle/config ownership is isolated from same-UID writers",
+    run_argv = build_runc_run_argv(
+        executable,
+        state_root,
+        bundle_root,
+        workspace_root,
+        pid_file,
+        container_id,
+    )
+    return _spawn_pinned_runc_with_private_bundle(
+        executable,
+        run_argv,
+        bundle_root,
+        binding.config_json,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 
