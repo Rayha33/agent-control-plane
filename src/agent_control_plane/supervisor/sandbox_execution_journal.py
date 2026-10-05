@@ -178,6 +178,8 @@ class SandboxExecutionJournalMixin:
         bundle_digest: str,
         *,
         rootfs_digest: str,
+        rootfs_closure_digest: str,
+        runc_executable_digest: str,
         runtime_version: str,
         oci_version: str,
         credential: str | None = None,
@@ -190,10 +192,64 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError("sandbox_execution_invalid", "bundle digest must be SHA-256")
         if not isinstance(rootfs_digest, str) or _DIGEST.fullmatch(rootfs_digest) is None:
             raise SupervisorError("sandbox_execution_invalid", "rootfs digest must be SHA-256")
+        if (
+            not isinstance(rootfs_closure_digest, str)
+            or _DIGEST.fullmatch(rootfs_closure_digest) is None
+        ):
+            raise SupervisorError(
+                "sandbox_execution_invalid", "rootfs closure digest must be SHA-256"
+            )
+        if (
+            not isinstance(runc_executable_digest, str)
+            or _DIGEST.fullmatch(runc_executable_digest) is None
+        ):
+            raise SupervisorError(
+                "sandbox_execution_invalid", "trusted runc executable digest must be SHA-256"
+            )
         runtime_version = self._sandbox_text(runtime_version, "runtime_version", limit=128)
         oci_version = self._sandbox_text(oci_version, "oci_version", limit=32)
         if _OCI_VERSION.fullmatch(oci_version) is None:
             raise SupervisorError("sandbox_execution_invalid", "OCI version must be numeric semver")
+
+        config = self.config
+        rootfs_pin = config.oci_rootfs_pin
+        runc_pin = config.oci_runc_executable
+        configured_runtime_version = config.oci_runc_version
+        if (
+            rootfs_pin is None
+            or runc_pin is None
+            or not isinstance(configured_runtime_version, str)
+            or not configured_runtime_version
+        ):
+            raise SupervisorError(
+                "sandbox_execution_pin_unavailable",
+                "sandbox reservation requires configured rootfs and runc pins",
+            )
+
+        # Hash-shaped caller claims are not evidence. Revalidate the process-local
+        # sealed handles, then require every persisted runtime identity to match
+        # those exact configured values before the reservation can be journaled.
+        from . import oci_worker
+
+        try:
+            oci_worker._verify_trusted_rootfs(rootfs_pin)
+            oci_worker._verify_trusted_runc_executable(runc_pin)
+        except SupervisorError as error:
+            raise SupervisorError(
+                "sandbox_execution_pin_invalid",
+                "configured rootfs or runc pin could not be verified",
+            ) from error
+        if (
+            rootfs_digest != rootfs_pin.sha256
+            or rootfs_closure_digest != rootfs_pin.closure_sha256
+            or runc_executable_digest != runc_pin.sha256
+            or runtime_version != configured_runtime_version
+        ):
+            raise SupervisorError(
+                "sandbox_execution_pin_mismatch",
+                "reservation runtime identity does not match configured OCI pins",
+            )
+
         execution_id = str(uuid.uuid4())
         container_id = f"acp-{attempt_id[:24]}-{claim_token}-{execution_id[:8]}"
         execution_root = (
@@ -220,9 +276,10 @@ class SandboxExecutionJournalMixin:
                     """
                     INSERT INTO sandbox_executions
                       (attempt_id, claim_token, execution_id, backend, container_id,
-                       bundle_digest, rootfs_digest, runtime_version, oci_version,
+                       bundle_digest, rootfs_digest, rootfs_closure_digest,
+                       runc_executable_digest, runtime_version, oci_version,
                        bundle_path, state_path, phase, created_at, updated_at)
-                    VALUES (?, ?, ?, 'oci-runc', ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+                    VALUES (?, ?, ?, 'oci-runc', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
                     """,
                     (
                         attempt_id,
@@ -231,6 +288,8 @@ class SandboxExecutionJournalMixin:
                         container_id,
                         bundle_digest,
                         rootfs_digest,
+                        rootfs_closure_digest,
+                        runc_executable_digest,
                         runtime_version,
                         oci_version,
                         bundle_path,
@@ -258,6 +317,8 @@ class SandboxExecutionJournalMixin:
                     "container_id": container_id,
                     "bundle_digest": bundle_digest,
                     "rootfs_digest": rootfs_digest,
+                    "rootfs_closure_digest": rootfs_closure_digest,
+                    "runc_executable_digest": runc_executable_digest,
                     "runtime_version": runtime_version,
                     "oci_version": oci_version,
                 },
@@ -652,6 +713,7 @@ class SandboxExecutionJournalMixin:
             cleanup_json = row["cleanup_receipt_json"]
             if cleanup_json not in {
                 canonical_json(self._sandbox_cleanup_receipt(row)),
+                canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row)),
                 canonical_json(self._sandbox_cleanup_receipt_v1(row)),
             }:
                 raise SupervisorError(
@@ -929,6 +991,14 @@ class SandboxExecutionJournalMixin:
                     raise SupervisorError(
                         "sandbox_workspace_unbound",
                         "sandbox launch requires a durable baseline/workspace binding",
+                    )
+                if any(
+                    _DIGEST.fullmatch(row[name] or "") is None
+                    for name in ("rootfs_closure_digest", "runc_executable_digest")
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_content_pins_required",
+                        "sandbox launch requires pinned rootfs closure and runc executable digests",
                     )
             fields = ", ".join(f"{name} = ?" for name in updates)
             changed = connection.execute(
@@ -1214,8 +1284,13 @@ class SandboxExecutionJournalMixin:
         expected_encoded = canonical_json(expected)
         if row["phase"] == "cleanup_reported":
             persisted = row["cleanup_receipt_json"]
+            legacy_v2_encoded = canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row))
             legacy_encoded = canonical_json(self._sandbox_cleanup_receipt_v1(row))
-            if encoded == persisted and persisted in {expected_encoded, legacy_encoded}:
+            if encoded == persisted and persisted in {
+                expected_encoded,
+                legacy_v2_encoded,
+                legacy_encoded,
+            }:
                 return self._sandbox_execution_view(row)
             if encoded != expected_encoded:
                 raise SupervisorError(
@@ -1252,6 +1327,8 @@ class SandboxExecutionJournalMixin:
             "container_id": row["container_id"],
             "bundle_digest": row["bundle_digest"],
             "rootfs_digest": row["rootfs_digest"],
+            "rootfs_closure_digest": row["rootfs_closure_digest"],
+            "runc_executable_digest": row["runc_executable_digest"],
             "runtime_version": row["runtime_version"],
             "oci_version": row["oci_version"],
             "runc_exit_code": row["runc_exit_code"],
@@ -1278,10 +1355,18 @@ class SandboxExecutionJournalMixin:
     def _sandbox_cleanup_receipt_v1(self, row: Any) -> dict[str, Any]:
         """Reconstruct the historical receipt solely for immutable replay checks."""
 
-        receipt = self._sandbox_cleanup_receipt(row)
+        receipt = self._sandbox_cleanup_receipt_v2_legacy(row)
         receipt["version"] = 1
         receipt.pop("verification_status")
         receipt["observations"] = dict(_LEGACY_CLEANUP_OBSERVATIONS)
+        return receipt
+
+    def _sandbox_cleanup_receipt_v2_legacy(self, row: Any) -> dict[str, Any]:
+        """Reconstruct a schema-16 v2 receipt for exact post-migration replay."""
+
+        receipt = self._sandbox_cleanup_receipt(row)
+        receipt.pop("rootfs_closure_digest")
+        receipt.pop("runc_executable_digest")
         return receipt
 
     def _sandbox_execution_mark_ambiguous(

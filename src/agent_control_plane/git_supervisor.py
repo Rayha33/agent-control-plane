@@ -194,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -798,6 +798,93 @@ def _add_sandbox_result_candidate_evidence(connection: sqlite3.Connection) -> No
     )
 
 
+def _add_sandbox_runtime_content_pins(connection: sqlite3.Connection) -> None:
+    """Bind each future OCI execution to its complete rootfs and runc bytes.
+
+    Existing journal rows keep empty sentinels: their runtime content identities
+    cannot be reconstructed after the fact, and a separate launch guard keeps
+    such rows from advancing into execution.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    additions = (
+        ("rootfs_closure_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("runc_executable_digest", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_insert_reserved")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_insert_reserved
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.phase != 'reserved'
+          OR NEW.monitor_pid IS NOT NULL OR NEW.monitor_identity != ''
+          OR NEW.runc_client_pid IS NOT NULL OR NEW.runc_client_identity != ''
+          OR NEW.init_pid IS NOT NULL OR NEW.init_identity != ''
+          OR NEW.wrapper_unit != '' OR NEW.wrapper_invocation_id != ''
+          OR NEW.scope_unit != '' OR NEW.scope_invocation_id != '' OR NEW.cgroup_path != ''
+          OR NEW.stop_reason != '' OR NEW.runc_exit_code IS NOT NULL
+          OR NEW.runc_exit_observed_by != '' OR NEW.cleanup_receipt_json != '{}'
+          OR NEW.failure_reason != ''
+          OR length(NEW.bundle_digest) != 64 OR NEW.bundle_digest GLOB '*[^0-9a-f]*'
+          OR length(NEW.rootfs_digest) != 64 OR NEW.rootfs_digest GLOB '*[^0-9a-f]*'
+          OR length(NEW.rootfs_closure_digest) != 64
+          OR NEW.rootfs_closure_digest GLOB '*[^0-9a-f]*'
+          OR length(NEW.runc_executable_digest) != 64
+          OR NEW.runc_executable_digest GLOB '*[^0-9a-f]*'
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_must_start_reserved');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_identity_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_identity_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.attempt_id IS NOT NEW.attempt_id
+          OR OLD.claim_token IS NOT NEW.claim_token
+          OR OLD.execution_id IS NOT NEW.execution_id
+          OR OLD.backend IS NOT NEW.backend
+          OR OLD.container_id IS NOT NEW.container_id
+          OR OLD.bundle_digest IS NOT NEW.bundle_digest
+          OR OLD.rootfs_digest IS NOT NEW.rootfs_digest
+          OR OLD.rootfs_closure_digest IS NOT NEW.rootfs_closure_digest
+          OR OLD.runc_executable_digest IS NOT NEW.runc_executable_digest
+          OR OLD.runtime_version IS NOT NEW.runtime_version
+          OR OLD.oci_version IS NOT NEW.oci_version
+          OR OLD.bundle_path IS NOT NEW.bundle_path
+          OR OLD.state_path IS NOT NEW.state_path
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_identity_immutable');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_launch_requires_content_pins")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_content_pins
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            length(NEW.rootfs_closure_digest) != 64
+            OR NEW.rootfs_closure_digest GLOB '*[^0-9a-f]*'
+            OR length(NEW.runc_executable_digest) != 64
+            OR NEW.runc_executable_digest GLOB '*[^0-9a-f]*'
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_content_pins_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -814,6 +901,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (14, _add_sandbox_execution_journal),
     (15, _add_sandbox_workspace_binding),
     (16, _add_sandbox_result_candidate_evidence),
+    (17, _add_sandbox_runtime_content_pins),
 )
 
 

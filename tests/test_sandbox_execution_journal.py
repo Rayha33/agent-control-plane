@@ -19,6 +19,7 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
 )
 from agent_control_plane.supervisor import claims as claims_module
+from agent_control_plane.supervisor import oci_worker
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
 from agent_control_plane.supervisor.common import canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
@@ -46,14 +47,53 @@ def claimed(supervisor: GitSupervisor) -> dict:
     return supervisor.claim(task["id"], "sandbox-worker")
 
 
+def configure_test_sandbox_pins(supervisor: GitSupervisor) -> None:
+    if (
+        supervisor.config.oci_rootfs_pin is not None
+        and supervisor.config.oci_runc_executable is not None
+        and supervisor.config.oci_runc_version is not None
+    ):
+        return
+    rootfs = supervisor.root.parent / f"{supervisor.root.name}-test-rootfs"
+    (rootfs / "bin").mkdir(parents=True, mode=0o700, exist_ok=True)
+    fixture_executable = rootfs / "bin" / "sh"
+    if not fixture_executable.exists():
+        fixture_executable.write_text("sandbox journal test rootfs\n", encoding="ascii")
+        fixture_executable.chmod(0o700)
+    manifest = oci_worker.rootfs_tree_manifest(rootfs)
+    rootfs_pin = oci_worker._pin_trusted_rootfs(
+        rootfs,
+        manifest["rootfs_sha256"],
+        supervisor.root,
+        expected_closure_sha256=manifest["closure_sha256"],
+    )
+    runc_pin = oci_worker._pin_trusted_runc_executable("/bin/sh", supervisor.root)
+    supervisor.config = replace(
+        supervisor.config,
+        oci_rootfs_pin=rootfs_pin,
+        oci_runc_executable=runc_pin,
+        oci_runc_version="1.3.5",
+    )
+
+
+def configured_sandbox_claims(supervisor: GitSupervisor) -> dict[str, str]:
+    configure_test_sandbox_pins(supervisor)
+    return {
+        "rootfs_digest": supervisor.config.oci_rootfs_pin.sha256,
+        "rootfs_closure_digest": supervisor.config.oci_rootfs_pin.closure_sha256,
+        "runc_executable_digest": supervisor.config.oci_runc_executable.sha256,
+        "runtime_version": supervisor.config.oci_runc_version,
+        "oci_version": "1.2.1",
+    }
+
+
 def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
+    runtime_claims = configured_sandbox_claims(supervisor)
     row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
         "a" * 64,
-        rootfs_digest="b" * 64,
-        runtime_version="runc 1.3.5",
-        oci_version="1.2.1",
+        **runtime_claims,
     )
     execution_root = Path(row["bundle_path"]).parent
     execution_root.mkdir(mode=0o700, parents=True)
@@ -174,12 +214,12 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v16_requires_durable_workspace_binding_before_launch(repo: Path) -> None:
+def test_schema_v17_requires_durable_workspace_binding_before_launch(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 16
+    assert SCHEMA_VERSION == 17
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["baseline_manifest_digest"]
@@ -187,9 +227,11 @@ def test_schema_v16_requires_durable_workspace_binding_before_launch(repo: Path)
     assert row["workspace_root_path"].endswith("/workspace")
     assert row["claim_token"] == attempt["claim_token"]
     assert row["backend"] == "oci-runc"
-    assert row["runtime_version"] == "runc 1.3.5"
+    assert row["runtime_version"] == "1.3.5"
     assert row["oci_version"] == "1.2.1"
-    assert row["rootfs_digest"] == "b" * 64
+    assert row["rootfs_digest"] == supervisor.config.oci_rootfs_pin.sha256
+    assert row["rootfs_closure_digest"] == supervisor.config.oci_rootfs_pin.closure_sha256
+    assert row["runc_executable_digest"] == supervisor.config.oci_runc_executable.sha256
     assert row["result_candidate_version"] == 0
     assert row["bundle_path"].startswith(str((repo / ".acp" / "sandbox-executions").resolve()))
     assert row["state_path"].endswith("/state")
@@ -201,6 +243,9 @@ def test_schema_v16_requires_durable_workspace_binding_before_launch(repo: Path)
         result_migration = dict(MIGRATIONS)[16]
         result_migration(connection)
         result_migration(connection)
+        runtime_pin_migration = dict(MIGRATIONS)[17]
+        runtime_pin_migration(connection)
+        runtime_pin_migration(connection)
         with pytest.raises(sqlite3.IntegrityError, match="result_candidate_immutable"):
             connection.execute(
                 "UPDATE sandbox_executions SET result_candidate_version = 1, "
@@ -266,7 +311,7 @@ def test_v15_to_v16_migration_adds_non_authorizing_candidate_fields() -> None:
                bundle_digest, rootfs_digest, runtime_version, oci_version,
                bundle_path, state_path, phase, created_at, updated_at)
             VALUES (?, 1, 'execution-1', 'oci-runc', 'container-1', ?, ?,
-                    'runc 1.3.5', '1.2.1', '/bundle', '/state', 'reserved', 'now', 'now')
+                    '1.3.5', '1.2.1', '/bundle', '/state', 'reserved', 'now', 'now')
             """,
             ("attempt-1", "a" * 64, "b" * 64),
         )
@@ -288,16 +333,75 @@ def test_v15_to_v16_migration_adds_non_authorizing_candidate_fields() -> None:
         connection.close()
 
 
+def test_v16_to_v17_migration_keeps_unknown_content_pins_non_authorizing() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("CREATE TABLE attempts (id TEXT PRIMARY KEY, pid INTEGER)")
+        connection.execute("INSERT INTO attempts (id, pid) VALUES ('attempt-1', NULL)")
+        migrations = dict(MIGRATIONS)
+        for version in (14, 15, 16):
+            migrations[version](connection)
+        connection.execute(
+            """
+            INSERT INTO sandbox_executions
+              (attempt_id, claim_token, execution_id, backend, container_id,
+               bundle_digest, rootfs_digest, runtime_version, oci_version,
+               bundle_path, state_path, phase, created_at, updated_at)
+            VALUES (?, 1, 'execution-1', 'oci-runc', 'container-1', ?, ?,
+                    '1.3.5', '1.2.1', '/bundle', '/state', 'reserved', 'now', 'now')
+            """,
+            ("attempt-1", "a" * 64, "b" * 64),
+        )
+
+        migrations[17](connection)
+        migrations[17](connection)
+        migrated = connection.execute(
+            "SELECT rootfs_closure_digest, runc_executable_digest "
+            "FROM sandbox_executions WHERE attempt_id = 'attempt-1'"
+        ).fetchone()
+        assert migrated["rootfs_closure_digest"] == ""
+        assert migrated["runc_executable_digest"] == ""
+
+        connection.execute(
+            """
+            UPDATE sandbox_executions
+            SET workspace_binding_version = 1,
+                baseline_root_path = '/baseline', baseline_root_dev = 1,
+                baseline_root_ino = 2, workspace_root_path = '/workspace',
+                workspace_root_dev = 1, workspace_root_ino = 3,
+                baseline_manifest_json = '{}', baseline_manifest_digest = ?
+            WHERE attempt_id = 'attempt-1'
+            """,
+            ("c" * 64,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_execution_content_pins_required"):
+            connection.execute(
+                """
+                UPDATE sandbox_executions
+                SET phase = 'launched', monitor_pid = 101,
+                    monitor_identity = 'linux:101:1101', runc_client_pid = 202,
+                    runc_client_identity = 'linux:202:1202', wrapper_unit = 'acp-worker.service',
+                    wrapper_invocation_id = '11111111111111111111111111111111',
+                    scope_unit = 'acp-container.scope',
+                    scope_invocation_id = '22222222222222222222222222222222',
+                    cgroup_path = '/user.slice/acp-container.scope'
+                WHERE attempt_id = 'attempt-1'
+                """
+            )
+    finally:
+        connection.close()
+
+
 def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
+    runtime_claims = configured_sandbox_claims(supervisor)
     row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
         "a" * 64,
-        rootfs_digest="b" * 64,
-        runtime_version="runc 1.3.5",
-        oci_version="1.2.1",
+        **runtime_claims,
     )
     assert row["workspace_binding_version"] == 0
 
@@ -454,15 +558,14 @@ def test_schema_13_read_only_open_refuses_until_journal_migration(repo: Path) ->
 def test_reservation_requires_exact_live_fence_and_no_registered_direct_worker(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
+    runtime_claims = configured_sandbox_claims(supervisor)
 
     with pytest.raises(SupervisorError) as stale:
         supervisor._sandbox_execution_reserve(
             attempt["id"],
             attempt["claim_token"] + 1,
             "a" * 64,
-            rootfs_digest="b" * 64,
-            runtime_version="runc 1.3.5",
-            oci_version="1.2.1",
+            **runtime_claims,
         )
     assert stale.value.code == "stale_fencing_token"
     with pytest.raises(SupervisorError) as invalid:
@@ -470,11 +573,19 @@ def test_reservation_requires_exact_live_fence_and_no_registered_direct_worker(r
             attempt["id"],
             attempt["claim_token"],
             "not-a-digest",
-            rootfs_digest="b" * 64,
-            runtime_version="runc 1.3.5",
-            oci_version="1.2.1",
+            **runtime_claims,
         )
     assert invalid.value.code == "sandbox_execution_invalid"
+
+    for field in ("rootfs_closure_digest", "runc_executable_digest"):
+        options = dict(runtime_claims)
+        options[field] = "not-a-digest"
+        with pytest.raises(SupervisorError) as malformed:
+            supervisor._sandbox_execution_reserve(
+                attempt["id"], attempt["claim_token"], "a" * 64, **options
+            )
+        assert malformed.value.code == "sandbox_execution_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"]) is None
 
     with supervisor.connect() as connection:
         connection.execute(
@@ -484,6 +595,58 @@ def test_reservation_requires_exact_live_fence_and_no_registered_direct_worker(r
     with pytest.raises(SupervisorError) as registered:
         reserve(supervisor, attempt)
     assert registered.value.code == "worker_already_running"
+    assert supervisor._sandbox_execution_get(attempt["id"]) is None
+
+
+def test_sandbox_reservation_requires_configured_sealed_runtime_pins(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    with pytest.raises(SupervisorError) as missing:
+        supervisor._sandbox_execution_reserve(
+            attempt["id"],
+            attempt["claim_token"],
+            "a" * 64,
+            rootfs_digest="b" * 64,
+            rootfs_closure_digest="c" * 64,
+            runc_executable_digest="d" * 64,
+            runtime_version="1.3.5",
+            oci_version="1.2.1",
+        )
+    assert missing.value.code == "sandbox_execution_pin_unavailable"
+    assert supervisor._sandbox_execution_get(attempt["id"]) is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "rootfs_digest",
+        "rootfs_closure_digest",
+        "runc_executable_digest",
+        "runtime_version",
+    ),
+)
+def test_sandbox_reservation_binds_claims_to_configured_runtime_pins(
+    repo: Path, field: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    runtime_claims = configured_sandbox_claims(supervisor)
+    mismatched_claims = dict(runtime_claims)
+    original = mismatched_claims[field]
+    mismatched_claims[field] = (
+        "1.3.4"
+        if field == "runtime_version"
+        else ("0" if original[0] != "0" else "1") + original[1:]
+    )
+
+    with pytest.raises(SupervisorError) as mismatch:
+        supervisor._sandbox_execution_reserve(
+            attempt["id"],
+            attempt["claim_token"],
+            "a" * 64,
+            **mismatched_claims,
+        )
+    assert mismatch.value.code == "sandbox_execution_pin_mismatch"
     assert supervisor._sandbox_execution_get(attempt["id"]) is None
 
 
@@ -556,12 +719,22 @@ def test_result_import_rechecks_journal_at_result_write_boundary(
                 """
                 INSERT INTO sandbox_executions
                   (attempt_id, claim_token, execution_id, backend, container_id,
-                   bundle_digest, rootfs_digest, runtime_version, oci_version,
+                   bundle_digest, rootfs_digest, rootfs_closure_digest,
+                   runc_executable_digest, runtime_version, oci_version,
                    bundle_path, state_path, phase, created_at, updated_at)
-                VALUES (?, ?, 'race-execution', 'oci-runc', 'race-container', ?, ?,
+                VALUES (?, ?, 'race-execution', 'oci-runc', 'race-container', ?, ?, ?, ?,
                         'test-runc', '1.2.1', '/bundle', '/state', 'reserved', ?, ?)
                 """,
-                (attempt_id, attempt["claim_token"], "a" * 64, "b" * 64, stamp, stamp),
+                (
+                    attempt_id,
+                    attempt["claim_token"],
+                    "a" * 64,
+                    "b" * 64,
+                    "c" * 64,
+                    "d" * 64,
+                    stamp,
+                    stamp,
+                ),
             )
         original_guard(connection, attempt_id)
 
@@ -748,15 +921,25 @@ def test_recorded_execution_evidence_is_immutable(repo: Path) -> None:
     record_running(supervisor, attempt)
 
     mutations = (
-        "monitor_pid = 404",
-        "monitor_identity = 'replacement-monitor'",
-        "scope_invocation_id = '33333333333333333333333333333333'",
-        "cgroup_path = '/different/scope'",
-        "init_pid = 505",
+        ("rootfs_closure_digest = 'e' || substr(rootfs_closure_digest, 2)", "identity"),
+        ("runc_executable_digest = 'e' || substr(runc_executable_digest, 2)", "identity"),
+        ("monitor_pid = 404", "evidence"),
+        ("monitor_identity = 'replacement-monitor'", "evidence"),
+        ("scope_invocation_id = '33333333333333333333333333333333'", "evidence"),
+        ("cgroup_path = '/different/scope'", "evidence"),
+        ("init_pid = 505", "evidence"),
     )
-    for mutation in mutations:
+    for mutation, identity_or_evidence in mutations:
+        expected_error = (
+            "sandbox_execution_identity_immutable"
+            if identity_or_evidence == "identity"
+            else "sandbox_execution_evidence"
+        )
         with supervisor.connect() as connection:
-            with pytest.raises(sqlite3.IntegrityError, match="sandbox_execution_evidence"):
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match=expected_error,
+            ):
                 connection.execute(
                     f"UPDATE sandbox_executions SET {mutation} WHERE attempt_id = ?",
                     (attempt["id"],),
@@ -1052,8 +1235,9 @@ def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> No
     assert persisted["result_candidate_digest"] == first["candidate_digest"]
 
 
-def test_persisted_v1_cleanup_receipt_replays_read_only_but_never_proves_cleanup(
-    repo: Path, tmp_path: Path
+@pytest.mark.parametrize("legacy_version", [1, 2])
+def test_persisted_pre_schema17_cleanup_receipt_replays_but_never_proves_cleanup(
+    repo: Path, tmp_path: Path, legacy_version: int
 ) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
@@ -1063,20 +1247,23 @@ def test_persisted_v1_cleanup_receipt_replays_read_only_but_never_proves_cleanup
     supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
 
     legacy_receipt = cleanup_receipt(supervisor, attempt["id"])
-    legacy_receipt["version"] = 1
-    legacy_receipt.pop("verification_status")
-    legacy_receipt["observations"] = {
-        "runc_delete_exit_code": 0,
-        "runc_state_absent": True,
-        "bundle_absent": True,
-        "state_directory_absent": True,
-        "wrapper_unit_absent": True,
-        "scope_unit_absent": True,
-        "cgroup_absent": True,
-        "monitor_identity_absent": True,
-        "runc_client_identity_absent": True,
-        "container_init_identity_absent": True,
-    }
+    legacy_receipt.pop("rootfs_closure_digest")
+    legacy_receipt.pop("runc_executable_digest")
+    if legacy_version == 1:
+        legacy_receipt["version"] = 1
+        legacy_receipt.pop("verification_status")
+        legacy_receipt["observations"] = {
+            "runc_delete_exit_code": 0,
+            "runc_state_absent": True,
+            "bundle_absent": True,
+            "state_directory_absent": True,
+            "wrapper_unit_absent": True,
+            "scope_unit_absent": True,
+            "cgroup_absent": True,
+            "monitor_identity_absent": True,
+            "runc_client_identity_absent": True,
+            "container_init_identity_absent": True,
+        }
     encoded = canonical_json(legacy_receipt)
     supervisor._sandbox_execution_transition(
         attempt["id"],
@@ -1088,11 +1275,36 @@ def test_persisted_v1_cleanup_receipt_replays_read_only_but_never_proves_cleanup
         event_payload={"receipt_sha256": hashlib.sha256(encoded.encode()).hexdigest()},
     )
 
+    # Recreate the pre-17 table shape, then exercise the real version-16 upgrade
+    # with a cleanup_reported row already carrying its historical receipt.
+    with supervisor.connect() as connection:
+        for trigger in (
+            "sandbox_execution_insert_reserved",
+            "sandbox_execution_identity_immutable",
+            "sandbox_execution_launch_requires_content_pins",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("ALTER TABLE sandbox_executions DROP COLUMN runc_executable_digest")
+        connection.execute("ALTER TABLE sandbox_executions DROP COLUMN rootfs_closure_digest")
+        connection.execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'")
+    supervisor = GitSupervisor(repo)
+    assert supervisor.schema_version_on_open == 16
+    migrated = supervisor._sandbox_execution_get(attempt["id"])
+    assert migrated["rootfs_closure_digest"] == ""
+    assert migrated["runc_executable_digest"] == ""
+
     replayed = supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], legacy_receipt
     )
     assert replayed["phase"] == "cleanup_reported"
-    assert replayed["cleanup_receipt"]["version"] == 1
+    assert replayed["cleanup_receipt"]["version"] == legacy_version
+
+    workspace = Path(supervisor._sandbox_execution_get(attempt["id"])["workspace_root_path"])
+    (workspace / "alpha.txt").write_text("legacy cleanup receipt candidate\n", encoding="utf-8")
+    candidate = supervisor._sandbox_execution_capture_result_candidate(
+        attempt["id"], attempt["claim_token"]
+    )
+    assert candidate["candidate"]["cleanup"]["status"] == "unverified"
 
     current_receipt = cleanup_receipt(supervisor, attempt["id"])
     with pytest.raises(SupervisorError) as replace_legacy:

@@ -368,7 +368,9 @@ identities but labels every cleanup observation `null` and the verification
 status `unverified`: no runtime readback has occurred. A new version-2 report
 cannot supply positive observations. An exact persisted version-1 receipt may
 replay for retry compatibility, but its historical claims remain unverified
-and cannot be replaced. `cleanup_reported` is therefore not
+and cannot be replaced. After schema 17, exact persisted pre-17 version-1 and
+version-2 receipts may replay in their original shape; replay does not add the
+new content pins or upgrade their evidence. `cleanup_reported` is therefore not
 `cleanup_verified`. Existing reaper, worker-finalization, and runtime-teardown
 paths refuse to release a journaled attempt until a future trusted verifier
 records `cleanup_verified`.
@@ -431,6 +433,23 @@ This schema adds no trusted cleanup verifier and no sandbox result-import route,
 so a journaled candidate still cannot create or submit a result. Direct-worker
 behavior remains unchanged. Same-UID raw database writers, workspace path
 races, and runtime cleanup are not proved safe by this receipt.
+
+**Runtime content-identity slice (schema 17; still not an executor).** New
+execution reservations now require the configured rootfs tree digest, the
+rootfs closure-manifest digest, and the trusted `runc` executable digest.
+Before writing a reservation, the journal revalidates the process-local sealed
+rootfs and `runc` handles and rejects any digest or runtime-version claim that
+does not exactly match those configured pins.
+SQLite treats all three as immutable execution identity, the hash-chained
+reservation event and cleanup receipt include the closure and executable pins,
+and both the journal API and database launch guard refuse to advance a row
+without them. Schema-16 rows migrate with empty/unknown sentinels; reserved rows
+cannot transition to launched, while already-launched rows retain their recorded
+phase. Their old content identities cannot be truthfully reconstructed
+retroactively. This binds later lifecycle evidence to the exact operator-pinned
+filesystem inventory and runtime executable bytes, but proves neither image
+provenance nor runtime policy application. No `run_worker` executor is wired,
+and the configured-OCI path continues to fail before heartbeat or host fallback.
 
 **Runtime-attestation validator and partial host collector (2026-10-04; still
 no launcher).** The `sandbox_attestation` module binds bounded observations into
