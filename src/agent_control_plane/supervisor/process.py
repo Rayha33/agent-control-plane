@@ -61,6 +61,7 @@ class ProcessMixin:
         pass_fds: Sequence[int] = (),
         lifecycle_fds: Sequence[int] = (),
         fd3_source: int | None = None,
+        exec_fd: int | None = None,
     ) -> dict[str, Any]:
         from ..worker_trampoline import _monitor_argv_prefix
 
@@ -81,6 +82,37 @@ class ProcessMixin:
                 raise SupervisorError(
                     "invalid_fd3_source", "command fd 3 source is not open"
                 ) from error
+        if exec_fd is not None:
+            if (
+                type(exec_fd) is not int
+                or exec_fd < 3
+                or not sys.platform.startswith("linux")
+                or os.execve not in os.supports_fd
+            ):
+                raise SupervisorError(
+                    "invalid_exec_fd",
+                    "descriptor-based command exec requires an open Linux executable descriptor",
+                )
+            if (
+                exec_fd in set(lifecycle_fds) | set(pass_fds)
+                or exec_fd == fd3_source
+                or (exec_fd == 3 and fd3_source is not None)
+            ):
+                raise SupervisorError(
+                    "invalid_exec_fd",
+                    "command executable descriptor conflicts with another inherited descriptor",
+                )
+            try:
+                info = os.fstat(exec_fd)
+                fcntl.fcntl(exec_fd, fcntl.F_GETFD)
+            except OSError as error:
+                raise SupervisorError(
+                    "invalid_exec_fd", "command executable descriptor is not open"
+                ) from error
+            if not stat.S_ISREG(info.st_mode):
+                raise SupervisorError(
+                    "invalid_exec_fd", "command executable descriptor must name a regular file"
+                )
         if sys.platform == "darwin":
             sandbox = Path("/usr/bin/sandbox-exec")
             if not sandbox.is_file():
@@ -110,6 +142,8 @@ class ProcessMixin:
         inherited_fd_set = {handshake_read, target_write, start_read, *pass_fds, *lifecycle_fds}
         if fd3_source is not None:
             inherited_fd_set.add(fd3_source)
+        if exec_fd is not None:
+            inherited_fd_set.add(exec_fd)
         inherited_fds = tuple(sorted(inherited_fd_set))
         try:
             process = subprocess.Popen(
@@ -118,7 +152,12 @@ class ProcessMixin:
                     "-I",
                     str(trampoline),
                     *_monitor_argv_prefix(
-                        handshake_read, target_write, start_read, lifecycle_fds, fd3_source
+                        handshake_read,
+                        target_write,
+                        start_read,
+                        lifecycle_fds,
+                        fd3_source,
+                        exec_fd,
                     ),
                     *arguments,
                 ],

@@ -7,9 +7,10 @@ import sys
 import time
 from collections.abc import Sequence
 
-MONITOR_MODE = "__ACP_MONITOR_PROCESS_TREE_V2__"
+MONITOR_MODE = "__ACP_MONITOR_PROCESS_TREE_V3__"
 LIFECYCLE_FDS_PREFIX = "__ACP_LIFECYCLE_FDS_V1__="
 _FD3_SOURCE_PREFIX = "__ACP_FD3_SOURCE_V1__="
+_EXEC_FD_PREFIX = "__ACP_EXEC_FD_V1__="
 
 
 def _monitor_argv_prefix(
@@ -18,6 +19,7 @@ def _monitor_argv_prefix(
     start_fd: int,
     lifecycle_fds: Sequence[int],
     fd3_source: int | None,
+    exec_fd: int | None = None,
 ) -> list[str]:
     """Build the versioned monitor header shared by both supervisor launch paths."""
 
@@ -25,6 +27,7 @@ def _monitor_argv_prefix(
         str(descriptor) for descriptor in sorted(set(lifecycle_fds))
     )
     fd3_source_argument = _FD3_SOURCE_PREFIX + ("" if fd3_source is None else str(fd3_source))
+    exec_fd_argument = _EXEC_FD_PREFIX + ("" if exec_fd is None else str(exec_fd))
     return [
         str(handshake_fd),
         str(target_fd),
@@ -32,6 +35,7 @@ def _monitor_argv_prefix(
         MONITOR_MODE,
         lifecycle_argument,
         fd3_source_argument,
+        exec_fd_argument,
     ]
 
 
@@ -69,6 +73,17 @@ def _map_fd3_source(fd3_source: int | None) -> None:
         return
     os.dup2(fd3_source, 3, inheritable=True)
     os.close(fd3_source)
+
+
+def _exec_command(command: list[str], exec_fd: int | None) -> None:
+    """Exec by a held descriptor when requested, without leaking it to the target."""
+
+    if exec_fd is None:
+        os.execvp(command[0], command)
+    # Linux can execute an already-open ELF image with FD_CLOEXEC set. Keep
+    # the executable descriptor out of the launched process's descriptor table.
+    os.set_inheritable(exec_fd, False)
+    os.execve(exec_fd, command, os.environ)
 
 
 def _linux_children() -> list[int] | None:
@@ -128,6 +143,7 @@ def _monitor_linux(
     command: list[str],
     lifecycle_fds: tuple[int, ...],
     fd3_source: int | None,
+    exec_fd: int | None,
     target_fd: int,
     start_fd: int,
 ) -> int:
@@ -168,11 +184,12 @@ def _monitor_linux(
         if os.getppid() != monitor_pid:
             os._exit(125)
         try:
-            os.execvp(command[0], command)
+            _exec_command(command, exec_fd)
         except OSError:
             os._exit(126)
-    if fd3_source is not None:
-        _close_lifecycle_fds((fd3_source,))
+    _close_lifecycle_fds(
+        tuple(descriptor for descriptor in (fd3_source, exec_fd) if descriptor is not None)
+    )
     if start_fd >= 0:
         os.close(start_fd)
     _report_target(target_fd, child)
@@ -204,6 +221,7 @@ def _monitor_single_process(
     command: list[str],
     lifecycle_fds: tuple[int, ...],
     fd3_source: int | None,
+    exec_fd: int | None,
     target_fd: int,
     start_fd: int,
 ) -> int:
@@ -231,11 +249,12 @@ def _monitor_single_process(
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         try:
-            os.execvp(command[0], command)
+            _exec_command(command, exec_fd)
         except OSError:
             os._exit(126)
-    if fd3_source is not None:
-        _close_lifecycle_fds((fd3_source,))
+    _close_lifecycle_fds(
+        tuple(descriptor for descriptor in (fd3_source, exec_fd) if descriptor is not None)
+    )
     if start_fd >= 0:
         os.close(start_fd)
     _report_target(target_fd, child)
@@ -272,11 +291,13 @@ def main() -> int:
     monitor = sys.argv[4] == MONITOR_MODE
     lifecycle_fds: tuple[int, ...] = ()
     fd3_source: int | None = None
+    exec_fd: int | None = None
     if monitor:
         if (
-            len(sys.argv) < 7
+            len(sys.argv) < 8
             or not sys.argv[5].startswith(LIFECYCLE_FDS_PREFIX)
             or not sys.argv[6].startswith(_FD3_SOURCE_PREFIX)
+            or not sys.argv[7].startswith(_EXEC_FD_PREFIX)
         ):
             return 125
         raw_lifecycle_fds = sys.argv[5].removeprefix(LIFECYCLE_FDS_PREFIX)
@@ -295,7 +316,23 @@ def main() -> int:
                 or fd3_source in {handshake_fd, target_fd, start_fd}
             ):
                 return 125
-        command = sys.argv[7:]
+        raw_exec_fd = sys.argv[7].removeprefix(_EXEC_FD_PREFIX)
+        if raw_exec_fd:
+            if not raw_exec_fd.isdecimal() or os.execve not in os.supports_fd:
+                return 125
+            exec_fd = int(raw_exec_fd)
+            if (
+                exec_fd < 3
+                or exec_fd in lifecycle_fds
+                or exec_fd in {handshake_fd, target_fd, start_fd, fd3_source}
+                or (exec_fd == 3 and fd3_source is not None)
+            ):
+                return 125
+            try:
+                os.fstat(exec_fd)
+            except OSError:
+                return 125
+        command = sys.argv[8:]
     else:
         command = sys.argv[5:]
     if not command:
@@ -307,9 +344,11 @@ def main() -> int:
     if permission != b"G":
         return 125
     if monitor and sys.platform.startswith("linux"):
-        return _monitor_linux(command, lifecycle_fds, fd3_source, target_fd, start_fd)
+        return _monitor_linux(command, lifecycle_fds, fd3_source, exec_fd, target_fd, start_fd)
     if monitor and sys.platform == "darwin":
-        return _monitor_single_process(command, lifecycle_fds, fd3_source, target_fd, start_fd)
+        return _monitor_single_process(
+            command, lifecycle_fds, fd3_source, exec_fd, target_fd, start_fd
+        )
     if monitor:
         return 125
     try:

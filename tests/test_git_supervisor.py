@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -3725,7 +3726,131 @@ def test_monitor_protocol_header_always_has_fd3_field() -> None:
         worker_trampoline.MONITOR_MODE,
         f"{worker_trampoline.LIFECYCLE_FDS_PREFIX}14,15",
         f"{worker_trampoline._FD3_SOURCE_PREFIX}",
+        f"{worker_trampoline._EXEC_FD_PREFIX}",
     ]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux supports execve by fd")
+def test_process_executes_held_executable_inode_without_leaking_its_fd(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    copied_executable = repo / "held-python-executable"
+    shutil.copy2(sys.executable, copied_executable)
+    executable_fd = os.open(copied_executable, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    copied_executable.unlink()
+    try:
+        command = [
+            "/path/that/must-not-be-resolved",
+            "-I",
+            "-c",
+            (
+                "import os, sys; fd=int(sys.argv[1]); "
+                "\ntry: os.fstat(fd)\nexcept OSError: print('fd-exec:closed')"
+                "\nelse: print('fd-exec:leaked')"
+            ),
+            str(executable_fd),
+        ]
+        result = supervisor._run_process(
+            command,
+            "held executable descriptor test",
+            repo,
+            supervisor._child_env(),
+            exec_fd=executable_fd,
+        )
+        assert result["exit_code"] == 0
+        assert result["stdout"].strip() == "fd-exec:closed"
+    finally:
+        os.close(executable_fd)
+
+
+def test_process_rejects_conflicting_exec_descriptor(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    gate_read, gate_write = os.pipe()
+    try:
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "conflicting exec descriptor",
+                repo,
+                supervisor._child_env(),
+                fd3_source=gate_read,
+                exec_fd=gate_read,
+            )
+        assert captured.value.code == "invalid_exec_fd"
+        with pytest.raises(SupervisorError) as fd3_conflict:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "fd 3 destination conflict",
+                repo,
+                supervisor._child_env(),
+                fd3_source=gate_read,
+                exec_fd=3,
+            )
+        assert fd3_conflict.value.code == "invalid_exec_fd"
+    finally:
+        os.close(gate_read)
+        os.close(gate_write)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux execve FD collision")
+def test_process_rejects_exec_fd3_overwritten_by_lifecycle_mapping(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    original_fd3: int | None = None
+    original_fd3_inheritable = False
+    executable_fd: int | None = None
+    gate_read: int | None = None
+    gate_write: int | None = None
+    try:
+        try:
+            original_fd3 = os.dup(3)
+            original_fd3_inheritable = os.get_inheritable(3)
+        except OSError:
+            pass
+        executable_fd = os.open(sys.executable, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        gate_read, gate_write = os.pipe()
+        assert gate_read != 3
+        os.dup2(executable_fd, 3)
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "fd 3 executable/lifecycle collision",
+                repo,
+                supervisor._child_env(),
+                fd3_source=gate_read,
+                exec_fd=3,
+            )
+        assert captured.value.code == "invalid_exec_fd"
+    finally:
+        for descriptor in (gate_read, gate_write):
+            if descriptor is not None:
+                os.close(descriptor)
+        if executable_fd is not None and executable_fd != 3:
+            os.close(executable_fd)
+        if original_fd3 is None:
+            try:
+                os.close(3)
+            except OSError:
+                pass
+        else:
+            os.dup2(original_fd3, 3, inheritable=original_fd3_inheritable)
+            os.close(original_fd3)
+
+
+def test_process_rejects_non_file_exec_descriptor(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    executable_read, executable_write = os.pipe()
+    try:
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "non-file exec descriptor",
+                repo,
+                supervisor._child_env(),
+                exec_fd=executable_read,
+            )
+        assert captured.value.code == "invalid_exec_fd"
+    finally:
+        os.close(executable_read)
+        os.close(executable_write)
 
 
 def test_process_rejects_standard_stream_as_fd3_source(repo: Path) -> None:

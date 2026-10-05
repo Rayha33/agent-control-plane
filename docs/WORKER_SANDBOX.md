@@ -369,6 +369,17 @@ launch path calls it; no held descriptor spans an actual `runc run`, no runtime
 path/digest is persisted in the execution journal, and no OCI enforcement is
 established. These slices do not authorize launching candidate code.
 
+The contained process trampoline now has an opt-in Linux `exec_fd` input: the
+trusted monitor passes a caller-held regular-file descriptor to its blocked
+command child, executes that inode with `execve(fd, ...)`, and closes both the
+monitor's copy and the descriptor across the final exec. A regression unlinks
+the opened interpreter before launch, successfully executes it despite the
+missing pathname and nonexistent `argv[0]`, and confirms the descriptor is not
+visible to the target.
+This closes the generic path-substitution gap for a future held-runc launch,
+but no current `run_worker` route opens the configured runc pin and supplies
+`exec_fd`; OCI worker execution remains unavailable and fail-closed.
+
 ### Durable execution-journal slice (2026-10-04)
 
 Schema 14 introduced a private, per-attempt `sandbox_executions` journal. Reservation
