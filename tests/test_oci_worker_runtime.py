@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from shlex import quote as shell_quote
@@ -210,6 +211,31 @@ def _snapshot_start_time(snapshot: Any, expected_pid: int, *, require_live: bool
     return observations[0][2]
 
 
+def _snapshot_tty_number(snapshot: Any, expected_pid: int) -> int:
+    """Return one stable Linux proc-stat tty_nr value for the exact PID."""
+
+    observations: list[tuple[int, int]] = []
+    for stat_bytes in (snapshot.stat_before, snapshot.stat_after):
+        open_paren = stat_bytes.find(b"(")
+        close_paren = stat_bytes.rfind(b")")
+        if open_paren <= 0 or close_paren <= open_paren:
+            raise AssertionError("malformed /proc stat observation")
+        try:
+            pid = int(stat_bytes[:open_paren].strip())
+            fields_from_state = stat_bytes[close_paren + 2 :].split()
+            if len(fields_from_state) <= 4:
+                raise ValueError("missing tty_nr")
+            tty_number = int(fields_from_state[4])
+        except ValueError as error:
+            raise AssertionError("malformed PID or tty_nr in /proc stat observation") from error
+        if pid != expected_pid:
+            raise AssertionError("/proc stat PID changed during the tty observation")
+        observations.append((pid, tty_number))
+    if observations[0] != observations[1]:
+        raise AssertionError("worker init controlling-terminal identity changed during audit")
+    return observations[0][1]
+
+
 def _snapshot_cgroup_path(snapshot: Any) -> Path:
     """Resolve the cgroup bytes captured between the two PID stat reads."""
 
@@ -291,6 +317,7 @@ _MAX_WORKER_MOUNTINFO_BYTES = 16 * 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class _WorkerMountInfo:
+    device_id: tuple[int, int]
     root: str
     filesystem: str
     source: str
@@ -334,6 +361,38 @@ def _parse_worker_security_status(raw: bytes) -> dict[str, int | bool]:
     if parsed["NoNewPrivs"] is not True:
         raise AssertionError("worker init does not have NoNewPrivs enabled")
     return parsed
+
+
+def _parse_worker_pid_namespace_status(raw: bytes, *, label: str) -> tuple[int, tuple[int, ...]]:
+    """Parse Pid/NSpid from one bounded proc status record without ambiguity."""
+
+    if len(raw) > _MAX_WORKER_STATUS_BYTES or not raw.endswith(b"\n"):
+        raise AssertionError(f"{label} is malformed or exceeds its read limit")
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise AssertionError(f"{label} is not ASCII") from error
+    fields: dict[str, str] = {}
+    for line in lines:
+        name, separator, value = line.partition(":")
+        if not separator:
+            raise AssertionError(f"{label} contains a malformed line")
+        if name in {"Pid", "NSpid"}:
+            if name in fields:
+                raise AssertionError(f"{label} contains duplicate {name}")
+            fields[name] = value.strip()
+    if set(fields) != {"Pid", "NSpid"}:
+        raise AssertionError(f"{label} omits Pid or NSpid")
+    pid_value = fields["Pid"]
+    namespace_values = fields["NSpid"].split()
+    values = [pid_value, *namespace_values]
+    if any(not value.isascii() or not value.isdigit() or int(value) < 1 for value in values):
+        raise AssertionError(f"{label} has an invalid Pid or NSpid")
+    pid = int(pid_value)
+    nspid = tuple(int(value) for value in namespace_values)
+    if not nspid or nspid[0] != pid:
+        raise AssertionError(f"{label} Pid does not match its procfs-relative NSpid")
+    return pid, nspid
 
 
 def _parse_worker_mountinfo(raw: bytes) -> dict[str, _WorkerMountInfo]:
@@ -380,6 +439,7 @@ def _parse_worker_mountinfo(raw: bytes) -> dict[str, _WorkerMountInfo]:
         major, device_separator, minor = before[2].partition(b":")
         if not device_separator or not major.isdigit() or not minor.isdigit():
             raise AssertionError("worker mountinfo contains an invalid device identity")
+        device_id = (int(major), int(minor))
         try:
             root = decode_canonical_absolute_path(before[3], "root")
             mountpoint = decode_canonical_absolute_path(before[4], "mountpoint")
@@ -398,6 +458,7 @@ def _parse_worker_mountinfo(raw: bytes) -> dict[str, _WorkerMountInfo]:
                 "worker mountinfo contains a non-canonical or duplicate mountpoint"
             )
         result[normalized] = _WorkerMountInfo(
+            device_id=device_id,
             root=root,
             filesystem=filesystem,
             source=source,
@@ -412,6 +473,8 @@ def _parse_worker_mountinfo(raw: bytes) -> dict[str, _WorkerMountInfo]:
 
 def _validate_worker_mount_policy(
     mounts: dict[str, _WorkerMountInfo],
+    *,
+    expected_runc_version: str | None = None,
 ) -> list[dict[str, Any]]:
     expected_mounts = {
         "/": (None, "ro"),
@@ -420,10 +483,34 @@ def _validate_worker_mount_policy(
         "/tmp": ("tmpfs", "rw"),
         "/home/agent": ("tmpfs", "rw"),
     }
-    unexpected_mountpoints = sorted(set(mounts) - expected_mounts.keys())
+    expected_runc_135_mounts = {
+        "/dev/full": ("/full", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/dev/null": ("/null", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/dev/random": ("/random", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/dev/tty": ("/tty", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/dev/urandom": ("/urandom", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/dev/zero": ("/zero", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/proc/kcore": ("/null", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/proc/keys": ("/null", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+        "/proc/sys": ("/sys", "proc", "proc", {"ro", "nodev", "noexec", "nosuid", "relatime"}),
+        "/proc/sysrq-trigger": (
+            "/sysrq-trigger",
+            "proc",
+            "proc",
+            {"ro", "nodev", "noexec", "nosuid", "relatime"},
+        ),
+    }
+    actual_mountpoints = set(mounts)
+    base_mountpoints = set(expected_mounts)
+    extra_mountpoints = actual_mountpoints - base_mountpoints
+    if extra_mountpoints and expected_runc_version != "1.3.5":
+        unexpected_mountpoints = sorted(extra_mountpoints)
+    else:
+        unexpected_mountpoints = sorted(extra_mountpoints - expected_runc_135_mounts.keys())
     if unexpected_mountpoints:
         unexpected = {
             target: {
+                "device_id": mounts[target].device_id,
                 "root": mounts[target].root,
                 "filesystem": mounts[target].filesystem,
                 "source": mounts[target].source,
@@ -434,6 +521,72 @@ def _validate_worker_mount_policy(
             for target in unexpected_mountpoints
         }
         raise AssertionError(f"worker mountinfo contains unexpected mountpoints: {unexpected}")
+    if expected_runc_version == "1.3.5":
+        propagating_mounts = {
+            target: list(mount.optional_fields)
+            for target, mount in mounts.items()
+            if mount.optional_fields
+        }
+        if propagating_mounts:
+            raise AssertionError(
+                f"worker runc 1.3.5 mounts retain propagation fields: {propagating_mounts}"
+            )
+        missing_defaults = sorted(set(expected_runc_135_mounts) - extra_mountpoints)
+        if missing_defaults:
+            raise AssertionError(
+                f"runc 1.3.5 mountinfo omits exact default mounts: {missing_defaults}"
+            )
+        device_mount_ids: set[tuple[int, int]] = set()
+        for target, (root, filesystem, source, options) in expected_runc_135_mounts.items():
+            observed = mounts[target]
+            if (observed.root, observed.filesystem, observed.source) != (
+                root,
+                filesystem,
+                source,
+            ):
+                raise AssertionError(
+                    f"worker default mount {target} has unexpected root/filesystem/source: "
+                    f"{observed.root!r}/{observed.filesystem!r}/{observed.source!r}"
+                )
+            if observed.mount_options != frozenset(options):
+                raise AssertionError(
+                    f"worker default mount {target} has unexpected mount options "
+                    f"{sorted(observed.mount_options)}"
+                )
+            if observed.optional_fields:
+                raise AssertionError(
+                    f"worker default mount {target} has propagation fields "
+                    f"{list(observed.optional_fields)}"
+                )
+            if filesystem == "devtmpfs":
+                if "rw" not in observed.super_options or "ro" in observed.super_options:
+                    raise AssertionError(
+                        f"worker device mount {target} has unexpected super options "
+                        f"{sorted(observed.super_options)}"
+                    )
+                device_mount_ids.add(observed.device_id)
+            elif observed.super_options != frozenset({"ro"}):
+                raise AssertionError(
+                    f"worker proc mask {target} is not read-only at the superblock: "
+                    f"{sorted(observed.super_options)}"
+                )
+        if len(device_mount_ids) != 1:
+            raise AssertionError(
+                f"worker runc device mounts do not share one devtmpfs identity: "
+                f"{sorted(device_mount_ids)}"
+            )
+        proc_mount = mounts["/proc"]
+        if any(
+            mounts[target].device_id != proc_mount.device_id
+            for target in ("/proc/sys", "/proc/sysrq-trigger")
+        ):
+            raise AssertionError(
+                "worker read-only proc masks do not share the /proc device identity"
+            )
+    elif extra_mountpoints:
+        raise AssertionError(
+            "worker runtime version is required to inspect default mount identities"
+        )
     observed_mounts: list[dict[str, Any]] = []
     for target, (expected_filesystem, access) in expected_mounts.items():
         observed = mounts.get(target)
@@ -449,9 +602,12 @@ def _validate_worker_mount_policy(
             )
         if target != "/" and not {"nosuid", "nodev"}.issubset(options):
             raise AssertionError(f"worker mount {target} is missing nosuid/nodev protection")
+        if target == "/proc" and (observed.root != "/" or observed.source != "proc"):
+            raise AssertionError("worker /proc mount is not a fresh procfs rooted at /")
         observed_mounts.append(
             {
                 "target": target,
+                "device_id": list(observed.device_id),
                 "filesystem": filesystem,
                 "source": observed.source,
                 "root": observed.root,
@@ -460,7 +616,168 @@ def _validate_worker_mount_policy(
                 "super_options": sorted(observed.super_options),
             }
         )
+    if expected_runc_version == "1.3.5":
+        for target in expected_runc_135_mounts:
+            observed = mounts[target]
+            observed_mounts.append(
+                {
+                    "target": target,
+                    "device_id": list(observed.device_id),
+                    "filesystem": observed.filesystem,
+                    "source": observed.source,
+                    "root": observed.root,
+                    "options": sorted(observed.mount_options),
+                    "optional_fields": list(observed.optional_fields),
+                    "super_options": sorted(observed.super_options),
+                }
+            )
     return observed_mounts
+
+
+_WORKER_RUNC_135_DEVICE_NODES = {
+    "/dev/full": ("/dev/full", (1, 7)),
+    "/dev/null": ("/dev/null", (1, 3)),
+    "/dev/random": ("/dev/random", (1, 8)),
+    "/dev/tty": ("/dev/tty", (5, 0)),
+    "/dev/urandom": ("/dev/urandom", (1, 9)),
+    "/dev/zero": ("/dev/zero", (1, 5)),
+    "/proc/kcore": ("/dev/null", (1, 3)),
+    "/proc/keys": ("/dev/null", (1, 3)),
+}
+
+
+def _worker_char_device_identity(
+    info: os.stat_result,
+    *,
+    expected_device_number: tuple[int, int],
+    label: str,
+) -> tuple[int, int, int, int, int, int]:
+    if not stat.S_ISCHR(info.st_mode):
+        raise AssertionError(f"worker device path {label} is not a character device")
+    device_number = (os.major(info.st_rdev), os.minor(info.st_rdev))
+    if device_number != expected_device_number:
+        raise AssertionError(
+            f"worker device path {label} has device number {device_number}, "
+            f"expected {expected_device_number}"
+        )
+    # Device-node group ownership is host-policy-dependent (for example,
+    # /dev/tty is commonly root:tty). Require a root owner and expected access
+    # mode; the host/guest identity comparison below binds the exact GID.
+    if stat.S_IMODE(info.st_mode) != 0o666 or info.st_uid != 0:
+        raise AssertionError(
+            f"worker device path {label} has unexpected owner/mode "
+            f"{info.st_uid}:{info.st_gid} {stat.S_IMODE(info.st_mode):04o}"
+        )
+    return (info.st_dev, info.st_ino, info.st_rdev, info.st_mode, info.st_uid, info.st_gid)
+
+
+def _audit_worker_init_device_mount_identities(
+    pid: int,
+    mounts: dict[str, _WorkerMountInfo],
+    *,
+    stat_path: Callable[..., os.stat_result] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Prove default device binds retain the exact approved host character nodes."""
+
+    if stat_path is None:
+        stat_path = os.stat
+    observed: dict[str, dict[str, Any]] = {}
+    process_root = Path(f"/proc/{pid}/root")
+    for target, (host_path, expected_device_number) in _WORKER_RUNC_135_DEVICE_NODES.items():
+        try:
+            host_info = stat_path(Path(host_path), follow_symlinks=False)
+            guest_info = stat_path(process_root / target.lstrip("/"), follow_symlinks=False)
+        except OSError as error:
+            raise AssertionError(
+                f"could not stat exact worker device identity for {target}"
+            ) from error
+        host_identity = _worker_char_device_identity(
+            host_info,
+            expected_device_number=expected_device_number,
+            label=host_path,
+        )
+        guest_identity = _worker_char_device_identity(
+            guest_info,
+            expected_device_number=expected_device_number,
+            label=f"/proc/{pid}/root{target}",
+        )
+        expected_mount_id = (os.major(host_info.st_dev), os.minor(host_info.st_dev))
+        if expected_mount_id != mounts[target].device_id:
+            raise AssertionError(
+                f"worker device mount {target} filesystem identity "
+                f"{mounts[target].device_id} does not match its host node {expected_mount_id}"
+            )
+        if host_identity != guest_identity:
+            raise AssertionError(
+                f"worker device mount {target} does not preserve exact host inode/owner/mode identity"
+            )
+        observed[target] = {
+            "host_path": host_path,
+            "device_number": list(expected_device_number),
+            "st_dev": host_info.st_dev,
+            "st_ino": host_info.st_ino,
+            "st_mode": stat.S_IMODE(host_info.st_mode),
+            "st_uid": host_info.st_uid,
+            "st_gid": host_info.st_gid,
+        }
+    return observed
+
+
+def _audit_worker_init_pid_namespace(
+    pid: int,
+    process_root: Path,
+    host_status: bytes,
+    *,
+    read_bounded: Callable[[Path, int, str], bytes],
+    stat_path: Callable[..., os.stat_result] | None = None,
+) -> dict[str, Any]:
+    """Prove the mounted /proc is bound to the exact worker-init PID namespace."""
+
+    if stat_path is None:
+        stat_path = os.stat
+    host_pid, host_nspid = _parse_worker_pid_namespace_status(
+        host_status,
+        label="host worker-init status",
+    )
+    if host_pid != pid or len(host_nspid) < 2 or host_nspid[-1] != 1:
+        raise AssertionError(
+            "host worker-init status does not place the exact PID at PID 1 of a child namespace"
+        )
+
+    guest_proc_one = process_root / "root" / "proc" / "1"
+    guest_status = _parse_worker_pid_namespace_status(
+        read_bounded(
+            guest_proc_one / "status",
+            _MAX_WORKER_STATUS_BYTES,
+            "worker /proc/1 status",
+        ),
+        label="worker /proc/1 status",
+    )
+    if guest_status != (1, (1,)):
+        raise AssertionError(
+            "worker /proc/1 has an unexpected procfs-relative PID view: "
+            f"observed={guest_status!r}, expected={(1, (1,))!r}"
+        )
+
+    host_pid_namespace = stat_path(Path(f"/proc/{pid}/ns/pid"), follow_symlinks=True)
+    proc_one_pid_namespace = stat_path(
+        guest_proc_one / "ns" / "pid",
+        follow_symlinks=True,
+    )
+    host_identity = (host_pid_namespace.st_dev, host_pid_namespace.st_ino)
+    proc_identity = (proc_one_pid_namespace.st_dev, proc_one_pid_namespace.st_ino)
+    if proc_identity != host_identity:
+        raise AssertionError(
+            "worker /proc/1 PID namespace identity differs from the exact host init: "
+            f"observed={proc_identity!r}, expected={host_identity!r}"
+        )
+    return {
+        "host_pid": host_pid,
+        "host_nspid": list(host_nspid),
+        "proc_one_nspid": list(guest_status[1]),
+        "pid_namespace_device": host_pid_namespace.st_dev,
+        "pid_namespace_inode": host_pid_namespace.st_ino,
+    }
 
 
 def _audit_worker_init_runtime_policy(
@@ -468,6 +785,7 @@ def _audit_worker_init_runtime_policy(
     *,
     expected_start_time: bytes,
     expected_cgroup_path: Path,
+    expected_runc_version: str,
 ) -> dict[str, Any]:
     """Read effective privilege and mount policy from the host before gate release."""
 
@@ -479,6 +797,8 @@ def _audit_worker_init_runtime_policy(
             raise AssertionError("worker init PID/start-time changed during runtime policy audit")
         if _snapshot_cgroup_path(snapshot).resolve(strict=True) != expected_cgroup:
             raise AssertionError("worker init cgroup changed during runtime policy audit")
+        if expected_runc_version == "1.3.5" and _snapshot_tty_number(snapshot, pid) != 0:
+            raise AssertionError("worker init has a controlling terminal while /dev/tty is mounted")
 
     def read_bounded(path: Path, limit: int, label: str) -> bytes:
         with path.open("rb") as stream:
@@ -489,16 +809,32 @@ def _audit_worker_init_runtime_policy(
 
     process_root = Path(f"/proc/{pid}")
     verify_identity()
-    status = _parse_worker_security_status(
-        read_bounded(process_root / "status", _MAX_WORKER_STATUS_BYTES, "status")
+    raw_status = read_bounded(process_root / "status", _MAX_WORKER_STATUS_BYTES, "status")
+    status = _parse_worker_security_status(raw_status)
+    pid_namespace = _audit_worker_init_pid_namespace(
+        pid,
+        process_root,
+        raw_status,
+        read_bounded=read_bounded,
     )
     mounts = _parse_worker_mountinfo(
         read_bounded(process_root / "mountinfo", _MAX_WORKER_MOUNTINFO_BYTES, "mountinfo")
     )
+    observed_mounts = _validate_worker_mount_policy(
+        mounts,
+        expected_runc_version=expected_runc_version,
+    )
+    device_identities = (
+        _audit_worker_init_device_mount_identities(pid, mounts)
+        if expected_runc_version == "1.3.5"
+        else {}
+    )
     verify_identity()
     return {
         "status": status,
-        "mounts": _validate_worker_mount_policy(mounts),
+        "pid_namespace": pid_namespace,
+        "mounts": observed_mounts,
+        "device_identities": device_identities,
         "mountpoints": sorted(mounts),
     }
 
@@ -732,8 +1068,22 @@ def _cleanup_identity_gaps(
     return tuple(gaps)
 
 
-def _synthetic_proc_stat(pid: int, state: bytes, start_time: int) -> bytes:
-    fields = [state, *([b"0"] * 18), str(start_time).encode("ascii")]
+def _synthetic_proc_stat(
+    pid: int,
+    state: bytes,
+    start_time: int,
+    *,
+    tty_number: int = 0,
+) -> bytes:
+    fields = [
+        state,
+        b"0",
+        b"0",
+        b"0",
+        str(tty_number).encode("ascii"),
+        *([b"0"] * 14),
+        str(start_time).encode("ascii"),
+    ]
     return str(pid).encode("ascii") + b" (acp test worker) " + b" ".join(fields)
 
 
@@ -746,6 +1096,7 @@ def test_snapshot_start_identity_checks_both_sides_of_cgroup_read() -> None:
     )
 
     assert _snapshot_start_time(snapshot, pid, require_live=True) == b"9876"
+    assert _snapshot_tty_number(snapshot, pid) == 0
 
     recycled = ProcessSnapshot(
         stat_before=snapshot.stat_before,
@@ -754,6 +1105,14 @@ def test_snapshot_start_identity_checks_both_sides_of_cgroup_read() -> None:
     )
     with pytest.raises(AssertionError, match="start-time changed"):
         _snapshot_start_time(recycled, pid, require_live=True)
+
+    tty_attached = ProcessSnapshot(
+        stat_before=_synthetic_proc_stat(pid, b"S", 9876),
+        cgroup=snapshot.cgroup,
+        stat_after=_synthetic_proc_stat(pid, b"R", 9876, tty_number=123),
+    )
+    with pytest.raises(AssertionError, match="controlling-terminal identity changed"):
+        _snapshot_tty_number(tty_attached, pid)
 
     exited = ProcessSnapshot(
         stat_before=_synthetic_proc_stat(pid, b"Z", 9876),
@@ -800,6 +1159,7 @@ def test_worker_mountinfo_parser_decodes_mountpoint_and_rejects_duplicates() -> 
         b"ext4 /dev/worker\\040volume rw,relatime\n"
     )
     observed = _parse_worker_mountinfo(raw)
+    assert observed["/"].device_id == (0, 1)
     assert observed["/"].filesystem == "rootfs"
     assert observed["/"].mount_options == frozenset({"ro", "nosuid", "nodev"})
     assert observed["/workspace"].filesystem == "ext4"
@@ -830,14 +1190,24 @@ def test_worker_mountinfo_parser_decodes_mountpoint_and_rejects_duplicates() -> 
 
 
 def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
-    def mount(filesystem: str, options: set[str]) -> _WorkerMountInfo:
+    def mount(
+        filesystem: str,
+        options: set[str],
+        *,
+        root: str = "/",
+        source: str | None = None,
+        device_id: tuple[int, int] = (0, 1),
+        super_options: set[str] | None = None,
+        optional_fields: tuple[str, ...] = (),
+    ) -> _WorkerMountInfo:
         return _WorkerMountInfo(
-            root="/",
+            device_id=device_id,
+            root=root,
             filesystem=filesystem,
-            source=filesystem,
+            source=filesystem if source is None else source,
             mount_options=frozenset(options),
-            optional_fields=(),
-            super_options=frozenset(options),
+            optional_fields=optional_fields,
+            super_options=frozenset(options if super_options is None else super_options),
         )
 
     mounts = {
@@ -860,6 +1230,271 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
         _validate_worker_mount_policy({**mounts, "/etc/credentials": mount("bind", {"ro"})})
     with pytest.raises(AssertionError, match="unexpected mountpoints"):
         _validate_worker_mount_policy({**mounts, "/var/agent-data": mount("tmpfs", {"rw"})})
+
+    runc_135_mounts = dict(mounts)
+    dev_id = (0, 55)
+    proc_id = (0, 56)
+    for target, root in (
+        ("/dev/full", "/full"),
+        ("/dev/null", "/null"),
+        ("/dev/random", "/random"),
+        ("/dev/tty", "/tty"),
+        ("/dev/urandom", "/urandom"),
+        ("/dev/zero", "/zero"),
+        ("/proc/kcore", "/null"),
+        ("/proc/keys", "/null"),
+    ):
+        runc_135_mounts[target] = mount(
+            "devtmpfs",
+            {"rw", "nosuid", "relatime"},
+            root=root,
+            source="udev",
+            device_id=dev_id,
+            super_options={"rw", "size=1024"},
+        )
+    for target, root in (
+        ("/proc/sys", "/sys"),
+        ("/proc/sysrq-trigger", "/sysrq-trigger"),
+    ):
+        runc_135_mounts[target] = mount(
+            "proc",
+            {"ro", "nodev", "noexec", "nosuid", "relatime"},
+            root=root,
+            source="proc",
+            device_id=proc_id,
+            super_options={"ro"},
+        )
+    runc_135_mounts["/proc"] = mount(
+        "proc",
+        {"ro", "nosuid", "nodev", "noexec"},
+        device_id=proc_id,
+    )
+    accepted_defaults = _validate_worker_mount_policy(
+        runc_135_mounts,
+        expected_runc_version="1.3.5",
+    )
+    assert {mount["target"] for mount in accepted_defaults} == set(runc_135_mounts)
+    with pytest.raises(AssertionError, match="unexpected mountpoints"):
+        _validate_worker_mount_policy(runc_135_mounts)
+    with pytest.raises(AssertionError, match="unexpected mountpoints"):
+        _validate_worker_mount_policy(runc_135_mounts, expected_runc_version="1.4.0")
+    with pytest.raises(AssertionError, match="root/filesystem/source"):
+        _validate_worker_mount_policy(
+            {
+                **runc_135_mounts,
+                "/dev/null": mount(
+                    "devtmpfs",
+                    {"rw"},
+                    root="/zero",
+                    source="udev",
+                    device_id=dev_id,
+                    super_options={"rw"},
+                ),
+            },
+            expected_runc_version="1.3.5",
+        )
+    with pytest.raises(AssertionError, match="propagation fields"):
+        _validate_worker_mount_policy(
+            {
+                **runc_135_mounts,
+                "/dev/null": mount(
+                    "devtmpfs",
+                    {"rw", "nosuid", "relatime"},
+                    root="/null",
+                    source="udev",
+                    device_id=dev_id,
+                    super_options={"rw"},
+                    optional_fields=("master:10",),
+                ),
+            },
+            expected_runc_version="1.3.5",
+        )
+    with pytest.raises(AssertionError, match="fresh procfs rooted at /"):
+        _validate_worker_mount_policy(
+            {
+                **mounts,
+                "/proc": mount("proc", {"ro", "nosuid", "nodev", "noexec"}, root="/host"),
+            }
+        )
+
+
+def test_worker_default_device_mounts_require_exact_host_inode_identity() -> None:
+    from types import SimpleNamespace
+
+    pid = 1234
+    devtmpfs_id = os.makedev(0, 57)
+    stats: dict[Path, Any] = {}
+    mounts: dict[str, _WorkerMountInfo] = {}
+    host_stats: dict[str, Any] = {}
+    for index, (target, (host_path, device_number)) in enumerate(
+        _WORKER_RUNC_135_DEVICE_NODES.items(), start=1
+    ):
+        host_stat = host_stats.get(host_path)
+        if host_stat is None:
+            host_stat = SimpleNamespace(
+                st_mode=stat.S_IFCHR | 0o666,
+                st_rdev=os.makedev(*device_number),
+                st_dev=devtmpfs_id,
+                st_ino=100 + index,
+                st_uid=0,
+                st_gid=5 if host_path == "/dev/tty" else 0,
+            )
+            host_stats[host_path] = host_stat
+            stats[Path(host_path)] = host_stat
+        guest_path = Path(f"/proc/{pid}/root") / target.lstrip("/")
+        stats[guest_path] = host_stat
+        mounts[target] = _WorkerMountInfo(
+            device_id=(0, 57),
+            root="/null" if target.startswith("/proc/") else target.removeprefix("/dev"),
+            filesystem="devtmpfs",
+            source="udev",
+            mount_options=frozenset({"rw", "nosuid", "relatime"}),
+            optional_fields=(),
+            super_options=frozenset({"rw"}),
+        )
+
+    def stat_path(path: Path, *, follow_symlinks: bool) -> os.stat_result:
+        assert follow_symlinks is False
+        return stats[path]
+
+    observed = _audit_worker_init_device_mount_identities(pid, mounts, stat_path=stat_path)
+    assert set(observed) == set(_WORKER_RUNC_135_DEVICE_NODES)
+
+    null_guest = Path(f"/proc/{pid}/root/dev/null")
+    stats[null_guest] = SimpleNamespace(
+        **{
+            **vars(stats[null_guest]),
+            "st_ino": stats[null_guest].st_ino + 1,
+        }
+    )
+    with pytest.raises(AssertionError, match="exact host inode/owner/mode identity"):
+        _audit_worker_init_device_mount_identities(pid, mounts, stat_path=stat_path)
+
+    stats[null_guest] = host_stats["/dev/null"]
+    tty_guest = Path(f"/proc/{pid}/root/dev/tty")
+    stats[tty_guest] = SimpleNamespace(
+        **{
+            **vars(stats[tty_guest]),
+            "st_gid": stats[tty_guest].st_gid + 1,
+        }
+    )
+    with pytest.raises(AssertionError, match="exact host inode/owner/mode identity"):
+        _audit_worker_init_device_mount_identities(pid, mounts, stat_path=stat_path)
+
+    stats[tty_guest] = host_stats["/dev/tty"]
+    null_mount = mounts["/dev/null"]
+    mounts["/dev/null"] = _WorkerMountInfo(
+        device_id=(0, 58),
+        root=null_mount.root,
+        filesystem=null_mount.filesystem,
+        source=null_mount.source,
+        mount_options=null_mount.mount_options,
+        optional_fields=null_mount.optional_fields,
+        super_options=null_mount.super_options,
+    )
+    with pytest.raises(AssertionError, match="filesystem identity"):
+        _audit_worker_init_device_mount_identities(pid, mounts, stat_path=stat_path)
+
+
+def test_worker_char_device_identity_rejects_unapproved_node_metadata() -> None:
+    from types import SimpleNamespace
+
+    tty = SimpleNamespace(
+        st_mode=stat.S_IFCHR | 0o666,
+        st_rdev=os.makedev(5, 0),
+        st_dev=os.makedev(0, 57),
+        st_ino=12,
+        st_uid=0,
+        st_gid=5,
+    )
+    assert _worker_char_device_identity(
+        tty,
+        expected_device_number=(5, 0),
+        label="/dev/tty",
+    ) == (tty.st_dev, tty.st_ino, tty.st_rdev, tty.st_mode, 0, 5)
+
+    with pytest.raises(AssertionError, match="not a character device"):
+        _worker_char_device_identity(
+            SimpleNamespace(**{**vars(tty), "st_mode": stat.S_IFREG | 0o666}),
+            expected_device_number=(5, 0),
+            label="/dev/tty",
+        )
+    with pytest.raises(AssertionError, match="device number"):
+        _worker_char_device_identity(
+            SimpleNamespace(**{**vars(tty), "st_rdev": os.makedev(5, 1)}),
+            expected_device_number=(5, 0),
+            label="/dev/tty",
+        )
+    with pytest.raises(AssertionError, match="owner/mode"):
+        _worker_char_device_identity(
+            SimpleNamespace(**{**vars(tty), "st_uid": 1000}),
+            expected_device_number=(5, 0),
+            label="/dev/tty",
+        )
+    with pytest.raises(AssertionError, match="owner/mode"):
+        _worker_char_device_identity(
+            SimpleNamespace(**{**vars(tty), "st_mode": stat.S_IFCHR | 0o640}),
+            expected_device_number=(5, 0),
+            label="/dev/tty",
+        )
+
+
+def test_worker_proc_mount_must_match_exact_init_pid_namespace() -> None:
+    from types import SimpleNamespace
+
+    pid = 1234
+    process_root = Path(f"/proc/{pid}")
+    host_status = b"Name:\tacp-worker\nPid:\t1234\nNSpid:\t1234 1\n"
+    guest_status = b"Name:\tacp-worker\nPid:\t1\nNSpid:\t1\n"
+    guest_proc_one = process_root / "root" / "proc" / "1"
+    namespace_path = Path(f"/proc/{pid}/ns/pid")
+    guest_namespace_path = guest_proc_one / "ns" / "pid"
+    namespace_stat = SimpleNamespace(st_dev=9, st_ino=77)
+    namespace_stats = {
+        namespace_path: namespace_stat,
+        guest_namespace_path: namespace_stat,
+    }
+
+    def read_bounded(path: Path, limit: int, _label: str) -> bytes:
+        assert limit == _MAX_WORKER_STATUS_BYTES
+        assert path == guest_proc_one / "status"
+        return guest_status
+
+    def stat_path(path: Path, *, follow_symlinks: bool) -> os.stat_result:
+        assert follow_symlinks is True
+        return namespace_stats[path]
+
+    observed = _audit_worker_init_pid_namespace(
+        pid,
+        process_root,
+        host_status,
+        read_bounded=read_bounded,
+        stat_path=stat_path,
+    )
+    assert observed["host_pid"] == pid
+    assert observed["host_nspid"] == [pid, 1]
+    assert observed["proc_one_nspid"] == [1]
+
+    host_proc_status = b"Name:\tinit\nPid:\t1\nNSpid:\t1\n"
+    namespace_stats[guest_namespace_path] = SimpleNamespace(st_dev=9, st_ino=78)
+    with pytest.raises(AssertionError, match="PID namespace identity differs"):
+        _audit_worker_init_pid_namespace(
+            pid,
+            process_root,
+            host_status,
+            read_bounded=lambda _path, _limit, _label: host_proc_status,
+            stat_path=stat_path,
+        )
+
+    nested_proc_status = b"Name:\tworker-child\nPid:\t2\nNSpid:\t2\n"
+    with pytest.raises(AssertionError, match="unexpected procfs-relative PID view"):
+        _audit_worker_init_pid_namespace(
+            pid,
+            process_root,
+            host_status,
+            read_bounded=lambda _path, _limit, _label: nested_proc_status,
+            stat_path=stat_path,
+        )
 
 
 def test_worker_init_fd_audit_brackets_stable_non_socket_stdio(
@@ -1153,6 +1788,11 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     expected_version = os.environ.get("ACP_OCI_TEST_RUNC_VERSION")
     if not expected_version:
         pytest.fail("set ACP_OCI_TEST_RUNC_VERSION to the exact approved runc release")
+    rootfs_propagation = os.environ.get("ACP_OCI_TEST_ROOTFS_PROPAGATION", "private")
+    if rootfs_propagation not in {"private", "rprivate"}:
+        pytest.fail("OCI integration rootfs propagation must be private or rprivate")
+    if rootfs_propagation == "rprivate" and expected_version != "1.3.5":
+        pytest.fail("the rprivate diagnostic override is pinned to runc 1.3.5")
 
     repo_root = Path(__file__).resolve().parents[1]
     if not repo_root.is_relative_to(Path("/tmp")):
@@ -1389,6 +2029,10 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             tmpfs_bytes=8 * 1024 * 1024,
             home_bytes=2 * 1024 * 1024,
         )
+        # runc 1.3.5 accepts this implementation-specific recursive spelling;
+        # keep the portable OCI compiler default unchanged and opt in only for
+        # this exact-version, gated diagnostic run.
+        config["linux"]["rootfsPropagation"] = rootfs_propagation
         if config["root"].get("readonly") is not True:
             pytest.fail("OCI rootfs policy is not read-only")
         file_size_limits = [
@@ -1493,11 +2137,18 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
 
         # Read kernel-applied privilege and mount state through the host's
         # procfs while the trusted fd3 launcher still blocks candidate code.
-        runtime_policy = _audit_worker_init_runtime_policy(
-            init_pid,
-            expected_start_time=init_start,
-            expected_cgroup_path=cgroup_path,
-        )
+        try:
+            runtime_policy = _audit_worker_init_runtime_policy(
+                init_pid,
+                expected_start_time=init_start,
+                expected_cgroup_path=cgroup_path,
+                expected_runc_version=observed_version,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"runc rootfsPropagation={rootfs_propagation!r} failed before fd3 gate release: "
+                f"{error}"
+            ) from error
 
         # The launch gate is the proof boundary: the init and policy readbacks
         # are live, but the first candidate instruction has not written output.
@@ -1580,6 +2231,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     "worker_executor_integrated": False,
                     "kernel": Path("/proc/sys/kernel/osrelease").read_text().strip(),
                     "runc_version": observed_version,
+                    "rootfs_propagation": rootfs_propagation,
                     "busybox": busybox_version,
                     "required_busybox_applets": sorted(
                         applets & {"cat", "grep", "ln", "nc", "readlink", "sed", "touch", "tr"}

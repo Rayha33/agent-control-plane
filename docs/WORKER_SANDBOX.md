@@ -741,20 +741,21 @@ postflight found the exact systemd unit `LoadState=not-found`, the cgroup path
 absent, no checkout canary, and two user processes in D state (below the
 stop threshold of five).
 
-An independent read-only reviewer gave GO on the exact current readback
-code/docs diff after the live run; that reviewer did not run tests or access
-the NAS. The measurements above come from the separately recorded exact-hash
-execution. The current validator now requires exactly the five configured
-mountpoints; it does not assert their propagation tags, bind-source identity,
-tmpfs super-options or sizes, and rejects `/proc/sys` submounts as extra mounts
-rather than validating their read-only state. The test remains direct `runc`
+An independent read-only reviewer gave GO on the exact readback code/docs diff
+at this test-source SHA after the live run; that reviewer did not run tests or
+access the NAS. The measurements above come from the separately recorded
+exact-hash execution. At this source SHA, the validator required exactly the
+five configured mountpoints; it did not assert their propagation tags,
+bind-source identity, tmpfs super-options or sizes, and rejected `/proc/sys`
+submounts as extra mounts rather than validating their read-only state. The
+test remains direct `runc`
 with a fixed no-model fixture—not the registered
 supervised worker executor. It does not prove real-provider authentication or
 egress, arbitrary hostile-worker behavior, result transfer, cancellation,
 crash recovery, concurrency, or task #2370 acceptance. Worker execution stays
 unintegrated and `externalSandbox` remains disabled.
 
-### Strict runtime-added mount diagnostic (2026-10-05; fail-closed)
+### Strict runtime-added mount diagnostic (2026-10-05; source SHA `97c0bb16`; fail-closed)
 
 The exact test source SHA-256
 `97c0bb16870253258c0a62fcc052eeb8de15a07f65f0708723841f1bea626e3b` was
@@ -785,21 +786,164 @@ are [appended to the configured resource rules](https://github.com/opencontainer
 so an OCI deny-all device list alone does not prove runc-added `mknod`
 permissions are absent.
 
-Before any future allowlist expansion, host-side checks must bind the readback
-to the exact init PID/start identity and verify device file type, `st_rdev`,
-owner/mode and inode identity; prove `/proc/kcore` and `/proc/keys` are the
-intended `/dev/null` masks; verify `/proc/sys` and sysrq mount roots/options;
-and account for propagation. `master:10` identifies a slave mount: mount and
-unmount events can propagate inward from its master shared peer group, while
-events under the slave do not propagate back. Whether such inbound events can
-alter the worker's effective device mounts, or how to sever them reliably,
-remains unverified; keep rejecting the extra mounts until that is resolved
+At this source SHA, no additional mount was accepted. The diagnostic
+identified checks required before any version-pinned test-only expansion:
+bind the readback to the exact init PID/start identity; verify device file
+type, `st_rdev`, owner/mode and inode identity; prove `/proc/kcore` and
+`/proc/keys` are the intended `/dev/null` masks; verify `/proc/sys` and sysrq
+mount roots/options; and account for propagation. `master:10` identifies a
+slave mount: mount and unmount events can propagate inward from its master
+shared peer group, while events under the slave do not propagate back. Whether
+such inbound events can alter the worker's effective device mounts, or how to
+sever them reliably, remains unverified; this source SHA therefore keeps
+rejecting the extra mounts
 ([Linux mount-namespace propagation semantics](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html)).
-If any property is unsupported or ambiguous, keep rejecting the extra mount.
+The later recursive-private recheck below removed those optional propagation
+tags in its mountinfo snapshot, but did not exercise host mount/unmount events
+or validate device identity. That source SHA still rejects the extra mounts;
+if any property is unsupported or ambiguous, keep rejecting it.
 Postflight after this failed diagnostic found no matching runc scope, cgroup,
 process, or checkout canary; the user's default target remained active, the
 non-helper D-state count was zero, and `/tmp` remained at 19%. This diagnostic
 is not a worker-executor or sandbox-acceptance result.
+
+### Recursive-private propagation recheck (2026-10-05; fail-closed)
+
+The opt-in fixture gained a test-only `ACP_OCI_TEST_ROOTFS_PROPAGATION`
+override. The default remains the compiler's OCI-standard `private`; selecting
+`rprivate` is accepted only when the pinned executable reports runc 1.3.5.
+Runc 1.3.5 maps that implementation-specific spelling to
+`MS_PRIVATE|MS_REC`, while OCI Runtime Specification v1.2.1 lists only
+`shared`, `slave`, `private`, and `unbindable` for `rootfsPropagation`
+([runc mapping](https://github.com/opencontainers/runc/blob/v1.3.5/libcontainer/specconv/spec_linux.go),
+[OCI field](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config-linux.md#configlinuxrootfsmountpropagation)).
+No production compiler or launch path changed.
+
+On uid 1000, Linux 6.18.15, and rootless runc 1.3.5, the exact test source
+SHA-256 was
+`1d30bd03705c7b45ba39bed70f2f8ee5b1fa44d15b20b192c80bd2bf291ab702` (base
+commit `b0b02a5824e55ca45b1ce0d78431c1320b81ba78`). The host bracketed the
+init's mountinfo read with the exact PID/start-time/cgroup identity. The same
+ten runtime-created mountpoints remained outside the unchanged five-point
+allowlist, so the audit rejected the attempt before fd 3 was released:
+
+- `/dev/full`, `/dev/null`, `/dev/random`, `/dev/tty`, `/dev/urandom`, and
+  `/dev/zero`: `devtmpfs`, source `udev`, each rooted at its corresponding
+  device path, `rw,nosuid,relatime`;
+- `/proc/kcore` and `/proc/keys`: `devtmpfs`, source `udev`, root `/null`,
+  `rw,nosuid,relatime`;
+- `/proc/sys` and `/proc/sysrq-trigger`: `proc`, roots `/sys` and
+  `/sysrq-trigger`, `ro,nodev,noexec,nosuid,relatime`, read-only super-options.
+
+Unlike the earlier `private` readback, none of these ten entries had a
+propagation optional field (including `master:10`). This is mountinfo evidence
+for the tested snapshot; no host mount/unmount event was injected. Recursive
+private propagation therefore removes the observed slave-group relationship,
+but it does not remove runc's device and proc mounts or authorize them. The
+strict audit still fails closed; the candidate and its egress probe did not
+run, and no model or provider was called. Device `st_rdev`, owner/mode/inode
+identity, `/proc` mask identity, and the read-only path behavior still require
+their own exact-init checks before any allowlist expansion.
+
+The bounded test teardown and a separate read-only postflight found no matching
+`acp-live` systemd scope, zero user processes in D state, an active user
+`default.target`, and `/tmp` at 19%. This diagnostic narrows the propagation
+hypothesis only; it is not a positive isolation result, an integrated worker
+executor, or completion of task #2370.
+
+### Exact default-device identity preflight (2026-10-05; fail-closed)
+
+On uid 1000, Linux 6.18.15, and rootless runc 1.3.5, the updated test source
+SHA-256 was
+`90f74895091f8af47bf2be6c01c5ce6b6c8060d2f7d013e03d2b2837f7a4601e`.
+All non-generated Python package sources in the NAS scratch checkout matched
+the local checkout, and the copied test file matched this hash. The run used
+the test-only `rootfsPropagation=rprivate` override. PID namespace, capability,
+and exact runc 1.3.5 mount metadata checks passed while the candidate remained
+behind fd 3; device-node identity validation then failed closed at `/dev/tty`
+before releasing that gate.
+
+The host `/dev/tty` node was a character device with `st_rdev=5:0`,
+`st_dev=6`, inode 12, owner/group `0:5`, and mode `0666`. The diagnostic
+incorrectly required every approved device node to have owner/group `0:0`, so
+it rejected the valid host `root:tty` group before comparing the guest bind's
+exact inode metadata. This is a diagnostic predicate defect, not a successful
+device-bind proof: the guest `/dev/tty` comparison and later device/mask checks
+were not reached. No candidate payload, model, or provider ran.
+
+The test's teardown reported no secondary cleanup error; a read-only postflight
+found no active `acp-*` scope or `runc` process, the unique attempt root was
+absent, `default.target` remained active, uid-1000 D-state count was zero, and
+`/tmp` remained at 19%. The test-only correction keeps root ownership and mode
+`0666` requirements, but binds GID through exact host-versus-guest node identity
+rather than assuming every Linux host assigns `/dev/tty` to GID 0. This failure
+does not authorize the device mounts or establish sandbox acceptance. The
+independently reviewed correction and separately gated run are recorded below.
+
+### Corrected default-device identity and bounded live probe (2026-10-05; pass)
+
+The test-only validator now requires each approved node to be a root-owned
+character device with mode `0666` and the expected `st_rdev`; it compares the
+exact host and guest `st_dev`, inode, `st_rdev`, mode, UID, and GID. This keeps
+the host's legitimate `/dev/tty` group (`0:5`) without treating arbitrary guest
+metadata as trusted. Regression tests reject a wrong inode or GID, wrong device
+type or number, non-root owner, unsafe mode, and a mount whose device identity
+does not match the host node. Independent adversarial QC gave GO on exact test
+SHA-256
+`7598af2be5409203198bc2a3e497adc0793642bb92ad482e6efbd9859631dc9d`.
+
+On uid 1000, Linux 6.18.15, rootless runc 1.3.5, and BusyBox 1.35.0, the exact
+test file was copied into the leased disposable NAS checkout and verified at
+that SHA. Every non-generated file under `src/agent_control_plane` matched the
+local checkout. The single live invocation set
+`ACP_RUN_OCI_INTEGRATION=1`, `ACP_OCI_TEST_RUNC_VERSION=1.3.5`, and the
+test-only `ACP_OCI_TEST_ROOTFS_PROPAGATION=rprivate`. It exited 0 (`1 passed`)
+in 6.52 seconds. The pre-exec policy and identity checks passed before the
+host released fd 3. The candidate then signaled readiness and waited at a
+separate workspace gate; while it waited, the host-side fd audit observed only
+descriptors 0, 1, and 2, each targeting a pipe, before releasing that gate.
+The fd audit asserts the descriptor set and rejects socket targets; pipe-target
+types are recorded observations, not an asserted invariant.
+
+The exact init reported zero `CapInh`, `CapPrm`, `CapEff`, `CapBnd`, and
+`CapAmb`, with `NoNewPrivs=1`; its host PID mapped to namespace PID 1, and
+worker `/proc/1` exposed only the namespace-relative PID 1. The audited mount
+table had exactly `/`, `/proc`, `/workspace`, `/tmp`, `/home/agent`, the six
+runc default device nodes under `/dev`, the `/proc/kcore` and `/proc/keys`
+`/dev/null` masks, and read-only `/proc/sys` plus `/proc/sysrq-trigger`. All
+ten runc-added entries had no propagation fields under `rprivate`. The
+validator matched source, root, filesystem, and mount options against the
+pinned runc 1.3.5 expectations; it also required the six devtmpfs nodes and two
+`/dev/null` masks to share one device ID, and the proc masks to share `/proc`'s
+device ID. For super-options, it required devtmpfs to include `rw` and exclude
+`ro` (additional tokens were allowed), while each proc mask had to equal
+`{ro}`. The host `/dev/tty` identity was `st_rdev=5:0`, `st_dev=6`, inode 12,
+UID:GID `0:5`, mode `0666`; all eight device and `/proc` mask identity
+comparisons passed.
+
+The test confirmed writable assigned workspace, `/tmp`, and agent-home
+tmpfs, plus the expected result; it denied reads/writes to the base checkout,
+sibling attempt, unrelated project, host home/config/credential sentinels,
+host `/etc`, host `/tmp`, and absolute/relative symlink targets. The candidate
+saw only `lo`, had no default route, its network probe returned 1, and the
+host-NIC listener was not reached. The test-owned checkout canary was removed
+during teardown. The exact cgroup was
+`/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/user.slice/acp-acp-live-0ff8b1e177b84fca937715c236b876e6.scope`,
+with `memory.max=134217728`, `pids.max=16`, and `cpu.max=50000 100000`. The
+reported rootfs tree digest was
+`0fd9d84bf185648243c7734df37a43ab3d3f74e50eef7526b49c1e764179b6cc`.
+
+Teardown and separate postflight succeeded: the exact scope was `not-found`,
+its cgroup and attempt root were absent, no runc process or other `acp-*`
+scope remained, the user's `default.target` was active, uid-1000 D-state count
+was zero, and `/tmp` remained at 19%. No model or provider was called.
+
+This is a bounded direct-runc proof using ACP's current OCI config builder,
+not integration with the registered worker executor (`run_worker` remains
+fail-closed for configured OCI). It does not prove real-provider credentials
+or egress, hostile long-running process behavior, cancellation/restart
+recovery, concurrent attempts, result transfer/QC, or end-to-end sandbox
+acceptance; task #2370 remains open.
 
 ### systemd/runc cgroup composition probe (2026-10-03)
 
