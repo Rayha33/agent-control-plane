@@ -42,7 +42,7 @@ no supervisor call path reads back runtime state and durably validates it before
 releasing the OCI init gate. It proves no namespace, mount, credential, egress,
 cancellation, or result-import property.
 
-**Private-bundle runc handoff (exact-source NAS replay and independent QC passed; hosted exact-head CI pending).**
+**Private-bundle runc handoff (exact-source NAS replay, independent QC, and hosted CI passed on the implementation/test-fixture commit).**
 The public `spawn_pinned_runc()` path now validates the sealed policy/runtime
 binding, opens stable descriptors for the bundle and rootfs, and starts an
 isolated helper. The helper maps only the caller's UID/GID to the same host IDs
@@ -85,8 +85,10 @@ capability policy. The exact-host replay source hashes were `oci_worker.py`
 `e860647fb1e0a13265a09bc4d313ee5b3d9d4f2e355e87d2a11c0a6226eb8b2d`. The
 exact runc client and worker cgroup were absent after teardown; the external
 pytest evidence directory was retained. Two independent reviewers gave GO for
-the bounded launcher and cleanup-guard slice; hosted exact-head CI for the next
-feature-branch head remains pending before task #2417 can close. The test-only
+the bounded launcher and cleanup-guard slice. GitHub Actions run `37320832762`
+passed all four Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-
+fixture commit `9a6368d`; this receipt does not cover later documentation-only
+commits. Task #2417 records the current PR head and its latest check. The test-only
 pre-exec hook exercises same-UID proc-root writes, host config replacement,
 bundle rename/recreation, and `setns`; it is not available through the public
 API. The `_spawn_pinned_runc_for_unisolated_diagnostic()` and its host-path
@@ -428,8 +430,10 @@ unproved. The current candidate path uses a private read-only tmpfs and
 descriptor-anchored `--bundle`. A direct exact-host adversarial replay for this
 handoff is recorded in the evidence history below. The current runtime/test
 sources passed the exact-host replay, and two independent reviewers gave GO for
-the bounded launcher and cleanup-guard slice; hosted exact-head CI for the next
-feature-branch head remains pending. The
+the bounded launcher and cleanup-guard slice. GitHub Actions run `37320832762`
+passed all four Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-
+fixture commit `9a6368d`; this receipt does not cover later documentation-only
+commits. Task #2417 records the current PR head and its latest check. The
 unisolated diagnostic helper remains unsafe and is not called by `run_worker`.
 No runtime path/digest is durably tied to the attempt journal before candidate
 exec, and the attempt journal still cannot reach `cleanup_verified`. When
@@ -1316,9 +1320,11 @@ generic OCI runtime.
 The input-provenance/full-policy gap is closed for the adapter. The former
 host-path config race is now addressed in the candidate `spawn_pinned_runc()`
 implementation by the private read-only tmpfs and inherited bundle FD described
-above; task #2417 remains open pending hosted exact-head CI for the updated
-feature-branch head. Exact-source NAS replay and independent QC have passed for
-the bounded launcher/cleanup slice. The
+above. Exact-source NAS replay and independent QC have passed for the bounded
+launcher/cleanup slice. GitHub Actions run `37320832762` passed all four
+Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-fixture commit
+`9a6368d`; this receipt does not cover later documentation-only commits. Task
+#2417 records the current PR head and its latest check. The
 underscored `_spawn_pinned_runc_for_unisolated_diagnostic()` is retained only
 for explicit no-model host-path diagnostics and is not a safe worker launch
 path. Do not connect either low-level launcher to `run_worker`: lifecycle,
