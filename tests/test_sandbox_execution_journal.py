@@ -1400,6 +1400,189 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
     assert persisted["result_candidate_digest"] == captured["candidate_digest"]
 
 
+def test_sandbox_import_route_fails_closed_before_cleanup_verification(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+    (Path(row["workspace_root_path"]) / "alpha.txt").write_text(
+        "sandbox result\n", encoding="utf-8"
+    )
+    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+    )
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.import_sandbox_execution_result(attempt["id"], attempt["claim_token"])
+
+    assert rejected.value.code == "sandbox_result_unverified"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
+
+
+def test_sandbox_import_rejects_stale_claim_before_candidate_capture(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET claim_token = claim_token + 1 WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.commit()
+
+    with pytest.raises(SupervisorError) as stale:
+        supervisor.import_sandbox_execution_result(attempt["id"], attempt["claim_token"])
+
+    assert stale.value.code == "stale_fencing_token"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
+
+
+def test_sandbox_import_uses_distinct_source_and_recovers_published_ref(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+    (Path(row["workspace_root_path"]) / "alpha.txt").write_text(
+        "sandbox result\n", encoding="utf-8"
+    )
+    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+    )
+    supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
+
+    # Exercise the downstream import boundary with a synthetic already-verified
+    # journal state. No production method currently writes cleanup_verified, so
+    # this is not cleanup-verifier or live-runtime evidence.
+    Path(row["bundle_path"]).rmdir()
+    Path(row["state_path"]).rmdir()
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
+        connection.execute(
+            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+        # Model a corrupt/legacy mixed-source journal with a different claim
+        # token and result digest; healthy-schema guards normally prevent it.
+        connection.execute("DROP TRIGGER result_import_direct_source_insert_guard")
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, source_kind, worker_pid, worker_identity,
+               worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp,
+               commit_sha, phase, created_at, updated_at)
+            VALUES ('corrupt-direct-import', ?, ?, 'direct_worker', 202,
+                    'synthetic-pid-identity', '{}', 'base', 'tree', 'baseline',
+                    ?, 'changes', 'refs/acp/corrupt-direct', 0, 'commit',
+                    'prepared', 'now', 'now')
+            """,
+            (attempt["id"], attempt["claim_token"] + 1, "f" * 64),
+        )
+        connection.commit()
+
+    with pytest.raises(SupervisorError) as mixed_source:
+        supervisor.import_sandbox_execution_result(attempt["id"], attempt["claim_token"])
+    assert mixed_source.value.code == "sandbox_result_source_mismatch"
+    with supervisor.connect() as connection:
+        connection.execute("DELETE FROM result_imports WHERE id = 'corrupt-direct-import'")
+
+    def interrupt_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated crash after result ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", interrupt_before_submit)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        supervisor.import_sandbox_execution_result(attempt["id"], attempt["claim_token"])
+
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert imported["phase"] == "ref_published"
+        assert imported["source_kind"] == "sandbox_execution"
+        assert imported["worker_pid"] is None
+        assert imported["worker_identity"] == ""
+        assert imported["worker_exit_receipt_json"] == ""
+        assert imported["sandbox_execution_id"] == row["execution_id"]
+        assert len(imported["sandbox_cleanup_receipt_digest"]) == 64
+
+    reopened = GitSupervisor(repo)
+    expected_cleanup_digest = imported["sandbox_cleanup_receipt_digest"]
+    with reopened.connect() as connection:
+        connection.execute("DROP TRIGGER result_import_source_identity_immutable")
+        connection.execute(
+            "UPDATE result_imports SET sandbox_cleanup_receipt_digest = ? WHERE id = ?",
+            ("a" * 64, imported["id"]),
+        )
+        connection.commit()
+    with pytest.raises(SupervisorError) as digest_conflict:
+        reopened.recover_worker_result_import(imported["id"])
+    assert digest_conflict.value.code == "sandbox_result_source_mismatch"
+    with reopened.connect() as connection:
+        persisted = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()
+        assert persisted["phase"] == "ref_published"
+        connection.execute(
+            "UPDATE result_imports SET sandbox_cleanup_receipt_digest = ? WHERE id = ?",
+            (expected_cleanup_digest, imported["id"]),
+        )
+        connection.commit()
+
+    with reopened.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO result_imports
+              (id, attempt_id, claim_token, source_kind, worker_pid, worker_identity,
+               worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
+               result_digest, change_digest, result_ref, commit_timestamp,
+               commit_sha, phase, created_at, updated_at)
+            VALUES ('corrupt-direct-recovery', ?, ?, 'direct_worker', 203,
+                    'other-pid-identity', '{}', 'base', 'tree', 'baseline',
+                    ?, 'changes', 'refs/acp/corrupt-recovery', 0, 'commit',
+                    'prepared', 'now', 'now')
+            """,
+            (attempt["id"], attempt["claim_token"] + 1, "e" * 64),
+        )
+        connection.commit()
+    with pytest.raises(SupervisorError) as recovery_conflict:
+        reopened.recover_worker_result_import(imported["id"])
+    assert recovery_conflict.value.code == "sandbox_result_source_mismatch"
+    with pytest.raises(SupervisorError) as submit_conflict:
+        reopened._submit(
+            attempt["id"],
+            attempt["claim_token"],
+            expected_worker_pid=None,
+            credential=None,
+            imported_result_id=imported["id"],
+        )
+    assert submit_conflict.value.code == "sandbox_result_source_mismatch"
+    with reopened.connect() as connection:
+        connection.execute("DELETE FROM result_imports WHERE id = 'corrupt-direct-recovery'")
+
+    submission = reopened.recover_worker_result_import(imported["id"])
+    repeated = reopened.import_sandbox_execution_result(attempt["id"], attempt["claim_token"])
+    assert repeated["id"] == submission["id"]
+    with reopened.connect() as connection:
+        persisted = connection.execute(
+            "SELECT phase, submission_id, source_kind FROM result_imports WHERE id = ?",
+            (imported["id"],),
+        ).fetchone()
+        assert persisted["phase"] == "submitted"
+        assert persisted["submission_id"] == submission["id"]
+        assert persisted["source_kind"] == "sandbox_execution"
+    assert reopened.verify_event_chain()["ok"] is True
+
+
 def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)

@@ -116,6 +116,22 @@ def _private_directory_identity(path: Path, label: str) -> tuple[int, int]:
     return observed.st_dev, observed.st_ino
 
 
+def _require_private_path_absent(path: Path, label: str) -> None:
+    """Treat only a positively missing private path as cleanup evidence."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_private_path_invalid", f"{label} absence could not be verified"
+        ) from error
+    raise SupervisorError(
+        "sandbox_private_path_conflict", f"{label} remains after cleanup verification"
+    )
+
+
 def _sandbox_execution_cleanup_is_verified(connection: Any, attempt_id: str) -> bool:
     """Old/direct attempts have no journal; journaled attempts require verification."""
 
@@ -645,19 +661,29 @@ class SandboxExecutionJournalMixin:
                 "sandbox_workspace_invalid", "journaled workspace paths do not match execution root"
             )
         execution_root_identity = _private_directory_identity(execution_root, "execution root")
-        bundle_root_identity = _private_directory_identity(Path(row["bundle_path"]), "bundle root")
-        state_root_identity = _private_directory_identity(
-            Path(row["state_path"]), "runc state root"
-        )
-        if (
-            execution_root_identity != (row["execution_root_dev"], row["execution_root_ino"])
-            or bundle_root_identity != (row["bundle_root_dev"], row["bundle_root_ino"])
-            or state_root_identity != (row["state_root_dev"], row["state_root_ino"])
-        ):
+        if execution_root_identity != (row["execution_root_dev"], row["execution_root_ino"]):
             raise SupervisorError(
                 "sandbox_private_path_conflict",
-                "private execution directory identity no longer matches the durable journal",
+                "execution root identity no longer matches the durable journal",
             )
+        if row["phase"] == "cleanup_verified":
+            _require_private_path_absent(Path(row["bundle_path"]), "bundle root")
+            _require_private_path_absent(Path(row["state_path"]), "runc state root")
+        else:
+            bundle_root_identity = _private_directory_identity(
+                Path(row["bundle_path"]), "bundle root"
+            )
+            state_root_identity = _private_directory_identity(
+                Path(row["state_path"]), "runc state root"
+            )
+            if bundle_root_identity != (
+                row["bundle_root_dev"],
+                row["bundle_root_ino"],
+            ) or state_root_identity != (row["state_root_dev"], row["state_root_ino"]):
+                raise SupervisorError(
+                    "sandbox_private_path_conflict",
+                    "private execution directory identity no longer matches the durable journal",
+                )
         baseline = _restore_snapshot_from_record(
             baseline_path,
             row["baseline_manifest_json"],
@@ -680,6 +706,7 @@ class SandboxExecutionJournalMixin:
             binding_columns = (
                 "execution_id",
                 "claim_token",
+                "phase",
                 "bundle_path",
                 "workspace_binding_version",
                 "private_path_binding_version",
@@ -756,7 +783,7 @@ class SandboxExecutionJournalMixin:
             if (
                 execution is None
                 or execution["execution_id"] != binding["execution_id"]
-                or execution["phase"] != "cleanup_reported"
+                or execution["phase"] not in {"cleanup_reported", "cleanup_verified"}
                 or execution["runc_exit_code"] != 0
                 or execution["runc_exit_observed_by"] != "runc_client_popen_wait"
                 or execution["baseline_root_path"] != str(baseline_root)
@@ -804,7 +831,7 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_not_found", "execution reservation is missing"
                 )
             if (
-                row["phase"] != "cleanup_reported"
+                row["phase"] not in {"cleanup_reported", "cleanup_verified"}
                 or row["runc_exit_code"] != 0
                 or row["runc_exit_observed_by"] != "runc_client_popen_wait"
                 or row["workspace_binding_version"] != 1
@@ -900,6 +927,7 @@ class SandboxExecutionJournalMixin:
                 return {
                     "candidate": candidate,
                     "candidate_digest": digest,
+                    "baseline": binding["baseline"],
                     "change_set": change_set,
                 }
             if row["result_candidate_version"] != 0:
@@ -911,7 +939,8 @@ class SandboxExecutionJournalMixin:
                 UPDATE sandbox_executions
                 SET result_candidate_version = 1, result_candidate_json = ?,
                     result_candidate_digest = ?, updated_at = ?
-                WHERE attempt_id = ? AND claim_token = ? AND phase = 'cleanup_reported'
+                WHERE attempt_id = ? AND claim_token = ?
+                  AND phase IN ('cleanup_reported', 'cleanup_verified')
                   AND result_candidate_version = 0
                 """,
                 (encoded, digest, utc_now(), attempt_id, claim_token),
@@ -934,7 +963,53 @@ class SandboxExecutionJournalMixin:
                     "cleanup_status": "unverified",
                 },
             )
-        return {"candidate": candidate, "candidate_digest": digest, "change_set": change_set}
+        return {
+            "candidate": candidate,
+            "candidate_digest": digest,
+            "baseline": binding["baseline"],
+            "change_set": change_set,
+        }
+
+    def _sandbox_execution_result_import_source(
+        self,
+        connection: Any,
+        attempt_id: str,
+        claim_token: int,
+    ) -> dict[str, str]:
+        """Return journal identities usable only after trusted cleanup verification."""
+
+        row = connection.execute(
+            "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None or row["claim_token"] != claim_token:
+            raise SupervisorError(
+                "sandbox_execution_not_found", "matching sandbox execution is missing"
+            )
+        _require_sandbox_execution_result_eligible(connection, attempt_id)
+        direct_import = connection.execute(
+            "SELECT id FROM result_imports WHERE attempt_id = ? "
+            "AND source_kind = 'direct_worker' LIMIT 1",
+            (attempt_id,),
+        ).fetchone()
+        if direct_import is not None:
+            raise SupervisorError(
+                "sandbox_result_source_mismatch",
+                "attempt already has a direct-worker result import",
+            )
+        cleanup_json = row["cleanup_receipt_json"]
+        if cleanup_json not in {
+            canonical_json(self._sandbox_cleanup_receipt(row)),
+            canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row)),
+            canonical_json(self._sandbox_cleanup_receipt_v1(row)),
+        }:
+            raise SupervisorError(
+                "sandbox_cleanup_report_invalid",
+                "verified execution does not retain its exact journaled cleanup report",
+            )
+        return {
+            "execution_id": row["execution_id"],
+            "cleanup_receipt_digest": hashlib.sha256(cleanup_json.encode("utf-8")).hexdigest(),
+        }
 
     def _sandbox_execution_require_result_candidate_matches(
         self,

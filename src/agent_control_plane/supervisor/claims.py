@@ -2610,15 +2610,124 @@ class ClaimsMixin:
         change_set: ChangeSet,
         credential: str | None = None,
     ) -> dict[str, Any]:
-        """Journal and submit a host-validated result without mutating the checkout.
+        """Journal and submit a direct worker result without mutating the checkout."""
 
-        Worker identity is the supervisor-registered PID plus its kernel start
-        identity and successful ``Popen.wait`` event. Runtime-driver unit IDs are
-        intentionally not used as worker identity.
-        """
+        return self._import_host_validated_result(
+            attempt_id,
+            claim_token,
+            baseline,
+            change_set,
+            credential=credential,
+            source_kind="direct_worker",
+        )
+
+    def import_sandbox_execution_result(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Capture and import only the durable sandbox workspace after verified cleanup."""
+
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM result_imports WHERE attempt_id = ? AND claim_token = ? "
+                "AND source_kind = 'sandbox_execution'",
+                (attempt_id, claim_token),
+            ).fetchall()
+        if existing:
+            if len(existing) != 1:
+                raise SupervisorError(
+                    "result_import_ambiguous", "sandbox execution has conflicting result journals"
+                )
+            return self.recover_worker_result_import(existing[0]["id"], credential=credential)
+
+        with self.connect() as connection:
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            source = self._sandbox_execution_result_import_source(
+                connection, attempt_id, claim_token
+            )
+            if attempt["pid"] is not None or attempt["pid_identity"]:
+                raise SupervisorError(
+                    "sandbox_result_source_mismatch",
+                    "sandbox result import cannot alias a direct worker PID identity",
+                )
+
+        captured = self._sandbox_execution_capture_result_candidate(
+            attempt_id, claim_token, credential=credential
+        )
+        baseline = captured["baseline"]
+        change_set = captured["change_set"]
+        import_digest = sha256(
+            canonical_json(
+                {
+                    "baseline_digest": change_set.baseline_digest,
+                    "result_digest": change_set.result_digest,
+                    "change_digest": change_set.digest,
+                }
+            ).encode("utf-8")
+        )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            current_source = self._sandbox_execution_result_import_source(
+                connection, attempt_id, claim_token
+            )
+            if current_source != source or attempt["pid"] is not None or attempt["pid_identity"]:
+                raise SupervisorError(
+                    "sandbox_result_source_mismatch",
+                    "sandbox identity or cleanup receipt changed during result capture",
+                )
+            self._sandbox_execution_require_result_candidate_matches(
+                connection,
+                attempt_id,
+                baseline_digest=baseline.manifest.digest,
+                import_digest=import_digest,
+                change_digest=change_set.digest,
+            )
+
+        return self._import_host_validated_result(
+            attempt_id,
+            claim_token,
+            baseline,
+            change_set,
+            credential=credential,
+            source_kind="sandbox_execution",
+            sandbox_execution_id=source["execution_id"],
+            sandbox_cleanup_receipt_digest=source["cleanup_receipt_digest"],
+        )
+
+    def _import_host_validated_result(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        baseline: Snapshot,
+        change_set: ChangeSet,
+        *,
+        credential: str | None,
+        source_kind: str,
+        sandbox_execution_id: str | None = None,
+        sandbox_cleanup_receipt_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the common host-built import with source-specific journal evidence."""
 
         if type(baseline) is not Snapshot or type(change_set) is not ChangeSet:
             raise SupervisorError("invalid_worker_result", "snapshot or change set is invalid")
+        if source_kind not in {"direct_worker", "sandbox_execution"}:
+            raise SupervisorError("invalid_worker_result", "result source kind is invalid")
+        if source_kind == "direct_worker" and (
+            sandbox_execution_id is not None or sandbox_cleanup_receipt_digest is not None
+        ):
+            raise SupervisorError("invalid_worker_result", "direct result source is inconsistent")
+        if source_kind == "sandbox_execution" and (
+            not isinstance(sandbox_execution_id, str)
+            or not sandbox_execution_id
+            or not isinstance(sandbox_cleanup_receipt_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sandbox_cleanup_receipt_digest) is None
+        ):
+            raise SupervisorError("invalid_worker_result", "sandbox result source is incomplete")
         baseline.manifest.validate()
         change_set.validate()
         if change_set.baseline_digest != baseline.manifest.digest:
@@ -2665,7 +2774,22 @@ class ClaimsMixin:
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
             self._authenticate_attempt(connection, attempt, credential)
             _require_sandbox_execution_result_eligible(connection, attempt_id)
-            _require_direct_worker_result_source(connection, attempt_id)
+            if source_kind == "direct_worker":
+                _require_direct_worker_result_source(connection, attempt_id)
+            else:
+                source = self._sandbox_execution_result_import_source(
+                    connection, attempt_id, claim_token
+                )
+                if (
+                    source["execution_id"] != sandbox_execution_id
+                    or source["cleanup_receipt_digest"] != sandbox_cleanup_receipt_digest
+                    or attempt["pid"] is not None
+                    or attempt["pid_identity"]
+                ):
+                    raise SupervisorError(
+                        "sandbox_result_source_mismatch",
+                        "sandbox source identity changed before result import",
+                    )
             self._sandbox_execution_require_result_candidate_matches(
                 connection,
                 attempt_id,
@@ -2679,12 +2803,18 @@ class ClaimsMixin:
                     "result import requires a claim-time checkout snapshot",
                 )
             task = self._task_row(connection, attempt["task_id"])
-            worker_pid = attempt["pid"]
-            if worker_pid is None or worker_pid < 1:
-                raise SupervisorError(
-                    "worker_registration_lost", "result import has no registered worker PID"
-                )
-            exit_receipt = self._worker_exit_receipt_in(connection, attempt, worker_pid)
+            if source_kind == "direct_worker":
+                worker_pid = attempt["pid"]
+                if worker_pid is None or worker_pid < 1:
+                    raise SupervisorError(
+                        "worker_registration_lost", "result import has no registered worker PID"
+                    )
+                worker_identity = attempt["pid_identity"]
+                exit_receipt = self._worker_exit_receipt_in(connection, attempt, worker_pid)
+            else:
+                worker_pid = None
+                worker_identity = ""
+                exit_receipt = ""
             self._assert_base_checkout_unchanged(
                 connection,
                 attempt_id,
@@ -2794,7 +2924,26 @@ class ClaimsMixin:
                     )
                     self._authenticate_attempt(connection, current, credential)
                     _require_sandbox_execution_result_eligible(connection, attempt_id)
-                    _require_direct_worker_result_source(connection, attempt_id)
+                    if source_kind == "direct_worker":
+                        _require_direct_worker_result_source(connection, attempt_id)
+                        current_receipt = self._worker_exit_receipt_in(
+                            connection, current, worker_pid
+                        )
+                        source_changed = (
+                            current["pid_identity"] != attempt_snapshot["pid_identity"]
+                            or current_receipt != exit_receipt
+                        )
+                    else:
+                        current_source = self._sandbox_execution_result_import_source(
+                            connection, attempt_id, claim_token
+                        )
+                        source_changed = (
+                            current_source["execution_id"] != sandbox_execution_id
+                            or current_source["cleanup_receipt_digest"]
+                            != sandbox_cleanup_receipt_digest
+                            or current["pid"] is not None
+                            or current["pid_identity"]
+                        )
                     self._sandbox_execution_require_result_candidate_matches(
                         connection,
                         attempt_id,
@@ -2802,33 +2951,36 @@ class ClaimsMixin:
                         import_digest=result_digest,
                         change_digest=change_set.digest,
                     )
-                    current_receipt = self._worker_exit_receipt_in(connection, current, worker_pid)
                     if (
-                        current["pid_identity"] != attempt_snapshot["pid_identity"]
-                        or current_receipt != exit_receipt
+                        source_changed
                         or self._task_row(connection, current["task_id"])["base_sha"] != base_sha
                     ):
                         raise SupervisorError(
                             "stale_worker_result",
-                            "worker or task fence changed during result import",
+                            "worker, sandbox, or task fence changed during result import",
                         )
                     connection.execute(
                         """
                         INSERT INTO result_imports
-                          (id, attempt_id, claim_token, worker_pid, worker_identity,
-                           worker_exit_receipt_json, base_sha, tree_sha, baseline_digest,
-                           result_digest, change_digest, result_ref, commit_timestamp,
-                           commit_sha, phase, staging_path, object_ids_json,
+                          (id, attempt_id, claim_token, source_kind, worker_pid,
+                           worker_identity, worker_exit_receipt_json, sandbox_execution_id,
+                           sandbox_cleanup_receipt_digest, base_sha, tree_sha,
+                           baseline_digest, result_digest, change_digest, result_ref,
+                           commit_timestamp, commit_sha, phase, staging_path, object_ids_json,
                            promote_object_ids_json, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                'prepared', ?, ?, ?, ?, ?)
                         """,
                         (
                             import_id,
                             attempt_id,
                             claim_token,
+                            source_kind,
                             worker_pid,
-                            current["pid_identity"],
+                            worker_identity,
                             exit_receipt,
+                            sandbox_execution_id,
+                            sandbox_cleanup_receipt_digest,
                             base_sha,
                             candidate.tree_sha,
                             candidate.baseline_digest,
@@ -2852,9 +3004,16 @@ class ClaimsMixin:
                             "import_id": import_id,
                             "attempt_id": attempt_id,
                             "claim_token": claim_token,
+                            "source_kind": source_kind,
                             "worker_pid": worker_pid,
-                            "worker_identity": current["pid_identity"],
-                            "worker_exit_receipt_digest": sha256(exit_receipt.encode("utf-8")),
+                            "worker_identity": worker_identity,
+                            "worker_exit_receipt_digest": (
+                                sha256(exit_receipt.encode("utf-8"))
+                                if source_kind == "direct_worker"
+                                else ""
+                            ),
+                            "sandbox_execution_id": sandbox_execution_id,
+                            "sandbox_cleanup_receipt_digest": sandbox_cleanup_receipt_digest,
                             "result_digest": result_digest,
                             "tree_sha": candidate.tree_sha,
                             "commit_sha": commit_sha,
@@ -2871,6 +3030,51 @@ class ClaimsMixin:
                     )
 
         return self.recover_worker_result_import(journal_id, credential=credential)
+
+    def _require_result_import_source_in(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        attempt: sqlite3.Row | None = None,
+    ) -> None:
+        """Revalidate immutable source identity and its live authorization gate."""
+
+        attempt_id = row["attempt_id"]
+        _require_sandbox_execution_result_eligible(connection, attempt_id)
+        if row["source_kind"] == "direct_worker":
+            if (
+                row["sandbox_execution_id"] is not None
+                or row["sandbox_cleanup_receipt_digest"] is not None
+            ):
+                raise SupervisorError(
+                    "result_import_ambiguous", "direct result journal contains sandbox identity"
+                )
+            _require_direct_worker_result_source(connection, attempt_id)
+            return
+        if row["source_kind"] != "sandbox_execution":
+            raise SupervisorError("result_import_ambiguous", "result journal source is invalid")
+        source = self._sandbox_execution_result_import_source(
+            connection, attempt_id, row["claim_token"]
+        )
+        if (
+            row["worker_pid"] is not None
+            or row["worker_identity"] != ""
+            or row["worker_exit_receipt_json"] != ""
+            or source["execution_id"] != row["sandbox_execution_id"]
+            or source["cleanup_receipt_digest"] != row["sandbox_cleanup_receipt_digest"]
+            or (attempt is not None and (attempt["pid"] is not None or attempt["pid_identity"]))
+        ):
+            raise SupervisorError(
+                "sandbox_result_source_mismatch",
+                "sandbox result journal does not match the exact verified execution source",
+            )
+        self._sandbox_execution_require_result_candidate_matches(
+            connection,
+            attempt_id,
+            baseline_digest=row["baseline_digest"],
+            import_digest=row["result_digest"],
+            change_digest=row["change_digest"],
+        )
 
     @staticmethod
     def _mark_result_import_ambiguous_in(
@@ -2917,8 +3121,7 @@ class ClaimsMixin:
         self._assert_no_git_grafts()
         with self.connect() as connection:
             preflight_row = connection.execute(
-                "SELECT attempt_id, baseline_digest, result_digest, change_digest "
-                "FROM result_imports WHERE id = ?",
+                "SELECT * FROM result_imports WHERE id = ?",
                 (import_id,),
             ).fetchone()
             if preflight_row is not None:
@@ -2927,16 +3130,8 @@ class ClaimsMixin:
                 ).fetchone()
                 if preflight_attempt is not None:
                     self._authenticate_attempt(connection, preflight_attempt, credential)
-                    _require_sandbox_execution_result_eligible(
-                        connection, preflight_row["attempt_id"]
-                    )
-                    _require_direct_worker_result_source(connection, preflight_row["attempt_id"])
-                    self._sandbox_execution_require_result_candidate_matches(
-                        connection,
-                        preflight_row["attempt_id"],
-                        baseline_digest=preflight_row["baseline_digest"],
-                        import_digest=preflight_row["result_digest"],
-                        change_digest=preflight_row["change_digest"],
+                    self._require_result_import_source_in(
+                        connection, preflight_row, preflight_attempt
                     )
         # Missing/corrupt journals still need bounded orphan-stage cleanup before
         # the existing not-found/ambiguous checks below.
@@ -2957,15 +3152,7 @@ class ClaimsMixin:
                     "result_import_ambiguous", "journal attempt is missing; result remains fenced"
                 )
             self._authenticate_attempt(connection, attempt_row, credential)
-            _require_sandbox_execution_result_eligible(connection, row["attempt_id"])
-            _require_direct_worker_result_source(connection, row["attempt_id"])
-            self._sandbox_execution_require_result_candidate_matches(
-                connection,
-                row["attempt_id"],
-                baseline_digest=row["baseline_digest"],
-                import_digest=row["result_digest"],
-                change_digest=row["change_digest"],
-            )
+            self._require_result_import_source_in(connection, row, attempt_row)
             try:
                 expected_id = str(
                     uuid.uuid5(
@@ -3065,14 +3252,18 @@ class ClaimsMixin:
                 attempt = self._active_attempt(
                     connection, row["attempt_id"], row["claim_token"], int(time.time())
                 )
-                receipt = self._worker_exit_receipt_in(connection, attempt, row["worker_pid"])
-                if (
-                    attempt["pid_identity"] != row["worker_identity"]
-                    or receipt != row["worker_exit_receipt_json"]
-                ):
-                    raise SupervisorError(
-                        "worker_registration_lost", "journal no longer matches its worker identity"
-                    )
+                if row["source_kind"] == "direct_worker":
+                    receipt = self._worker_exit_receipt_in(connection, attempt, row["worker_pid"])
+                    if (
+                        attempt["pid_identity"] != row["worker_identity"]
+                        or receipt != row["worker_exit_receipt_json"]
+                    ):
+                        raise SupervisorError(
+                            "worker_registration_lost",
+                            "journal no longer matches its worker identity",
+                        )
+                else:
+                    self._require_result_import_source_in(connection, row, attempt)
                 task = self._task_row(connection, attempt["task_id"])
                 if task["base_sha"] != row["base_sha"]:
                     raise SupervisorError(
@@ -3141,25 +3332,18 @@ class ClaimsMixin:
                         int(time.time()),
                     )
                     self._authenticate_attempt(connection, active, credential)
-                    _require_sandbox_execution_result_eligible(connection, current["attempt_id"])
-                    _require_direct_worker_result_source(connection, current["attempt_id"])
-                    self._sandbox_execution_require_result_candidate_matches(
-                        connection,
-                        current["attempt_id"],
-                        baseline_digest=current["baseline_digest"],
-                        import_digest=current["result_digest"],
-                        change_digest=current["change_digest"],
-                    )
-                    current_receipt = self._worker_exit_receipt_in(
-                        connection, active, current["worker_pid"]
-                    )
-                    if (
-                        active["pid_identity"] != current["worker_identity"]
-                        or current_receipt != current["worker_exit_receipt_json"]
-                    ):
-                        raise SupervisorError(
-                            "result_import_ambiguous", "worker fence changed during recovery"
+                    self._require_result_import_source_in(connection, current, active)
+                    if current["source_kind"] == "direct_worker":
+                        current_receipt = self._worker_exit_receipt_in(
+                            connection, active, current["worker_pid"]
                         )
+                        if (
+                            active["pid_identity"] != current["worker_identity"]
+                            or current_receipt != current["worker_exit_receipt_json"]
+                        ):
+                            raise SupervisorError(
+                                "result_import_ambiguous", "worker fence changed during recovery"
+                            )
                     target = candidate_ref_target(
                         attempt_snapshot["worktree"],
                         current["result_ref"],
@@ -3371,13 +3555,18 @@ class ClaimsMixin:
             sandbox_execution = connection.execute(
                 "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
-            if sandbox_execution is not None:
-                _require_direct_worker_result_source(connection, attempt_id)
             if sandbox_execution is not None and imported_result_id is None:
                 raise SupervisorError(
                     "sandbox_result_evidence_missing",
                     "journaled sandbox submission requires a matching imported result",
                 )
+            if sandbox_execution is not None and imported_result_id is not None:
+                source_row = connection.execute(
+                    "SELECT source_kind FROM result_imports WHERE id = ?",
+                    (imported_result_id,),
+                ).fetchone()
+                if source_row is None or source_row["source_kind"] != "sandbox_execution":
+                    _require_direct_worker_result_source(connection, attempt_id)
             if expected_worker_pid is None and attempt["pid"] is not None:
                 raise SupervisorError(
                     "worker_still_running",
@@ -3398,39 +3587,45 @@ class ClaimsMixin:
             worktree = Path(attempt["worktree"])
             import_row = None
             if imported_result_id is not None:
-                if expected_worker_pid is None:
-                    raise SupervisorError(
-                        "worker_registration_lost",
-                        "imported submission requires a worker PID fence",
-                    )
                 import_row = connection.execute(
                     "SELECT * FROM result_imports WHERE id = ?", (imported_result_id,)
                 ).fetchone()
+                if import_row is None or import_row["phase"] != "ref_published":
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "result journal does not match this exact attempt",
+                    )
                 if (
-                    import_row is None
-                    or import_row["phase"] != "ref_published"
-                    or import_row["attempt_id"] != attempt_id
+                    import_row["attempt_id"] != attempt_id
                     or import_row["claim_token"] != claim_token
-                    or import_row["worker_pid"] != expected_worker_pid
-                    or attempt["pid"] != import_row["worker_pid"]
-                    or attempt["pid_identity"] != import_row["worker_identity"]
                     or task["base_sha"] != import_row["base_sha"]
                 ):
                     raise SupervisorError(
                         "result_import_ambiguous",
                         "result journal does not match this exact attempt",
                     )
-                self._sandbox_execution_require_result_candidate_matches(
-                    connection,
-                    attempt_id,
-                    baseline_digest=import_row["baseline_digest"],
-                    import_digest=import_row["result_digest"],
-                    change_digest=import_row["change_digest"],
-                )
-                receipt = self._worker_exit_receipt_in(connection, attempt, expected_worker_pid)
-                if receipt != import_row["worker_exit_receipt_json"]:
+                self._require_result_import_source_in(connection, import_row, attempt)
+                if import_row["source_kind"] == "direct_worker":
+                    if (
+                        expected_worker_pid is None
+                        or import_row["worker_pid"] != expected_worker_pid
+                        or attempt["pid"] != import_row["worker_pid"]
+                        or attempt["pid_identity"] != import_row["worker_identity"]
+                    ):
+                        raise SupervisorError(
+                            "worker_registration_lost",
+                            "direct result journal does not match its worker PID fence",
+                        )
+                    receipt = self._worker_exit_receipt_in(connection, attempt, expected_worker_pid)
+                    if receipt != import_row["worker_exit_receipt_json"]:
+                        raise SupervisorError(
+                            "result_import_ambiguous",
+                            "result journal worker exit receipt changed",
+                        )
+                elif expected_worker_pid is not None:
                     raise SupervisorError(
-                        "result_import_ambiguous", "result journal worker exit receipt changed"
+                        "sandbox_result_source_mismatch",
+                        "sandbox result submission cannot use a direct worker PID fence",
                     )
                 candidate = CandidateTree(
                     tree_sha=import_row["tree_sha"],

@@ -573,8 +573,8 @@ does not remove those paths, verify runtime teardown, close same-UID races
 between check and use, or write `cleanup_verified`. `run_worker` remains
 fail-closed for configured OCI.
 
-**Source-discriminated result-import journal (schema 19; still no sandbox
-import).** Existing result-import rows migrate as `direct_worker`, preserving
+**Source-discriminated result-import journal (schema 19; sandbox import remains
+cleanup-gated).** Existing result-import rows migrate as `direct_worker`, preserving
 their worker PID/receipt and staged-object inventory. New sandbox-source rows
 have no direct-worker PID or worker-exit receipt and are structurally bound to
 the exact `(attempt_id, execution_id)` plus a cleanup-receipt digest. Database
@@ -585,9 +585,23 @@ being relabeled. The existing direct-worker INSERT shape remains compatible.
 These SQLite triggers are not a boundary against raw database writers; for
 example, replacement-style writes can bypass update-only immutability checks.
 These constraints separate receipt identities but do not produce or authenticate
-a cleanup receipt. No trusted cleanup verifier or sandbox-aware import/recovery
-route exists, `cleanup_verified` is still unwritten, and `run_worker` remains
-fail-closed for configured OCI.
+a cleanup receipt. `import_sandbox_execution_result` now reconstructs a
+candidate from the durable claim-time baseline and sandbox workspace, then
+imports it through the common host-built tree/commit, staging, ref-publication,
+and idempotent recovery path. Its import row carries `source_kind`, the exact
+execution ID, and the digest of the persisted cleanup report; it carries no
+worker PID, identity, or exit receipt. Recovery and submission recheck that
+source binding, candidate digests, and the `cleanup_verified` eligibility gate.
+For a `cleanup_verified` row, workspace restore additionally requires the
+private bundle and runc state directories to be absent while the recorded
+execution-root identity and workspace/baseline bindings still match. The
+cleanup-report digest identifies the journaled report; it is not proof that the
+report is trusted or verified. No trusted cleanup verifier or production writer
+for `cleanup_verified` exists yet, so the new route still fails closed for real
+executions and `run_worker` remains fail-closed for configured OCI. The route's
+success/recovery test constructs synthetic already-verified journal state only
+to cover downstream import logic; it is not cleanup-verifier or live-runtime
+evidence.
 
 **Runtime-attestation validator and partial host collector (2026-10-04; still
 no launcher).** The `sandbox_attestation` module binds bounded observations into
