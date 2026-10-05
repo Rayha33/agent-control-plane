@@ -192,11 +192,14 @@ ACP's worker boundary:
 
 - App Server is the rich-client protocol; its `command/exec` runs under the
   server's sandbox, while `externalSandbox` tells Codex to skip that command
-  sandbox because an outer boundary is already in force. If ACP uses App Server
-  later, its process still has to run inside the independently enforced
-  per-attempt sandbox. Keep its control transport local (stdio or Unix socket);
-  the documented WebSocket listener is experimental and unsupported for
-  production. See [Codex App Server](https://learn.chatgpt.com/docs/app-server).
+  sandbox only when an outer boundary is already in force. It creates no ACP
+  namespace and is not a documented caller-supplied remote executor. The
+  current docs classify the App Server command and WebSocket transport as
+  experimental and unsupported for production workloads; do not select this as
+  ACP's supported production worker path. If that status changes, the App Server
+  process must still run inside ACP's independently enforced per-attempt
+  boundary, with a local stdio or Unix-socket control channel. See [Codex App
+  Server](https://learn.chatgpt.com/docs/app-server).
 - The Agents API self-hosted-environment path instead keeps OpenAI's harness
   outside and runs `codex exec-server` in the supplied environment. The
   executor receives a separate environment key as `CODEX_API_KEY`; generated
@@ -790,6 +793,15 @@ cgroup ownership/placement.
 These no-op probes establish namespace/service-manager preconditions only;
 they do not test OCI mounts, cgroup-controller delegation, worker containment,
 cancellation, credentials, egress, or result import.
+
+### Fresh host-facts recheck (2026-10-05; read-only)
+
+A fresh SSH inventory returned Debian 12 (bookworm), Linux 6.18.15 x86_64,
+`systemd 252.39-1~deb12u2`, rootless `runc` 1.3.5 / OCI spec 1.2.1,
+`cgroup2fs`, and caller UID 1000. This updates the current binary-version
+observation; it does not establish when systemd changed from the earlier
+252.38 sample, prove that the user manager is healthy, or qualify any worker
+execution path. These are host assumptions for bounded no-model tests only.
 
 ### Rootless OCI feasibility probe (2026-10-03)
 
