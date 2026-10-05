@@ -194,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -885,6 +885,96 @@ def _add_sandbox_runtime_content_pins(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_sandbox_execution_private_path_binding(connection: sqlite3.Connection) -> None:
+    """Bind private bundle/state directory inode identities before any OCI launch."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    additions = (
+        (
+            "private_path_binding_version",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (private_path_binding_version IN (0, 1))",
+        ),
+        ("execution_root_dev", "INTEGER"),
+        ("execution_root_ino", "INTEGER"),
+        ("bundle_root_dev", "INTEGER"),
+        ("bundle_root_ino", "INTEGER"),
+        ("state_root_dev", "INTEGER"),
+        ("state_root_ino", "INTEGER"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_private_path_binding_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_private_path_binding_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.private_path_binding_version != 0
+          OR NEW.execution_root_dev IS NOT NULL OR NEW.execution_root_ino IS NOT NULL
+          OR NEW.bundle_root_dev IS NOT NULL OR NEW.bundle_root_ino IS NOT NULL
+          OR NEW.state_root_dev IS NOT NULL OR NEW.state_root_ino IS NOT NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_private_path_binding_must_be_recorded');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_private_path_binding_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_private_path_binding_write_once
+        BEFORE UPDATE OF private_path_binding_version, execution_root_dev,
+          execution_root_ino, bundle_root_dev, bundle_root_ino, state_root_dev,
+          state_root_ino ON sandbox_executions
+        WHEN NOT (
+          OLD.private_path_binding_version = 0
+          AND NEW.private_path_binding_version = 1
+          AND OLD.workspace_binding_version = 0 AND NEW.workspace_binding_version = 1
+          AND OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND NEW.execution_root_dev IS NOT NULL AND NEW.execution_root_dev >= 0
+          AND NEW.execution_root_ino IS NOT NULL AND NEW.execution_root_ino > 0
+          AND NEW.bundle_root_dev IS NOT NULL AND NEW.bundle_root_dev >= 0
+          AND NEW.bundle_root_ino IS NOT NULL AND NEW.bundle_root_ino > 0
+          AND NEW.state_root_dev IS NOT NULL AND NEW.state_root_dev >= 0
+          AND NEW.state_root_ino IS NOT NULL AND NEW.state_root_ino > 0
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_private_path_binding_immutable');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_launch_requires_private_paths")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_private_paths
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            NEW.private_path_binding_version != 1
+            OR NEW.execution_root_dev IS NULL OR NEW.execution_root_ino IS NULL
+            OR NEW.bundle_root_dev IS NULL OR NEW.bundle_root_ino IS NULL
+            OR NEW.state_root_dev IS NULL OR NEW.state_root_ino IS NULL
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_private_paths_required');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_result_candidate_requires_private_paths")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_result_candidate_requires_private_paths
+        BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+          result_candidate_digest ON sandbox_executions
+        WHEN NEW.result_candidate_version = 1
+          AND NEW.private_path_binding_version != 1
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_result_private_paths_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -902,6 +992,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (15, _add_sandbox_workspace_binding),
     (16, _add_sandbox_result_candidate_evidence),
     (17, _add_sandbox_runtime_content_pins),
+    (18, _add_sandbox_execution_private_path_binding),
 )
 
 

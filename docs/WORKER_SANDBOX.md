@@ -399,9 +399,10 @@ identities but labels every cleanup observation `null` and the verification
 status `unverified`: no runtime readback has occurred. A new version-2 report
 cannot supply positive observations. An exact persisted version-1 receipt may
 replay for retry compatibility, but its historical claims remain unverified
-and cannot be replaced. After schema 17, exact persisted pre-17 version-1 and
-version-2 receipts may replay in their original shape; replay does not add the
-new content pins or upgrade their evidence. `cleanup_reported` is therefore not
+and cannot be replaced. After schema 17 or later migrations, exact persisted
+pre-17 version-1 and version-2 receipts may replay in their original shape;
+replay does not add the new content pins or upgrade their evidence.
+`cleanup_reported` is therefore not
 `cleanup_verified`. Existing reaper, worker-finalization, and runtime-teardown
 paths refuse to release a journaled attempt until a future trusted verifier
 records `cleanup_verified`.
@@ -429,15 +430,17 @@ reconstructs the baseline handle after process restart from that durable row,
 then reopens the exact baseline and workspace roots without following the root
 symlink, checks their saved inode identities, and verifies the complete
 baseline tree. After that filesystem work it revalidates the live claim,
-credential, and exact persisted binding fields in a serialized transaction before returning;
-any later result capture or import must still perform its own transactional
-fence check. The restore step checks only the workspace root identity;
-future result capture must recheck that identity and still pass the mutable
-tree through `collect_changes` as hostile output. This closes the process-local
-`Snapshot`-provenance gap for baseline recovery; it does not close same-UID path
-races, impose an aggregate workspace disk quota, produce a worker-exit/cleanup
-attestation, or enable result import. No worker launch route, trusted cleanup
-verifier, or sandbox result-import route is added here, and direct-worker
+credential, and exact persisted binding fields in a serialized transaction
+before returning; any later result capture or import must still perform its own
+transactional fence check. The restore step also reopens the exact execution, bundle, and
+runc-state roots by saved device/inode; future result capture must recheck the
+workspace root identity and still pass the mutable tree through `collect_changes`
+as hostile output. This closes the process-local `Snapshot`-provenance gap for
+baseline recovery and detects replaced runtime paths at each check; it does not
+close same-UID races between revalidation and later use, impose an aggregate
+workspace disk quota, produce a worker-exit/cleanup attestation, or enable result
+import. No worker launch route, trusted cleanup verifier, or sandbox
+result-import route is added here, and direct-worker
 behavior is unchanged. Schema 16 adds a separate non-authorizing candidate
 receipt, described below. The SQLite triggers enforce ordinary journal transition
 and write-once invariants; they are not an adversarial boundary against a
@@ -481,6 +484,18 @@ retroactively. This binds later lifecycle evidence to the exact operator-pinned
 filesystem inventory and runtime executable bytes, but proves neither image
 provenance nor runtime policy application. No `run_worker` executor is wired,
 and the configured-OCI path continues to fail before heartbeat or host fallback.
+
+**Private runtime-path binding (schema 18; still not an executor).** The
+reserved-to-bound workspace transaction now also records device/inode identities
+for the private execution root, OCI bundle root, and runc state root. The
+launcher transition and post-restart workspace restore reopen these exact
+directories without following a root symlink and reject a replacement at the
+same pathname. Legacy rows have unknown path identities and are not backfilled;
+they cannot advance to launch or produce a new candidate. This enables a future
+cleanup collector to address only the paths created for its exact attempt. It
+does not remove those paths, verify runtime teardown, close same-UID races
+between check and use, or write `cleanup_verified`. `run_worker` remains
+fail-closed for configured OCI.
 
 **Runtime-attestation validator and partial host collector (2026-10-04; still
 no launcher).** The `sandbox_attestation` module binds bounded observations into

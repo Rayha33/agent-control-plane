@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import stat
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -94,6 +95,25 @@ _LEGACY_CLEANUP_OBSERVATIONS = {
     "runc_client_identity_absent": True,
     "container_init_identity_absent": True,
 }
+
+
+def _private_directory_identity(path: Path, label: str) -> tuple[int, int]:
+    """Capture one private directory inode without accepting a symlink root."""
+
+    try:
+        observed = path.lstat()
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_private_path_invalid", f"{label} is unavailable for identity binding"
+        ) from error
+    if not stat.S_ISDIR(observed.st_mode):
+        raise SupervisorError("sandbox_private_path_invalid", f"{label} must be a real directory")
+    _verify_directory_identity(
+        path,
+        expected_device=observed.st_dev,
+        expected_inode=observed.st_ino,
+    )
+    return observed.st_dev, observed.st_ino
 
 
 def _sandbox_execution_cleanup_is_verified(connection: Any, attempt_id: str) -> bool:
@@ -381,14 +401,21 @@ class SandboxExecutionJournalMixin:
         if reserved is None or reserved["claim_token"] != claim_token:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
         execution_root = Path(reserved["bundle_path"]).parent
+        bundle_root = Path(reserved["bundle_path"])
+        state_root = Path(reserved["state_path"])
         if (
             baseline_root != execution_root / "baseline"
             or workspace_root != execution_root / "workspace"
+            or bundle_root != execution_root / "bundle"
+            or state_root != execution_root / "state"
         ):
             raise SupervisorError(
                 "sandbox_workspace_invalid",
-                "workspace roots must be the reserved execution directory's exact children",
+                "workspace, bundle, and state roots must be reserved execution children",
             )
+        execution_root_identity = _private_directory_identity(execution_root, "execution root")
+        bundle_root_identity = _private_directory_identity(bundle_root, "bundle root")
+        state_root_identity = _private_directory_identity(state_root, "runc state root")
         _verify_directory_identity(
             baseline_root,
             expected_device=baseline_device,
@@ -442,10 +469,29 @@ class SandboxExecutionJournalMixin:
             execution_root = Path(row["bundle_path"]).parent
             expected_baseline = execution_root / "baseline"
             expected_workspace = execution_root / "workspace"
-            if baseline_root != expected_baseline or workspace_root != expected_workspace:
+            if (
+                baseline_root != expected_baseline
+                or workspace_root != expected_workspace
+                or bundle_root != execution_root / "bundle"
+                or state_root != execution_root / "state"
+            ):
                 raise SupervisorError(
                     "sandbox_workspace_invalid",
-                    "workspace roots must be the reserved execution directory's exact children",
+                    "workspace, bundle, and state roots must be reserved execution children",
+                )
+            current_path_identities = (
+                _private_directory_identity(execution_root, "execution root"),
+                _private_directory_identity(bundle_root, "bundle root"),
+                _private_directory_identity(state_root, "runc state root"),
+            )
+            if current_path_identities != (
+                execution_root_identity,
+                bundle_root_identity,
+                state_root_identity,
+            ):
+                raise SupervisorError(
+                    "sandbox_private_path_conflict",
+                    "private execution directories changed while workspace binding was recorded",
                 )
             values = (
                 str(baseline_root),
@@ -456,6 +502,10 @@ class SandboxExecutionJournalMixin:
                 workspace_inode,
                 manifest_json,
                 baseline.manifest.digest,
+                1,
+                *execution_root_identity,
+                *bundle_root_identity,
+                *state_root_identity,
             )
             if row["workspace_binding_version"] == 1:
                 recorded = (
@@ -467,6 +517,13 @@ class SandboxExecutionJournalMixin:
                     row["workspace_root_ino"],
                     row["baseline_manifest_json"],
                     row["baseline_manifest_digest"],
+                    row["private_path_binding_version"],
+                    row["execution_root_dev"],
+                    row["execution_root_ino"],
+                    row["bundle_root_dev"],
+                    row["bundle_root_ino"],
+                    row["state_root_dev"],
+                    row["state_root_ino"],
                 )
                 if recorded != values:
                     raise SupervisorError(
@@ -484,7 +541,11 @@ class SandboxExecutionJournalMixin:
                   workspace_binding_version = 1,
                   baseline_root_path = ?, baseline_root_dev = ?, baseline_root_ino = ?,
                   workspace_root_path = ?, workspace_root_dev = ?, workspace_root_ino = ?,
-                  baseline_manifest_json = ?, baseline_manifest_digest = ?, updated_at = ?
+                  baseline_manifest_json = ?, baseline_manifest_digest = ?,
+                  private_path_binding_version = ?,
+                  execution_root_dev = ?, execution_root_ino = ?,
+                  bundle_root_dev = ?, bundle_root_ino = ?,
+                  state_root_dev = ?, state_root_ino = ?, updated_at = ?
                 WHERE attempt_id = ? AND claim_token = ? AND phase = 'reserved'
                   AND workspace_binding_version = 0
                 """,
@@ -508,6 +569,13 @@ class SandboxExecutionJournalMixin:
                     "baseline_root_ino": baseline_inode,
                     "workspace_root_dev": workspace_device,
                     "workspace_root_ino": workspace_inode,
+                    "private_path_binding_version": 1,
+                    "execution_root_dev": execution_root_identity[0],
+                    "execution_root_ino": execution_root_identity[1],
+                    "bundle_root_dev": bundle_root_identity[0],
+                    "bundle_root_ino": bundle_root_identity[1],
+                    "state_root_dev": state_root_identity[0],
+                    "state_root_ino": state_root_identity[1],
                     "entry_count": len(baseline.manifest.entries),
                     "total_bytes": baseline.manifest.total_bytes,
                 },
@@ -537,9 +605,10 @@ class SandboxExecutionJournalMixin:
             ).fetchone()
         if row is None or row["claim_token"] != claim_token:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
-        if row["workspace_binding_version"] != 1:
+        if row["workspace_binding_version"] != 1 or row["private_path_binding_version"] != 1:
             raise SupervisorError(
-                "sandbox_workspace_unbound", "execution has no durable workspace binding"
+                "sandbox_workspace_unbound",
+                "execution lacks a complete durable workspace/private-path binding",
             )
         if row["phase"] == "ambiguous":
             raise SupervisorError(
@@ -551,9 +620,25 @@ class SandboxExecutionJournalMixin:
         if (
             Path(row["baseline_root_path"]) != baseline_path
             or Path(row["workspace_root_path"]) != workspace_path
+            or Path(row["bundle_path"]) != execution_root / "bundle"
+            or Path(row["state_path"]) != execution_root / "state"
         ):
             raise SupervisorError(
                 "sandbox_workspace_invalid", "journaled workspace paths do not match execution root"
+            )
+        execution_root_identity = _private_directory_identity(execution_root, "execution root")
+        bundle_root_identity = _private_directory_identity(Path(row["bundle_path"]), "bundle root")
+        state_root_identity = _private_directory_identity(
+            Path(row["state_path"]), "runc state root"
+        )
+        if (
+            execution_root_identity != (row["execution_root_dev"], row["execution_root_ino"])
+            or bundle_root_identity != (row["bundle_root_dev"], row["bundle_root_ino"])
+            or state_root_identity != (row["state_root_dev"], row["state_root_ino"])
+        ):
+            raise SupervisorError(
+                "sandbox_private_path_conflict",
+                "private execution directory identity no longer matches the durable journal",
             )
         baseline = _restore_snapshot_from_record(
             baseline_path,
@@ -579,6 +664,13 @@ class SandboxExecutionJournalMixin:
                 "claim_token",
                 "bundle_path",
                 "workspace_binding_version",
+                "private_path_binding_version",
+                "execution_root_dev",
+                "execution_root_ino",
+                "bundle_root_dev",
+                "bundle_root_ino",
+                "state_root_dev",
+                "state_root_ino",
                 "baseline_root_path",
                 "baseline_root_dev",
                 "baseline_root_ino",
@@ -599,6 +691,7 @@ class SandboxExecutionJournalMixin:
                 )
         return {
             "version": 1,
+            "private_path_binding_version": row["private_path_binding_version"],
             "execution_id": row["execution_id"],
             "attempt_id": attempt_id,
             "claim_token": claim_token,
@@ -606,6 +699,15 @@ class SandboxExecutionJournalMixin:
             "workspace_root": current_workspace,
             "workspace_device": row["workspace_root_dev"],
             "workspace_inode": row["workspace_root_ino"],
+            "execution_root": execution_root,
+            "execution_root_device": row["execution_root_dev"],
+            "execution_root_inode": row["execution_root_ino"],
+            "bundle_root": Path(row["bundle_path"]),
+            "bundle_root_device": row["bundle_root_dev"],
+            "bundle_root_inode": row["bundle_root_ino"],
+            "state_root": Path(row["state_path"]),
+            "state_root_device": row["state_root_dev"],
+            "state_root_inode": row["state_root_ino"],
         }
 
     def _sandbox_execution_capture_result_candidate(
@@ -992,6 +1094,28 @@ class SandboxExecutionJournalMixin:
                         "sandbox_workspace_unbound",
                         "sandbox launch requires a durable baseline/workspace binding",
                     )
+                if row["private_path_binding_version"] != 1:
+                    raise SupervisorError(
+                        "sandbox_private_path_unbound",
+                        "sandbox launch requires exact private bundle/state directory identities",
+                    )
+                execution_root = Path(row["bundle_path"]).parent
+                expected_paths = (
+                    (execution_root, row["execution_root_dev"], row["execution_root_ino"]),
+                    (Path(row["bundle_path"]), row["bundle_root_dev"], row["bundle_root_ino"]),
+                    (Path(row["state_path"]), row["state_root_dev"], row["state_root_ino"]),
+                )
+                if (
+                    Path(row["bundle_path"]) != execution_root / "bundle"
+                    or Path(row["state_path"]) != execution_root / "state"
+                    or any(device is None or inode is None for _, device, inode in expected_paths)
+                ):
+                    raise SupervisorError(
+                        "sandbox_private_path_unbound",
+                        "journaled private execution paths are incomplete or noncanonical",
+                    )
+                for path, device, inode in expected_paths:
+                    _verify_directory_identity(path, expected_device=device, expected_inode=inode)
                 if any(
                     _DIGEST.fullmatch(row[name] or "") is None
                     for name in ("rootfs_closure_digest", "runc_executable_digest")

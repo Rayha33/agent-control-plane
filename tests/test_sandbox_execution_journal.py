@@ -97,6 +97,8 @@ def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
     )
     execution_root = Path(row["bundle_path"]).parent
     execution_root.mkdir(mode=0o700, parents=True)
+    Path(row["bundle_path"]).mkdir(mode=0o700)
+    Path(row["state_path"]).mkdir(mode=0o700)
     baseline = copy_snapshot(attempt["worktree"], execution_root / "baseline")
     workspace = copy_snapshot(baseline.root, execution_root / "workspace")
     return supervisor._sandbox_execution_bind_workspace(
@@ -214,14 +216,20 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v17_requires_durable_workspace_binding_before_launch(repo: Path) -> None:
+def test_schema_v18_requires_durable_workspace_and_private_path_binding_before_launch(
+    repo: Path,
+) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 17
+    assert SCHEMA_VERSION == 18
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
+    assert row["private_path_binding_version"] == 1
+    assert row["execution_root_ino"] == Path(row["bundle_path"]).parent.stat().st_ino
+    assert row["bundle_root_ino"] == Path(row["bundle_path"]).stat().st_ino
+    assert row["state_root_ino"] == Path(row["state_path"]).stat().st_ino
     assert row["baseline_manifest_digest"]
     assert row["baseline_root_path"].endswith("/baseline")
     assert row["workspace_root_path"].endswith("/workspace")
@@ -246,6 +254,9 @@ def test_schema_v17_requires_durable_workspace_binding_before_launch(repo: Path)
         runtime_pin_migration = dict(MIGRATIONS)[17]
         runtime_pin_migration(connection)
         runtime_pin_migration(connection)
+        private_path_migration = dict(MIGRATIONS)[18]
+        private_path_migration(connection)
+        private_path_migration(connection)
         with pytest.raises(sqlite3.IntegrityError, match="result_candidate_immutable"):
             connection.execute(
                 "UPDATE sandbox_executions SET result_candidate_version = 1, "
@@ -333,7 +344,7 @@ def test_v15_to_v16_migration_adds_non_authorizing_candidate_fields() -> None:
         connection.close()
 
 
-def test_v16_to_v17_migration_keeps_unknown_content_pins_non_authorizing() -> None:
+def test_v16_to_v18_migrations_keep_unknown_content_and_path_pins_non_authorizing() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -375,7 +386,25 @@ def test_v16_to_v17_migration_keeps_unknown_content_pins_non_authorizing() -> No
             """,
             ("c" * 64,),
         )
-        with pytest.raises(sqlite3.IntegrityError, match="sandbox_execution_content_pins_required"):
+        migrations[18](connection)
+        migrations[18](connection)
+        legacy_path_binding = connection.execute(
+            "SELECT private_path_binding_version, execution_root_ino, bundle_root_ino, "
+            "state_root_ino FROM sandbox_executions WHERE attempt_id = 'attempt-1'"
+        ).fetchone()
+        assert legacy_path_binding["private_path_binding_version"] == 0
+        assert legacy_path_binding["execution_root_ino"] is None
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_private_path_binding_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET private_path_binding_version = 1, "
+                "execution_root_dev = 1, execution_root_ino = 2, bundle_root_dev = 1, "
+                "bundle_root_ino = 3, state_root_dev = 1, state_root_ino = 4 "
+                "WHERE attempt_id = 'attempt-1'"
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_execution_(content_pins|private_paths)_required",
+        ):
             connection.execute(
                 """
                 UPDATE sandbox_executions
@@ -412,7 +441,8 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
     with (
         supervisor.connect() as connection,
         pytest.raises(
-            sqlite3.IntegrityError, match="workspace_binding_required|phase_transition_invalid"
+            sqlite3.IntegrityError,
+            match="workspace_binding_required|private_paths_required|phase_transition_invalid",
         ),
     ):
         connection.execute(
@@ -963,6 +993,12 @@ def test_recorded_execution_evidence_is_immutable(repo: Path) -> None:
                 "UPDATE sandbox_executions SET cleanup_receipt_json = '{}' WHERE attempt_id = ?",
                 (attempt["id"],),
             )
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_private_path_binding_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET bundle_root_ino = bundle_root_ino + 1 "
+                "WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
 
 
 def test_transition_order_keeps_monitor_runc_and_init_identities_distinct(repo: Path) -> None:
@@ -1003,6 +1039,71 @@ def test_transition_order_keeps_monitor_runc_and_init_identities_distinct(repo: 
     row = supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
     assert row["phase"] == "exited"
     assert row["runc_exit_code"] == 0
+    assert supervisor.verify_event_chain()["ok"] is True
+
+
+@pytest.mark.parametrize("path_field", ["execution_root", "bundle_path", "state_path"])
+@pytest.mark.parametrize("replacement_kind", ["symlink", "directory"])
+def test_workspace_restore_and_launch_reject_replaced_private_runtime_paths(
+    repo: Path,
+    tmp_path: Path,
+    path_field: str,
+    replacement_kind: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+    runtime_path = (
+        Path(row["bundle_path"]).parent if path_field == "execution_root" else Path(row[path_field])
+    )
+    moved_path = runtime_path.with_name(f"{runtime_path.name}-original")
+    runtime_path.rename(moved_path)
+    if replacement_kind == "symlink":
+        runtime_path.symlink_to(tmp_path, target_is_directory=True)
+    else:
+        runtime_path.mkdir(mode=0o700)
+        if path_field == "execution_root":
+            (runtime_path / "bundle").mkdir(mode=0o700)
+            (runtime_path / "state").mkdir(mode=0o700)
+
+    with pytest.raises(SupervisorError) as restore:
+        supervisor._sandbox_execution_restore_workspace_binding(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert restore.value.code in {
+        "sandbox_private_path_invalid",
+        "sandbox_private_path_conflict",
+        "invalid_snapshot",
+    }
+
+    with pytest.raises(SupervisorError) as launch:
+        record_launch(supervisor, attempt)
+    assert launch.value.code in {
+        "sandbox_private_path_invalid",
+        "invalid_snapshot",
+        "unsafe_workspace_root",
+    }
+
+
+def test_private_runtime_path_binding_is_required_and_write_once(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    row = reserve(supervisor, attempt)
+
+    with supervisor.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_private_path_binding_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET state_root_ino = state_root_ino + 1 "
+                "WHERE attempt_id = ?",
+                (attempt["id"],),
+            )
+
+    restored = supervisor._sandbox_execution_restore_workspace_binding(
+        attempt["id"], attempt["claim_token"]
+    )
+    assert restored["private_path_binding_version"] == 1
+    assert restored["bundle_root_inode"] == row["bundle_root_ino"]
+    assert restored["state_root_inode"] == row["state_root_ino"]
     assert supervisor.verify_event_chain()["ok"] is True
 
 
