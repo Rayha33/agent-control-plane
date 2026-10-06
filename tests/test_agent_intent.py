@@ -424,7 +424,7 @@ def test_active_intent_list_reports_its_attempt_limit(
 
 
 def test_intent_schema_migration_is_versioned_and_installs_immutability_guards() -> None:
-    assert SCHEMA_VERSION == 23
+    assert SCHEMA_VERSION == 24
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE attempts(id TEXT PRIMARY KEY)")
 
@@ -442,7 +442,26 @@ def test_intent_schema_migration_is_versioned_and_installs_immutability_guards()
     connection.close()
 
 
-def test_schema_22_control_database_upgrades_to_intent_schema_23(repo: Path) -> None:
+def test_latest_intent_revision_index_uses_attempt_and_revision_order() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        """CREATE TABLE agent_intent_revisions(
+            attempt_id TEXT, claim_token INTEGER, revision INTEGER, intent_json TEXT,
+            created_at TEXT, PRIMARY KEY(attempt_id, claim_token, revision)
+        )"""
+    )
+
+    dict(MIGRATIONS)[24](connection)
+
+    plan = connection.execute(
+        "EXPLAIN QUERY PLAN SELECT revision FROM agent_intent_revisions "
+        "WHERE attempt_id = 'a' ORDER BY revision DESC LIMIT 1"
+    ).fetchall()
+    assert any("idx_agent_intent_revisions_attempt_latest" in row[3] for row in plan)
+    connection.close()
+
+
+def test_schema_22_control_database_upgrades_to_intent_schema_24(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     with supervisor.connect() as connection:
         for trigger in (
@@ -458,10 +477,14 @@ def test_schema_22_control_database_upgrades_to_intent_schema_23(repo: Path) -> 
     upgraded = GitSupervisor(repo)
     assert upgraded.schema_version_on_open == 22
     read_only = GitSupervisor(repo, read_only=True)
-    assert read_only.schema_version_on_open == 23
+    assert read_only.schema_version_on_open == 24
     with read_only.connect() as connection:
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_intent_revisions'"
+        ).fetchone()
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_agent_intent_revisions_attempt_latest'"
         ).fetchone()
 
 

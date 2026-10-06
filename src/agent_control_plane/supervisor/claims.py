@@ -73,6 +73,7 @@ class ClaimsMixin:
         """Read a sanitized Git query without buffering an unbounded tree listing."""
         if timeout_seconds <= 0:
             raise SupervisorError("git_timeout", "read-only Git query timed out")
+        deadline = time.monotonic() + timeout_seconds
         git = str(self._system_git_executable(self.root))
         argv = [
             *self._supervisor_git_prefix(git, Path(os.devnull)),
@@ -117,7 +118,6 @@ class ClaimsMixin:
         reader = threading.Thread(target=drain_stdout, daemon=True)
         reader.start()
         output = bytearray()
-        deadline = time.monotonic() + timeout_seconds
         try:
             while not reader_done.is_set() or not chunks.empty():
                 remaining = deadline - time.monotonic()

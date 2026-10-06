@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -360,6 +360,17 @@ def _add_agent_intent_revisions(connection: sqlite3.Connection) -> None:
               AND revision = NEW.revision
           )
           BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END
+        """
+    )
+
+
+def _add_agent_intent_attempt_latest_index(connection: sqlite3.Connection) -> None:
+    """Find each attempt's latest immutable intent revision with one index seek."""
+
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_intent_revisions_attempt_latest
+          ON agent_intent_revisions(attempt_id, revision DESC)
         """
     )
 
@@ -1590,6 +1601,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (21, _add_sandbox_exit_receipt_guard),
     (22, _add_sandbox_launch_plan_binding),
     (23, _add_agent_intent_revisions),
+    (24, _add_agent_intent_attempt_latest_index),
 )
 
 

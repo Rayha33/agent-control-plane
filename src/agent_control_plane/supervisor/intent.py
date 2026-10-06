@@ -376,17 +376,22 @@ class AgentIntentMixin:
         }
 
     def _observed_changed_paths(self, attempt: sqlite3.Row, *, deadline: float) -> dict[str, Any]:
+        if time.monotonic() >= deadline:
+            return {"status": "not_sampled", "reason": "time_budget_exhausted", "paths": []}
         worktree = Path(attempt["worktree"])
         root_value = attempt["worktree_root"] or str(self.state_dir / "worktrees")
         root = Path(root_value)
         expected = root / attempt["id"]
-        if (
-            not worktree.is_absolute()
-            or not root.is_absolute()
-            or worktree.is_symlink()
-            or worktree.resolve(strict=False) != expected.resolve(strict=False)
-            or not worktree.is_dir()
-        ):
+        worktree_matches_attempt = (
+            worktree.is_absolute()
+            and root.is_absolute()
+            and not worktree.is_symlink()
+            and worktree.resolve(strict=False) == expected.resolve(strict=False)
+            and worktree.is_dir()
+        )
+        if time.monotonic() >= deadline:
+            return {"status": "not_sampled", "reason": "time_budget_exhausted", "paths": []}
+        if not worktree_matches_attempt:
             return {"status": "unavailable", "reason": "attempt_worktree_unavailable", "paths": []}
         if (
             not isinstance(attempt["start_sha"], str)
@@ -471,9 +476,11 @@ class AgentIntentMixin:
                 LEFT JOIN agent_intent_revisions AS intent
                   ON intent.attempt_id = attempt.id
                  AND intent.revision = (
-                     SELECT MAX(current.revision)
+                     SELECT current.revision
                      FROM agent_intent_revisions AS current
                      WHERE current.attempt_id = attempt.id
+                     ORDER BY current.revision DESC
+                     LIMIT 1
                  )
                 WHERE attempt.status = 'working' AND task.status = 'working'
                   AND task.current_attempt_id = attempt.id AND attempt.lease_expires_at > ?

@@ -858,14 +858,14 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v23_requires_durable_workspace_and_private_path_binding_before_launch(
+def test_current_schema_requires_durable_workspace_and_private_path_binding_before_launch(
     repo: Path,
 ) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 23
+    assert SCHEMA_VERSION == 24
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1

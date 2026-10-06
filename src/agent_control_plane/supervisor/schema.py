@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS agent_intent_revisions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_intent_revisions_latest
   ON agent_intent_revisions(attempt_id, claim_token, revision DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_intent_revisions_attempt_latest
+  ON agent_intent_revisions(attempt_id, revision DESC);
 CREATE TRIGGER IF NOT EXISTS agent_intent_revisions_no_update
   BEFORE UPDATE ON agent_intent_revisions
   BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END;

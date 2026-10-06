@@ -447,15 +447,20 @@ retains revisions after the attempt is terminal. The read-only MCP tools
 credential. History is paged (25 revisions by default, maximum 50 per page);
 use `--after-revision` to continue a long lineage.
 
-The shared `plan`, `queue`, and `status` views (and plain `acp intents`) do not
-spawn Git subprocesses. They return `observed.status=not_requested`; ask for the
-separate filesystem observation explicitly with `acp intents --observed` or
-`acp_intents` with `include_observed=true`. That read samples at most eight
-attempts within a two-second total budget; unsampled attempts are identified,
-not reported as clean. The comparison includes at most 256 active attempts and
-caps overlap/dependency analysis at 100,000 comparisons or 1,000 results. Each
-section carries a `complete`/`truncated` summary so a partial scan cannot be
-mistaken for no conflicts. Identical scope entries are normalized away.
+Intent coordination in the shared `plan`, `queue`, and `status` views (and plain
+`acp intents`) does not run its per-attempt changed-path Git scans by default;
+those entries say `observed.status=not_requested`. Other status sections may
+perform their own Git reads, including worktree inventory and read-resource
+checks. Request the intent changed-path scan explicitly with `acp intents
+--observed` or `acp_intents` with `include_observed=true`. It considers at most
+eight attempts and applies a shared two-second deadline to the Git queries.
+Filesystem path validation and OS process startup are synchronous and cannot be
+forcibly interrupted; if the deadline is exhausted, the result is unavailable or
+not sampled rather than reported as clean. The comparison includes at most 256
+active attempts and caps overlap/dependency analysis at 100,000 comparisons or
+1,000 results. Each section carries a `complete`/`truncated` summary so partial
+coverage cannot be mistaken for no conflicts. Identical scope entries are
+normalized away.
 
 Overlaps name both owners and classify read/read, advisory read/write,
 conflicting write, or explicitly shared ownership. Dependencies can point to a
