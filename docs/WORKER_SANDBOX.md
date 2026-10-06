@@ -156,8 +156,14 @@ were `git_supervisor.py`
 `57bddbb0f76c3526973adc5419cfc71a110cf9cca519f3c3ecd83e9efab01c34`.
 The full local suite passed against this schema-21 candidate (1,165 passed,
 57 platform/runtime-gated skips, 388.54 seconds); local Ruff and `uv build`
-passed. Independent exact-hash re-review and exact-head hosted CI remain
-pending.
+passed. Independent exact-hash re-review returned GO on 2026-10-06: all eight
+supplied hashes matched, and the reviewer confirmed the connection-scoped
+receipt gate, sole validating exit writer, generic-transition restriction,
+and direct-SQL regression. The reviewer did not rerun the reported suites.
+GitHub Actions run `37438363183` was triggered on published implementation
+commit `0d4f45be2d52f540fc424d619ecea1af1af07f33`; its four matrix jobs were
+in progress when this evidence note was written. Any follow-up commit requires
+its own exact-head CI check.
 
 This remains an implementation slice, not a complete security claim. On
 2026-10-05, two opt-in no-model tests passed on NAS Linux 6.18.15 with runc
@@ -183,8 +189,9 @@ API. The `_spawn_pinned_runc_for_unisolated_diagnostic()` and its host-path
 workers.
 
 The current candidate aims to bind the exact bytes and directory objects runc
-consumes. The Linux attack test now passes, but independent exact-hash review
-is still pending. State and workspace remain host-backed directories:
+consumes. The Linux attack test passes, and the independent exact-hash review
+returned GO for the schema-21 source/test state described above; that reviewer
+did not rerun the test suites. State and workspace remain host-backed directories:
 descriptor pinning prevents a launch-time pathname replacement from redirecting
 runc, but it does not create a per-attempt filesystem boundary against another
 same-UID process that can access those directories. The descriptor-bound config
