@@ -629,6 +629,48 @@ def test_cli_plan_queue_and_status_are_read_only_previews(tmp_path: Path) -> Non
     assert "cli-worker" in text.stdout
 
 
+def test_cli_publishes_intent_and_read_only_views_share_the_structured_snapshot(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "intent", "alpha.txt")
+    claimed = json.loads(run_cli(repo, "claim", task["id"], "--agent", "cli-worker").stdout)
+    document = {
+        "version": 1,
+        "responsibility": "Update alpha data flow",
+        "paths": [{"pattern": "alpha.txt", "change": "write"}],
+        "surfaces": [],
+        "depends_on": [],
+        "phase": "planned",
+        "confidence": 0.8,
+    }
+
+    published = run_cli(
+        repo,
+        "intent-publish",
+        claimed["id"],
+        "--token",
+        str(claimed["claim_token"]),
+        "--json",
+        json.dumps(document, separators=(",", ":")),
+    )
+    assert published.returncode == 0, published.stderr
+    assert json.loads(published.stdout)["revision"] == 1
+
+    intents = json.loads(run_cli(repo, "intents").stdout)
+    plan = json.loads(run_cli(repo, "plan", _add(repo, "waiting", "beta.txt")["id"]).stdout)
+    status = json.loads(run_cli(repo, "status").stdout)
+    assert intents["active_attempts"][0]["intent"]["responsibility"] == document["responsibility"]
+    assert plan["intent_coordination"] == intents
+    assert status["intent_coordination"] == intents
+    assert (
+        json.loads(run_cli(repo, "intent-history", claimed["id"]).stdout)["revisions"][0][
+            "revision"
+        ]
+        == 1
+    )
+
+
 def test_cli_status_read_only_open_does_not_create_git_coordination_state(
     tmp_path: Path,
 ) -> None:

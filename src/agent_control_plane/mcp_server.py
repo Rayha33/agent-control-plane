@@ -79,6 +79,25 @@ TOOLS: dict[str, tuple[str, str, dict[str, Any]]] = {
             "properties": {"task_id": {"type": "string"}},
         },
     ),
+    "acp_intents": (
+        "intent_snapshot",
+        "Active caller-declared intent, exact/potential overlaps, dependencies, and server-observed changed paths. Advisory only.",
+        {"type": "object", "additionalProperties": False, "properties": {}},
+    ),
+    "acp_intent_history": (
+        "intent_history",
+        "Append-only intent revisions for one attempt, including terminal attempts.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["attempt_id"],
+            "properties": {
+                "attempt_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "after_revision": {"type": "integer", "minimum": 0},
+            },
+        },
+    ),
     "acp_bundle": (
         "reproduction_bundle",
         "The signed, deterministic reproduction bundle for one QC verdict.",

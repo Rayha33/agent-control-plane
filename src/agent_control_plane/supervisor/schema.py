@@ -120,6 +120,30 @@ CREATE TABLE IF NOT EXISTS attempts (
   updated_at TEXT NOT NULL,
   UNIQUE(task_id, number)
 );
+CREATE TABLE IF NOT EXISTS agent_intent_revisions (
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  claim_token INTEGER NOT NULL,
+  revision INTEGER NOT NULL,
+  intent_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(attempt_id, claim_token, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_intent_revisions_latest
+  ON agent_intent_revisions(attempt_id, claim_token, revision DESC);
+CREATE TRIGGER IF NOT EXISTS agent_intent_revisions_no_update
+  BEFORE UPDATE ON agent_intent_revisions
+  BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END;
+CREATE TRIGGER IF NOT EXISTS agent_intent_revisions_no_delete
+  BEFORE DELETE ON agent_intent_revisions
+  BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END;
+CREATE TRIGGER IF NOT EXISTS agent_intent_revisions_no_replace
+  BEFORE INSERT ON agent_intent_revisions
+  WHEN EXISTS (
+    SELECT 1 FROM agent_intent_revisions
+    WHERE attempt_id = NEW.attempt_id AND claim_token = NEW.claim_token
+      AND revision = NEW.revision
+  )
+  BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END;
 CREATE TABLE IF NOT EXISTS resource_leases (
   resource TEXT PRIMARY KEY,
   task_id TEXT,

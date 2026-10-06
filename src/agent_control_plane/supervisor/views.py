@@ -323,11 +323,15 @@ class ViewsMixin:
 
     def plan_claim(self, task_id: str) -> dict[str, Any]:
         """Dry-run a claim. Read-only: it never reaps, claims, or provisions."""
-        return Scheduler(self).plan_claim(task_id)
+        preview = Scheduler(self).plan_claim(task_id)
+        preview["intent_coordination"] = self.intent_snapshot()
+        return preview
 
     def ready_queue(self) -> dict[str, Any]:
         """Deterministic launch plan for every claimable task. Read-only."""
-        return Scheduler(self).ready_queue()
+        queue = Scheduler(self).ready_queue()
+        queue["intent_coordination"] = self.intent_snapshot()
+        return queue
 
     def merge_plan(self) -> dict[str, Any]:
         """Integration ordering preview for approved submissions. Read-only."""
@@ -415,6 +419,7 @@ class ViewsMixin:
             "configured_root": str(configured_worktree_root),
             "managed_roots": managed_roots,
         }
+        snapshot["intent_coordination"] = self.intent_snapshot()
         return snapshot
 
     @staticmethod

@@ -15,6 +15,7 @@ Where each phase lives:
     config       Config, .acp/config.toml loading, per-attempt trust pins
     identity     runner enrollment and authentication
     claims       claim, heartbeat, the write-set guard, submit
+    intent       claim-fenced, append-only work intent and read-only overlap views
     runtime      runtime allocation, driver secrets/evidence, runtime up/down/restart
     workers      worker launch, registration and termination
     process      contained child processes, the kernel monitor, the supervisor's Git calls

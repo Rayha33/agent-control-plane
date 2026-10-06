@@ -808,6 +808,40 @@ class StatusView:
             )
         if snapshot["truncated"]:
             lines.append(f"  ... {counts['tasks'] - len(snapshot['tasks'])} more")
+        intent = snapshot.get("intent_coordination")
+        if intent is not None:
+            lines += ["", "AGENT INTENT (advisory only)"]
+            if not intent.get("active_attempts"):
+                lines.append("  no active attempts have published intent")
+            for entry in intent.get("active_attempts", []):
+                declared = entry.get("intent") or {}
+                scopes = [item["pattern"] for item in declared.get("paths", [])]
+                state = entry.get("intent_state", "unknown")
+                lines.append(
+                    f"  {entry['task_id']} attempt {entry['attempt_id'][:8]} "
+                    f"{entry['agent_id']} {state}: {', '.join(scopes) if scopes else 'no paths declared'}"
+                )
+                observed = entry.get("observed", {})
+                if observed.get("status") == "available":
+                    lines.append(
+                        f"    observed changed paths: {', '.join(observed.get('paths', [])) or 'none'}"
+                    )
+                else:
+                    lines.append(
+                        f"    observed changed paths: unavailable ({observed.get('reason', 'unknown')})"
+                    )
+            for overlap in intent.get("overlaps", []):
+                left = overlap["left"]
+                right = overlap["right"]
+                scope = left.get("pattern", left.get("name", overlap["kind"]))
+                lines.append(
+                    f"  overlap {overlap['classification']}: {left['task_id']} ↔ "
+                    f"{right['task_id']} on {scope}"
+                )
+            for missing in intent.get("unknown_attempts", []):
+                lines.append(
+                    f"  unknown/incomplete {missing['attempt_id'][:8]}: {missing['state']}"
+                )
         disk = snapshot.get("disk")
         if disk is not None:
             lines += ["", "DISK"]

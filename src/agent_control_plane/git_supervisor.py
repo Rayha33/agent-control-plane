@@ -163,6 +163,7 @@ from .supervisor.config import (
 )
 from .supervisor.identity import IdentityMixin
 from .supervisor.integration import IntegrationMixin
+from .supervisor.intent import AgentIntentMixin
 from .supervisor.process import ProcessMixin
 from .supervisor.qc import QcMixin
 from .supervisor.reaper import ReaperMixin
@@ -194,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -310,6 +311,55 @@ def _add_qc_runs_latest_lookup_index(connection: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_qc_runs_submission_latest
           ON qc_runs(submission_id, finished_at DESC, id DESC)
+        """
+    )
+
+
+def _add_agent_intent_revisions(connection: sqlite3.Connection) -> None:
+    """Store immutable, claim-fenced revisions of caller-declared work intent."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_intent_revisions (
+          attempt_id TEXT NOT NULL REFERENCES attempts(id),
+          claim_token INTEGER NOT NULL,
+          revision INTEGER NOT NULL,
+          intent_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(attempt_id, claim_token, revision)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_intent_revisions_latest
+          ON agent_intent_revisions(attempt_id, claim_token, revision DESC)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS agent_intent_revisions_no_update
+          BEFORE UPDATE ON agent_intent_revisions
+          BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS agent_intent_revisions_no_delete
+          BEFORE DELETE ON agent_intent_revisions
+          BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS agent_intent_revisions_no_replace
+          BEFORE INSERT ON agent_intent_revisions
+          WHEN EXISTS (
+            SELECT 1 FROM agent_intent_revisions
+            WHERE attempt_id = NEW.attempt_id AND claim_token = NEW.claim_token
+              AND revision = NEW.revision
+          )
+          BEGIN SELECT RAISE(ABORT, 'agent_intent_revision_immutable'); END
         """
     )
 
@@ -1539,6 +1589,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (20, _add_sandbox_kernel_wait_evidence),
     (21, _add_sandbox_exit_receipt_guard),
     (22, _add_sandbox_launch_plan_binding),
+    (23, _add_agent_intent_revisions),
 )
 
 
@@ -1572,6 +1623,7 @@ class GitSupervisor(
     StoreMixin,
     ConfigMixin,
     IdentityMixin,
+    AgentIntentMixin,
     ViewsMixin,
     ProcessMixin,
     WorkersMixin,

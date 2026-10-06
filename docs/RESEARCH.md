@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-10-03.
+Research updated: 2026-10-06.
 
 ## Verdict
 
@@ -410,6 +410,36 @@ tracked paths at claim, then expose changed paths and before/after object ids in
 status and integration preview. The signal is advisory only. It neither infers actual reads
 nor proves a semantic break; missing scopes or Git state stay visibly unknown, and no
 automatic blocking or requeue follows.
+
+### Agents need a revisable plan before overlapping edits (2026-10-06)
+
+[Codex issue #36719](https://github.com/openai/codex/issues/36719), opened Aug 3,
+asks agents to publish and revise likely file, symbol, API, and schema changes, name
+dependencies and phase, and surface overlap without turning prediction into a rigid
+lock. A separate [Codex issue #37226](https://github.com/openai/codex/issues/37226)
+describes stale writes when independent chats share a checkout. In a practitioner
+[discussion about parallel agents](https://www.reddit.com/r/ChatGPTCoding/comments/1vx0hb6/if_you_run_multiple_ai_agents_on_the_same_repo/),
+participants describe worktrees solving source collisions while shared services,
+databases, migrations, and common router/schema files still need separate ownership.
+These are feature requests and individual reports, not prevalence measurements.
+
+The empirical picture is narrower than the anecdotes may suggest. A 2026 study of
+33,596 agent-authored pull requests across 2,807 repositories found cross-agent pairs
+were 0.5% of its observed co-active pairs (in 122 repositories); in a replay sample of
+747 unique pairs, textual merge conflicts were 41.7% for cross-agent pairs versus
+19.8% for same-agent pairs. The authors note that textual conflict detection misses
+semantic conflicts. This is evidence that cross-agent co-activity is not universal in
+that dataset, but its observed cross-agent subset is riskier; it does not estimate how
+often two agents in one live checkout collide. [Study and abstract](https://arxiv.org/abs/2607.04697).
+
+The product response is an append-only, claim-fenced intent history with a
+read-only comparison of declared path/surface overlap, dependencies, and separately
+Git-observed changed paths. It distinguishes harmless read/read overlap, likely
+write conflicts, and explicitly shared ownership. This is a coordination signal,
+not proof that an agent published before its first write, a semantic conflict detector,
+or a lock: declarations can be missing, stale, incomplete, or wrong, and no automatic
+blocking follows. The feature addresses the planning-layer gap while preserving worktree,
+resource, runtime, and integration gates as separate controls.
 
 ### CoreSimulator devices are shared runtime state (2026-10-03)
 
