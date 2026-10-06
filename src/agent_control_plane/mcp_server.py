@@ -81,8 +81,12 @@ TOOLS: dict[str, tuple[str, str, dict[str, Any]]] = {
     ),
     "acp_intents": (
         "intent_snapshot",
-        "Active caller-declared intent, exact/potential overlaps, dependencies, and server-observed changed paths. Advisory only.",
-        {"type": "object", "additionalProperties": False, "properties": {}},
+        "Active caller-declared intent and bounded overlap/dependency analysis; optionally request bounded server Git observations. Advisory only.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"include_observed": {"type": "boolean", "default": False}},
+        },
     ),
     "acp_intent_history": (
         "intent_history",

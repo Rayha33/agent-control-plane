@@ -826,10 +826,28 @@ class StatusView:
                     lines.append(
                         f"    observed changed paths: {', '.join(observed.get('paths', [])) or 'none'}"
                     )
+                elif observed.get("status") == "not_requested":
+                    lines.append(
+                        "    observed changed paths: not requested (use `acp intents --observed`)"
+                    )
+                elif observed.get("status") == "not_sampled":
+                    lines.append(
+                        "    observed changed paths: not sampled "
+                        f"({observed.get('reason', 'unknown')})"
+                    )
                 else:
                     lines.append(
                         f"    observed changed paths: unavailable ({observed.get('reason', 'unknown')})"
                     )
+            for analysis_name in ("overlap_analysis", "dependency_analysis"):
+                analysis = intent.get(analysis_name, {})
+                if analysis.get("status") == "truncated":
+                    lines.append(
+                        f"  {analysis_name.replace('_', ' ')} truncated: "
+                        f"{analysis.get('reason', 'unknown')}"
+                    )
+            if intent.get("active_attempt_summary", {}).get("truncated"):
+                lines.append("  active intent list truncated at its safety limit")
             for overlap in intent.get("overlaps", []):
                 left = overlap["left"]
                 right = overlap["right"]

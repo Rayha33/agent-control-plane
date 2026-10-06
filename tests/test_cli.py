@@ -658,9 +658,12 @@ def test_cli_publishes_intent_and_read_only_views_share_the_structured_snapshot(
     assert json.loads(published.stdout)["revision"] == 1
 
     intents = json.loads(run_cli(repo, "intents").stdout)
+    observed_intents = json.loads(run_cli(repo, "intents", "--observed").stdout)
     plan = json.loads(run_cli(repo, "plan", _add(repo, "waiting", "beta.txt")["id"]).stdout)
     status = json.loads(run_cli(repo, "status").stdout)
     assert intents["active_attempts"][0]["intent"]["responsibility"] == document["responsibility"]
+    assert intents["observation_summary"]["requested"] is False
+    assert observed_intents["observation_summary"]["requested"] is True
     assert plan["intent_coordination"] == intents
     assert status["intent_coordination"] == intents
     assert (

@@ -67,8 +67,12 @@ _RESULT_IMPORT_STAGING_TOTAL_MAX_BYTES = 2 * 1024 * 1024 * 1024
 class ClaimsMixin:
     """Claiming a task, heartbeats, the write-set guard and submission."""
 
-    def _git_readonly_bytes_bounded(self, *arguments: str, max_bytes: int) -> bytes:
+    def _git_readonly_bytes_bounded(
+        self, *arguments: str, max_bytes: int, timeout_seconds: float = 10.0
+    ) -> bytes:
         """Read a sanitized Git query without buffering an unbounded tree listing."""
+        if timeout_seconds <= 0:
+            raise SupervisorError("git_timeout", "read-only Git query timed out")
         git = str(self._system_git_executable(self.root))
         argv = [
             *self._supervisor_git_prefix(git, Path(os.devnull)),
@@ -113,7 +117,7 @@ class ClaimsMixin:
         reader = threading.Thread(target=drain_stdout, daemon=True)
         reader.start()
         output = bytearray()
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + timeout_seconds
         try:
             while not reader_done.is_set() or not chunks.empty():
                 remaining = deadline - time.monotonic()

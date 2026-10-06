@@ -447,13 +447,24 @@ retains revisions after the attempt is terminal. The read-only MCP tools
 credential. History is paged (25 revisions by default, maximum 50 per page);
 use `--after-revision` to continue a long lineage.
 
+The shared `plan`, `queue`, and `status` views (and plain `acp intents`) do not
+spawn Git subprocesses. They return `observed.status=not_requested`; ask for the
+separate filesystem observation explicitly with `acp intents --observed` or
+`acp_intents` with `include_observed=true`. That read samples at most eight
+attempts within a two-second total budget; unsampled attempts are identified,
+not reported as clean. The comparison includes at most 256 active attempts and
+caps overlap/dependency analysis at 100,000 comparisons or 1,000 results. Each
+section carries a `complete`/`truncated` summary so a partial scan cannot be
+mistaken for no conflicts. Identical scope entries are normalized away.
+
 Overlaps name both owners and classify read/read, advisory read/write,
 conflicting write, or explicitly shared ownership. Dependencies can point to a
 declared `kind:name` surface across different paths; matches are shown with
 compatibility `not_assessed`. Missing, incomplete, stale, or unparseable
 declarations remain explicit `unknown`, never "no conflict." The intent is
-shown beside changed paths ACP derives from the attempt worktree's Git state;
-those observations do not include semantic review or prove merge safety.
+shown separately from changed paths ACP derives from the attempt worktree's Git
+state when explicitly requested; those observations do not include semantic
+review or prove merge safety.
 
 ## Operator status
 

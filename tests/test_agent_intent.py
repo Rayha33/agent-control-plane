@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from support import init_repo, make_task
 
+import agent_control_plane.supervisor.intent as intent_module
 from agent_control_plane.git_supervisor import (
     MIGRATIONS,
     SCHEMA_VERSION,
@@ -154,8 +155,14 @@ def test_missing_intent_is_unknown_and_server_observes_changed_paths_read_only(r
     snapshot = supervisor.intent_snapshot()
 
     assert snapshot["active_attempts"][0]["intent_state"] == "missing"
-    assert snapshot["unknown_attempts"] == [{"attempt_id": attempt["id"], "state": "missing"}]
     assert snapshot["active_attempts"][0]["observed"] == {
+        "status": "not_requested",
+        "reason": "use_explicit_observation",
+        "paths": [],
+    }
+    assert snapshot["unknown_attempts"] == [{"attempt_id": attempt["id"], "state": "missing"}]
+    observed_snapshot = supervisor.intent_snapshot(include_observed=True)
+    assert observed_snapshot["active_attempts"][0]["observed"] == {
         "status": "available",
         "source": "supervisor_git_observation",
         "paths": ["alpha.txt"],
@@ -165,6 +172,7 @@ def test_missing_intent_is_unknown_and_server_observes_changed_paths_read_only(r
 
     read_only = GitSupervisor(repo, read_only=True)
     assert dispatch(read_only, "acp_intents", {}) == snapshot
+    assert dispatch(read_only, "acp_intents", {"include_observed": True}) == observed_snapshot
 
     with supervisor.connect() as connection:
         connection.execute(
@@ -267,11 +275,152 @@ def test_observer_rejects_option_like_untrusted_start_revision(repo: Path) -> No
             (f"--output={would_be_output}", attempt["id"]),
         )
 
-    observed = supervisor.intent_snapshot()["active_attempts"][0]["observed"]
+    observed = supervisor.intent_snapshot(include_observed=True)["active_attempts"][0]["observed"]
 
     assert observed["status"] == "unavailable"
     assert observed["reason"] == "invalid_start_revision"
     assert not would_be_output.exists()
+
+
+def test_duplicate_intent_scopes_are_normalized_without_erasing_distinct_changes(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(task["id"], "worker")
+    supervisor.publish_intent(
+        attempt["id"],
+        attempt["claim_token"],
+        intent(
+            paths=[
+                {"pattern": "src/api.py", "change": "write"},
+                {"pattern": "src/api.py", "change": "write"},
+                {"pattern": "src/api.py", "change": "read"},
+            ],
+            surfaces=[
+                {"kind": "schema", "name": "UserRecord", "change": "write"},
+                {"kind": "schema", "name": "userrecord", "change": "write"},
+            ],
+            depends_on=["schema:UserRecord", "SCHEMA:userrecord"],
+        ),
+    )
+
+    declaration = supervisor.intent_snapshot()["active_attempts"][0]["intent"]
+
+    assert declaration["paths"] == [
+        {"pattern": "src/api.py", "change": "write", "shared": False},
+        {"pattern": "src/api.py", "change": "read", "shared": False},
+    ]
+    assert declaration["surfaces"] == [
+        {"kind": "schema", "name": "UserRecord", "change": "write", "shared": False}
+    ]
+    assert declaration["depends_on"] == ["schema:UserRecord"]
+
+
+def test_intent_snapshot_avoids_git_by_default_and_bounds_optional_observation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempts = []
+    for key in ("alpha", "beta"):
+        task = make_task(supervisor, f"{key}.txt")
+        attempts.append(supervisor.claim(task["id"], f"{key}-worker"))
+
+    def unexpected_observer(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("default intent snapshot must not observe Git")
+
+    monkeypatch.setattr(supervisor, "_observed_changed_paths", unexpected_observer)
+    default_snapshot = supervisor.intent_snapshot()
+    assert all(
+        item["observed"]["status"] == "not_requested"
+        for item in default_snapshot["active_attempts"]
+    )
+    assert default_snapshot["observation_summary"]["requested"] is False
+    monkeypatch.delattr(supervisor, "_observed_changed_paths")
+
+    observed_attempt_ids: list[str] = []
+
+    def bounded_observer(_self: object, attempt: sqlite3.Row, *, deadline: float) -> dict:
+        assert deadline > 0
+        observed_attempt_ids.append(attempt["id"])
+        return {"status": "available", "source": "test", "paths": []}
+
+    monkeypatch.setattr(intent_module, "_OBSERVATION_ATTEMPT_LIMIT", 1)
+    monkeypatch.setattr(GitSupervisor, "_observed_changed_paths", bounded_observer)
+    observed = supervisor.intent_snapshot(include_observed=True)
+
+    assert len(observed_attempt_ids) == 1
+    observed_entries = observed["active_attempts"]
+    assert sum(item["observed"]["status"] == "available" for item in observed_entries) == 1
+    assert (
+        sum(
+            item["observed"].get("reason") == "observation_attempt_limit"
+            for item in observed_entries
+        )
+        == 1
+    )
+    assert observed["observation_summary"]["truncated"] is True
+
+
+def test_overlap_scan_marks_comparison_truncation_instead_of_no_conflict(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    first_task = make_task(supervisor, "alpha.txt")
+    second_task = make_task(supervisor, "beta.txt")
+    first = supervisor.claim(first_task["id"], "first")
+    second = supervisor.claim(second_task["id"], "second")
+    supervisor.publish_intent(
+        first["id"],
+        first["claim_token"],
+        intent(
+            paths=[
+                {"pattern": "src/one.py", "change": "write"},
+                {"pattern": "src/two.py", "change": "write"},
+            ]
+        ),
+    )
+    supervisor.publish_intent(
+        second["id"],
+        second["claim_token"],
+        intent(
+            paths=[
+                {"pattern": "other/one.py", "change": "write"},
+                {"pattern": "other/two.py", "change": "write"},
+            ]
+        ),
+    )
+    monkeypatch.setattr(intent_module, "_OVERLAP_COMPARISON_LIMIT", 1)
+
+    snapshot = supervisor.intent_snapshot()
+
+    assert snapshot["overlaps"] == []
+    assert snapshot["overlap_analysis"]["status"] == "truncated"
+    assert snapshot["overlap_analysis"]["reason"] == "comparison_limit"
+    assert snapshot["overlap_analysis"]["comparisons"] == 1
+
+
+def test_active_intent_list_reports_its_attempt_limit(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    for key in ("alpha", "beta"):
+        task = make_task(supervisor, f"{key}.txt")
+        supervisor.claim(task["id"], f"{key}-worker")
+    monkeypatch.setattr(intent_module, "_ACTIVE_INTENT_LIMIT", 1)
+
+    snapshot = supervisor.intent_snapshot()
+
+    assert len(snapshot["active_attempts"]) == 1
+    assert snapshot["active_attempt_summary"] == {
+        "included": 1,
+        "limit": 1,
+        "truncated": True,
+    }
+    assert snapshot["overlap_analysis"]["status"] == "truncated"
+    assert snapshot["overlap_analysis"]["reason"] == "active_attempt_limit"
+    assert snapshot["dependency_analysis"]["status"] == "truncated"
+    assert snapshot["dependency_analysis"]["reason"] == "active_attempt_limit"
 
 
 def test_intent_schema_migration_is_versioned_and_installs_immutability_guards() -> None:

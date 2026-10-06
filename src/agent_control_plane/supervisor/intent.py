@@ -30,6 +30,13 @@ INTENT_CHANGES = frozenset({"read", "additive", "write", "destructive"})
 INTENT_SURFACE_KINDS = frozenset({"symbol", "interface", "schema", "api", "resource"})
 _OBSERVED_PATHS_MAX_BYTES = 2 * 1024 * 1024
 _OBSERVED_PATHS_MAX_COUNT = 4096
+_OBSERVATION_ATTEMPT_LIMIT = 8
+_OBSERVATION_WALL_BUDGET_SECONDS = 2.0
+_ACTIVE_INTENT_LIMIT = 256
+_OVERLAP_COMPARISON_LIMIT = 100_000
+_OVERLAP_RESULT_LIMIT = 1_000
+_DEPENDENCY_COMPARISON_LIMIT = 100_000
+_DEPENDENCY_RESULT_LIMIT = 1_000
 
 
 def _text(value: Any, field: str, *, maximum: int = 512) -> str:
@@ -112,6 +119,7 @@ def validate_intent(value: Any) -> dict[str, Any]:
         raise SupervisorError("invalid_intent", "confidence must be a finite number from 0 to 1")
 
     paths: list[dict[str, Any]] = []
+    seen_paths: set[tuple[str, str, bool]] = set()
     for entry in value["paths"]:
         if not isinstance(entry, dict) or set(entry) - {"pattern", "change", "shared"}:
             raise SupervisorError(
@@ -124,9 +132,13 @@ def validate_intent(value: Any) -> dict[str, Any]:
         shared = entry.get("shared", False)
         if not isinstance(change, str) or change not in INTENT_CHANGES or type(shared) is not bool:
             raise SupervisorError("invalid_intent", "path change/shared value is invalid")
-        paths.append({"pattern": pattern, "change": change, "shared": shared})
+        key = (pattern, change, shared)
+        if key not in seen_paths:
+            seen_paths.add(key)
+            paths.append({"pattern": pattern, "change": change, "shared": shared})
 
     surfaces: list[dict[str, Any]] = []
+    seen_surfaces: set[tuple[str, str, str, bool]] = set()
     for entry in value["surfaces"]:
         if not isinstance(entry, dict) or set(entry) - {"kind", "name", "change", "shared"}:
             raise SupervisorError(
@@ -146,9 +158,19 @@ def validate_intent(value: Any) -> dict[str, Any]:
             or type(shared) is not bool
         ):
             raise SupervisorError("invalid_intent", "surface kind/change/shared value is invalid")
-        surfaces.append({"kind": kind, "name": name, "change": change, "shared": shared})
+        key = (kind, _name_key(name), change, shared)
+        if key not in seen_surfaces:
+            seen_surfaces.add(key)
+            surfaces.append({"kind": kind, "name": name, "change": change, "shared": shared})
 
-    dependencies = [_text(item, "dependency") for item in value["depends_on"]]
+    dependencies: list[str] = []
+    seen_dependencies: set[str] = set()
+    for item in value["depends_on"]:
+        dependency = _text(item, "dependency")
+        key = _name_key(dependency)
+        if key not in seen_dependencies:
+            seen_dependencies.add(key)
+            dependencies.append(dependency)
     return {
         "version": INTENT_VERSION,
         "responsibility": responsibility,
@@ -353,7 +375,7 @@ class AgentIntentMixin:
             "latest_revision": latest_revision,
         }
 
-    def _observed_changed_paths(self, attempt: sqlite3.Row) -> dict[str, Any]:
+    def _observed_changed_paths(self, attempt: sqlite3.Row, *, deadline: float) -> dict[str, Any]:
         worktree = Path(attempt["worktree"])
         root_value = attempt["worktree_root"] or str(self.state_dir / "worktrees")
         root = Path(root_value)
@@ -372,6 +394,13 @@ class AgentIntentMixin:
         ):
             return {"status": "unavailable", "reason": "invalid_start_revision", "paths": []}
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {
+                    "status": "not_sampled",
+                    "reason": "time_budget_exhausted",
+                    "paths": [],
+                }
             tracked = self._git_readonly_bytes_bounded(
                 "-C",
                 str(worktree),
@@ -383,7 +412,15 @@ class AgentIntentMixin:
                 attempt["start_sha"],
                 "--",
                 max_bytes=_OBSERVED_PATHS_MAX_BYTES,
+                timeout_seconds=remaining,
             )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {
+                    "status": "not_sampled",
+                    "reason": "time_budget_exhausted",
+                    "paths": [],
+                }
             untracked = self._git_readonly_bytes_bounded(
                 "-C",
                 str(worktree),
@@ -392,55 +429,85 @@ class AgentIntentMixin:
                 "--exclude-standard",
                 "-z",
                 max_bytes=_OBSERVED_PATHS_MAX_BYTES,
+                timeout_seconds=remaining,
             )
             raw_paths = sorted(set(tracked.split(b"\0") + untracked.split(b"\0")) - {b""})
             if len(raw_paths) > _OBSERVED_PATHS_MAX_COUNT:
                 return {"status": "unavailable", "reason": "too_many_changed_paths", "paths": []}
             paths = [path.decode("utf-8") for path in raw_paths]
-        except (OSError, UnicodeDecodeError, SupervisorError):
+        except (OSError, UnicodeDecodeError, SupervisorError) as error:
+            if (
+                isinstance(error, SupervisorError)
+                and error.code == "git_timeout"
+                and time.monotonic() >= deadline
+            ):
+                return {
+                    "status": "unavailable",
+                    "reason": "time_budget_exhausted",
+                    "paths": [],
+                }
             return {"status": "unavailable", "reason": "git_observation_failed", "paths": []}
         return {"status": "available", "source": "supervisor_git_observation", "paths": paths}
 
-    def intent_snapshot(self) -> dict[str, Any]:
-        """Compare active, caller-declared scopes without making scheduling decisions."""
+    def intent_snapshot(self, include_observed: bool = False) -> dict[str, Any]:
+        """Compare active declared scopes; Git observations are opt-in and bounded."""
+        if type(include_observed) is not bool:
+            raise SupervisorError("invalid_argument", "include_observed must be a boolean")
         now = int(time.time())
         with self.connect() as connection:
             attempts = connection.execute(
                 """
-                SELECT attempt.*, task.title AS task_title
+                SELECT attempt.*, task.title AS task_title,
+                       intent.revision AS intent_revision,
+                       intent.claim_token AS intent_claim_token,
+                       intent.intent_json AS intent_json,
+                       intent.created_at AS intent_created_at,
+                       EXISTS(
+                         SELECT 1 FROM agent_intent_revisions AS any_intent
+                         WHERE any_intent.attempt_id = attempt.id
+                       ) AS has_intent_revisions
                 FROM attempts AS attempt
                 JOIN tasks AS task ON task.id = attempt.task_id
+                LEFT JOIN agent_intent_revisions AS intent
+                  ON intent.attempt_id = attempt.id
+                 AND intent.revision = (
+                     SELECT MAX(current.revision)
+                     FROM agent_intent_revisions AS current
+                     WHERE current.attempt_id = attempt.id
+                 )
                 WHERE attempt.status = 'working' AND task.status = 'working'
                   AND task.current_attempt_id = attempt.id AND attempt.lease_expires_at > ?
                 ORDER BY attempt.task_id, attempt.number
+                LIMIT ?
                 """,
-                (now,),
+                (now, _ACTIVE_INTENT_LIMIT + 1),
             ).fetchall()
             case_row = connection.execute(
                 "SELECT value FROM meta WHERE key = 'path_case_sensitive'"
             ).fetchone()
             path_case_sensitive = bool(case_row and case_row["value"] == "1")
-            latest_rows = {
-                row["attempt_id"]: row
-                for row in connection.execute(
-                    """
-                    SELECT intent.* FROM agent_intent_revisions AS intent
-                    JOIN (
-                      SELECT attempt_id, MAX(revision) AS revision
-                      FROM agent_intent_revisions GROUP BY attempt_id
-                    ) AS latest
-                      ON latest.attempt_id = intent.attempt_id
-                     AND latest.revision = intent.revision
-                    """
-                ).fetchall()
-            }
+        active_attempts_truncated = len(attempts) > _ACTIVE_INTENT_LIMIT
+        attempts = attempts[:_ACTIVE_INTENT_LIMIT]
 
         entries: list[dict[str, Any]] = []
         unknown_attempts: list[dict[str, str]] = []
+        observation_deadline = (
+            time.monotonic() + _OBSERVATION_WALL_BUDGET_SECONDS if include_observed else None
+        )
+        observation_count = 0
+        observation_truncated = False
         for attempt in attempts:
-            revision = latest_rows.get(attempt["id"])
+            revision = None
+            if attempt["intent_revision"] is not None:
+                revision = {
+                    "revision": attempt["intent_revision"],
+                    "claim_token": attempt["intent_claim_token"],
+                    "intent_json": attempt["intent_json"],
+                    "created_at": attempt["intent_created_at"],
+                }
             if revision is None:
-                state, intent = "missing", None
+                state = "stale" if attempt["has_intent_revisions"] else "missing"
+                intent = None
             elif revision["claim_token"] != attempt["claim_token"]:
                 state, intent = "stale", None
             else:
@@ -450,6 +517,34 @@ class AgentIntentMixin:
                     state = "declared" if intent["paths"] or intent["surfaces"] else "incomplete"
             if state in {"missing", "stale", "unparseable", "incomplete"}:
                 unknown_attempts.append({"attempt_id": attempt["id"], "state": state})
+            if not include_observed:
+                observed = {
+                    "status": "not_requested",
+                    "reason": "use_explicit_observation",
+                    "paths": [],
+                }
+            elif observation_count >= _OBSERVATION_ATTEMPT_LIMIT:
+                observed = {
+                    "status": "not_sampled",
+                    "reason": "observation_attempt_limit",
+                    "paths": [],
+                }
+                observation_truncated = True
+            elif observation_deadline is None or time.monotonic() >= observation_deadline:
+                observed = {
+                    "status": "not_sampled",
+                    "reason": "time_budget_exhausted",
+                    "paths": [],
+                }
+                observation_truncated = True
+            else:
+                observation_count += 1
+                observed = self._observed_changed_paths(attempt, deadline=observation_deadline)
+                if observed["status"] != "available":
+                    observation_truncated = observation_truncated or observed["reason"] in {
+                        "time_budget_exhausted",
+                        "observation_attempt_limit",
+                    }
             entry = {
                 "task_id": attempt["task_id"],
                 "task_title": attempt["task_title"],
@@ -461,12 +556,17 @@ class AgentIntentMixin:
                 "intent_state": state,
                 "revision": revision["revision"] if revision else None,
                 "intent": intent,
-                "observed": self._observed_changed_paths(attempt),
+                "observed": observed,
             }
             entries.append(entry)
 
         overlaps: list[dict[str, Any]] = []
+        overlap_comparisons = 0
+        overlap_reason: str | None = None
+        stop_overlap_scan = False
         dependency_matches: list[dict[str, Any]] = []
+        dependency_comparisons = 0
+        dependency_reason: str | None = None
         providers: dict[str, list[dict[str, Any]]] = {}
         for entry in entries:
             intent = entry["intent"]
@@ -480,21 +580,32 @@ class AgentIntentMixin:
                     {"entry": entry, "surface": surface}
                 )
         for entry in entries:
+            if dependency_reason is not None:
+                break
             intent = entry["intent"]
             if not intent:
                 continue
             for dependency in intent["depends_on"]:
                 matches = providers.get(_name_key(dependency), [])
-                unique = {
-                    (
+                seen_matches: set[tuple[str, str, str]] = set()
+                for match in matches:
+                    if match["entry"]["attempt_id"] == entry["attempt_id"]:
+                        continue
+                    if dependency_comparisons >= _DEPENDENCY_COMPARISON_LIMIT:
+                        dependency_reason = "comparison_limit"
+                        break
+                    dependency_comparisons += 1
+                    match_key = (
                         match["entry"]["attempt_id"],
                         match["surface"]["kind"],
-                        match["surface"]["name"],
-                    ): match
-                    for match in matches
-                    if match["entry"]["attempt_id"] != entry["attempt_id"]
-                }
-                for match in unique.values():
+                        _name_key(match["surface"]["name"]),
+                    )
+                    if match_key in seen_matches:
+                        continue
+                    seen_matches.add(match_key)
+                    if len(dependency_matches) >= _DEPENDENCY_RESULT_LIMIT:
+                        dependency_reason = "result_limit"
+                        break
                     dependency_matches.append(
                         {
                             "dependent_attempt_id": entry["attempt_id"],
@@ -509,8 +620,12 @@ class AgentIntentMixin:
                             "compatibility": "not_assessed",
                         }
                     )
+                if dependency_reason is not None:
+                    break
 
         for index, left_entry in enumerate(entries):
+            if stop_overlap_scan:
+                break
             left_intent = left_entry["intent"]
             if not left_intent:
                 continue
@@ -519,12 +634,23 @@ class AgentIntentMixin:
                 if not right_intent:
                     continue
                 for left in left_intent["paths"]:
+                    if stop_overlap_scan:
+                        break
                     for right in right_intent["paths"]:
+                        if overlap_comparisons >= _OVERLAP_COMPARISON_LIMIT:
+                            overlap_reason = "comparison_limit"
+                            stop_overlap_scan = True
+                            break
+                        overlap_comparisons += 1
                         left_key = _path_key(left["pattern"], case_sensitive=path_case_sensitive)
                         right_key = _path_key(right["pattern"], case_sensitive=path_case_sensitive)
                         if not self.resources_overlap(left_key, right_key):
                             continue
                         interaction = _scope_interaction(left, right)
+                        if len(overlaps) >= _OVERLAP_RESULT_LIMIT:
+                            overlap_reason = "result_limit"
+                            stop_overlap_scan = True
+                            break
                         overlaps.append(
                             {
                                 "kind": "path",
@@ -542,13 +668,28 @@ class AgentIntentMixin:
                                 **interaction,
                             }
                         )
+                    if stop_overlap_scan:
+                        break
+                if stop_overlap_scan:
+                    break
                 for left in left_intent["surfaces"]:
+                    if stop_overlap_scan:
+                        break
                     for right in right_intent["surfaces"]:
+                        if overlap_comparisons >= _OVERLAP_COMPARISON_LIMIT:
+                            overlap_reason = "comparison_limit"
+                            stop_overlap_scan = True
+                            break
+                        overlap_comparisons += 1
                         if left["kind"] != right["kind"] or _name_key(left["name"]) != _name_key(
                             right["name"]
                         ):
                             continue
                         interaction = _scope_interaction(left, right)
+                        if len(overlaps) >= _OVERLAP_RESULT_LIMIT:
+                            overlap_reason = "result_limit"
+                            stop_overlap_scan = True
+                            break
                         overlaps.append(
                             {
                                 "kind": left["kind"],
@@ -566,12 +707,53 @@ class AgentIntentMixin:
                                 **interaction,
                             }
                         )
+                    if stop_overlap_scan:
+                        break
+                if stop_overlap_scan:
+                    break
+
+        if active_attempts_truncated:
+            overlap_reason = overlap_reason or "active_attempt_limit"
+            dependency_reason = dependency_reason or "active_attempt_limit"
 
         return {
             "version": INTENT_VERSION,
             "advisory_only": True,
             "active_attempts": entries,
+            "active_attempt_summary": {
+                "included": len(entries),
+                "limit": _ACTIVE_INTENT_LIMIT,
+                "truncated": active_attempts_truncated,
+            },
+            "observation_summary": {
+                "requested": include_observed,
+                "sampled_attempts": observation_count,
+                "attempt_limit": _OBSERVATION_ATTEMPT_LIMIT,
+                "wall_budget_seconds": _OBSERVATION_WALL_BUDGET_SECONDS,
+                "truncated": include_observed
+                and (
+                    observation_truncated
+                    or active_attempts_truncated
+                    or any(entry["observed"]["status"] == "not_sampled" for entry in entries)
+                ),
+            },
             "overlaps": overlaps,
+            "overlap_analysis": {
+                "status": "truncated" if overlap_reason else "complete",
+                "reason": overlap_reason,
+                "comparisons": overlap_comparisons,
+                "reported": len(overlaps),
+                "comparison_limit": _OVERLAP_COMPARISON_LIMIT,
+                "result_limit": _OVERLAP_RESULT_LIMIT,
+            },
             "dependency_matches": dependency_matches,
+            "dependency_analysis": {
+                "status": "truncated" if dependency_reason else "complete",
+                "reason": dependency_reason,
+                "comparisons": dependency_comparisons,
+                "reported": len(dependency_matches),
+                "comparison_limit": _DEPENDENCY_COMPARISON_LIMIT,
+                "result_limit": _DEPENDENCY_RESULT_LIMIT,
+            },
             "unknown_attempts": unknown_attempts,
         }

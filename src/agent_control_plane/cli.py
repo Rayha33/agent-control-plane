@@ -265,8 +265,13 @@ def parser() -> argparse.ArgumentParser:
     intent_publish.add_argument("--token", type=int, required=True, dest="claim_token")
     intent_publish.add_argument("--json", required=True, dest="intent_json")
     add_credential_source(intent_publish)
-    commands.add_parser(
-        "intents", help="read active intent, overlap, dependency, and Git observations"
+    intents = commands.add_parser(
+        "intents", help="read active intent and bounded overlap/dependency analysis"
+    )
+    intents.add_argument(
+        "--observed",
+        action="store_true",
+        help="include bounded server Git observations (up to 8 attempts / 2 seconds)",
     )
     intent_history = commands.add_parser(
         "intent-history", help="read retained intent revisions for an attempt"
@@ -931,7 +936,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _read_credential(args),
             )
         elif args.action == "intents":
-            result = supervisor.intent_snapshot()
+            result = supervisor.intent_snapshot(include_observed=args.observed)
         elif args.action == "intent-history":
             result = supervisor.intent_history(
                 args.attempt_id,

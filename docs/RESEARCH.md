@@ -435,11 +435,15 @@ often two agents in one live checkout collide. [Study and abstract](https://arxi
 The product response is an append-only, claim-fenced intent history with a
 read-only comparison of declared path/surface overlap, dependencies, and separately
 Git-observed changed paths. It distinguishes harmless read/read overlap, likely
-write conflicts, and explicitly shared ownership. This is a coordination signal,
-not proof that an agent published before its first write, a semantic conflict detector,
-or a lock: declarations can be missing, stale, incomplete, or wrong, and no automatic
-blocking follows. The feature addresses the planning-layer gap while preserving worktree,
-resource, runtime, and integration gates as separate controls.
+write conflicts, and explicitly shared ownership. Status, plan, queue, and the default
+intent command do not launch Git subprocesses; changed-path observation is explicit,
+limited to eight attempts and two seconds per snapshot. Active attempts, overlap and
+dependency analysis are capped, and every capped result reports its truncation state.
+This is a coordination signal, not proof that an agent published before its first
+write, a semantic conflict detector, or a lock: declarations can be missing, stale,
+incomplete, or wrong, and no automatic blocking follows. The feature addresses the
+planning-layer gap while preserving worktree, resource, runtime, and integration gates
+as separate controls.
 
 ### CoreSimulator devices are shared runtime state (2026-10-03)
 
