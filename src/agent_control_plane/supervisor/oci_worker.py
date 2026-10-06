@@ -1864,10 +1864,11 @@ def _measure_rootfs_tree(
         )
         if _rootfs_stat_identity(opened_root) != _rootfs_stat_identity(current_root):
             raise SupervisorError("invalid_oci_rootfs", "OCI rootfs changed while being read")
-        if mountinfo_before is not None and _read_linux_mountinfo() != mountinfo_before:
-            raise SupervisorError(
-                "invalid_oci_rootfs", "Linux mount table changed while rootfs was read"
-            )
+        if mountinfo_before is not None:
+            # Global mount namespaces may legitimately change outside this tree while
+            # it is measured. Revalidate the only relevant invariant: no nested
+            # mount is present beneath this root at either boundary.
+            _reject_nested_linux_mounts(root, _read_linux_mountinfo())
     except SupervisorError:
         raise
     except (OSError, TypeError, NotImplementedError) as error:

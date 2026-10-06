@@ -359,24 +359,43 @@ def test_rootfs_mountinfo_rejects_same_device_nested_bind_mount_and_decodes_path
     assert error.value.code == "invalid_oci_rootfs"
 
 
-def test_rootfs_mount_table_change_during_scan_fails_closed(
+def test_rootfs_nested_mount_added_during_scan_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rootfs = tmp_path / "rootfs"
     rootfs.mkdir()
     root_mount = os.fsencode(rootfs)
+    nested_mount = os.fsencode(rootfs / "late mount").replace(b" ", b"\\040")
     first = b"36 25 0:42 / " + root_mount + b" rw - ext4 /dev/loop0 rw\n"
-    second = first.replace(b"36 25", b"37 25", 1)
+    second = first + b"37 25 0:42 / " + nested_mount + b" rw - ext4 /dev/loop0 rw\n"
     snapshots = iter((first, second))
     monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
     monkeypatch.setattr(oci_worker, "_read_linux_mountinfo", lambda: next(snapshots))
     monkeypatch.setattr(oci_worker, "_check_rootfs_posix_acl", lambda _descriptor: None)
     monkeypatch.setattr(oci_worker, "_check_rootfs_file_capability", lambda _descriptor: None)
 
-    with pytest.raises(SupervisorError, match="mount table changed") as error:
+    with pytest.raises(SupervisorError, match="nested mount") as error:
         oci_worker.rootfs_tree_sha256(rootfs)
 
     assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_rootfs_mount_changes_outside_root_do_not_fail_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    root_mount = os.fsencode(rootfs)
+    external_mount = os.fsencode(tmp_path / "unrelated mount").replace(b" ", b"\\040")
+    first = b"36 25 0:42 / " + root_mount + b" rw - ext4 /dev/loop0 rw\n"
+    second = first + b"37 25 0:43 / " + external_mount + b" rw - tmpfs tmpfs rw\n"
+    snapshots = iter((first, second))
+    monkeypatch.setattr(oci_worker.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(oci_worker, "_read_linux_mountinfo", lambda: next(snapshots))
+    monkeypatch.setattr(oci_worker, "_check_rootfs_posix_acl", lambda _descriptor: None)
+    monkeypatch.setattr(oci_worker, "_check_rootfs_file_capability", lambda _descriptor: None)
+
+    assert oci_worker.rootfs_tree_sha256(rootfs)
 
 
 def test_rootfs_digest_rejects_directory_default_acl(
