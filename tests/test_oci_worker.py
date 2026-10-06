@@ -50,6 +50,20 @@ _OCI_SCHEMA_SHA256 = {
 }
 
 
+def _release_unjournaled_gate_for_test(handle: oci_worker.RuncLaunchHandle) -> None:
+    """Bypass the journal only for low-level launcher tests."""
+
+    assert oci_worker._runc_launch_handle_is_self_consistent(handle)
+    with handle._gate_lock:
+        descriptor = handle._gate_writer
+        assert descriptor is not None
+        handle._gate_writer = None
+        try:
+            assert os.write(descriptor, b"go\n") == 3
+        finally:
+            os.close(descriptor)
+
+
 def _pinned_oci_schema_validator() -> Draft4Validator:
     schema_dir = _OCI_SCHEMA_DIR.resolve()
     base_uri = schema_dir.as_uri() + "/"
@@ -2534,7 +2548,7 @@ def test_pinned_runc_launcher_maps_only_the_release_gate_to_fd3(
     assert process is not None
     try:
         assert process.poll() is None
-        handle.release_gate()
+        _release_unjournaled_gate_for_test(handle)
         stdout, stderr = process.communicate(timeout=5)
     finally:
         handle.close_gate()
@@ -2639,6 +2653,20 @@ def test_runc_launch_gate_release_is_atomic_with_concurrent_close(
     gate_read, gate_write = os.pipe()
     process = subprocess.Popen([sys.executable, "-I", "-S", "-c", "pass"])
     handle = oci_worker.RuncLaunchHandle(_gate_writer=gate_write)
+    target = oci_worker._RuncLaunchTarget(
+        launch_mode="private_bundle",
+        argv=(),
+        runc_executable_path="/usr/bin/runc",
+        runc_executable_sha256="a" * 64,
+    )
+    oci_worker._register_runc_launch_handle(
+        handle,
+        process=process,
+        process_identity=f"linux:{process.pid}:1",
+        target=target,
+    )
+    oci_worker._runc_launch_handle_bind_execution(handle, "attempt-1", 1, "execution-1")
+    oci_worker._authorize_runc_launch_gate_release(handle, "attempt-1", 1, "execution-1")
     original_write = os.write
     write_entered = threading.Event()
     allow_write = threading.Event()

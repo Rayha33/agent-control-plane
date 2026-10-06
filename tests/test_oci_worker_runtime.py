@@ -62,6 +62,20 @@ _ATTEMPT_ROOT_CHILDREN = {
 }
 
 
+def _release_unjournaled_gate_for_test(handle: oci_worker.RuncLaunchHandle) -> None:
+    """Bypass the journal only for the opt-in runtime policy test."""
+
+    assert oci_worker._runc_launch_handle_is_self_consistent(handle)
+    with handle._gate_lock:
+        descriptor = handle._gate_writer
+        assert descriptor is not None
+        handle._gate_writer = None
+        try:
+            assert os.write(descriptor, b"go\n") == 3
+        finally:
+            os.close(descriptor)
+
+
 def _require_root_owned_file(path: Path, label: str) -> Path:
     resolved = path.resolve(strict=True)
     info = resolved.stat()
@@ -2744,7 +2758,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
 
         if run_handle is None:
             pytest.fail("pinned runc launch handle was not retained")
-        run_handle.release_gate()
+        _release_unjournaled_gate_for_test(run_handle)
         fd_ready = workspace / "fd-audit-ready"
         ready_deadline = time.monotonic() + 5
         while (

@@ -45,7 +45,8 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -3363,9 +3364,9 @@ class RuncLaunchHandle:
     """One registered runc client and its private OCI-init release gate.
 
     The child process is deliberately kept out of this public handle and in the
-    launcher's private registry. The handle intentionally has no automatic-release behavior:
-    the caller must persist and attest launch state before calling
-    :meth:`release_gate`. The lock linearizes release against cancellation:
+    launcher's private registry. The public :meth:`release_gate` is enabled only
+    after the durable journal records this exact execution as running. The lock
+    linearizes release against cancellation:
     whichever operation acquires it first determines whether the gate is
     released or closed. Closing an unreleased gate denies candidate exec.
     """
@@ -3381,7 +3382,7 @@ class RuncLaunchHandle:
         return self._bundle_path
 
     def release_gate(self) -> None:
-        """Authorize the already-attested OCI init to execute its command once."""
+        """Release the init gate after this launch's durable running transition."""
 
         with self._gate_lock:
             descriptor = self._gate_writer
@@ -3389,6 +3390,7 @@ class RuncLaunchHandle:
                 raise SupervisorError(
                     "sandbox_launch_gate_closed", "OCI init launch gate is already closed"
                 )
+            _consume_runc_launch_gate_authorization(self)
             self._gate_writer = None
             try:
                 if os.write(descriptor, b"go\n") != 3:
@@ -3511,6 +3513,7 @@ class _RuncLaunchRecord:
     process_identity: str
     target: _RuncLaunchTarget
     execution_binding: tuple[str, int, str] | None = None
+    gate_release_authorized: bool = False
     wait_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
     wait_returncode: int | None = None
     _test_waitpid: Callable[[int, int], tuple[int, int]] | None = field(
@@ -3541,6 +3544,51 @@ _RUNC_WAIT_RECEIPTS: dict[
     int, tuple[weakref.ReferenceType[Any], tuple[int, str, int, str, int, str]]
 ] = {}
 _RUNC_WAIT_RECEIPTS_LOCK = threading.Lock()
+
+
+@contextmanager
+def _runc_launch_gate_lock_for_execution(
+    attempt_id: str, claim_token: int, execution_id: str
+) -> Iterator[RuncLaunchHandle | None]:
+    """Serialize a journal lifecycle mutation with release of its exact gate.
+
+    The registry lock is released before waiting for the handle lock, matching
+    ``release_gate``'s handle-then-registry order and avoiding lock inversion.
+    A missing handle is safe: without a live registered handle no caller can
+    release that execution's gate.
+    """
+
+    binding = (attempt_id, claim_token, execution_id)
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        candidates = []
+        for key, (reference, record) in tuple(_RUNC_LAUNCH_RECORDS.items()):
+            handle = reference()
+            if handle is None:
+                _RUNC_LAUNCH_RECORDS.pop(key, None)
+            elif record.execution_binding == binding:
+                candidates.append(handle)
+    if len(candidates) > 1:
+        raise SupervisorError(
+            "sandbox_execution_launch_handle_conflict",
+            "more than one pinned-runc handle is bound to this durable execution",
+        )
+    if not candidates:
+        yield None
+        return
+
+    handle = candidates[0]
+    with handle._gate_lock:
+        with _RUNC_LAUNCH_RECORDS_LOCK:
+            registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
+            if (
+                registered is None
+                or registered[0]() is not handle
+                or registered[1].execution_binding != binding
+            ):
+                locked_handle = None
+            else:
+                locked_handle = handle
+        yield locked_handle
 
 
 def _register_runc_launch_handle(
@@ -3686,6 +3734,7 @@ def _record_runc_kernel_wait_status(
             process_identity=current.process_identity,
             target=current.target,
             execution_binding=current.execution_binding,
+            gate_release_authorized=current.gate_release_authorized,
             wait_lock=current.wait_lock,
             wait_returncode=returncode,
             _test_waitpid=current._test_waitpid,
@@ -3708,6 +3757,145 @@ def _runc_launch_handle_is_self_consistent(handle: Any) -> bool:
     """Recognize only a live handle present in the private launch registry."""
 
     return _runc_launch_record(handle) is not None
+
+
+def _runc_launch_handle_is_bound_to_execution(
+    handle: Any, attempt_id: str, claim_token: int, execution_id: str
+) -> bool:
+    """Check that a registered launch handle has the exact durable binding."""
+
+    record = _runc_launch_record(handle)
+    return record is not None and record.execution_binding == (
+        attempt_id,
+        claim_token,
+        execution_id,
+    )
+
+
+def _authorize_runc_launch_gate_release(
+    handle: RuncLaunchHandle, attempt_id: str, claim_token: int, execution_id: str
+) -> None:
+    """Issue one in-process gate permit after the journal commits ``running``."""
+
+    if type(handle) is not RuncLaunchHandle:
+        raise SupervisorError(
+            "sandbox_execution_launch_handle_required",
+            "OCI gate authorization requires the registered pinned-runc handle",
+        )
+    with handle._gate_lock:
+        _authorize_runc_launch_gate_release_locked(handle, attempt_id, claim_token, execution_id)
+
+
+def _authorize_runc_launch_gate_release_locked(
+    handle: RuncLaunchHandle, attempt_id: str, claim_token: int, execution_id: str
+) -> None:
+    """Issue the permit while the caller holds the handle's gate lock."""
+
+    if type(handle) is not RuncLaunchHandle:
+        raise SupervisorError(
+            "sandbox_execution_launch_handle_required",
+            "OCI gate authorization requires the registered pinned-runc handle",
+        )
+    binding = (attempt_id, claim_token, execution_id)
+    if handle._gate_writer is None:
+        raise SupervisorError(
+            "sandbox_launch_gate_closed", "OCI init launch gate is already closed"
+        )
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
+        if registered is None or registered[0]() is not handle:
+            raise SupervisorError(
+                "sandbox_execution_launch_handle_required",
+                "OCI gate authorization requires registered launcher provenance",
+            )
+        record = registered[1]
+        if record.execution_binding != binding:
+            raise SupervisorError(
+                "sandbox_execution_launch_handle_conflict",
+                "OCI gate authorization does not match the durable execution binding",
+            )
+        if record.gate_release_authorized:
+            raise SupervisorError(
+                "sandbox_launch_gate_authorization_conflict",
+                "OCI gate already has an unconsumed running authorization",
+            )
+        updated = _RuncLaunchRecord(
+            process=record.process,
+            pid=record.pid,
+            process_identity=record.process_identity,
+            target=record.target,
+            execution_binding=record.execution_binding,
+            gate_release_authorized=True,
+            wait_lock=record.wait_lock,
+            wait_returncode=record.wait_returncode,
+            _test_waitpid=record._test_waitpid,
+            _test_identity_reader=record._test_identity_reader,
+        )
+        _RUNC_LAUNCH_RECORDS[id(handle)] = (registered[0], updated)
+
+
+def _revoke_runc_launch_gate_release_locked(
+    handle: RuncLaunchHandle, attempt_id: str, claim_token: int, execution_id: str
+) -> None:
+    """Revoke an unconsumed gate permit while the caller holds the gate lock."""
+
+    if type(handle) is not RuncLaunchHandle:
+        return
+    binding = (attempt_id, claim_token, execution_id)
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
+        if (
+            registered is None
+            or registered[0]() is not handle
+            or registered[1].execution_binding != binding
+            or not registered[1].gate_release_authorized
+        ):
+            return
+        record = registered[1]
+        updated = _RuncLaunchRecord(
+            process=record.process,
+            pid=record.pid,
+            process_identity=record.process_identity,
+            target=record.target,
+            execution_binding=record.execution_binding,
+            gate_release_authorized=False,
+            wait_lock=record.wait_lock,
+            wait_returncode=record.wait_returncode,
+            _test_waitpid=record._test_waitpid,
+            _test_identity_reader=record._test_identity_reader,
+        )
+        _RUNC_LAUNCH_RECORDS[id(handle)] = (registered[0], updated)
+
+
+def _consume_runc_launch_gate_authorization(handle: RuncLaunchHandle) -> None:
+    """Consume the one-shot permit; only the journal issues it in production."""
+
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
+        if (
+            registered is None
+            or registered[0]() is not handle
+            or not registered[1].gate_release_authorized
+            or registered[1].execution_binding is None
+        ):
+            raise SupervisorError(
+                "sandbox_launch_gate_not_authorized",
+                "OCI init gate release requires a durable running transition for this launch",
+            )
+        record = registered[1]
+        updated = _RuncLaunchRecord(
+            process=record.process,
+            pid=record.pid,
+            process_identity=record.process_identity,
+            target=record.target,
+            execution_binding=record.execution_binding,
+            gate_release_authorized=False,
+            wait_lock=record.wait_lock,
+            wait_returncode=record.wait_returncode,
+            _test_waitpid=record._test_waitpid,
+            _test_identity_reader=record._test_identity_reader,
+        )
+        _RUNC_LAUNCH_RECORDS[id(handle)] = (registered[0], updated)
 
 
 def _runc_launch_handle_bind_execution(
@@ -3734,12 +3922,23 @@ def _runc_launch_handle_bind_execution(
                 "sandbox_execution_launch_handle_conflict",
                 "pinned-runc handle is already bound to another durable execution",
             )
+        if record.execution_binding is None and any(
+            other_id != id(handle)
+            and reference() is not None
+            and other_record.execution_binding == binding
+            for other_id, (reference, other_record) in _RUNC_LAUNCH_RECORDS.items()
+        ):
+            raise SupervisorError(
+                "sandbox_execution_launch_handle_conflict",
+                "durable execution is already bound to another pinned-runc handle",
+            )
         updated = _RuncLaunchRecord(
             process=record.process,
             pid=record.pid,
             process_identity=record.process_identity,
             target=record.target,
             execution_binding=binding,
+            gate_release_authorized=record.gate_release_authorized,
             wait_lock=record.wait_lock,
             wait_returncode=record.wait_returncode,
             _test_waitpid=record._test_waitpid,

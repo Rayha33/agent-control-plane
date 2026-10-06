@@ -1,10 +1,12 @@
 """Durable, fail-closed identity journal for a future OCI worker executor.
 
 Launch and exit records are bound to the pinned-runc process handle and its
-wait receipt, but this module does not orchestrate a worker lifecycle, attest
-kernel state, or establish a sandbox. A cleanup report is not accepted as
-cleanup verification. The existing reaper and runtime teardown stay fenced
-until a separate trusted verifier advances the journal to ``cleanup_verified``.
+wait receipt. The public OCI-init gate can be released only after the exact
+registered handle is durably recorded as running, but this module does not
+orchestrate a worker lifecycle, authenticate observation provenance, or
+establish a sandbox. A cleanup report is not accepted as cleanup verification.
+The existing reaper and runtime teardown stay fenced until a separate trusted
+verifier advances the journal to ``cleanup_verified``.
 """
 
 from __future__ import annotations
@@ -22,8 +24,12 @@ from typing import Any
 from .common import CLEANUP_FENCE_EPOCH, SupervisorError, canonical_json, utc_now
 from .oci_worker import (
     RuncLaunchHandle,
+    _authorize_runc_launch_gate_release_locked,
+    _revoke_runc_launch_gate_release_locked,
     _runc_client_wait_receipt_is_self_consistent,
+    _runc_launch_gate_lock_for_execution,
     _runc_launch_handle_bind_execution,
+    _runc_launch_handle_is_bound_to_execution,
     _runc_launch_handle_is_self_consistent,
     _runc_launch_pid,
     _runc_launch_process_identity,
@@ -76,7 +82,6 @@ _TRANSITION_FIELDS = {
         }
     ),
     ("launched", "running"): frozenset({"init_pid", "init_identity"}),
-    ("launched", "stopping"): frozenset({"stop_reason"}),
     ("running", "stopping"): frozenset({"stop_reason"}),
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
 }
@@ -1454,6 +1459,7 @@ class SandboxExecutionJournalMixin:
         claim_token: int,
         *,
         attestation: RunningRuntimeAttestation,
+        runc_handle: RuncLaunchHandle | None = None,
         credential: str | None = None,
     ) -> dict[str, Any]:
         self._sandbox_validate_attempt_id(attempt_id)
@@ -1498,16 +1504,37 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_invalid", "container init must have a distinct host PID"
             )
-        return self._sandbox_execution_transition(
-            attempt_id,
-            claim_token,
-            expected_phase="launched",
-            next_phase="running",
-            updates={"init_pid": init_pid, "init_identity": init_identity},
-            event_type="sandbox.execution_running",
-            event_payload={"attestation": attestation.audit_payload()},
-            credential=credential,
-        )
+        if not _runc_launch_handle_is_bound_to_execution(
+            runc_handle, attempt_id, claim_token, row["execution_id"]
+        ):
+            raise SupervisorError(
+                "sandbox_execution_launch_handle_required",
+                "running transition requires the exact registered launch handle",
+            )
+        with _runc_launch_gate_lock_for_execution(
+            attempt_id, claim_token, row["execution_id"]
+        ) as locked_handle:
+            if locked_handle is not runc_handle:
+                raise SupervisorError(
+                    "sandbox_execution_launch_handle_required",
+                    "running transition requires the exact locked launch handle",
+                )
+            updated = self._sandbox_execution_transition(
+                attempt_id,
+                claim_token,
+                expected_phase="launched",
+                next_phase="running",
+                updates={"init_pid": init_pid, "init_identity": init_identity},
+                event_type="sandbox.execution_running",
+                event_payload={"attestation": attestation.audit_payload()},
+                credential=credential,
+            )
+            # The same lock covers the durable transition and one-shot permit
+            # issue. A stop/quarantine cannot commit between these operations.
+            _authorize_runc_launch_gate_release_locked(
+                locked_handle, attempt_id, claim_token, row["execution_id"]
+            )
+            return updated
 
     def _sandbox_execution_request_stop(
         self,
@@ -1524,29 +1551,55 @@ class SandboxExecutionJournalMixin:
             row = connection.execute(
                 "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
-        if row and row["claim_token"] == claim_token and row["phase"] == "stopping":
-            if row["stop_reason"] == reason:
-                return self._sandbox_execution_view(row)
-            raise SupervisorError(
-                "sandbox_execution_transition_conflict",
-                "a different stop reason is already durable; fence retained",
-            )
-        if not row or row["phase"] not in {"launched", "running"}:
-            phase = row["phase"] if row else "missing"
-            raise SupervisorError(
-                "sandbox_execution_transition_invalid",
-                f"cannot request stop from phase {phase}; fence retained",
-            )
-        return self._sandbox_execution_transition(
-            attempt_id,
-            claim_token,
-            expected_phase=row["phase"],
-            next_phase="stopping",
-            updates={"stop_reason": reason},
-            event_type="sandbox.execution_stop_requested",
-            event_payload={"stop_reason": reason},
-            credential=credential,
-        )
+        if not row or row["claim_token"] != claim_token:
+            raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
+        execution_id = row["execution_id"]
+        with _runc_launch_gate_lock_for_execution(
+            attempt_id, claim_token, execution_id
+        ) as locked_handle:
+            # Re-read after acquiring the release lock: this closes both the
+            # launched->stopping and running->stopping races against gate open.
+            with self.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+            if not row or row["claim_token"] != claim_token:
+                raise SupervisorError(
+                    "sandbox_execution_not_found", "execution reservation is missing"
+                )
+            if row["execution_id"] != execution_id:
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "durable execution identity changed while requesting stop",
+                )
+            if row["phase"] == "stopping":
+                if row["stop_reason"] != reason:
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "a different stop reason is already durable; fence retained",
+                    )
+                updated = self._sandbox_execution_view(row)
+            else:
+                if row["phase"] != "running":
+                    raise SupervisorError(
+                        "sandbox_execution_transition_invalid",
+                        f"cannot request stop from phase {row['phase']}; fence retained",
+                    )
+                updated = self._sandbox_execution_transition(
+                    attempt_id,
+                    claim_token,
+                    expected_phase=row["phase"],
+                    next_phase="stopping",
+                    updates={"stop_reason": reason},
+                    event_type="sandbox.execution_stop_requested",
+                    event_payload={"stop_reason": reason},
+                    credential=credential,
+                )
+            if locked_handle is not None:
+                _revoke_runc_launch_gate_release_locked(
+                    locked_handle, attempt_id, claim_token, execution_id
+                )
+            return updated
 
     def _sandbox_execution_record_exit(
         self,
@@ -1556,6 +1609,36 @@ class SandboxExecutionJournalMixin:
         *,
         credential: str | None = None,
     ) -> dict[str, Any]:
+        if not _runc_client_wait_receipt_is_self_consistent(wait_receipt):
+            raise SupervisorError(
+                "sandbox_execution_wait_receipt_required",
+                "runc exit recording requires a sealed receipt issued by the pinned-runc wait handle",
+            )
+        with _runc_launch_gate_lock_for_execution(
+            attempt_id, claim_token, wait_receipt.execution_id
+        ) as locked_handle:
+            updated = self._sandbox_execution_record_exit_under_gate_lock(
+                attempt_id, claim_token, wait_receipt, credential=credential
+            )
+            if locked_handle is not None:
+                _revoke_runc_launch_gate_release_locked(
+                    locked_handle,
+                    attempt_id,
+                    claim_token,
+                    wait_receipt.execution_id,
+                )
+            return updated
+
+    def _sandbox_execution_record_exit_under_gate_lock(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        wait_receipt: _RuncClientWaitReceipt,
+        *,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist exit evidence while its release gate cannot be opened."""
+
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
         if not _runc_client_wait_receipt_is_self_consistent(wait_receipt):
@@ -1757,6 +1840,36 @@ class SandboxExecutionJournalMixin:
         return receipt
 
     def _sandbox_execution_mark_ambiguous(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        reason = self._sandbox_text(reason, "ambiguity_reason", limit=512)
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if not row or row["claim_token"] != claim_token:
+            return self._sandbox_execution_mark_ambiguous_under_gate_lock(
+                attempt_id, claim_token, reason
+            )
+        execution_id = row["execution_id"]
+        with _runc_launch_gate_lock_for_execution(
+            attempt_id, claim_token, execution_id
+        ) as locked_handle:
+            updated = self._sandbox_execution_mark_ambiguous_under_gate_lock(
+                attempt_id, claim_token, reason
+            )
+            if locked_handle is not None:
+                _revoke_runc_launch_gate_release_locked(
+                    locked_handle, attempt_id, claim_token, execution_id
+                )
+            return updated
+
+    def _sandbox_execution_mark_ambiguous_under_gate_lock(
         self,
         attempt_id: str,
         claim_token: int,

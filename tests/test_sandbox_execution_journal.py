@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -99,10 +100,14 @@ def _test_runc_handle(
     start_ticks: int = 1202,
     exit_code: int = 0,
     sealed: bool = True,
+    gate_writer: int | None = None,
 ) -> oci_worker.RuncLaunchHandle:
     process = _TestRuncProcess(202)
     identity = f"linux:{process.pid}:{start_ticks}"
-    handle = oci_worker.RuncLaunchHandle(_gate_writer=None)
+    if gate_writer is None:
+        gate_read, gate_writer = os.pipe()
+        os.close(gate_read)
+    handle = oci_worker.RuncLaunchHandle(_gate_writer=gate_writer)
     if sealed:
         assert target is not None
 
@@ -281,6 +286,192 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     assert supervisor.verify_event_chain()["ok"] is True
 
 
+def test_public_gate_release_requires_exact_durable_running_transition(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+        with pytest.raises(SupervisorError) as premature:
+            handle.release_gate()
+        assert premature.value.code == "sandbox_launch_gate_not_authorized"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+
+        unrelated = _test_runc_handle(target=_test_runc_target(execution))
+        with pytest.raises(SupervisorError) as wrong_handle:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=running_attestation(supervisor, attempt),
+                runc_handle=unrelated,
+            )
+        assert wrong_handle.value.code == "sandbox_execution_launch_handle_required"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+
+        running = record_running(supervisor, attempt)
+        assert running["phase"] == "running"
+        handle.release_gate()
+        assert os.read(gate_read, 3) == b"go\n"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_stop_before_running_transition_is_rejected_without_gate_release(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        with pytest.raises(SupervisorError) as not_running:
+            supervisor._sandbox_execution_request_stop(
+                attempt["id"], attempt["claim_token"], "cancel before init"
+            )
+        assert not_running.value.code == "sandbox_execution_transition_invalid"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_stop_after_running_transition_revokes_unconsumed_gate_permit(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        assert record_running(supervisor, attempt)["phase"] == "running"
+        assert (
+            supervisor._sandbox_execution_request_stop(
+                attempt["id"], attempt["claim_token"], "cancel before release"
+            )["phase"]
+            == "stopping"
+        )
+
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_stop_cannot_commit_between_running_and_gate_authorization(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    original_transition = GitSupervisor._sandbox_execution_transition
+    running_commit_finished = threading.Event()
+    allow_running_transition_to_return = threading.Event()
+    stop_started = threading.Event()
+    stop_finished = threading.Event()
+    results: dict[str, object] = {}
+
+    def pause_after_running_commit(self, *args, **kwargs):
+        updated = original_transition(self, *args, **kwargs)
+        if kwargs.get("expected_phase") == "launched" and kwargs.get("next_phase") == "running":
+            running_commit_finished.set()
+            assert allow_running_transition_to_return.wait(timeout=3)
+        return updated
+
+    def run_running_transition() -> None:
+        try:
+            results["running"] = record_running(supervisor, attempt)
+        except BaseException as error:
+            results["running_error"] = error
+
+    def request_stop() -> None:
+        stop_started.set()
+        try:
+            results["stopped"] = supervisor._sandbox_execution_request_stop(
+                attempt["id"], attempt["claim_token"], "concurrent cancel"
+            )
+        except BaseException as error:
+            results["stop_error"] = error
+        finally:
+            stop_finished.set()
+
+    monkeypatch.setattr(GitSupervisor, "_sandbox_execution_transition", pause_after_running_commit)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            running_future = pool.submit(run_running_transition)
+            assert running_commit_finished.wait(timeout=3)
+            stop_future = pool.submit(request_stop)
+            assert stop_started.wait(timeout=3)
+            assert not stop_finished.wait(timeout=0.05)
+            allow_running_transition_to_return.set()
+            running_future.result(timeout=3)
+            stop_future.result(timeout=3)
+
+        assert "running_error" not in results
+        assert results["running"]["phase"] == "running"
+        assert results["stopped"]["phase"] == "stopping"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        allow_running_transition_to_return.set()
+        handle.close_gate()
+        os.close(gate_read)
+
+
+@pytest.mark.parametrize("terminal_transition", ["exit", "ambiguous"])
+def test_terminal_journal_transition_revokes_unconsumed_gate_permit(
+    repo: Path, terminal_transition: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        record_running(supervisor, attempt)
+        if terminal_transition == "exit":
+            assert record_exit(supervisor, attempt)["phase"] == "exited"
+        else:
+            assert (
+                supervisor._sandbox_execution_mark_ambiguous(
+                    attempt["id"], attempt["claim_token"], "ambiguous test quarantine"
+                )["phase"]
+                == "ambiguous"
+            )
+
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
 def test_launch_rejects_rootfs_content_that_differs_from_reservation(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
@@ -400,10 +591,13 @@ def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int 
 
 
 def record_running(supervisor: GitSupervisor, attempt: dict) -> dict:
+    handle = attempt.get("_test_runc_handle")
+    assert isinstance(handle, oci_worker.RuncLaunchHandle)
     return supervisor._sandbox_execution_record_running(
         attempt["id"],
         attempt["claim_token"],
         attestation=running_attestation(supervisor, attempt),
+        runc_handle=handle,
     )
 
 
@@ -1601,7 +1795,10 @@ def test_runc_wait_receipt_must_match_durable_pid_start_identity(repo: Path) -> 
     assert execution is not None
     wrong_handle = _test_runc_handle(target=_test_runc_target(execution), start_ticks=9999)
     oci_worker._runc_launch_handle_bind_execution(
-        wrong_handle, attempt["id"], attempt["claim_token"], execution["execution_id"]
+        wrong_handle,
+        attempt["id"],
+        attempt["claim_token"],
+        execution["execution_id"] + "-different",
     )
     reused_pid = wrong_handle.wait()
     with pytest.raises(SupervisorError) as mismatched:
@@ -1715,7 +1912,10 @@ def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Pa
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
 
     running = supervisor._sandbox_execution_record_running(
-        attempt["id"], attempt["claim_token"], attestation=receipt
+        attempt["id"],
+        attempt["claim_token"],
+        attestation=receipt,
+        runc_handle=attempt["_test_runc_handle"],
     )
     assert running["phase"] == "running"
     assert running["init_pid"] == 303

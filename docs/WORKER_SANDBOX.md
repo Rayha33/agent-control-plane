@@ -737,13 +737,34 @@ launch reservation: upstream runc 1.3.5 creates a hidden sibling PID file with
 The executor therefore needs a fresh, private state/metadata directory before
 launch; pre-creating the final PID path is not a substitute.
 
-No worker executor currently calls the collector, no gate is released, and
-only synthetic runc/systemd outputs are tested. The Python receipt type and
-unkeyed digest can detect accidental inconsistency only; an in-process caller
-can construct a receipt and recompute its digest. They do not prove the
-observations' provenance, provide a signature, or form a boundary against a
-compromised supervisor process. The feature remains fail-closed and no runtime
-enforcement or real-host attestation is claimed.
+No worker executor currently calls the collector or integrates public gate
+release. Collector tests use synthetic runc/systemd values; opt-in OCI tests
+exercise the launcher/policy only and do not provide observation provenance.
+The Python receipt type and unkeyed digest can detect accidental inconsistency
+only; an in-process caller can construct a receipt and recompute its digest.
+They do not prove the observations' provenance, provide a signature, or form a
+boundary against a compromised supervisor process. The feature remains
+fail-closed and no worker isolation or authenticated runtime attestation is
+claimed.
+
+**Journal-gated init release (2026-10-06).** The public
+`RuncLaunchHandle.release_gate()` now refuses release until the exact registered
+handle is bound to the attempt/execution and `_sandbox_execution_record_running`
+has committed the matching `running` transition. The same per-handle lock now
+serializes that transition and permit issue with supported cancellation
+(`running` to `stopping`), exit, and quarantine transitions; those transitions
+revoke any unconsumed permit before releasing the lock. Gate release consumes
+its permit and writes `go\n` under that lock. A stop request before `running`
+remains rejected by the journal's phase constraints.
+Thus a stop that commits first cannot be followed by gate release, while a gate
+release that wins first may start the command before a later stop commits; the
+actual process-kill/reaper path remains unimplemented. This is sequencing
+hardening only: the running transition still accepts a self-consistent receipt
+whose observation provenance is unauthenticated, so it is not proof of
+independent runtime attestation. The low-level launcher tests keep their bypass
+inside test modules; it is not shipped as a production helper and is not
+evidence of a supervised worker path. `run_worker` remains fail-closed for
+configured OCI; no supervisor-managed runc launch or result import is claimed.
 
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
