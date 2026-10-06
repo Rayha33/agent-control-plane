@@ -18,6 +18,7 @@ import sqlite3
 import stat
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -48,7 +49,10 @@ from .sandbox_workspace import (
 from .sandbox_workspace import Snapshot as _Snapshot
 from .sandbox_workspace import _snapshot_origin as _snapshot_origin
 from .sandbox_workspace import collect_changes as _collect_changes
-from .store import _authorize_sandbox_exit_receipt_write
+from .store import (
+    _authorize_sandbox_exit_receipt_write,
+    _authorize_sandbox_launch_plan_write,
+)
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
@@ -79,12 +83,217 @@ _TRANSITION_FIELDS = {
             "scope_unit",
             "scope_invocation_id",
             "cgroup_path",
+            "launch_plan_binding_version",
+            "launch_plan_json",
+            "launch_config_digest",
+            "launch_argv_digest",
+            "launch_plan_digest",
         }
     ),
     ("launched", "running"): frozenset({"init_pid", "init_identity"}),
     ("running", "stopping"): frozenset({"stop_reason"}),
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
 }
+
+
+def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]:
+    """Canonical, durable projection of a registered runc handle and reservation."""
+
+    argv = list(target.argv)
+    argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
+    return {
+        "version": 1,
+        "reservation": {
+            key: execution[key]
+            for key in (
+                "attempt_id",
+                "claim_token",
+                "execution_id",
+                "backend",
+                "container_id",
+                "bundle_digest",
+                "rootfs_digest",
+                "rootfs_closure_digest",
+                "runc_executable_digest",
+                "runtime_version",
+                "oci_version",
+                "bundle_path",
+                "state_path",
+                "workspace_binding_version",
+                "baseline_manifest_digest",
+                "workspace_root_path",
+                "workspace_root_dev",
+                "workspace_root_ino",
+                "private_path_binding_version",
+                "execution_root_dev",
+                "execution_root_ino",
+                "bundle_root_dev",
+                "bundle_root_ino",
+                "state_root_dev",
+                "state_root_ino",
+            )
+        },
+        "launch": {
+            "mode": target.launch_mode,
+            "runc_executable_path": target.runc_executable_path,
+            "runc_executable_sha256": target.runc_executable_sha256,
+            "config_sha256": target.config_sha256,
+            "argv": argv,
+            "argv_sha256": argv_digest,
+            "container_id": target.container_id,
+            "bundle": {
+                "path": target.bundle_path,
+                "device": target.bundle_device,
+                "inode": target.bundle_inode,
+            },
+            "rootfs": {
+                "path": target.rootfs_path,
+                "device": target.rootfs_device,
+                "inode": target.rootfs_inode,
+                "sha256": target.rootfs_sha256,
+                "closure_sha256": target.rootfs_closure_sha256,
+                "snapshot": {
+                    "device": target.rootfs_snapshot_device,
+                    "inode": target.rootfs_snapshot_inode,
+                    "sha256": target.rootfs_snapshot_sha256,
+                    "closure_sha256": target.rootfs_snapshot_closure_sha256,
+                    "entry_count": target.rootfs_snapshot_entry_count,
+                    "bytes": target.rootfs_snapshot_bytes,
+                },
+            },
+            "state": {
+                "path": target.state_path,
+                "device": target.state_device,
+                "inode": target.state_inode,
+            },
+            "workspace": {
+                "path": target.workspace_path,
+                "device": target.workspace_device,
+                "inode": target.workspace_inode,
+            },
+            "pid_file_path": target.pid_file_path,
+        },
+    }
+
+
+def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
+    """Verify the durable plan digest and every reservation identity it commits."""
+
+    try:
+        if (
+            row["launch_plan_required"] != 1
+            or row["launch_plan_binding_version"] != 1
+            or _DIGEST.fullmatch(row["launch_config_digest"] or "") is None
+            or _DIGEST.fullmatch(row["launch_argv_digest"] or "") is None
+            or _DIGEST.fullmatch(row["launch_plan_digest"] or "") is None
+        ):
+            return False
+        raw_plan = row["launch_plan_json"]
+        plan = json.loads(raw_plan)
+        if not isinstance(plan, dict) or canonical_json(plan) != raw_plan:
+            return False
+        if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
+            return False
+        if plan.get("version") != 1:
+            return False
+        reservation = plan.get("reservation")
+        expected_reservation = {
+            key: row[key]
+            for key in (
+                "attempt_id",
+                "claim_token",
+                "execution_id",
+                "backend",
+                "container_id",
+                "bundle_digest",
+                "rootfs_digest",
+                "rootfs_closure_digest",
+                "runc_executable_digest",
+                "runtime_version",
+                "oci_version",
+                "bundle_path",
+                "state_path",
+                "workspace_binding_version",
+                "baseline_manifest_digest",
+                "workspace_root_path",
+                "workspace_root_dev",
+                "workspace_root_ino",
+                "private_path_binding_version",
+                "execution_root_dev",
+                "execution_root_ino",
+                "bundle_root_dev",
+                "bundle_root_ino",
+                "state_root_dev",
+                "state_root_ino",
+            )
+        }
+        launch = plan.get("launch")
+        if reservation != expected_reservation or not isinstance(launch, dict):
+            return False
+        argv = launch.get("argv")
+        bundle = launch.get("bundle")
+        rootfs = launch.get("rootfs")
+        state = launch.get("state")
+        workspace = launch.get("workspace")
+        if not all(isinstance(value, dict) for value in (bundle, rootfs, state, workspace)):
+            return False
+        pid_file_path = launch.get("pid_file_path")
+        snapshot = rootfs.get("snapshot")
+        if not isinstance(pid_file_path, str) or not isinstance(snapshot, dict):
+            return False
+        argv_shape_matches = (
+            isinstance(argv, list)
+            and len(argv) == 13
+            and all(isinstance(value, str) and value for value in argv)
+            and argv[0] == launch.get("runc_executable_path")
+            and argv[1] == "--root"
+            and re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", argv[2]) is not None
+            and argv[3:6] == ["--systemd-cgroup", "run", "--bundle"]
+            and re.fullmatch(r"/proc/self/fd/[1-9][0-9]*", argv[6]) is not None
+            and argv[7] == "--pid-file"
+            and argv[8] == f"{argv[2]}/{Path(pid_file_path).name}"
+            and argv[9:12] == ["--preserve-fds", "1", "--keep"]
+            and argv[12] == row["container_id"]
+            and argv[2] != argv[6]
+        )
+        return (
+            launch.get("mode") == "private_bundle"
+            and launch.get("runc_executable_sha256") == row["runc_executable_digest"]
+            and launch.get("container_id") == row["container_id"]
+            and launch.get("config_sha256") == row["launch_config_digest"]
+            and launch.get("argv_sha256") == row["launch_argv_digest"]
+            and argv_shape_matches
+            and hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
+            == row["launch_argv_digest"]
+            and bundle
+            == {
+                "path": row["bundle_path"],
+                "device": row["bundle_root_dev"],
+                "inode": row["bundle_root_ino"],
+            }
+            and rootfs.get("path") == str(Path(row["bundle_path"]) / "rootfs")
+            and rootfs.get("sha256") == row["rootfs_digest"]
+            and rootfs.get("closure_sha256") == row["rootfs_closure_digest"]
+            and snapshot.get("sha256") == row["rootfs_digest"]
+            and snapshot.get("closure_sha256") == row["rootfs_closure_digest"]
+            and state
+            == {
+                "path": row["state_path"],
+                "device": row["state_root_dev"],
+                "inode": row["state_root_ino"],
+            }
+            and workspace
+            == {
+                "path": row["workspace_root_path"],
+                "device": row["workspace_root_dev"],
+                "inode": row["workspace_root_ino"],
+            }
+            and Path(pid_file_path).parent == Path(row["state_path"])
+        )
+    except (IndexError, KeyError, TypeError, ValueError, UnicodeError):
+        return False
+
+
 _CLEANUP_OBSERVATIONS = {
     "runc_delete_exit_code": None,
     "runc_state_absent": None,
@@ -150,19 +359,24 @@ def _sandbox_execution_cleanup_is_verified(connection: Any, attempt_id: str) -> 
     """Old/direct attempts have no journal; journaled attempts require verification."""
 
     row = connection.execute(
-        "SELECT phase FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+        "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
     ).fetchone()
-    return row is None or row["phase"] == "cleanup_verified"
+    return row is None or (
+        row["phase"] == "cleanup_verified" and _sandbox_launch_plan_binding_is_self_consistent(row)
+    )
 
 
 def _require_sandbox_execution_result_eligible(connection: Any, attempt_id: str) -> None:
     """Fence result import/submission until a journaled worker exited cleanly."""
 
     row = connection.execute(
-        "SELECT phase, runc_exit_code FROM sandbox_executions WHERE attempt_id = ?",
-        (attempt_id,),
+        "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
     ).fetchone()
-    if row is not None and not (row["phase"] == "cleanup_verified" and row["runc_exit_code"] == 0):
+    if row is not None and not (
+        row["phase"] == "cleanup_verified"
+        and row["runc_exit_code"] == 0
+        and _sandbox_launch_plan_binding_is_self_consistent(row)
+    ):
         raise SupervisorError(
             "sandbox_result_unverified",
             "sandbox result requires successful runc exit and independently verified cleanup",
@@ -344,10 +558,10 @@ class SandboxExecutionJournalMixin:
                     """
                     INSERT INTO sandbox_executions
                       (attempt_id, claim_token, execution_id, backend, container_id,
-                       bundle_digest, rootfs_digest, rootfs_closure_digest,
+                       bundle_digest, launch_plan_required, rootfs_digest, rootfs_closure_digest,
                        runc_executable_digest, runtime_version, oci_version,
                        bundle_path, state_path, phase, created_at, updated_at)
-                    VALUES (?, ?, ?, 'oci-runc', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+                    VALUES (?, ?, ?, 'oci-runc', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
                     """,
                     (
                         attempt_id,
@@ -1164,6 +1378,7 @@ class SandboxExecutionJournalMixin:
         event_type: str,
         event_payload: dict[str, Any],
         credential: str | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         allowed_fields = _TRANSITION_FIELDS.get((expected_phase, next_phase))
         if (
@@ -1177,8 +1392,10 @@ class SandboxExecutionJournalMixin:
             )
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        connection_context = self.connect() if _connection is None else nullcontext(_connection)
+        with connection_context as connection:
+            if _connection is None:
+                connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
             if attempt["status"] != "working":
                 raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
@@ -1196,6 +1413,11 @@ class SandboxExecutionJournalMixin:
                     f"expected phase {expected_phase}, found {row['phase']}; fence retained",
                 )
             if expected_phase == "reserved" and next_phase == "launched":
+                if row["launch_plan_required"] != 1:
+                    raise SupervisorError(
+                        "sandbox_execution_launch_plan_required",
+                        "legacy reservation has no trusted launch-plan requirement",
+                    )
                 if row["workspace_binding_version"] != 1:
                     raise SupervisorError(
                         "sandbox_workspace_unbound",
@@ -1223,6 +1445,13 @@ class SandboxExecutionJournalMixin:
                     )
                 for path, device, inode in expected_paths:
                     _verify_directory_identity(path, expected_device=device, expected_inode=inode)
+                candidate = dict(row)
+                candidate.update(updates)
+                if not _sandbox_launch_plan_binding_is_self_consistent(candidate):
+                    raise SupervisorError(
+                        "sandbox_execution_launch_plan_invalid",
+                        "launch transition lacks a self-consistent durable launch-plan binding",
+                    )
                 if any(
                     _DIGEST.fullmatch(row[name] or "") is None
                     for name in ("rootfs_closure_digest", "runc_executable_digest")
@@ -1332,6 +1561,11 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
         if durable_execution["claim_token"] != claim_token:
             raise SupervisorError("stale_fencing_token", "claim token is stale")
+        if durable_execution["launch_plan_required"] != 1:
+            raise SupervisorError(
+                "sandbox_execution_launch_plan_required",
+                "legacy reservation has no trusted launch-plan requirement",
+            )
         if durable_execution["workspace_binding_version"] != 1:
             raise SupervisorError(
                 "sandbox_workspace_unbound",
@@ -1384,6 +1618,13 @@ class SandboxExecutionJournalMixin:
                 "sandbox_execution_launch_target_mismatch",
                 "pinned-runc launch target does not match the exact durable reservation",
             )
+        launch_plan = _sandbox_launch_plan_material(durable_execution, launch_target)
+        launch_plan_json = canonical_json(launch_plan)
+        launch_config_digest = launch_target.config_sha256
+        launch_argv_digest = hashlib.sha256(
+            canonical_json(list(launch_target.argv)).encode("utf-8")
+        ).hexdigest()
+        launch_plan_digest = hashlib.sha256(launch_plan_json.encode("utf-8")).hexdigest()
         _runc_launch_handle_bind_execution(
             runc_handle, attempt_id, claim_token, durable_execution["execution_id"]
         )
@@ -1397,61 +1638,77 @@ class SandboxExecutionJournalMixin:
             "scope_unit": scope_unit,
             "scope_invocation_id": scope_invocation_id,
             "cgroup_path": cgroup_path,
+            "launch_plan_binding_version": 1,
+            "launch_plan_json": launch_plan_json,
+            "launch_config_digest": launch_config_digest,
+            "launch_argv_digest": launch_argv_digest,
+            "launch_plan_digest": launch_plan_digest,
         }
-        return self._sandbox_execution_transition(
-            attempt_id,
-            claim_token,
-            expected_phase="reserved",
-            next_phase="launched",
-            updates=updates,
-            event_type="sandbox.execution_launched",
-            event_payload={
-                **updates,
-                "launch_target": {
-                    "mode": launch_target.launch_mode,
-                    "runc_executable_path": launch_target.runc_executable_path,
-                    "runc_executable_sha256": launch_target.runc_executable_sha256,
-                    "config_sha256": launch_target.config_sha256,
-                    "config_sha256_semantics": "sha256-exact-config-json-bytes",
-                    "argv_sha256": hashlib.sha256(
-                        canonical_json(list(launch_target.argv)).encode("utf-8")
-                    ).hexdigest(),
-                    "container_id": launch_target.container_id,
-                    "bundle": {
-                        "path": launch_target.bundle_path,
-                        "device": launch_target.bundle_device,
-                        "inode": launch_target.bundle_inode,
-                    },
-                    "rootfs": {
-                        "path": launch_target.rootfs_path,
-                        "device": launch_target.rootfs_device,
-                        "inode": launch_target.rootfs_inode,
-                        "sha256": launch_target.rootfs_sha256,
-                        "closure_sha256": launch_target.rootfs_closure_sha256,
-                        "snapshot": {
-                            "device": launch_target.rootfs_snapshot_device,
-                            "inode": launch_target.rootfs_snapshot_inode,
-                            "sha256": launch_target.rootfs_snapshot_sha256,
-                            "closure_sha256": launch_target.rootfs_snapshot_closure_sha256,
-                            "entry_count": launch_target.rootfs_snapshot_entry_count,
-                            "bytes": launch_target.rootfs_snapshot_bytes,
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            with _authorize_sandbox_launch_plan_write(
+                connection,
+                runc_handle,
+                attempt_id,
+                claim_token,
+                durable_execution["execution_id"],
+                launch_plan_json,
+                launch_plan_digest,
+            ):
+                return self._sandbox_execution_transition(
+                    attempt_id,
+                    claim_token,
+                    expected_phase="reserved",
+                    next_phase="launched",
+                    updates=updates,
+                    event_type="sandbox.execution_launched",
+                    event_payload={
+                        **updates,
+                        "launch_plan": launch_plan,
+                        "launch_target": {
+                            "mode": launch_target.launch_mode,
+                            "runc_executable_path": launch_target.runc_executable_path,
+                            "runc_executable_sha256": launch_target.runc_executable_sha256,
+                            "config_sha256": launch_target.config_sha256,
+                            "config_sha256_semantics": "sha256-exact-config-json-bytes",
+                            "argv_sha256": launch_argv_digest,
+                            "container_id": launch_target.container_id,
+                            "bundle": {
+                                "path": launch_target.bundle_path,
+                                "device": launch_target.bundle_device,
+                                "inode": launch_target.bundle_inode,
+                            },
+                            "rootfs": {
+                                "path": launch_target.rootfs_path,
+                                "device": launch_target.rootfs_device,
+                                "inode": launch_target.rootfs_inode,
+                                "sha256": launch_target.rootfs_sha256,
+                                "closure_sha256": launch_target.rootfs_closure_sha256,
+                                "snapshot": {
+                                    "device": launch_target.rootfs_snapshot_device,
+                                    "inode": launch_target.rootfs_snapshot_inode,
+                                    "sha256": launch_target.rootfs_snapshot_sha256,
+                                    "closure_sha256": launch_target.rootfs_snapshot_closure_sha256,
+                                    "entry_count": launch_target.rootfs_snapshot_entry_count,
+                                    "bytes": launch_target.rootfs_snapshot_bytes,
+                                },
+                            },
+                            "state": {
+                                "path": launch_target.state_path,
+                                "device": launch_target.state_device,
+                                "inode": launch_target.state_inode,
+                            },
+                            "workspace": {
+                                "path": launch_target.workspace_path,
+                                "device": launch_target.workspace_device,
+                                "inode": launch_target.workspace_inode,
+                            },
+                            "pid_file_path": launch_target.pid_file_path,
                         },
                     },
-                    "state": {
-                        "path": launch_target.state_path,
-                        "device": launch_target.state_device,
-                        "inode": launch_target.state_inode,
-                    },
-                    "workspace": {
-                        "path": launch_target.workspace_path,
-                        "device": launch_target.workspace_device,
-                        "inode": launch_target.workspace_inode,
-                    },
-                    "pid_file_path": launch_target.pid_file_path,
-                },
-            },
-            credential=credential,
-        )
+                    credential=credential,
+                    _connection=connection,
+                )
 
     def _sandbox_execution_record_running(
         self,
@@ -1474,6 +1731,11 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_transition_invalid",
                 f"cannot record running from phase {row['phase']}; fence retained",
+            )
+        if not _sandbox_launch_plan_binding_is_self_consistent(row):
+            raise SupervisorError(
+                "sandbox_execution_launch_plan_required",
+                "running transition requires a durable trusted launch-plan binding",
             )
         if not running_attestation_is_self_consistent(attestation):
             raise SupervisorError(
@@ -1660,6 +1922,13 @@ class SandboxExecutionJournalMixin:
                 )
             if row["claim_token"] != claim_token:
                 raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
+            if row["phase"] in {"launched", "running", "stopping"} and not (
+                _sandbox_launch_plan_binding_is_self_consistent(row)
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_launch_plan_required",
+                    "exit transition requires a durable trusted launch-plan binding",
+                )
             if (
                 wait_receipt.pid != row["runc_client_pid"]
                 or wait_receipt.process_identity != row["runc_client_identity"]
@@ -1976,6 +2245,11 @@ class SandboxExecutionJournalMixin:
             value["result_candidate"] = json.loads(raw_candidate) if raw_candidate else None
         except (TypeError, ValueError, json.JSONDecodeError):
             value["result_candidate"] = {"state": "unavailable"}
+        raw_launch_plan = value.get("launch_plan_json", "")
+        try:
+            value["launch_plan"] = json.loads(raw_launch_plan) if raw_launch_plan else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value["launch_plan"] = {"state": "unavailable"}
         return value
 
     @staticmethod

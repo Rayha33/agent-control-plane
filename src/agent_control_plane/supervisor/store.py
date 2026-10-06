@@ -23,6 +23,9 @@ from .common import GENESIS_HASH, SupervisorError, canonical_json, sha256, utc_n
 _SANDBOX_EXIT_RECEIPT_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, int, str, int]] | None
 ] = ContextVar("acp_sandbox_exit_receipt_authorization", default=None)
+_SANDBOX_LAUNCH_PLAN_AUTHORIZATION: ContextVar[
+    tuple[int, tuple[str, int, str, str, str, str, str]] | None
+] = ContextVar("acp_sandbox_launch_plan_authorization", default=None)
 
 
 @contextmanager
@@ -82,6 +85,102 @@ def _sandbox_exit_receipt_authorized_for(connection: sqlite3.Connection):
     return authorized
 
 
+@contextmanager
+def _authorize_sandbox_launch_plan_write(
+    connection: sqlite3.Connection,
+    handle: Any,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    plan_json: str,
+    plan_digest: str,
+) -> Iterator[None]:
+    """Scope one launch-plan update to the exact registered, bound runc handle."""
+
+    import hashlib
+
+    from .oci_worker import (
+        RuncLaunchHandle,
+        _runc_launch_handle_is_bound_to_execution,
+        _runc_launch_handle_is_self_consistent,
+        _runc_launch_target,
+    )
+
+    target = _runc_launch_target(handle)
+    if (
+        type(handle) is not RuncLaunchHandle
+        or not _runc_launch_handle_is_self_consistent(handle)
+        or target is None
+        or not _runc_launch_handle_is_bound_to_execution(
+            handle, attempt_id, claim_token, execution_id
+        )
+        or not isinstance(target.config_sha256, str)
+        or len(target.config_sha256) != 64
+        or not isinstance(target.argv, tuple)
+        or any(not isinstance(value, str) for value in target.argv)
+    ):
+        raise SupervisorError(
+            "sandbox_execution_launch_handle_required",
+            "launch-plan persistence requires the exact registered runc handle",
+        )
+    config_digest = target.config_sha256
+    argv_digest = hashlib.sha256(canonical_json(list(target.argv)).encode("utf-8")).hexdigest()
+    if (
+        not isinstance(plan_json, str)
+        or not plan_json
+        or hashlib.sha256(plan_json.encode("utf-8")).hexdigest() != plan_digest
+    ):
+        raise SupervisorError(
+            "sandbox_execution_launch_plan_invalid",
+            "launch-plan digest does not match its canonical journal payload",
+        )
+    fields = (
+        attempt_id,
+        claim_token,
+        execution_id,
+        config_digest,
+        argv_digest,
+        plan_digest,
+        plan_json,
+    )
+    token = _SANDBOX_LAUNCH_PLAN_AUTHORIZATION.set((id(connection), fields))
+    try:
+        yield
+    finally:
+        _SANDBOX_LAUNCH_PLAN_AUTHORIZATION.reset(token)
+
+
+def _sandbox_launch_plan_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        config_digest: str,
+        argv_digest: str,
+        plan_digest: str,
+        plan_json: str,
+    ) -> int:
+        authorization = _SANDBOX_LAUNCH_PLAN_AUTHORIZATION.get()
+        expected = (
+            attempt_id,
+            claim_token,
+            execution_id,
+            config_digest,
+            argv_digest,
+            plan_digest,
+            plan_json,
+        )
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
+
+
 class StoreMixin:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -99,6 +198,11 @@ class StoreMixin:
                 6,
                 _sandbox_exit_receipt_authorized_for(connection),
             )
+            connection.create_function(
+                "acp_sandbox_launch_plan_authorized",
+                7,
+                _sandbox_launch_plan_authorized_for(connection),
+            )
             try:
                 yield connection
             finally:
@@ -110,6 +214,11 @@ class StoreMixin:
             "acp_sandbox_exit_receipt_authorized",
             6,
             _sandbox_exit_receipt_authorized_for(connection),
+        )
+        connection.create_function(
+            "acp_sandbox_launch_plan_authorized",
+            7,
+            _sandbox_launch_plan_authorized_for(connection),
         )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")

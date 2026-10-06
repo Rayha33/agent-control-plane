@@ -194,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1364,6 +1364,159 @@ def _add_sandbox_exit_receipt_guard(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_sandbox_launch_plan_binding(connection: sqlite3.Connection) -> None:
+    """Bind each new OCI launch to a write-once, launcher-authorized plan.
+
+    Pre-existing rows receive ``launch_plan_required = 0`` and empty plan fields.
+    Their original launcher handle and exact config/argv are not reconstructible,
+    so migration deliberately does not attest them. New reservations opt into the
+    binding and can advance only through the registered-handle write capability.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-plan binding migration"
+        )
+    additions = (
+        (
+            "launch_plan_required",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (launch_plan_required IN (0, 1))",
+        ),
+        (
+            "launch_plan_binding_version",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (launch_plan_binding_version IN (0, 1))",
+        ),
+        ("launch_plan_json", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_config_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_argv_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_plan_digest", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_launch_plan_insert_guard",
+        "sandbox_launch_plan_required_immutable",
+        "sandbox_launch_plan_write_once",
+        "sandbox_execution_launch_requires_plan",
+        "sandbox_execution_running_requires_plan",
+        "sandbox_execution_exit_requires_plan",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_plan_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_plan_binding_version != 0
+          OR NEW.launch_plan_json != ''
+          OR NEW.launch_config_digest != ''
+          OR NEW.launch_argv_digest != ''
+          OR NEW.launch_plan_digest != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_plan_must_be_bound_after_reservation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_plan_required_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.launch_plan_required IS NOT NEW.launch_plan_required
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_plan_requirement_immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_plan_write_once
+        BEFORE UPDATE OF launch_plan_binding_version, launch_plan_json,
+          launch_config_digest, launch_argv_digest, launch_plan_digest
+          ON sandbox_executions
+        WHEN NOT (
+          OLD.launch_plan_required = 1 AND NEW.launch_plan_required = 1
+          AND OLD.launch_plan_binding_version = 0
+          AND NEW.launch_plan_binding_version = 1
+          AND OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND NEW.launch_plan_json != ''
+          AND length(NEW.launch_plan_json) <= 65536
+          AND length(NEW.launch_config_digest) = 64
+          AND NEW.launch_config_digest NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_argv_digest) = 64
+          AND NEW.launch_argv_digest NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_plan_digest) = 64
+          AND NEW.launch_plan_digest NOT GLOB '*[^0-9a-f]*'
+          AND acp_sandbox_launch_plan_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            NEW.launch_config_digest, NEW.launch_argv_digest,
+            NEW.launch_plan_digest, NEW.launch_plan_json
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_plan_binding_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_plan
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            NEW.launch_plan_required != 1
+            OR NEW.launch_plan_binding_version != 1
+            OR NEW.launch_plan_json = ''
+            OR length(NEW.launch_config_digest) != 64
+            OR NEW.launch_config_digest GLOB '*[^0-9a-f]*'
+            OR length(NEW.launch_argv_digest) != 64
+            OR NEW.launch_argv_digest GLOB '*[^0-9a-f]*'
+            OR length(NEW.launch_plan_digest) != 64
+            OR NEW.launch_plan_digest GLOB '*[^0-9a-f]*'
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_launch_plan_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_running_requires_plan
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'launched' AND NEW.phase = 'running'
+          AND (
+            NEW.launch_plan_required != 1
+            OR NEW.launch_plan_binding_version != 1
+            OR NEW.launch_plan_json = ''
+            OR length(NEW.launch_plan_digest) != 64
+            OR NEW.launch_plan_digest GLOB '*[^0-9a-f]*'
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_launch_plan_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_exit_requires_plan
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase IN ('launched', 'running', 'stopping') AND NEW.phase = 'exited'
+          AND (
+            NEW.launch_plan_required != 1
+            OR NEW.launch_plan_binding_version != 1
+            OR NEW.launch_plan_json = ''
+            OR length(NEW.launch_plan_digest) != 64
+            OR NEW.launch_plan_digest GLOB '*[^0-9a-f]*'
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_launch_plan_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1385,6 +1538,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (19, _add_result_import_source_discriminator),
     (20, _add_sandbox_kernel_wait_evidence),
     (21, _add_sandbox_exit_receipt_guard),
+    (22, _add_sandbox_launch_plan_binding),
 )
 
 

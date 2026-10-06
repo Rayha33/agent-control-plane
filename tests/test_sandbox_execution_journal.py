@@ -134,13 +134,13 @@ def _test_runc_target(
         argv=(
             "/usr/bin/runc",
             "--root",
-            state_path,
+            "/proc/self/fd/66",
             "--systemd-cgroup",
             "run",
             "--bundle",
-            execution["bundle_path"],
+            "/proc/self/fd/64",
             "--pid-file",
-            str(Path(state_path) / "init.pid"),
+            "/proc/self/fd/66/init.pid",
             "--preserve-fds",
             "1",
             "--keep",
@@ -283,7 +283,221 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     assert launch["rootfs"]["snapshot"]["device"] == target.rootfs_snapshot_device
     assert launch["rootfs"]["snapshot"]["inode"] == target.rootfs_snapshot_inode
     assert launch["rootfs"]["snapshot"]["sha256"] == execution["rootfs_digest"]
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable["launch_plan_required"] == 1
+    assert durable["launch_plan_binding_version"] == 1
+    assert durable["launch_config_digest"] == target.config_sha256
+    assert (
+        durable["launch_argv_digest"]
+        == hashlib.sha256(canonical_json(list(target.argv)).encode("utf-8")).hexdigest()
+    )
+    assert (
+        durable["launch_plan_digest"]
+        == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
+    )
+    assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
+    assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(durable)
+    event_plan = json.loads(event["payload_json"])["launch_plan"]
+    assert event_plan == durable["launch_plan"]
     assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_generic_transition_cannot_forge_launch_plan_binding(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+    updates = launch_transition_updates(execution, target)
+
+    with pytest.raises(sqlite3.IntegrityError, match="sandbox_launch_plan_binding_required"):
+        supervisor._sandbox_execution_transition(
+            attempt["id"],
+            attempt["claim_token"],
+            expected_phase="reserved",
+            next_phase="launched",
+            updates=updates,
+            event_type="sandbox.execution_launched",
+            event_payload=updates,
+        )
+
+    columns = ", ".join(f"{name} = ?" for name in updates)
+    with (
+        supervisor.connect() as connection,
+        pytest.raises(sqlite3.IntegrityError, match="sandbox_launch_plan_binding_required"),
+    ):
+        connection.execute(
+            f"UPDATE sandbox_executions SET {columns}, phase = 'launched' "
+            "WHERE attempt_id = ? AND claim_token = ? AND phase = 'reserved'",
+            (*updates.values(), attempt["id"], attempt["claim_token"]),
+        )
+
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    assert row["phase"] == "reserved"
+    assert row["launch_plan_binding_version"] == 0
+    assert row["launch_plan_json"] == ""
+
+
+@pytest.mark.parametrize("mismatch", ["config", "argv"])
+def test_launch_transition_rejects_mismatched_config_or_argv(repo: Path, mismatch: str) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+    updates = launch_transition_updates(execution, target)
+    plan = json.loads(updates["launch_plan_json"])
+    if mismatch == "config":
+        plan["launch"]["config_sha256"] = "f" * 64
+    else:
+        plan["launch"]["argv"].append("--unexpected")
+        plan["launch"]["argv_sha256"] = hashlib.sha256(
+            canonical_json(plan["launch"]["argv"]).encode("utf-8")
+        ).hexdigest()
+    updates["launch_plan_json"] = canonical_json(plan)
+    updates["launch_plan_digest"] = hashlib.sha256(
+        updates["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._sandbox_execution_transition(
+            attempt["id"],
+            attempt["claim_token"],
+            expected_phase="reserved",
+            next_phase="launched",
+            updates=updates,
+            event_type="sandbox.execution_launched",
+            event_payload=updates,
+        )
+
+    assert error.value.code == "sandbox_execution_launch_plan_invalid"
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    assert row["phase"] == "reserved"
+    assert row["launch_plan_binding_version"] == 0
+
+
+def test_launch_plan_binding_is_write_once(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    original = supervisor._sandbox_execution_get(attempt["id"])["launch_plan_digest"]
+    changed = ("1" if original[0] == "0" else "0") * 64
+
+    with (
+        supervisor.connect() as connection,
+        pytest.raises(sqlite3.IntegrityError, match="sandbox_launch_plan_binding_required"),
+    ):
+        connection.execute(
+            "UPDATE sandbox_executions SET launch_plan_digest = ? WHERE attempt_id = ?",
+            (changed, attempt["id"]),
+        )
+
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    assert row["phase"] == "launched"
+    assert row["launch_plan_digest"] == original
+    assert row["launch_plan_digest"] != changed
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(row)
+
+
+def test_launch_plan_transition_rolls_back_and_replays_after_event_failure(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    original_event = supervisor._event
+
+    def fail_launch_event(connection, event_type: str, actor: str, payload: dict) -> None:
+        if event_type == "sandbox.execution_launched":
+            raise RuntimeError("injected crash before launch transaction commit")
+        original_event(connection, event_type, actor, payload)
+
+    monkeypatch.setattr(supervisor, "_event", fail_launch_event)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        record_launch(supervisor, attempt, runc_handle=handle)
+    after_failure = supervisor._sandbox_execution_get(attempt["id"])
+    assert after_failure["phase"] == "reserved"
+    assert after_failure["launch_plan_binding_version"] == 0
+    assert after_failure["launch_plan_json"] == ""
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_type = 'sandbox.execution_launched'"
+            ).fetchone()[0]
+            == 0
+        )
+
+    monkeypatch.setattr(supervisor, "_event", original_event)
+    replayed = record_launch(supervisor, attempt, runc_handle=handle)
+    assert replayed["phase"] == "launched"
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(replayed)
+    assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_launch_plan_survives_reopen_but_does_not_recover_dead_handle(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    record_launch(supervisor, attempt, runc_handle=handle)
+    registry_entry = oci_worker._RUNC_LAUNCH_RECORDS.pop(id(handle))
+    try:
+        reopened = GitSupervisor(repo)
+        durable = reopened._sandbox_execution_get(attempt["id"])
+        assert durable["phase"] == "launched"
+        assert journal_module._sandbox_launch_plan_binding_is_self_consistent(durable)
+        with pytest.raises(SupervisorError) as missing_handle:
+            reopened._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=running_attestation(reopened, attempt),
+                runc_handle=handle,
+            )
+        assert missing_handle.value.code == "sandbox_execution_launch_handle_required"
+        assert reopened._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+    finally:
+        oci_worker._RUNC_LAUNCH_RECORDS[id(handle)] = registry_entry
+
+
+def test_concurrent_launch_plan_binding_has_one_durable_winner(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    barrier = threading.Barrier(2)
+
+    def race_launch() -> tuple[str, object]:
+        barrier.wait(timeout=3)
+        try:
+            return "ok", record_launch(supervisor, attempt, runc_handle=handle)
+        except SupervisorError as error:
+            return "error", error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            future.result(timeout=5)
+            for future in (pool.submit(race_launch), pool.submit(race_launch))
+        ]
+
+    assert [kind for kind, _ in results].count("ok") == 1
+    errors = [value for kind, value in results if kind == "error"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], SupervisorError)
+    assert errors[0].code == "sandbox_execution_transition_invalid"
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable["phase"] == "launched"
+    assert durable["launch_plan_binding_version"] == 1
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(durable)
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM events WHERE event_type = 'sandbox.execution_launched'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_public_gate_release_requires_exact_durable_running_transition(repo: Path) -> None:
@@ -511,6 +725,28 @@ def record_launch(
     )
 
 
+def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTarget) -> dict:
+    plan = journal_module._sandbox_launch_plan_material(execution, target)
+    plan_json = canonical_json(plan)
+    argv_digest = hashlib.sha256(canonical_json(list(target.argv)).encode("utf-8")).hexdigest()
+    return {
+        "monitor_pid": 101,
+        "monitor_identity": "linux:101:1101",
+        "runc_client_pid": 202,
+        "runc_client_identity": "linux:202:1202",
+        "wrapper_unit": "acp-worker.service",
+        "wrapper_invocation_id": "1" * 32,
+        "scope_unit": "acp-container.scope",
+        "scope_invocation_id": "2" * 32,
+        "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope",
+        "launch_plan_binding_version": 1,
+        "launch_plan_json": plan_json,
+        "launch_config_digest": target.config_sha256,
+        "launch_argv_digest": argv_digest,
+        "launch_plan_digest": hashlib.sha256(plan_json.encode("utf-8")).hexdigest(),
+    }
+
+
 def record_exit(supervisor: GitSupervisor, attempt: dict, exit_code: int = 0) -> dict:
     handle = attempt.get("_test_runc_handle")
     assert isinstance(handle, oci_worker.RuncLaunchHandle)
@@ -622,14 +858,14 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v21_requires_durable_workspace_and_private_path_binding_before_launch(
+def test_schema_v22_requires_durable_workspace_and_private_path_binding_before_launch(
     repo: Path,
 ) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 21
+    assert SCHEMA_VERSION == 22
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -647,6 +883,8 @@ def test_schema_v21_requires_durable_workspace_and_private_path_binding_before_l
     assert row["rootfs_closure_digest"] == supervisor.config.oci_rootfs_pin.closure_sha256
     assert row["runc_executable_digest"] == supervisor.config.oci_runc_executable.sha256
     assert row["result_candidate_version"] == 0
+    assert row["launch_plan_required"] == 1
+    assert row["launch_plan_binding_version"] == 0
     assert row["bundle_path"].startswith(str((repo / ".acp" / "sandbox-executions").resolve()))
     assert row["state_path"].endswith("/state")
 
@@ -947,7 +1185,10 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
         supervisor.connect() as connection,
         pytest.raises(
             sqlite3.IntegrityError,
-            match="workspace_binding_required|private_paths_required|phase_transition_invalid",
+            match=(
+                "workspace_binding_required|private_paths_required|"
+                "sandbox_execution_launch_plan_required|phase_transition_invalid"
+            ),
         ),
     ):
         connection.execute(
@@ -1088,6 +1329,62 @@ def test_schema_13_read_only_open_refuses_until_journal_migration(repo: Path) ->
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
     assert "sandbox_executions" in tables
+
+
+@pytest.mark.parametrize("phase", ["reserved", "launched"])
+def test_v21_rows_migrate_unattested_and_remain_fail_closed(repo: Path, phase: str) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    if phase == "launched":
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    # Recreate the pre-v22 table: the migration must not infer that a historical
+    # caller-supplied digest was a trusted config/argv binding.
+    with supervisor.connect() as connection:
+        for trigger in (
+            "sandbox_launch_plan_insert_guard",
+            "sandbox_launch_plan_required_immutable",
+            "sandbox_launch_plan_write_once",
+            "sandbox_execution_launch_requires_plan",
+            "sandbox_execution_running_requires_plan",
+            "sandbox_execution_exit_requires_plan",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+        for column in (
+            "launch_plan_digest",
+            "launch_argv_digest",
+            "launch_config_digest",
+            "launch_plan_json",
+            "launch_plan_binding_version",
+            "launch_plan_required",
+        ):
+            connection.execute(f"ALTER TABLE sandbox_executions DROP COLUMN {column}")
+        connection.execute("UPDATE meta SET value = '21' WHERE key = 'schema_version'")
+
+    migrated = GitSupervisor(repo)
+    assert migrated.schema_version_on_open == 21
+    legacy = migrated._sandbox_execution_get(attempt["id"])
+    assert legacy["phase"] == phase
+    assert legacy["launch_plan_required"] == 0
+    assert legacy["launch_plan_binding_version"] == 0
+    assert legacy["launch_plan_json"] == ""
+    assert legacy["launch_plan_digest"] == ""
+
+    if phase == "reserved":
+        with pytest.raises(SupervisorError) as error:
+            record_launch(migrated, attempt, runc_handle=handle)
+    else:
+        with pytest.raises(SupervisorError) as error:
+            migrated._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=running_attestation(migrated, attempt),
+                runc_handle=handle,
+            )
+    assert error.value.code == "sandbox_execution_launch_plan_required"
+    assert migrated._sandbox_execution_get(attempt["id"])["phase"] == phase
 
 
 def test_reservation_requires_exact_live_fence_and_no_registered_direct_worker(repo: Path) -> None:

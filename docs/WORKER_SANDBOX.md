@@ -165,6 +165,27 @@ commit `0d4f45be2d52f540fc424d619ecea1af1af07f33`; its four matrix jobs were
 in progress when this evidence note was written. Any follow-up commit requires
 its own exact-head CI check.
 
+Schema 22 adds a one-time launch-plan binding. A fresh reservation opts into the
+binding; only the exact process-local, registered runc handle already bound to
+that attempt may persist the canonical plan through a connection-scoped SQLite
+capability. The plan includes exact config-byte and frozen-argv digests, the
+complete argv, the reserved caller bundle digest, and attempt/claim/execution,
+container, rootfs, private-path, state, and workspace identities. The row stores
+the canonical plan and its digest, and the append-only launch event records the
+same plan. A database trigger rejects direct SQL and generic transitions on
+ACP-managed SQLite connections unless the journal activates the exact
+process-local capability for the registered runc handle. This is an
+application-integrity guard, not a security boundary against a privileged
+process with arbitrary write access to the SQLite database file: such a process
+can register a same-named SQLite function or remove/replace the triggers.
+Database-file writers are outside this slice's threat model. Migrated rows
+retain empty plan fields and an unattested marker; they cannot be advanced
+through a new launch, running, or successful exit transition and cannot
+authorize result import. This binds the
+caller-supplied bundle digest to observed launch inputs but does not independently
+prove the semantic correctness of that caller claim. The configured `run_worker`
+path remains fail-closed and this is not runtime isolation evidence.
+
 This remains an implementation slice, not a complete security claim. On
 2026-10-05, two opt-in no-model tests passed on NAS Linux 6.18.15 with runc
 1.3.5: a pre-exec setup failure reaped the helper, and the public
