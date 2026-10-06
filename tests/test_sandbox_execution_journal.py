@@ -42,8 +42,8 @@ def repo(tmp_path: Path) -> Path:
     return init_repo(tmp_path)
 
 
-def claimed(supervisor: GitSupervisor) -> dict:
-    task = make_task(supervisor, "alpha.txt", title="sandbox journal test")
+def claimed(supervisor: GitSupervisor, path: str = "alpha.txt") -> dict:
+    task = make_task(supervisor, path, title="sandbox journal test")
     return supervisor.claim(task["id"], "sandbox-worker")
 
 
@@ -87,6 +87,91 @@ def configured_sandbox_claims(supervisor: GitSupervisor) -> dict[str, str]:
     }
 
 
+class _TestRuncProcess:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+
+def _test_runc_handle(
+    *,
+    target: oci_worker._RuncLaunchTarget | None = None,
+    start_ticks: int = 1202,
+    exit_code: int = 0,
+    sealed: bool = True,
+) -> oci_worker.RuncLaunchHandle:
+    process = _TestRuncProcess(202)
+    identity = f"linux:{process.pid}:{start_ticks}"
+    handle = oci_worker.RuncLaunchHandle(_gate_writer=None)
+    if sealed:
+        assert target is not None
+
+        def test_waitpid(pid: int, _options: int) -> tuple[int, int]:
+            return pid, exit_code << 8
+
+        oci_worker._register_runc_launch_handle(
+            handle,
+            process=process,
+            process_identity=identity,
+            target=target,
+            _test_waitpid=test_waitpid,
+            _test_identity_reader=lambda pid: identity if pid == process.pid else None,
+        )
+    return handle
+
+
+def _test_runc_target(
+    execution: dict, *, launch_mode: str = "private_bundle", container_id: str | None = None
+) -> oci_worker._RuncLaunchTarget:
+    state_path = execution["state_path"]
+    return oci_worker._RuncLaunchTarget(
+        launch_mode=launch_mode,
+        argv=(
+            "/usr/bin/runc",
+            "--root",
+            state_path,
+            "--systemd-cgroup",
+            "run",
+            "--bundle",
+            execution["bundle_path"],
+            "--pid-file",
+            str(Path(state_path) / "init.pid"),
+            "--preserve-fds",
+            "1",
+            "--keep",
+            container_id or execution["container_id"],
+        ),
+        runc_executable_path="/usr/bin/runc",
+        runc_executable_sha256=execution["runc_executable_digest"],
+        config_sha256="b" * 64,
+        bundle_path=execution["bundle_path"],
+        bundle_device=execution["bundle_root_dev"],
+        bundle_inode=execution["bundle_root_ino"],
+        rootfs_path=str(Path(execution["bundle_path"]) / "rootfs"),
+        rootfs_device=1,
+        rootfs_inode=1202,
+        rootfs_sha256=execution["rootfs_digest"],
+        rootfs_closure_sha256=execution["rootfs_closure_digest"],
+        rootfs_entry_count=3,
+        rootfs_bytes=25,
+        rootfs_snapshot_limit_bytes=4 * 1024 * 1024,
+        rootfs_snapshot_device=2,
+        rootfs_snapshot_inode=1203,
+        rootfs_snapshot_sha256=execution["rootfs_digest"],
+        rootfs_snapshot_closure_sha256=execution["rootfs_closure_digest"],
+        rootfs_snapshot_entry_count=3,
+        rootfs_snapshot_bytes=25,
+        state_path=state_path,
+        state_device=execution["state_root_dev"],
+        state_inode=execution["state_root_ino"],
+        workspace_path=execution["workspace_root_path"],
+        workspace_device=execution["workspace_root_dev"],
+        workspace_inode=execution["workspace_root_ino"],
+        pid_file_path=str(Path(state_path) / "init.pid"),
+        container_id=container_id or execution["container_id"],
+    )
+
+
 def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
     runtime_claims = configured_sandbox_claims(supervisor)
     row = supervisor._sandbox_execution_reserve(
@@ -106,20 +191,141 @@ def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
     )
 
 
-def record_launch(supervisor: GitSupervisor, attempt: dict) -> dict:
+def test_launch_record_requires_pinned_runc_handle(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+
+    with pytest.raises(SupervisorError) as unsealed:
+        record_launch(
+            supervisor,
+            attempt,
+            runc_handle=_test_runc_handle(target=_test_runc_target(execution), sealed=False),
+        )
+
+    assert unsealed.value.code == "sandbox_execution_launch_handle_required"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_pinned_runc_handle_cannot_be_rebound_to_another_attempt(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    first_attempt = claimed(supervisor)
+    first_execution = reserve(supervisor, first_attempt)
+    handle = _test_runc_handle(target=_test_runc_target(first_execution))
+    record_launch(supervisor, first_attempt, runc_handle=handle)
+
+    second_attempt = claimed(supervisor, "beta.txt")
+    reserve(supervisor, second_attempt)
+    with pytest.raises(SupervisorError) as rebound:
+        record_launch(supervisor, second_attempt, runc_handle=handle)
+
+    assert rebound.value.code == "sandbox_execution_launch_target_mismatch"
+    assert supervisor._sandbox_execution_get(second_attempt["id"])["phase"] == "reserved"
+
+
+def test_wrong_first_attempt_cannot_claim_runc_handle_provenance(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    first_attempt = claimed(supervisor)
+    first_execution = reserve(supervisor, first_attempt)
+    second_attempt = claimed(supervisor, "beta.txt")
+    second_execution = reserve(supervisor, second_attempt)
+    handle = _test_runc_handle(target=_test_runc_target(first_execution))
+
+    with pytest.raises(SupervisorError) as wrong_first_binding:
+        record_launch(supervisor, second_attempt, runc_handle=handle)
+
+    assert wrong_first_binding.value.code == "sandbox_execution_launch_target_mismatch"
+    assert supervisor._sandbox_execution_get(second_attempt["id"])["phase"] == "reserved"
+    assert record_launch(supervisor, first_attempt, runc_handle=handle)["phase"] == "launched"
+    assert second_execution["phase"] == "reserved"
+
+
+def test_diagnostic_runc_handle_cannot_be_recorded_as_supervised(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(
+        target=_test_runc_target(execution, launch_mode="unisolated_diagnostic")
+    )
+
+    with pytest.raises(SupervisorError) as diagnostic:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    assert diagnostic.value.code == "sandbox_execution_launch_target_mismatch"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+    handle = _test_runc_handle(target=target)
+
+    assert record_launch(supervisor, attempt, runc_handle=handle)["phase"] == "launched"
+    with supervisor.connect() as connection:
+        event = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type = 'sandbox.execution_launched'"
+        ).fetchone()
+    assert event is not None
+    launch = json.loads(event["payload_json"])["launch_target"]
+    assert launch["config_sha256"] == target.config_sha256
+    assert launch["config_sha256_semantics"] == "sha256-exact-config-json-bytes"
+    assert launch["rootfs"]["sha256"] == execution["rootfs_digest"]
+    assert launch["rootfs"]["closure_sha256"] == execution["rootfs_closure_digest"]
+    assert launch["rootfs"]["device"] == target.rootfs_device
+    assert launch["rootfs"]["inode"] == target.rootfs_inode
+    assert launch["rootfs"]["snapshot"]["device"] == target.rootfs_snapshot_device
+    assert launch["rootfs"]["snapshot"]["inode"] == target.rootfs_snapshot_inode
+    assert launch["rootfs"]["snapshot"]["sha256"] == execution["rootfs_digest"]
+    assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_launch_rejects_rootfs_content_that_differs_from_reservation(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = replace(_test_runc_target(execution), rootfs_sha256="c" * 64)
+    handle = _test_runc_handle(target=target)
+
+    with pytest.raises(SupervisorError) as rootfs_mismatch:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    assert rootfs_mismatch.value.code == "sandbox_execution_launch_target_mismatch"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def record_launch(
+    supervisor: GitSupervisor,
+    attempt: dict,
+    *,
+    runc_handle: oci_worker.RuncLaunchHandle | None = None,
+) -> dict:
+    if runc_handle is None:
+        execution = supervisor._sandbox_execution_get(attempt["id"])
+        assert execution is not None
+        runc_handle = _test_runc_handle(target=_test_runc_target(execution))
+    attempt["_test_runc_handle"] = runc_handle
     return supervisor._sandbox_execution_record_launch(
         attempt["id"],
         attempt["claim_token"],
         monitor_pid=101,
         monitor_identity="linux:101:1101",
-        runc_client_pid=202,
-        runc_client_identity="linux:202:1202",
+        runc_handle=runc_handle,
         wrapper_unit="acp-worker.service",
         wrapper_invocation_id="1" * 32,
         scope_unit="acp-container.scope",
         scope_invocation_id="2" * 32,
         cgroup_path=("/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope"),
     )
+
+
+def record_exit(supervisor: GitSupervisor, attempt: dict, exit_code: int = 0) -> dict:
+    handle = attempt.get("_test_runc_handle")
+    assert isinstance(handle, oci_worker.RuncLaunchHandle)
+    receipt = handle.wait()
+    assert receipt.returncode == exit_code
+    return supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], receipt)
 
 
 def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int = 303):
@@ -140,9 +346,15 @@ def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int 
             stat(row["monitor_pid"], 1101),
         ),
         row["runc_client_pid"]: ProcessSnapshot(
-            stat(row["runc_client_pid"], 1202),
+            stat(
+                row["runc_client_pid"],
+                int(row["runc_client_identity"].rsplit(":", 1)[1]),
+            ),
             f"0::{wrapper_cgroup}\n".encode("ascii"),
-            stat(row["runc_client_pid"], 1202),
+            stat(
+                row["runc_client_pid"],
+                int(row["runc_client_identity"].rsplit(":", 1)[1]),
+            ),
         ),
         init_pid: ProcessSnapshot(
             stat(init_pid, init_start),
@@ -216,14 +428,14 @@ def result_fixture(attempt: dict, tmp_path: Path):
     return baseline, change_set
 
 
-def test_schema_v19_requires_durable_workspace_and_private_path_binding_before_launch(
+def test_schema_v21_requires_durable_workspace_and_private_path_binding_before_launch(
     repo: Path,
 ) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 19
+    assert SCHEMA_VERSION == 21
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -257,6 +469,9 @@ def test_schema_v19_requires_durable_workspace_and_private_path_binding_before_l
         private_path_migration = dict(MIGRATIONS)[18]
         private_path_migration(connection)
         private_path_migration(connection)
+        kernel_wait_migration = dict(MIGRATIONS)[20]
+        kernel_wait_migration(connection)
+        kernel_wait_migration(connection)
         with pytest.raises(sqlite3.IntegrityError, match="result_candidate_immutable"):
             connection.execute(
                 "UPDATE sandbox_executions SET result_candidate_version = 1, "
@@ -340,6 +555,102 @@ def test_v15_to_v16_migration_adds_non_authorizing_candidate_fields() -> None:
         assert migrated["result_candidate_version"] == 0
         assert migrated["result_candidate_json"] == ""
         assert migrated["result_candidate_digest"] == ""
+    finally:
+        connection.close()
+
+
+def test_v19_to_v20_migration_preserves_legacy_check_and_does_not_backfill_evidence() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("CREATE TABLE attempts (id TEXT PRIMARY KEY, pid INTEGER)")
+        connection.execute("INSERT INTO attempts (id, pid) VALUES ('attempt-1', NULL)")
+        connection.execute("CREATE TABLE submissions (id TEXT PRIMARY KEY)")
+        migrations = dict(MIGRATIONS)
+        for version in (14, 15, 16, 17, 18):
+            migrations[version](connection)
+        connection.execute(
+            """
+            CREATE TABLE result_imports (
+              id TEXT PRIMARY KEY,
+              attempt_id TEXT NOT NULL REFERENCES attempts(id),
+              claim_token INTEGER NOT NULL,
+              worker_pid INTEGER,
+              worker_identity TEXT NOT NULL DEFAULT '',
+              worker_exit_receipt_json TEXT NOT NULL DEFAULT '',
+              base_sha TEXT NOT NULL,
+              tree_sha TEXT NOT NULL,
+              baseline_digest TEXT NOT NULL,
+              result_digest TEXT NOT NULL,
+              change_digest TEXT NOT NULL,
+              result_ref TEXT NOT NULL UNIQUE,
+              commit_timestamp INTEGER NOT NULL,
+              commit_sha TEXT NOT NULL,
+              phase TEXT NOT NULL,
+              submission_id TEXT REFERENCES submissions(id),
+              error TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              staging_path TEXT NOT NULL DEFAULT '',
+              object_ids_json TEXT NOT NULL DEFAULT '[]',
+              promote_object_ids_json TEXT NOT NULL DEFAULT '[]'
+            )
+            """
+        )
+        migrations[19](connection)
+        connection.execute(
+            """
+            INSERT INTO sandbox_executions
+              (attempt_id, claim_token, execution_id, backend, container_id,
+               bundle_digest, rootfs_digest, rootfs_closure_digest,
+               runc_executable_digest, runtime_version, oci_version,
+               bundle_path, state_path, phase, created_at, updated_at)
+            VALUES (?, 1, 'execution-1', 'oci-runc', 'container-1', ?, ?, ?, ?,
+                    '1.3.5', '1.2.1', '/bundle', '/state', 'reserved', 'now', 'now')
+            """,
+            ("attempt-1", "a" * 64, "b" * 64, "c" * 64, "d" * 64),
+        )
+        before_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sandbox_executions'"
+        ).fetchone()["sql"]
+        assert "runc_exit_observed_by = 'runc_client_popen_wait'" in before_sql
+
+        migrations[20](connection)
+        migrations[20](connection)
+        migrations[21](connection)
+        migrations[21](connection)
+
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")
+        }
+        assert "runc_exit_evidence_source" in columns
+        migrated = connection.execute(
+            "SELECT runc_exit_observed_by, runc_exit_evidence_source "
+            "FROM sandbox_executions WHERE attempt_id = 'attempt-1'"
+        ).fetchone()
+        assert migrated["runc_exit_observed_by"] == ""
+        assert migrated["runc_exit_evidence_source"] == ""
+        after_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sandbox_executions'"
+        ).fetchone()["sql"]
+        assert "runc_exit_observed_by = 'runc_client_popen_wait'" in after_sql
+        candidate_trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'sandbox_result_candidate_write_once'"
+        ).fetchone()["sql"]
+        assert "NEW.runc_exit_evidence_source = 'runc_client_kernel_waitpid'" in candidate_trigger
+        assert "NEW.runc_exit_observed_by = 'runc_client_kernel_waitpid'" not in candidate_trigger
+        receipt_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'sandbox_execution_exit_receipt_guard'"
+        ).fetchone()["sql"]
+        assert "acp_sandbox_exit_receipt_authorized" in receipt_guard
+
+        with pytest.raises(sqlite3.IntegrityError, match="evidence"):
+            connection.execute(
+                "UPDATE sandbox_executions SET runc_exit_evidence_source = "
+                "'runc_client_kernel_waitpid' WHERE attempt_id = 'attempt-1'"
+            )
     finally:
         connection.close()
 
@@ -1072,9 +1383,12 @@ def test_recorded_execution_evidence_is_immutable(repo: Path) -> None:
                     (attempt["id"],),
                 )
 
-    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    record_exit(supervisor, attempt)
     with supervisor.connect() as connection:
-        with pytest.raises(sqlite3.IntegrityError, match="sandbox_execution_evidence"):
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_execution_exit_evidence_write_requires_exit",
+        ):
             connection.execute(
                 "UPDATE sandbox_executions SET runc_exit_code = 1 WHERE attempt_id = ?",
                 (attempt["id"],),
@@ -1133,10 +1447,169 @@ def test_transition_order_keeps_monitor_runc_and_init_identities_distinct(repo: 
         == "stopping"
     )
 
-    row = supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    with pytest.raises(SupervisorError) as caller_supplied:
+        supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    assert caller_supplied.value.code == "sandbox_execution_wait_receipt_required"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "stopping"
+
+    row = record_exit(supervisor, attempt)
     assert row["phase"] == "exited"
     assert row["runc_exit_code"] == 0
+    assert row["runc_exit_observed_by"] == "runc_client_kernel_waitpid"
+    assert row["runc_exit_evidence_source"] == "runc_client_kernel_waitpid"
+    with supervisor.connect() as connection:
+        stored = connection.execute(
+            "SELECT runc_exit_observed_by, runc_exit_evidence_source "
+            "FROM sandbox_executions WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert stored["runc_exit_observed_by"] == "runc_client_popen_wait"
+    assert stored["runc_exit_evidence_source"] == "runc_client_kernel_waitpid"
     assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_exit_evidence_cannot_be_stamped_before_kernel_wait(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+
+    with supervisor.connect() as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_execution_exit_evidence_write_requires_exit",
+        ):
+            connection.execute(
+                """
+                UPDATE sandbox_executions
+                SET phase = 'running', init_pid = 4242, init_identity = 'synthetic-start',
+                    runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+                WHERE attempt_id = ?
+                """,
+                (attempt["id"],),
+            )
+
+    still_launched = supervisor._sandbox_execution_get(attempt["id"])
+    assert still_launched is not None
+    assert still_launched["phase"] == "launched"
+    assert still_launched["runc_exit_evidence_source"] == ""
+
+    record_running(supervisor, attempt)
+    exited = record_exit(supervisor, attempt)
+    assert exited["runc_exit_evidence_source"] == "runc_client_kernel_waitpid"
+
+
+def test_generic_transition_cannot_forge_exit_without_registered_wait_receipt() -> None:
+    # Exit persistence is not part of the generic transition surface. Keep this
+    # regression independent of a Git checkout so it runs on the NAS Linux lane.
+    supervisor = GitSupervisor.__new__(GitSupervisor)
+    attempt_id = "sandbox-attempt-receipt-gate"
+    claim_token = 7
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor._sandbox_execution_transition(
+            attempt_id,
+            claim_token,
+            expected_phase="launched",
+            next_phase="exited",
+            updates={
+                "runc_exit_code": 0,
+                "runc_exit_observed_by": "runc_client_popen_wait",
+                "runc_exit_evidence_source": "runc_client_kernel_waitpid",
+            },
+            event_type="sandbox.execution_exited",
+            event_payload={
+                "runc_exit_code": 0,
+                "observed_by": "runc_client_kernel_waitpid",
+            },
+        )
+    assert rejected.value.code == "sandbox_execution_transition_invalid"
+
+
+def test_sql_exit_transition_cannot_forge_kernel_wait_receipt(tmp_path: Path) -> None:
+    database_path = tmp_path / "receipt-guard.db"
+    raw_connection = sqlite3.connect(database_path)
+    try:
+        raw_connection.execute(
+            """
+            CREATE TABLE sandbox_executions (
+              attempt_id TEXT PRIMARY KEY,
+              claim_token INTEGER NOT NULL,
+              execution_id TEXT NOT NULL,
+              phase TEXT NOT NULL,
+              runc_client_pid INTEGER,
+              runc_client_identity TEXT NOT NULL,
+              runc_exit_code INTEGER,
+              runc_exit_observed_by TEXT NOT NULL DEFAULT '',
+              runc_exit_evidence_source TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        raw_connection.commit()
+    finally:
+        raw_connection.close()
+
+    supervisor = GitSupervisor.__new__(GitSupervisor)
+    supervisor.read_only = False
+    supervisor.db_path = database_path
+    with supervisor.connect() as connection:
+        dict(MIGRATIONS)[21](connection)
+        connection.execute(
+            "INSERT INTO sandbox_executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "sandbox-attempt-sql-guard",
+                11,
+                "sandbox-execution-sql-guard",
+                "launched",
+                202,
+                "linux:202:1202",
+                None,
+                "",
+                "",
+            ),
+        )
+
+    with supervisor.connect() as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_execution_wait_receipt_required",
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET runc_exit_code = 0, "
+                "runc_exit_observed_by = 'runc_client_popen_wait', "
+                "runc_exit_evidence_source = 'runc_client_kernel_waitpid', "
+                "phase = 'exited' WHERE attempt_id = ?",
+                ("sandbox-attempt-sql-guard",),
+            )
+
+    with supervisor.connect() as connection:
+        row = connection.execute(
+            "SELECT phase, runc_exit_evidence_source FROM sandbox_executions WHERE attempt_id = ?",
+            ("sandbox-attempt-sql-guard",),
+        ).fetchone()
+    assert row["phase"] == "launched"
+    assert row["runc_exit_evidence_source"] == ""
+
+
+def test_runc_wait_receipt_must_match_durable_pid_start_identity(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None
+    wrong_handle = _test_runc_handle(target=_test_runc_target(execution), start_ticks=9999)
+    oci_worker._runc_launch_handle_bind_execution(
+        wrong_handle, attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    reused_pid = wrong_handle.wait()
+    with pytest.raises(SupervisorError) as mismatched:
+        supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], reused_pid)
+
+    assert mismatched.value.code == "sandbox_execution_wait_receipt_stale"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "running"
+    assert record_exit(supervisor, attempt)["phase"] == "exited"
 
 
 @pytest.mark.parametrize("path_field", ["execution_root", "bundle_path", "state_path"])
@@ -1255,7 +1728,7 @@ def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: P
     reserve(supervisor, attempt)
     record_launch(supervisor, attempt)
     record_running(supervisor, attempt)
-    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    record_exit(supervisor, attempt)
 
     receipt = cleanup_receipt(supervisor, attempt["id"])
     assert receipt["version"] == 2
@@ -1329,7 +1802,7 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
     record_launch(supervisor, attempt)
     record_running(supervisor, attempt)
     (workspace / "alpha.txt").write_text("candidate result\n", encoding="utf-8")
-    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    record_exit(supervisor, attempt)
     supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
@@ -1356,7 +1829,7 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
     recorded = supervisor._sandbox_execution_get(attempt["id"])
     assert candidate["exit"] == {
         "code": 0,
-        "observed_by": "runc_client_popen_wait",
+        "observed_by": "runc_client_kernel_waitpid",
         "runc_client_pid": recorded["runc_client_pid"],
         "runc_client_identity": recorded["runc_client_identity"],
     }
@@ -1409,7 +1882,7 @@ def test_sandbox_import_route_fails_closed_before_cleanup_verification(repo: Pat
     (Path(row["workspace_root_path"]) / "alpha.txt").write_text(
         "sandbox result\n", encoding="utf-8"
     )
-    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    record_exit(supervisor, attempt)
     supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
@@ -1454,7 +1927,7 @@ def test_sandbox_import_uses_distinct_source_and_recovers_published_ref(
     (Path(row["workspace_root_path"]) / "alpha.txt").write_text(
         "sandbox result\n", encoding="utf-8"
     )
-    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    record_exit(supervisor, attempt)
     supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
@@ -1591,7 +2064,7 @@ def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> No
     record_launch(supervisor, attempt)
     record_running(supervisor, attempt)
     (workspace / "alpha.txt").write_text("candidate v1\n", encoding="utf-8")
-    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    record_exit(supervisor, attempt)
     supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
@@ -1625,7 +2098,7 @@ def test_persisted_pre_schema17_cleanup_receipt_replays_but_never_proves_cleanup
     reserve(supervisor, attempt)
     record_launch(supervisor, attempt)
     record_running(supervisor, attempt)
-    supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], 0)
+    record_exit(supervisor, attempt)
 
     legacy_receipt = cleanup_receipt(supervisor, attempt["id"])
     legacy_receipt.pop("rootfs_closure_digest")

@@ -15,15 +15,21 @@ while rootless cgroup setup may be unavailable. The generated
 ``linux.seccomp`` profile is a denylist defense-in-depth layer, not a complete
 syscall allowlist or a substitute for the namespace/mount boundary. Runtime
 application and behavioral denial still require exact-host verification before
-worker launch is enabled. The public low-level runc API now places the sealed
-config in a private, read-only tmpfs addressed through an inherited bundle FD;
-this protects the config handoff, not the host-backed rootfs contents, workspace,
-state, PID file, lifecycle journal, or result-import path. Those remain subject
-to separate integrity, ownership, and supervision gates.
+worker launch is enabled. The public low-level runc API places the sealed config
+and a verified copy of the rootfs in private, read-only tmpfs mounts addressed
+through an inherited bundle FD. The rootfs copy is bounded and rejects
+unsupported ownership or extended attributes. State and workspace directory
+objects are pinned through inherited descriptors to prevent launch-time path
+replacement, but remain host-backed and are not an outer worker isolation
+boundary. The helper binds the workspace descriptor into a private tmpfs anchor
+inside its mount namespace so runc's container-init child does not depend on
+inheriting the supervisor's FD. Lifecycle journal ownership, cleanup, and result
+import remain subject to separate gates.
 """
 
 from __future__ import annotations
 
+import array
 import errno
 import hashlib
 import json
@@ -32,6 +38,7 @@ import platform
 import re
 import selectors
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -39,7 +46,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -54,9 +61,12 @@ _MAX_UINT64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
 _MAX_ROOTFS_ENTRIES = 200_000
 _MAX_ROOTFS_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_ROOTFS_SNAPSHOT_BYTES = 256 * 1024 * 1024
+_ROOTFS_SNAPSHOT_OVERHEAD_BYTES = 4 * 1024 * 1024
 _MAX_ROOTFS_PATH_BYTES = 4096
 _MAX_ROOTFS_DEPTH = 256
 _ROOTFS_CLOSURE_SCHEMA = "acp-oci-rootfs-closure-v1"
+_ST_RDONLY = 1
 _MAX_MOUNTINFO_BYTES = 16 * 1024 * 1024
 _DEFAULT_TMPFS_BYTES = 64 * 1024 * 1024
 _DEFAULT_HOME_BYTES = 16 * 1024 * 1024
@@ -107,16 +117,18 @@ resource.setrlimit(
 os.execve(runc_fd, payload["argv"], payload["env"])
 """
 _RUNC_PRIVATE_BUNDLE_LAUNCHER = r"""
+import array
 import ctypes
 import errno
 import json
 import os
 import resource
+import socket
 import stat
 import sys
 
-start_fd, status_fd, map_ack_fd, exec_ack_fd, gate_fd, runc_fd, bundle_fd, rootfs_fd = (
-    int(value) for value in sys.argv[1:9]
+start_fd, status_fd, map_ack_fd, exec_ack_fd, gate_fd, runc_fd, bundle_fd, rootfs_fd, snapshot_socket_fd = (
+    int(value) for value in sys.argv[1:10]
 )
 CLONE_NEWNS = 0x00020000
 CLONE_NEWUSER = 0x10000000
@@ -124,12 +136,13 @@ MS_PRIVATE = 0x00040000
 MS_REC = 0x00004000
 ST_RDONLY = 1
 AT_EMPTY_PATH = 0x1000
+AT_FDCWD = -100
+OPEN_TREE_CLONE = 0x00000001
+OPEN_TREE_CLOEXEC = 0x00080000
 FSOPEN_CLOEXEC = 0x00000001
 FSCONFIG_SET_STRING = 1
 FSCONFIG_CMD_CREATE = 6
 FSMOUNT_CLOEXEC = 0x00000001
-OPEN_TREE_CLONE = 0x00000001
-OPEN_TREE_CLOEXEC = 0x00080000
 MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
 MOVE_MOUNT_T_EMPTY_PATH = 0x00000040
 MOUNT_ATTR_RDONLY = 0x00000001
@@ -182,6 +195,15 @@ def _unshare(flags):
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number))
 
+def _set_nondumpable():
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(4, 0, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), "PR_SET_DUMPABLE")
+
 def _make_mounts_private():
     libc = ctypes.CDLL(None, use_errno=True)
     mount = libc.mount
@@ -215,9 +237,6 @@ def _mount_api():
     fsmount = libc.fsmount
     fsmount.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
     fsmount.restype = ctypes.c_int
-    open_tree = libc.open_tree
-    open_tree.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    open_tree.restype = ctypes.c_int
     move_mount = libc.move_mount
     move_mount.argtypes = [
         ctypes.c_int,
@@ -227,6 +246,9 @@ def _mount_api():
         ctypes.c_uint,
     ]
     move_mount.restype = ctypes.c_int
+    open_tree = libc.open_tree
+    open_tree.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    open_tree.restype = ctypes.c_int
     mount_setattr = libc.mount_setattr
     mount_setattr.argtypes = [
         ctypes.c_int,
@@ -236,7 +258,7 @@ def _mount_api():
         ctypes.c_size_t,
     ]
     mount_setattr.restype = ctypes.c_int
-    return fsopen, fsconfig, fsmount, open_tree, move_mount, mount_setattr
+    return fsopen, fsconfig, fsmount, move_mount, open_tree, mount_setattr
 
 def _check_mount_call(result, label):
     if result != 0:
@@ -262,6 +284,162 @@ def _set_mount_attributes(mount_setattr, descriptor, attributes):
         "mount_setattr",
     )
 
+def _source_identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+def _check_source_entry(info, source_device, *, regular=False):
+    if (
+        info.st_dev != source_device
+        or info.st_uid != payload["uid"]
+        or info.st_gid != payload["gid"]
+        or info.st_mode & (stat.S_ISUID | stat.S_ISGID)
+        or (regular and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1))
+    ):
+        raise OSError("rootfs snapshot source has unsupported type, owner, or metadata")
+
+def _check_no_xattrs(descriptor):
+    try:
+        if os.listxattr(descriptor):
+            raise OSError("rootfs snapshot does not copy extended attributes")
+    except (AttributeError, OSError) as error:
+        raise OSError("rootfs extended attributes cannot be verified") from error
+
+def _link_stays_inside(relative_path, target):
+    parts = [] if target.startswith(b"/") else relative_path.split(b"/")[:-1]
+    for component in target.split(b"/"):
+        if component in {b"", b"."}:
+            continue
+        if component == b"..":
+            if not parts:
+                return False
+            parts.pop()
+        else:
+            parts.append(component)
+    return True
+
+def _copy_rootfs_tree(source_root_fd, destination_root_fd, source_device):
+    counts = {"entries": 1, "bytes": 0}
+    root_info = os.fstat(source_root_fd)
+    _check_source_entry(root_info, source_device)
+    _check_no_xattrs(source_root_fd)
+
+    def copy_directory(source_fd, destination_fd, prefix, depth):
+        if depth > 256:
+            raise OSError("rootfs snapshot exceeds its depth limit")
+        before = os.fstat(source_fd)
+        with os.scandir(source_fd) as iterator:
+            names = sorted((entry.name for entry in iterator), key=os.fsencode)
+        for name in names:
+            counts["entries"] += 1
+            if counts["entries"] > payload["rootfs_entry_count"]:
+                raise OSError("rootfs changed beyond its reserved entry count")
+            name_bytes = os.fsencode(name)
+            relative_path = name_bytes if not prefix else prefix + b"/" + name_bytes
+            if len(relative_path) > 4096:
+                raise OSError("rootfs snapshot path exceeds its limit")
+            info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            _check_source_entry(info, source_device)
+            if stat.S_ISDIR(info.st_mode):
+                os.mkdir(name, 0o700, dir_fd=destination_fd)
+                source_child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=source_fd,
+                )
+                destination_child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=destination_fd,
+                )
+                try:
+                    opened = os.fstat(source_child)
+                    if _source_identity(info) != _source_identity(opened):
+                        raise OSError("rootfs directory changed during snapshot")
+                    _check_no_xattrs(source_child)
+                    copy_directory(source_child, destination_child, relative_path, depth + 1)
+                    if _source_identity(opened) != _source_identity(os.fstat(source_child)):
+                        raise OSError("rootfs directory changed during snapshot")
+                    os.fchmod(destination_child, stat.S_IMODE(info.st_mode))
+                finally:
+                    os.close(source_child)
+                    os.close(destination_child)
+            elif stat.S_ISREG(info.st_mode):
+                _check_source_entry(info, source_device, regular=True)
+                counts["bytes"] += info.st_size
+                if counts["bytes"] > payload["rootfs_bytes"]:
+                    raise OSError("rootfs changed beyond its reserved byte count")
+                source_file = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                    dir_fd=source_fd,
+                )
+                destination_file = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=destination_fd,
+                )
+                try:
+                    opened = os.fstat(source_file)
+                    if _source_identity(info) != _source_identity(opened):
+                        raise OSError("rootfs file changed during snapshot")
+                    _check_no_xattrs(source_file)
+                    size = 0
+                    while True:
+                        block = os.read(source_file, 1024 * 1024)
+                        if not block:
+                            break
+                        size += len(block)
+                        offset = 0
+                        while offset < len(block):
+                            offset += os.write(destination_file, block[offset:])
+                    if size != info.st_size or _source_identity(opened) != _source_identity(
+                        os.fstat(source_file)
+                    ):
+                        raise OSError("rootfs file changed during snapshot")
+                    os.fchmod(destination_file, stat.S_IMODE(info.st_mode))
+                    os.fsync(destination_file)
+                finally:
+                    os.close(source_file)
+                    os.close(destination_file)
+            elif stat.S_ISLNK(info.st_mode):
+                link_path = f"/proc/self/fd/{source_fd}/{name}"
+                if os.listxattr(link_path, follow_symlinks=False):
+                    raise OSError("rootfs symlink has unsupported extended attributes")
+                target = os.fsencode(os.readlink(name, dir_fd=source_fd))
+                after = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                if (
+                    _source_identity(info) != _source_identity(after)
+                    or not _link_stays_inside(relative_path, target)
+                ):
+                    raise OSError("rootfs symlink changed or escapes during snapshot")
+                counts["bytes"] += len(target)
+                if counts["bytes"] > payload["rootfs_bytes"]:
+                    raise OSError("rootfs changed beyond its reserved byte count")
+                os.symlink(os.fsdecode(target), name, dir_fd=destination_fd)
+            else:
+                raise OSError("rootfs snapshot encountered a special file")
+        if _source_identity(before) != _source_identity(os.fstat(source_fd)):
+            raise OSError("rootfs directory changed during snapshot")
+
+    copy_directory(source_root_fd, destination_root_fd, b"", 0)
+    if (
+        counts["entries"] != payload["rootfs_entry_count"]
+        or counts["bytes"] != payload["rootfs_bytes"]
+    ):
+        raise OSError("rootfs changed while its private snapshot was created")
+    os.fchmod(destination_root_fd, stat.S_IMODE(root_info.st_mode))
+
 try:
     phase = b"1"
     payload_bytes = bytearray()
@@ -282,10 +460,22 @@ try:
             "env",
             "config",
             "bundle",
+            "bundle_fd_path",
             "bundle_device",
             "bundle_inode",
             "rootfs_device",
             "rootfs_inode",
+            "state_fd",
+            "state_device",
+            "state_inode",
+            "workspace_fd",
+            "workspace_device",
+            "workspace_inode",
+            "workspace_path",
+            "workspace_source",
+            "rootfs_entry_count",
+            "rootfs_bytes",
+            "rootfs_snapshot_limit_bytes",
             "uid",
             "gid",
         }
@@ -293,10 +483,32 @@ try:
         or not isinstance(payload["env"], dict)
         or not isinstance(payload["config"], str)
         or not isinstance(payload["bundle"], str)
+        or not isinstance(payload["bundle_fd_path"], str)
         or type(payload["bundle_device"]) is not int
         or type(payload["bundle_inode"]) is not int
         or type(payload["rootfs_device"]) is not int
         or type(payload["rootfs_inode"]) is not int
+        or type(payload["state_fd"]) is not int
+        or type(payload["state_device"]) is not int
+        or type(payload["state_inode"]) is not int
+        or type(payload["workspace_fd"]) is not int
+        or type(payload["workspace_device"]) is not int
+        or type(payload["workspace_inode"]) is not int
+        or not isinstance(payload["workspace_path"], str)
+        or not payload["workspace_path"].startswith("/")
+        or "\x00" in payload["workspace_path"]
+        or not isinstance(payload["workspace_source"], str)
+        or payload["state_fd"] in {bundle_fd, rootfs_fd, payload["workspace_fd"]}
+        or payload["workspace_fd"] in {bundle_fd, rootfs_fd}
+        or payload["bundle_fd_path"] != f"/proc/self/fd/{bundle_fd}"
+        or type(payload["rootfs_entry_count"]) is not int
+        or payload["rootfs_entry_count"] < 1
+        or payload["rootfs_entry_count"] > 200001
+        or type(payload["rootfs_bytes"]) is not int
+        or payload["rootfs_bytes"] < 0
+        or type(payload["rootfs_snapshot_limit_bytes"]) is not int
+        or payload["rootfs_snapshot_limit_bytes"] < payload["rootfs_bytes"]
+        or payload["rootfs_snapshot_limit_bytes"] > 268435456
         or type(payload["uid"]) is not int
         or type(payload["gid"]) is not int
     ):
@@ -305,6 +517,22 @@ try:
     if (
         any(not isinstance(value, str) or not value or "\x00" in value for value in command)
         or sum(len(os.fsencode(value)) + 1 for value in command) > 65536
+        or len(command) != 13
+        or command[1] != "--root"
+        or command[3:5] != ["--systemd-cgroup", "run"]
+        or command[5] != "--bundle"
+        or command[7] != "--pid-file"
+        or command[9:11] != ["--preserve-fds", "1"]
+        or command[11] != "--keep"
+    ):
+        _fail()
+    container_id = command[12]
+    if (
+        not container_id
+        or len(container_id) > 64
+        or container_id[0] not in "abcdefghijklmnopqrstuvwxyz0123456789"
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_.-" for character in container_id)
+        or payload["workspace_source"] != f"/dev/shm/acp-{container_id}-workspace"
     ):
         _fail()
 
@@ -316,7 +544,6 @@ try:
     _message(b"U")
     if not _read_exact(map_ack_fd, b"M"):
         _fail()
-    os.close(map_ack_fd)
     phase = b"3"
     with open("/proc/self/uid_map", "rb") as stream:
         uid_map = stream.read().split()
@@ -328,6 +555,18 @@ try:
         _fail()
     if os.getuid() != payload["uid"] or os.getgid() != payload["gid"]:
         _fail()
+    _set_nondumpable()
+
+    for descriptor, device, inode in (
+        (payload["state_fd"], payload["state_device"], payload["state_inode"]),
+        (payload["workspace_fd"], payload["workspace_device"], payload["workspace_inode"]),
+    ):
+        descriptor_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(descriptor_info.st_mode)
+            or (descriptor_info.st_dev, descriptor_info.st_ino) != (device, inode)
+        ):
+            _fail()
 
     phase = b"4"
     _unshare(CLONE_NEWNS)
@@ -335,9 +574,177 @@ try:
     _make_mounts_private()
     phase = b"6"
     try:
-        fsopen, fsconfig, fsmount, open_tree, move_mount, mount_setattr = _mount_api()
+        fsopen, fsconfig, fsmount, move_mount, open_tree, mount_setattr = _mount_api()
     except AttributeError as error:
         raise OSError(errno.ENOSYS, "descriptor-based mount API is unavailable") from error
+
+    # Give runc's container-init child a stable workspace source path without
+    # relying on that child inheriting the supervisor's descriptor. The private
+    # tmpfs covers root-owned /dev/shm only in this mount namespace; a same-UID
+    # host process cannot replace its anchor through the host's /dev/shm.
+    workspace_anchor_mount_target_fd = os.open(
+        "/dev/shm",
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    workspace_anchor_mount_before = os.fstat(workspace_anchor_mount_target_fd)
+    if not stat.S_ISDIR(workspace_anchor_mount_before.st_mode):
+        _fail()
+    workspace_anchor_filesystem_fd = _check_mount_fd(
+        fsopen(b"tmpfs", FSOPEN_CLOEXEC), "fsopen(workspace anchor tmpfs)"
+    )
+    _check_mount_call(
+        fsconfig(
+            workspace_anchor_filesystem_fd,
+            FSCONFIG_SET_STRING,
+            b"size",
+            b"1m",
+            0,
+        ),
+        "workspace anchor tmpfs size",
+    )
+    _check_mount_call(
+        fsconfig(
+            workspace_anchor_filesystem_fd,
+            FSCONFIG_SET_STRING,
+            b"nr_inodes",
+            b"4",
+            0,
+        ),
+        "workspace anchor tmpfs inode limit",
+    )
+    _check_mount_call(
+        fsconfig(
+            workspace_anchor_filesystem_fd,
+            FSCONFIG_SET_STRING,
+            b"mode",
+            b"0700",
+            0,
+        ),
+        "workspace anchor tmpfs mode",
+    )
+    _check_mount_call(
+        fsconfig(workspace_anchor_filesystem_fd, FSCONFIG_CMD_CREATE, None, None, 0),
+        "workspace anchor tmpfs create",
+    )
+    workspace_anchor_mount_fd = _check_mount_fd(
+        fsmount(
+            workspace_anchor_filesystem_fd,
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        ),
+        "fsmount(workspace anchor tmpfs)",
+    )
+    os.close(workspace_anchor_filesystem_fd)
+    _check_mount_call(
+        move_mount(
+            workspace_anchor_mount_fd,
+            b"",
+            workspace_anchor_mount_target_fd,
+            b"",
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ),
+        "attach private workspace anchor tmpfs",
+    )
+    os.close(workspace_anchor_mount_fd)
+    os.close(workspace_anchor_mount_target_fd)
+    private_shm_fd = os.open(
+        "/dev/shm",
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    private_shm_info = os.fstat(private_shm_fd)
+    if (
+        not stat.S_ISDIR(private_shm_info.st_mode)
+        or private_shm_info.st_uid != payload["uid"]
+        or stat.S_IMODE(private_shm_info.st_mode) != 0o700
+        or (private_shm_info.st_dev, private_shm_info.st_ino)
+        == (workspace_anchor_mount_before.st_dev, workspace_anchor_mount_before.st_ino)
+    ):
+        _fail()
+    workspace_anchor_name = payload["workspace_source"].rsplit("/", 1)[-1]
+    os.mkdir(workspace_anchor_name, 0o700, dir_fd=private_shm_fd)
+    workspace_anchor_fd = os.open(
+        workspace_anchor_name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=private_shm_fd,
+    )
+    os.close(private_shm_fd)
+    # Let the parent run a deterministic same-UID path-replacement probe at
+    # the last point before open_tree resolves the host pathname. Production
+    # callers only acknowledge this bounded setup stage without a callback.
+    _message(b"W")
+    if not _read_exact(map_ack_fd, b"A"):
+        _fail()
+    os.close(map_ack_fd)
+    # mount(2) cannot attach a bind mount by an inherited /proc/self/fd path:
+    # that magic-link source is rejected with EINVAL on supported Linux hosts.
+    # open_tree must therefore resolve the captured pathname in this private
+    # namespace. Its detached mount pins the selected object; comparing that
+    # mount root to the inherited descriptor closes the pathname race before
+    # it can be attached anywhere.
+    workspace_mount_fd = _check_mount_fd(
+        open_tree(
+            AT_FDCWD,
+            payload["workspace_path"].encode("utf-8"),
+            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC,
+        ),
+        "open pinned workspace mount tree",
+    )
+    workspace_mount_info = os.fstat(workspace_mount_fd)
+    if (
+        not stat.S_ISDIR(workspace_mount_info.st_mode)
+        or (workspace_mount_info.st_dev, workspace_mount_info.st_ino)
+        != (payload["workspace_device"], payload["workspace_inode"])
+    ):
+        _fail()
+    _set_mount_attributes(mount_setattr, workspace_mount_fd, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)
+    _check_mount_call(
+        move_mount(
+            workspace_mount_fd,
+            b"",
+            workspace_anchor_fd,
+            b"",
+            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+        ),
+        "attach pinned workspace mount tree to private anchor",
+    )
+    os.close(workspace_mount_fd)
+    os.close(workspace_anchor_fd)
+    private_shm_fd = os.open(
+        "/dev/shm",
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    workspace_anchor_fd = os.open(
+        workspace_anchor_name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=private_shm_fd,
+    )
+    os.close(private_shm_fd)
+    workspace_anchor_info = os.fstat(workspace_anchor_fd)
+    if (
+        not stat.S_ISDIR(workspace_anchor_info.st_mode)
+        or (workspace_anchor_info.st_dev, workspace_anchor_info.st_ino)
+        != (payload["workspace_device"], payload["workspace_inode"])
+        or os.fstatvfs(workspace_anchor_fd).f_flag & ST_RDONLY
+    ):
+        _fail()
+    _set_mount_attributes(mount_setattr, workspace_anchor_fd, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)
+    os.close(workspace_anchor_fd)
+
     # Reopen bundle and rootfs after unshare: inherited descriptors refer to
     # parent-namespace mount objects and are not targets in this namespace.
     bundle_target_fd = os.open(
@@ -359,7 +766,7 @@ try:
         _fail()
     rootfs_source_fd = os.open(
         "rootfs",
-        getattr(os, "O_PATH", os.O_RDONLY)
+        os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0),
@@ -420,19 +827,44 @@ try:
 
     phase = b"8"
     rootfs_source_info = os.fstat(rootfs_fd)
-    rootfs_mount_fd = _check_mount_fd(
-        open_tree(
-            rootfs_fd,
-            b"",
-            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH,
+    rootfs_filesystem_fd = _check_mount_fd(fsopen(b"tmpfs", FSOPEN_CLOEXEC), "fsopen(rootfs tmpfs)")
+    _check_mount_call(
+        fsconfig(
+            rootfs_filesystem_fd,
+            FSCONFIG_SET_STRING,
+            b"size",
+            str(payload["rootfs_snapshot_limit_bytes"]).encode("ascii"),
+            0,
         ),
-        "open_tree(rootfs)",
+        "rootfs tmpfs size",
     )
-    _set_mount_attributes(
-        mount_setattr,
-        rootfs_mount_fd,
-        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+    _check_mount_call(
+        fsconfig(
+            rootfs_filesystem_fd,
+            FSCONFIG_SET_STRING,
+            b"nr_inodes",
+            str(payload["rootfs_entry_count"]).encode("ascii"),
+            0,
+        ),
+        "rootfs tmpfs inode limit",
     )
+    _check_mount_call(
+        fsconfig(rootfs_filesystem_fd, FSCONFIG_SET_STRING, b"mode", b"0700", 0),
+        "rootfs tmpfs mode",
+    )
+    _check_mount_call(
+        fsconfig(rootfs_filesystem_fd, FSCONFIG_CMD_CREATE, None, None, 0),
+        "rootfs tmpfs create",
+    )
+    rootfs_mount_fd = _check_mount_fd(
+        fsmount(
+            rootfs_filesystem_fd,
+            FSMOUNT_CLOEXEC,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+        ),
+        "fsmount(rootfs tmpfs)",
+    )
+    os.close(rootfs_filesystem_fd)
     os.mkdir("rootfs", 0o700, dir_fd=bundle_fd)
     rootfs_target_fd = os.open(
         "rootfs",
@@ -450,14 +882,39 @@ try:
             b"",
             MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
         ),
-        "attach read-only rootfs",
+        "attach private rootfs tmpfs",
     )
-    os.close(rootfs_mount_fd)
     os.close(rootfs_target_fd)
+    rootfs_snapshot_fd = os.open(
+        "rootfs",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=bundle_fd,
+    )
+    _copy_rootfs_tree(rootfs_fd, rootfs_snapshot_fd, rootfs_source_info.st_dev)
     os.close(rootfs_fd)
+    _set_mount_attributes(
+        mount_setattr,
+        rootfs_mount_fd,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+    )
+    if not os.fstatvfs(rootfs_snapshot_fd).f_flag & ST_RDONLY:
+        _fail()
+    os.close(rootfs_mount_fd)
 
     config_bytes = payload["config"].encode("ascii")
     if not config_bytes or len(config_bytes) > 65536:
+        _fail()
+    config = json.loads(config_bytes)
+    workspace_mounts = [
+        mount
+        for mount in config.get("mounts", [])
+        if isinstance(mount, dict) and mount.get("destination") == "/workspace"
+    ]
+    if (
+        len(workspace_mounts) != 1
+        or workspace_mounts[0].get("type") != "bind"
+        or workspace_mounts[0].get("source") != payload["workspace_source"]
+    ):
         _fail()
     config_fd = os.open(
         "config.json",
@@ -492,37 +949,45 @@ try:
         config_read_fd = -1
     if observed_config != config_bytes:
         _fail()
-    rootfs_read_fd = os.open(
-        "rootfs",
-        getattr(os, "O_PATH", os.O_RDONLY)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-        dir_fd=bundle_fd,
-    )
-    try:
-        rootfs_info = os.fstat(rootfs_read_fd)
-        if (
-            (rootfs_info.st_dev, rootfs_info.st_ino)
-            != (rootfs_source_info.st_dev, rootfs_source_info.st_ino)
-            or not os.fstatvfs(rootfs_read_fd).f_flag & ST_RDONLY
-        ):
-            _fail()
-    finally:
-        os.close(rootfs_read_fd)
-
     phase = b"A"
     bundle_args = [index for index, value in enumerate(command) if value == "--bundle"]
     if (
-        len(bundle_args) != 1
+        len(command) != 13
+        or command[1] != "--root"
+        or command[3:5] != ["--systemd-cgroup", "run"]
+        or command[5] != "--bundle"
+        or command[7] != "--pid-file"
+        or command[9:11] != ["--preserve-fds", "1"]
+        or command[11] != "--keep"
+        or len(bundle_args) != 1
         or bundle_args[0] + 1 >= len(command)
-        or command[bundle_args[0] + 1] != payload["bundle"]
+        or command[bundle_args[0] + 1] != payload["bundle_fd_path"]
+        or command[2] != f"/proc/self/fd/{payload['state_fd']}"
     ):
         _fail()
-    bundle_path = "/proc/self/fd/" + str(bundle_fd)
-    command[bundle_args[0] + 1] = bundle_path
+    pid_file_parent, pid_file_name = os.path.split(command[8])
+    if (
+        pid_file_parent != f"/proc/self/fd/{payload['state_fd']}"
+        or pid_file_name in {"", ".", ".."}
+        or "/" in pid_file_name
+    ):
+        _fail()
+    os.set_inheritable(payload["state_fd"], True)
     os.set_inheritable(bundle_fd, True)
+    os.close(payload["workspace_fd"])
     phase = b"B"
+    bundle_snapshot_fd = os.open(
+        ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=bundle_fd
+    )
+    transfer_socket = socket.socket(fileno=snapshot_socket_fd)
+    descriptors = array.array("i", [rootfs_snapshot_fd, bundle_snapshot_fd])
+    if transfer_socket.sendmsg(
+        [b"S"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors.tobytes())]
+    ) != 1:
+        _fail()
+    transfer_socket.close()
+    os.close(rootfs_snapshot_fd)
+    os.close(bundle_snapshot_fd)
     _message(b"R")
     if not _read_exact(exec_ack_fd, b"X"):
         _fail()
@@ -683,12 +1148,12 @@ _PINNED_RUNC_WORKER_CONFIGS: dict[
     int,
     tuple[
         weakref.ReferenceType[Any],
-        tuple[_TrustedRuncExecutable, str, bytes, str],
+        tuple[_TrustedRuncExecutable, str, bytes, str, str, str],
     ],
 ] = {}
 _COMPILER_ISSUED_OCI_WORKER_CONFIGS: dict[
     int,
-    tuple[weakref.ReferenceType[Any], bytes, str],
+    tuple[weakref.ReferenceType[Any], bytes, str, str, str],
 ] = {}
 _TRUSTED_ROOTFS_PINS: dict[
     int,
@@ -984,12 +1449,14 @@ class _TrustedRuncExecutable:
 
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
 class _PinnedRuncWorkerConfig:
-    """Immutable worker config bound to one sealed runc executable pin."""
+    """Immutable worker config bound to sealed runtime and rootfs pins."""
 
     executable: _TrustedRuncExecutable
     version: str
     config_json: bytes = field(repr=False)
     sha256: str
+    rootfs_sha256: str
+    rootfs_closure_sha256: str
 
 
 class _CompilerIssuedOciWorkerConfig(dict[str, Any]):
@@ -1163,9 +1630,10 @@ def _check_rootfs_file_capability(descriptor: int) -> None:
 
 
 def _measure_rootfs_tree(
-    path: str | Path,
+    path: str | Path | None,
     *,
     _manifest_entries: list[dict[str, Any]] | None = None,
+    _root_fd: int | None = None,
 ) -> tuple[str, int, int]:
     """Return a canonical tree digest and the inode opened for that scan.
 
@@ -1177,16 +1645,27 @@ def _measure_rootfs_tree(
     image was audited.
     """
 
-    root = _plain_directory(path, code="invalid_oci_rootfs", label="OCI rootfs")
+    if _root_fd is None:
+        root = _plain_directory(path, code="invalid_oci_rootfs", label="OCI rootfs")
+    else:
+        if path is not None:
+            raise SupervisorError("invalid_oci_rootfs", "rootfs descriptor and path are exclusive")
+        root = Path(".")
     is_linux = platform.system() == "Linux"
-    mountinfo_before = _read_linux_mountinfo() if is_linux else None
+    mountinfo_before = _read_linux_mountinfo() if is_linux and _root_fd is None else None
     if mountinfo_before is not None:
         _reject_nested_linux_mounts(root, mountinfo_before)
     root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     try:
-        root_fd = os.open(root, root_flags | nofollow | cloexec)
+        if _root_fd is None:
+            root_fd = os.open(root, root_flags | nofollow | cloexec)
+        else:
+            descriptor_info = os.fstat(_root_fd)
+            if not stat.S_ISDIR(descriptor_info.st_mode):
+                raise OSError("rootfs descriptor is not a directory")
+            root_fd = os.open(".", root_flags | nofollow | cloexec, dir_fd=_root_fd)
     except OSError as error:
         raise SupervisorError("invalid_oci_rootfs", "OCI rootfs cannot be opened safely") from error
 
@@ -1276,7 +1755,7 @@ def _measure_rootfs_tree(
                     "invalid_oci_rootfs", "OCI rootfs crosses a filesystem boundary"
                 )
             if stat.S_ISDIR(info.st_mode):
-                if not is_linux and os.path.ismount(child):
+                if not is_linux and _root_fd is None and os.path.ismount(child):
                     raise SupervisorError(
                         "invalid_oci_rootfs", "OCI rootfs contains a nested mount"
                     )
@@ -1379,7 +1858,9 @@ def _measure_rootfs_tree(
         _check_rootfs_posix_acl(root_fd)
         record(b"", "directory", opened_root, "")
         visit(root, root_fd, b"", 0)
-        current_root = os.stat(root, follow_symlinks=False)
+        current_root = (
+            os.stat(root, follow_symlinks=False) if _root_fd is None else os.fstat(root_fd)
+        )
         if _rootfs_stat_identity(opened_root) != _rootfs_stat_identity(current_root):
             raise SupervisorError("invalid_oci_rootfs", "OCI rootfs changed while being read")
         if mountinfo_before is not None and _read_linux_mountinfo() != mountinfo_before:
@@ -1430,6 +1911,22 @@ def rootfs_tree_manifest(path: str | Path) -> dict[str, Any]:
 
     entries: list[dict[str, Any]] = []
     tree_sha256, _device, _inode = _measure_rootfs_tree(path, _manifest_entries=entries)
+    closure_sha256 = hashlib.sha256(_canonical_rootfs_closure(entries)).hexdigest()
+    return {
+        "schema": _ROOTFS_CLOSURE_SCHEMA,
+        "rootfs_sha256": tree_sha256,
+        "closure_sha256": closure_sha256,
+        "entries": entries,
+    }
+
+
+def rootfs_tree_manifest_fd(root_fd: int) -> dict[str, Any]:
+    """Measure a rootfs through an already-open directory descriptor."""
+
+    entries: list[dict[str, Any]] = []
+    tree_sha256, _device, _inode = _measure_rootfs_tree(
+        None, _manifest_entries=entries, _root_fd=root_fd
+    )
     closure_sha256 = hashlib.sha256(_canonical_rootfs_closure(entries)).hexdigest()
     return {
         "schema": _ROOTFS_CLOSURE_SCHEMA,
@@ -2032,7 +2529,13 @@ def _canonical_oci_worker_config(config: dict[str, Any]) -> bytes:
         ) from error
 
 
-def _issue_compiler_oci_worker_config(config: dict[str, Any]) -> _CompilerIssuedOciWorkerConfig:
+def _issue_compiler_oci_worker_config(
+    config: dict[str, Any], *, rootfs_sha256: str, rootfs_closure_sha256: str
+) -> _CompilerIssuedOciWorkerConfig:
+    if not _is_rootfs_sha256(rootfs_sha256) or not _is_rootfs_sha256(rootfs_closure_sha256):
+        raise SupervisorError(
+            "invalid_oci_rootfs", "compiler-issued worker config requires exact rootfs pins"
+        )
     issued = _CompilerIssuedOciWorkerConfig(config)
     config_json = _canonical_oci_worker_config(issued)
     digest = hashlib.sha256(config_json).hexdigest()
@@ -2044,12 +2547,20 @@ def _issue_compiler_oci_worker_config(config: dict[str, Any]) -> _CompilerIssued
             _COMPILER_ISSUED_OCI_WORKER_CONFIGS.pop(key, None)
 
     reference = weakref.ref(issued, discard)
-    _COMPILER_ISSUED_OCI_WORKER_CONFIGS[key] = (reference, config_json, digest)
+    _COMPILER_ISSUED_OCI_WORKER_CONFIGS[key] = (
+        reference,
+        config_json,
+        digest,
+        rootfs_sha256,
+        rootfs_closure_sha256,
+    )
     return issued
 
 
-def _compiler_issued_oci_worker_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Return the sealed compiler bytes only when the exact result is intact."""
+def _compiler_issued_oci_worker_config(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], str, str]:
+    """Return the exact config and rootfs pins sealed by the compiler."""
 
     sealed = (
         _COMPILER_ISSUED_OCI_WORKER_CONFIGS.get(id(config))
@@ -2061,7 +2572,7 @@ def _compiler_issued_oci_worker_config(config: dict[str, Any]) -> dict[str, Any]
             "invalid_oci_worker_policy",
             "runc compatibility adapter requires an exact compiler-issued OCI config",
         )
-    config_json, digest = sealed[1], sealed[2]
+    config_json, digest, rootfs_sha256, rootfs_closure_sha256 = sealed[1:]
     if (
         _canonical_oci_worker_config(config) != config_json
         or hashlib.sha256(config_json).hexdigest() != digest
@@ -2076,7 +2587,7 @@ def _compiler_issued_oci_worker_config(config: dict[str, Any]) -> dict[str, Any]
             "invalid_oci_worker_policy", "sealed compiler OCI config cannot be decoded"
         ) from error
     _validate_complete_oci_worker_policy(decoded)
-    return decoded
+    return decoded, rootfs_sha256, rootfs_closure_sha256
 
 
 def build_oci_worker_config(
@@ -2350,7 +2861,9 @@ def build_oci_worker_config(
                 ],
                 "readonlyPaths": ["/proc/sys", "/proc/sysrq-trigger"],
             },
-        }
+        },
+        rootfs_sha256=rootfs_pin.sha256,
+        rootfs_closure_sha256=rootfs_pin.closure_sha256 or "",
     )
 
 
@@ -2653,7 +3166,9 @@ def _apply_pinned_runc_recursive_private_policy(
             "invalid_oci_runtime_version",
             "recursive rootfs propagation currently requires pinned runc 1.3.5",
         )
-    compiled_config = _compiler_issued_oci_worker_config(config)
+    compiled_config, rootfs_sha256, rootfs_closure_sha256 = _compiler_issued_oci_worker_config(
+        config
+    )
     observed_version = _probe_trusted_runc_version(executable, expected_version)
     if observed_version != _RUNC_RECURSIVE_PRIVATE_VERSION:
         raise SupervisorError(
@@ -2669,6 +3184,8 @@ def _apply_pinned_runc_recursive_private_policy(
         version=observed_version,
         config_json=config_json,
         sha256=digest,
+        rootfs_sha256=rootfs_sha256,
+        rootfs_closure_sha256=rootfs_closure_sha256,
     )
     key = id(binding)
 
@@ -2680,7 +3197,14 @@ def _apply_pinned_runc_recursive_private_policy(
     reference = weakref.ref(binding, discard)
     _PINNED_RUNC_WORKER_CONFIGS[key] = (
         reference,
-        (executable, observed_version, config_json, digest),
+        (
+            executable,
+            observed_version,
+            config_json,
+            digest,
+            rootfs_sha256,
+            rootfs_closure_sha256,
+        ),
     )
     return binding
 
@@ -2700,7 +3224,7 @@ def _verify_pinned_runc_worker_config(
         raise SupervisorError(
             "invalid_oci_worker_policy", "runc worker config must come from the pinned adapter"
         )
-    pinned, version, config_json, digest = sealed[1]
+    pinned, version, config_json, digest, rootfs_sha256, rootfs_closure_sha256 = sealed[1]
     if (
         binding.executable is not executable
         or pinned is not executable
@@ -2708,6 +3232,10 @@ def _verify_pinned_runc_worker_config(
         or binding.config_json != config_json
         or binding.sha256 != digest
         or hashlib.sha256(binding.config_json).hexdigest() != digest
+        or binding.rootfs_sha256 != rootfs_sha256
+        or binding.rootfs_closure_sha256 != rootfs_closure_sha256
+        or not _is_rootfs_sha256(rootfs_sha256)
+        or not _is_rootfs_sha256(rootfs_closure_sha256)
     ):
         raise SupervisorError(
             "invalid_oci_worker_policy",
@@ -2830,19 +3358,18 @@ def build_runc_run_argv(
     ]
 
 
-@dataclass
+@dataclass(eq=False, slots=True, weakref_slot=True)
 class RuncLaunchHandle:
-    """One held runc client process and its private OCI-init release gate.
+    """One registered runc client and its private OCI-init release gate.
 
-    ``process.pid`` remains the runc client PID after the launcher execs the
-    pinned binary. The handle intentionally has no automatic-release behavior:
+    The child process is deliberately kept out of this public handle and in the
+    launcher's private registry. The handle intentionally has no automatic-release behavior:
     the caller must persist and attest launch state before calling
     :meth:`release_gate`. The lock linearizes release against cancellation:
     whichever operation acquires it first determines whether the gate is
     released or closed. Closing an unreleased gate denies candidate exec.
     """
 
-    process: subprocess.Popen[bytes]
     _gate_writer: int | None
     _bundle_path: str | None = None
     _gate_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -2874,6 +3401,54 @@ class RuncLaunchHandle:
             finally:
                 os.close(descriptor)
 
+    def wait(self, timeout: float | None = None) -> _RuncClientWaitReceipt:
+        """Reap this pinned-runc child and return its bound kernel wait receipt."""
+
+        launch = _runc_launch_record(self)
+        if launch is None:
+            raise SupervisorError(
+                "sandbox_runc_wait_unverified",
+                "runc wait requires the handle returned by the pinned launcher",
+            )
+        binding = launch.execution_binding
+        if binding is None:
+            raise SupervisorError(
+                "sandbox_runc_wait_unbound",
+                "runc wait evidence must be bound to a durable attempt before it is recorded",
+            )
+        wait_lock = launch.wait_lock
+        if not wait_lock.acquire(timeout=max(0.0, timeout) if timeout is not None else -1):
+            raise subprocess.TimeoutExpired("pinned-runc", timeout)
+        try:
+            launch = _runc_launch_record(self)
+            if launch is None or launch.execution_binding != binding:
+                raise SupervisorError(
+                    "sandbox_runc_wait_unverified",
+                    "pinned runc launch provenance changed while waiting",
+                )
+            returncode = launch.wait_returncode
+            if returncode is None:
+                returncode = _wait_and_reap_registered_runc(launch, timeout)
+                _record_runc_kernel_wait_status(self, launch, returncode)
+        finally:
+            wait_lock.release()
+        current = _runc_launch_record(self)
+        if current is None or current.execution_binding != binding:
+            raise SupervisorError(
+                "sandbox_runc_wait_unverified",
+                "pinned runc launch provenance changed while waiting",
+            )
+        receipt = _RuncClientWaitReceipt(
+            pid=launch.pid,
+            process_identity=launch.process_identity,
+            returncode=returncode,
+            attempt_id=binding[0],
+            claim_token=binding[1],
+            execution_id=binding[2],
+        )
+        _register_runc_client_wait_receipt(receipt)
+        return receipt
+
     def close_gate(self) -> None:
         """Close an unreleased gate so the OCI init's fixed trampoline exits."""
 
@@ -2888,6 +3463,362 @@ class RuncLaunchHandle:
             self.close_gate()
         except OSError:
             pass
+
+
+@dataclass(frozen=True)
+class _RuncLaunchTarget:
+    """Immutable launch inputs captured by the selected pinned-runc launcher."""
+
+    launch_mode: str
+    argv: tuple[str, ...]
+    runc_executable_path: str
+    runc_executable_sha256: str
+    # SHA-256 over the exact config.json bytes embedded in the launcher payload.
+    config_sha256: str | None = None
+    bundle_path: str | None = None
+    bundle_device: int | None = None
+    bundle_inode: int | None = None
+    rootfs_path: str | None = None
+    rootfs_device: int | None = None
+    rootfs_inode: int | None = None
+    rootfs_sha256: str | None = None
+    rootfs_closure_sha256: str | None = None
+    rootfs_entry_count: int | None = None
+    rootfs_bytes: int | None = None
+    rootfs_snapshot_limit_bytes: int | None = None
+    rootfs_snapshot_device: int | None = None
+    rootfs_snapshot_inode: int | None = None
+    rootfs_snapshot_sha256: str | None = None
+    rootfs_snapshot_closure_sha256: str | None = None
+    rootfs_snapshot_entry_count: int | None = None
+    rootfs_snapshot_bytes: int | None = None
+    state_path: str | None = None
+    state_device: int | None = None
+    state_inode: int | None = None
+    workspace_path: str | None = None
+    workspace_device: int | None = None
+    workspace_inode: int | None = None
+    pid_file_path: str | None = None
+    container_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _RuncLaunchRecord:
+    """Private immutable provenance retained independently of mutable handles."""
+
+    process: Any
+    pid: int
+    process_identity: str
+    target: _RuncLaunchTarget
+    execution_binding: tuple[str, int, str] | None = None
+    wait_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+    wait_returncode: int | None = None
+    _test_waitpid: Callable[[int, int], tuple[int, int]] | None = field(
+        default=None, compare=False, repr=False
+    )
+    _test_identity_reader: Callable[[int], str | None] | None = field(
+        default=None, compare=False, repr=False
+    )
+
+
+@dataclass(frozen=True)
+class _RuncClientWaitReceipt:
+    """Process wait evidence issued only by a registered pinned-runc handle."""
+
+    pid: int
+    process_identity: str
+    returncode: int
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+
+
+_RUNC_LAUNCH_RECORDS: dict[
+    int, tuple[weakref.ReferenceType[RuncLaunchHandle], _RuncLaunchRecord]
+] = {}
+_RUNC_LAUNCH_RECORDS_LOCK = threading.RLock()
+_RUNC_WAIT_RECEIPTS: dict[
+    int, tuple[weakref.ReferenceType[Any], tuple[int, str, int, str, int, str]]
+] = {}
+_RUNC_WAIT_RECEIPTS_LOCK = threading.Lock()
+
+
+def _register_runc_launch_handle(
+    handle: RuncLaunchHandle,
+    *,
+    process: Any,
+    process_identity: str,
+    target: _RuncLaunchTarget,
+    _test_waitpid: Callable[[int, int], tuple[int, int]] | None = None,
+    _test_identity_reader: Callable[[int], str | None] | None = None,
+) -> None:
+    """Keep launcher provenance in a private weak registry, not mutable fields."""
+
+    if type(handle) is not RuncLaunchHandle or type(target) is not _RuncLaunchTarget:
+        raise SupervisorError("sandbox_runc_handle_invalid", "pinned runc handle is invalid")
+    pid = getattr(process, "pid", None)
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or not isinstance(process_identity, str)
+        or not process_identity.startswith(f"linux:{pid}:")
+        or not process_identity.rsplit(":", 1)[-1].isdecimal()
+    ):
+        raise SupervisorError(
+            "sandbox_runc_identity_unavailable", "pinned runc process identity is invalid"
+        )
+    key = id(handle)
+
+    def discard(reference: weakref.ReferenceType[RuncLaunchHandle]) -> None:
+        with _RUNC_LAUNCH_RECORDS_LOCK:
+            current = _RUNC_LAUNCH_RECORDS.get(key)
+            if current is not None and current[0] is reference:
+                _RUNC_LAUNCH_RECORDS.pop(key, None)
+
+    reference = weakref.ref(handle, discard)
+    record = _RuncLaunchRecord(
+        process=process,
+        pid=pid,
+        process_identity=process_identity,
+        target=target,
+        _test_waitpid=_test_waitpid,
+        _test_identity_reader=_test_identity_reader,
+    )
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        _RUNC_LAUNCH_RECORDS[key] = (reference, record)
+
+
+def _runc_launch_record(handle: Any) -> _RuncLaunchRecord | None:
+    if type(handle) is not RuncLaunchHandle:
+        return None
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
+        if registered is None or registered[0]() is not handle:
+            return None
+        record = registered[1]
+    if getattr(record.process, "pid", None) != record.pid or not record.process_identity.startswith(
+        f"linux:{record.pid}:"
+    ):
+        return None
+    return record
+
+
+def _runc_launch_pid(handle: Any) -> int | None:
+    """Return the registered PID without exposing its mutable Popen object."""
+
+    record = _runc_launch_record(handle)
+    return record.pid if record is not None else None
+
+
+def _runc_launch_process_for_testing(handle: Any) -> Any | None:
+    """Private subprocess access for launcher integration tests only."""
+
+    record = _runc_launch_record(handle)
+    return record.process if record is not None else None
+
+
+def _wait_and_reap_registered_runc(launch: _RuncLaunchRecord, timeout: float | None) -> int:
+    """Wait for and reap the exact registered PID using kernel wait status.
+
+    ``Popen.returncode`` is only a mutable Python cache and is never treated as
+    evidence. A successful ``waitpid`` is required before a receipt can exist.
+    """
+
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    while True:
+        identity_reader = launch._test_identity_reader or _runc_client_process_identity
+        if identity_reader(launch.pid) != launch.process_identity:
+            raise SupervisorError(
+                "sandbox_runc_wait_unverified",
+                "registered runc PID identity changed before kernel reaping",
+            )
+        try:
+            waitpid = launch._test_waitpid or os.waitpid
+            waited_pid, wait_status = waitpid(launch.pid, os.WNOHANG)
+        except InterruptedError:
+            continue
+        except (ChildProcessError, OSError) as error:
+            raise SupervisorError(
+                "sandbox_runc_wait_unverified",
+                "registered runc child could not be reaped by its supervisor",
+            ) from error
+        if waited_pid == launch.pid:
+            returncode = os.waitstatus_to_exitcode(wait_status)
+            # Keep Popen's convenience API internally consistent, but only
+            # after the kernel has supplied and reaped the actual status.
+            launch.process.returncode = returncode
+            return returncode
+        if waited_pid != 0:
+            raise SupervisorError(
+                "sandbox_runc_wait_unverified", "kernel returned an unexpected child PID"
+            )
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("pinned-runc", timeout)
+            time.sleep(min(0.01, remaining))
+        else:
+            time.sleep(0.01)
+
+
+def _record_runc_kernel_wait_status(
+    handle: RuncLaunchHandle, launch: _RuncLaunchRecord, returncode: int
+) -> None:
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
+        if registered is None or registered[0]() is not handle:
+            raise SupervisorError(
+                "sandbox_runc_wait_unverified", "registered runc handle disappeared after wait"
+            )
+        current = registered[1]
+        if (
+            current.pid != launch.pid
+            or current.process_identity != launch.process_identity
+            or current.execution_binding != launch.execution_binding
+            or current.process is not launch.process
+        ):
+            raise SupervisorError(
+                "sandbox_runc_wait_unverified", "registered runc provenance changed after wait"
+            )
+        updated = _RuncLaunchRecord(
+            process=current.process,
+            pid=current.pid,
+            process_identity=current.process_identity,
+            target=current.target,
+            execution_binding=current.execution_binding,
+            wait_lock=current.wait_lock,
+            wait_returncode=returncode,
+            _test_waitpid=current._test_waitpid,
+            _test_identity_reader=current._test_identity_reader,
+        )
+        _RUNC_LAUNCH_RECORDS[id(handle)] = (registered[0], updated)
+
+
+def _runc_launch_target(handle: Any) -> _RuncLaunchTarget | None:
+    record = _runc_launch_record(handle)
+    return record.target if record is not None else None
+
+
+def _runc_launch_process_identity(handle: Any) -> str | None:
+    record = _runc_launch_record(handle)
+    return record.process_identity if record is not None else None
+
+
+def _runc_launch_handle_is_self_consistent(handle: Any) -> bool:
+    """Recognize only a live handle present in the private launch registry."""
+
+    return _runc_launch_record(handle) is not None
+
+
+def _runc_launch_handle_bind_execution(
+    handle: RuncLaunchHandle, attempt_id: str, claim_token: int, execution_id: str
+) -> None:
+    """Bind a prevalidated launch target once to its exact durable execution."""
+
+    binding = (attempt_id, claim_token, execution_id)
+    with _RUNC_LAUNCH_RECORDS_LOCK:
+        registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
+        if registered is None or registered[0]() is not handle:
+            raise SupervisorError(
+                "sandbox_execution_launch_handle_required",
+                "attempt binding requires launcher-captured pinned-runc provenance",
+            )
+        record = registered[1]
+        if record.target.launch_mode != "private_bundle":
+            raise SupervisorError(
+                "sandbox_execution_launch_target_mismatch",
+                "diagnostic runc launches cannot be bound to supervised attempts",
+            )
+        if record.execution_binding not in {None, binding}:
+            raise SupervisorError(
+                "sandbox_execution_launch_handle_conflict",
+                "pinned-runc handle is already bound to another durable execution",
+            )
+        updated = _RuncLaunchRecord(
+            process=record.process,
+            pid=record.pid,
+            process_identity=record.process_identity,
+            target=record.target,
+            execution_binding=binding,
+            wait_lock=record.wait_lock,
+            wait_returncode=record.wait_returncode,
+            _test_waitpid=record._test_waitpid,
+            _test_identity_reader=record._test_identity_reader,
+        )
+        _RUNC_LAUNCH_RECORDS[id(handle)] = (registered[0], updated)
+
+
+def _register_runc_client_wait_receipt(receipt: _RuncClientWaitReceipt) -> None:
+    key = id(receipt)
+    contents = (
+        receipt.pid,
+        receipt.process_identity,
+        receipt.returncode,
+        receipt.attempt_id,
+        receipt.claim_token,
+        receipt.execution_id,
+    )
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        with _RUNC_WAIT_RECEIPTS_LOCK:
+            current = _RUNC_WAIT_RECEIPTS.get(key)
+            if current is not None and current[0] is reference:
+                _RUNC_WAIT_RECEIPTS.pop(key, None)
+
+    reference = weakref.ref(receipt, discard)
+    with _RUNC_WAIT_RECEIPTS_LOCK:
+        _RUNC_WAIT_RECEIPTS[key] = (reference, contents)
+
+
+def _runc_client_process_identity(pid: int) -> str | None:
+    """Capture a PID-reuse-resistant identity while the launched process exists."""
+
+    if type(pid) is not int or pid <= 0 or not sys.platform.startswith("linux"):
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw.rsplit(")", 1)[1].split()
+        start_ticks = fields[19]
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
+    if not start_ticks.isdecimal():
+        return None
+    return f"linux:{pid}:{start_ticks}"
+
+
+def _runc_client_wait_receipt_is_self_consistent(receipt: Any) -> bool:
+    """Accept only an unmodified receipt returned by a registered handle."""
+
+    if type(receipt) is not _RuncClientWaitReceipt:
+        return False
+    with _RUNC_WAIT_RECEIPTS_LOCK:
+        registered = _RUNC_WAIT_RECEIPTS.get(id(receipt))
+        if registered is None or registered[0]() is not receipt:
+            return False
+        expected = registered[1]
+    actual = (
+        receipt.pid,
+        receipt.process_identity,
+        receipt.returncode,
+        receipt.attempt_id,
+        receipt.claim_token,
+        receipt.execution_id,
+    )
+    return (
+        actual == expected
+        and type(receipt.pid) is int
+        and receipt.pid > 0
+        and receipt.process_identity.startswith(f"linux:{receipt.pid}:")
+        and receipt.process_identity.rsplit(":", 1)[-1].isdecimal()
+        and type(receipt.returncode) is int
+        and -255 <= receipt.returncode <= 255
+        and isinstance(receipt.attempt_id, str)
+        and bool(receipt.attempt_id)
+        and type(receipt.claim_token) is int
+        and receipt.claim_token > 0
+        and isinstance(receipt.execution_id, str)
+        and bool(receipt.execution_id)
+    )
 
 
 def _runc_client_environment() -> dict[str, str]:
@@ -3021,6 +3952,7 @@ def _spawn_pinned_runc(
     runc_descriptor = -1
     start_read = start_write = gate_read = gate_write = -1
     process: subprocess.Popen[bytes] | None = None
+    process_identity: str | None = None
     launch_payload_may_have_been_delivered = False
     try:
         runc_descriptor = fcntl.fcntl(opened_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
@@ -3055,6 +3987,12 @@ def _spawn_pinned_runc(
             pass_fds=(start_read, gate_read, runc_descriptor),
             start_new_session=True,
         )
+        process_identity = _runc_client_process_identity(process.pid)
+        if process_identity is None:
+            raise SupervisorError(
+                "sandbox_runc_identity_unavailable",
+                "pinned-runc client process identity could not be recorded before submission",
+            )
         descriptor_to_close = start_read
         start_read = -1
         os.close(descriptor_to_close)
@@ -3078,7 +4016,18 @@ def _spawn_pinned_runc(
         descriptor_to_close = start_write
         start_write = -1
         os.close(descriptor_to_close)
-        handle = RuncLaunchHandle(process=process, _gate_writer=gate_write)
+        launch_target = _RuncLaunchTarget(
+            launch_mode="unisolated_diagnostic",
+            argv=command,
+            runc_executable_path=str(binary),
+            runc_executable_sha256=executable.sha256,
+        )
+        handle = RuncLaunchHandle(
+            _gate_writer=gate_write,
+        )
+        _register_runc_launch_handle(
+            handle, process=process, process_identity=process_identity, target=launch_target
+        )
         gate_write = -1
         return handle
     except BaseException as launch_error:
@@ -3256,25 +4205,313 @@ def _open_private_bundle_fds(bundle_root: str | Path) -> tuple[Path, int, int]:
         raise
 
 
+def _open_pinned_runtime_directory(path: str | Path, *, device: int, inode: int, label: str) -> int:
+    """Open a pinned state/workspace directory without following its path later."""
+
+    flags = (
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        observed = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (device, inode)
+            or (observed.st_dev, observed.st_ino) != (device, inode)
+        ):
+            raise OSError(f"{label} path no longer matches its captured identity")
+    except OSError as error:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise SupervisorError(
+            "invalid_oci_runtime_paths", f"pinned runc {label} changed before fd binding"
+        ) from error
+    return descriptor
+
+
+def _private_bundle_runc_launch_target(
+    executable: _TrustedRuncExecutable,
+    command: tuple[str, ...],
+    bundle: Path,
+    bundle_info: os.stat_result,
+    rootfs_info: os.stat_result,
+    rootfs_fd: int,
+    config_json: bytes,
+    expected_rootfs_sha256: str,
+    expected_rootfs_closure_sha256: str,
+) -> _RuncLaunchTarget:
+    """Capture the exact command, config, and path identities launched by runc."""
+
+    if (
+        len(command) != 13
+        or command[1] != "--root"
+        or command[3:5] != ("--systemd-cgroup", "run")
+        or command[5] != "--bundle"
+        or command[7] != "--pid-file"
+        or command[9:11] != ("--preserve-fds", "1")
+        or command[11] != "--keep"
+        or command[0] != str(executable.path)
+        or command[6] != str(bundle)
+    ):
+        raise SupervisorError(
+            "invalid_oci_command", "private-bundle launch command is not the exact supported form"
+        )
+    state_path = Path(command[2])
+    pid_file_path = Path(command[8])
+    container_id = command[12]
+    if (
+        not state_path.is_absolute()
+        or not pid_file_path.is_absolute()
+        or not _CONTAINER_ID.fullmatch(container_id)
+    ):
+        raise SupervisorError(
+            "invalid_oci_command", "private-bundle launch target contains invalid paths or ID"
+        )
+    try:
+        config = json.loads(config_json)
+        mounts = config["mounts"]
+        workspace_mounts = [
+            mount
+            for mount in mounts
+            if isinstance(mount, dict) and mount.get("destination") == "/workspace"
+        ]
+        workspace_path = workspace_mounts[0]["source"]
+        cgroups_path = config["linux"]["cgroupsPath"]
+        if (
+            len(workspace_mounts) != 1
+            or workspace_mounts[0].get("type") != "bind"
+            or not isinstance(workspace_path, str)
+            or not Path(workspace_path).is_absolute()
+            or cgroups_path != f"user.slice:acp:{container_id}"
+        ):
+            raise ValueError("OCI config does not bind one exact workspace and container ID")
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SupervisorError(
+            "invalid_oci_worker_policy",
+            "private-bundle launch config lacks an exact workspace/container binding",
+        ) from error
+
+    directory_identities: list[tuple[int, int]] = []
+    for path, label in ((state_path, "state root"), (Path(workspace_path), "workspace")):
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise SupervisorError(
+                "invalid_oci_runtime_paths", f"pinned runc {label} is unavailable"
+            ) from error
+        if not stat.S_ISDIR(info.st_mode):
+            raise SupervisorError(
+                "invalid_oci_runtime_paths", f"pinned runc {label} is not a real directory"
+            )
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise SupervisorError(
+                "invalid_oci_runtime_paths", f"pinned runc {label} is not owner-private"
+            )
+        directory_identities.append((info.st_dev, info.st_ino))
+    (state_device, state_inode), (workspace_device, workspace_inode) = directory_identities
+    if (state_device, state_inode) == (workspace_device, workspace_inode):
+        raise SupervisorError(
+            "invalid_oci_runtime_paths",
+            "runc state root and workspace must be distinct directories",
+        )
+    rootfs_path = bundle / "rootfs"
+    expected_rootfs_identity = (rootfs_info.st_dev, rootfs_info.st_ino)
+    try:
+        opened_rootfs = os.fstat(rootfs_fd)
+        path_rootfs = os.stat(rootfs_path, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_rootfs.st_mode)
+            or (opened_rootfs.st_dev, opened_rootfs.st_ino) != expected_rootfs_identity
+            or (path_rootfs.st_dev, path_rootfs.st_ino) != expected_rootfs_identity
+        ):
+            raise OSError("opened rootfs no longer matches the captured bundle identity")
+        # Bind the opened bundle rootfs to the operator-pinned content. This
+        # catches replacement or mutation after config compilation and before
+        # the private launcher submits runc.
+        rootfs_manifest = rootfs_tree_manifest(rootfs_path)
+        if (
+            rootfs_manifest["rootfs_sha256"] != expected_rootfs_sha256
+            or rootfs_manifest["closure_sha256"] != expected_rootfs_closure_sha256
+        ):
+            raise SupervisorError(
+                "invalid_oci_rootfs",
+                "OCI bundle rootfs no longer matches the compiler-sealed operator pins",
+            )
+        rootfs_bytes = sum(entry["size"] for entry in rootfs_manifest["entries"])
+        rootfs_entry_count = len(rootfs_manifest["entries"])
+        rootfs_snapshot_data_bytes = sum(
+            ((entry["size"] + 4095) // 4096) * 4096
+            for entry in rootfs_manifest["entries"]
+            if entry["type"] in {"file", "symlink"}
+        )
+        rootfs_snapshot_limit_bytes = max(
+            _ROOTFS_SNAPSHOT_OVERHEAD_BYTES,
+            rootfs_snapshot_data_bytes + _ROOTFS_SNAPSHOT_OVERHEAD_BYTES,
+        )
+        if rootfs_snapshot_limit_bytes > _MAX_ROOTFS_SNAPSHOT_BYTES:
+            raise SupervisorError(
+                "invalid_oci_rootfs",
+                "OCI rootfs exceeds the bounded private snapshot capacity",
+            )
+        opened_rootfs_after = os.fstat(rootfs_fd)
+        path_rootfs_after = os.stat(rootfs_path, follow_symlinks=False)
+        if (opened_rootfs_after.st_dev, opened_rootfs_after.st_ino) != expected_rootfs_identity or (
+            path_rootfs_after.st_dev,
+            path_rootfs_after.st_ino,
+        ) != expected_rootfs_identity:
+            raise OSError("rootfs changed identity while its content was verified")
+    except SupervisorError:
+        raise
+    except OSError as error:
+        raise SupervisorError(
+            "invalid_oci_rootfs", "opened runc rootfs could not be verified against its path"
+        ) from error
+    return _RuncLaunchTarget(
+        launch_mode="private_bundle",
+        argv=command,
+        runc_executable_path=str(executable.path),
+        runc_executable_sha256=executable.sha256,
+        config_sha256=hashlib.sha256(config_json).hexdigest(),
+        bundle_path=str(bundle),
+        bundle_device=bundle_info.st_dev,
+        bundle_inode=bundle_info.st_ino,
+        rootfs_path=str(rootfs_path),
+        rootfs_device=rootfs_info.st_dev,
+        rootfs_inode=rootfs_info.st_ino,
+        rootfs_sha256=rootfs_manifest["rootfs_sha256"],
+        rootfs_closure_sha256=rootfs_manifest["closure_sha256"],
+        rootfs_entry_count=rootfs_entry_count,
+        rootfs_bytes=rootfs_bytes,
+        rootfs_snapshot_limit_bytes=rootfs_snapshot_limit_bytes,
+        state_path=str(state_path),
+        state_device=state_device,
+        state_inode=state_inode,
+        workspace_path=workspace_path,
+        workspace_device=workspace_device,
+        workspace_inode=workspace_inode,
+        pid_file_path=str(pid_file_path),
+        container_id=container_id,
+    )
+
+
+def _bind_private_runc_launch_fds(
+    target: _RuncLaunchTarget,
+    config_json: bytes,
+    *,
+    bundle_fd_path: str,
+    state_fd: int,
+    workspace_fd: int,
+) -> tuple[_RuncLaunchTarget, bytes]:
+    """Rewrite runc inputs to resolve state, bundle, and workspace by FD."""
+
+    command = target.argv
+    if (
+        not isinstance(bundle_fd_path, str)
+        or re.fullmatch(r"/proc/self/fd/(?:0|[1-9][0-9]{0,8})", bundle_fd_path) is None
+    ):
+        raise SupervisorError(
+            "invalid_oci_runtime_paths", "private runc bundle path is not descriptor-addressed"
+        )
+    bundle_fd_number = int(bundle_fd_path.rsplit("/", 1)[-1])
+    if (
+        target.launch_mode != "private_bundle"
+        or len(command) != 13
+        or command[1] != "--root"
+        or command[3:5] != ("--systemd-cgroup", "run")
+        or command[5] != "--bundle"
+        or command[7] != "--pid-file"
+        or command[9:11] != ("--preserve-fds", "1")
+        or command[11] != "--keep"
+        or target.state_path is None
+        or target.workspace_path is None
+        or target.pid_file_path is None
+        or target.container_id is None
+        or command[2] != target.state_path
+        or command[8] != target.pid_file_path
+        or command[6] != target.bundle_path
+        or command[12] != target.container_id
+        or type(state_fd) is not int
+        or type(workspace_fd) is not int
+        or state_fd < 3
+        or workspace_fd < 3
+        or state_fd in {workspace_fd, bundle_fd_number}
+        or workspace_fd == bundle_fd_number
+    ):
+        raise SupervisorError(
+            "invalid_oci_runtime_paths", "private runc inputs cannot be bound to pinned FDs"
+        )
+
+    state_fd_path = f"/proc/self/fd/{state_fd}"
+    workspace_source_path = f"/dev/shm/acp-{target.container_id}-workspace"
+    pid_file = Path(target.pid_file_path)
+    if (
+        pid_file.parent != Path(target.state_path)
+        or pid_file.name in {"", ".", ".."}
+        or "/" in pid_file.name
+    ):
+        raise SupervisorError(
+            "invalid_oci_runtime_paths", "runc PID file must be a direct child of its state root"
+        )
+
+    try:
+        config = json.loads(config_json)
+        mounts = config["mounts"]
+        workspace_mounts = [
+            mount
+            for mount in mounts
+            if isinstance(mount, dict) and mount.get("destination") == "/workspace"
+        ]
+        if (
+            len(workspace_mounts) != 1
+            or workspace_mounts[0].get("type") != "bind"
+            or workspace_mounts[0].get("source") != target.workspace_path
+        ):
+            raise ValueError("OCI workspace mount no longer matches its captured path")
+        workspace_mounts[0]["source"] = workspace_source_path
+        effective_config = _canonical_oci_worker_config(config)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, SupervisorError) as error:
+        raise SupervisorError(
+            "invalid_oci_worker_policy", "private runc config cannot be rebound to workspace FD"
+        ) from error
+
+    effective_command = list(command)
+    effective_command[2] = state_fd_path
+    effective_command[6] = bundle_fd_path
+    effective_command[8] = f"{state_fd_path}/{pid_file.name}"
+    bound_target = replace(
+        target,
+        argv=tuple(effective_command),
+        config_sha256=hashlib.sha256(effective_config).hexdigest(),
+    )
+    return bound_target, effective_config
+
+
 def _spawn_pinned_runc_with_private_bundle(
     executable: _TrustedRuncExecutable,
     argv: Sequence[str],
     bundle_root: str | Path,
     config_json: bytes,
     *,
+    rootfs_sha256: str,
+    rootfs_closure_sha256: str,
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
+    _before_workspace_open: Callable[[int, Path, int, int], None] | None = None,
     _before_runc_exec: Callable[[int, Path, int], None] | None = None,
 ) -> RuncLaunchHandle:
     """Exec pinned runc only after sealing its bundle in a private mount namespace.
 
     A mapped user namespace grants the helper mount authority over a private
     mount namespace without mapping host root. It creates a bounded detached
-    tmpfs and attaches it to the already-open bundle directory with
-    descriptor-based ``move_mount``, then clones and attaches the opened rootfs
-    read-only. The compiler policy supplies a bounded /dev tmpfs so runc can
-    prepare its device nodes without making the rootfs writable. It writes the
-    exact sealed config and marks the bundle read-only.
+    tmpfs for the bundle and another for a content copy of the rootfs, verifies
+    the copy through a returned directory FD, then marks both mounts read-only.
+    The compiler policy supplies a bounded /dev tmpfs so runc can prepare its
+    device nodes without making the rootfs writable. The helper is made
+    non-dumpable before creating the snapshot, blocking same-UID procfs access.
     Runc consumes the bundle through its inherited mount FD, never through the
     mutable host pathname. The optional pre-exec callback is
     private test instrumentation; the supported public API never supplies it.
@@ -3323,30 +4560,6 @@ def _spawn_pinned_runc_with_private_bundle(
         raise SupervisorError(
             "invalid_oci_worker_policy", "sealed OCI config is not ASCII"
         ) from error
-    payload = (
-        json.dumps(
-            {
-                "argv": command,
-                "env": runtime_environment,
-                "config": config_text,
-                "bundle": command[bundle_args[0] + 1],
-                "bundle_device": initial_bundle_info.st_dev,
-                "bundle_inode": initial_bundle_info.st_ino,
-                "rootfs_device": initial_rootfs_info.st_dev,
-                "rootfs_inode": initial_rootfs_info.st_ino,
-                "uid": os.geteuid(),
-                "gid": os.getegid(),
-            },
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("ascii")
-        + b"\n"
-    )
-    if len(payload) > _MAX_RUNC_LAUNCH_PAYLOAD_BYTES:
-        os.close(initial_bundle_fd)
-        os.close(initial_rootfs_fd)
-        raise SupervisorError("invalid_oci_command", "private runc payload exceeds its byte limit")
-
     try:
         opened_descriptor = _open_verified_runc_executable(executable)
     except BaseException:
@@ -3354,10 +4567,15 @@ def _spawn_pinned_runc_with_private_bundle(
         os.close(initial_rootfs_fd)
         raise
     runc_fd = bundle_fd = rootfs_fd = -1
+    state_path_fd = workspace_path_fd = state_fd = workspace_fd = -1
     start_read = start_write = status_read = status_write = -1
     map_ack_read = map_ack_write = exec_ack_read = exec_ack_write = -1
     gate_read = gate_write = -1
+    snapshot_socket_parent: socket.socket | None = None
+    snapshot_socket_child: socket.socket | None = None
+    snapshot_rootfs_fd = private_bundle_fd = -1
     process: subprocess.Popen[bytes] | None = None
+    process_identity: str | None = None
     launch_payload_may_have_been_delivered = False
     try:
         runc_fd = fcntl.fcntl(opened_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
@@ -3373,10 +4591,101 @@ def _spawn_pinned_runc_with_private_bundle(
         initial_rootfs_fd = -1
         os.close(descriptor)
         bundle_fd_path = f"/proc/self/fd/{bundle_fd}"
-        bundle_fd_number = bundle_fd
         if command[bundle_args[0] + 1] != str(bundle):
             raise SupervisorError(
                 "invalid_oci_bundle", "runc bundle argv does not match its pinned directory"
+            )
+        launch_target = _private_bundle_runc_launch_target(
+            executable,
+            command,
+            bundle,
+            initial_bundle_info,
+            initial_rootfs_info,
+            rootfs_fd,
+            config_json,
+            rootfs_sha256,
+            rootfs_closure_sha256,
+        )
+        if (
+            launch_target.state_device is None
+            or launch_target.state_inode is None
+            or launch_target.workspace_device is None
+            or launch_target.workspace_inode is None
+            or launch_target.workspace_path is None
+        ):
+            raise SupervisorError(
+                "invalid_oci_runtime_paths", "state/workspace identities were not captured"
+            )
+        state_path_fd = _open_pinned_runtime_directory(
+            launch_target.state_path,
+            device=launch_target.state_device,
+            inode=launch_target.state_inode,
+            label="state root",
+        )
+        workspace_path_fd = _open_pinned_runtime_directory(
+            launch_target.workspace_path,
+            device=launch_target.workspace_device,
+            inode=launch_target.workspace_inode,
+            label="workspace",
+        )
+        state_fd = fcntl.fcntl(state_path_fd, fcntl.F_DUPFD_CLOEXEC, 66)
+        workspace_fd = fcntl.fcntl(workspace_path_fd, fcntl.F_DUPFD_CLOEXEC, 67)
+        os.close(state_path_fd)
+        state_path_fd = -1
+        os.close(workspace_path_fd)
+        workspace_path_fd = -1
+        launch_target, config_json = _bind_private_runc_launch_fds(
+            launch_target,
+            config_json,
+            bundle_fd_path=bundle_fd_path,
+            state_fd=state_fd,
+            workspace_fd=workspace_fd,
+        )
+        config_text = config_json.decode("ascii")
+        if any(
+            type(value) is not int
+            for value in (
+                launch_target.rootfs_entry_count,
+                launch_target.rootfs_bytes,
+                launch_target.rootfs_snapshot_limit_bytes,
+            )
+        ):
+            raise SupervisorError("invalid_oci_rootfs", "rootfs snapshot bounds were not captured")
+
+        payload = (
+            json.dumps(
+                {
+                    "argv": launch_target.argv,
+                    "env": runtime_environment,
+                    "config": config_text,
+                    "bundle": command[bundle_args[0] + 1],
+                    "bundle_fd_path": bundle_fd_path,
+                    "bundle_device": initial_bundle_info.st_dev,
+                    "bundle_inode": initial_bundle_info.st_ino,
+                    "rootfs_device": initial_rootfs_info.st_dev,
+                    "rootfs_inode": initial_rootfs_info.st_ino,
+                    "state_fd": state_fd,
+                    "state_device": launch_target.state_device,
+                    "state_inode": launch_target.state_inode,
+                    "workspace_fd": workspace_fd,
+                    "workspace_device": launch_target.workspace_device,
+                    "workspace_inode": launch_target.workspace_inode,
+                    "workspace_path": launch_target.workspace_path,
+                    "workspace_source": (f"/dev/shm/acp-{launch_target.container_id}-workspace"),
+                    "rootfs_entry_count": launch_target.rootfs_entry_count,
+                    "rootfs_bytes": launch_target.rootfs_bytes,
+                    "rootfs_snapshot_limit_bytes": launch_target.rootfs_snapshot_limit_bytes,
+                    "uid": os.geteuid(),
+                    "gid": os.getegid(),
+                },
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("ascii")
+            + b"\n"
+        )
+        if len(payload) > _MAX_RUNC_LAUNCH_PAYLOAD_BYTES:
+            raise SupervisorError(
+                "invalid_oci_command", "private runc payload exceeds its byte limit"
             )
 
         start_read, start_write = os.pipe2(os.O_CLOEXEC)
@@ -3384,6 +4693,11 @@ def _spawn_pinned_runc_with_private_bundle(
         map_ack_read, map_ack_write = os.pipe2(os.O_CLOEXEC)
         exec_ack_read, exec_ack_write = os.pipe2(os.O_CLOEXEC)
         gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        snapshot_socket_parent, snapshot_socket_child = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
+        )
+        snapshot_socket_parent.settimeout(_RUNC_NAMESPACE_SETUP_TIMEOUT_SECONDS)
         launcher_environment = {
             "HOME": runtime_environment["HOME"],
             "PATH": runtime_environment["PATH"],
@@ -3405,6 +4719,7 @@ def _spawn_pinned_runc_with_private_bundle(
                 str(runc_fd),
                 str(bundle_fd),
                 str(rootfs_fd),
+                str(snapshot_socket_child.fileno()),
             ],
             cwd="/",
             env=launcher_environment,
@@ -3421,9 +4736,24 @@ def _spawn_pinned_runc_with_private_bundle(
                 runc_fd,
                 bundle_fd,
                 rootfs_fd,
+                state_fd,
+                workspace_fd,
+                snapshot_socket_child.fileno(),
             ),
             start_new_session=True,
         )
+        snapshot_socket_child.close()
+        snapshot_socket_child = None
+        os.close(state_fd)
+        state_fd = -1
+        os.close(workspace_fd)
+        workspace_fd = -1
+        process_identity = _runc_client_process_identity(process.pid)
+        if process_identity is None:
+            raise SupervisorError(
+                "sandbox_runc_identity_unavailable",
+                "pinned-runc client process identity could not be recorded before namespace setup",
+            )
         descriptor = start_read
         start_read = -1
         os.close(descriptor)
@@ -3463,12 +4793,98 @@ def _spawn_pinned_runc_with_private_bundle(
         _write_child_user_namespace_maps(process.pid, os.geteuid(), os.getegid())
         if os.write(map_ack_write, b"M") != 1:
             raise OSError("could not acknowledge user-namespace maps")
+        _read_private_launcher_message(status_read, process, expected=b"W")
+        if _before_workspace_open is not None:
+            if launch_target.workspace_path is None:
+                raise SupervisorError(
+                    "invalid_oci_runtime_paths", "workspace path was not captured"
+                )
+            _before_workspace_open(
+                process.pid,
+                Path(launch_target.workspace_path),
+                launch_target.workspace_device,
+                launch_target.workspace_inode,
+            )
+        if os.write(map_ack_write, b"A") != 1:
+            raise OSError("could not acknowledge workspace mount lookup")
         descriptor = map_ack_write
         map_ack_write = -1
         os.close(descriptor)
         _read_private_launcher_message(status_read, process, expected=b"R")
+        if snapshot_socket_parent is None:
+            raise OSError("private rootfs snapshot channel is unavailable")
+        try:
+            packet, ancillary, message_flags, _address = snapshot_socket_parent.recvmsg(
+                1, socket.CMSG_SPACE(2 * array.array("i").itemsize)
+            )
+        except OSError as error:
+            raise SupervisorError(
+                "invalid_oci_rootfs", "private rootfs snapshot descriptor was not received"
+            ) from error
+        received_descriptors: list[int] = []
+        unexpected_control = False
+        for level, message_type, data in ancillary:
+            if level == socket.SOL_SOCKET and message_type == socket.SCM_RIGHTS:
+                values = array.array("i")
+                values.frombytes(data[: len(data) - (len(data) % values.itemsize)])
+                received_descriptors.extend(values.tolist())
+            else:
+                unexpected_control = True
+        if message_flags & socket.MSG_CTRUNC or unexpected_control:
+            for received in received_descriptors:
+                os.close(received)
+            reason = (
+                "rootfs snapshot descriptor packet was truncated"
+                if message_flags & socket.MSG_CTRUNC
+                else "unexpected rootfs snapshot control data"
+            )
+            raise SupervisorError("invalid_oci_rootfs", reason)
+        if packet != b"S" or len(received_descriptors) != 2:
+            for received in received_descriptors:
+                os.close(received)
+            raise SupervisorError("invalid_oci_rootfs", "rootfs snapshot descriptors are invalid")
+        snapshot_rootfs_fd, private_bundle_fd = received_descriptors
+        snapshot_socket_parent.close()
+        snapshot_socket_parent = None
+        snapshot_info = os.fstat(snapshot_rootfs_fd)
+        private_bundle_info = os.fstat(private_bundle_fd)
+        if (
+            not stat.S_ISDIR(snapshot_info.st_mode)
+            or os.fstatvfs(snapshot_rootfs_fd).f_flag & _ST_RDONLY == 0
+            or (snapshot_info.st_dev, snapshot_info.st_ino)
+            == (launch_target.rootfs_device, launch_target.rootfs_inode)
+            or not stat.S_ISDIR(private_bundle_info.st_mode)
+            or os.fstatvfs(private_bundle_fd).f_flag & _ST_RDONLY == 0
+            or (private_bundle_info.st_dev, private_bundle_info.st_ino)
+            == (launch_target.bundle_device, launch_target.bundle_inode)
+        ):
+            raise SupervisorError(
+                "invalid_oci_rootfs",
+                "private rootfs or bundle snapshot is not a distinct read-only mount",
+            )
+        snapshot_manifest = rootfs_tree_manifest_fd(snapshot_rootfs_fd)
+        snapshot_bytes = sum(entry["size"] for entry in snapshot_manifest["entries"])
+        if (
+            snapshot_manifest["rootfs_sha256"] != launch_target.rootfs_sha256
+            or snapshot_manifest["closure_sha256"] != launch_target.rootfs_closure_sha256
+            or len(snapshot_manifest["entries"]) != launch_target.rootfs_entry_count
+            or snapshot_bytes != launch_target.rootfs_bytes
+        ):
+            raise SupervisorError(
+                "invalid_oci_rootfs",
+                "private rootfs snapshot does not match the pre-launch reserved content",
+            )
+        launch_target = replace(
+            launch_target,
+            rootfs_snapshot_device=snapshot_info.st_dev,
+            rootfs_snapshot_inode=snapshot_info.st_ino,
+            rootfs_snapshot_sha256=snapshot_manifest["rootfs_sha256"],
+            rootfs_snapshot_closure_sha256=snapshot_manifest["closure_sha256"],
+            rootfs_snapshot_entry_count=len(snapshot_manifest["entries"]),
+            rootfs_snapshot_bytes=snapshot_bytes,
+        )
         if _before_runc_exec is not None:
-            _before_runc_exec(process.pid, bundle, bundle_fd_number)
+            _before_runc_exec(process.pid, bundle, private_bundle_fd)
         # This byte is the runc-submission boundary: after it is attempted the
         # caller must reconcile exact runtime state if no handle is returned.
         launch_payload_may_have_been_delivered = True
@@ -3482,9 +4898,11 @@ def _spawn_pinned_runc_with_private_bundle(
         status_read = -1
         os.close(descriptor)
         handle = RuncLaunchHandle(
-            process=process,
             _gate_writer=gate_write,
             _bundle_path=bundle_fd_path,
+        )
+        _register_runc_launch_handle(
+            handle, process=process, process_identity=process_identity, target=launch_target
         )
         gate_write = -1
         return handle
@@ -3534,6 +4952,10 @@ def _spawn_pinned_runc_with_private_bundle(
             runc_fd,
             bundle_fd,
             rootfs_fd,
+            state_path_fd,
+            workspace_path_fd,
+            state_fd,
+            workspace_fd,
             start_read,
             start_write,
             status_read,
@@ -3546,6 +4968,7 @@ def _spawn_pinned_runc_with_private_bundle(
         )
         opened_descriptor = initial_bundle_fd = initial_rootfs_fd = -1
         runc_fd = bundle_fd = rootfs_fd = -1
+        state_path_fd = workspace_path_fd = state_fd = workspace_fd = -1
         start_read = start_write = status_read = status_write = -1
         map_ack_read = map_ack_write = exec_ack_read = exec_ack_write = -1
         gate_read = -1
@@ -3555,6 +4978,15 @@ def _spawn_pinned_runc_with_private_bundle(
                     os.close(descriptor)
                 except OSError:
                     pass
+        for descriptor in (snapshot_rootfs_fd, private_bundle_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        for channel in (snapshot_socket_parent, snapshot_socket_child):
+            if channel is not None:
+                channel.close()
 
 
 def spawn_pinned_runc(
@@ -3574,7 +5006,8 @@ def spawn_pinned_runc(
     exact sealed pin. The launcher creates config.json only inside a detached
     private tmpfs attached to the already-open bundle directory using
     descriptor-based ``move_mount`` in a mapped user and mount namespace. It
-    clones the pinned rootfs into the bundle as a separate read-only mount.
+    copies the pinned rootfs into a bounded private tmpfs and verifies the exact
+    copied tree before runc exec as a separate read-only mount.
     Runc receives the tmpfs mount through an inherited FD, so same-UID host-path
     replacement cannot redirect the config handoff.
     This low-level API still does not reserve a supervisor attempt, attest
@@ -3601,6 +5034,8 @@ def spawn_pinned_runc(
         run_argv,
         bundle_root,
         binding.config_json,
+        rootfs_sha256=binding.rootfs_sha256,
+        rootfs_closure_sha256=binding.rootfs_closure_sha256,
         stdout=stdout,
         stderr=stderr,
     )

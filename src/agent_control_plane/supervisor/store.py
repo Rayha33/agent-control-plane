@@ -15,9 +15,71 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
-from .common import GENESIS_HASH, canonical_json, sha256, utc_now
+from .common import GENESIS_HASH, SupervisorError, canonical_json, sha256, utc_now
+
+_SANDBOX_EXIT_RECEIPT_AUTHORIZATION: ContextVar[
+    tuple[int, tuple[str, int, str, int, str, int]] | None
+] = ContextVar("acp_sandbox_exit_receipt_authorization", default=None)
+
+
+@contextmanager
+def _authorize_sandbox_exit_receipt_write(
+    connection: sqlite3.Connection, receipt: Any
+) -> Iterator[None]:
+    """Scope the SQLite exit-write capability to one validated wait receipt."""
+
+    from .oci_worker import _runc_client_wait_receipt_is_self_consistent
+
+    if not _runc_client_wait_receipt_is_self_consistent(receipt):
+        raise SupervisorError(
+            "sandbox_execution_wait_receipt_required",
+            "runc exit persistence requires a registered pinned-runc wait receipt",
+        )
+    fields = (
+        receipt.attempt_id,
+        receipt.claim_token,
+        receipt.execution_id,
+        receipt.pid,
+        receipt.process_identity,
+        receipt.returncode,
+    )
+    token = _SANDBOX_EXIT_RECEIPT_AUTHORIZATION.set((id(connection), fields))
+    try:
+        yield
+    finally:
+        _SANDBOX_EXIT_RECEIPT_AUTHORIZATION.reset(token)
+
+
+def _sandbox_exit_receipt_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        runc_client_pid: int,
+        runc_client_identity: str,
+        exit_code: int,
+    ) -> int:
+        authorization = _SANDBOX_EXIT_RECEIPT_AUTHORIZATION.get()
+        expected = (
+            attempt_id,
+            claim_token,
+            execution_id,
+            runc_client_pid,
+            runc_client_identity,
+            exit_code,
+        )
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
 
 
 class StoreMixin:
@@ -32,6 +94,11 @@ class StoreMixin:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 30000")
+            connection.create_function(
+                "acp_sandbox_exit_receipt_authorized",
+                6,
+                _sandbox_exit_receipt_authorized_for(connection),
+            )
             try:
                 yield connection
             finally:
@@ -39,6 +106,11 @@ class StoreMixin:
             return
         connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "acp_sandbox_exit_receipt_authorized",
+            6,
+            _sandbox_exit_receipt_authorized_for(connection),
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 30000")

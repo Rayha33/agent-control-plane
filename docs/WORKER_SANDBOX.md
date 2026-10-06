@@ -42,14 +42,13 @@ no supervisor call path reads back runtime state and durably validates it before
 releasing the OCI init gate. It proves no namespace, mount, credential, egress,
 cancellation, or result-import property.
 
-**Private-bundle runc handoff (exact-source NAS replay, independent QC, and hosted CI passed on the implementation/test-fixture commit).**
+**Private-bundle runc handoff (historical exact-source NAS replay, independent QC, and hosted CI passed on the implementation/test-fixture commit).**
 The public `spawn_pinned_runc()` path now validates the sealed policy/runtime
 binding, opens stable descriptors for the bundle and rootfs, and starts an
 isolated helper. The helper maps only the caller's UID/GID to the same host IDs
 in a new user namespace and creates a recursively private mount namespace. It
 creates a bounded detached tmpfs using Linux's fd-based mount API, attaches it
-to the opened bundle directory with empty-path `move_mount`, clones the pinned
-rootfs descriptor as a separate read-only mount, writes the exact
+to the opened bundle directory with empty-path `move_mount`, writes the exact
 compiler-sealed config, and marks the bundle read-only. The compiler policy
 also places a `nosuid,noexec` tmpfs at `/dev`, bounded to 1 MiB of data and 64
 inodes: Linux tmpfs enforces `size` and `nr_inodes` as separate limits
@@ -58,9 +57,9 @@ Runc 1.3.5 creates device mountpoint inodes and its `ptmx` link there during
 bootstrap, before applying the OCI `root.readonly` setting to `/`. This keeps
 those setup writes off the read-only rootfs; the runtime audit verifies the
 actual `/` mount is read-only before the init gate opens. Because mount targets
-must belong to the helper's new mount namespace, it reopens the bundle and
-rootfs there and compares their device/inode identities to the parent's pinned
-descriptors before proceeding. Exact runc 1.3.5
+must belong to the helper's new mount namespace, it reopens the bundle there
+and compares its device/inode identity to the parent's pinned descriptor.
+Exact runc 1.3.5
 receives `--bundle /proc/self/fd/N`; a same-UID host-path replacement therefore
 does not redirect its config handoff. The launcher fails closed if the required
 fd-based mount API is unavailable; it has no path-based mount fallback.
@@ -72,7 +71,95 @@ That exception carries the runc client PID and a separate reap result; unknown
 or negative reap evidence makes the integration harness preserve its bundle and
 state instead of treating the missing process handle as proof of absence.
 
-This is still an implementation slice, not a complete security claim. On
+Those replay/QC/CI results apply only to the named historical hashes and commit;
+they do not validate the current uncommitted candidate. The 2026-10-06 exact-
+hash review found that the old read-only rootfs mount still shared mutable host
+inodes, and that the public handle exposed mutable `Popen.returncode`. The
+current candidate replaces the rootfs mount with a bounded (256 MiB maximum)
+tmpfs content copy, rejects rootfs entries not owned by the caller or carrying
+extended attributes, makes the helper non-dumpable, returns the read-only
+snapshot FD to the parent for a tree/closure comparison, and adds a deterministic
+post-hash source-mutation attack to the Linux runtime test. It also removes
+`Popen` from the launch handle and requires a kernel `waitpid` reap before
+issuing a receipt. It also captures state/workspace device+inode identities,
+opens and revalidates those exact directories, and passes descriptors to the
+private helper. Runc's `--root`, PID-file parent, and `/workspace` bind source
+are rebound before exec; the state root and PID file use `/proc/self/fd/N`. In
+its private mount namespace, the helper creates a detached workspace mount
+with `open_tree` from the captured absolute path, verifies its root
+device/inode against the inherited workspace FD, applies `nosuid,nodev`, and
+attaches it to a namespace-private anchor with empty-path `move_mount`. A
+concurrent path replacement therefore fails closed before runc exec. The
+anchor is a 1 MiB tmpfs created over root-owned `/dev/shm`; the config points
+to that namespace-private path so runc's container-init child does not need to
+inherit the FD. A deterministic Linux test first replaces the workspace path
+at the helper's pre-`open_tree` handshake and requires an inode mismatch to
+fail closed and reap the helper; the successful launch test then renames each
+host path after binding and checks state/PID-file writes and workspace output
+stay on the pinned directories despite a same-name host `/dev/shm` marker. On
+2026-10-06, the hash-verified NAS staging replay passed both this runtime test
+and the setup-failure reap test (2 passed in 7.67 seconds) on Linux 6.18.15
+with runc 1.3.5; Ruff format and lint also passed. The replay covered
+`oci_worker.py` SHA-256 `0db5a646aeec7905b721f17cfc32aeaff54748d670c243f877cc8937270f13f3`,
+`test_oci_worker.py` SHA-256
+`aebdce1ef87bcf6f488efbae85a69a9ccb2826edd89fa1446510d5dd59a10a1e`, and
+`test_oci_worker_runtime.py` SHA-256
+`57bddbb0f76c3526973adc5419cfc71a110cf9cca519f3c3ecd83e9efab01c34`.
+The full repository workflow passed on macOS/Python 3.12.8 after this handshake
+change: 1,161 tests passed, 57 platform/runtime-gated tests skipped, Ruff format
+and lint passed, and `uv build` produced both wheel and source distribution.
+Independent exact-hash QC and the hosted GitHub Actions matrix remain pending.
+
+A subsequent exact-hash review found a P1 gap: the launch binding did not carry
+the operator's rootfs tree/closure pins from config compilation to spawn, so a
+same-UID rootfs replacement could be re-hashed as if it were pinned. The
+current revision seals both digests in the compiler and launch registries,
+passes them through the public spawn API, and compares bundle content against
+those original pins before starting the private helper. A regression mutates
+the bundle rootfs after compilation and requires rejection before helper or
+candidate startup. The reviewer also found that the journal called kernel
+`waitpid` evidence `Popen.wait`, and then found that changing old migration
+definitions would not repair already-migrated databases. Schema 20 adds
+immutable `runc_exit_evidence_source`, requires `runc_client_kernel_waitpid`
+there for new exit transitions and result candidates, and keeps the old
+`runc_exit_observed_by` value `runc_client_popen_wait` solely for the existing
+SQLite CHECK. Schema 21 adds a forward migration installing a receipt gate on
+the database transition itself. The app's SQLite UDF authorizes one exact
+connection/receipt tuple only while the journal persists a receipt already
+validated against the durable attempt, fencing token, execution, PID, and
+process identity. The generic transition helper no longer exposes `* -> exited`;
+the receipt-validating exit method performs that update inside the scoped
+authorization. Direct SQL with the expected marker strings is rejected unless
+that validated receipt scope is active. Both the generic helper and raw-SQL
+bypass have dedicated regressions, and the lifecycle test covers valid receipt
+persistence. The forward migration leaves old evidence blank rather than
+backfilling proof it cannot reconstruct; old rows cannot produce a new
+candidate. On 2026-10-06, the refreshed exact-hash NAS staging replay passed six
+tests: the v19-to-v20 and v20-to-v21 migrations, direct-SQL exit forgery
+rejection, generic-transition rejection, rootfs path-swap rejection, bounded
+setup-failure helper reap, and the live rootless-runc boundary. The host was
+Linux 6.18.15 with runc 1.3.5; pytest used an external `/tmp` basetemp. Ruff
+format and lint passed across all 87 source/test files. Replay source hashes
+were `git_supervisor.py`
+`13c1f82c420c6e115cfd51d15082aa6049f0bcf802be77b0b993d4b820ecf74d`,
+`sandbox_execution_journal.py`
+`232b07f8e4beb12a8c7fc744f7cfab50b5c8d77b0320ad953665f3bc0d33b405`,
+`store.py`
+`998b769c32df6b5d3f49e4a8795c1c7bcdee699ef23d9e00d607fc1daa5d26f4`,
+`test_sandbox_execution_journal.py`
+`21deae240ff6f825374ae50aeb6f66693b873a047708f062d085144fce65becb`,
+`oci_worker.py`
+`0002d15cc32f638cec2231e1a2e81f4a2a2af7372a4ab0588992416c267f150c`,
+`test_oci_worker.py`
+`9095ed962311d797223464e5c8598febda16f492c9ab2fa58731bc488abaf6f6`, and
+`test_oci_worker_runtime.py`
+`57bddbb0f76c3526973adc5419cfc71a110cf9cca519f3c3ecd83e9efab01c34`.
+The full local suite passed against this schema-21 candidate (1,165 passed,
+57 platform/runtime-gated skips, 388.54 seconds); local Ruff and `uv build`
+passed. Independent exact-hash re-review and exact-head hosted CI remain
+pending.
+
+This remains an implementation slice, not a complete security claim. On
 2026-10-05, two opt-in no-model tests passed on NAS Linux 6.18.15 with runc
 1.3.5: a pre-exec setup failure reaped the helper, and the public
 `spawn_pinned_runc()` path completed the same-UID bundle replacement/rename
@@ -95,12 +182,18 @@ API. The `_spawn_pinned_runc_for_unisolated_diagnostic()` and its host-path
 `_spawn_pinned_runc()` remain unsafe diagnostic paths and must not be used for
 workers.
 
-The new mount boundary protects the config handoff only. The host-backed rootfs
-source can still be changed by a same-UID process outside the read-only bind
-mount; the workspace, state root, PID file, lifecycle journal, cancellation,
-crash recovery, cleanup verification, credential/egress policy, and result
-import remain separate gates. `run_worker` remains fail-closed and is not
-connected to this low-level launch API.
+The current candidate aims to bind the exact bytes and directory objects runc
+consumes. The Linux attack test now passes, but independent exact-hash review
+is still pending. State and workspace remain host-backed directories:
+descriptor pinning prevents a launch-time pathname replacement from redirecting
+runc, but it does not create a per-attempt filesystem boundary against another
+same-UID process that can access those directories. The descriptor-bound config
+hash is over the exact rewritten bytes sent to runc, not the compiler's original
+path-based bytes. PID-file integrity beyond the pinned state directory,
+lifecycle-journal integration, cancellation, crash recovery, cleanup
+verification, credential/egress policy, and result import remain separate
+gates. `run_worker` remains fail-closed and is not connected to this low-level
+launch API.
 
 **Private Git bootstrap policy (compiler only; not integrated).** The OCI
 policy compiler now has an opt-in `private_git` mode for a rootfs that includes

@@ -55,7 +55,9 @@ _ATTEMPT_ROOT_CHILDREN = {
     "bundle",
     "host-fixtures",
     "runc-state",
+    "runc-state-pinned",
     "workspace-snapshot",
+    "workspace-pinned",
     "workspace-source",
 }
 
@@ -2151,6 +2153,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     if (workspace / ".git").exists():
         pytest.fail("host snapshot copied its top-level Git pointer into the worker workspace")
     container_id = f"acp-live-{uuid.uuid4().hex}"
+    host_workspace_anchor = Path("/dev/shm") / f"acp-{container_id}-workspace"
+    host_workspace_anchor_marker = host_workspace_anchor / "host-only-marker"
+    host_workspace_anchor_identity: tuple[int, int] | None = None
     checkout_probe_directory = repo_root / f".acp-checkout-write-probe-{uuid.uuid4().hex}"
     checkout_write = checkout_probe_directory / "canary"
     checkout_probe_identity: tuple[int, int] | None = None
@@ -2158,6 +2163,12 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     state_root = attempt_root / "runc-state"
     state_root.mkdir(mode=0o700)
     pid_file = state_root / "container.pid"
+    original_state_root = state_root
+    renamed_state_root = attempt_root / "runc-state-pinned"
+    original_workspace = workspace
+    renamed_workspace = attempt_root / "workspace-pinned"
+    recreated_state_identity: tuple[int, int] | None = None
+    recreated_workspace_identity: tuple[int, int] | None = None
     rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs)
     rootfs_digest = rootfs_manifest["rootfs_sha256"]
     rootfs_pin = oci_worker._pin_trusted_rootfs(
@@ -2237,7 +2248,19 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     controls: dict[str, str] = {}
     runtime_policy: dict[str, Any] | None = None
     config: dict[str, Any] = {}
+    runtime_path_attack_evidence: dict[str, Any] = {}
+    workspace_lookup_probe: dict[str, Any] = {}
     try:
+        if not Path("/dev/shm").is_dir():
+            pytest.fail("live workspace-anchor proof requires host /dev/shm")
+        if os.path.lexists(host_workspace_anchor):
+            pytest.fail("unique host workspace-anchor collision path already exists")
+        host_workspace_anchor.mkdir(mode=0o700)
+        host_workspace_anchor_marker.write_text("host-only replacement marker", encoding="ascii")
+        host_workspace_anchor_identity = (
+            host_workspace_anchor.stat().st_dev,
+            host_workspace_anchor.stat().st_ino,
+        )
         if os.path.lexists(checkout_probe_directory):
             pytest.fail("unique test-owned checkout write-probe path already exists")
         checkout_probe_directory.mkdir(mode=0o700)
@@ -2326,7 +2349,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         def attack_bundle_before_runc(
             helper_pid: int, private_bundle: Path, bundle_fd: int
         ) -> None:
-            nonlocal recreated_bundle_identity
+            nonlocal recreated_bundle_identity, recreated_state_identity
+            nonlocal recreated_workspace_identity, state_root, workspace, pid_file
             proc_root_config = (
                 Path(f"/proc/{helper_pid}/root")
                 / private_bundle.relative_to(Path("/"))
@@ -2335,20 +2359,78 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             try:
                 descriptor = os.open(proc_root_config, os.O_WRONLY)
             except OSError as error:
-                if error.errno != errno.EROFS:
-                    raise AssertionError(
-                        "same-UID proc-root writer did not fail with EROFS"
-                    ) from error
-                bundle_attack_evidence["proc_root_write"] = "EROFS"
+                if error.errno not in {errno.EROFS, errno.EACCES, errno.EPERM}:
+                    raise AssertionError("same-UID proc-root writer was not denied") from error
+                bundle_attack_evidence["proc_root_write"] = errno.errorcode[error.errno]
             else:
                 os.close(descriptor)
                 raise AssertionError("same-UID writer opened the private config for writing")
 
-            private_fd_config = Path(f"/proc/{helper_pid}/fd/{bundle_fd}/config.json")
-            if private_fd_config.read_bytes() != worker_config.config_json:
-                raise AssertionError("fd-anchored private config was not the sealed compiler bytes")
+            config_fd = os.open(
+                "config.json", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0), dir_fd=bundle_fd
+            )
+            with os.fdopen(config_fd, "rb") as config_stream:
+                private_config = config_stream.read()
+            private_config_obj = json.loads(private_config)
+            workspace_mount = next(
+                mount
+                for mount in private_config_obj["mounts"]
+                if mount.get("destination") == "/workspace"
+            )
+            workspace_fd_source = workspace_mount.get("source")
+            expected_workspace_source = f"/dev/shm/acp-{container_id}-workspace"
+            if workspace_fd_source != expected_workspace_source:
+                raise AssertionError("private config workspace source was not namespace-anchored")
+            expected_private_config = json.loads(worker_config.config_json)
+            expected_workspace_mount = next(
+                mount
+                for mount in expected_private_config["mounts"]
+                if mount.get("destination") == "/workspace"
+            )
+            expected_workspace_mount["source"] = workspace_fd_source
+            expected_private_config_bytes = oci_worker._canonical_oci_worker_config(
+                expected_private_config
+            )
+            if private_config != expected_private_config_bytes:
+                raise AssertionError(
+                    "fd-anchored config changed beyond its pinned workspace source"
+                )
             bundle_attack_evidence["private_config_digest"] = hashlib.sha256(
-                private_fd_config.read_bytes()
+                private_config
+            ).hexdigest()
+            runtime_path_attack_evidence["workspace_fd_source"] = workspace_fd_source
+            if host_workspace_anchor_marker.read_text(encoding="ascii") != (
+                "host-only replacement marker"
+            ):
+                raise AssertionError("host /dev/shm collision marker changed before runc exec")
+            runtime_path_attack_evidence["host_workspace_anchor_collision"] = True
+
+            snapshot_busybox_fd = os.open(
+                "rootfs/bin/busybox",
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=bundle_fd,
+            )
+            with os.fdopen(snapshot_busybox_fd, "rb") as snapshot_stream:
+                snapshot_busybox = snapshot_stream.read()
+            snapshot_busybox_sha256 = hashlib.sha256(snapshot_busybox).hexdigest()
+            source_busybox = private_bundle / "rootfs" / "bin" / "busybox"
+            original_source_busybox_sha256 = hashlib.sha256(source_busybox.read_bytes()).hexdigest()
+            expected_busybox_sha256 = next(
+                entry["content_sha256"]
+                for entry in rootfs_manifest["entries"]
+                if entry["path"] == "bin/busybox"
+            )
+            if snapshot_busybox_sha256 != expected_busybox_sha256:
+                raise AssertionError(
+                    "private rootfs snapshot differs from the reserved BusyBox bytes"
+                )
+            source_busybox.write_bytes(b"mutated after private snapshot verification\n")
+            bundle_attack_evidence["rootfs_source_mutated"] = True
+            bundle_attack_evidence["snapshot_busybox_sha256"] = snapshot_busybox_sha256
+            bundle_attack_evidence["reserved_busybox_sha256"] = expected_busybox_sha256
+            bundle_attack_evidence["source_busybox_before_sha256"] = original_source_busybox_sha256
+            bundle_attack_evidence["source_busybox_after_sha256"] = hashlib.sha256(
+                source_busybox.read_bytes()
             ).hexdigest()
 
             replacement = private_bundle / "host-replacement.json"
@@ -2362,12 +2444,42 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             bundle_attack_evidence["host_config_replaced"] = True
             bundle_attack_evidence["host_bundle_renamed_and_recreated"] = True
 
+            if renamed_state_root.exists() or renamed_workspace.exists():
+                raise AssertionError("runtime-path replacement targets already exist")
+            os.rename(original_state_root, renamed_state_root)
+            original_state_root.mkdir(mode=0o700)
+            state_marker = original_state_root / "replacement-marker"
+            state_marker.write_text("attacker-controlled state path", encoding="ascii")
+            state_replacement = original_state_root.lstat()
+            recreated_state_identity = (state_replacement.st_dev, state_replacement.st_ino)
+            os.rename(original_workspace, renamed_workspace)
+            original_workspace.mkdir(mode=0o700)
+            workspace_marker = original_workspace / "replacement-marker"
+            workspace_marker.write_text("attacker-controlled workspace path", encoding="ascii")
+            workspace_replacement = original_workspace.lstat()
+            recreated_workspace_identity = (
+                workspace_replacement.st_dev,
+                workspace_replacement.st_ino,
+            )
+            state_root = renamed_state_root
+            workspace = renamed_workspace
+            pid_file = state_root / "container.pid"
+            runtime_path_attack_evidence["state_path_replaced_after_fd_capture"] = True
+            runtime_path_attack_evidence["workspace_path_replaced_after_fd_capture"] = True
+            runtime_path_attack_evidence["replacement_state_inode"] = recreated_state_identity[1]
+            runtime_path_attack_evidence["replacement_workspace_inode"] = (
+                recreated_workspace_identity[1]
+            )
+
             setns_script = (
-                "import ctypes, os, sys; "
-                "fd=os.open(f'/proc/{sys.argv[1]}/ns/mnt', os.O_RDONLY); "
-                "libc=ctypes.CDLL(None, use_errno=True); "
+                "import ctypes, os, sys\n"
+                "try:\n"
+                "    fd=os.open(f'/proc/{sys.argv[1]}/ns/mnt', os.O_RDONLY)\n"
+                "except OSError as e:\n"
+                "    print(e.errno)\n"
+                "else: libc=ctypes.CDLL(None, use_errno=True); "
                 "rc=libc.setns(fd, 0x00020000); "
-                "os.write(1, str(0 if rc == 0 else ctypes.get_errno()).encode())"
+                "print(0 if rc == 0 else ctypes.get_errno())"
             )
             setns = subprocess.run(
                 [sys.executable, "-I", "-S", "-c", setns_script, str(helper_pid)],
@@ -2377,15 +2489,59 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                 timeout=5,
                 env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
             )
-            if setns.returncode != 0 or setns.stdout != str(errno.EPERM):
+            if setns.returncode != 0 or setns.stdout.strip() not in {
+                str(errno.EPERM),
+                str(errno.EACCES),
+            }:
                 raise AssertionError(
                     f"same-UID setns did not fail with EPERM: {setns.returncode}/{setns.stdout!r}"
                 )
-            bundle_attack_evidence["setns"] = "EPERM"
-            if private_fd_config.read_bytes() != worker_config.config_json:
+            bundle_attack_evidence["setns"] = errno.errorcode[int(setns.stdout.strip())]
+            config_fd = os.open(
+                "config.json", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0), dir_fd=bundle_fd
+            )
+            with os.fdopen(config_fd, "rb") as config_stream:
+                private_config_after_attack = config_stream.read()
+            if private_config_after_attack != private_config:
                 raise AssertionError("host bundle replacement changed the fd-anchored config")
 
         private_bundle_launcher = oci_worker._spawn_pinned_runc_with_private_bundle
+        private_bundle_launch_count = 0
+
+        def replace_workspace_before_mount_lookup(
+            helper_pid: int,
+            selected_workspace: Path,
+            pinned_workspace_device: int,
+            pinned_workspace_inode: int,
+        ) -> None:
+            if selected_workspace != original_workspace:
+                raise AssertionError("workspace lookup probe received an unexpected path")
+            original_info = original_workspace.lstat()
+            original_identity = (original_info.st_dev, original_info.st_ino)
+            if (
+                not stat.S_ISDIR(original_info.st_mode)
+                or original_identity != (pinned_workspace_device, pinned_workspace_inode)
+                or os.path.lexists(renamed_workspace)
+            ):
+                raise AssertionError("workspace lookup probe did not start from the pinned inode")
+            workspace_lookup_probe["helper_pid"] = helper_pid
+            workspace_lookup_probe["original_identity"] = original_identity
+            os.rename(original_workspace, renamed_workspace)
+            original_workspace.mkdir(mode=0o700)
+            marker = original_workspace / "replacement-marker"
+            marker.write_text("replacement before open_tree", encoding="ascii")
+            replacement_info = original_workspace.lstat()
+            workspace_lookup_probe["replacement_identity"] = (
+                replacement_info.st_dev,
+                replacement_info.st_ino,
+            )
+            runtime_path_attack_evidence["workspace_path_replaced_before_open_tree"] = True
+
+        def fail_if_workspace_replacement_reaches_exec(
+            _helper_pid: int, _bundle: Path, _private_bundle_fd: int
+        ) -> None:
+            workspace_lookup_probe["exec_hook_reached"] = True
+            raise AssertionError("workspace replacement was not rejected before runc exec")
 
         def inject_same_uid_attack(
             executable: Any,
@@ -2394,6 +2550,18 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             config_json: bytes,
             **kwargs: Any,
         ) -> Any:
+            nonlocal private_bundle_launch_count
+            private_bundle_launch_count += 1
+            if private_bundle_launch_count == 1:
+                return private_bundle_launcher(
+                    executable,
+                    argv,
+                    selected_bundle,
+                    config_json,
+                    _before_workspace_open=replace_workspace_before_mount_lookup,
+                    _before_runc_exec=fail_if_workspace_replacement_reaches_exec,
+                    **kwargs,
+                )
             return private_bundle_launcher(
                 executable,
                 argv,
@@ -2406,6 +2574,61 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         monkeypatch.setattr(
             oci_worker, "_spawn_pinned_runc_with_private_bundle", inject_same_uid_attack
         )
+        try:
+            oci_worker.spawn_pinned_runc(
+                worker_config,
+                state_root,
+                bundle_root,
+                workspace,
+                pid_file,
+                container_id,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except oci_worker.SupervisorError as error:
+            workspace_lookup_probe["launch_error"] = str(error)
+            if error.code != "sandbox_bundle_setup_failed":
+                raise AssertionError(
+                    "workspace lookup replacement did not fail before runc submission"
+                ) from error
+        else:
+            raise AssertionError("workspace lookup replacement unexpectedly launched runc")
+        if workspace_lookup_probe.get("exec_hook_reached"):
+            raise AssertionError("workspace pathname replacement reached the runc exec hook")
+        if not runtime_path_attack_evidence.get("workspace_path_replaced_before_open_tree"):
+            raise AssertionError(
+                "workspace lookup replacement hook did not run: "
+                f"{workspace_lookup_probe.get('launch_error', 'launch returned without error')}"
+            )
+        try:
+            os.waitpid(workspace_lookup_probe["helper_pid"], os.WNOHANG)
+        except ChildProcessError:
+            workspace_lookup_probe["helper_reaped"] = True
+        else:
+            raise AssertionError("workspace lookup helper was not reaped after fail-closed setup")
+        replacement_info = original_workspace.lstat()
+        replacement_identity = workspace_lookup_probe.get("replacement_identity")
+        replacement_marker = original_workspace / "replacement-marker"
+        if (
+            not stat.S_ISDIR(replacement_info.st_mode)
+            or (replacement_info.st_dev, replacement_info.st_ino) != replacement_identity
+            or replacement_info.st_uid != os.geteuid()
+            or stat.S_IMODE(replacement_info.st_mode) != 0o700
+            or [entry.name for entry in original_workspace.iterdir()] != ["replacement-marker"]
+            or not stat.S_ISREG(replacement_marker.lstat().st_mode)
+            or replacement_marker.read_text(encoding="ascii") != "replacement before open_tree"
+        ):
+            raise AssertionError("workspace lookup replacement identity changed before restore")
+        replacement_marker.unlink()
+        original_workspace.rmdir()
+        renamed_info = renamed_workspace.lstat()
+        if not stat.S_ISDIR(renamed_info.st_mode) or (
+            renamed_info.st_dev,
+            renamed_info.st_ino,
+        ) != workspace_lookup_probe.get("original_identity"):
+            raise AssertionError("pinned workspace inode changed during lookup race probe")
+        os.rename(renamed_workspace, original_workspace)
+        runtime_path_attack_evidence["workspace_path_replacement_failed_closed"] = True
         try:
             run_handle = oci_worker.spawn_pinned_runc(
                 worker_config,
@@ -2426,7 +2649,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                 if launch_client_reaped is not True:
                     attempt_cleanup["preserve"] = True
             raise
-        process = run_handle.process
+        process = oci_worker._runc_launch_process_for_testing(run_handle)
+        assert process is not None
         launch_submitted = True
         if not _check_runc_client_after_submission(attempt_cleanup, process):
             pytest.fail("pinned runc launcher exited before reaching its fd-3 gate")
@@ -2577,6 +2801,31 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         assert (workspace / "absolute-host-tmp").is_symlink()
         assert (workspace / "relative-host-tmp").is_symlink()
         assert not checkout_write.exists()
+        assert bundle_attack_evidence["rootfs_source_mutated"] is True
+        assert (
+            bundle_attack_evidence["snapshot_busybox_sha256"]
+            == bundle_attack_evidence["reserved_busybox_sha256"]
+            == bundle_attack_evidence["source_busybox_before_sha256"]
+        )
+        assert (
+            bundle_attack_evidence["source_busybox_after_sha256"]
+            != bundle_attack_evidence["snapshot_busybox_sha256"]
+        )
+        assert runtime_path_attack_evidence["state_path_replaced_after_fd_capture"] is True
+        assert runtime_path_attack_evidence["workspace_path_replaced_after_fd_capture"] is True
+        assert (state_root / container_id).is_dir()
+        assert pid_file.is_file()
+        assert sorted(path.name for path in original_state_root.iterdir()) == ["replacement-marker"]
+        assert (original_state_root / "replacement-marker").read_text(encoding="ascii") == (
+            "attacker-controlled state path"
+        )
+        assert sorted(path.name for path in original_workspace.iterdir()) == ["replacement-marker"]
+        assert (original_workspace / "replacement-marker").read_text(encoding="ascii") == (
+            "attacker-controlled workspace path"
+        )
+        assert host_workspace_anchor_marker.read_text(encoding="ascii") == (
+            "host-only replacement marker"
+        )
 
         ready, _, _ = select.select([listener], [], [], 0)
         if ready:
@@ -2590,6 +2839,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     "proof": "bounded public spawn_pinned_runc launch using compiler-bound OCI config",
                     "worker_executor_integrated": False,
                     "same_uid_bundle_attack": bundle_attack_evidence,
+                    "same_uid_runtime_path_attack": runtime_path_attack_evidence,
                     "kernel": Path("/proc/sys/kernel/osrelease").read_text().strip(),
                     "runc_version": observed_version,
                     "rootfs_propagation": rootfs_propagation,
@@ -2892,6 +3142,45 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         if client_still_running is True:
             cleanup_errors.append("runc client process remained after cleanup")
 
+        def remove_exact_host_workspace_anchor() -> None:
+            if host_workspace_anchor_identity is None:
+                return
+            info = host_workspace_anchor.lstat()
+            entries = list(host_workspace_anchor.iterdir())
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or (info.st_dev, info.st_ino) != host_workspace_anchor_identity
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+                or [entry.name for entry in entries] != ["host-only-marker"]
+                or not stat.S_ISREG(host_workspace_anchor_marker.lstat().st_mode)
+                or host_workspace_anchor_marker.read_text(encoding="ascii")
+                != "host-only replacement marker"
+            ):
+                raise AssertionError("host workspace-anchor collision probe changed")
+            host_workspace_anchor_marker.unlink()
+            host_workspace_anchor.rmdir()
+
+        _run_cleanup_action_if_client_state_known(
+            cleanup_client_state_known,
+            lambda: _attempt_cleanup(
+                cleanup_errors,
+                "could not remove exact host workspace-anchor collision probe",
+                remove_exact_host_workspace_anchor,
+            ),
+        )
+        if (
+            host_workspace_anchor_identity is not None
+            and cleanup_client_state_known
+            and _cleanup_path_exists(
+                cleanup_errors,
+                "could not verify host workspace-anchor collision probe removal",
+                host_workspace_anchor,
+            )
+            is True
+        ):
+            cleanup_errors.append("host workspace-anchor collision probe remained")
+
         if (
             delete_result is not None
             and delete_result[0] != 0
@@ -2951,6 +3240,46 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
 
         # A failed teardown retains the private evidence tree for diagnosis.
         if not cleanup_errors:
+
+            def remove_exact_runtime_path_replacement(
+                path: Path, identity: tuple[int, int] | None, expected_contents: str
+            ) -> None:
+                if identity is None:
+                    raise AssertionError("runtime-path replacement identity was not captured")
+                info = path.lstat()
+                entries = list(path.iterdir())
+                marker = path / "replacement-marker"
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or (info.st_dev, info.st_ino) != identity
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700
+                    or [entry.name for entry in entries] != ["replacement-marker"]
+                    or not stat.S_ISREG(marker.lstat().st_mode)
+                    or marker.read_text(encoding="ascii") != expected_contents
+                ):
+                    raise AssertionError("runtime-path replacement changed after the attack proof")
+                marker.unlink()
+                path.rmdir()
+
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not remove the exact state-path replacement probe",
+                lambda: remove_exact_runtime_path_replacement(
+                    original_state_root,
+                    recreated_state_identity,
+                    "attacker-controlled state path",
+                ),
+            )
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not remove the exact workspace-path replacement probe",
+                lambda: remove_exact_runtime_path_replacement(
+                    original_workspace,
+                    recreated_workspace_identity,
+                    "attacker-controlled workspace path",
+                ),
+            )
             attempt_cleanup["runtime_verified"] = True
             _attempt_cleanup(
                 cleanup_errors,

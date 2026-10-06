@@ -179,6 +179,22 @@ def test_rootfs_manifest_lists_paths_metadata_and_hashes_not_file_contents(tmp_p
     assert secret_like_content not in encoded
 
 
+def test_rootfs_manifest_from_descriptor_matches_path_manifest(tmp_path: Path) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "bin").mkdir()
+    (rootfs / "bin" / "tool").write_bytes(b"descriptor-anchored snapshot")
+    (rootfs / "current").symlink_to("bin/tool")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(rootfs, flags)
+    try:
+        expected = oci_worker.rootfs_tree_manifest(rootfs)
+        assert oci_worker.rootfs_tree_manifest_fd(root_fd) == expected
+        assert oci_worker.rootfs_tree_manifest_fd(root_fd) == expected
+    finally:
+        os.close(root_fd)
+
+
 def test_rootfs_manifest_is_stable_across_entry_creation_order(tmp_path: Path) -> None:
     first = tmp_path / "first-rootfs"
     second = tmp_path / "second-rootfs"
@@ -644,6 +660,9 @@ def test_pinned_runc_adapter_uses_recursive_private_for_exact_probed_release(
     assert adapted.executable is pin
     assert adapted.version == "1.3.5"
     assert adapted_config["linux"]["rootfsPropagation"] == "rprivate"
+    configured_rootfs = oci_worker.rootfs_tree_manifest(bundle / "rootfs")
+    assert adapted.rootfs_sha256 == configured_rootfs["rootfs_sha256"]
+    assert adapted.rootfs_closure_sha256 == configured_rootfs["closure_sha256"]
     assert config["linux"]["rootfsPropagation"] == "private"
     assert len(calls) == 1
     assert calls[0][0] == [str(pin.path), "--version"]
@@ -774,6 +793,8 @@ def test_private_bundle_launcher_reaps_client_on_setup_failure(
             argv,
             bundle,
             binding.config_json,
+            rootfs_sha256=binding.rootfs_sha256,
+            rootfs_closure_sha256=binding.rootfs_closure_sha256,
             _before_runc_exec=fail_before_runc_exec,
         )
 
@@ -799,16 +820,16 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
-    spawned: list[tuple[object, tuple[str, ...], Path, bytes]] = []
+    spawned: list[tuple[object, tuple[str, ...], Path, bytes, dict[str, Any]]] = []
 
     def private_spawn(
         executable: object,
         argv: list[str],
         bundle_root: Path,
         config_json: bytes,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> object:
-        spawned.append((executable, tuple(argv), bundle_root, config_json))
+        spawned.append((executable, tuple(argv), bundle_root, config_json, kwargs))
         return object()
 
     monkeypatch.setattr(oci_worker, "_spawn_pinned_runc_with_private_bundle", private_spawn)
@@ -825,11 +846,169 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
     assert result is not None
     assert not (bundle / "config.json").exists()
     assert len(spawned) == 1
-    executable, argv, launched_bundle, config_json = spawned[0]
+    executable, argv, launched_bundle, config_json, launch_options = spawned[0]
     assert executable is pin
     assert argv[argv.index("--bundle") + 1] == str(bundle.resolve())
     assert launched_bundle == bundle.resolve()
     assert config_json == binding.config_json
+    assert launch_options["rootfs_sha256"] == binding.rootfs_sha256
+    assert launch_options["rootfs_closure_sha256"] == binding.rootfs_closure_sha256
+
+
+def test_pinned_spawn_rejects_rootfs_changed_after_config_compilation_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin = pinned_runc(tmp_path)
+    bundle, workspace = oci_fixture(tmp_path)
+    monkeypatch.setattr(oci_worker, "_supports_runc_fd_exec", lambda: True)
+    monkeypatch.setattr(
+        oci_worker,
+        "_run_bounded_command",
+        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+    )
+    config = compile_config(bundle, workspace)
+    binding = oci_worker._apply_pinned_runc_recursive_private_policy(
+        config, pin, expected_version="1.3.5"
+    )
+    configured_rootfs = oci_worker.rootfs_tree_manifest(bundle / "rootfs")
+    assert binding.rootfs_sha256 == configured_rootfs["rootfs_sha256"]
+    assert binding.rootfs_closure_sha256 == configured_rootfs["closure_sha256"]
+    (bundle / "rootfs" / "usr" / "bin" / "busybox").write_text(
+        "changed after config compilation\n", encoding="ascii"
+    )
+
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    candidate_launches: list[tuple[Any, ...]] = []
+
+    def reject_candidate_launch(*args: Any, **kwargs: Any) -> Any:
+        candidate_launches.append((*args, kwargs))
+        raise AssertionError("candidate launcher must not start for substituted rootfs content")
+
+    monkeypatch.setattr(oci_worker.subprocess, "Popen", reject_candidate_launch)
+    monkeypatch.setattr(
+        oci_worker.os,
+        "pipe2",
+        lambda *_args, **_kwargs: pytest.fail(
+            "launcher setup must not start for substituted rootfs"
+        ),
+        raising=False,
+    )
+    with pytest.raises(SupervisorError, match="compiler-sealed operator pins") as error:
+        oci_worker.spawn_pinned_runc(
+            binding,
+            state_root,
+            bundle,
+            workspace.root,
+            state_root / "worker.pid",
+            "acp-worker-123",
+        )
+
+    assert error.value.code == "invalid_oci_rootfs"
+    assert candidate_launches == []
+
+
+def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pin = pinned_runc(tmp_path)
+    bundle, workspace = oci_fixture(tmp_path)
+    monkeypatch.setattr(oci_worker, "_supports_runc_fd_exec", lambda: True)
+    monkeypatch.setattr(
+        oci_worker,
+        "_run_bounded_command",
+        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+    )
+    binding = oci_worker._apply_pinned_runc_recursive_private_policy(
+        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+    )
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    command = tuple(
+        build_runc_run_argv(
+            pin,
+            state_root,
+            bundle,
+            workspace.root,
+            state_root / "worker.pid",
+            "acp-worker-123",
+        )
+    )
+    bundle_info = os.stat(bundle, follow_symlinks=False)
+    rootfs_fd = os.open(
+        bundle / "rootfs",
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        target = oci_worker._private_bundle_runc_launch_target(
+            pin,
+            command,
+            bundle.resolve(),
+            bundle_info,
+            os.fstat(rootfs_fd),
+            rootfs_fd,
+            binding.config_json,
+            binding.rootfs_sha256,
+            binding.rootfs_closure_sha256,
+        )
+    finally:
+        os.close(rootfs_fd)
+
+    bound, config_json = oci_worker._bind_private_runc_launch_fds(
+        target,
+        binding.config_json,
+        bundle_fd_path="/proc/self/fd/64",
+        state_fd=66,
+        workspace_fd=67,
+    )
+    config = json.loads(config_json)
+    workspace_mount = next(
+        mount for mount in config["mounts"] if mount["destination"] == "/workspace"
+    )
+
+    assert bound.argv[2] == "/proc/self/fd/66"
+    assert bound.argv[6] == "/proc/self/fd/64"
+    assert bound.argv[8] == "/proc/self/fd/66/worker.pid"
+    assert workspace_mount["source"] == "/dev/shm/acp-acp-worker-123-workspace"
+    assert target.state_path == str(state_root)
+    assert target.workspace_path == str(workspace.root)
+    assert bound.config_sha256 == hashlib.sha256(config_json).hexdigest()
+    assert config_json != binding.config_json
+
+
+def test_open_pinned_runtime_directory_survives_path_replacement(tmp_path: Path) -> None:
+    original = tmp_path / "runtime-root"
+    renamed = tmp_path / "runtime-root-pinned"
+    original.mkdir(mode=0o700)
+    captured = original.stat()
+    descriptor = oci_worker._open_pinned_runtime_directory(
+        original,
+        device=captured.st_dev,
+        inode=captured.st_ino,
+        label="test runtime root",
+    )
+    try:
+        os.rename(original, renamed)
+        original.mkdir(mode=0o700)
+        assert (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) == (
+            captured.st_dev,
+            captured.st_ino,
+        )
+        with pytest.raises(oci_worker.SupervisorError, match="changed before fd binding"):
+            oci_worker._open_pinned_runtime_directory(
+                original,
+                device=captured.st_dev,
+                inode=captured.st_ino,
+                label="test runtime root",
+            )
+        receipt_fd = os.open(
+            "receipt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=descriptor
+        )
+        os.close(receipt_fd)
+        assert (renamed / "receipt").is_file()
+        assert not (original / "receipt").exists()
+    finally:
+        os.close(descriptor)
 
 
 def test_same_uid_can_replace_diagnostic_bundle_config_after_validation(
@@ -2351,17 +2530,19 @@ def test_pinned_runc_launcher_maps_only_the_release_gate_to_fd3(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    process = oci_worker._runc_launch_process_for_testing(handle)
+    assert process is not None
     try:
-        assert handle.process.poll() is None
+        assert process.poll() is None
         handle.release_gate()
-        stdout, stderr = handle.process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=5)
     finally:
         handle.close_gate()
-        if handle.process.poll() is None:
-            handle.process.kill()
-            handle.process.wait(timeout=2)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
 
-    assert handle.process.returncode == 0, stderr.decode("utf-8", errors="replace")
+    assert process.returncode == 0, stderr.decode("utf-8", errors="replace")
     assert stdout == b"go\n"
     assert stderr == b""
 
@@ -2377,16 +2558,18 @@ def test_pinned_runc_launcher_eof_denies_command_exec(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    process = oci_worker._runc_launch_process_for_testing(handle)
+    assert process is not None
     try:
         handle.close_gate()
-        stdout, stderr = handle.process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=5)
     finally:
         handle.close_gate()
-        if handle.process.poll() is None:
-            handle.process.kill()
-            handle.process.wait(timeout=2)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
 
-    assert handle.process.returncode == 125, stderr.decode("utf-8", errors="replace")
+    assert process.returncode == 125, stderr.decode("utf-8", errors="replace")
     assert b"SHOULD_NOT_RUN" not in stdout
 
 
@@ -2455,7 +2638,7 @@ def test_runc_launch_gate_release_is_atomic_with_concurrent_close(
 ) -> None:
     gate_read, gate_write = os.pipe()
     process = subprocess.Popen([sys.executable, "-I", "-S", "-c", "pass"])
-    handle = oci_worker.RuncLaunchHandle(process=process, _gate_writer=gate_write)
+    handle = oci_worker.RuncLaunchHandle(_gate_writer=gate_write)
     original_write = os.write
     write_entered = threading.Event()
     allow_write = threading.Event()
@@ -2513,10 +2696,90 @@ def test_runc_launch_gate_release_is_atomic_with_concurrent_close(
     assert gate_payload == b"go\n"
 
 
+def test_runc_wait_receipt_requires_kernel_reap_not_mutable_popen_returncode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    identity = f"linux:{process.pid}:123456"
+    monkeypatch.setattr(
+        oci_worker,
+        "_runc_client_process_identity",
+        lambda pid: identity if pid == process.pid else None,
+    )
+    handle = oci_worker.RuncLaunchHandle(_gate_writer=None)
+    target = oci_worker._RuncLaunchTarget(
+        launch_mode="private_bundle",
+        argv=("/usr/bin/runc",),
+        runc_executable_path="/usr/bin/runc",
+        runc_executable_sha256="a" * 64,
+    )
+    oci_worker._register_runc_launch_handle(
+        handle,
+        process=process,
+        process_identity=identity,
+        target=target,
+    )
+    oci_worker._runc_launch_handle_bind_execution(handle, "attempt-test", 1, "execution-test")
+
+    assert not hasattr(handle, "process")
+    with pytest.raises(AttributeError):
+        handle.process = process  # type: ignore[attr-defined]
+
+    # Even internal mutation of Popen's convenience cache cannot authorize a
+    # receipt while the kernel still reports the child as running.
+    process.returncode = 0
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            handle.wait(timeout=0)
+        os.kill(process.pid, 9)
+        receipt = handle.wait(timeout=2)
+    finally:
+        if oci_worker._runc_launch_record(handle) is None or process.returncode is None:
+            try:
+                os.kill(process.pid, 9)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except ChildProcessError:
+                pass
+
+    assert receipt.returncode == -9
+    assert process.returncode == -9
+    assert oci_worker._runc_client_wait_receipt_is_self_consistent(receipt)
+
+
+def test_pinned_runc_identity_parser_uses_process_start_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = 4242
+    fields = ["S", *(["0"] * 18), "987654"]
+    process_stat = f"{pid} (runc (private launcher)) {' '.join(fields)}\n"
+
+    class FakePath:
+        def __init__(self, value: str) -> None:
+            assert value == f"/proc/{pid}/stat"
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "ascii"
+            return process_stat
+
+    monkeypatch.setattr(oci_worker.sys, "platform", "linux")
+    monkeypatch.setattr(oci_worker, "Path", FakePath)
+
+    assert oci_worker._runc_client_process_identity(pid) == "linux:4242:987654"
+    assert oci_worker._runc_client_process_identity(0) is None
+
+
 def test_runc_launch_gate_close_wins_before_release() -> None:
     gate_read, gate_write = os.pipe()
     process = subprocess.Popen([sys.executable, "-I", "-S", "-c", "pass"])
-    handle = oci_worker.RuncLaunchHandle(process=process, _gate_writer=gate_write)
+    handle = oci_worker.RuncLaunchHandle(_gate_writer=gate_write)
     try:
         handle.close_gate()
         with pytest.raises(SupervisorError) as error:

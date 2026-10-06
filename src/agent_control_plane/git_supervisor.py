@@ -194,7 +194,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 21
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1156,6 +1156,214 @@ def _add_sandbox_execution_private_path_binding(connection: sqlite3.Connection) 
     )
 
 
+def _add_sandbox_kernel_wait_evidence(connection: sqlite3.Connection) -> None:
+    """Separate exact kernel wait evidence from the legacy schema marker.
+
+    Prior schema versions constrain ``runc_exit_observed_by`` to the historical
+    ``runc_client_popen_wait`` value. SQLite cannot update that CHECK in place,
+    so retain that field as a compatibility marker and store the exact
+    waitpid-derived source in a new, immutable column. Existing rows are not
+    backfilled: their original evidence cannot be upgraded retroactively.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before kernel-wait evidence migration"
+        )
+    if "runc_exit_evidence_source" not in columns:
+        connection.execute(
+            "ALTER TABLE sandbox_executions ADD COLUMN runc_exit_evidence_source "
+            "TEXT NOT NULL DEFAULT '' CHECK (runc_exit_evidence_source IN "
+            "('', 'runc_client_kernel_waitpid'))"
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_insert_reserved")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_insert_reserved
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.phase != 'reserved'
+          OR NEW.monitor_pid IS NOT NULL OR NEW.monitor_identity != ''
+          OR NEW.runc_client_pid IS NOT NULL OR NEW.runc_client_identity != ''
+          OR NEW.init_pid IS NOT NULL OR NEW.init_identity != ''
+          OR NEW.wrapper_unit != '' OR NEW.wrapper_invocation_id != ''
+          OR NEW.scope_unit != '' OR NEW.scope_invocation_id != '' OR NEW.cgroup_path != ''
+          OR NEW.stop_reason != '' OR NEW.runc_exit_code IS NOT NULL
+          OR NEW.runc_exit_observed_by != '' OR NEW.runc_exit_evidence_source != ''
+          OR NEW.cleanup_receipt_json != '{}' OR NEW.failure_reason != ''
+          OR length(NEW.bundle_digest) != 64 OR NEW.bundle_digest GLOB '*[^0-9a-f]*'
+          OR length(NEW.rootfs_digest) != 64 OR NEW.rootfs_digest GLOB '*[^0-9a-f]*'
+          OR length(NEW.rootfs_closure_digest) != 64
+          OR NEW.rootfs_closure_digest GLOB '*[^0-9a-f]*'
+          OR length(NEW.runc_executable_digest) != 64
+          OR NEW.runc_executable_digest GLOB '*[^0-9a-f]*'
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_must_start_reserved');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_evidence_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_evidence_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN (OLD.monitor_pid IS NOT NULL AND NEW.monitor_pid IS NOT OLD.monitor_pid)
+          OR (OLD.monitor_identity != '' AND NEW.monitor_identity IS NOT OLD.monitor_identity)
+          OR (OLD.runc_client_pid IS NOT NULL AND NEW.runc_client_pid IS NOT OLD.runc_client_pid)
+          OR (OLD.runc_client_identity != '' AND NEW.runc_client_identity IS NOT OLD.runc_client_identity)
+          OR (OLD.init_pid IS NOT NULL AND NEW.init_pid IS NOT OLD.init_pid)
+          OR (OLD.init_identity != '' AND NEW.init_identity IS NOT OLD.init_identity)
+          OR (OLD.wrapper_unit != '' AND NEW.wrapper_unit IS NOT OLD.wrapper_unit)
+          OR (OLD.wrapper_invocation_id != '' AND NEW.wrapper_invocation_id IS NOT OLD.wrapper_invocation_id)
+          OR (OLD.scope_unit != '' AND NEW.scope_unit IS NOT OLD.scope_unit)
+          OR (OLD.scope_invocation_id != '' AND NEW.scope_invocation_id IS NOT OLD.scope_invocation_id)
+          OR (OLD.cgroup_path != '' AND NEW.cgroup_path IS NOT OLD.cgroup_path)
+          OR (OLD.stop_reason != '' AND NEW.stop_reason IS NOT OLD.stop_reason)
+          OR (OLD.runc_exit_code IS NOT NULL AND NEW.runc_exit_code IS NOT OLD.runc_exit_code)
+          OR (OLD.runc_exit_observed_by != '' AND NEW.runc_exit_observed_by IS NOT OLD.runc_exit_observed_by)
+          OR (OLD.runc_exit_evidence_source != '' AND NEW.runc_exit_evidence_source IS NOT OLD.runc_exit_evidence_source)
+          OR (OLD.cleanup_receipt_json != '{}' AND NEW.cleanup_receipt_json IS NOT OLD.cleanup_receipt_json)
+          OR (OLD.failure_reason != '' AND NEW.failure_reason IS NOT OLD.failure_reason)
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_evidence_immutable');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_evidence_phase_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_evidence_phase_guard
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.phase = NEW.phase AND (
+          OLD.monitor_pid IS NOT NEW.monitor_pid
+          OR OLD.monitor_identity IS NOT NEW.monitor_identity
+          OR OLD.runc_client_pid IS NOT NEW.runc_client_pid
+          OR OLD.runc_client_identity IS NOT NEW.runc_client_identity
+          OR OLD.init_pid IS NOT NEW.init_pid
+          OR OLD.init_identity IS NOT NEW.init_identity
+          OR OLD.wrapper_unit IS NOT NEW.wrapper_unit
+          OR OLD.wrapper_invocation_id IS NOT NEW.wrapper_invocation_id
+          OR OLD.scope_unit IS NOT NEW.scope_unit
+          OR OLD.scope_invocation_id IS NOT NEW.scope_invocation_id
+          OR OLD.cgroup_path IS NOT NEW.cgroup_path
+          OR OLD.stop_reason IS NOT NEW.stop_reason
+          OR OLD.runc_exit_code IS NOT NEW.runc_exit_code
+          OR OLD.runc_exit_observed_by IS NOT NEW.runc_exit_observed_by
+          OR OLD.runc_exit_evidence_source IS NOT NEW.runc_exit_evidence_source
+          OR OLD.cleanup_receipt_json IS NOT NEW.cleanup_receipt_json
+          OR OLD.failure_reason IS NOT NEW.failure_reason
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_evidence_requires_phase_transition');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_requires_kernel_waitpid")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_exit_requires_kernel_waitpid
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase IN ('launched', 'running', 'stopping')
+          AND NEW.phase = 'exited'
+          AND (
+            NEW.runc_exit_observed_by != 'runc_client_popen_wait'
+            OR NEW.runc_exit_evidence_source != 'runc_client_kernel_waitpid'
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_kernel_wait_evidence_required');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_evidence_write_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_exit_evidence_write_guard
+        BEFORE UPDATE OF runc_exit_code, runc_exit_observed_by,
+          runc_exit_evidence_source ON sandbox_executions
+        WHEN (
+          OLD.runc_exit_code IS NOT NEW.runc_exit_code
+          OR OLD.runc_exit_observed_by IS NOT NEW.runc_exit_observed_by
+          OR OLD.runc_exit_evidence_source IS NOT NEW.runc_exit_evidence_source
+        ) AND NOT (
+          OLD.phase IN ('launched', 'running', 'stopping')
+          AND NEW.phase = 'exited'
+          AND OLD.runc_exit_code IS NULL
+          AND OLD.runc_exit_observed_by = ''
+          AND OLD.runc_exit_evidence_source = ''
+          AND NEW.runc_exit_code IS NOT NULL
+          AND NEW.runc_exit_observed_by = 'runc_client_popen_wait'
+          AND NEW.runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_exit_evidence_write_requires_exit');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_result_candidate_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_result_candidate_write_once
+        BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+          result_candidate_digest ON sandbox_executions
+        WHEN (
+          OLD.result_candidate_version = 0 AND NOT (
+            NEW.result_candidate_version = 1
+            AND NEW.result_candidate_json != ''
+            AND length(NEW.result_candidate_json) <= 65536
+            AND length(NEW.result_candidate_digest) = 64
+            AND OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_reported'
+            AND NEW.runc_exit_code = 0
+            AND NEW.runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+            AND NEW.workspace_binding_version = 1
+            AND NEW.baseline_manifest_digest != ''
+            AND NEW.workspace_root_path != ''
+            AND NEW.workspace_root_dev IS NOT NULL
+            AND NEW.workspace_root_ino IS NOT NULL
+            AND NEW.cleanup_receipt_json != '{}'
+            AND instr(NEW.result_candidate_json, '"authorization":"none"') > 0
+            AND instr(NEW.result_candidate_json, '"status":"unverified"') > 0
+          )
+        ) OR (
+          OLD.result_candidate_version != 0 AND (
+            NEW.result_candidate_version IS NOT OLD.result_candidate_version
+            OR NEW.result_candidate_json IS NOT OLD.result_candidate_json
+            OR NEW.result_candidate_digest IS NOT OLD.result_candidate_digest
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_result_candidate_immutable');
+        END
+        """
+    )
+
+
+def _add_sandbox_exit_receipt_guard(connection: sqlite3.Connection) -> None:
+    """Require the receipt-validating application path for new exit transitions."""
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_receipt_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_exit_receipt_guard
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase IN ('launched', 'running', 'stopping')
+          AND NEW.phase = 'exited'
+          AND acp_sandbox_exit_receipt_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            OLD.runc_client_pid, OLD.runc_client_identity, NEW.runc_exit_code
+          ) != 1
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_wait_receipt_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1175,6 +1383,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     (17, _add_sandbox_runtime_content_pins),
     (18, _add_sandbox_execution_private_path_binding),
     (19, _add_result_import_source_discriminator),
+    (20, _add_sandbox_kernel_wait_evidence),
+    (21, _add_sandbox_exit_receipt_guard),
 )
 
 

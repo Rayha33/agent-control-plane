@@ -1,8 +1,9 @@
 """Durable, fail-closed identity journal for a future OCI worker executor.
 
-This module records lifecycle claims; it does not launch runc, attest kernel
-state, or establish a sandbox. In particular, a cleanup report is not accepted
-as cleanup verification. The existing reaper and runtime teardown stay fenced
+Launch and exit records are bound to the pinned-runc process handle and its
+wait receipt, but this module does not orchestrate a worker lifecycle, attest
+kernel state, or establish a sandbox. A cleanup report is not accepted as
+cleanup verification. The existing reaper and runtime teardown stay fenced
 until a separate trusted verifier advances the journal to ``cleanup_verified``.
 """
 
@@ -19,6 +20,16 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .common import CLEANUP_FENCE_EPOCH, SupervisorError, canonical_json, utc_now
+from .oci_worker import (
+    RuncLaunchHandle,
+    _runc_client_wait_receipt_is_self_consistent,
+    _runc_launch_handle_bind_execution,
+    _runc_launch_handle_is_self_consistent,
+    _runc_launch_pid,
+    _runc_launch_process_identity,
+    _runc_launch_target,
+    _RuncClientWaitReceipt,
+)
 from .sandbox_attestation import (
     RunningRuntimeAttestation,
     running_attestation_is_self_consistent,
@@ -31,6 +42,7 @@ from .sandbox_workspace import (
 from .sandbox_workspace import Snapshot as _Snapshot
 from .sandbox_workspace import _snapshot_origin as _snapshot_origin
 from .sandbox_workspace import collect_changes as _collect_changes
+from .store import _authorize_sandbox_exit_receipt_write
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
@@ -66,9 +78,6 @@ _TRANSITION_FIELDS = {
     ("launched", "running"): frozenset({"init_pid", "init_identity"}),
     ("launched", "stopping"): frozenset({"stop_reason"}),
     ("running", "stopping"): frozenset({"stop_reason"}),
-    ("launched", "exited"): frozenset({"runc_exit_code", "runc_exit_observed_by"}),
-    ("running", "exited"): frozenset({"runc_exit_code", "runc_exit_observed_by"}),
-    ("stopping", "exited"): frozenset({"runc_exit_code", "runc_exit_observed_by"}),
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
 }
 _CLEANUP_OBSERVATIONS = {
@@ -785,7 +794,7 @@ class SandboxExecutionJournalMixin:
                 or execution["execution_id"] != binding["execution_id"]
                 or execution["phase"] not in {"cleanup_reported", "cleanup_verified"}
                 or execution["runc_exit_code"] != 0
-                or execution["runc_exit_observed_by"] != "runc_client_popen_wait"
+                or execution["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or execution["baseline_root_path"] != str(baseline_root)
                 or execution["baseline_root_dev"] != baseline_device
                 or execution["baseline_root_ino"] != baseline_inode
@@ -833,7 +842,7 @@ class SandboxExecutionJournalMixin:
             if (
                 row["phase"] not in {"cleanup_reported", "cleanup_verified"}
                 or row["runc_exit_code"] != 0
-                or row["runc_exit_observed_by"] != "runc_client_popen_wait"
+                or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or row["workspace_binding_version"] != 1
                 or row["baseline_root_path"] != str(baseline_root)
                 or row["baseline_root_dev"] != baseline_device
@@ -904,7 +913,7 @@ class SandboxExecutionJournalMixin:
                 },
                 "exit": {
                     "code": row["runc_exit_code"],
-                    "observed_by": row["runc_exit_observed_by"],
+                    "observed_by": row["runc_exit_evidence_source"],
                     "runc_client_pid": row["runc_client_pid"],
                     "runc_client_identity": row["runc_client_identity"],
                 },
@@ -1105,7 +1114,7 @@ class SandboxExecutionJournalMixin:
         }
         expected_exit = {
             "code": row["runc_exit_code"],
-            "observed_by": row["runc_exit_observed_by"],
+            "observed_by": row["runc_exit_evidence_source"],
             "runc_client_pid": row["runc_client_pid"],
             "runc_client_identity": row["runc_client_identity"],
         }
@@ -1259,8 +1268,7 @@ class SandboxExecutionJournalMixin:
         *,
         monitor_pid: int,
         monitor_identity: str,
-        runc_client_pid: int,
-        runc_client_identity: str,
+        runc_handle: RuncLaunchHandle,
         wrapper_unit: str,
         wrapper_invocation_id: str,
         scope_unit: str,
@@ -1268,11 +1276,24 @@ class SandboxExecutionJournalMixin:
         cgroup_path: str,
         credential: str | None = None,
     ) -> dict[str, Any]:
+        self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
         monitor_pid = self._sandbox_pid(monitor_pid, "monitor_pid")
-        runc_client_pid = self._sandbox_pid(runc_client_pid, "runc_client_pid")
+        launch_target = _runc_launch_target(runc_handle)
+        if not _runc_launch_handle_is_self_consistent(runc_handle) or launch_target is None:
+            raise SupervisorError(
+                "sandbox_execution_launch_handle_required",
+                "sandbox launch requires registered provenance from a pinned-runc launcher",
+            )
+        if launch_target.launch_mode != "private_bundle":
+            raise SupervisorError(
+                "sandbox_execution_launch_target_mismatch",
+                "diagnostic runc launches cannot be recorded as supervised attempts",
+            )
+        runc_client_pid = self._sandbox_pid(_runc_launch_pid(runc_handle), "runc_client_pid")
         monitor_identity = self._sandbox_process_identity(monitor_identity, "monitor_identity")
         runc_client_identity = self._sandbox_process_identity(
-            runc_client_identity, "runc_client_identity"
+            _runc_launch_process_identity(runc_handle), "runc_client_identity"
         )
         wrapper_unit = self._sandbox_systemd_unit(wrapper_unit, "wrapper_unit", ".service")
         wrapper_invocation_id = self._sandbox_invocation_id(
@@ -1297,6 +1318,70 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_invalid", "cgroup path must name the exact recorded scope"
             )
+        with self.connect() as connection:
+            durable_execution = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if not durable_execution:
+            raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
+        if durable_execution["claim_token"] != claim_token:
+            raise SupervisorError("stale_fencing_token", "claim token is stale")
+        if durable_execution["workspace_binding_version"] != 1:
+            raise SupervisorError(
+                "sandbox_workspace_unbound",
+                "sandbox launch requires a durable baseline/workspace binding",
+            )
+        if durable_execution["private_path_binding_version"] != 1:
+            raise SupervisorError(
+                "sandbox_private_path_unbound",
+                "sandbox launch requires exact private bundle/state directory identities",
+            )
+        if durable_execution["phase"] != "reserved":
+            raise SupervisorError(
+                "sandbox_execution_transition_invalid",
+                f"expected phase reserved, found {durable_execution['phase']}; fence retained",
+            )
+        target_paths_match = (
+            launch_target.bundle_path == durable_execution["bundle_path"]
+            and launch_target.bundle_device == durable_execution["bundle_root_dev"]
+            and launch_target.bundle_inode == durable_execution["bundle_root_ino"]
+            and launch_target.rootfs_path == str(Path(durable_execution["bundle_path"]) / "rootfs")
+            and launch_target.rootfs_sha256 == durable_execution["rootfs_digest"]
+            and launch_target.rootfs_closure_sha256 == durable_execution["rootfs_closure_digest"]
+            and launch_target.state_path == durable_execution["state_path"]
+            and launch_target.state_device == durable_execution["state_root_dev"]
+            and launch_target.state_inode == durable_execution["state_root_ino"]
+            and launch_target.workspace_path == durable_execution["workspace_root_path"]
+            and launch_target.workspace_device == durable_execution["workspace_root_dev"]
+            and launch_target.workspace_inode == durable_execution["workspace_root_ino"]
+            and launch_target.container_id == durable_execution["container_id"]
+            and launch_target.runc_executable_sha256 == durable_execution["runc_executable_digest"]
+        )
+        if (
+            not target_paths_match
+            or launch_target.pid_file_path is None
+            or Path(launch_target.pid_file_path).parent != Path(durable_execution["state_path"])
+            or launch_target.config_sha256 is None
+            or _DIGEST.fullmatch(launch_target.config_sha256) is None
+            or type(launch_target.rootfs_device) is not int
+            or type(launch_target.rootfs_inode) is not int
+            or type(launch_target.rootfs_snapshot_device) is not int
+            or type(launch_target.rootfs_snapshot_inode) is not int
+            or launch_target.rootfs_snapshot_sha256 != launch_target.rootfs_sha256
+            or launch_target.rootfs_snapshot_closure_sha256 != launch_target.rootfs_closure_sha256
+            or launch_target.rootfs_snapshot_entry_count != launch_target.rootfs_entry_count
+            or launch_target.rootfs_snapshot_bytes != launch_target.rootfs_bytes
+            or (launch_target.rootfs_snapshot_device, launch_target.rootfs_snapshot_inode)
+            == (launch_target.rootfs_device, launch_target.rootfs_inode)
+        ):
+            raise SupervisorError(
+                "sandbox_execution_launch_target_mismatch",
+                "pinned-runc launch target does not match the exact durable reservation",
+            )
+        _runc_launch_handle_bind_execution(
+            runc_handle, attempt_id, claim_token, durable_execution["execution_id"]
+        )
         updates = {
             "monitor_pid": monitor_pid,
             "monitor_identity": monitor_identity,
@@ -1315,7 +1400,51 @@ class SandboxExecutionJournalMixin:
             next_phase="launched",
             updates=updates,
             event_type="sandbox.execution_launched",
-            event_payload={key: value for key, value in updates.items()},
+            event_payload={
+                **updates,
+                "launch_target": {
+                    "mode": launch_target.launch_mode,
+                    "runc_executable_path": launch_target.runc_executable_path,
+                    "runc_executable_sha256": launch_target.runc_executable_sha256,
+                    "config_sha256": launch_target.config_sha256,
+                    "config_sha256_semantics": "sha256-exact-config-json-bytes",
+                    "argv_sha256": hashlib.sha256(
+                        canonical_json(list(launch_target.argv)).encode("utf-8")
+                    ).hexdigest(),
+                    "container_id": launch_target.container_id,
+                    "bundle": {
+                        "path": launch_target.bundle_path,
+                        "device": launch_target.bundle_device,
+                        "inode": launch_target.bundle_inode,
+                    },
+                    "rootfs": {
+                        "path": launch_target.rootfs_path,
+                        "device": launch_target.rootfs_device,
+                        "inode": launch_target.rootfs_inode,
+                        "sha256": launch_target.rootfs_sha256,
+                        "closure_sha256": launch_target.rootfs_closure_sha256,
+                        "snapshot": {
+                            "device": launch_target.rootfs_snapshot_device,
+                            "inode": launch_target.rootfs_snapshot_inode,
+                            "sha256": launch_target.rootfs_snapshot_sha256,
+                            "closure_sha256": launch_target.rootfs_snapshot_closure_sha256,
+                            "entry_count": launch_target.rootfs_snapshot_entry_count,
+                            "bytes": launch_target.rootfs_snapshot_bytes,
+                        },
+                    },
+                    "state": {
+                        "path": launch_target.state_path,
+                        "device": launch_target.state_device,
+                        "inode": launch_target.state_inode,
+                    },
+                    "workspace": {
+                        "path": launch_target.workspace_path,
+                        "device": launch_target.workspace_device,
+                        "inode": launch_target.workspace_inode,
+                    },
+                    "pid_file_path": launch_target.pid_file_path,
+                },
+            },
             credential=credential,
         )
 
@@ -1423,55 +1552,94 @@ class SandboxExecutionJournalMixin:
         self,
         attempt_id: str,
         claim_token: int,
-        exit_code: int,
+        wait_receipt: _RuncClientWaitReceipt,
         *,
         credential: str | None = None,
     ) -> dict[str, Any]:
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
+        if not _runc_client_wait_receipt_is_self_consistent(wait_receipt):
+            raise SupervisorError(
+                "sandbox_execution_wait_receipt_required",
+                "runc exit recording requires a sealed receipt issued by the pinned-runc wait handle",
+            )
+        exit_code = wait_receipt.returncode
         if type(exit_code) is not int or not -255 <= exit_code <= 255:
             raise SupervisorError("sandbox_execution_invalid", "runc exit code is invalid")
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
-        if (
-            row
-            and row["claim_token"] == claim_token
-            and row["phase"]
-            in {
-                "exited",
-                "cleanup_reported",
-                "cleanup_verified",
-            }
-        ):
-            if row["runc_exit_code"] == exit_code:
-                return self._sandbox_execution_view(row)
-            raise SupervisorError(
-                "sandbox_execution_transition_conflict", "conflicting runc exit receipt"
+            if not row:
+                raise SupervisorError(
+                    "sandbox_execution_not_found", "execution reservation is missing"
+                )
+            if row["claim_token"] != claim_token:
+                raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
+            if (
+                wait_receipt.pid != row["runc_client_pid"]
+                or wait_receipt.process_identity != row["runc_client_identity"]
+                or wait_receipt.attempt_id != row["attempt_id"]
+                or wait_receipt.claim_token != row["claim_token"]
+                or wait_receipt.execution_id != row["execution_id"]
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_wait_receipt_stale",
+                    "runc wait receipt does not match the durable launch process identity",
+                )
+            if row["phase"] in {"exited", "cleanup_reported", "cleanup_verified"}:
+                if row["runc_exit_code"] == exit_code:
+                    if row["runc_exit_evidence_source"] == "runc_client_kernel_waitpid":
+                        return self._sandbox_execution_view(row)
+                    raise SupervisorError(
+                        "sandbox_execution_evidence_unverified",
+                        "legacy exit row has no durable kernel-wait evidence",
+                    )
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict", "conflicting runc exit receipt"
+                )
+            if row["phase"] not in {"launched", "running", "stopping"}:
+                raise SupervisorError(
+                    "sandbox_execution_transition_invalid",
+                    f"cannot record exit from phase {row['phase']}; fence retained",
+                )
+
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if attempt["status"] != "working":
+                raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+            self._authenticate_attempt(connection, attempt, credential)
+            with _authorize_sandbox_exit_receipt_write(connection, wait_receipt):
+                changed = connection.execute(
+                    "UPDATE sandbox_executions SET runc_exit_code = ?, "
+                    "runc_exit_observed_by = 'runc_client_popen_wait', "
+                    "runc_exit_evidence_source = 'runc_client_kernel_waitpid', "
+                    "phase = 'exited', updated_at = ? "
+                    "WHERE attempt_id = ? AND claim_token = ? AND phase = ?",
+                    (exit_code, utc_now(), attempt_id, claim_token, row["phase"]),
+                ).rowcount
+            if changed != 1:
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "execution journal changed concurrently; fence retained",
+                )
+            self._event(
+                connection,
+                "sandbox.execution_exited",
+                attempt["agent_id"],
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "execution_id": row["execution_id"],
+                    "phase": "exited",
+                    "runc_exit_code": exit_code,
+                    "observed_by": "runc_client_kernel_waitpid",
+                },
             )
-        if not row or row["phase"] not in {"launched", "running", "stopping"}:
-            phase = row["phase"] if row else "missing"
-            raise SupervisorError(
-                "sandbox_execution_transition_invalid",
-                f"cannot record exit from phase {phase}; fence retained",
-            )
-        return self._sandbox_execution_transition(
-            attempt_id,
-            claim_token,
-            expected_phase=row["phase"],
-            next_phase="exited",
-            updates={
-                "runc_exit_code": exit_code,
-                "runc_exit_observed_by": "runc_client_popen_wait",
-            },
-            event_type="sandbox.execution_exited",
-            event_payload={
-                "runc_exit_code": exit_code,
-                "observed_by": "runc_client_popen_wait",
-            },
-            credential=credential,
-        )
+            updated = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        return self._sandbox_execution_view(updated)
 
     def _sandbox_execution_record_cleanup_report(
         self,
@@ -1549,7 +1717,9 @@ class SandboxExecutionJournalMixin:
             "runtime_version": row["runtime_version"],
             "oci_version": row["oci_version"],
             "runc_exit_code": row["runc_exit_code"],
-            "runc_exit_observed_by": row["runc_exit_observed_by"],
+            "runc_exit_observed_by": (
+                row["runc_exit_evidence_source"] or row["runc_exit_observed_by"]
+            ),
             "processes": {
                 "monitor": {"pid": row["monitor_pid"], "identity": row["monitor_identity"]},
                 "runc_client": {
@@ -1679,6 +1849,10 @@ class SandboxExecutionJournalMixin:
     @staticmethod
     def _sandbox_execution_view(row: Any) -> dict[str, Any]:
         value = dict(row)
+        if value.get("runc_exit_evidence_source"):
+            # Keep the historical API field useful while the database column is
+            # retained only to satisfy the immutable pre-v20 SQLite CHECK.
+            value["runc_exit_observed_by"] = value["runc_exit_evidence_source"]
         raw = value.pop("cleanup_receipt_json", "{}")
         try:
             value["cleanup_receipt"] = json.loads(raw)
