@@ -209,6 +209,32 @@ is then injected into the supervised worker, deterministic QC, the critic, and
 integration commands. This prevents a verifier from accidentally testing
 another attempt's localhost service or database configuration.
 
+The opt-in `[sandbox.oci]` setting requires a root-owned, non-set-id `runc`
+executable (with no Linux file capabilities), an exact configured version, and
+an operator-selected `rootfs_path`, `rootfs_sha256`, and
+`rootfs_closure_sha256`. `acp oci-rootfs-manifest --rootfs PATH` emits an
+filesystem path/metadata/content-hash inventory (file bytes omitted), not a
+runtime dependency resolver. The operator must inspect every entry and inspect
+the bytes of generated `etc/` configuration separately before pinning the
+reported closure hash. ACP pins the rootfs path, the
+device/inode actually opened by the scan, and both digests at config load; it
+rejects Linux POSIX ACLs and uses Linux mountinfo snapshots to reject nested
+mounts, including same-device binds. It revalidates those facts
+when compiling an OCI config. Other extended attributes and non-Linux ACL
+mechanisms are outside the digest. Compute the configured digest on the target
+Linux host after provisioning because it binds host UID/GID. It detects
+substitution only in its bound
+fields/content, relative to the configured digest; it is not an image audit or
+provenance attestation. This still validates configuration and captures
+process-local pins only: `run_worker` blocks rather than falling back to a host
+process, and no worker consumes the OCI setting. It does not prove runc
+enforcement or authorize sandbox launch. An executor must still use a
+controlled, read-only provisioned rootfs to close concurrent writer/path
+replacement races, launch through the held runc descriptor, record runtime
+provenance durably, and
+independently verify cancellation and cleanup before this configuration can
+authorize a worker.
+
 Runtime teardown is triggered by negative QC, completed integration, or lease
 expiry. Port values are released only after every teardown command passes and
 the OS confirms that the ports can be rebound. Failed cleanup remains durable

@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -32,7 +33,13 @@ from agent_control_plane.git_supervisor import (
     SupervisorError,
 )
 from agent_control_plane.supervisor import claims as claims_module
+from agent_control_plane.supervisor import oci_worker as oci_worker_module
 from agent_control_plane.supervisor import process as process_module
+from agent_control_plane.supervisor import result_import as result_import_module
+from agent_control_plane.supervisor import workers as workers_module
+from agent_control_plane.supervisor.common import canonical_json, sha256
+from agent_control_plane.supervisor.result_import import result_ref_name
+from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
 from agent_control_plane.trust_bundles import install_bundle, verify_bundle_pin
 
 
@@ -113,6 +120,31 @@ def write_config(
             )
 
 
+def _create_test_oci_rootfs(repo: Path) -> tuple[Path, str]:
+    rootfs = repo.parent / f"{repo.name}-oci-rootfs"
+    for relative in ("bin", "etc", "proc", "tmp", "home/agent", "usr/bin"):
+        (rootfs / relative).mkdir(parents=True, exist_ok=True, mode=0o755)
+    for relative in ("bin/sh", "usr/bin/busybox"):
+        executable = rootfs / relative
+        executable.write_text("test rootfs only\n", encoding="ascii")
+        executable.chmod(0o755)
+    return rootfs, oci_worker_module.rootfs_tree_sha256(rootfs)
+
+
+def append_oci_config(repo: Path, body: str) -> tuple[Path, str]:
+    rootfs, digest = _create_test_oci_rootfs(repo)
+    closure_digest = oci_worker_module.rootfs_tree_manifest(rootfs)["closure_sha256"]
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n[sandbox.oci]\n"
+            f"{body}\n"
+            f"rootfs_path = {json.dumps(str(rootfs))}\n"
+            f"rootfs_sha256 = {json.dumps(digest)}\n"
+            f"rootfs_closure_sha256 = {json.dumps(closure_digest)}\n"
+        )
+    return rootfs, digest
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     git(tmp_path, "init", "-b", "main")
@@ -127,6 +159,13 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture
+def result_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Keep imported worker snapshots outside the base checkout under test."""
+
+    return tmp_path_factory.mktemp("worker-result")
+
+
 def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change") -> dict:
     return supervisor.create_task(
         title,
@@ -134,6 +173,164 @@ def task(supervisor: GitSupervisor, resource: str, title: str = "bounded change"
         ["The declared content is correct", "QC passes"],
         [resource],
     )
+
+
+def _record_test_worker_exit(supervisor: GitSupervisor, attempt_id: str) -> int:
+    gate_read, gate_write = os.pipe()
+    command = [
+        sys.executable,
+        "-c",
+        "import os,sys; os.read(int(sys.argv[1]),1)",
+        str(gate_read),
+    ]
+    monitor = [
+        sys.executable,
+        "-c",
+        (
+            "import subprocess; "
+            f"child=subprocess.Popen({command!r},pass_fds=({gate_read},)); "
+            "print(child.pid,flush=True); child.wait()"
+        ),
+    ]
+    try:
+        process = subprocess.Popen(
+            monitor,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            pass_fds=(gate_read,),
+        )
+    except BaseException:
+        os.close(gate_write)
+        raise
+    finally:
+        os.close(gate_read)
+
+    def release_gate() -> None:
+        try:
+            os.write(gate_write, b"G")
+        except BrokenPipeError:
+            pass
+        finally:
+            os.close(gate_write)
+
+    try:
+        assert process.stdout is not None
+        command_pid = int(process.stdout.readline())
+        process.stdout.close()
+        monitor_identity = supervisor._process_identity(process.pid)
+        command_identity = supervisor._process_identity(command_pid)
+        assert monitor_identity is not None
+        assert command_identity is not None
+        attempt = supervisor.attempt(attempt_id)
+        with supervisor.connect() as connection:
+            connection.execute(
+                "UPDATE attempts SET pid = ?, pid_identity = ? WHERE id = ?",
+                (process.pid, monitor_identity, attempt_id),
+            )
+        command_digest = supervisor._record_worker_command_ready(
+            attempt_id,
+            attempt["claim_token"],
+            process.pid,
+            monitor_identity,
+            command_pid,
+            command_identity,
+            command,
+            None,
+        )
+    except BaseException:
+        release_gate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        raise
+    else:
+        release_gate()
+    exit_code = process.wait(timeout=5)
+    supervisor._record_worker_exit(
+        attempt_id,
+        process.pid,
+        exit_code,
+        command_pid,
+        command_identity,
+        command_digest,
+    )
+    return process.pid
+
+
+def _result_bundle(attempt: dict, output_root: Path):
+    output_root.mkdir(parents=True, exist_ok=True)
+    worktree = Path(attempt["worktree"])
+    baseline = copy_snapshot(worktree, output_root / "baseline")
+    output = copy_snapshot(worktree, output_root / "worker-output").root
+    (output / "alpha.txt").write_text("imported result\n", encoding="utf-8")
+    changes = collect_changes(
+        baseline.manifest,
+        output,
+        write_set_rules=[("alpha.txt", True, False)],
+    )
+    return baseline, changes
+
+
+def _result_import_identity(attempt: dict, baseline, changes) -> tuple[str, str, str]:
+    result_digest = sha256(
+        canonical_json(
+            {
+                "baseline_digest": baseline.manifest.digest,
+                "result_digest": changes.result_digest,
+                "change_digest": changes.digest,
+            }
+        ).encode("utf-8")
+    )
+    import_id = str(
+        _uuid.uuid5(
+            _uuid.NAMESPACE_URL,
+            f"acp-worker-result:{attempt['id']}:{attempt['claim_token']}:{result_digest}",
+        )
+    )
+    reference = result_ref_name(attempt["id"], attempt["claim_token"], result_digest)
+    return import_id, result_digest, reference
+
+
+@pytest.mark.parametrize("invalid_token", [True, 1.0, 0, -1])
+def test_import_worker_result_rejects_invalid_claim_token_before_git_writes(
+    repo: Path,
+    result_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_token: int | float | bool,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject malformed result import token")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+
+    def unexpected_build(*args, **kwargs):
+        pytest.fail("invalid claim token reached Git candidate construction")
+
+    monkeypatch.setattr(claims_module, "build_candidate_tree", unexpected_build)
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.import_worker_result(attempt["id"], invalid_token, baseline, changes)
+    assert rejected.value.code == "invalid_worker_result"
+
+
+def test_result_import_recovery_checks_git_policy_before_journal_lookup(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    for check_name in ("_assert_safe_git_execution_config", "_assert_no_git_grafts"):
+        original = getattr(supervisor, check_name)
+
+        def reject_policy(*args, _check_name=check_name, **kwargs):
+            raise SupervisorError("test_git_policy_rejected", _check_name)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(supervisor, check_name, reject_policy)
+            with pytest.raises(SupervisorError) as rejected:
+                supervisor.recover_worker_result_import("missing-journal")
+        assert rejected.value.code == "test_git_policy_rejected"
+        assert getattr(supervisor, check_name) == original
 
 
 def test_external_attempt_worktree_root_rejects_relative_repository_and_symlink_paths(
@@ -155,6 +352,169 @@ def test_external_attempt_worktree_root_rejects_relative_repository_and_symlink_
     with pytest.raises(SupervisorError) as symlink_escape:
         GitSupervisor(repo)
     assert symlink_escape.value.code == "invalid_config"
+
+
+def test_oci_runc_config_pins_executable_and_records_verified_version(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    rootfs, rootfs_digest = append_oci_config(
+        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"'
+    )
+    pin = object()
+    calls: list[tuple[str, str]] = []
+
+    def fake_pin(executable: str, root: Path):
+        calls.append((executable, str(root)))
+        return pin
+
+    def fake_probe(executable, expected_version: str) -> str:
+        assert executable is pin
+        assert expected_version == "1.3.5"
+        return "1.3.5"
+
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", fake_pin)
+    monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", fake_probe)
+
+    supervisor = GitSupervisor(repo)
+
+    assert supervisor.config.oci_runc_executable is pin
+    assert supervisor.config.oci_runc_version == "1.3.5"
+    assert supervisor.config.oci_rootfs_pin.path == rootfs.resolve()
+    assert supervisor.config.oci_rootfs_pin.sha256 == rootfs_digest
+    assert (
+        supervisor.config.oci_rootfs_pin.closure_sha256
+        == oci_worker_module.rootfs_tree_manifest(rootfs)["closure_sha256"]
+    )
+    assert calls == [("/usr/bin/runc", str(repo.resolve()))]
+
+
+def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> None:
+    write_config(repo)
+    rootfs, digest = _create_test_oci_rootfs(repo)
+    closure_digest = oci_worker_module.rootfs_tree_manifest(rootfs)["closure_sha256"]
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
+            'runc_version = "1.3.5"\n'
+            f"rootfs_path = {json.dumps(str(rootfs))}\n"
+            f"rootfs_sha256 = {json.dumps(digest)}\n"
+            f"rootfs_closure_sha256 = {json.dumps(closure_digest)}\n"
+        )
+    (rootfs / "usr" / "bin" / "busybox").write_text("unreviewed change\n", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="digest does not match") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
+    write_config(repo)
+    rootfs, digest = _create_test_oci_rootfs(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write(
+            '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
+            'runc_version = "1.3.5"\n'
+            f"rootfs_path = {json.dumps(str(rootfs))}\n"
+            f"rootfs_sha256 = {json.dumps(digest)}\n"
+            f"rootfs_closure_sha256 = {json.dumps('0' * 64)}\n"
+        )
+
+    with pytest.raises(SupervisorError, match="closure digest does not match") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_oci_rootfs"
+
+
+def test_oci_config_requires_a_rootfs_path_and_digest(repo: Path) -> None:
+    write_config(repo)
+    with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
+        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+
+    with pytest.raises(
+        SupervisorError, match="requires runc_executable.*rootfs_sha256.*rootfs_closure_sha256"
+    ) as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
+
+
+def test_oci_configured_worker_fails_closed_before_host_fallback(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "host-fallback-worker-ran"
+
+    def heartbeat_must_not_run(*_args, **_kwargs):
+        pytest.fail("configured OCI fallback must fail before worker heartbeat")
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("configured OCI fallback must not reserve or spawn a host worker")
+
+    monkeypatch.setattr(supervisor, "heartbeat", heartbeat_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+    ]
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert error.value.code == "sandbox_executor_unavailable"
+    assert "refusing host fallback" in str(error.value)
+    assert not marker.exists()
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ('runc_executable = "runc"\nrunc_version = "1.3.5"', "absolute path"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "latest"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-01"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a..b"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5+meta."', "release version"),
+        (
+            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\nextra = true',
+            "requires runc_executable",
+        ),
+    ],
+)
+def test_oci_runc_config_rejects_ambiguous_values(repo: Path, entry: str, message: str) -> None:
+    write_config(repo)
+    append_oci_config(repo, entry)
+
+    with pytest.raises(SupervisorError, match=message) as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
+
+
+def test_oci_runc_config_is_opt_in(repo: Path) -> None:
+    write_config(repo)
+
+    supervisor = GitSupervisor(repo)
+
+    assert supervisor.config.oci_runc_executable is None
+    assert supervisor.config.oci_runc_version is None
+    assert supervisor.config.oci_rootfs_pin is None
 
 
 def test_external_attempt_worktree_root_rejects_linked_worktree_git_common_dir(
@@ -841,6 +1201,804 @@ def test_submit_accepts_an_unchanged_dirty_base_checkout(repo: Path) -> None:
     ) == "pre-existing untracked secret\n"
 
 
+def test_result_import_reachability_includes_all_refs_heads_and_worktree_indexes(
+    repo: Path, tmp_path: Path
+) -> None:
+    supervisor = GitSupervisor(repo)
+    (repo / "index-only.txt").write_text("staged but not committed\n", encoding="utf-8")
+    git(repo, "add", "index-only.txt")
+    staged_blob = git(repo, "hash-object", "index-only.txt")
+    head = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--mixed", head)
+
+    def make_unreferenced_commit(path: str, body: str) -> tuple[str, str]:
+        (repo / path).write_text(body, encoding="utf-8")
+        git(repo, "add", path)
+        blob = git(repo, "hash-object", path)
+        tree = git(repo, "write-tree")
+        commit = git(
+            repo,
+            "-c",
+            "user.name=ACP tests",
+            "-c",
+            "user.email=acp-tests@example.invalid",
+            "commit-tree",
+            tree,
+            "-p",
+            head,
+            "-m",
+            path,
+        )
+        git(repo, "reset", "--mixed", head)
+        return commit, blob
+
+    secondary_commit, secondary_blob = make_unreferenced_commit(
+        "secondary-ref-only.txt", "object reachable through a non-current ref\n"
+    )
+    git(repo, "update-ref", "refs/acp-tests/secondary", secondary_commit)
+    worktree_commit, worktree_blob = make_unreferenced_commit(
+        "detached-worktree-only.txt", "object reachable through detached worktree HEAD\n"
+    )
+    secondary_worktree = tmp_path / "detached-worktree"
+    git(repo, "worktree", "add", "--detach", str(secondary_worktree), worktree_commit)
+    (secondary_worktree / "worktree-index-only.txt").write_text(
+        "object reachable only through another worktree index\n", encoding="utf-8"
+    )
+    git(secondary_worktree, "add", "worktree-index-only.txt")
+    secondary_index_blob = git(secondary_worktree, "hash-object", "worktree-index-only.txt")
+    git(repo, "add", "index-only.txt")
+
+    with supervisor._git_operation_guard():
+        reachable = supervisor._result_import_reachable_objects_locked(40)
+
+    assert reachable is not None
+    assert head in reachable
+    assert staged_blob in reachable
+    assert secondary_commit in reachable
+    assert secondary_blob in reachable
+    assert worktree_commit in reachable
+    assert worktree_blob in reachable
+    assert secondary_index_blob in reachable
+    assert (
+        result_import_module.remove_unreachable_candidate_objects(
+            repo,
+            [secondary_blob, worktree_blob, secondary_index_blob],
+            protected_object_ids=set(),
+            reachable_object_ids=reachable,
+        )
+        == ()
+    )
+    for object_id in (secondary_blob, worktree_blob, secondary_index_blob):
+        assert git(repo, "cat-file", "-e", object_id) == ""
+
+
+@requires_linux_worker
+def test_import_worker_result_submits_immutable_host_commit_without_checkout_mutation(
+    repo: Path, result_root: Path
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox result import")
+    attempt = supervisor.claim(created["id"], "worker")
+    base_sha = git(Path(attempt["worktree"]), "rev-parse", "HEAD")
+    host_head = git(repo, "rev-parse", "HEAD")
+    host_branch = git(repo, "symbolic-ref", "--short", "HEAD")
+    host_status = git(repo, "status", "--porcelain=v1", "-z")
+    host_index = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    host_index_before = host_index.read_bytes()
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    worker_pid = _record_test_worker_exit(supervisor, attempt["id"])
+    worker_identity = supervisor.attempt(attempt["id"])["pid_identity"]
+
+    submission = supervisor.import_worker_result(
+        attempt["id"], attempt["claim_token"], baseline, changes
+    )
+
+    assert submission["status"] == "pending_qc"
+    repeated = supervisor.import_worker_result(
+        attempt["id"], attempt["claim_token"], baseline, changes
+    )
+    assert repeated["id"] == submission["id"]
+    with pytest.raises(SupervisorError) as invalid_token:
+        supervisor.import_worker_result(attempt["id"], True, baseline, changes)
+    assert invalid_token.value.code == "invalid_worker_result"
+    assert git(repo, "rev-parse", "HEAD") == host_head
+    assert git(repo, "symbolic-ref", "--short", "HEAD") == host_branch
+    assert git(repo, "status", "--porcelain=v1", "-z") == host_status
+    assert host_index.read_bytes() == host_index_before
+    assert git(Path(attempt["worktree"]), "rev-parse", "HEAD") == base_sha
+    assert git(Path(attempt["worktree"]), "status", "--porcelain=v1") == ""
+    assert git(repo, "show", f"{submission['commit_sha']}:alpha.txt") == "imported result"
+    assert git(repo, "rev-parse", f"{submission['commit_sha']}^") == base_sha
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()[0]
+            == 1
+        )
+        assert imported["phase"] == "submitted"
+        assert imported["submission_id"] == submission["id"]
+        assert imported["worker_exit_receipt_json"]
+        assert imported["worker_pid"] == worker_pid
+        assert imported["worker_identity"] == worker_identity
+        assert imported["tree_sha"] in json.loads(imported["object_ids_json"])
+        assert imported["commit_sha"] in json.loads(imported["object_ids_json"])
+        assert set(json.loads(imported["promote_object_ids_json"])).issubset(
+            set(json.loads(imported["object_ids_json"]))
+        )
+        assert imported["staging_path"] == ""
+        assert git(repo, "rev-parse", imported["result_ref"]) == submission["commit_sha"]
+    assert not (Path(supervisor.state_dir) / "result-import-staging" / imported["id"]).exists()
+    assert supervisor.verify_event_chain()["ok"]
+    result_ref = imported["result_ref"]
+    git(repo, "update-ref", result_ref, base_sha, submission["commit_sha"])
+    with pytest.raises(SupervisorError) as corrupted:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    assert corrupted.value.code == "result_import_ambiguous"
+
+
+@requires_linux_worker
+@pytest.mark.parametrize("corruption", ["missing_ready", "identity_type", "digest_mismatch"])
+def test_import_rejects_unbound_or_malformed_worker_command_receipt(
+    repo: Path, result_root: Path, corruption: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject unbound worker command receipt")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+
+    with supervisor.connect() as connection:
+        if corruption == "missing_ready":
+            row = connection.execute(
+                "SELECT id, payload_json FROM events WHERE event_type = 'worker.command_ready' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            payload = json.loads(row["payload_json"])
+            payload["attempt_id"] = "different-attempt"
+        else:
+            row = connection.execute(
+                "SELECT id, payload_json FROM events WHERE event_type = 'worker.exited' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            payload = json.loads(row["payload_json"])
+            if corruption == "identity_type":
+                payload["command_identity"] = {}
+            else:
+                payload["command_digest"] = "f" * 64
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), row["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    assert rejected.value.code == "worker_exit_receipt_invalid"
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+
+
+@requires_linux_worker
+@pytest.mark.parametrize("checkpoint", ["blob", "tree", "journal"])
+def test_unjournaled_result_stage_cannot_be_recovered_or_adopted(
+    repo: Path,
+    result_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", f"crash before journal at {checkpoint}")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    import_id, _result_digest, reference = _result_import_identity(attempt, baseline, changes)
+    observed_stage_objects: list[str] = []
+
+    if checkpoint == "journal":
+        original_event = supervisor._event
+
+        def stop_during_journal(connection, event_type, actor_id, payload):
+            result = original_event(connection, event_type, actor_id, payload)
+            if event_type == "worker.result_import_prepared":
+                raise KeyboardInterrupt("simulated process stop during journal preparation")
+            return result
+
+        monkeypatch.setattr(supervisor, "_event", stop_during_journal)
+    else:
+        original_run_git = result_import_module._run_git
+
+        def stop_during_object_write(*args, **kwargs):
+            result = original_run_git(*args, **kwargs)
+            arguments = args[2]
+            environment = args[3]
+            is_stage_object = "result-import-staging" in environment.get("GIT_OBJECT_DIRECTORY", "")
+            should_stop = (
+                checkpoint == "blob" and is_stage_object and arguments[:2] == ("hash-object", "-w")
+            ) or (checkpoint == "tree" and is_stage_object and arguments == ("write-tree",))
+            if should_stop:
+                observed_stage_objects.append(result.decode("ascii").strip())
+                raise KeyboardInterrupt(f"simulated process stop during {checkpoint} creation")
+            return result
+
+        monkeypatch.setattr(result_import_module, "_run_git", stop_during_object_write)
+
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+
+    stage_path = Path(supervisor.state_dir) / "result-import-staging" / import_id
+    assert stage_path.is_dir()
+    if checkpoint == "journal":
+        staged_objects = stage_path / "objects"
+        observed_stage_objects.extend(
+            f"{fanout.name}{item.name}"
+            for fanout in staged_objects.iterdir()
+            if fanout.is_dir() and len(fanout.name) == 2
+            for item in fanout.iterdir()
+            if len(item.name) == 38 or len(item.name) == 62
+        )
+    assert observed_stage_objects
+    for object_id in observed_stage_objects:
+        assert (
+            subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", object_id],
+                capture_output=True,
+                check=False,
+            ).returncode
+            != 0
+        )
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute("SELECT 1 FROM result_imports WHERE id = ?", (import_id,)).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", reference],
+            check=False,
+        ).returncode
+        != 0
+    )
+
+    monkeypatch.undo()
+    with pytest.raises(SupervisorError) as missing_journal:
+        supervisor.recover_worker_result_import(import_id)
+    assert missing_journal.value.code == "result_import_not_found"
+    assert not stage_path.exists()
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", reference],
+            check=False,
+        ).returncode
+        != 0
+    )
+
+    retried = supervisor.import_worker_result(
+        attempt["id"], attempt["claim_token"], baseline, changes
+    )
+    assert retried["status"] == "pending_qc"
+
+
+@requires_linux_worker
+def test_result_import_recovers_after_partial_object_promotion(
+    repo: Path,
+    result_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "recover partial object promotion")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    original_promote = claims_module.promote_candidate_objects
+    promoted_prefix: list[str] = []
+
+    def promote_one_then_stop(repository, object_directory, object_ids, **kwargs):
+        if object_ids:
+            original_promote(
+                repository,
+                object_directory,
+                object_ids[:1],
+                **kwargs,
+            )
+            promoted_prefix.extend(object_ids[:1])
+        raise KeyboardInterrupt("simulated process stop during object promotion")
+
+    monkeypatch.setattr(claims_module, "promote_candidate_objects", promote_one_then_stop)
+    with pytest.raises(KeyboardInterrupt, match="during object promotion"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert imported["phase"] == "prepared"
+        assert imported["worker_identity"]
+        assert imported["worker_exit_receipt_json"]
+        assert json.loads(imported["object_ids_json"])
+        assert json.loads(imported["promote_object_ids_json"])
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert promoted_prefix
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", imported["result_ref"]],
+            check=False,
+        ).returncode
+        != 0
+    )
+    assert all(
+        subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", object_id],
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+        for object_id in promoted_prefix
+    )
+
+    monkeypatch.setattr(claims_module, "promote_candidate_objects", original_promote)
+    restarted = GitSupervisor(repo)
+    submission = restarted.recover_worker_result_import(imported["id"])
+    assert submission["status"] == "pending_qc"
+    assert git(repo, "rev-parse", imported["result_ref"]) == submission["commit_sha"]
+    assert not Path(imported["staging_path"]).exists()
+    repeated = restarted.import_worker_result(
+        attempt["id"], attempt["claim_token"], baseline, changes
+    )
+    assert repeated["id"] == submission["id"]
+
+
+@requires_linux_worker
+def test_ambiguous_import_cleanup_removes_only_unreachable_owned_objects(
+    repo: Path,
+    result_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "clean stale result object promotion")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    original_promote = claims_module.promote_candidate_objects
+    promoted_prefix: list[str] = []
+
+    def promote_one_then_stop(repository, object_directory, object_ids, **kwargs):
+        if object_ids:
+            original_promote(
+                repository,
+                object_directory,
+                object_ids[:1],
+                **kwargs,
+            )
+            promoted_prefix.extend(object_ids[:1])
+        raise KeyboardInterrupt("simulated process stop during object promotion")
+
+    monkeypatch.setattr(claims_module, "promote_candidate_objects", promote_one_then_stop)
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        connection.execute(
+            "UPDATE attempts SET claim_token = claim_token + 1 WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.commit()
+
+    monkeypatch.setattr(claims_module, "promote_candidate_objects", original_promote)
+    with pytest.raises(SupervisorError) as stale:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert stale.value.code == "result_import_ambiguous"
+    assert promoted_prefix
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", promoted_prefix[0]],
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+    with pytest.raises(SupervisorError) as ambiguous:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert ambiguous.value.code == "result_import_ambiguous"
+    assert not Path(imported["staging_path"]).exists()
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", promoted_prefix[0]],
+            capture_output=True,
+            check=False,
+        ).returncode
+        != 0
+    )
+    assert git(repo, "rev-parse", "HEAD") == git(Path(attempt["worktree"]), "rev-parse", "HEAD")
+    with supervisor.connect() as connection:
+        state = connection.execute(
+            "SELECT phase, staging_path FROM result_imports WHERE id = ?",
+            (imported["id"],),
+        ).fetchone()
+    assert state["phase"] == "ambiguous"
+    assert state["staging_path"] == ""
+
+
+@requires_linux_worker
+@pytest.mark.parametrize("mutation", ["outside_inventory", "different_subset"])
+def test_ambiguous_import_cleanup_rejects_unproven_promotion_inventory(
+    repo: Path,
+    result_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject unproven result object provenance")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    unrelated_blob: str | None = None
+    original_promote = claims_module.promote_candidate_objects
+    promoted_prefix: list[str] = []
+
+    def promote_one_then_stop(repository, object_directory, object_ids, **kwargs):
+        if object_ids:
+            original_promote(repository, object_directory, object_ids[:1], **kwargs)
+            promoted_prefix.extend(object_ids[:1])
+        raise KeyboardInterrupt("simulated stop during object promotion")
+
+    monkeypatch.setattr(claims_module, "promote_candidate_objects", promote_one_then_stop)
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        object_ids = set(json.loads(imported["object_ids_json"]))
+        promotion_ids = set(json.loads(imported["promote_object_ids_json"]))
+        if mutation == "outside_inventory":
+            unrelated_file = tmp_path / "unrelated-unreachable-blob.txt"
+            unrelated_file.write_text("not owned by this import\n", encoding="utf-8")
+            unrelated_blob = git(repo, "hash-object", "-w", str(unrelated_file))
+            assert unrelated_blob not in object_ids
+            promotion_ids.add(unrelated_blob)
+        else:
+            assert len(promotion_ids) > 1
+            promotion_ids.remove(max(promotion_ids))
+            assert promotion_ids.issubset(object_ids)
+        connection.execute(
+            "UPDATE result_imports SET promote_object_ids_json = ? WHERE id = ?",
+            (canonical_json(sorted(promotion_ids)), imported["id"]),
+        )
+        connection.execute(
+            "UPDATE attempts SET claim_token = claim_token + 1 WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.commit()
+
+    monkeypatch.setattr(claims_module, "promote_candidate_objects", original_promote)
+    for _ in range(2):
+        with pytest.raises(SupervisorError) as ambiguous:
+            supervisor.recover_worker_result_import(imported["id"])
+        assert ambiguous.value.code == "result_import_ambiguous"
+
+    assert promoted_prefix
+    retained_ids = [*promoted_prefix]
+    if unrelated_blob is not None:
+        retained_ids.append(unrelated_blob)
+    for object_id in retained_ids:
+        assert (
+            subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", object_id],
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+    with supervisor.connect() as connection:
+        state = connection.execute(
+            "SELECT phase, staging_path FROM result_imports WHERE id = ?",
+            (imported["id"],),
+        ).fetchone()
+    assert state["phase"] == "ambiguous"
+    assert state["staging_path"] == imported["staging_path"]
+    assert not Path(imported["staging_path"]).exists()
+
+
+@requires_linux_worker
+def test_result_import_recovery_refuses_noncanonical_journal_ref(
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject corrupt result ref journal")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        connection.execute(
+            "UPDATE result_imports SET result_ref = 'refs/heads/main' WHERE id = ?",
+            (imported["id"],),
+        )
+        connection.commit()
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert rejected.value.code == "result_import_ambiguous"
+    with supervisor.connect() as connection:
+        phase = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()["phase"]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert phase == "ambiguous"
+
+
+@requires_linux_worker
+def test_result_import_recovery_refuses_corrupted_worker_identity(
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject corrupt worker identity")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    with supervisor.connect() as connection:
+        worker_identity = connection.execute(
+            "SELECT pid_identity FROM attempts WHERE id = ?", (attempt["id"],)
+        ).fetchone()["pid_identity"]
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert imported["worker_identity"] == worker_identity
+        # Simulate raw corruption; supported journal writes cannot change source identity.
+        connection.execute("DROP TRIGGER result_import_source_identity_immutable")
+        connection.execute(
+            "UPDATE result_imports SET worker_identity = ? WHERE id = ?",
+            ("tampered-worker-identity", imported["id"]),
+        )
+        connection.commit()
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert rejected.value.code == "result_import_ambiguous"
+    with supervisor.connect() as connection:
+        phase = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()["phase"]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert phase == "ambiguous"
+
+
+@requires_linux_worker
+def test_result_import_recovery_checks_base_checkout_audit_chain(
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "reject damaged audit chain")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        connection.execute(
+            "UPDATE events SET event_hash = ? WHERE sequence = (SELECT MIN(sequence) FROM events)",
+            ("0" * 64,),
+        )
+        connection.commit()
+
+    with pytest.raises(SupervisorError) as rejected:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert rejected.value.code == "result_import_ambiguous"
+    with supervisor.connect() as connection:
+        phase = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()["phase"]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert phase == "ambiguous"
+
+
+@requires_linux_worker
+def test_result_import_recovers_exact_ref_after_crash_before_journal_phase_commit(
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "recover result import")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    publish = claims_module.publish_candidate_ref
+
+    def publish_then_crash(*args, **kwargs):
+        publish(*args, **kwargs)
+        raise SupervisorError("test_crash_injected", "simulated process stop after ref update")
+
+    monkeypatch.setattr(claims_module, "publish_candidate_ref", publish_then_crash)
+    with pytest.raises(SupervisorError) as injected:
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    assert injected.value.code == "test_crash_injected"
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert imported["phase"] == "prepared"
+        assert git(repo, "rev-parse", imported["result_ref"]) == imported["commit_sha"]
+
+    monkeypatch.setattr(claims_module, "publish_candidate_ref", publish)
+    submission = supervisor.recover_worker_result_import(imported["id"])
+    assert submission["status"] == "pending_qc"
+    with supervisor.connect() as connection:
+        recovered = connection.execute(
+            "SELECT phase, submission_id FROM result_imports WHERE id = ?",
+            (imported["id"],),
+        ).fetchone()
+    assert recovered["phase"] == "submitted"
+    assert recovered["submission_id"] == submission["id"]
+
+
+@requires_linux_worker
+def test_result_import_recovery_is_idempotent_under_concurrent_submit(
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "concurrent result recovery")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    original_submit = supervisor._submit
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        assert imported["phase"] == "ref_published"
+
+    barrier = Barrier(2)
+
+    def concurrent_submit(*args, **kwargs):
+        barrier.wait(timeout=15)
+        return original_submit(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "_submit", concurrent_submit)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(supervisor.recover_worker_result_import, imported["id"])
+            for _ in range(2)
+        ]
+        submissions = [future.result(timeout=60) for future in futures]
+
+    assert submissions[0]["id"] == submissions[1]["id"]
+    with supervisor.connect() as connection:
+        row = connection.execute(
+            "SELECT phase, submission_id FROM result_imports WHERE id = ?",
+            (imported["id"],),
+        ).fetchone()
+        assert row["phase"] == "submitted"
+        assert row["submission_id"] == submissions[0]["id"]
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@requires_linux_worker
+def test_result_import_never_replays_after_claim_fence_changes(
+    repo: Path, result_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "fence stale result import")
+    attempt = supervisor.claim(created["id"], "worker")
+    baseline, changes = _result_bundle(attempt, result_root / "result")
+    _record_test_worker_exit(supervisor, attempt["id"])
+    original_submit = supervisor._submit
+
+    def stop_before_submit(*args, **kwargs):
+        raise RuntimeError("simulated stop after ref publication")
+
+    monkeypatch.setattr(supervisor, "_submit", stop_before_submit)
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        supervisor.import_worker_result(attempt["id"], attempt["claim_token"], baseline, changes)
+    with supervisor.connect() as connection:
+        imported = connection.execute(
+            "SELECT * FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+        connection.execute(
+            "UPDATE attempts SET claim_token = claim_token + 1 WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.commit()
+
+    monkeypatch.setattr(supervisor, "_submit", original_submit)
+    with pytest.raises(SupervisorError) as stale:
+        supervisor.recover_worker_result_import(imported["id"])
+    assert stale.value.code == "result_import_ambiguous"
+    with supervisor.connect() as connection:
+        phase = connection.execute(
+            "SELECT phase FROM result_imports WHERE id = ?", (imported["id"],)
+        ).fetchone()["phase"]
+        assert (
+            connection.execute(
+                "SELECT 1 FROM submissions WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+    assert phase == "ambiguous"
+    assert git(repo, "rev-parse", imported["result_ref"]) == imported["commit_sha"]
+
+
 def _commit_result_manifest(
     supervisor: GitSupervisor,
     manifest: dict | str,
@@ -1471,10 +2629,19 @@ def test_persistent_write_racing_a_claim_snapshot_is_blocked_before_qc(
     secret = "root-write-during-snapshot"
 
     def write_after_path_was_fingerprinted(
-        root_real: Path, relative: bytes, display: bytes
+        root_real: Path,
+        relative: bytes,
+        display: bytes,
+        *,
+        expected_root_identity: tuple[int, int, int, int, int] | None = None,
     ) -> dict:
         nonlocal changed
-        result = original(root_real, relative, display)
+        result = original(
+            root_real,
+            relative,
+            display,
+            expected_root_identity=expected_root_identity,
+        )
         if relative == b"alpha.txt" and not changed:
             changed = True
             (repo / "alpha.txt").write_text(secret + "\n", encoding="utf-8")
@@ -2496,6 +3663,236 @@ def test_command_cannot_escape_by_terminating_its_monitor(repo: Path, close_stdi
     assert not marker.exists()
 
 
+def test_process_maps_fd3_only_into_command_and_closes_monitor_copy(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    marker = repo / "fd3-mapping-source-state"
+    gate_read, gate_write = os.pipe()
+    if gate_read == 3:
+        moved_read = os.dup(gate_read)
+        os.close(gate_read)
+        gate_read = moved_read
+    gate_identity = os.fstat(gate_read)
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            "import os, pathlib, sys, time\n"
+            "source = int(sys.argv[2])\n"
+            "try:\n    os.fstat(source)\n"
+            "except OSError:\n    state = 'closed'\n"
+            "else:\n    state = 'leaked'\n"
+            "mapped = os.fstat(3)\n"
+            "state += ':correct' if (mapped.st_dev, mapped.st_ino) == "
+            "(int(sys.argv[3]), int(sys.argv[4])) else ':wrong'\n"
+            "os.close(3)\n"
+            "pathlib.Path(sys.argv[1]).write_text(state)\n"
+            "time.sleep(0.4)\n"
+        ),
+        str(marker),
+        str(gate_read),
+        str(gate_identity.st_dev),
+        str(gate_identity.st_ino),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            supervisor._run_process,
+            command,
+            "fd3 mapping containment test",
+            repo,
+            supervisor._child_env(),
+            fd3_source=gate_read,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and not future.done() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.read_text(encoding="utf-8") == "closed:correct"
+            os.close(gate_read)
+            gate_read = -1
+            with pytest.raises(BrokenPipeError):
+                os.write(gate_write, b"G")
+            result = future.result(timeout=5)
+            assert result["exit_code"] == 0
+        finally:
+            if gate_read >= 0:
+                os.close(gate_read)
+            os.close(gate_write)
+
+
+def test_monitor_protocol_header_always_has_fd3_field() -> None:
+    assert worker_trampoline._monitor_argv_prefix(10, 11, 12, (15, 14, 15), None) == [
+        "10",
+        "11",
+        "12",
+        worker_trampoline.MONITOR_MODE,
+        f"{worker_trampoline.LIFECYCLE_FDS_PREFIX}14,15",
+        f"{worker_trampoline._FD3_SOURCE_PREFIX}",
+        f"{worker_trampoline._EXEC_FD_PREFIX}",
+    ]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux supports execve by fd")
+def test_process_executes_held_executable_inode_without_leaking_its_fd(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    copied_executable = repo / "held-python-executable"
+    shutil.copy2(sys.executable, copied_executable)
+    executable_fd = os.open(copied_executable, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    copied_executable.unlink()
+    try:
+        command = [
+            "/path/that/must-not-be-resolved",
+            "-I",
+            "-c",
+            (
+                "import os, sys; fd=int(sys.argv[1]); "
+                "\ntry: os.fstat(fd)\nexcept OSError: print('fd-exec:closed')"
+                "\nelse: print('fd-exec:leaked')"
+            ),
+            str(executable_fd),
+        ]
+        result = supervisor._run_process(
+            command,
+            "held executable descriptor test",
+            repo,
+            supervisor._child_env(),
+            exec_fd=executable_fd,
+        )
+        assert result["exit_code"] == 0
+        assert result["stdout"].strip() == "fd-exec:closed"
+    finally:
+        os.close(executable_fd)
+
+
+def test_process_rejects_conflicting_exec_descriptor(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    gate_read, gate_write = os.pipe()
+    try:
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "conflicting exec descriptor",
+                repo,
+                supervisor._child_env(),
+                fd3_source=gate_read,
+                exec_fd=gate_read,
+            )
+        assert captured.value.code == "invalid_exec_fd"
+        with pytest.raises(SupervisorError) as fd3_conflict:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "fd 3 destination conflict",
+                repo,
+                supervisor._child_env(),
+                fd3_source=gate_read,
+                exec_fd=3,
+            )
+        assert fd3_conflict.value.code == "invalid_exec_fd"
+    finally:
+        os.close(gate_read)
+        os.close(gate_write)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux execve FD collision")
+def test_process_rejects_exec_fd3_overwritten_by_lifecycle_mapping(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    original_fd3: int | None = None
+    original_fd3_inheritable = False
+    executable_fd: int | None = None
+    gate_read: int | None = None
+    gate_write: int | None = None
+    try:
+        try:
+            original_fd3 = os.dup(3)
+            original_fd3_inheritable = os.get_inheritable(3)
+        except OSError:
+            pass
+        executable_fd = os.open(sys.executable, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        gate_read, gate_write = os.pipe()
+        assert gate_read != 3
+        os.dup2(executable_fd, 3)
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "fd 3 executable/lifecycle collision",
+                repo,
+                supervisor._child_env(),
+                fd3_source=gate_read,
+                exec_fd=3,
+            )
+        assert captured.value.code == "invalid_exec_fd"
+    finally:
+        for descriptor in (gate_read, gate_write):
+            if descriptor is not None:
+                os.close(descriptor)
+        if executable_fd is not None and executable_fd != 3:
+            os.close(executable_fd)
+        if original_fd3 is None:
+            try:
+                os.close(3)
+            except OSError:
+                pass
+        else:
+            os.dup2(original_fd3, 3, inheritable=original_fd3_inheritable)
+            os.close(original_fd3)
+
+
+def test_process_rejects_non_file_exec_descriptor(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    executable_read, executable_write = os.pipe()
+    try:
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "non-file exec descriptor",
+                repo,
+                supervisor._child_env(),
+                exec_fd=executable_read,
+            )
+        assert captured.value.code == "invalid_exec_fd"
+    finally:
+        os.close(executable_read)
+        os.close(executable_write)
+
+
+def test_process_rejects_standard_stream_as_fd3_source(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with pytest.raises(SupervisorError) as captured:
+        supervisor._run_process(
+            [sys.executable, "-c", "pass"],
+            "invalid fd3 mapping",
+            repo,
+            supervisor._child_env(),
+            fd3_source=2,
+        )
+    assert captured.value.code == "invalid_fd3_source"
+
+
+@pytest.mark.parametrize("pass_fd", [3, "source"])
+def test_process_rejects_fd3_source_passthrough_collisions(repo: Path, pass_fd: int | str) -> None:
+    supervisor = GitSupervisor(repo)
+    gate_read, gate_write = os.pipe()
+    if gate_read == 3:
+        moved_read = os.dup(gate_read)
+        os.close(gate_read)
+        gate_read = moved_read
+    try:
+        passthrough = gate_read if pass_fd == "source" else pass_fd
+        with pytest.raises(SupervisorError) as captured:
+            supervisor._run_process(
+                [sys.executable, "-c", "pass"],
+                "conflicting fd3 mapping",
+                repo,
+                supervisor._child_env(),
+                pass_fds=(passthrough,),
+                fd3_source=gate_read,
+            )
+        assert captured.value.code == "invalid_fd3_source"
+    finally:
+        os.close(gate_read)
+        os.close(gate_write)
+
+
 def test_integration_merge_disables_detached_and_blocking_repository_hooks(repo: Path) -> None:
     marker = repo / "post-merge-hook-escaped"
     hook = repo / ".git" / "hooks" / "post-merge"
@@ -3412,6 +4809,222 @@ subprocess.run(["git", "commit", "-m", "contained worker"], check=True)
 
 
 @requires_linux_worker
+def test_worker_payload_waits_for_durable_command_identity_receipt(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = Path(supervisor.state_dir) / f"payload-started-{attempt['id']}"
+    ready_entered = Event()
+    release_ready = Event()
+    original_record = supervisor._record_worker_command_ready
+
+    def block_before_receipt(*arguments, **keywords):
+        ready_entered.set()
+        assert release_ready.wait(timeout=5)
+        return original_record(*arguments, **keywords)
+
+    monkeypatch.setattr(supervisor, "_record_worker_command_ready", block_before_receipt)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,subprocess; "
+            f"pathlib.Path({str(marker)!r}).write_text('ran'); "
+            "pathlib.Path('alpha.txt').write_text('gated worker\\n'); "
+            "subprocess.run(['git','add','alpha.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','gated worker'],check=True)"
+        ),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
+        assert ready_entered.wait(timeout=5)
+        try:
+            assert not marker.exists()
+        finally:
+            release_ready.set()
+        submission = future.result(timeout=10)
+
+    assert submission["status"] == "pending_qc"
+    assert marker.read_text(encoding="utf-8") == "ran"
+    with supervisor.connect() as connection:
+        events = connection.execute(
+            """
+            SELECT sequence, event_type, payload_json FROM events
+            WHERE json_extract(payload_json, '$.attempt_id') = ?
+              AND event_type IN ('worker.command_ready', 'worker.exited')
+            ORDER BY sequence
+            """,
+            (attempt["id"],),
+        ).fetchall()
+    assert [row["event_type"] for row in events] == ["worker.command_ready", "worker.exited"]
+    ready = json.loads(events[0]["payload_json"])
+    exited = json.loads(events[1]["payload_json"])
+    assert events[0]["sequence"] < events[1]["sequence"]
+    assert ready["command_pid"] != ready["monitor_pid"]
+    assert ready["command_pid"] == exited["command_pid"]
+    assert ready["command_identity"] == exited["command_identity"]
+    assert ready["command_digest"] == exited["command_digest"]
+    assert (
+        ready["command_digest"]
+        == hashlib.sha256(
+            json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+    )
+
+
+@requires_linux_worker
+def test_worker_command_receipt_failure_keeps_payload_gated(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = repo / "unrecorded-payload-started"
+
+    def reject_command_receipt(*_arguments, **_keywords):
+        raise SupervisorError("injected_receipt_failure", "injected command receipt failure")
+
+    monkeypatch.setattr(supervisor, "_record_worker_command_ready", reject_command_receipt)
+    command = [
+        sys.executable,
+        "-c",
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')",
+    ]
+    with pytest.raises(SupervisorError, match="injected command receipt failure"):
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert not marker.exists()
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'worker.exited' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+
+
+@requires_linux_worker
+def test_worker_exit_receipt_failure_clears_dead_process_registration(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = Path(attempt["worktree"]) / "payload-ran-before-exit-receipt-failure"
+
+    def reject_exit_receipt(*_arguments, **_keywords):
+        raise SupervisorError("injected_exit_receipt_failure", "injected exit receipt failure")
+
+    monkeypatch.setattr(supervisor, "_record_worker_exit", reject_exit_receipt)
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,subprocess; "
+            f"pathlib.Path({str(marker)!r}).write_text('ran'); "
+            "pathlib.Path('alpha.txt').write_text('worker finished\\n'); "
+            "subprocess.run(['git','add','alpha.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','worker finished'],check=True)"
+        ),
+    ]
+    with pytest.raises(SupervisorError, match="injected exit receipt failure"):
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert marker.read_text(encoding="utf-8") == "ran"
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'worker.exit_receipt_failed' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            is not None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'worker.exited' "
+                "AND json_extract(payload_json, '$.attempt_id') = ?",
+                (attempt["id"],),
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM result_imports WHERE attempt_id = ?", (attempt["id"],)
+            ).fetchone()
+            is None
+        )
+
+
+@requires_linux_worker
+def test_worker_receipt_digest_uses_frozen_caller_argv(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    marker = Path(supervisor.state_dir) / f"argv-snapshot-{attempt['id']}"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,subprocess; "
+            f"pathlib.Path({str(marker)!r}).write_text('frozen'); "
+            "pathlib.Path('alpha.txt').write_text('frozen argv\\n'); "
+            "subprocess.run(['git','add','alpha.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','frozen argv'],check=True)"
+        ),
+    ]
+    frozen_command = tuple(command)
+    original_popen = subprocess.Popen
+    mutated_script = command[2].replace("'frozen'", "'mutated'")
+
+    def mutate_after_trampoline_spawn(*arguments, **keywords):
+        process = original_popen(*arguments, **keywords)
+        argv = arguments[0]
+        if isinstance(argv, list) and any(
+            Path(str(argument)).name == "worker_trampoline.py" for argument in argv
+        ):
+            command[2] = mutated_script
+        return process
+
+    monkeypatch.setattr(
+        "agent_control_plane.git_supervisor.subprocess.Popen", mutate_after_trampoline_spawn
+    )
+    submission = supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert submission["status"] == "pending_qc"
+    assert command[2] == mutated_script
+    assert marker.read_text(encoding="utf-8") == "frozen"
+    with supervisor.connect() as connection:
+        ready = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type = 'worker.command_ready' "
+            "AND json_extract(payload_json, '$.attempt_id') = ?",
+            (attempt["id"],),
+        ).fetchone()
+    payload = json.loads(ready["payload_json"])
+    assert (
+        payload["command_digest"]
+        == hashlib.sha256(
+            json.dumps(list(frozen_command), ensure_ascii=True, separators=(",", ":")).encode(
+                "ascii"
+            )
+        ).hexdigest()
+    )
+
+
+@requires_linux_worker
 def test_registration_failure_terminates_spawned_worker(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4224,10 +5837,24 @@ def test_trust_loss_after_worker_exit_blocks_submission_and_retains_proved_ident
     release_exit = Event()
     original_record_exit = supervisor._record_worker_exit
 
-    def blocked_record_exit(attempt_id: str, pid: int, exit_code: int) -> None:
+    def blocked_record_exit(
+        attempt_id: str,
+        pid: int,
+        exit_code: int,
+        command_pid: int,
+        command_identity: str,
+        command_digest: str,
+    ) -> None:
         worker_exited.set()
         assert release_exit.wait(timeout=5)
-        original_record_exit(attempt_id, pid, exit_code)
+        original_record_exit(
+            attempt_id,
+            pid,
+            exit_code,
+            command_pid,
+            command_identity,
+            command_digest,
+        )
 
     monkeypatch.setattr(supervisor, "_record_worker_exit", blocked_record_exit)
     command = [
@@ -4420,3 +6047,124 @@ def test_trust_pin_invalidated_during_qc_cannot_record_approval(repo: Path) -> N
             "SELECT COUNT(*) FROM qc_runs WHERE submission_id = ?", (submission["id"],)
         ).fetchone()[0]
     assert count == 0
+
+
+@requires_linux_worker
+def test_worker_output_uses_pipe_and_host_log_capture_is_bounded(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    log_path = Path(supervisor.state_dir) / "logs" / f"worker-{attempt['id']}.log"
+    command = f"""
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+
+stdout_target = os.readlink('/proc/self/fd/1')
+log_path = {str(log_path)!r}
+log_fd_present = False
+for descriptor in os.listdir('/proc/self/fd'):
+    try:
+        log_fd_present = log_fd_present or os.readlink(f'/proc/self/fd/{{descriptor}}') == log_path
+    except OSError:
+        pass
+pathlib.Path('alpha.txt').write_text(stdout_target + '\\n' + ('host-log-fd-present' if log_fd_present else 'host-log-fd-absent'))
+subprocess.run(['git', 'add', 'alpha.txt'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.run(['git', 'commit', '-m', 'bounded worker output'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# Bound only the candidate process so a stalled pipe cannot replace pytest's SIGALRM.
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.alarm(15)
+sys.stdout.buffer.write(stdout_target.encode() + b'\\nvisible-prefix\\n')
+for _ in range(9):
+    sys.stdout.buffer.write(b'x' * (1024 * 1024))
+sys.stdout.flush()
+"""
+
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
+
+    assert submission["status"] == "pending_qc"
+    worker_metadata = git(Path(attempt["worktree"]), "show", "HEAD:alpha.txt")
+    assert "pipe:[" in worker_metadata
+    assert "host-log-fd-absent" in worker_metadata
+    log = log_path.read_bytes()
+    assert log.startswith(b"pipe:[")
+    assert b"visible-prefix\n" in log
+    assert b"[ACP worker output truncated at 8 MiB]" in log
+    assert len(log) <= 8 * 1024 * 1024
+
+
+@requires_linux_worker
+def test_worker_output_uses_remaining_attempt_log_budget(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    log_path = Path(supervisor.state_dir) / "logs" / f"worker-{attempt['id']}.log"
+    marker = workers_module._WORKER_LOG_TRUNCATION_MARKER
+    log_prefix = b"previous attempt output\n" * 100
+    log_prefix += b"p" * (workers_module._MAX_WORKER_LOG_BYTES - len(marker) - 16 - len(log_prefix))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_bytes(log_prefix)
+    command = """
+import pathlib
+import subprocess
+import sys
+
+pathlib.Path('alpha.txt').write_text('near-cap output\\n')
+subprocess.run(['git', 'add', 'alpha.txt'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.run(['git', 'commit', '-m', 'near-cap output'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+sys.stdout.buffer.write(b'near-cap-output-is-truncated')
+sys.stdout.flush()
+"""
+
+    submission = supervisor.run_worker(
+        attempt["id"], attempt["claim_token"], [sys.executable, "-c", command]
+    )
+
+    assert submission["status"] == "pending_qc"
+    log = log_path.read_bytes()
+    assert len(log) == workers_module._MAX_WORKER_LOG_BYTES
+    assert log.startswith(log_prefix)
+    assert len(log[len(log_prefix) :]) == 16 + len(marker)
+    assert log.endswith(marker)
+
+
+@pytest.mark.parametrize(
+    "existing_log_size",
+    [
+        pytest.param(
+            workers_module._MAX_WORKER_LOG_BYTES
+            - len(workers_module._WORKER_LOG_TRUNCATION_MARKER)
+            + 1,
+            id="not-enough-room-for-marker",
+        ),
+        pytest.param(workers_module._MAX_WORKER_LOG_BYTES + 1, id="already-over-cap"),
+    ],
+)
+@requires_linux_worker
+def test_worker_launch_fails_closed_when_existing_log_budget_is_exhausted(
+    repo: Path, existing_log_size: int
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    log_path = Path(supervisor.state_dir) / "logs" / f"worker-{attempt['id']}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_log = b"x" * existing_log_size
+    log_path.write_bytes(existing_log)
+    marker = Path(supervisor.state_dir) / f"must-not-launch-{attempt['id']}"
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('started')",
+    ]
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+
+    assert error.value.code == "worker_log_budget_exhausted"
+    assert log_path.read_bytes() == existing_log
+    assert not marker.exists()

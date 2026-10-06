@@ -98,6 +98,26 @@ def test_cli_submit_and_run_accept_a_result_manifest_path() -> None:
     assert run.command == ["python", "worker.py"]
 
 
+def test_cli_prints_operator_reviewable_rootfs_manifest_without_opening_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rootfs = tmp_path / "rootfs"
+    rootfs.mkdir()
+    (rootfs / "tool").write_text("fixture content", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "GitSupervisor",
+        lambda *_args, **_kwargs: pytest.fail("manifest command must not open supervisor state"),
+    )
+
+    assert cli.main(["oci-rootfs-manifest", "--rootfs", str(rootfs)]) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["schema"] == "acp-oci-rootfs-closure-v1"
+    assert output["closure_sha256"]
+    assert "fixture content" not in json.dumps(output)
+
+
 def test_cli_submit_persists_a_bounded_completion_receipt(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     task = _add(repo, "CLI completion receipt", "owned.txt", "--resource", "reports/**")
@@ -607,6 +627,51 @@ def test_cli_plan_queue_and_status_are_read_only_previews(tmp_path: Path) -> Non
     assert text.returncode == 0
     assert "ATTENTION" in text.stdout
     assert "cli-worker" in text.stdout
+
+
+def test_cli_publishes_intent_and_read_only_views_share_the_structured_snapshot(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "intent", "alpha.txt")
+    claimed = json.loads(run_cli(repo, "claim", task["id"], "--agent", "cli-worker").stdout)
+    document = {
+        "version": 1,
+        "responsibility": "Update alpha data flow",
+        "paths": [{"pattern": "alpha.txt", "change": "write"}],
+        "surfaces": [],
+        "depends_on": [],
+        "phase": "planned",
+        "confidence": 0.8,
+    }
+
+    published = run_cli(
+        repo,
+        "intent-publish",
+        claimed["id"],
+        "--token",
+        str(claimed["claim_token"]),
+        "--json",
+        json.dumps(document, separators=(",", ":")),
+    )
+    assert published.returncode == 0, published.stderr
+    assert json.loads(published.stdout)["revision"] == 1
+
+    intents = json.loads(run_cli(repo, "intents").stdout)
+    observed_intents = json.loads(run_cli(repo, "intents", "--observed").stdout)
+    plan = json.loads(run_cli(repo, "plan", _add(repo, "waiting", "beta.txt")["id"]).stdout)
+    status = json.loads(run_cli(repo, "status").stdout)
+    assert intents["active_attempts"][0]["intent"]["responsibility"] == document["responsibility"]
+    assert intents["observation_summary"]["requested"] is False
+    assert observed_intents["observation_summary"]["requested"] is True
+    assert plan["intent_coordination"] == intents
+    assert status["intent_coordination"] == intents
+    assert (
+        json.loads(run_cli(repo, "intent-history", claimed["id"]).stdout)["revisions"][0][
+            "revision"
+        ]
+        == 1
+    )
 
 
 def test_cli_status_read_only_open_does_not_create_git_coordination_state(

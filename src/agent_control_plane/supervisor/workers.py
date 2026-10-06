@@ -10,7 +10,11 @@ every call site, CLI path and `GitSupervisor.<name>` lookup resolves exactly as 
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+import select
 import signal
 import subprocess
 import sys
@@ -19,8 +23,28 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from ..worker_trampoline import LIFECYCLE_FDS_PREFIX, MONITOR_MODE
+from ..worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
+from ..worker_trampoline import MONITOR_MODE as MONITOR_MODE
 from .common import SupervisorError, utc_now
+from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
+
+_MAX_WORKER_LOG_BYTES = 8 * 1024 * 1024
+_WORKER_LOG_TRUNCATION_MARKER = b"\n[ACP worker output truncated at 8 MiB]\n"
+_WORKER_OUTPUT_CHUNK_BYTES = 64 * 1024
+
+
+def _read_worker_output_chunk(
+    output_fd: int, log: Any, remaining_bytes: int
+) -> tuple[int, bool, bool]:
+    """Drain one pipe chunk, retaining only the bounded prefix in the host log."""
+
+    chunk = os.read(output_fd, _WORKER_OUTPUT_CHUNK_BYTES)
+    if not chunk:
+        return 0, False, True
+    retained = chunk[:remaining_bytes]
+    written = log.write(retained) if retained else 0
+    written = written or 0
+    return written, written < len(chunk), False
 
 
 class WorkersMixin:
@@ -34,8 +58,24 @@ class WorkersMixin:
         credential: str | None = None,
         result_manifest_path: str | None = None,
     ) -> dict[str, Any]:
+        from ..worker_trampoline import _monitor_argv_prefix
+
+        # Freeze caller-owned mutable argv before it is logged, expanded into
+        # Popen, or hashed for the pre-exec receipt.
+        command = tuple(command)
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
+        if self.config.oci_runc_executable is not None:
+            raise SupervisorError(
+                "sandbox_executor_unavailable",
+                "sandbox.oci is configured but supervised OCI worker execution is unavailable; refusing host fallback",
+            )
+        # A journaled OCI reservation can survive a supervisor restart or a
+        # configuration change. Reject it before heartbeat/log setup so an
+        # unavailable executor cannot mutate that attempt while refusing it.
+        # This is only a side-effect-free preflight: _reserve_worker_launch
+        # retains the transactional check that arbitrates concurrent claims.
+        self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
         attempt = self.heartbeat(
             attempt_id,
             claim_token,
@@ -57,9 +97,27 @@ class WorkersMixin:
             process: subprocess.Popen[bytes] | None = None
             handshake_read = -1
             handshake_write = -1
+            target_read = -1
+            target_write = -1
+            start_read = -1
+            start_write = -1
+            output_fd: int | None = None
+            output_open = False
+            output_bytes_written = 0
+            output_truncated = False
+            log_bytes_existing = os.fstat(log.fileno()).st_size
+            log_bytes_available = _MAX_WORKER_LOG_BYTES - log_bytes_existing
+            if log_bytes_available < len(_WORKER_LOG_TRUNCATION_MARKER):
+                raise SupervisorError(
+                    "worker_log_budget_exhausted",
+                    "existing worker log leaves no room for the bounded output notice",
+                )
+            output_bytes_budget = log_bytes_available - len(_WORKER_LOG_TRUNCATION_MARKER)
             launch_reserved = False
             try:
                 handshake_read, handshake_write = os.pipe()
+                target_read, target_write = os.pipe()
+                start_read, start_write = os.pipe()
                 self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
                 launch_reserved = True
                 trampoline = Path(__file__).parent.with_name("worker_trampoline.py").resolve()
@@ -68,28 +126,32 @@ class WorkersMixin:
                         sys.executable,
                         "-I",
                         str(trampoline),
-                        str(handshake_read),
-                        "-1",
-                        "-1",
-                        MONITOR_MODE,
-                        LIFECYCLE_FDS_PREFIX,
+                        *_monitor_argv_prefix(handshake_read, target_write, start_read, (), None),
                         *command,
                     ],
                     cwd=attempt["worktree"],
-                    stdout=log,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
-                    pass_fds=(handshake_read,),
+                    pass_fds=(handshake_read, target_write, start_read),
                     env=worker_env,
                 )
+                if process.stdout is None:
+                    raise SupervisorError(
+                        "worker_output_unavailable", "worker output pipe was not created"
+                    )
+                output_fd = process.stdout.fileno()
+                output_open = True
                 process_identity = self._process_identity(process.pid)
                 if process_identity is None:
                     raise SupervisorError(
                         "worker_identity_unavailable",
                         "worker kernel identity could not be recorded",
                     )
-                os.close(handshake_read)
-                handshake_read = -1
+                for descriptor in (handshake_read, target_write, start_read):
+                    os.close(descriptor)
+                handshake_read = target_write = start_read = -1
                 launch_fenced = False
                 with self.connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
@@ -172,31 +234,108 @@ class WorkersMixin:
                         "worker_launch_fenced",
                         "trust quarantine fenced the worker before launch authorization",
                     )
-                # Revalidate after the kernel identity is durable but before the
-                # handshake authorizes candidate code. If the pin disappeared,
-                # quarantine retains this PID until the monitor is reaped.
+                # The first gate releases only the trusted monitor. Its child
+                # blocks before exec while ACP records the exact command PID and
+                # start identity; candidate code remains unable to run.
                 self._verify_attempt_trust(attempt_id)
                 os.write(handshake_write, b"G")
                 os.close(handshake_write)
                 handshake_write = -1
+                ready, _, _ = select.select([target_read], [], [], 3)
+                raw_target = os.read(target_read, 32) if ready else b""
+                if not re.fullmatch(rb"[1-9][0-9]*\n", raw_target):
+                    raise SupervisorError(
+                        "worker_identity_unavailable",
+                        "worker monitor did not report its blocked command identity",
+                    )
+                command_pid = int(raw_target)
+                command_identity = self._process_identity(command_pid)
+                if command_identity is None:
+                    raise SupervisorError(
+                        "worker_identity_unavailable",
+                        "worker command kernel identity could not be recorded before exec",
+                    )
+                os.close(target_read)
+                target_read = -1
+                command_digest = self._record_worker_command_ready(
+                    attempt_id,
+                    claim_token,
+                    process.pid,
+                    process_identity,
+                    command_pid,
+                    command_identity,
+                    command,
+                    credential,
+                )
+                # Revalidate after both monitor and command identities are
+                # durable, but before the second gate authorizes candidate code.
+                self._verify_attempt_trust(attempt_id)
+                os.write(start_write, b"G")
+                os.close(start_write)
+                start_write = -1
                 interval = max(2, min(10, self.config.lease_seconds // 3))
-                while True:
-                    try:
-                        process.wait(timeout=interval)
-                        break
-                    except subprocess.TimeoutExpired:
+                heartbeat_at = time.monotonic() + interval
+                while process.poll() is None:
+                    timeout = max(0.0, min(0.1, heartbeat_at - time.monotonic()))
+                    readable, _, _ = select.select(
+                        [output_fd] if output_open and output_fd is not None else [],
+                        [],
+                        [],
+                        timeout,
+                    )
+                    if readable and output_fd is not None:
+                        written, truncated, eof = _read_worker_output_chunk(
+                            output_fd,
+                            log,
+                            output_bytes_budget - output_bytes_written,
+                        )
+                        output_bytes_written += written
+                        output_truncated = output_truncated or truncated
+                        output_open = output_open and not eof
+                    if time.monotonic() >= heartbeat_at:
                         self.heartbeat(
                             attempt_id,
                             claim_token,
                             None,
                             credential=credential,
                         )
+                        heartbeat_at = time.monotonic() + interval
+                process.wait()
+                # Collect any bytes already buffered when the monitor exited,
+                # but do not wait for an escaped writer to close the pipe.
+                drain_until = time.monotonic() + 0.25
+                while output_open and output_fd is not None and time.monotonic() < drain_until:
+                    readable, _, _ = select.select([output_fd], [], [], 0)
+                    if not readable:
+                        break
+                    written, truncated, eof = _read_worker_output_chunk(
+                        output_fd,
+                        log,
+                        output_bytes_budget - output_bytes_written,
+                    )
+                    output_bytes_written += written
+                    output_truncated = output_truncated or truncated
+                    output_open = output_open and not eof
+                if output_truncated and log_bytes_available >= len(_WORKER_LOG_TRUNCATION_MARKER):
+                    log.write(_WORKER_LOG_TRUNCATION_MARKER)
+                log.flush()
+                if process.stdout is not None:
+                    process.stdout.close()
             except BaseException:
-                for descriptor in (handshake_read, handshake_write):
+                for descriptor in (
+                    handshake_read,
+                    handshake_write,
+                    target_read,
+                    target_write,
+                    start_read,
+                    start_write,
+                ):
                     if descriptor >= 0:
                         os.close(descriptor)
                 if process is not None:
                     self._stop_kernel_monitor(process)
+                    if process.stdout is not None:
+                        process.stdout.close()
                 if launch_reserved:
                     self._clear_worker_registration(
                         attempt_id,
@@ -218,7 +357,23 @@ class WorkersMixin:
                 "worker_failed",
                 f"worker exited {process.returncode}; log: {log_path}",
             )
-        self._record_worker_exit(attempt_id, process.pid, process.returncode)
+        try:
+            self._record_worker_exit(
+                attempt_id,
+                process.pid,
+                process.returncode,
+                command_pid,
+                command_identity,
+                command_digest,
+            )
+        except BaseException:
+            self._clear_worker_registration(
+                attempt_id,
+                {process.pid},
+                "worker.exit_receipt_failed",
+                process.returncode,
+            )
+            raise
         try:
             submit_options = {
                 "expected_worker_pid": process.pid,
@@ -235,6 +390,30 @@ class WorkersMixin:
                 process.returncode,
             )
             raise
+
+    def _preflight_direct_worker_launch(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None,
+    ) -> None:
+        """Reject an existing sandbox reservation before direct-launch side effects.
+
+        This does not reserve the attempt slot: a concurrent sandbox reservation
+        may still win after this read. `_reserve_worker_launch` remains the
+        authoritative atomic check immediately before host process creation.
+        """
+
+        with self.connect() as connection:
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            if connection.execute(
+                "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone():
+                raise SupervisorError(
+                    "sandbox_execution_reserved",
+                    "a journaled sandbox execution owns this attempt slot",
+                )
 
     def _reserve_worker_launch(
         self,
@@ -258,6 +437,13 @@ class WorkersMixin:
                 raise SupervisorError(
                     "worker_already_running",
                     "this attempt already has a launching or running worker",
+                )
+            if connection.execute(
+                "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone():
+                raise SupervisorError(
+                    "sandbox_execution_reserved",
+                    "a journaled sandbox execution owns this attempt slot",
                 )
             changed = connection.execute(
                 """
@@ -421,6 +607,11 @@ class WorkersMixin:
 
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if not _sandbox_execution_cleanup_is_verified(connection, attempt_id):
+                raise SupervisorError(
+                    "sandbox_cleanup_unverified",
+                    "OCI execution cleanup is not independently verified; worker identity remains fenced",
+                )
             attempt = connection.execute(
                 "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
             ).fetchone()
@@ -474,7 +665,71 @@ class WorkersMixin:
             )
             return target
 
-    def _record_worker_exit(self, attempt_id: str, pid: int, exit_code: int) -> None:
+    def _record_worker_command_ready(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        monitor_pid: int,
+        monitor_identity: str,
+        command_pid: int,
+        command_identity: str,
+        command: Sequence[str],
+        credential: str | None,
+    ) -> str:
+        """Persist the blocked command identity before releasing its exec gate."""
+
+        command_digest = hashlib.sha256(
+            json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest()
+        if (
+            command_pid < 1
+            or command_pid == monitor_pid
+            or type(command_identity) is not str
+            or re.fullmatch(rf"linux:{command_pid}:[0-9]+", command_identity) is None
+            or self._process_identity(command_pid) != command_identity
+        ):
+            raise SupervisorError(
+                "worker_identity_unavailable",
+                "blocked worker command identity is missing or changed before exec",
+            )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            if (
+                attempt["pid"] != monitor_pid
+                or attempt["pid_identity"] != monitor_identity
+                or self._process_identity(monitor_pid) != monitor_identity
+            ):
+                raise SupervisorError(
+                    "worker_registration_lost",
+                    "worker monitor identity changed before command authorization",
+                )
+            self._event(
+                connection,
+                "worker.command_ready",
+                attempt["agent_id"],
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "monitor_pid": monitor_pid,
+                    "monitor_identity": monitor_identity,
+                    "command_pid": command_pid,
+                    "command_identity": command_identity,
+                    "command_digest": command_digest,
+                },
+            )
+        return command_digest
+
+    def _record_worker_exit(
+        self,
+        attempt_id: str,
+        pid: int,
+        exit_code: int,
+        command_pid: int,
+        command_identity: str,
+        command_digest: str,
+    ) -> None:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = connection.execute(
@@ -485,14 +740,65 @@ class WorkersMixin:
                     "worker_registration_lost",
                     "worker PID ownership changed before submission",
                 )
+            if not attempt["pid_identity"]:
+                raise SupervisorError(
+                    "worker_identity_unavailable",
+                    "worker exit cannot be tied to a recorded kernel identity",
+                )
+            if (
+                command_pid < 1
+                or command_pid == pid
+                or type(command_identity) is not str
+                or type(command_digest) is not str
+                or re.fullmatch(rf"linux:{command_pid}:[0-9]+", command_identity) is None
+                or re.fullmatch(r"[0-9a-f]{64}", command_digest) is None
+            ):
+                raise SupervisorError(
+                    "worker_identity_unavailable",
+                    "worker command identity or digest is malformed",
+                )
+            ready = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE event_type = 'worker.command_ready'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.claim_token') = ?
+                  AND json_extract(payload_json, '$.monitor_pid') = ?
+                  AND json_extract(payload_json, '$.monitor_identity') = ?
+                  AND json_extract(payload_json, '$.command_pid') = ?
+                  AND json_extract(payload_json, '$.command_identity') = ?
+                  AND json_extract(payload_json, '$.command_digest') = ?
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (
+                    attempt_id,
+                    attempt["claim_token"],
+                    pid,
+                    attempt["pid_identity"],
+                    command_pid,
+                    command_identity,
+                    command_digest,
+                ),
+            ).fetchone()
+            if ready is None:
+                raise SupervisorError(
+                    "worker_identity_unavailable",
+                    "worker exit has no durable pre-exec command identity record",
+                )
             self._event(
                 connection,
                 "worker.exited",
                 attempt["agent_id"],
                 {
                     "attempt_id": attempt_id,
+                    "claim_token": attempt["claim_token"],
                     "pid": pid,
+                    "pid_identity": attempt["pid_identity"],
+                    "command_pid": command_pid,
+                    "command_identity": command_identity,
+                    "command_digest": command_digest,
                     "exit_code": exit_code,
+                    "observed_by": "supervisor_popen_wait",
                 },
             )
 

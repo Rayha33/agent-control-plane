@@ -35,8 +35,10 @@ acp-trust-helper = "agent_control_plane.trust_helper:main"
 dev = [
   "httpx2>=2.12,<3",
   "httpx>=0.28,<1",
+  "jsonschema>=4.26,<5",
   "pytest-cov>=7,<8",
   "pytest>=9.0.3,<10",
+  "referencing>=0.30.2,<1",
   "ruff>=0.15.8,<0.16",
 ]
 

@@ -43,6 +43,7 @@ WRITE_METHODS = {
     "runtime_down",
     "runtime_restart",
     "ratify_reviewers",
+    "publish_intent",
 }
 
 
@@ -124,7 +125,14 @@ def test_no_tool_reaches_a_method_that_takes_a_credential() -> None:
 
 
 def test_no_write_tool_is_exposed(repo: Path) -> None:
-    for name in ("acp_claim", "acp_submit", "acp_heartbeat", "acp_integrate", "acp_gc"):
+    for name in (
+        "acp_claim",
+        "acp_submit",
+        "acp_heartbeat",
+        "acp_integrate",
+        "acp_gc",
+        "acp_publish_intent",
+    ):
         assert body(call(repo, name))["error"] == "unknown_tool"
 
 

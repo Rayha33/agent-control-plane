@@ -61,6 +61,7 @@ wedge.
 | Fenced side effects | Database schema/migration, deploy namespace, and artifact/tag mutations require the live task and resource fencing tokens and emit durable, credential-free receipts |
 | Runner authentication | Worker, critic, and integrator credentials are role-scoped and attempts bind to the credential version that claimed them |
 | Overlap preview | A dry-run claim reports exact and potential scope collisions, and who owns them, before an agent starts |
+| Revisable agent intent | Claim-fenced, append-only declarations expose changing file/symbol/API/schema plans, dependencies, overlap, and server-observed paths without changing scheduling authority |
 | Dependency scheduling | Declared and artifact producer/consumer edges gate claims and order a deterministic ready queue |
 | Merge scheduling | Approved submissions get an ordering preview, shared-path conflict prediction, and staleness when the base moves |
 | Operator status | One read-only screen ranks what needs a human, what failed cleanup, what is running, and backing-filesystem capacity |
@@ -152,7 +153,7 @@ pinned CI runner and a newer operator install, say:
   contract could approve work the newer contract rejects. It now stops with
   `schema_newer_than_binary` and tells you to upgrade acp.
 - **Only commands that admit they mutate will upgrade one.** `plan`, `queue`,
-  `merge-plan`, `status`, `wait`, `show`, `reviewers`, `bundle` and `verify-events` open
+  `merge-plan`, `status`, `wait`, `show`, `intents`, `intent-history`, `reviewers`, `bundle` and `verify-events` open
   `mode=ro`. Against a database that is behind, they report
   `schema_upgrade_required` and leave the file byte for byte as they found it.
 
@@ -422,6 +423,53 @@ also cannot account for work that has not reached an approved submission.
 All four planning commands are read-only. Unlike <code>claim</code> and
 <code>list</code>, they never reap: looking at the board does not orphan an
 agent's attempt.
+
+### Revisable agent intent
+
+Static task resources reserve write scopes. Intent is the separate, revisable
+coordination signal an agent can publish after exploration and before or during
+edits. It records the worker's own responsibility, likely paths, named symbols
+or interfaces, dependencies, phase, and confidence. It does not infer intent
+from prompts or code and never blocks a claim, cancels work, or orders merges.
+
+Publish a version-1 JSON document with the current attempt id and fencing token:
+
+~~~bash
+uv run --extra dev acp intent-publish ATTEMPT_ID --token CLAIM_TOKEN --json \
+  '{"version":1,"responsibility":"Update the API model","paths":[{"pattern":"src/api/**","change":"write"}],"surfaces":[{"kind":"schema","name":"UserRecord","change":"additive"}],"depends_on":["schema:Account"],"phase":"planned","confidence":0.75}'
+~~~
+
+Each accepted publication appends an immutable revision. A stale/expired
+attempt cannot revise it. `acp intents` returns the same structured active view
+included by `plan`, `queue`, and `status`; `acp intent-history ATTEMPT_ID`
+retains revisions after the attempt is terminal. The read-only MCP tools
+`acp_intents` and `acp_intent_history` expose those same views without a worker
+credential. History is paged (25 revisions by default, maximum 50 per page);
+use `--after-revision` to continue a long lineage.
+
+Intent coordination in the shared `plan`, `queue`, and `status` views (and plain
+`acp intents`) does not run its per-attempt changed-path Git scans by default;
+those entries say `observed.status=not_requested`. Other status sections may
+perform their own Git reads, including worktree inventory and read-resource
+checks. Request the intent changed-path scan explicitly with `acp intents
+--observed` or `acp_intents` with `include_observed=true`. It considers at most
+eight attempts and applies a shared two-second deadline to the Git queries.
+Filesystem path validation and OS process startup are synchronous and cannot be
+forcibly interrupted; if the deadline is exhausted, the result is unavailable or
+not sampled rather than reported as clean. The comparison includes at most 256
+active attempts and caps overlap/dependency analysis at 100,000 comparisons or
+1,000 results. Each section carries a `complete`/`truncated` summary so partial
+coverage cannot be mistaken for no conflicts. Identical scope entries are
+normalized away.
+
+Overlaps name both owners and classify read/read, advisory read/write,
+conflicting write, or explicitly shared ownership. Dependencies can point to a
+declared `kind:name` surface across different paths; matches are shown with
+compatibility `not_assessed`. Missing, incomplete, stale, or unparseable
+declarations remain explicit `unknown`, never "no conflict." The intent is
+shown separately from changed paths ACP derives from the attempt worktree's Git
+state when explicitly requested; those observations do not include semantic
+review or prove merge safety.
 
 ## Operator status
 

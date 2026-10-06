@@ -27,6 +27,7 @@ from .common import (
     SupervisorError,
     utc_now,
 )
+from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
 
 
 class ReaperMixin:
@@ -1034,6 +1035,44 @@ class ReaperMixin:
                     "WHERE attempt_id = ?",
                     (CLEANUP_FENCE_EPOCH, stamp, attempt["id"]),
                 )
+                if not _sandbox_execution_cleanup_is_verified(connection, attempt["id"]):
+                    phase = connection.execute(
+                        "SELECT phase FROM sandbox_executions WHERE attempt_id = ?",
+                        (attempt["id"],),
+                    ).fetchone()["phase"]
+                    connection.execute(
+                        "UPDATE attempts SET termination_target_status = 'quarantined', "
+                        "updated_at = ? WHERE id = ?",
+                        (stamp, attempt["id"]),
+                    )
+                    connection.execute(
+                        "UPDATE tasks SET status = 'cleanup_pending', "
+                        "cleanup_target_status = 'blocked', "
+                        "cleanup_error = ?, updated_at = ? "
+                        "WHERE id = ? AND current_attempt_id = ?",
+                        (
+                            "sandbox execution cleanup is not independently verified; "
+                            "attempt and resources remain fenced",
+                            stamp,
+                            attempt["task_id"],
+                            attempt["id"],
+                        ),
+                    )
+                    if (
+                        attempt["status"] != "terminating"
+                        or attempt["termination_target_status"] != "quarantined"
+                    ):
+                        self._event(
+                            connection,
+                            "sandbox.execution_cleanup_held",
+                            "reaper",
+                            {
+                                "attempt_id": attempt["id"],
+                                "claim_token": attempt["claim_token"],
+                                "phase": phase,
+                            },
+                        )
+                    continue
                 cleanup_attempts.add(attempt["id"])
                 if attempt["pid"] and attempt["pid"] > 0 and not attempt["termination_proof"]:
                     workers_to_stop.append((attempt["id"], attempt["pid"], attempt["pid_identity"]))
@@ -1072,6 +1111,8 @@ class ReaperMixin:
                     submission["attempt_id"] if submission else row["current_attempt_id"]
                 )
                 if cleanup_attempt_id:
+                    if not _sandbox_execution_cleanup_is_verified(connection, cleanup_attempt_id):
+                        continue
                     task_cleanups[row["id"]] = cleanup_attempt_id
                     if row["status"] != "cleanup_pending":
                         self._fence_task_cleanup(
@@ -1100,7 +1141,11 @@ class ReaperMixin:
                 """,
                 (epoch,),
             ).fetchall()
-            cleanup_attempts.update(row["attempt_id"] for row in expired_runtime)
+            cleanup_attempts.update(
+                row["attempt_id"]
+                for row in expired_runtime
+                if _sandbox_execution_cleanup_is_verified(connection, row["attempt_id"])
+            )
         terminated_workers: list[dict[str, Any]] = []
         workers = {attempt_id: (pid, identity) for attempt_id, pid, identity in workers_to_stop}
         runtime_cleanup: list[dict[str, Any]] = []
@@ -1350,6 +1395,11 @@ class ReaperMixin:
     ) -> str | None:
         """Release reservations only after durable runtime-release proof."""
 
+        if not _sandbox_execution_cleanup_is_verified(connection, attempt_id):
+            raise SupervisorError(
+                "sandbox_cleanup_unverified",
+                "OCI execution cleanup is not independently verified; task reservations remain fenced",
+            )
         task = connection.execute(
             "SELECT status, cleanup_target_status FROM tasks WHERE id = ?",
             (task_id,),

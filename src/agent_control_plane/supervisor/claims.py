@@ -14,6 +14,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -28,6 +29,26 @@ from typing import Any
 
 from ..scheduling import declared_read_resources, declared_resources, normalize_artifact
 from .common import SUBMISSION_OBJECT_CONTRACT, SupervisorError, canonical_json, sha256, utc_now
+from .result_import import (
+    CandidateTree,
+    build_candidate_tree,
+    candidate_commit_object,
+    candidate_commit_payload,
+    candidate_ref_target,
+    candidate_tree_object_ids,
+    cleanup_candidate_object_temps,
+    missing_candidate_objects,
+    promote_candidate_objects,
+    publish_candidate_ref,
+    remove_unreachable_candidate_objects,
+    result_ref_name,
+    verify_candidate_objects,
+)
+from .sandbox_execution_journal import (
+    _require_direct_worker_result_source,
+    _require_sandbox_execution_result_eligible,
+)
+from .sandbox_workspace import ChangeSet, Snapshot
 from .schema import META_CASE_SENSITIVE
 
 _READ_RESOURCE_MAX_PATHS = 10_000
@@ -39,13 +60,20 @@ _RESULT_ARTIFACT_MAX_COUNT = 16
 _RESULT_ARTIFACT_MAX_PATH_BYTES = 1024
 _RESULT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
 _RESULT_ARTIFACT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
+_RESULT_IMPORT_STAGE_MAX_BYTES = 512 * 1024 * 1024
+_RESULT_IMPORT_STAGING_TOTAL_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class ClaimsMixin:
     """Claiming a task, heartbeats, the write-set guard and submission."""
 
-    def _git_readonly_bytes_bounded(self, *arguments: str, max_bytes: int) -> bytes:
+    def _git_readonly_bytes_bounded(
+        self, *arguments: str, max_bytes: int, timeout_seconds: float = 10.0
+    ) -> bytes:
         """Read a sanitized Git query without buffering an unbounded tree listing."""
+        if timeout_seconds <= 0:
+            raise SupervisorError("git_timeout", "read-only Git query timed out")
+        deadline = time.monotonic() + timeout_seconds
         git = str(self._system_git_executable(self.root))
         argv = [
             *self._supervisor_git_prefix(git, Path(os.devnull)),
@@ -90,7 +118,6 @@ class ClaimsMixin:
         reader = threading.Thread(target=drain_stdout, daemon=True)
         reader.start()
         output = bytearray()
-        deadline = time.monotonic() + 10
         try:
             while not reader_done.is_set() or not chunks.empty():
                 remaining = deadline - time.monotonic()
@@ -1404,7 +1431,14 @@ class ClaimsMixin:
             f"cannot safely fingerprint base checkout path {display}",
         )
 
-    def _open_snapshot_directory(self, parent_fd: int, name: str, display: bytes) -> int:
+    def _open_snapshot_directory(
+        self,
+        parent_fd: int,
+        name: str,
+        display: bytes,
+        *,
+        within_snapshot_root: bool = True,
+    ) -> int:
         descriptor = -1
         try:
             before_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1427,16 +1461,21 @@ class ClaimsMixin:
             if descriptor >= 0:
                 os.close(descriptor)
             raise self._snapshot_path_error(display) from None
-        if self._stat_identity(before_path) != self._stat_identity(opened) or self._stat_identity(
-            opened
-        ) != self._stat_identity(after_path):
+        identity = (
+            self._stat_identity if within_snapshot_root else self._snapshot_directory_identity
+        )
+        if identity(before_path) != identity(opened) or identity(opened) != identity(after_path):
             os.close(descriptor)
             raise self._snapshot_path_error(display)
         return descriptor
 
     def _open_snapshot_root(
-        self, root_real: Path, display: bytes
-    ) -> tuple[int, list[int], list[tuple[int, str, int]]]:
+        self,
+        root_real: Path,
+        display: bytes,
+        *,
+        expected_root_identity: tuple[int, int, int, int, int] | None = None,
+    ) -> tuple[int, list[int], list[tuple[int, str, int, bool]]]:
         if not root_real.is_absolute():
             raise self._snapshot_path_error(display)
         flags = (
@@ -1450,13 +1489,26 @@ class ClaimsMixin:
         except (OSError, RuntimeError, TypeError, ValueError):
             raise self._snapshot_path_error(display) from None
         descriptors = [descriptor]
-        directories: list[tuple[int, str, int]] = []
+        directories: list[tuple[int, str, int, bool]] = []
         try:
-            for component in root_real.parts[1:]:
+            components = root_real.parts[1:]
+            for index, component in enumerate(components):
+                within_snapshot_root = index == len(components) - 1
                 parent_fd = descriptors[-1]
-                child_fd = self._open_snapshot_directory(parent_fd, component, display)
+                child_fd = self._open_snapshot_directory(
+                    parent_fd,
+                    component,
+                    display,
+                    within_snapshot_root=within_snapshot_root,
+                )
                 descriptors.append(child_fd)
-                directories.append((parent_fd, component, child_fd))
+                directories.append((parent_fd, component, child_fd, within_snapshot_root))
+            if (
+                expected_root_identity is not None
+                and self._snapshot_directory_identity(os.fstat(descriptors[-1]))
+                != expected_root_identity
+            ):
+                raise self._snapshot_path_error(display)
         except Exception:
             for opened_fd in reversed(descriptors):
                 os.close(opened_fd)
@@ -1464,13 +1516,18 @@ class ClaimsMixin:
         return descriptors[-1], descriptors, directories
 
     def _verify_snapshot_directories(
-        self, directories: list[tuple[int, str, int]], display: bytes
+        self, directories: list[tuple[int, str, int, bool]], display: bytes
     ) -> None:
         try:
-            for parent_fd, name, child_fd in directories:
+            for parent_fd, name, child_fd, within_snapshot_root in directories:
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 opened = os.fstat(child_fd)
-                if self._stat_identity(current) != self._stat_identity(opened):
+                identity = (
+                    self._stat_identity
+                    if within_snapshot_root
+                    else self._snapshot_directory_identity
+                )
+                if identity(current) != identity(opened):
                     raise self._snapshot_path_error(display)
         except SupervisorError:
             raise
@@ -1478,7 +1535,12 @@ class ClaimsMixin:
             raise self._snapshot_path_error(display) from None
 
     def _fingerprint_base_path(
-        self, root_real: Path, relative: bytes, display: bytes
+        self,
+        root_real: Path,
+        relative: bytes,
+        display: bytes,
+        *,
+        expected_root_identity: tuple[int, int, int, int, int] | None = None,
     ) -> dict[str, Any]:
         components = relative.split(b"/")
         if not components or any(part in {b"", b".", b".."} for part in components):
@@ -1490,13 +1552,17 @@ class ClaimsMixin:
             raise self._snapshot_path_error(display)
         if os.path.isabs(decoded[0]) or os.path.splitdrive(decoded[0])[0]:
             raise self._snapshot_path_error(display)
-        _root_fd, descriptors, directories = self._open_snapshot_root(root_real, display)
+        if expected_root_identity is None:
+            expected_root_identity = self._snapshot_root_identity(root_real, display)
+        _root_fd, descriptors, directories = self._open_snapshot_root(
+            root_real, display, expected_root_identity=expected_root_identity
+        )
         try:
             for component in decoded[:-1]:
                 parent_fd = descriptors[-1]
                 child_fd = self._open_snapshot_directory(parent_fd, component, display)
                 descriptors.append(child_fd)
-                directories.append((parent_fd, component, child_fd))
+                directories.append((parent_fd, component, child_fd, True))
             parent_fd = descriptors[-1]
             leaf = decoded[-1]
             before_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
@@ -1564,7 +1630,7 @@ class ClaimsMixin:
             if stat.S_ISDIR(before_path.st_mode):
                 child_fd = self._open_snapshot_directory(parent_fd, leaf, display)
                 descriptors.append(child_fd)
-                directories.append((parent_fd, leaf, child_fd))
+                directories.append((parent_fd, leaf, child_fd, True))
                 self._verify_snapshot_directories(directories, display)
                 metadata = os.fstat(child_fd)
                 return {"kind": "directory", "mode": stat.S_IMODE(metadata.st_mode)}
@@ -1584,6 +1650,45 @@ class ClaimsMixin:
             metadata.st_ctime_ns,
         )
 
+    @staticmethod
+    def _snapshot_directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+        """Identity of a path-prefix directory outside the checkout snapshot.
+
+        Sibling worktrees and concurrent tests routinely create entries beneath
+        shared temporary-directory ancestors. That changes directory size and
+        timestamps without replacing the path component. Compare stable object
+        and access-control identity there; retain full metadata checks from the
+        checkout root downward, where entry changes can race the snapshot.
+        """
+
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+        )
+
+    def _snapshot_root_identity(
+        self, root_real: Path, display: bytes
+    ) -> tuple[int, int, int, int, int]:
+        try:
+            metadata = os.stat(root_real, follow_symlinks=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise self._snapshot_path_error(display) from None
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise self._snapshot_path_error(display)
+        return self._snapshot_directory_identity(metadata)
+
+    def _verify_snapshot_root_identity(
+        self,
+        root_real: Path,
+        expected: tuple[int, int, int, int, int],
+        display: bytes,
+    ) -> None:
+        if self._snapshot_root_identity(root_real, display) != expected:
+            raise self._snapshot_path_error(display)
+
     def _snapshot_checkout_repository(
         self,
         root: Path,
@@ -1601,6 +1706,7 @@ class ClaimsMixin:
                     "base_checkout_uninspectable", "nested Git checkout depth exceeds the limit"
                 )
             ancestors = ancestors | {real_root}
+            root_identity = self._snapshot_root_identity(real_root, os.fsencode(real_root))
             self._assert_safe_git_execution_config(real_root, snapshot_only=True)
             reported_root = self._git_bytes(
                 "-C",
@@ -1617,6 +1723,7 @@ class ClaimsMixin:
                     "base_checkout_uninspectable",
                     "nested Git checkout root does not match its source path",
                 )
+            self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
             status_raw = self._git_bytes(
                 "-C",
                 str(root),
@@ -1626,7 +1733,9 @@ class ClaimsMixin:
                 "--untracked-files=all",
                 "--ignore-submodules=none",
             )
+            self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
             index_raw = self._git_bytes("-C", str(root), "ls-files", "--stage", "-z")
+            self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
         except SupervisorError as error:
             if error.code in {
                 "base_checkout_uninspectable",
@@ -1705,7 +1814,12 @@ class ClaimsMixin:
         entries: dict[str, str] = {}
         for path in sorted(set(index) | set(status)):
             display = prefix + path
-            fingerprint = self._fingerprint_base_path(real_root, path, display)
+            fingerprint = self._fingerprint_base_path(
+                real_root,
+                path,
+                display,
+                expected_root_identity=root_identity,
+            )
             index_entries = sorted(index.get(path, []))
             modes = {entry.split(" ", 1)[0] for entry in index_entries}
             target = root.joinpath(*(os.fsdecode(part) for part in path.split(b"/")))
@@ -1731,7 +1845,8 @@ class ClaimsMixin:
             }
             entries[self._snapshot_path_key(display)] = sha256(canonical_json(entry).encode())
 
-        return {"format": 1, "entries": entries}
+        self._verify_snapshot_root_identity(real_root, root_identity, os.fsencode(real_root))
+        return {"format": 2, "root_identity": list(root_identity), "entries": entries}
 
     def _capture_base_checkout_snapshot(self) -> dict[str, Any]:
         return self._snapshot_checkout_repository(self.root)
@@ -1788,11 +1903,28 @@ class ClaimsMixin:
             raise SupervisorError(
                 "base_checkout_snapshot_invalid", "claim-time base checkout snapshot is unreadable"
             ) from None
-        if not isinstance(baseline, dict) or baseline.get("format") != 1:
+        snapshot_format = baseline.get("format") if isinstance(baseline, dict) else None
+        if not isinstance(baseline, dict) or snapshot_format not in {1, 2}:
             raise SupervisorError(
                 "base_checkout_snapshot_invalid", "claim-time base checkout snapshot is unsupported"
             )
         current = self._capture_base_checkout_snapshot()
+        if snapshot_format == 2:
+            root_identity = baseline.get("root_identity")
+            if (
+                not isinstance(root_identity, list)
+                or len(root_identity) != 5
+                or any(type(value) is not int for value in root_identity)
+            ):
+                raise SupervisorError(
+                    "base_checkout_snapshot_invalid",
+                    "claim-time base checkout root identity is unreadable",
+                )
+            if root_identity != current.get("root_identity"):
+                raise SupervisorError(
+                    "base_checkout_mutated",
+                    "base checkout root identity changed since attempt claim",
+                )
         old_entries = baseline.get("entries")
         new_entries = current["entries"]
         if not isinstance(old_entries, dict):
@@ -1838,6 +1970,1575 @@ class ClaimsMixin:
             result_manifest_path=result_manifest_path,
         )
 
+    @staticmethod
+    def _worker_exit_receipt_in(
+        connection: sqlite3.Connection,
+        attempt: sqlite3.Row,
+        expected_pid: int,
+    ) -> str:
+        """Return the hash-chained supervisor wait receipt for this exact worker."""
+
+        identity = attempt["pid_identity"]
+        if (
+            attempt["pid"] != expected_pid
+            or expected_pid < 1
+            or re.fullmatch(rf"linux:{expected_pid}:[0-9]+", identity or "") is None
+        ):
+            raise SupervisorError(
+                "worker_registration_lost",
+                "result import has no exact registered worker process identity",
+            )
+        try:
+            row = connection.execute(
+                """
+                SELECT id, event_hash, created_at, payload_json, sequence FROM events
+                WHERE event_type = 'worker.exited'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.claim_token') = ?
+                  AND json_extract(payload_json, '$.pid') = ?
+                  AND json_extract(payload_json, '$.pid_identity') = ?
+                  AND json_extract(payload_json, '$.observed_by') = 'supervisor_popen_wait'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (attempt["id"], attempt["claim_token"], expected_pid, identity),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            raise SupervisorError(
+                "worker_exit_receipt_invalid", "worker exit audit record is unreadable"
+            ) from None
+        if row is None:
+            raise SupervisorError(
+                "worker_not_exited", "supervisor has no wait receipt for this worker identity"
+            )
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            raise SupervisorError(
+                "worker_exit_receipt_invalid", "worker exit audit record is malformed"
+            ) from None
+        command_pid = payload.get("command_pid")
+        command_identity = payload.get("command_identity")
+        command_digest = payload.get("command_digest")
+        if (
+            type(command_pid) is not int
+            or command_pid < 1
+            or command_pid == expected_pid
+            or type(command_identity) is not str
+            or type(command_digest) is not str
+            or re.fullmatch(rf"linux:{command_pid}:[0-9]+", command_identity) is None
+            or re.fullmatch(r"[0-9a-f]{64}", command_digest) is None
+        ):
+            raise SupervisorError(
+                "worker_exit_receipt_invalid",
+                "worker exit audit record lacks a valid pre-exec command identity",
+            )
+        try:
+            ready = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE event_type = 'worker.command_ready'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.claim_token') = ?
+                  AND json_extract(payload_json, '$.monitor_pid') = ?
+                  AND json_extract(payload_json, '$.monitor_identity') = ?
+                  AND json_extract(payload_json, '$.command_pid') = ?
+                  AND json_extract(payload_json, '$.command_identity') = ?
+                  AND json_extract(payload_json, '$.command_digest') = ?
+                  AND sequence < ?
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (
+                    attempt["id"],
+                    attempt["claim_token"],
+                    expected_pid,
+                    identity,
+                    command_pid,
+                    command_identity,
+                    command_digest,
+                    row["sequence"],
+                ),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            raise SupervisorError(
+                "worker_exit_receipt_invalid", "worker command identity record is unreadable"
+            ) from None
+        if ready is None:
+            raise SupervisorError(
+                "worker_exit_receipt_invalid",
+                "worker exit has no matching durable pre-exec command identity record",
+            )
+        if type(payload.get("exit_code")) is not int or payload["exit_code"] != 0:
+            raise SupervisorError("worker_failed", "worker did not exit successfully")
+        return canonical_json(
+            {
+                "event_id": row["id"],
+                "event_hash": row["event_hash"],
+                "created_at": row["created_at"],
+                "payload": payload,
+            }
+        )
+
+    def _assert_result_import_worktree_base_locked(
+        self, attempt: sqlite3.Row, base_sha: str
+    ) -> None:
+        """Prove the exact registered attempt worktree is still clean at its base."""
+
+        worktree = Path(attempt["worktree"])
+        root = (
+            Path(attempt["worktree_root"])
+            if attempt["worktree_root"]
+            else (self.state_dir / "worktrees").resolve(strict=False)
+        )
+        if (
+            not self._attempt_worktree_is_managed(attempt["id"], worktree, root)
+            or worktree.is_symlink()
+        ):
+            raise SupervisorError(
+                "result_import_worktree_invalid", "registered attempt worktree identity is invalid"
+            )
+        try:
+            canonical = str(worktree.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            raise SupervisorError(
+                "result_import_worktree_invalid", "registered attempt worktree is unavailable"
+            ) from None
+
+        def git(*arguments: str) -> str:
+            result = self._run_git_while_locked(*arguments)
+            if result.returncode:
+                raise SupervisorError(
+                    "result_import_worktree_invalid", "registered attempt Git state is unreadable"
+                )
+            return result.stdout.decode("utf-8", errors="strict").rstrip("\r\n")
+
+        registered = self._parse_registered_worktrees(git("worktree", "list", "--porcelain", "-z"))
+        if registered.get(canonical) != attempt["branch"]:
+            raise SupervisorError(
+                "result_import_worktree_invalid", "attempt path is not registered to its branch"
+            )
+        top = Path(git("-C", canonical, "rev-parse", "--show-toplevel")).resolve(strict=True)
+        common = Path(
+            git("-C", canonical, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ).resolve(strict=True)
+        expected_common = Path(self._git_common_dir).resolve(strict=True)
+        branch = git("-C", canonical, "branch", "--show-current")
+        head = git("-C", canonical, "rev-parse", "--verify", "HEAD")
+        status = self._run_git_while_locked("-C", canonical, "status", "--porcelain=v1", "-z")
+        if (
+            top != Path(canonical)
+            or common != expected_common
+            or branch != attempt["branch"]
+            or head != base_sha
+            or status.returncode != 0
+            or status.stdout
+        ):
+            raise SupervisorError(
+                "stale_worker_result",
+                "registered attempt worktree is not clean at the recorded base",
+            )
+
+    def _result_import_staging_root(self, *, create: bool = False) -> Path:
+        state_root = self.state_dir.resolve(strict=True)
+        root = state_root / "result-import-staging"
+        if root.is_symlink():
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging root must not be a symlink"
+            )
+        try:
+            if create:
+                root.mkdir(mode=0o700, exist_ok=True)
+                if os.name != "nt":
+                    self._fsync_result_import_directory(state_root)
+            resolved = root.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging root is unavailable"
+            ) from error
+        if resolved != root or not resolved.is_dir():
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging root identity is invalid"
+            )
+        return resolved
+
+    def _result_import_stage_path(self, import_id: str, *, create: bool = False) -> Path:
+        try:
+            if str(uuid.UUID(import_id)) != import_id:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError):
+            raise SupervisorError(
+                "invalid_worker_result", "result stage identity is invalid"
+            ) from None
+        root = self._result_import_staging_root(create=create)
+        stage = root / import_id
+        if stage.is_symlink():
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result import stage must not be a symlink"
+            )
+        if create:
+            try:
+                stage.mkdir(mode=0o700)
+                (stage / "objects").mkdir(mode=0o700)
+            except FileExistsError:
+                raise SupervisorError(
+                    "result_import_staging_unavailable",
+                    "result import stage already exists without a matching journal",
+                ) from None
+            except OSError as error:
+                raise SupervisorError(
+                    "result_import_staging_unavailable", "result import stage could not be created"
+                ) from error
+        return stage
+
+    @staticmethod
+    def _parse_result_import_object_ids(raw: str, object_id_length: int) -> tuple[str, ...] | None:
+        try:
+            values = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(values, list) or any(
+            not isinstance(value, str)
+            or re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", value) is None
+            for value in values
+        ):
+            return None
+        if values != sorted(set(values)):
+            return None
+        return tuple(values)
+
+    def _result_import_stage_size(self, root: Path) -> int:
+        total = 0
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        try:
+            for current, directories, files in os.walk(root, followlinks=False, onerror=fail_walk):
+                current_path = Path(current)
+                for name in directories:
+                    path = current_path / name
+                    if path.is_symlink():
+                        raise SupervisorError(
+                            "result_import_staging_unavailable", "staging tree contains a symlink"
+                        )
+                for name in files:
+                    path = current_path / name
+                    if path.is_symlink():
+                        raise SupervisorError(
+                            "result_import_staging_unavailable", "staging tree contains a symlink"
+                        )
+                    total += path.stat(follow_symlinks=False).st_size
+        except OSError as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "staging size could not be measured"
+            ) from error
+        return total
+
+    def _fsync_result_import_stage(self, root: Path) -> None:
+        """Flush the exact staged object files before the SQLite journal can name them."""
+
+        directories: list[Path] = []
+
+        def fail_walk(error: OSError) -> None:
+            raise error
+
+        try:
+            for current, child_directories, files in os.walk(
+                root, followlinks=False, onerror=fail_walk
+            ):
+                current_path = Path(current)
+                directories.append(current_path)
+                for name in (*child_directories, *files):
+                    if (current_path / name).is_symlink():
+                        raise OSError("staging tree contains a symlink")
+                for name in files:
+                    descriptor = os.open(current_path / name, os.O_RDONLY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            if os.name != "nt":
+                for directory in reversed(directories):
+                    descriptor = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                self._fsync_result_import_directory(root.parent)
+        except OSError as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "staged Git objects could not be flushed"
+            ) from error
+
+    @staticmethod
+    def _fsync_result_import_directory(directory: Path) -> None:
+        if os.name == "nt":
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(directory, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _cleanup_result_import_staging_locked(self) -> None:
+        """Remove only unjournaled/terminal private stages and proven unreachable owned blobs."""
+
+        root = self._result_import_staging_root(create=True)
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM result_imports").fetchall()
+        by_id = {row["id"]: row for row in rows}
+
+        try:
+            entries = tuple(os.scandir(root))
+        except OSError as error:
+            raise SupervisorError(
+                "result_import_staging_unavailable", "result staging directory could not be listed"
+            ) from error
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                if str(uuid.UUID(entry.name)) != entry.name:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            row = by_id.get(entry.name)
+            if row is not None and row["phase"] == "prepared":
+                recorded_path = row["staging_path"]
+                if recorded_path and Path(recorded_path) == root / entry.name:
+                    continue
+            if row is not None and row["phase"] not in {"ref_published", "submitted", "ambiguous"}:
+                continue
+            target = root / entry.name
+            if target.is_symlink() or target.parent != root:
+                continue
+            try:
+                shutil.rmtree(target)
+            except OSError as error:
+                raise SupervisorError(
+                    "result_import_staging_unavailable",
+                    "terminal private result stage could not be removed",
+                ) from error
+
+        cleanup_rows = [
+            row
+            for row in rows
+            if row["phase"] == "ambiguous"
+            and row["staging_path"]
+            and Path(row["staging_path"]) == root / row["id"]
+        ]
+        if not cleanup_rows:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+
+        prepared_events = self._result_import_prepared_events_locked(cleanup_rows)
+        if prepared_events is None:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+
+        object_format_result = self._run_git_while_locked("rev-parse", "--show-object-format")
+        if object_format_result.returncode:
+            return
+        object_format = object_format_result.stdout.decode("ascii", errors="strict").strip()
+        if object_format not in {"sha1", "sha256"}:
+            return
+        object_id_length = 64 if object_format == "sha256" else 40
+
+        protected: set[str] = set()
+        terminal_rows: list[sqlite3.Row] = []
+        inventory_valid = True
+        git_executable = self._system_git_executable(self.root)
+        cleanup_import_ids = {row["id"] for row in cleanup_rows}
+        promote_inventory_by_import: dict[str, tuple[str, ...]] = {}
+        for row in cleanup_rows:
+            object_ids = self._parse_result_import_object_ids(
+                row["object_ids_json"] or "[]", object_id_length
+            )
+            promote_ids = self._parse_result_import_object_ids(
+                row["promote_object_ids_json"] or "[]", object_id_length
+            )
+            if (
+                object_ids is None
+                or promote_ids is None
+                or not set(promote_ids).issubset(object_ids)
+                or row["tree_sha"] not in object_ids
+                or row["commit_sha"] not in object_ids
+                or not self._prepared_result_import_event_matches(
+                    row, object_ids, promote_ids, prepared_events.get(row["id"])
+                )
+            ):
+                completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+                self._clear_result_import_staging_paths(completed_rows)
+                return
+            promote_inventory_by_import[row["id"]] = promote_ids
+
+        for row in rows:
+            object_ids = self._parse_result_import_object_ids(
+                row["object_ids_json"] or "[]", object_id_length
+            )
+            promote_ids = self._parse_result_import_object_ids(
+                row["promote_object_ids_json"] or "[]", object_id_length
+            )
+            if object_ids is None or promote_ids is None:
+                if row["phase"] != "ambiguous":
+                    inventory_valid = False
+                continue
+            if row["phase"] == "ambiguous":
+                if row["id"] in cleanup_import_ids:
+                    cleanup_candidate_object_temps(
+                        self.root,
+                        row["id"],
+                        promote_inventory_by_import[row["id"]],
+                        git_executable=git_executable,
+                    )
+                    if not (root / row["id"]).exists() and not (root / row["id"]).is_symlink():
+                        terminal_rows.append(row)
+            else:
+                protected.update(object_ids)
+                if not object_ids:
+                    try:
+                        protected.update(
+                            candidate_tree_object_ids(
+                                self.root,
+                                row["tree_sha"],
+                                git_executable=git_executable,
+                            )
+                        )
+                    except SupervisorError:
+                        inventory_valid = False
+                if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", row["commit_sha"]):
+                    protected.add(row["commit_sha"])
+        if not inventory_valid:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+        reachable = self._result_import_reachable_objects_locked(object_id_length)
+        if reachable is None:
+            completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+            self._clear_result_import_staging_paths(completed_rows)
+            return
+        for row in cleanup_rows:
+            remove_unreachable_candidate_objects(
+                self.root,
+                promote_inventory_by_import[row["id"]],
+                protected_object_ids=protected,
+                reachable_object_ids=reachable,
+                git_executable=git_executable,
+            )
+        completed_rows = self._cleanup_completed_result_stages_locked(rows, root)
+        self._clear_result_import_staging_paths([*completed_rows, *terminal_rows])
+
+    def _result_import_prepared_events_locked(
+        self, rows: Sequence[sqlite3.Row]
+    ) -> dict[str, dict[str, Any]] | None:
+        """Load prepared event provenance only from an intact audit chain."""
+
+        payloads: dict[str, dict[str, Any]] = {}
+        with self.connect() as connection:
+            if not self._verify_event_chain(connection)["ok"]:
+                return None
+            for row in rows:
+                events = connection.execute(
+                    "SELECT payload_json FROM events WHERE event_type = ? "
+                    "AND json_extract(payload_json, '$.import_id') = ?",
+                    ("worker.result_import_prepared", row["id"]),
+                ).fetchall()
+                if len(events) != 1:
+                    return None
+                try:
+                    payload = json.loads(events[0]["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                if not isinstance(payload, dict):
+                    return None
+                payloads[row["id"]] = payload
+        return payloads
+
+    @staticmethod
+    def _prepared_result_import_event_matches(
+        row: sqlite3.Row,
+        object_ids: Sequence[str],
+        promote_ids: Sequence[str],
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        if payload is None:
+            return False
+        expected = {
+            "import_id": row["id"],
+            "attempt_id": row["attempt_id"],
+            "claim_token": row["claim_token"],
+            "worker_pid": row["worker_pid"],
+            "worker_identity": row["worker_identity"],
+            "worker_exit_receipt_digest": sha256(row["worker_exit_receipt_json"].encode("utf-8")),
+            "result_digest": row["result_digest"],
+            "tree_sha": row["tree_sha"],
+            "commit_sha": row["commit_sha"],
+            "result_ref": row["result_ref"],
+            "staging_path": row["staging_path"],
+            "object_inventory_digest": sha256(canonical_json(list(object_ids)).encode("utf-8")),
+            "promotion_inventory_digest": sha256(canonical_json(list(promote_ids)).encode("utf-8")),
+            "promotion_object_count": len(promote_ids),
+        }
+        return all(payload.get(key) == value for key, value in expected.items())
+
+    @staticmethod
+    def _cleanup_completed_result_stages_locked(
+        rows: Sequence[sqlite3.Row], root: Path
+    ) -> list[sqlite3.Row]:
+        """Return completed imports whose canonical private stage is already absent."""
+
+        completed: list[sqlite3.Row] = []
+        for row in rows:
+            if row["phase"] not in {"ref_published", "submitted"}:
+                continue
+            if not row["staging_path"] or Path(row["staging_path"]) != root / row["id"]:
+                continue
+            stage = root / row["id"]
+            if stage.exists() or stage.is_symlink():
+                continue
+            completed.append(row)
+        return completed
+
+    def _clear_result_import_staging_paths(self, rows: Sequence[sqlite3.Row]) -> None:
+        if not rows:
+            return
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for import_id in sorted({row["id"] for row in rows}):
+                current = connection.execute(
+                    "SELECT attempt_id, claim_token, result_digest, phase, staging_path "
+                    "FROM result_imports WHERE id = ?",
+                    (import_id,),
+                ).fetchone()
+                if (
+                    current is None
+                    or not current["staging_path"]
+                    or current["phase"] not in {"ref_published", "submitted", "ambiguous"}
+                ):
+                    continue
+                connection.execute(
+                    "UPDATE result_imports SET staging_path = '' WHERE id = ?",
+                    (import_id,),
+                )
+                self._event(
+                    connection,
+                    "worker.result_import_stage_cleaned",
+                    "recovery",
+                    {
+                        "import_id": import_id,
+                        "attempt_id": current["attempt_id"],
+                        "claim_token": current["claim_token"],
+                        "result_digest": current["result_digest"],
+                        "phase": current["phase"],
+                    },
+                )
+
+    def _result_import_reachable_objects_locked(self, object_id_length: int) -> set[str] | None:
+        """Read refs, reflogs, every registered worktree HEAD, and every worktree index."""
+
+        listed = self._run_git_while_locked("worktree", "list", "--porcelain", "-z")
+        if listed.returncode:
+            return None
+        try:
+            worktrees = self._parse_registered_worktrees(
+                listed.stdout.decode("utf-8", errors="surrogateescape")
+            )
+        except (UnicodeError, ValueError):
+            return None
+        if not worktrees:
+            return None
+        heads: set[str] = set()
+        indexed: set[str] = set()
+        for worktree_text in worktrees:
+            worktree = Path(worktree_text)
+            if worktree.is_symlink() or not worktree.is_dir():
+                return None
+            head = self._run_git_while_locked(
+                "-C", str(worktree), "rev-parse", "--verify", "HEAD^{commit}"
+            )
+            if head.returncode:
+                return None
+            head_id = head.stdout.decode("ascii", errors="strict").strip()
+            if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", head_id) is None:
+                return None
+            heads.add(head_id)
+            index = self._run_git_while_locked("-C", str(worktree), "ls-files", "--stage", "-z")
+            if index.returncode:
+                return None
+            for record in index.stdout.split(b"\0"):
+                if not record:
+                    continue
+                metadata, separator, _path = record.partition(b"\t")
+                fields = metadata.split(b" ")
+                if not separator or len(fields) != 3:
+                    return None
+                try:
+                    object_id = fields[1].decode("ascii", errors="strict")
+                except UnicodeDecodeError:
+                    return None
+                if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", object_id) is None:
+                    return None
+                indexed.add(object_id)
+
+        arguments = (
+            "rev-list",
+            "--objects",
+            "--all",
+            "--reflog",
+            "--no-object-names",
+            *sorted(heads),
+        )
+        reachable_result = self._run_git_while_locked(*arguments)
+        if reachable_result.returncode:
+            return None
+        reachable = set(indexed)
+        for line in reachable_result.stdout.splitlines():
+            if not line:
+                continue
+            try:
+                object_id = line.split(maxsplit=1)[0].decode("ascii", errors="strict")
+            except UnicodeDecodeError:
+                return None
+            if re.fullmatch(rf"[0-9a-f]{{{object_id_length}}}", object_id) is None:
+                return None
+            reachable.add(object_id)
+        return reachable
+
+    def import_worker_result(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        baseline: Snapshot,
+        change_set: ChangeSet,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Journal and submit a direct worker result without mutating the checkout."""
+
+        return self._import_host_validated_result(
+            attempt_id,
+            claim_token,
+            baseline,
+            change_set,
+            credential=credential,
+            source_kind="direct_worker",
+        )
+
+    def import_sandbox_execution_result(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Capture and import only the durable sandbox workspace after verified cleanup."""
+
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM result_imports WHERE attempt_id = ? AND claim_token = ? "
+                "AND source_kind = 'sandbox_execution'",
+                (attempt_id, claim_token),
+            ).fetchall()
+        if existing:
+            if len(existing) != 1:
+                raise SupervisorError(
+                    "result_import_ambiguous", "sandbox execution has conflicting result journals"
+                )
+            return self.recover_worker_result_import(existing[0]["id"], credential=credential)
+
+        with self.connect() as connection:
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            source = self._sandbox_execution_result_import_source(
+                connection, attempt_id, claim_token
+            )
+            if attempt["pid"] is not None or attempt["pid_identity"]:
+                raise SupervisorError(
+                    "sandbox_result_source_mismatch",
+                    "sandbox result import cannot alias a direct worker PID identity",
+                )
+
+        captured = self._sandbox_execution_capture_result_candidate(
+            attempt_id, claim_token, credential=credential
+        )
+        baseline = captured["baseline"]
+        change_set = captured["change_set"]
+        import_digest = sha256(
+            canonical_json(
+                {
+                    "baseline_digest": change_set.baseline_digest,
+                    "result_digest": change_set.result_digest,
+                    "change_digest": change_set.digest,
+                }
+            ).encode("utf-8")
+        )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            current_source = self._sandbox_execution_result_import_source(
+                connection, attempt_id, claim_token
+            )
+            if current_source != source or attempt["pid"] is not None or attempt["pid_identity"]:
+                raise SupervisorError(
+                    "sandbox_result_source_mismatch",
+                    "sandbox identity or cleanup receipt changed during result capture",
+                )
+            self._sandbox_execution_require_result_candidate_matches(
+                connection,
+                attempt_id,
+                baseline_digest=baseline.manifest.digest,
+                import_digest=import_digest,
+                change_digest=change_set.digest,
+            )
+
+        return self._import_host_validated_result(
+            attempt_id,
+            claim_token,
+            baseline,
+            change_set,
+            credential=credential,
+            source_kind="sandbox_execution",
+            sandbox_execution_id=source["execution_id"],
+            sandbox_cleanup_receipt_digest=source["cleanup_receipt_digest"],
+        )
+
+    def _import_host_validated_result(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        baseline: Snapshot,
+        change_set: ChangeSet,
+        *,
+        credential: str | None,
+        source_kind: str,
+        sandbox_execution_id: str | None = None,
+        sandbox_cleanup_receipt_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the common host-built import with source-specific journal evidence."""
+
+        if type(baseline) is not Snapshot or type(change_set) is not ChangeSet:
+            raise SupervisorError("invalid_worker_result", "snapshot or change set is invalid")
+        if source_kind not in {"direct_worker", "sandbox_execution"}:
+            raise SupervisorError("invalid_worker_result", "result source kind is invalid")
+        if source_kind == "direct_worker" and (
+            sandbox_execution_id is not None or sandbox_cleanup_receipt_digest is not None
+        ):
+            raise SupervisorError("invalid_worker_result", "direct result source is inconsistent")
+        if source_kind == "sandbox_execution" and (
+            not isinstance(sandbox_execution_id, str)
+            or not sandbox_execution_id
+            or not isinstance(sandbox_cleanup_receipt_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sandbox_cleanup_receipt_digest) is None
+        ):
+            raise SupervisorError("invalid_worker_result", "sandbox result source is incomplete")
+        baseline.manifest.validate()
+        change_set.validate()
+        if change_set.baseline_digest != baseline.manifest.digest:
+            raise SupervisorError(
+                "invalid_worker_result", "change set is not bound to the supplied baseline"
+            )
+        result_digest = sha256(
+            canonical_json(
+                {
+                    "baseline_digest": baseline.manifest.digest,
+                    "result_digest": change_set.result_digest,
+                    "change_digest": change_set.digest,
+                }
+            ).encode("utf-8")
+        )
+        reference = result_ref_name(attempt_id, claim_token, result_digest)
+        import_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"acp-worker-result:{attempt_id}:{claim_token}:{result_digest}",
+            )
+        )
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT id FROM result_imports WHERE attempt_id = ? "
+                "AND claim_token = ? AND result_digest = ?",
+                (attempt_id, claim_token, result_digest),
+            ).fetchone()
+        if existing is not None:
+            if existing["id"] != import_id:
+                self._mark_result_import_ambiguous(
+                    existing["id"], "result journal ID is not its deterministic identity"
+                )
+                raise SupervisorError(
+                    "result_import_ambiguous", "result journal identity is inconsistent"
+                )
+            return self.recover_worker_result_import(import_id, credential=credential)
+
+        self._assert_safe_git_execution_config()
+        self._assert_no_git_grafts()
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            _require_sandbox_execution_result_eligible(connection, attempt_id)
+            if source_kind == "direct_worker":
+                _require_direct_worker_result_source(connection, attempt_id)
+            else:
+                source = self._sandbox_execution_result_import_source(
+                    connection, attempt_id, claim_token
+                )
+                if (
+                    source["execution_id"] != sandbox_execution_id
+                    or source["cleanup_receipt_digest"] != sandbox_cleanup_receipt_digest
+                    or attempt["pid"] is not None
+                    or attempt["pid_identity"]
+                ):
+                    raise SupervisorError(
+                        "sandbox_result_source_mismatch",
+                        "sandbox source identity changed before result import",
+                    )
+            self._sandbox_execution_require_result_candidate_matches(
+                connection,
+                attempt_id,
+                baseline_digest=baseline.manifest.digest,
+                import_digest=result_digest,
+                change_digest=change_set.digest,
+            )
+            if not attempt["base_checkout_snapshot_required"]:
+                raise SupervisorError(
+                    "base_checkout_snapshot_invalid",
+                    "result import requires a claim-time checkout snapshot",
+                )
+            task = self._task_row(connection, attempt["task_id"])
+            if source_kind == "direct_worker":
+                worker_pid = attempt["pid"]
+                if worker_pid is None or worker_pid < 1:
+                    raise SupervisorError(
+                        "worker_registration_lost", "result import has no registered worker PID"
+                    )
+                worker_identity = attempt["pid_identity"]
+                exit_receipt = self._worker_exit_receipt_in(connection, attempt, worker_pid)
+            else:
+                worker_pid = None
+                worker_identity = ""
+                exit_receipt = ""
+            self._assert_base_checkout_unchanged(
+                connection,
+                attempt_id,
+                attempt["base_checkout_snapshot_json"],
+                bool(attempt["base_checkout_snapshot_required"]),
+            )
+            rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
+            attempt_snapshot = dict(attempt)
+            base_sha = task["base_sha"]
+
+        git_executable = self._system_git_executable(self.root)
+        with self._git_operation_guard():
+            self._cleanup_result_import_staging_locked()
+            journal_id = import_id
+            with self.connect() as connection:
+                existing = connection.execute(
+                    "SELECT id FROM result_imports WHERE attempt_id = ? "
+                    "AND claim_token = ? AND result_digest = ?",
+                    (attempt_id, claim_token, result_digest),
+                ).fetchone()
+            if existing:
+                if existing["id"] != import_id:
+                    self._mark_result_import_ambiguous(
+                        existing["id"], "result journal ID is not its deterministic identity"
+                    )
+                    raise SupervisorError(
+                        "result_import_ambiguous", "result journal identity is inconsistent"
+                    )
+                journal_id = existing["id"]
+            else:
+                self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
+                staging_root = self._result_import_staging_root()
+                existing_stage_bytes = self._result_import_stage_size(staging_root)
+                if (
+                    existing_stage_bytes
+                    > _RESULT_IMPORT_STAGING_TOTAL_MAX_BYTES - _RESULT_IMPORT_STAGE_MAX_BYTES
+                ):
+                    raise SupervisorError(
+                        "result_import_storage_limit",
+                        "bounded result-import staging capacity is exhausted",
+                    )
+                stage_path = self._result_import_stage_path(import_id, create=True)
+                stage_objects = stage_path / "objects"
+                common_objects = Path(self._git_common_dir).resolve(strict=True) / "objects"
+                candidate = build_candidate_tree(
+                    attempt_snapshot["worktree"],
+                    baseline,
+                    change_set,
+                    base_sha=base_sha,
+                    write_set_rules=rules,
+                    object_directory=stage_objects,
+                    alternate_object_directory=common_objects,
+                    git_executable=git_executable,
+                )
+                self._assert_result_import_worktree_base_locked(attempt_snapshot, base_sha)
+                committed_at = int(time.time())
+                payload = candidate_commit_payload(
+                    candidate,
+                    attempt_id=attempt_id,
+                    claim_token=claim_token,
+                    result_digest=result_digest,
+                    committed_at=committed_at,
+                )
+                commit_sha = candidate_commit_object(
+                    attempt_snapshot["worktree"],
+                    payload,
+                    write=False,
+                    object_directory=stage_objects,
+                    git_executable=git_executable,
+                )
+                written_commit = candidate_commit_object(
+                    attempt_snapshot["worktree"],
+                    payload,
+                    write=True,
+                    object_directory=stage_objects,
+                    git_executable=git_executable,
+                )
+                if written_commit != commit_sha:
+                    raise SupervisorError(
+                        "candidate_tree_failed", "staged result commit hash changed while writing"
+                    )
+                self._fsync_result_import_stage(stage_path)
+                object_ids = tuple(sorted({*candidate.object_ids, commit_sha}))
+                promote_ids = missing_candidate_objects(
+                    attempt_snapshot["worktree"],
+                    object_ids,
+                    git_executable=git_executable,
+                )
+                stage_bytes = self._result_import_stage_size(stage_path)
+                total_stage_bytes = self._result_import_stage_size(
+                    self._result_import_staging_root()
+                )
+                if (
+                    stage_bytes > _RESULT_IMPORT_STAGE_MAX_BYTES
+                    or total_stage_bytes > _RESULT_IMPORT_STAGING_TOTAL_MAX_BYTES
+                ):
+                    shutil.rmtree(stage_path)
+                    raise SupervisorError(
+                        "result_import_storage_limit",
+                        "bounded result-import staging capacity is exhausted",
+                    )
+                stamp = utc_now()
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = self._active_attempt(
+                        connection, attempt_id, claim_token, int(time.time())
+                    )
+                    self._authenticate_attempt(connection, current, credential)
+                    _require_sandbox_execution_result_eligible(connection, attempt_id)
+                    if source_kind == "direct_worker":
+                        _require_direct_worker_result_source(connection, attempt_id)
+                        current_receipt = self._worker_exit_receipt_in(
+                            connection, current, worker_pid
+                        )
+                        source_changed = (
+                            current["pid_identity"] != attempt_snapshot["pid_identity"]
+                            or current_receipt != exit_receipt
+                        )
+                    else:
+                        current_source = self._sandbox_execution_result_import_source(
+                            connection, attempt_id, claim_token
+                        )
+                        source_changed = (
+                            current_source["execution_id"] != sandbox_execution_id
+                            or current_source["cleanup_receipt_digest"]
+                            != sandbox_cleanup_receipt_digest
+                            or current["pid"] is not None
+                            or current["pid_identity"]
+                        )
+                    self._sandbox_execution_require_result_candidate_matches(
+                        connection,
+                        attempt_id,
+                        baseline_digest=baseline.manifest.digest,
+                        import_digest=result_digest,
+                        change_digest=change_set.digest,
+                    )
+                    if (
+                        source_changed
+                        or self._task_row(connection, current["task_id"])["base_sha"] != base_sha
+                    ):
+                        raise SupervisorError(
+                            "stale_worker_result",
+                            "worker, sandbox, or task fence changed during result import",
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO result_imports
+                          (id, attempt_id, claim_token, source_kind, worker_pid,
+                           worker_identity, worker_exit_receipt_json, sandbox_execution_id,
+                           sandbox_cleanup_receipt_digest, base_sha, tree_sha,
+                           baseline_digest, result_digest, change_digest, result_ref,
+                           commit_timestamp, commit_sha, phase, staging_path, object_ids_json,
+                           promote_object_ids_json, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                'prepared', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            import_id,
+                            attempt_id,
+                            claim_token,
+                            source_kind,
+                            worker_pid,
+                            worker_identity,
+                            exit_receipt,
+                            sandbox_execution_id,
+                            sandbox_cleanup_receipt_digest,
+                            base_sha,
+                            candidate.tree_sha,
+                            candidate.baseline_digest,
+                            result_digest,
+                            candidate.change_digest,
+                            reference,
+                            committed_at,
+                            commit_sha,
+                            str(stage_path),
+                            canonical_json(list(object_ids)),
+                            canonical_json(list(promote_ids)),
+                            stamp,
+                            stamp,
+                        ),
+                    )
+                    self._event(
+                        connection,
+                        "worker.result_import_prepared",
+                        current["agent_id"],
+                        {
+                            "import_id": import_id,
+                            "attempt_id": attempt_id,
+                            "claim_token": claim_token,
+                            "source_kind": source_kind,
+                            "worker_pid": worker_pid,
+                            "worker_identity": worker_identity,
+                            "worker_exit_receipt_digest": (
+                                sha256(exit_receipt.encode("utf-8"))
+                                if source_kind == "direct_worker"
+                                else ""
+                            ),
+                            "sandbox_execution_id": sandbox_execution_id,
+                            "sandbox_cleanup_receipt_digest": sandbox_cleanup_receipt_digest,
+                            "result_digest": result_digest,
+                            "tree_sha": candidate.tree_sha,
+                            "commit_sha": commit_sha,
+                            "result_ref": reference,
+                            "staging_path": str(stage_path),
+                            "object_inventory_digest": sha256(
+                                canonical_json(list(object_ids)).encode("utf-8")
+                            ),
+                            "promotion_inventory_digest": sha256(
+                                canonical_json(list(promote_ids)).encode("utf-8")
+                            ),
+                            "promotion_object_count": len(promote_ids),
+                        },
+                    )
+
+        return self.recover_worker_result_import(journal_id, credential=credential)
+
+    def _require_result_import_source_in(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        attempt: sqlite3.Row | None = None,
+    ) -> None:
+        """Revalidate immutable source identity and its live authorization gate."""
+
+        attempt_id = row["attempt_id"]
+        _require_sandbox_execution_result_eligible(connection, attempt_id)
+        if row["source_kind"] == "direct_worker":
+            if (
+                row["sandbox_execution_id"] is not None
+                or row["sandbox_cleanup_receipt_digest"] is not None
+            ):
+                raise SupervisorError(
+                    "result_import_ambiguous", "direct result journal contains sandbox identity"
+                )
+            _require_direct_worker_result_source(connection, attempt_id)
+            return
+        if row["source_kind"] != "sandbox_execution":
+            raise SupervisorError("result_import_ambiguous", "result journal source is invalid")
+        source = self._sandbox_execution_result_import_source(
+            connection, attempt_id, row["claim_token"]
+        )
+        if (
+            row["worker_pid"] is not None
+            or row["worker_identity"] != ""
+            or row["worker_exit_receipt_json"] != ""
+            or source["execution_id"] != row["sandbox_execution_id"]
+            or source["cleanup_receipt_digest"] != row["sandbox_cleanup_receipt_digest"]
+            or (attempt is not None and (attempt["pid"] is not None or attempt["pid_identity"]))
+        ):
+            raise SupervisorError(
+                "sandbox_result_source_mismatch",
+                "sandbox result journal does not match the exact verified execution source",
+            )
+        self._sandbox_execution_require_result_candidate_matches(
+            connection,
+            attempt_id,
+            baseline_digest=row["baseline_digest"],
+            import_digest=row["result_digest"],
+            change_digest=row["change_digest"],
+        )
+
+    @staticmethod
+    def _mark_result_import_ambiguous_in(
+        connection: sqlite3.Connection, import_id: str, error: str
+    ) -> None:
+        connection.execute(
+            "UPDATE result_imports SET phase = 'ambiguous', error = ?, updated_at = ? "
+            "WHERE id = ? AND phase != 'submitted'",
+            (error[:1000], utc_now(), import_id),
+        )
+
+    def _mark_result_import_ambiguous(self, import_id: str, error: str) -> None:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt_id, claim_token, result_digest, phase FROM result_imports "
+                "WHERE id = ?",
+                (import_id,),
+            ).fetchone()
+            if not row or row["phase"] == "submitted":
+                return
+            self._mark_result_import_ambiguous_in(connection, import_id, error)
+            self._event(
+                connection,
+                "worker.result_import_ambiguous",
+                "recovery",
+                {
+                    "import_id": import_id,
+                    "attempt_id": row["attempt_id"],
+                    "claim_token": row["claim_token"],
+                    "result_digest": row["result_digest"],
+                    "error": error[:1000],
+                },
+            )
+
+    def recover_worker_result_import(
+        self,
+        import_id: str,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Reconcile only the exact journaled commit/ref; stale claims stay fenced."""
+
+        self._assert_safe_git_execution_config()
+        self._assert_no_git_grafts()
+        with self.connect() as connection:
+            preflight_row = connection.execute(
+                "SELECT * FROM result_imports WHERE id = ?",
+                (import_id,),
+            ).fetchone()
+            if preflight_row is not None:
+                preflight_attempt = connection.execute(
+                    "SELECT * FROM attempts WHERE id = ?", (preflight_row["attempt_id"],)
+                ).fetchone()
+                if preflight_attempt is not None:
+                    self._authenticate_attempt(connection, preflight_attempt, credential)
+                    self._require_result_import_source_in(
+                        connection, preflight_row, preflight_attempt
+                    )
+        # Missing/corrupt journals still need bounded orphan-stage cleanup before
+        # the existing not-found/ambiguous checks below.
+        with self._git_operation_guard():
+            self._cleanup_result_import_staging_locked()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM result_imports WHERE id = ?", (import_id,)
+            ).fetchone()
+            if row is None:
+                raise SupervisorError("result_import_not_found", "result import journal is missing")
+            attempt_row = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (row["attempt_id"],)
+            ).fetchone()
+            if attempt_row is None:
+                self._mark_result_import_ambiguous(import_id, "journal attempt is missing")
+                raise SupervisorError(
+                    "result_import_ambiguous", "journal attempt is missing; result remains fenced"
+                )
+            self._authenticate_attempt(connection, attempt_row, credential)
+            self._require_result_import_source_in(connection, row, attempt_row)
+            try:
+                expected_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        "acp-worker-result:"
+                        f"{row['attempt_id']}:{row['claim_token']}:{row['result_digest']}",
+                    )
+                )
+                expected_ref = result_ref_name(
+                    row["attempt_id"], row["claim_token"], row["result_digest"]
+                )
+            except (SupervisorError, TypeError, ValueError) as error:
+                self._mark_result_import_ambiguous(import_id, "journal identity fields are invalid")
+                raise SupervisorError(
+                    "result_import_ambiguous", "result journal identity is invalid"
+                ) from error
+            if row["id"] != expected_id or row["result_ref"] != expected_ref:
+                self._mark_result_import_ambiguous(
+                    import_id, "journal identity or result ref is not canonical"
+                )
+                raise SupervisorError(
+                    "result_import_ambiguous", "result journal identity or ref is inconsistent"
+                )
+            if row["phase"] == "submitted":
+                if not row["submission_id"]:
+                    self._mark_result_import_ambiguous(
+                        import_id, "submitted journal lacks submission ID"
+                    )
+                    raise SupervisorError(
+                        "result_import_ambiguous", "submitted journal has no linked submission"
+                    )
+                submission_row = connection.execute(
+                    "SELECT attempt_id, commit_sha FROM submissions WHERE id = ?",
+                    (row["submission_id"],),
+                ).fetchone()
+                if (
+                    submission_row is None
+                    or submission_row["attempt_id"] != row["attempt_id"]
+                    or submission_row["commit_sha"] != row["commit_sha"]
+                    or attempt_row["status"] != "submitted"
+                    or attempt_row["latest_sha"] != row["commit_sha"]
+                ):
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "submitted result journal does not match its submission",
+                    )
+                candidate = CandidateTree(
+                    tree_sha=row["tree_sha"],
+                    base_sha=row["base_sha"],
+                    baseline_digest=row["baseline_digest"],
+                    result_digest=row["result_digest"],
+                    change_digest=row["change_digest"],
+                )
+                payload = candidate_commit_payload(
+                    candidate,
+                    attempt_id=row["attempt_id"],
+                    claim_token=row["claim_token"],
+                    result_digest=row["result_digest"],
+                    committed_at=row["commit_timestamp"],
+                )
+                git_executable = self._system_git_executable(self.root)
+                try:
+                    expected_commit = candidate_commit_object(
+                        self.root,
+                        payload,
+                        write=False,
+                        git_executable=git_executable,
+                    )
+                    target = candidate_ref_target(
+                        self.root,
+                        expected_ref,
+                        git_executable=git_executable,
+                    )
+                    verify_candidate_objects(
+                        self.root,
+                        candidate,
+                        commit_sha=target,
+                        git_executable=git_executable,
+                    )
+                except SupervisorError as error:
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "submitted result commit or ref cannot be verified",
+                    ) from error
+                if target != row["commit_sha"] or expected_commit != row["commit_sha"]:
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "submitted result ref does not match its journaled commit",
+                    )
+                return self.submission(row["submission_id"])
+            if row["phase"] == "ambiguous":
+                raise SupervisorError(
+                    "result_import_ambiguous", "result import is fenced as ambiguous"
+                )
+
+            try:
+                attempt = self._active_attempt(
+                    connection, row["attempt_id"], row["claim_token"], int(time.time())
+                )
+                if row["source_kind"] == "direct_worker":
+                    receipt = self._worker_exit_receipt_in(connection, attempt, row["worker_pid"])
+                    if (
+                        attempt["pid_identity"] != row["worker_identity"]
+                        or receipt != row["worker_exit_receipt_json"]
+                    ):
+                        raise SupervisorError(
+                            "worker_registration_lost",
+                            "journal no longer matches its worker identity",
+                        )
+                else:
+                    self._require_result_import_source_in(connection, row, attempt)
+                task = self._task_row(connection, attempt["task_id"])
+                if task["base_sha"] != row["base_sha"]:
+                    raise SupervisorError(
+                        "stale_worker_result", "task base changed since result was journaled"
+                    )
+                self._assert_base_checkout_unchanged(
+                    connection,
+                    row["attempt_id"],
+                    attempt["base_checkout_snapshot_json"],
+                    bool(attempt["base_checkout_snapshot_required"]),
+                )
+            except SupervisorError as error:
+                if error.code not in {"invalid_runner_credential", "runner_auth_required"}:
+                    self._mark_result_import_ambiguous(import_id, str(error))
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "worker or claim fence changed; result remains retained and unsubmitted",
+                    ) from error
+                raise
+            journal = dict(row)
+            attempt_snapshot = dict(attempt)
+
+        candidate = CandidateTree(
+            tree_sha=journal["tree_sha"],
+            base_sha=journal["base_sha"],
+            baseline_digest=journal["baseline_digest"],
+            result_digest=journal["result_digest"],
+            change_digest=journal["change_digest"],
+        )
+        payload = candidate_commit_payload(
+            candidate,
+            attempt_id=journal["attempt_id"],
+            claim_token=journal["claim_token"],
+            result_digest=journal["result_digest"],
+            committed_at=journal["commit_timestamp"],
+        )
+        git_executable = self._system_git_executable(self.root)
+        try:
+            with self._git_operation_guard():
+                self._assert_result_import_worktree_base_locked(
+                    attempt_snapshot, journal["base_sha"]
+                )
+                expected_commit = candidate_commit_object(
+                    attempt_snapshot["worktree"],
+                    payload,
+                    write=False,
+                    git_executable=git_executable,
+                )
+                if expected_commit != journal["commit_sha"]:
+                    raise SupervisorError(
+                        "result_import_ambiguous", "deterministic result commit hash changed"
+                    )
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute(
+                        "SELECT * FROM result_imports WHERE id = ?", (import_id,)
+                    ).fetchone()
+                    if current is None or current["phase"] not in {"prepared", "ref_published"}:
+                        raise SupervisorError(
+                            "result_import_ambiguous", "result journal changed during recovery"
+                        )
+                    active = self._active_attempt(
+                        connection,
+                        current["attempt_id"],
+                        current["claim_token"],
+                        int(time.time()),
+                    )
+                    self._authenticate_attempt(connection, active, credential)
+                    self._require_result_import_source_in(connection, current, active)
+                    if current["source_kind"] == "direct_worker":
+                        current_receipt = self._worker_exit_receipt_in(
+                            connection, active, current["worker_pid"]
+                        )
+                        if (
+                            active["pid_identity"] != current["worker_identity"]
+                            or current_receipt != current["worker_exit_receipt_json"]
+                        ):
+                            raise SupervisorError(
+                                "result_import_ambiguous", "worker fence changed during recovery"
+                            )
+                    target = candidate_ref_target(
+                        attempt_snapshot["worktree"],
+                        current["result_ref"],
+                        git_executable=git_executable,
+                    )
+                    if target is None:
+                        if current["phase"] != "prepared":
+                            raise SupervisorError(
+                                "result_import_ambiguous",
+                                "published result ref disappeared; automatic replay refused",
+                            )
+                        if current["staging_path"]:
+                            expected_stage = self._result_import_stage_path(import_id)
+                            if current["staging_path"] != str(expected_stage):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result stage path is not canonical",
+                                )
+                            stage_objects = expected_stage / "objects"
+                            if (
+                                expected_stage.is_symlink()
+                                or not expected_stage.is_dir()
+                                or stage_objects.is_symlink()
+                                or not stage_objects.is_dir()
+                            ):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result object stage is unavailable",
+                                )
+                            object_id_length = len(current["base_sha"])
+                            object_ids = self._parse_result_import_object_ids(
+                                current["object_ids_json"], object_id_length
+                            )
+                            promote_ids = self._parse_result_import_object_ids(
+                                current["promote_object_ids_json"], object_id_length
+                            )
+                            if (
+                                object_ids is None
+                                or promote_ids is None
+                                or current["tree_sha"] not in object_ids
+                                or current["commit_sha"] not in object_ids
+                                or not set(promote_ids).issubset(object_ids)
+                            ):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result object provenance is invalid",
+                                )
+                            tree_object_ids = candidate_tree_object_ids(
+                                attempt_snapshot["worktree"],
+                                current["tree_sha"],
+                                object_directory=stage_objects,
+                                git_executable=git_executable,
+                            )
+                            if set(tree_object_ids) | {current["commit_sha"]} != set(object_ids):
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "journaled result object inventory does not match its tree",
+                                )
+                            verify_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                candidate,
+                                commit_sha=expected_commit,
+                                object_directory=stage_objects,
+                                git_executable=git_executable,
+                            )
+                            promote_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                stage_objects,
+                                promote_ids,
+                                import_id=import_id,
+                                git_executable=git_executable,
+                            )
+                            verify_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                candidate,
+                                commit_sha=expected_commit,
+                                git_executable=git_executable,
+                            )
+                        else:
+                            # Pre-v13 journals already wrote trees to the shared ODB.
+                            verify_candidate_objects(
+                                attempt_snapshot["worktree"],
+                                candidate,
+                                git_executable=git_executable,
+                            )
+                            written = candidate_commit_object(
+                                attempt_snapshot["worktree"],
+                                payload,
+                                write=True,
+                                git_executable=git_executable,
+                            )
+                            if written != expected_commit:
+                                raise SupervisorError(
+                                    "result_import_ambiguous",
+                                    "written result commit differs from journal",
+                                )
+                        publish_candidate_ref(
+                            attempt_snapshot["worktree"],
+                            current["result_ref"],
+                            expected_commit,
+                            git_executable=git_executable,
+                        )
+                    elif target != expected_commit:
+                        raise SupervisorError(
+                            "result_import_ambiguous", "result ref names an unjournaled commit"
+                        )
+                    verify_candidate_objects(
+                        attempt_snapshot["worktree"],
+                        candidate,
+                        commit_sha=expected_commit,
+                        git_executable=git_executable,
+                    )
+                    if current["phase"] == "prepared":
+                        connection.execute(
+                            "UPDATE result_imports SET phase = 'ref_published', updated_at = ? "
+                            "WHERE id = ? AND phase = 'prepared'",
+                            (utc_now(), import_id),
+                        )
+                        self._event(
+                            connection,
+                            "worker.result_import_ref_published",
+                            "recovery",
+                            {
+                                "import_id": import_id,
+                                "attempt_id": current["attempt_id"],
+                                "claim_token": current["claim_token"],
+                                "result_digest": current["result_digest"],
+                                "commit_sha": expected_commit,
+                                "result_ref": current["result_ref"],
+                            },
+                        )
+        except SupervisorError as error:
+            if error.code in {
+                "result_import_ambiguous",
+                "worker_registration_lost",
+                "claim_inactive",
+                "stale_fencing_token",
+                "lease_expired",
+                "stale_worker_result",
+                "result_import_worktree_invalid",
+                "worker_not_exited",
+            }:
+                self._mark_result_import_ambiguous(import_id, str(error))
+                raise SupervisorError(
+                    "result_import_ambiguous", "recovery could not prove the exact result fence"
+                ) from error
+            raise
+
+        try:
+            submission = self._submit(
+                journal["attempt_id"],
+                journal["claim_token"],
+                expected_worker_pid=journal["worker_pid"],
+                credential=credential,
+                imported_result_id=import_id,
+            )
+        except SupervisorError as error:
+            if error.code in {
+                "claim_inactive",
+                "stale_fencing_token",
+                "lease_expired",
+                "worker_registration_lost",
+                "stale_worker_result",
+                "base_checkout_mutated",
+                "dirty_worktree",
+                "reservation_lost",
+                "stale_reservation",
+            }:
+                with self.connect() as connection:
+                    completed = connection.execute(
+                        "SELECT phase, submission_id FROM result_imports WHERE id = ?",
+                        (import_id,),
+                    ).fetchone()
+                if completed and completed["phase"] == "submitted" and completed["submission_id"]:
+                    return self.recover_worker_result_import(import_id, credential=credential)
+                self._mark_result_import_ambiguous(import_id, str(error))
+                with self._git_operation_guard():
+                    self._cleanup_result_import_staging_locked()
+                raise SupervisorError(
+                    "result_import_ambiguous", "submission lost its claim fence; result is retained"
+                ) from error
+            raise
+        try:
+            with self._git_operation_guard():
+                self._cleanup_result_import_staging_locked()
+        except SupervisorError:
+            # Submission is already durable. Staging remains bounded and will be
+            # retried by the next import/recovery call if cleanup was unavailable.
+            pass
+        return submission
+
     def _submit(
         self,
         attempt_id: str,
@@ -1845,6 +3546,7 @@ class ClaimsMixin:
         expected_worker_pid: int | None,
         credential: str | None,
         result_manifest_path: str | None = None,
+        imported_result_id: str | None = None,
     ) -> dict[str, Any]:
         self._assert_safe_git_execution_config()
         self._assert_no_git_grafts()
@@ -1853,6 +3555,22 @@ class ClaimsMixin:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, epoch)
             self._authenticate_attempt(connection, attempt, credential)
+            _require_sandbox_execution_result_eligible(connection, attempt_id)
+            sandbox_execution = connection.execute(
+                "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if sandbox_execution is not None and imported_result_id is None:
+                raise SupervisorError(
+                    "sandbox_result_evidence_missing",
+                    "journaled sandbox submission requires a matching imported result",
+                )
+            if sandbox_execution is not None and imported_result_id is not None:
+                source_row = connection.execute(
+                    "SELECT source_kind FROM result_imports WHERE id = ?",
+                    (imported_result_id,),
+                ).fetchone()
+                if source_row is None or source_row["source_kind"] != "sandbox_execution":
+                    _require_direct_worker_result_source(connection, attempt_id)
             if expected_worker_pid is None and attempt["pid"] is not None:
                 raise SupervisorError(
                     "worker_still_running",
@@ -1871,9 +3589,97 @@ class ClaimsMixin:
                 bool(attempt["base_checkout_snapshot_required"]),
             )
             worktree = Path(attempt["worktree"])
-            if self._git_bytes("-C", str(worktree), "status", "--porcelain=v1", "-z"):
-                raise SupervisorError("dirty_worktree", "submission requires committed work")
-            commit = self._git_text("-C", str(worktree), "rev-parse", "HEAD")
+            import_row = None
+            if imported_result_id is not None:
+                import_row = connection.execute(
+                    "SELECT * FROM result_imports WHERE id = ?", (imported_result_id,)
+                ).fetchone()
+                if import_row is None or import_row["phase"] != "ref_published":
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "result journal does not match this exact attempt",
+                    )
+                if (
+                    import_row["attempt_id"] != attempt_id
+                    or import_row["claim_token"] != claim_token
+                    or task["base_sha"] != import_row["base_sha"]
+                ):
+                    raise SupervisorError(
+                        "result_import_ambiguous",
+                        "result journal does not match this exact attempt",
+                    )
+                self._require_result_import_source_in(connection, import_row, attempt)
+                if import_row["source_kind"] == "direct_worker":
+                    if (
+                        expected_worker_pid is None
+                        or import_row["worker_pid"] != expected_worker_pid
+                        or attempt["pid"] != import_row["worker_pid"]
+                        or attempt["pid_identity"] != import_row["worker_identity"]
+                    ):
+                        raise SupervisorError(
+                            "worker_registration_lost",
+                            "direct result journal does not match its worker PID fence",
+                        )
+                    receipt = self._worker_exit_receipt_in(connection, attempt, expected_worker_pid)
+                    if receipt != import_row["worker_exit_receipt_json"]:
+                        raise SupervisorError(
+                            "result_import_ambiguous",
+                            "result journal worker exit receipt changed",
+                        )
+                elif expected_worker_pid is not None:
+                    raise SupervisorError(
+                        "sandbox_result_source_mismatch",
+                        "sandbox result submission cannot use a direct worker PID fence",
+                    )
+                candidate = CandidateTree(
+                    tree_sha=import_row["tree_sha"],
+                    base_sha=import_row["base_sha"],
+                    baseline_digest=import_row["baseline_digest"],
+                    result_digest=import_row["result_digest"],
+                    change_digest=import_row["change_digest"],
+                )
+                payload = candidate_commit_payload(
+                    candidate,
+                    attempt_id=attempt_id,
+                    claim_token=claim_token,
+                    result_digest=import_row["result_digest"],
+                    committed_at=import_row["commit_timestamp"],
+                )
+                with self._git_operation_guard():
+                    self._assert_result_import_worktree_base_locked(attempt, task["base_sha"])
+                    expected_ref = result_ref_name(
+                        attempt_id, claim_token, import_row["result_digest"]
+                    )
+                    target = candidate_ref_target(
+                        worktree,
+                        expected_ref,
+                        git_executable=self._system_git_executable(self.root),
+                    )
+                    expected_commit = candidate_commit_object(
+                        worktree,
+                        payload,
+                        write=False,
+                        git_executable=self._system_git_executable(self.root),
+                    )
+                    verify_candidate_objects(
+                        worktree,
+                        candidate,
+                        commit_sha=target,
+                        git_executable=self._system_git_executable(self.root),
+                    )
+                if (
+                    import_row["result_ref"] != expected_ref
+                    or target != import_row["commit_sha"]
+                    or expected_commit != import_row["commit_sha"]
+                ):
+                    raise SupervisorError(
+                        "result_import_ambiguous", "published ref differs from durable journal"
+                    )
+                commit = import_row["commit_sha"]
+            else:
+                if self._git_bytes("-C", str(worktree), "status", "--porcelain=v1", "-z"):
+                    raise SupervisorError("dirty_worktree", "submission requires committed work")
+                commit = self._git_text("-C", str(worktree), "rev-parse", "HEAD")
             if self._git_text("cat-file", "-t", commit) != "commit":
                 raise SupervisorError(
                     "invalid_submission_object", "submission HEAD is not a commit object"
@@ -1978,6 +3784,24 @@ class ClaimsMixin:
                     stamp,
                 ),
             )
+            if import_row is not None:
+                changed_import = connection.execute(
+                    "UPDATE result_imports SET phase = 'submitted', submission_id = ?, "
+                    "updated_at = ? WHERE id = ? AND phase = 'ref_published' "
+                    "AND attempt_id = ? AND claim_token = ? AND commit_sha = ?",
+                    (
+                        submission_id,
+                        stamp,
+                        imported_result_id,
+                        attempt_id,
+                        claim_token,
+                        commit,
+                    ),
+                ).rowcount
+                if changed_import != 1:
+                    raise SupervisorError(
+                        "result_import_ambiguous", "result journal changed before submission commit"
+                    )
             connection.execute(
                 """
                 UPDATE attempts SET status = 'submitted', latest_sha = ?,
@@ -2017,6 +3841,10 @@ class ClaimsMixin:
                     "commit_sha": commit,
                     "patch_sha256": sha256(patch),
                     "resource_tokens": tokens,
+                    "result_import_id": imported_result_id,
+                    "result_digest": import_row["result_digest"]
+                    if import_row is not None
+                    else None,
                 },
             )
         return self.submission(submission_id)

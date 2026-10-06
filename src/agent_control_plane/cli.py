@@ -31,6 +31,8 @@ READ_ONLY_ACTIONS = frozenset(
         "verify-events",
         "guard",
         "runtime-resources",
+        "intents",
+        "intent-history",
     }
 )
 """Commands that only look. They open the database mode=ro and never migrate it.
@@ -118,6 +120,11 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("init", help="initialize config and local state")
     commands.add_parser("doctor", help="check repository and state integrity")
     commands.add_parser("migrate", help="upgrade the control database schema in place")
+    rootfs_manifest = commands.add_parser(
+        "oci-rootfs-manifest",
+        help="print a path/content-hash inventory for operator review of an OCI rootfs",
+    )
+    rootfs_manifest.add_argument("--rootfs", required=True, help="absolute rootfs directory")
     commands.add_parser(
         "mcp-serve", help="read-only MCP server over stdio (no credential, no writes)"
     )
@@ -251,6 +258,27 @@ def parser() -> argparse.ArgumentParser:
     )
     plan = commands.add_parser("plan", help="dry-run a claim and report what would block it")
     plan.add_argument("task_id")
+    intent_publish = commands.add_parser(
+        "intent-publish", help="append a claim-fenced, caller-authored intent revision"
+    )
+    intent_publish.add_argument("attempt_id")
+    intent_publish.add_argument("--token", type=int, required=True, dest="claim_token")
+    intent_publish.add_argument("--json", required=True, dest="intent_json")
+    add_credential_source(intent_publish)
+    intents = commands.add_parser(
+        "intents", help="read active intent and bounded overlap/dependency analysis"
+    )
+    intents.add_argument(
+        "--observed",
+        action="store_true",
+        help="include bounded server Git observations (up to 8 attempts / 2 seconds)",
+    )
+    intent_history = commands.add_parser(
+        "intent-history", help="read retained intent revisions for an attempt"
+    )
+    intent_history.add_argument("attempt_id")
+    intent_history.add_argument("--limit", type=int, default=25)
+    intent_history.add_argument("--after-revision", type=int, default=0)
     commands.add_parser("queue", help="ordered ready queue with overlap and dependency blockers")
     commands.add_parser("merge-plan", help="integration ordering preview for approved work")
     commands.add_parser("reviewers", help="declared reviewers and the evaluation policy state")
@@ -816,6 +844,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = _run_trust_helper(args)
             emit(result)
             return 0
+        if args.action == "oci-rootfs-manifest":
+            from .supervisor.oci_worker import rootfs_tree_manifest
+
+            emit(rootfs_tree_manifest(args.rootfs))
+            return 0
         supervisor = GitSupervisor(
             args.repo,
             diagnostic=args.action == "doctor",
@@ -889,6 +922,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = _wait_for_task(supervisor, args)
         elif args.action == "plan":
             result = supervisor.plan_claim(args.task_id)
+        elif args.action == "intent-publish":
+            try:
+                intent_document = json.loads(args.intent_json)
+            except json.JSONDecodeError as error:
+                raise SupervisorError(
+                    "invalid_intent", "--json must contain one JSON object"
+                ) from error
+            result = supervisor.publish_intent(
+                args.attempt_id,
+                args.claim_token,
+                intent_document,
+                _read_credential(args),
+            )
+        elif args.action == "intents":
+            result = supervisor.intent_snapshot(include_observed=args.observed)
+        elif args.action == "intent-history":
+            result = supervisor.intent_history(
+                args.attempt_id,
+                limit=args.limit,
+                after_revision=args.after_revision,
+            )
         elif args.action == "queue":
             result = supervisor.ready_queue()
         elif args.action == "merge-plan":
