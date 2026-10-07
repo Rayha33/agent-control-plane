@@ -22,7 +22,7 @@ import sqlite3
 import stat
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -962,7 +962,13 @@ class RuntimeMixin:
             # Closing our copy cannot drop a lock still retained by the monitor.
             os.close(lock_fd)
 
-    def runtime_restart(self, attempt_id: str, recover: bool = False) -> dict[str, Any]:
+    def runtime_restart(
+        self,
+        attempt_id: str,
+        recover: bool = False,
+        *,
+        phase_context: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Tear down and re-create driver resources between phases.
 
         QC must not be able to reach a service the worker left running: a stale
@@ -970,6 +976,71 @@ class RuntimeMixin:
         actually starts.
         """
         self._assert_driver_config_unchanged(attempt_id)
+        if phase_context is not None:
+            if recover:
+                raise SupervisorError(
+                    "runtime_target_phase_recovery_unsupported",
+                    "a phase-scoped target restart cannot be combined with recovery",
+                )
+            if any(
+                not isinstance(value, str)
+                or not value
+                or len(value) > 4096
+                or any(ord(character) < 32 for character in value)
+                for value in phase_context.values()
+            ):
+                raise SupervisorError(
+                    "runtime_target_phase_context_invalid",
+                    "phase target context values are invalid",
+                )
+            required = {
+                "ACP_PHASE",
+                "ACP_WORKTREE",
+                "ACP_SOURCE_REVISION",
+                "ACP_CLAIM_TOKEN",
+                "ACP_TASK_ID",
+            }
+            if set(phase_context) != required or phase_context.get("ACP_PHASE") not in {
+                "qc",
+                "integration",
+            }:
+                raise SupervisorError(
+                    "runtime_target_phase_context_invalid",
+                    "phase target restart context is incomplete",
+                )
+            if not re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})", phase_context["ACP_SOURCE_REVISION"]
+            ):
+                raise SupervisorError(
+                    "runtime_target_phase_context_invalid", "phase source revision is invalid"
+                )
+            try:
+                phase_claim_token = int(phase_context["ACP_CLAIM_TOKEN"])
+            except (TypeError, ValueError) as error:
+                raise SupervisorError(
+                    "runtime_target_phase_context_invalid", "phase claim token is invalid"
+                ) from error
+            if phase_claim_token < 1:
+                raise SupervisorError(
+                    "runtime_target_phase_context_invalid", "phase claim token is invalid"
+                )
+            phase_worktree = Path(phase_context["ACP_WORKTREE"])
+            if not phase_worktree.is_absolute() or not phase_worktree.is_dir():
+                raise SupervisorError(
+                    "runtime_target_phase_context_invalid", "phase worktree is unavailable"
+                )
+            with self.connect() as connection:
+                attempt = connection.execute(
+                    "SELECT task_id, claim_token FROM attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+            if (
+                not attempt
+                or int(attempt["claim_token"]) != phase_claim_token
+                or phase_context.get("ACP_TASK_ID") != str(attempt["task_id"])
+            ):
+                raise SupervisorError(
+                    "runtime_target_phase_context_stale", "phase target claim fence is stale"
+                )
         if recover:
             now = int(time.time())
             with self.connect() as connection:
@@ -991,13 +1062,17 @@ class RuntimeMixin:
                     "runtime restart is still within its recovery lease",
                 )
         with self._runtime_restart_guard(attempt_id, recover) as guard_fd:
-            return self._runtime_restart_locked(attempt_id, recover, guard_fd)
+            return self._runtime_restart_locked(
+                attempt_id, recover, guard_fd, phase_context=phase_context
+            )
 
     def _runtime_restart_locked(
         self,
         attempt_id: str,
         recover: bool,
         guard_fd: int,
+        *,
+        phase_context: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Restart while holding the kernel guard returned above."""
 
@@ -1042,9 +1117,19 @@ class RuntimeMixin:
                 connection,
                 "runtime.restart_started",
                 "supervisor",
-                {"attempt_id": attempt_id, "recovery": recovering},
+                {
+                    "attempt_id": attempt_id,
+                    "recovery": recovering,
+                    "target_phase": phase_context.get("ACP_PHASE") if phase_context else None,
+                    "source_revision": (
+                        phase_context.get("ACP_SOURCE_REVISION") if phase_context else None
+                    ),
+                },
             )
             environment = json.loads(runtime["env_json"])
+            base_environment = dict(environment)
+            if phase_context:
+                environment.update(phase_context)
 
         # A crash after cleanup proof but before setup must not require the old
         # credential again. Released rows are durable proof that teardown has
@@ -1101,13 +1186,20 @@ class RuntimeMixin:
                 "runtime_setup_failed",
                 "driver setup failed for " + ", ".join(sorted(item.driver for item in failed)),
             )
+        if phase_context:
+            for key in phase_context:
+                if key in base_environment:
+                    environment[key] = base_environment[key]
+                else:
+                    environment.pop(key, None)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             updated = connection.execute(
                 "UPDATE runtime_environments "
-                "SET state = 'ready', restart_token = '', restart_started_at = 0, updated_at = ? "
+                "SET state = 'ready', restart_token = '', restart_started_at = 0, "
+                "env_json = ?, updated_at = ? "
                 "WHERE attempt_id = ? AND state = 'restarting' AND restart_token = ?",
-                (utc_now(), attempt_id, restart_token),
+                (canonical_json(environment), utc_now(), attempt_id, restart_token),
             )
             if updated.rowcount != 1:
                 raise SupervisorError(

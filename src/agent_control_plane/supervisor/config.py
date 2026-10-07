@@ -35,6 +35,7 @@ from ..trust_bundles import (
     verify_bundle_pin,
 )
 from .common import RuntimePortPool, SupervisorError, utc_now
+from .runtime_targets import RuntimeTargetDefinition, parse_runtime_target_definitions
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class Config:
     runtime_setup_commands: tuple[str, ...]
     runtime_teardown_commands: tuple[str, ...]
     runtime_port_pools: tuple[RuntimePortPool, ...]
+    runtime_targets: tuple[RuntimeTargetDefinition, ...]
     credentials: tuple[CredentialDefinition, ...]
     runtime_drivers: tuple[DriverDefinition, ...]
     runtime_driver_entries: tuple[dict[str, Any], ...]
@@ -405,6 +407,11 @@ class ConfigMixin:
                         "invalid_config",
                         f"runtime port pools {other.env_name} and {pool.env_name} overlap",
                     )
+        runtime_targets = parse_runtime_target_definitions(
+            runtime.get("targets", []),
+            port_envs={pool.env_name for pool in runtime_port_pools},
+            driver_names={definition.name for definition in runtime_drivers},
+        )
         # Loaded here so a reviewer's command obeys the same trust rule as the
         # legacy single critic, and so a bad policy fails at construction.
         policy = load_policy(
@@ -430,6 +437,7 @@ class ConfigMixin:
             runtime_setup_commands=runtime_setup_commands,
             runtime_teardown_commands=runtime_teardown_commands,
             runtime_port_pools=tuple(runtime_port_pools),
+            runtime_targets=runtime_targets,
             credentials=credentials,
             runtime_drivers=runtime_drivers,
             runtime_driver_entries=driver_entries,

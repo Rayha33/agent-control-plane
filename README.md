@@ -54,7 +54,7 @@ wedge.
 | Fencing | Every attempt and exact resource receives a monotonic token |
 | Worktree ownership | Every successful claim provisions a dedicated branch and worktree |
 | Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
-| Runtime isolation | Attempts receive unique configured ports, a runtime directory, and setup/teardown hooks |
+| Runtime isolation | Attempts receive unique configured ports and lifecycle hooks; optional target preflights bind QC/integration receipts to assigned resources and the expected source revision |
 | Trusted resource drivers | Compose projects, PostgreSQL schemas, browser profiles, and CoreSimulator clones have scoped setup/probe/teardown proofs |
 | Scoped credential handles | Drivers receive one immutable credential version over a private descriptor; plaintext never enters argv, inherited env values, state, or evidence |
 | Privileged trust bundles | Versioned critic/driver executables are installed by a narrow helper and pinned per attempt/QC by manifest, inode, and content digest |
@@ -572,6 +572,12 @@ port variable. <code>ACP_PHASE</code> identifies setup, worker, QC, critic,
 integration, or teardown; <code>ACP_WORKTREE</code> always names that phase's
 checkout. The same allocated environment is injected into deterministic QC and
 integration commands.
+
+Port allocation does not prove which process, source revision, database, or queue
+answered a test. Projects can opt into the bounded identity preflight described in
+[Runtime target provenance](docs/runtime-targets.md). It fails closed on a required
+identity mismatch and records missing evidence as unknown; even a matching app
+report is labeled corroboration, not isolation or process-identity proof.
 
 Allocations are stored transactionally and follow the attempt through review
 and integration. Teardown runs after a negative QC verdict, completed

@@ -42,6 +42,7 @@ from .common import (
     sha256,
     utc_now,
 )
+from .runtime_targets import runtime_target_phase
 
 
 class QcMixin:
@@ -603,12 +604,42 @@ class QcMixin:
             self._git("worktree", "add", "--detach", str(qc_dir), submission["commit_sha"])
             packet = self._review_packet(task, submission, qc_dir, qc_id)
             packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+            packet_hash = sha256(packet_path.read_bytes())
             # Fresh services before review. Otherwise QC can pass against an app
             # server the worker left running, which proves the worker's old code
             # works, not the code being reviewed.
             if self.config.runtime_drivers:
                 try:
-                    self.runtime_restart(submission["attempt_id"])
+                    phase_targets = tuple(
+                        target for target in self.config.runtime_targets if "qc" in target.phases
+                    )
+                    phase_context = None
+                    if phase_targets:
+                        if not self._worktree_matches(qc_dir, submission["commit_sha"]):
+                            raise SupervisorError(
+                                "runtime_target_source_mismatch",
+                                "QC target checkout is not the submitted source revision",
+                            )
+                        with self.connect() as connection:
+                            attempt = connection.execute(
+                                "SELECT task_id, claim_token FROM attempts WHERE id = ?",
+                                (submission["attempt_id"],),
+                            ).fetchone()
+                        if not attempt or str(attempt["task_id"]) != str(submission["task_id"]):
+                            raise SupervisorError(
+                                "runtime_target_claim_stale", "QC target claim is no longer current"
+                            )
+                        phase_context = {
+                            "ACP_PHASE": "qc",
+                            "ACP_WORKTREE": str(qc_dir),
+                            "ACP_SOURCE_REVISION": str(submission["commit_sha"]),
+                            "ACP_CLAIM_TOKEN": str(attempt["claim_token"]),
+                            "ACP_TASK_ID": str(submission["task_id"]),
+                        }
+                    if phase_context:
+                        self.runtime_restart(submission["attempt_id"], phase_context=phase_context)
+                    else:
+                        self.runtime_restart(submission["attempt_id"])
                 except SupervisorError as error:
                     findings.append(
                         {
@@ -625,6 +656,42 @@ class QcMixin:
                     raise
                 else:
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
+                    if phase_targets:
+                        fence_sha = sha256(str(submission["resource_tokens_json"]).encode("utf-8"))
+                        receipt, target_env, blocked = runtime_target_phase(
+                            definitions=phase_targets,
+                            runtime_environment=runtime_env,
+                            driver_resources=self.driver_resources(submission["attempt_id"]),
+                            attempt_id=str(submission["attempt_id"]),
+                            task_id=str(submission["task_id"]),
+                            claim_token=int(attempt["claim_token"]),
+                            reservation_fence_sha256=fence_sha,
+                            phase="qc",
+                            source_revision=str(submission["commit_sha"]),
+                            runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
+                            receipt_id=qc_id,
+                        )
+                        results.append(receipt)
+                        packet["runtime_target_preflight"] = receipt
+                        packet["evidence_catalog"].append(
+                            {
+                                "id": receipt["evidence_id"],
+                                "kind": "runtime_target_preflight",
+                                "run_id": qc_id,
+                                "commit_sha": submission["commit_sha"],
+                                "sha256": receipt["evidence_sha256"],
+                                "exit_code": receipt["exit_code"],
+                            }
+                        )
+                        packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+                        packet_hash = sha256(packet_path.read_bytes())
+                        if blocked:
+                            raise SupervisorError(
+                                "runtime_target_identity_mismatch",
+                                "required QC runtime target identity is missing or mismatched",
+                            )
+                        runtime_env.update(phase_context or {})
+                        runtime_env.update(target_env)
             for index, command in enumerate(self.config.qc_commands, start=1):
                 self._restore_candidate(qc_dir, submission["commit_sha"])
                 result = self._run_command(
