@@ -1358,6 +1358,91 @@ def test_supervisor_persists_verified_simulator_udid_across_all_attempt_phases(
     assert not any("download" in argument.lower() for command in commands for argument in command)
 
 
+def test_phase_context_is_not_persisted_across_crashed_runtime_restart(
+    driver_repo: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    runner, _devices, _commands = _fake_simulator_runner(
+        (CLONE_SIMULATOR_UDID, REPLACEMENT_SIMULATOR_UDID)
+    )
+    observed_environments: list[dict[str, str]] = []
+
+    def fake_run_trusted(argv, cwd, env, timeout, credential, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        observed_environments.append(dict(env))
+        return runner(argv, cwd, env, timeout, credential)
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    (driver_repo / "acp.toml").write_text(
+        DRIVER_CONFIG.replace(
+            'name = "browser"\nkind = "browser_profile"',
+            'name = "ios"\nkind = "core_simulator"\n'
+            'executable = "/usr/bin/xcrun"\n'
+            f'base_udid = "{BASE_SIMULATOR_UDID}"',
+        ),
+        encoding="utf-8",
+    )
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+    initial_environment = supervisor.runtime_environment(attempt["id"])["environment"]
+    source_revision = subprocess.run(
+        ["git", "-C", str(driver_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    phase_context = {
+        "ACP_PHASE": "qc",
+        "ACP_WORKTREE": str(Path(attempt["worktree"]).resolve()),
+        "ACP_SOURCE_REVISION": source_revision,
+        "ACP_CLAIM_TOKEN": str(attempt["claim_token"]),
+        "ACP_TASK_ID": str(attempt["task_id"]),
+    }
+    original_run_driver_phase = supervisor._run_driver_phase
+
+    def crash_after_teardown(phase, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = original_run_driver_phase(phase, *args, **kwargs)
+        if phase == "teardown":
+            raise RuntimeError("simulated crash after durable teardown evidence")
+        return result
+
+    monkeypatch.setattr(supervisor, "_run_driver_phase", crash_after_teardown)
+    with pytest.raises(RuntimeError, match="after durable teardown evidence"):
+        supervisor.runtime_restart(attempt["id"], phase_context=phase_context)
+
+    with sqlite3.connect(supervisor.db_path) as connection:
+        durable_environment = json.loads(
+            connection.execute(
+                "SELECT env_json FROM runtime_environments WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET restart_started_at = 0 WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    assert all(
+        durable_environment.get(key) == initial_environment.get(key) for key in phase_context
+    )
+    assert "ACP_SIMULATOR_UDID" not in durable_environment
+    assert supervisor.driver_resources(attempt["id"])[0]["state"] == "released"
+
+    observed_environments.clear()
+    monkeypatch.setattr(supervisor, "_run_driver_phase", original_run_driver_phase)
+    recovered = supervisor.runtime_restart(attempt["id"], recover=True)
+
+    assert recovered["attempt_id"] == attempt["id"]
+    assert supervisor.runtime_environment(attempt["id"])["state"] == "ready"
+    assert observed_environments
+    for environment in observed_environments:
+        assert all(environment.get(key) == initial_environment.get(key) for key in phase_context)
+
+
 def test_crash_after_clone_before_udid_commit_quarantines_without_guessing(
     driver_repo: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

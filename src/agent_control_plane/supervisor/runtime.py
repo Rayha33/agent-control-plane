@@ -670,11 +670,24 @@ class RuntimeMixin:
                     event_payload,
                 )
             if environment is not None and (exports or removals):
-                connection.execute(
-                    "UPDATE runtime_environments SET env_json = ?, updated_at = ? "
-                    "WHERE attempt_id = ?",
-                    (canonical_json(environment), stamp, attempt_id),
-                )
+                # `environment` may contain an ephemeral QC/integration overlay.
+                # Persist only driver-owned deltas onto the durable base, so a
+                # crash after this evidence write cannot turn phase context into
+                # the environment used by a later recovery.
+                stored_environment = connection.execute(
+                    "SELECT env_json FROM runtime_environments WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if stored_environment is not None:
+                    durable_environment = json.loads(stored_environment["env_json"])
+                    durable_environment.update(exports)
+                    for key in removals:
+                        durable_environment.pop(key, None)
+                    connection.execute(
+                        "UPDATE runtime_environments SET env_json = ?, updated_at = ? "
+                        "WHERE attempt_id = ?",
+                        (canonical_json(durable_environment), stamp, attempt_id),
+                    )
 
     def driver_resources(
         self, attempt_id: str, *, fresh: bool = False

@@ -6,6 +6,7 @@ import socket
 import stat
 import subprocess
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -231,8 +232,14 @@ def test_identity_report_is_allowlisted_and_does_not_persist_secrets(
 class _TargetIdentityServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, status_code: int, content_type: str, body: bytes) -> None:
-        super().__init__(("127.0.0.1", 0), _TargetIdentityHandler)
+    def __init__(
+        self,
+        status_code: int,
+        content_type: str,
+        body: bytes | Callable[[], bytes],
+        port: int = 0,
+    ) -> None:
+        super().__init__(("127.0.0.1", port), _TargetIdentityHandler)
         self.status_code = status_code
         self.content_type = content_type
         self.body = body
@@ -241,11 +248,12 @@ class _TargetIdentityServer(ThreadingHTTPServer):
 class _TargetIdentityHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         server = self.server
+        body = server.body() if callable(server.body) else server.body
         self.send_response(server.status_code)
         self.send_header("Content-Type", server.content_type)
-        self.send_header("Content-Length", str(len(server.body)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(server.body)
+        self.wfile.write(body)
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -387,11 +395,11 @@ def test_target_names_must_not_alias_environment_variables() -> None:
     assert rejected.value.code == "invalid_config"
 
 
-@pytest.mark.parametrize("wrong_qc_attempt", [False, True])
+@pytest.mark.parametrize("stale_qc_worktree", [False, True])
 def test_qc_and_integration_receive_claim_fenced_target_receipts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    wrong_qc_attempt: bool,
+    stale_qc_worktree: bool,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -427,6 +435,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         ["alpha.txt"],
     )
     attempt = supervisor.claim(created["id"], "worker")
+    server = _TargetIdentityServer(200, "application/json", b"{}", port=port)
     context: dict[str, Any] = {}
     original_restart = supervisor.runtime_restart
 
@@ -444,24 +453,25 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             )
         return restarted
 
-    def report(_port: int, _path: str):
-        return {
-            "contract": runtime_targets.TARGET_CONTRACT,
-            "attempt_id": (
-                "stale-attempt"
-                if wrong_qc_attempt and context["ACP_PHASE"] == "qc"
-                else attempt["id"]
-            ),
-            "task_id": attempt["task_id"],
-            "claim_token": attempt["claim_token"],
-            "phase": context["ACP_PHASE"],
-            "source_revision": context["ACP_SOURCE_REVISION"],
-            "port": context["port"],
-            "driver_resource_id": context["driver_resource_id"],
-        }, "ok"
+    def report() -> bytes:
+        source_revision = context["ACP_SOURCE_REVISION"]
+        if stale_qc_worktree and context["ACP_PHASE"] == "qc":
+            source_revision = "0" * 40
+        return json.dumps(
+            {
+                "contract": runtime_targets.TARGET_CONTRACT,
+                "attempt_id": attempt["id"],
+                "task_id": attempt["task_id"],
+                "claim_token": attempt["claim_token"],
+                "phase": context["ACP_PHASE"],
+                "source_revision": source_revision,
+                "port": context["port"],
+                "driver_resource_id": context["driver_resource_id"],
+            }
+        ).encode("utf-8")
 
     monkeypatch.setattr(supervisor, "runtime_restart", capture_phase)
-    monkeypatch.setattr(runtime_targets, "probe_target_identity", report)
+    server.body = report
 
     worktree = Path(attempt["worktree"])
     (worktree / "alpha.txt").write_text("candidate\n", encoding="utf-8")
@@ -473,63 +483,78 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
     )
     submission = supervisor.submit(attempt["id"], attempt["claim_token"])
 
-    qc_result = supervisor.run_qc(submission["id"], "independent-qc")
-    if wrong_qc_attempt:
-        assert qc_result["verdict"] == "block"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        qc_result = supervisor.run_qc(submission["id"], "independent-qc")
+        if stale_qc_worktree:
+            assert qc_result["verdict"] == "block"
+            with supervisor.connect() as connection:
+                qc = connection.execute(
+                    "SELECT id, packet_sha256, results_json FROM qc_runs "
+                    "WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
+                    (submission["id"],),
+                ).fetchone()
+            packet_path = (
+                supervisor.state_dir / "logs" / f"review-{submission['id']}-{qc['id']}.json"
+            )
+            packet_bytes = packet_path.read_bytes()
+            packet = json.loads(packet_bytes)
+            assert hashlib.sha256(packet_bytes).hexdigest() == qc["packet_sha256"]
+            qc_results = json.loads(qc["results_json"])
+            qc_receipt = next(
+                item for item in qc_results if item.get("kind") == "runtime_target_preflight"
+            )
+            assert qc_receipt["exit_code"] == 1
+            assert qc_receipt["targets"][0]["probe_status"] == "ok"
+            assert qc_receipt["targets"][0]["mismatches"] == ["source_revision"]
+            assert (
+                packet["runtime_target_preflight"]["evidence_sha256"]
+                == qc_receipt["evidence_sha256"]
+            )
+            assert any(
+                item.get("sha256") == qc_receipt["evidence_sha256"]
+                for item in packet["evidence_catalog"]
+            )
+            assert not (
+                Path(attempt["runtime"]["environment"]["ACP_RUNTIME_DIR"]) / "target-gate-ran"
+            ).exists()
+            return
+        assert qc_result["verdict"] == "pass"
         with supervisor.connect() as connection:
             qc = connection.execute(
-                "SELECT id, packet_sha256, results_json FROM qc_runs "
+                "SELECT results_json FROM qc_runs "
                 "WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
                 (submission["id"],),
             ).fetchone()
-        packet_path = supervisor.state_dir / "logs" / f"review-{submission['id']}-{qc['id']}.json"
-        packet_bytes = packet_path.read_bytes()
-        packet = json.loads(packet_bytes)
-        assert hashlib.sha256(packet_bytes).hexdigest() == qc["packet_sha256"]
         qc_results = json.loads(qc["results_json"])
         qc_receipt = next(
             item for item in qc_results if item.get("kind") == "runtime_target_preflight"
         )
-        assert qc_receipt["exit_code"] == 1
-        assert qc_receipt["targets"][0]["mismatches"] == ["attempt_id"]
-        assert (
-            packet["runtime_target_preflight"]["evidence_sha256"] == qc_receipt["evidence_sha256"]
-        )
-        assert any(
-            item.get("sha256") == qc_receipt["evidence_sha256"]
-            for item in packet["evidence_catalog"]
-        )
-        assert not (
-            Path(attempt["runtime"]["environment"]["ACP_RUNTIME_DIR"]) / "target-gate-ran"
-        ).exists()
-        return
-    assert qc_result["verdict"] == "pass"
-    with supervisor.connect() as connection:
-        qc = connection.execute(
-            "SELECT results_json FROM qc_runs WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
-            (submission["id"],),
-        ).fetchone()
-    qc_results = json.loads(qc["results_json"])
-    qc_receipt = next(item for item in qc_results if item.get("kind") == "runtime_target_preflight")
-    assert qc_receipt["phase"] == "qc"
-    assert qc_receipt["source_revision"] == submission["commit_sha"]
-    assert qc_receipt["claim_token"] == attempt["claim_token"]
-    assert qc_receipt["targets"][0]["status"] == "corroborated"
-    assert qc_receipt["verified"] is False
+        assert qc_receipt["phase"] == "qc"
+        assert qc_receipt["source_revision"] == submission["commit_sha"]
+        assert qc_receipt["claim_token"] == attempt["claim_token"]
+        assert qc_receipt["targets"][0]["status"] == "corroborated"
+        assert qc_receipt["verified"] is False
 
-    integrated = supervisor.integrate(attempt["task_id"])
-    assert integrated["verdict"] == "pass", integrated["error"]
-    with supervisor.connect() as connection:
-        integration = connection.execute(
-            "SELECT results_json FROM integrations WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
-            (attempt["task_id"],),
-        ).fetchone()
-    integration_results = json.loads(integration["results_json"])
-    integration_receipt = next(
-        item for item in integration_results if item.get("kind") == "runtime_target_preflight"
-    )
-    assert integration_receipt["phase"] == "integration"
-    assert integration_receipt["source_revision"] == integrated["commit_sha"]
-    assert integration_receipt["claim_token"] == attempt["claim_token"]
-    assert integration_receipt["targets"][0]["status"] == "corroborated"
-    assert integration_receipt["verified"] is False
+        integrated = supervisor.integrate(attempt["task_id"])
+        assert integrated["verdict"] == "pass", integrated["error"]
+        with supervisor.connect() as connection:
+            integration = connection.execute(
+                "SELECT results_json FROM integrations "
+                "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                (attempt["task_id"],),
+            ).fetchone()
+        integration_results = json.loads(integration["results_json"])
+        integration_receipt = next(
+            item for item in integration_results if item.get("kind") == "runtime_target_preflight"
+        )
+        assert integration_receipt["phase"] == "integration"
+        assert integration_receipt["source_revision"] == integrated["commit_sha"]
+        assert integration_receipt["claim_token"] == attempt["claim_token"]
+        assert integration_receipt["targets"][0]["status"] == "corroborated"
+        assert integration_receipt["verified"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
