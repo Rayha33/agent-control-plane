@@ -529,13 +529,19 @@ def _validate_worker_mount_policy(
             {"ro", "nodev", "noexec", "nosuid", "relatime"},
         ),
     }
+    expected_runc_135_optional_mounts = {
+        "/proc/latency_stats": ("/null", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
+    }
     actual_mountpoints = set(mounts)
     base_mountpoints = set(expected_mounts)
     extra_mountpoints = actual_mountpoints - base_mountpoints
     if extra_mountpoints and expected_runc_version != "1.3.5":
         unexpected_mountpoints = sorted(extra_mountpoints)
     else:
-        unexpected_mountpoints = sorted(extra_mountpoints - expected_runc_135_mounts.keys())
+        known_runc_135_mountpoints = set(expected_runc_135_mounts) | set(
+            expected_runc_135_optional_mounts
+        )
+        unexpected_mountpoints = sorted(extra_mountpoints - known_runc_135_mountpoints)
     if unexpected_mountpoints:
         unexpected = {
             target: {
@@ -565,8 +571,16 @@ def _validate_worker_mount_policy(
             raise AssertionError(
                 f"runc 1.3.5 mountinfo omits exact default mounts: {missing_defaults}"
             )
+        verified_runc_135_mounts = {
+            **expected_runc_135_mounts,
+            **{
+                target: expected
+                for target, expected in expected_runc_135_optional_mounts.items()
+                if target in extra_mountpoints
+            },
+        }
         device_mount_ids: set[tuple[int, int]] = set()
-        for target, (root, filesystem, source, options) in expected_runc_135_mounts.items():
+        for target, (root, filesystem, source, options) in verified_runc_135_mounts.items():
             observed = mounts[target]
             if (observed.root, observed.filesystem, observed.source) != (
                 root,
@@ -666,7 +680,7 @@ def _validate_worker_mount_policy(
             }
         )
     if expected_runc_version == "1.3.5":
-        for target in expected_runc_135_mounts:
+        for target in verified_runc_135_mounts:
             observed = mounts[target]
             observed_mounts.append(
                 {
@@ -1395,6 +1409,49 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
         expected_runc_version="1.3.5",
     )
     assert {mount["target"] for mount in accepted_defaults} == set(runc_135_mounts)
+
+    latency_stats_mask = mount(
+        "devtmpfs",
+        {"rw", "nosuid", "relatime"},
+        root="/null",
+        source="udev",
+        device_id=dev_id,
+        super_options={"rw", "size=1024"},
+    )
+    runc_135_with_latency_stats = {
+        **runc_135_mounts,
+        "/proc/latency_stats": latency_stats_mask,
+    }
+    accepted_with_latency_stats = _validate_worker_mount_policy(
+        runc_135_with_latency_stats,
+        expected_runc_version="1.3.5",
+    )
+    assert {mount["target"] for mount in accepted_with_latency_stats} == set(
+        runc_135_with_latency_stats
+    )
+    with pytest.raises(AssertionError, match="root/filesystem/source"):
+        _validate_worker_mount_policy(
+            {
+                **runc_135_with_latency_stats,
+                "/proc/latency_stats": mount(
+                    "devtmpfs",
+                    {"rw", "nosuid", "relatime"},
+                    root="/latency_stats",
+                    source="udev",
+                    device_id=dev_id,
+                    super_options={"rw", "size=1024"},
+                ),
+            },
+            expected_runc_version="1.3.5",
+        )
+    with pytest.raises(AssertionError, match="unexpected mountpoints"):
+        _validate_worker_mount_policy(
+            {
+                **runc_135_with_latency_stats,
+                "/proc/unexpected": latency_stats_mask,
+            },
+            expected_runc_version="1.3.5",
+        )
     with pytest.raises(AssertionError, match="unexpected mountpoints"):
         _validate_worker_mount_policy(runc_135_mounts)
     with pytest.raises(AssertionError, match="unexpected mountpoints"):
@@ -2183,6 +2240,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     renamed_workspace = attempt_root / "workspace-pinned"
     recreated_state_identity: tuple[int, int] | None = None
     recreated_workspace_identity: tuple[int, int] | None = None
+    state_replacement_created = False
+    workspace_replacement_created = False
     rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs)
     rootfs_digest = rootfs_manifest["rootfs_sha256"]
     rootfs_pin = oci_worker._pin_trusted_rootfs(
@@ -2365,6 +2424,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         ) -> None:
             nonlocal recreated_bundle_identity, recreated_state_identity
             nonlocal recreated_workspace_identity, state_root, workspace, pid_file
+            nonlocal state_replacement_created, workspace_replacement_created
             proc_root_config = (
                 Path(f"/proc/{helper_pid}/root")
                 / private_bundle.relative_to(Path("/"))
@@ -2461,13 +2521,18 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             if renamed_state_root.exists() or renamed_workspace.exists():
                 raise AssertionError("runtime-path replacement targets already exist")
             os.rename(original_state_root, renamed_state_root)
+            state_root = renamed_state_root
+            pid_file = state_root / "container.pid"
             original_state_root.mkdir(mode=0o700)
+            state_replacement_created = True
             state_marker = original_state_root / "replacement-marker"
             state_marker.write_text("attacker-controlled state path", encoding="ascii")
             state_replacement = original_state_root.lstat()
             recreated_state_identity = (state_replacement.st_dev, state_replacement.st_ino)
             os.rename(original_workspace, renamed_workspace)
+            workspace = renamed_workspace
             original_workspace.mkdir(mode=0o700)
+            workspace_replacement_created = True
             workspace_marker = original_workspace / "replacement-marker"
             workspace_marker.write_text("attacker-controlled workspace path", encoding="ascii")
             workspace_replacement = original_workspace.lstat()
@@ -2475,9 +2540,6 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                 workspace_replacement.st_dev,
                 workspace_replacement.st_ino,
             )
-            state_root = renamed_state_root
-            workspace = renamed_workspace
-            pid_file = state_root / "container.pid"
             runtime_path_attack_evidence["state_path_replaced_after_fd_capture"] = True
             runtime_path_attack_evidence["workspace_path_replaced_after_fd_capture"] = True
             runtime_path_attack_evidence["replacement_state_inode"] = recreated_state_identity[1]
@@ -3276,24 +3338,26 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                 marker.unlink()
                 path.rmdir()
 
-            _attempt_cleanup(
-                cleanup_errors,
-                "could not remove the exact state-path replacement probe",
-                lambda: remove_exact_runtime_path_replacement(
-                    original_state_root,
-                    recreated_state_identity,
-                    "attacker-controlled state path",
-                ),
-            )
-            _attempt_cleanup(
-                cleanup_errors,
-                "could not remove the exact workspace-path replacement probe",
-                lambda: remove_exact_runtime_path_replacement(
-                    original_workspace,
-                    recreated_workspace_identity,
-                    "attacker-controlled workspace path",
-                ),
-            )
+            if state_replacement_created:
+                _attempt_cleanup(
+                    cleanup_errors,
+                    "could not remove the exact state-path replacement probe",
+                    lambda: remove_exact_runtime_path_replacement(
+                        original_state_root,
+                        recreated_state_identity,
+                        "attacker-controlled state path",
+                    ),
+                )
+            if workspace_replacement_created:
+                _attempt_cleanup(
+                    cleanup_errors,
+                    "could not remove the exact workspace-path replacement probe",
+                    lambda: remove_exact_runtime_path_replacement(
+                        original_workspace,
+                        recreated_workspace_identity,
+                        "attacker-controlled workspace path",
+                    ),
+                )
             attempt_cleanup["runtime_verified"] = True
             _attempt_cleanup(
                 cleanup_errors,
