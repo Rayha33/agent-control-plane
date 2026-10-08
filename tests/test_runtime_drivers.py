@@ -399,9 +399,11 @@ def test_run_trusted_never_forwards_supervisor_runner_credential(tmp_path: Path)
     assert secret not in str(result)
 
 
-def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) -> None:
+def test_run_trusted_separates_lifecycle_guards_from_command_fds(tmp_path: Path) -> None:
     lock_path = tmp_path / "restart.lock"
     guard_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    operation_path = tmp_path / "operation.lock"
+    operation_fd = os.open(operation_path, os.O_RDWR | os.O_CREAT, 0o600)
 
     def contained_runner(
         argv: list[str],
@@ -412,7 +414,8 @@ def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) ->
         lifecycle_fds: tuple[int, ...],
     ) -> dict[str, object]:
         assert guard_fd not in command_fds
-        assert lifecycle_fds == (guard_fd,)
+        assert operation_fd not in command_fds
+        assert lifecycle_fds == tuple(sorted((guard_fd, operation_fd)))
         return {
             "exit_code": 0,
             "stdout": "",
@@ -427,10 +430,12 @@ def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) ->
             tmp_path / "wd",
             {},
             guard_fd=guard_fd,
+            lifecycle_fds=(operation_fd,),
             process_runner=contained_runner,
         )
     finally:
         os.close(guard_fd)
+        os.close(operation_fd)
     assert result["exit_code"] == 0
 
 
@@ -1696,6 +1701,7 @@ def fake_postgres_runner(active: set[str], operations: list[tuple[str, str]]):
         credential,
         *,
         guard_fd=None,
+        lifecycle_fds=(),
         expected_owners=None,
         process_runner=None,
     ):
@@ -1824,10 +1830,10 @@ def test_concurrent_restart_is_rejected_and_cannot_remove_fresh_resource(
     assert entered.wait(5)
     with pytest.raises(SupervisorError) as concurrent:
         supervisor.runtime_restart(attempt["id"])
-    assert concurrent.value.code == "runtime_restart_in_progress"
+    assert concurrent.value.code == "task_operation_in_progress"
     with pytest.raises(SupervisorError) as fresh_recovery:
         supervisor.runtime_restart(attempt["id"], recover=True)
-    assert fresh_recovery.value.code == "runtime_restart_not_stale"
+    assert fresh_recovery.value.code == "task_operation_executor_alive"
     release.set()
     worker.join(5)
 
@@ -1857,6 +1863,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
         credential,
         *,
         guard_fd=None,
+        lifecycle_fds=(),
         expected_owners=None,
         process_runner=None,
     ):
@@ -1870,6 +1877,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
             timeout,
             credential,
             guard_fd=guard_fd,
+            lifecycle_fds=lifecycle_fds,
             expected_owners=expected_owners,
             process_runner=process_runner,
         )
@@ -1897,7 +1905,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
     recovery = GitSupervisor(repo)
     with pytest.raises(SupervisorError) as blocked:
         recovery.runtime_restart(attempt["id"], recover=True)
-    assert blocked.value.code == "runtime_restart_executor_alive"
+    assert blocked.value.code == "task_operation_executor_alive"
 
     release_teardown.set()
     worker.join(5)

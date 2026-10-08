@@ -636,10 +636,11 @@ class QcMixin:
                             "ACP_CLAIM_TOKEN": str(attempt["claim_token"]),
                             "ACP_TASK_ID": str(submission["task_id"]),
                         }
-                    if phase_context:
-                        self.runtime_restart(submission["attempt_id"], phase_context=phase_context)
-                    else:
-                        self.runtime_restart(submission["attempt_id"])
+                    self._runtime_restart_in_operation(
+                        submission["attempt_id"],
+                        operation_guard_fd,
+                        phase_context=phase_context,
+                    )
                 except SupervisorError as error:
                     findings.append(
                         {

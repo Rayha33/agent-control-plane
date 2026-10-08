@@ -238,7 +238,11 @@ class IntegrationMixin:
                         "ACP_CLAIM_TOKEN": str(attempt["claim_token"]),
                         "ACP_TASK_ID": str(task_id),
                     }
-                    self.runtime_restart(submission["attempt_id"], phase_context=phase_context)
+                    self._runtime_restart_in_operation(
+                        submission["attempt_id"],
+                        operation_guard_fd,
+                        phase_context=phase_context,
+                    )
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
                     receipt, target_env, blocked = runtime_target_phase(
                         definitions=phase_targets,

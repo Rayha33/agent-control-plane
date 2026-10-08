@@ -982,12 +982,39 @@ class RuntimeMixin:
         *,
         phase_context: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Tear down and re-create driver resources between phases.
+        """Tear down and re-create driver resources under the task operation fence.
 
         QC must not be able to reach a service the worker left running: a stale
         app server can make a reviewer pass a candidate whose code never
-        actually starts.
+        actually starts. Serializing public restarts with the whole QC/integration
+        operation also prevents a CLI restart from invalidating its target receipt.
         """
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT task_id FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+        if not attempt:
+            raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
+        with self._task_operation_guard(
+            str(attempt["task_id"]), recover=recover
+        ) as operation_guard_fd:
+            return self._runtime_restart_in_operation(
+                attempt_id,
+                operation_guard_fd,
+                recover=recover,
+                phase_context=phase_context,
+            )
+
+    def _runtime_restart_in_operation(
+        self,
+        attempt_id: str,
+        operation_guard_fd: int,
+        recover: bool = False,
+        *,
+        phase_context: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Restart while the caller holds this task's operation guard."""
+
         self._assert_driver_config_unchanged(attempt_id)
         if phase_context is not None:
             if recover:
@@ -1076,7 +1103,11 @@ class RuntimeMixin:
                 )
         with self._runtime_restart_guard(attempt_id, recover) as guard_fd:
             return self._runtime_restart_locked(
-                attempt_id, recover, guard_fd, phase_context=phase_context
+                attempt_id,
+                recover,
+                guard_fd,
+                phase_context=phase_context,
+                operation_guard_fd=operation_guard_fd,
             )
 
     def _runtime_restart_locked(
@@ -1086,6 +1117,7 @@ class RuntimeMixin:
         guard_fd: int,
         *,
         phase_context: Mapping[str, str] | None = None,
+        operation_guard_fd: int | None = None,
     ) -> dict[str, Any]:
         """Restart while holding the kernel guard returned above."""
 
@@ -1156,6 +1188,7 @@ class RuntimeMixin:
             teardown_names,
             restart_token=restart_token,
             restart_guard_fd=guard_fd,
+            operation_guard_fd=operation_guard_fd,
         )
         self._assert_restart_owner(attempt_id, restart_token)
         unproven = [item for item in teardown if not item.proof.get("cleanup_proved")]
@@ -1181,6 +1214,7 @@ class RuntimeMixin:
             environment,
             restart_token=restart_token,
             restart_guard_fd=guard_fd,
+            operation_guard_fd=operation_guard_fd,
         )
         self._assert_restart_owner(attempt_id, restart_token)
         failed = [item for item in setup if not item.ok]
