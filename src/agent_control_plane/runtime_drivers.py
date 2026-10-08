@@ -315,15 +315,17 @@ def run_trusted(
     expected_owners: set[int] | None = None,
     process_runner: ContainedProcessRunner | None = None,
     pass_fds: Sequence[int] = (),
+    lifecycle_fds: Sequence[int] = (),
     create_cwd: bool = True,
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
 
-    ``guard_fd`` is a supervisor-owned lifetime lock. A contained process
-    runner retains it in its trusted monitor but closes it before executing the
-    external command, so recovery remains fenced without giving the command an
-    unlock capability. Read-only diagnostics set ``create_cwd=False`` so a
-    missing attempt directory is refused instead of recreated.
+    ``guard_fd`` and ``lifecycle_fds`` are supervisor-owned lifetime locks. A
+    contained process runner retains them in its trusted monitor but closes them
+    before executing the external command, so recovery remains fenced without
+    giving the command an unlock capability. Read-only diagnostics set
+    ``create_cwd=False`` so a missing attempt directory is refused instead of
+    recreated.
     """
 
     if not argv:
@@ -439,6 +441,14 @@ def run_trusted(
             )
             if fd is not None
         }
+        retained_fds = set(lifecycle_fds)
+        if guard_fd is not None:
+            retained_fds.add(guard_fd)
+        if retained_fds & command_fds:
+            raise DriverError(
+                "invalid_lifecycle_fd",
+                "lifecycle lock descriptors must not be exposed to the driver command",
+            )
         if process_runner is not None:
             contained_argv = list(execution_argv)
             if descriptor_execution:
@@ -450,7 +460,7 @@ def run_trusted(
                 safe_env,
                 timeout,
                 tuple(sorted(command_fds)),
-                (guard_fd,) if guard_fd is not None else (),
+                tuple(sorted(retained_fds)),
             )
             contained = process_runner(*process_args)
             return {
@@ -461,10 +471,10 @@ def run_trusted(
                 "duration_ms": int(contained["duration_ms"]),
                 "timed_out": bool(contained.get("timed_out", False)),
             }
-        if guard_fd is not None:
+        if retained_fds:
             raise DriverError(
                 "lifecycle_monitor_required",
-                "a guard descriptor requires a contained process monitor",
+                "lifecycle lock descriptors require a contained process monitor",
             )
         execution_options: dict[str, Any] = {}
         if descriptor_execution:

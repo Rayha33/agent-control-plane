@@ -36,6 +36,7 @@ from .common import (
     sha256,
     utc_now,
 )
+from .runtime_targets import runtime_target_phase
 
 
 class IntegrationMixin:
@@ -113,7 +114,7 @@ class IntegrationMixin:
                     f"submission runtime state is {runtime['state'] if runtime else 'missing'}",
                 )
             attempt = connection.execute(
-                "SELECT base_checkout_snapshot_json, base_checkout_snapshot_required "
+                "SELECT base_checkout_snapshot_json, base_checkout_snapshot_required, claim_token "
                 "FROM attempts WHERE id = ?",
                 (submission["attempt_id"],),
             ).fetchone()
@@ -206,6 +207,64 @@ class IntegrationMixin:
                         or merge["stdout"].strip()
                         or "isolated merge failed",
                     )
+                phase_targets = tuple(
+                    target
+                    for target in self.config.runtime_targets
+                    if "integration" in target.phases
+                )
+                phase_context: dict[str, str] | None = None
+                target_env: dict[str, str] = {}
+                if phase_targets:
+                    self._restore_integration_workspace(
+                        worktree,
+                        integration_commit,
+                        operation_guard_fd,
+                        git_boundary,
+                    )
+                    if not self._integration_workspace_matches(
+                        worktree,
+                        integration_commit,
+                        operation_guard_fd,
+                        git_boundary,
+                    ):
+                        raise SupervisorError(
+                            "runtime_target_source_mismatch",
+                            "integration target checkout is not the merged source revision",
+                        )
+                    phase_context = {
+                        "ACP_PHASE": "integration",
+                        "ACP_WORKTREE": str(worktree),
+                        "ACP_SOURCE_REVISION": integration_commit,
+                        "ACP_CLAIM_TOKEN": str(attempt["claim_token"]),
+                        "ACP_TASK_ID": str(task_id),
+                    }
+                    self._runtime_restart_in_operation(
+                        submission["attempt_id"],
+                        operation_guard_fd,
+                        phase_context=phase_context,
+                    )
+                    runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
+                    receipt, target_env, blocked = runtime_target_phase(
+                        definitions=phase_targets,
+                        runtime_environment=runtime_env,
+                        driver_resources=self.driver_resources(submission["attempt_id"]),
+                        attempt_id=str(submission["attempt_id"]),
+                        task_id=str(task_id),
+                        claim_token=int(attempt["claim_token"]),
+                        reservation_fence_sha256=sha256(
+                            str(submission["resource_tokens_json"]).encode("utf-8")
+                        ),
+                        phase="integration",
+                        source_revision=integration_commit,
+                        runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
+                        receipt_id=integration_id,
+                    )
+                    results.append(receipt)
+                    if blocked:
+                        raise SupervisorError(
+                            "runtime_target_identity_mismatch",
+                            "required integration runtime target identity is missing or mismatched",
+                        )
                 for command in self.config.integration_commands:
                     self._restore_integration_workspace(
                         worktree,
@@ -213,10 +272,16 @@ class IntegrationMixin:
                         operation_guard_fd,
                         git_boundary,
                     )
+                    command_environment = self._phase_runtime_env(
+                        runtime_env, "integration", worktree
+                    )
+                    if phase_context:
+                        command_environment.update(phase_context)
+                        command_environment.update(target_env)
                     result = self._run_command(
                         command,
                         worktree,
-                        self._phase_runtime_env(runtime_env, "integration", worktree),
+                        command_environment,
                         pass_fds=(operation_guard_fd,),
                     )
                     results.append(result)

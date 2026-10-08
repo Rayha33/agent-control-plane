@@ -141,6 +141,25 @@ retain attempt-root semantics. This narrows a path-identity mismatch at the stru
 hook boundary; it does not guard Bash, bypassed hooks, or the race between authorization
 and the actual write, and it is not an OS sandbox.
 
+### Healthy but wrong service endpoints (2026-10-07)
+
+A current [r/ChatGPTCoding discussion](https://www.reddit.com/r/ChatGPTCoding/comments/1wrvhfb/git_worktrees_solved_our_parallelagent_file/)
+separates code checkout, the processes a browser test reaches, mutable test data,
+and checks after branches combine. The author reports that worktrees stopped
+same-checkout edits but did not stop browser QA from reaching a healthy API from
+another worktree; shared PostgreSQL, queues, and migrations could still contaminate
+parallel tests. A commenter recommends per-worktree containers and serialized
+integration/E2E checks. This is one thread and a self-report, not a prevalence
+estimate or independently reproduced vendor finding.
+
+For ACP, this makes a wrong-but-healthy target a required regression: a live
+loopback service that reports another source revision must block before QC runs
+commands. A matching service should exercise both QC and integration. The identity
+endpoint remains app-reported corroboration: it does not attribute the listener to
+a checkout, prove that every test client used the declared URL, or isolate an
+external database/queue. Those are separate runtime/network controls, not claims
+the current target receipt can make.
+
 ### Parallel worktree provisioning reports (2026-10-02)
 
 Claude Code issue [#47266](https://github.com/anthropics/claude-code/issues/47266)

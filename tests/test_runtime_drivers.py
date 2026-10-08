@@ -399,9 +399,11 @@ def test_run_trusted_never_forwards_supervisor_runner_credential(tmp_path: Path)
     assert secret not in str(result)
 
 
-def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) -> None:
+def test_run_trusted_separates_lifecycle_guards_from_command_fds(tmp_path: Path) -> None:
     lock_path = tmp_path / "restart.lock"
     guard_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    operation_path = tmp_path / "operation.lock"
+    operation_fd = os.open(operation_path, os.O_RDWR | os.O_CREAT, 0o600)
 
     def contained_runner(
         argv: list[str],
@@ -412,7 +414,8 @@ def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) ->
         lifecycle_fds: tuple[int, ...],
     ) -> dict[str, object]:
         assert guard_fd not in command_fds
-        assert lifecycle_fds == (guard_fd,)
+        assert operation_fd not in command_fds
+        assert lifecycle_fds == tuple(sorted((guard_fd, operation_fd)))
         return {
             "exit_code": 0,
             "stdout": "",
@@ -427,10 +430,12 @@ def test_run_trusted_separates_restart_guard_from_command_fds(tmp_path: Path) ->
             tmp_path / "wd",
             {},
             guard_fd=guard_fd,
+            lifecycle_fds=(operation_fd,),
             process_runner=contained_runner,
         )
     finally:
         os.close(guard_fd)
+        os.close(operation_fd)
     assert result["exit_code"] == 0
 
 
@@ -1358,6 +1363,91 @@ def test_supervisor_persists_verified_simulator_udid_across_all_attempt_phases(
     assert not any("download" in argument.lower() for command in commands for argument in command)
 
 
+def test_phase_context_is_not_persisted_across_crashed_runtime_restart(
+    driver_repo: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _enable_simulator_platform(monkeypatch)
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    runner, _devices, _commands = _fake_simulator_runner(
+        (CLONE_SIMULATOR_UDID, REPLACEMENT_SIMULATOR_UDID)
+    )
+    observed_environments: list[dict[str, str]] = []
+
+    def fake_run_trusted(argv, cwd, env, timeout, credential, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        observed_environments.append(dict(env))
+        return runner(argv, cwd, env, timeout, credential)
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    (driver_repo / "acp.toml").write_text(
+        DRIVER_CONFIG.replace(
+            'name = "browser"\nkind = "browser_profile"',
+            'name = "ios"\nkind = "core_simulator"\n'
+            'executable = "/usr/bin/xcrun"\n'
+            f'base_udid = "{BASE_SIMULATOR_UDID}"',
+        ),
+        encoding="utf-8",
+    )
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+    initial_environment = supervisor.runtime_environment(attempt["id"])["environment"]
+    source_revision = subprocess.run(
+        ["git", "-C", str(driver_repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    phase_context = {
+        "ACP_PHASE": "qc",
+        "ACP_WORKTREE": str(Path(attempt["worktree"]).resolve()),
+        "ACP_SOURCE_REVISION": source_revision,
+        "ACP_CLAIM_TOKEN": str(attempt["claim_token"]),
+        "ACP_TASK_ID": str(attempt["task_id"]),
+    }
+    original_run_driver_phase = supervisor._run_driver_phase
+
+    def crash_after_teardown(phase, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = original_run_driver_phase(phase, *args, **kwargs)
+        if phase == "teardown":
+            raise RuntimeError("simulated crash after durable teardown evidence")
+        return result
+
+    monkeypatch.setattr(supervisor, "_run_driver_phase", crash_after_teardown)
+    with pytest.raises(RuntimeError, match="after durable teardown evidence"):
+        supervisor.runtime_restart(attempt["id"], phase_context=phase_context)
+
+    with sqlite3.connect(supervisor.db_path) as connection:
+        durable_environment = json.loads(
+            connection.execute(
+                "SELECT env_json FROM runtime_environments WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET restart_started_at = 0 WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    assert all(
+        durable_environment.get(key) == initial_environment.get(key) for key in phase_context
+    )
+    assert "ACP_SIMULATOR_UDID" not in durable_environment
+    assert supervisor.driver_resources(attempt["id"])[0]["state"] == "released"
+
+    observed_environments.clear()
+    monkeypatch.setattr(supervisor, "_run_driver_phase", original_run_driver_phase)
+    recovered = supervisor.runtime_restart(attempt["id"], recover=True)
+
+    assert recovered["attempt_id"] == attempt["id"]
+    assert supervisor.runtime_environment(attempt["id"])["state"] == "ready"
+    assert observed_environments
+    for environment in observed_environments:
+        assert all(environment.get(key) == initial_environment.get(key) for key in phase_context)
+
+
 def test_crash_after_clone_before_udid_commit_quarantines_without_guessing(
     driver_repo: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
@@ -1611,6 +1701,7 @@ def fake_postgres_runner(active: set[str], operations: list[tuple[str, str]]):
         credential,
         *,
         guard_fd=None,
+        lifecycle_fds=(),
         expected_owners=None,
         process_runner=None,
     ):
@@ -1739,10 +1830,10 @@ def test_concurrent_restart_is_rejected_and_cannot_remove_fresh_resource(
     assert entered.wait(5)
     with pytest.raises(SupervisorError) as concurrent:
         supervisor.runtime_restart(attempt["id"])
-    assert concurrent.value.code == "runtime_restart_in_progress"
+    assert concurrent.value.code == "task_operation_in_progress"
     with pytest.raises(SupervisorError) as fresh_recovery:
         supervisor.runtime_restart(attempt["id"], recover=True)
-    assert fresh_recovery.value.code == "runtime_restart_not_stale"
+    assert fresh_recovery.value.code == "task_operation_executor_alive"
     release.set()
     worker.join(5)
 
@@ -1772,6 +1863,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
         credential,
         *,
         guard_fd=None,
+        lifecycle_fds=(),
         expected_owners=None,
         process_runner=None,
     ):
@@ -1785,6 +1877,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
             timeout,
             credential,
             guard_fd=guard_fd,
+            lifecycle_fds=lifecycle_fds,
             expected_owners=expected_owners,
             process_runner=process_runner,
         )
@@ -1812,7 +1905,7 @@ def test_stale_recovery_refuses_live_executor_before_overlapping_teardown(
     recovery = GitSupervisor(repo)
     with pytest.raises(SupervisorError) as blocked:
         recovery.runtime_restart(attempt["id"], recover=True)
-    assert blocked.value.code == "runtime_restart_executor_alive"
+    assert blocked.value.code == "task_operation_executor_alive"
 
     release_teardown.set()
     worker.join(5)
