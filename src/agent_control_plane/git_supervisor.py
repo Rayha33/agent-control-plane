@@ -2024,6 +2024,7 @@ class GitSupervisor(
         only_drivers: set[str] | None = None,
         restart_token: str | None = None,
         restart_guard_fd: int | None = None,
+        operation_guard_fd: int | None = None,
         persist_evidence: bool = True,
         read_only: bool = False,
     ) -> list[PhaseEvidence]:
@@ -2044,6 +2045,7 @@ class GitSupervisor(
             or persist_evidence
             or restart_token is not None
             or restart_guard_fd is not None
+            or operation_guard_fd is not None
             or only_drivers is None
         ):
             raise SupervisorError(
@@ -2150,6 +2152,8 @@ class GitSupervisor(
             execution_options: dict[str, Any] = {}
             if restart_guard_fd is not None:
                 execution_options["guard_fd"] = restart_guard_fd
+            if operation_guard_fd is not None:
+                execution_options["lifecycle_fds"] = (operation_guard_fd,)
             if trusted_owners is not None:
                 execution_options["expected_owners"] = trusted_owners
             execution_options["process_runner"] = self._run_trusted_contained

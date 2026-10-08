@@ -6,7 +6,9 @@ import socket
 import stat
 import subprocess
 import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -395,11 +397,15 @@ def test_target_names_must_not_alias_environment_variables() -> None:
     assert rejected.value.code == "invalid_config"
 
 
-@pytest.mark.parametrize("stale_qc_worktree", [False, True])
+@pytest.mark.parametrize(
+    ("stale_qc_worktree", "pause_phase"),
+    [(False, None), (True, None), (False, "qc"), (False, "integration")],
+)
 def test_qc_and_integration_receive_claim_fenced_target_receipts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stale_qc_worktree: bool,
+    pause_phase: str | None,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -407,17 +413,27 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
+    gate_started = tmp_path / "target-gate-started"
+    gate_release = tmp_path / "target-gate-release"
     gate = python_command(
-        "import hashlib,json,os,stat; from pathlib import Path; "
-        "p=Path(os.environ['ACP_RUNTIME_TARGETS_FILE']); raw=p.read_bytes(); "
-        "m=json.loads(raw); "
-        "assert not (p.stat().st_mode & 0o222); "
-        "assert hashlib.sha256(raw).hexdigest()==os.environ['ACP_RUNTIME_TARGETS_SHA256']; "
-        "assert m['phase']==os.environ['ACP_PHASE']; "
-        "assert m['claim_token']==int(os.environ['ACP_CLAIM_TOKEN']); "
-        "assert m['source_revision']==os.environ['ACP_SOURCE_REVISION']; "
-        "assert m['targets'][0]['endpoint']==os.environ['ACP_TARGET_API_URL']; "
-        "Path(os.environ['ACP_RUNTIME_DIR'],'target-gate-ran').write_text(os.environ['ACP_PHASE'])"
+        "import hashlib, json, os, stat, time\n"
+        "from pathlib import Path\n"
+        "p = Path(os.environ['ACP_RUNTIME_TARGETS_FILE'])\n"
+        "raw = p.read_bytes()\n"
+        "m = json.loads(raw)\n"
+        "assert not (p.stat().st_mode & 0o222)\n"
+        "assert hashlib.sha256(raw).hexdigest() == os.environ['ACP_RUNTIME_TARGETS_SHA256']\n"
+        "assert m['phase'] == os.environ['ACP_PHASE']\n"
+        "assert m['claim_token'] == int(os.environ['ACP_CLAIM_TOKEN'])\n"
+        "assert m['source_revision'] == os.environ['ACP_SOURCE_REVISION']\n"
+        "assert m['targets'][0]['endpoint'] == os.environ['ACP_TARGET_API_URL']\n"
+        f"if os.environ['ACP_PHASE'] == {pause_phase!r}:\n"
+        f"    Path({str(gate_started)!r}).write_text('started')\n"
+        "    deadline = time.monotonic() + 15\n"
+        f"    while not Path({str(gate_release)!r}).exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        f"    assert Path({str(gate_release)!r}).exists(), 'restart race gate was not released'\n"
+        "Path(os.environ['ACP_RUNTIME_DIR'], 'target-gate-ran').write_text(os.environ['ACP_PHASE'])"
     )
     write_config(repo, qc_commands=[gate], integration_commands=[gate])
     with (repo / "acp.toml").open("a", encoding="utf-8") as config:
@@ -428,6 +444,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             'driver = "api"\nphases = ["qc", "integration"]\n'
         )
     supervisor = GitSupervisor(repo)
+    concurrent_supervisor = GitSupervisor(repo)
     created = supervisor.create_task(
         "target identity fixture",
         "Exercise opt-in target identity receipts.",
@@ -437,10 +454,21 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
     attempt = supervisor.claim(created["id"], "worker")
     server = _TargetIdentityServer(200, "application/json", b"{}", port=port)
     context: dict[str, Any] = {}
-    original_restart = supervisor.runtime_restart
+    original_restart = supervisor._runtime_restart_in_operation
 
-    def capture_phase(attempt_id: str, recover: bool = False, *, phase_context=None):
-        restarted = original_restart(attempt_id, recover=recover, phase_context=phase_context)
+    def capture_phase(
+        attempt_id: str,
+        operation_guard_fd: int,
+        recover: bool = False,
+        *,
+        phase_context=None,
+    ):
+        restarted = original_restart(
+            attempt_id,
+            operation_guard_fd,
+            recover=recover,
+            phase_context=phase_context,
+        )
         if phase_context:
             resource = next(
                 item for item in supervisor.driver_resources(attempt_id) if item["driver"] == "api"
@@ -470,7 +498,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             }
         ).encode("utf-8")
 
-    monkeypatch.setattr(supervisor, "runtime_restart", capture_phase)
+    monkeypatch.setattr(supervisor, "_runtime_restart_in_operation", capture_phase)
     server.body = report
 
     worktree = Path(attempt["worktree"])
@@ -485,8 +513,36 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+
+    def run_with_restart_race(
+        phase: str, operation: Callable[[], dict[str, Any]]
+    ) -> dict[str, Any]:
+        if pause_phase != phase:
+            return operation()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(operation)
+            try:
+                deadline = time.monotonic() + 8
+                while not gate_started.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert gate_started.exists(), (
+                    f"{phase} gate did not reach the pause after preflight"
+                )
+                before_runtime = supervisor.runtime_environment(attempt["id"])
+                before_resources = supervisor.driver_resources(attempt["id"])
+                with pytest.raises(SupervisorError) as rejected:
+                    concurrent_supervisor.runtime_restart(attempt["id"])
+                assert rejected.value.code == "task_operation_in_progress"
+                assert supervisor.runtime_environment(attempt["id"]) == before_runtime
+                assert supervisor.driver_resources(attempt["id"]) == before_resources
+            finally:
+                gate_release.write_text("continue", encoding="utf-8")
+            return future.result(timeout=30)
+
     try:
-        qc_result = supervisor.run_qc(submission["id"], "independent-qc")
+        qc_result = run_with_restart_race(
+            "qc", lambda: supervisor.run_qc(submission["id"], "independent-qc")
+        )
         if stale_qc_worktree:
             assert qc_result["verdict"] == "block"
             with supervisor.connect() as connection:
@@ -520,7 +576,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 Path(attempt["runtime"]["environment"]["ACP_RUNTIME_DIR"]) / "target-gate-ran"
             ).exists()
             return
-        assert qc_result["verdict"] == "pass"
+        assert qc_result["verdict"] == "pass", qc_result.get("findings")
         with supervisor.connect() as connection:
             qc = connection.execute(
                 "SELECT results_json FROM qc_runs "
@@ -537,7 +593,9 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         assert qc_receipt["targets"][0]["status"] == "corroborated"
         assert qc_receipt["verified"] is False
 
-        integrated = supervisor.integrate(attempt["task_id"])
+        integrated = run_with_restart_race(
+            "integration", lambda: supervisor.integrate(attempt["task_id"])
+        )
         assert integrated["verdict"] == "pass", integrated["error"]
         with supervisor.connect() as connection:
             integration = connection.execute(

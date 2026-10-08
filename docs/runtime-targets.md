@@ -77,6 +77,15 @@ checkout and the receipt records its hash. These permissions and hashes detect
 accidental mutation; a same-UID command is not prevented from changing the
 file.
 
+QC and integration hold the task-operation lock continuously across target preflight
+and their configured commands. Public runtime restart and recovery acquire that same
+lock, so they fail closed instead of replacing a target after its receipt is checked.
+The internal phase restart reuses the lock already held by QC or integration. Trusted
+process monitors retain the lock while driver and phase-command process trees are
+alive, but close it before command execution; a crashed supervisor therefore cannot
+release the fence while a monitored command is still running, and the command itself
+cannot unlock it.
+
 ## Gate and evidence semantics
 
 ACP probes only the allocated loopback port, makes one bounded HTTP GET, accepts
