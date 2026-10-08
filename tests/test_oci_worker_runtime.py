@@ -6,9 +6,12 @@ closed when OCI is configured. Run only on a disposable Linux host with rootless
 runc and delegated cgroup v2, using an exact runc version as an environment
 pin. The default test suite skips the live test.
 
-Cleanup assumes pytest's private temporary parent is not concurrently modified
-by another process running as the same host UID; the hostile worker itself has
-no mount of the attempt bundle or its parent.
+The finalizer requires the exact recorded identities for every direct child
+before recursive cleanup. Cleanup still assumes pytest's private temporary
+parent is not concurrently modified by another process running as the same host
+UID; this test does not prove safety against a same-UID actor racing inside a
+verified child. The hostile worker itself has no mount of the attempt bundle or
+its parent.
 """
 
 from __future__ import annotations
@@ -1060,6 +1063,7 @@ def _remove_checkout_write_probe(
 def _remove_private_attempt_tree(
     directory: Path,
     identity: tuple[int, int],
+    expected_child_identities: dict[str, tuple[int, int]],
     expected_uid: int,
 ) -> None:
     """Remove this exact owned tree relative to a pinned private parent FD."""
@@ -1097,18 +1101,7 @@ def _remove_private_attempt_tree(
             opened_info = os.fstat(attempt_fd)
             if not os.path.samestat(named_info, opened_info):
                 raise AssertionError("private attempt tree changed during open")
-            with os.scandir(attempt_fd) as entries:
-                children = list(entries)
-            if any(entry.name not in _ATTEMPT_ROOT_CHILDREN for entry in children):
-                raise AssertionError("private attempt tree contains an unexpected entry")
-            for entry in children:
-                child_info = entry.stat(follow_symlinks=False)
-                if (
-                    not stat.S_ISDIR(child_info.st_mode)
-                    or child_info.st_uid != expected_uid
-                    or stat.S_IMODE(child_info.st_mode) != 0o700
-                ):
-                    raise AssertionError("private attempt-tree child is not an owned directory")
+            _verify_private_attempt_children(attempt_fd, expected_child_identities, expected_uid)
         finally:
             os.close(attempt_fd)
 
@@ -1120,6 +1113,45 @@ def _remove_private_attempt_tree(
         raise AssertionError("private attempt tree remained after cleanup")
     finally:
         os.close(parent_fd)
+
+
+def _verify_private_attempt_children(
+    attempt_fd: int,
+    expected_child_identities: dict[str, tuple[int, int]],
+    expected_uid: int,
+) -> None:
+    """Require the exact recorded root-child names and inode identities."""
+
+    with os.scandir(attempt_fd) as entries:
+        children = list(entries)
+    expected_names = set(expected_child_identities)
+    actual_names = {entry.name for entry in children}
+    if expected_names - _ATTEMPT_ROOT_CHILDREN:
+        raise AssertionError("private attempt cleanup has an unapproved child name")
+    if actual_names != expected_names:
+        raise AssertionError("private attempt tree contains an unexpected entry")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for entry in children:
+        child_info = entry.stat(follow_symlinks=False)
+        expected_child_identity = expected_child_identities[entry.name]
+        if (
+            not stat.S_ISDIR(child_info.st_mode)
+            or child_info.st_uid != expected_uid
+            or stat.S_IMODE(child_info.st_mode) != 0o700
+            or (child_info.st_dev, child_info.st_ino) != expected_child_identity
+        ):
+            raise AssertionError("private attempt-tree child identity changed")
+        child_fd = os.open(entry.name, directory_flags, dir_fd=attempt_fd)
+        try:
+            if not os.path.samestat(child_info, os.fstat(child_fd)):
+                raise AssertionError("private attempt-tree child changed during open")
+        finally:
+            os.close(child_fd)
 
 
 def _cleanup_identity_gaps(
@@ -1870,8 +1902,14 @@ def test_private_attempt_tree_cleanup_removes_owned_tree(tmp_path: Path) -> None
     directory.chmod(0o700)
     (directory / "workspace-source").mkdir(mode=0o700)
     info = directory.lstat()
+    child_info = (directory / "workspace-source").lstat()
 
-    _remove_private_attempt_tree(directory, (info.st_dev, info.st_ino), os.geteuid())
+    _remove_private_attempt_tree(
+        directory,
+        (info.st_dev, info.st_ino),
+        {"workspace-source": (child_info.st_dev, child_info.st_ino)},
+        os.geteuid(),
+    )
 
     assert not directory.exists()
 
@@ -1885,9 +1923,72 @@ def test_private_attempt_tree_cleanup_preserves_unexpected_entries(tmp_path: Pat
     info = directory.lstat()
 
     with pytest.raises(AssertionError, match="unexpected entry"):
-        _remove_private_attempt_tree(directory, (info.st_dev, info.st_ino), os.geteuid())
+        _remove_private_attempt_tree(directory, (info.st_dev, info.st_ino), {}, os.geteuid())
 
     assert unexpected.read_text(encoding="ascii") == "preserve"
+
+
+def test_private_attempt_tree_cleanup_preserves_allowed_name_inode_replacement(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "live-oci-attempt"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    original = directory / "workspace-source"
+    original.mkdir(mode=0o700)
+    original_identity_info = original.lstat()
+    original.rename(tmp_path / "workspace-pinned")
+    replacement = directory / "workspace-source"
+    replacement.mkdir(mode=0o700)
+    marker = replacement / "unexpected-residue"
+    marker.write_text("preserve", encoding="ascii")
+    root_info = directory.lstat()
+
+    with pytest.raises(AssertionError, match="child identity changed"):
+        _remove_private_attempt_tree(
+            directory,
+            (root_info.st_dev, root_info.st_ino),
+            {"workspace-source": (original_identity_info.st_dev, original_identity_info.st_ino)},
+            os.geteuid(),
+        )
+
+    assert marker.read_text(encoding="ascii") == "preserve"
+    assert (tmp_path / "workspace-pinned").is_dir()
+
+
+def test_private_attempt_tree_finalizer_rechecks_child_reappearing_after_precheck(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "live-oci-attempt"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    bundle = directory / "bundle"
+    bundle.mkdir(mode=0o700)
+    bundle_info = bundle.lstat()
+    root_info = directory.lstat()
+    expected_children = {"bundle": (bundle_info.st_dev, bundle_info.st_ino)}
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    attempt_fd = os.open(directory, flags)
+    try:
+        _verify_private_attempt_children(attempt_fd, expected_children, os.geteuid())
+    finally:
+        os.close(attempt_fd)
+
+    bundle.rename(tmp_path / "pinned-bundle")
+    bundle.mkdir(mode=0o700)
+    marker = bundle / "reappeared-residue"
+    marker.write_text("preserve", encoding="ascii")
+
+    with pytest.raises(AssertionError, match="child identity changed"):
+        _remove_private_attempt_tree(
+            directory,
+            (root_info.st_dev, root_info.st_ino),
+            expected_children,
+            os.geteuid(),
+        )
+
+    assert marker.read_text(encoding="ascii") == "preserve"
+    assert (tmp_path / "pinned-bundle").is_dir()
 
 
 def test_partial_launch_without_runtime_identity_fails_closed() -> None:
@@ -2155,14 +2256,44 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         b'"linux":{"rootfsPropagation":"shared"}}\n'
     )
     bundle_attack_evidence: dict[str, Any] = {}
+    attempt_child_identities: dict[str, tuple[int, int]] = {}
     attempt_cleanup = {
         "created": False,
         "identity": None,
+        "child_identities": attempt_child_identities,
         "launch_submitted": False,
         "runtime_verified": False,
         "preserve": False,
     }
     cleanup_client_state_known = True
+
+    def record_attempt_child(path: Path) -> tuple[int, int]:
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise AssertionError("private attempt-tree child is not owned and mode 0700")
+        identity = (info.st_dev, info.st_ino)
+        attempt_child_identities[path.name] = identity
+        return identity
+
+    def rename_attempt_child_identity(
+        old_name: str, path: Path, expected_identity: tuple[int, int]
+    ) -> None:
+        if attempt_child_identities.get(old_name) != expected_identity:
+            raise AssertionError("private attempt-tree rename lacks its recorded identity")
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or (info.st_dev, info.st_ino) != expected_identity
+        ):
+            raise AssertionError("private attempt-tree rename changed its child identity")
+        del attempt_child_identities[old_name]
+        attempt_child_identities[path.name] = expected_identity
 
     def finalize_attempt_tree() -> None:
         if not _attempt_tree_removal_allowed(
@@ -2174,7 +2305,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             raise AssertionError("private attempt-tree identity was not recorded")
         _run_cleanup_action_if_client_state_known(
             cleanup_client_state_known,
-            lambda: _remove_private_attempt_tree(attempt_root, identity, os.geteuid()),
+            lambda: _remove_private_attempt_tree(
+                attempt_root, identity, attempt_child_identities, os.geteuid()
+            ),
         )
 
     request.addfinalizer(finalize_attempt_tree)
@@ -2195,6 +2328,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     bundle_root.mkdir(mode=0o700)
     bundle_info = bundle_root.lstat()
     original_bundle_identity = (bundle_info.st_dev, bundle_info.st_ino)
+    record_attempt_child(bundle_root)
     rootfs = bundle_root / "rootfs"
     rootfs.mkdir(mode=0o755)
     for relative in (
@@ -2215,11 +2349,13 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
 
     workspace_source = attempt_root / "workspace-source"
     workspace_source.mkdir(mode=0o700)
+    record_attempt_child(workspace_source)
     (workspace_source / "input.txt").write_text("snapshot input", encoding="ascii")
     (workspace_source / ".git").write_text(
         "gitdir: /tmp/host-shared-git-metadata", encoding="ascii"
     )
     workspace_snapshot = copy_snapshot(workspace_source, attempt_root / "workspace-snapshot")
+    original_workspace_identity = record_attempt_child(Path(workspace_snapshot.root))
     workspace = Path(workspace_snapshot.root)
     if (workspace / ".git").exists():
         pytest.fail("host snapshot copied its top-level Git pointer into the worker workspace")
@@ -2233,6 +2369,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     checkout_probe_created = False
     state_root = attempt_root / "runc-state"
     state_root.mkdir(mode=0o700)
+    original_state_identity = record_attempt_child(state_root)
     pid_file = state_root / "container.pid"
     original_state_root = state_root
     renamed_state_root = attempt_root / "runc-state-pinned"
@@ -2259,6 +2396,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     host_tmp_file = fixture_root / "host-tmp-sentinel"
     fixture_root.mkdir(mode=0o700)
     fixture_root.chmod(0o700)
+    record_attempt_child(fixture_root)
     for directory in (
         fixture_root / "sibling-attempt",
         fixture_root / "unrelated-project",
@@ -2511,6 +2649,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             replacement.write_bytes(attacker_config)
             os.replace(replacement, private_bundle / "config.json")
             os.rename(private_bundle, renamed_bundle_root)
+            rename_attempt_child_identity("bundle", renamed_bundle_root, original_bundle_identity)
             private_bundle.mkdir(mode=0o700)
             recreated_info = private_bundle.lstat()
             recreated_bundle_identity = (recreated_info.st_dev, recreated_info.st_ino)
@@ -2521,6 +2660,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             if renamed_state_root.exists() or renamed_workspace.exists():
                 raise AssertionError("runtime-path replacement targets already exist")
             os.rename(original_state_root, renamed_state_root)
+            rename_attempt_child_identity("runc-state", renamed_state_root, original_state_identity)
             state_root = renamed_state_root
             pid_file = state_root / "container.pid"
             original_state_root.mkdir(mode=0o700)
@@ -2530,6 +2670,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             state_replacement = original_state_root.lstat()
             recreated_state_identity = (state_replacement.st_dev, state_replacement.st_ino)
             os.rename(original_workspace, renamed_workspace)
+            rename_attempt_child_identity(
+                original_workspace.name, renamed_workspace, original_workspace_identity
+            )
             workspace = renamed_workspace
             original_workspace.mkdir(mode=0o700)
             workspace_replacement_created = True
@@ -3304,6 +3447,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     config_path.unlink()
                     bundle_root.rmdir()
                 os.rename(renamed_bundle_root, bundle_root)
+                rename_attempt_child_identity(
+                    "bundle-host-renamed", bundle_root, original_bundle_identity
+                )
 
             _run_cleanup_action_if_client_state_known(
                 cleanup_client_state_known,
@@ -3375,6 +3521,16 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             state_root_present = _cleanup_path_exists(
                 cleanup_errors, "could not verify private state removal", state_root
             )
+            if bundle_present is False:
+                if attempt_child_identities.get("bundle") == original_bundle_identity:
+                    del attempt_child_identities["bundle"]
+                else:
+                    cleanup_errors.append("private bundle cleanup identity journal diverged")
+            if state_root_present is False:
+                if attempt_child_identities.get("runc-state-pinned") == original_state_identity:
+                    del attempt_child_identities["runc-state-pinned"]
+                else:
+                    cleanup_errors.append("private state cleanup identity journal diverged")
             if bundle_present or state_root_present:
                 cleanup_errors.append("disposable OCI bundle or state directory remained")
 
