@@ -957,6 +957,126 @@ def _systemd_control_group(unit_name: str) -> Path | None:
     return cgroup
 
 
+def _assert_cgroup_subtree_empty(
+    cgroup_path: Path,
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> None:
+    """Fail closed unless every cgroup in this exact subtree has no processes."""
+
+    root = cgroup_root.resolve(strict=True)
+    subtree = cgroup_path.resolve(strict=True)
+    if subtree == root or root not in subtree.parents:
+        raise AssertionError("systemd slice cgroup escaped the host cgroup-v2 root")
+    pending = [subtree]
+    visited = 0
+    while pending:
+        current = pending.pop()
+        visited += 1
+        if visited > 128 or current.is_symlink() or not current.is_dir():
+            raise AssertionError("systemd slice cgroup subtree was invalid or too large")
+        process_file = current / "cgroup.procs"
+        events_file = current / "cgroup.events"
+        processes = process_file.read_text(encoding="ascii").splitlines()
+        events = dict(
+            line.split(maxsplit=1)
+            for line in events_file.read_text(encoding="ascii").splitlines()
+            if line.strip()
+        )
+        if any(line.strip() for line in processes) or events.get("populated") != "0":
+            raise AssertionError(f"systemd slice cgroup still contains processes: {current}")
+        for child in current.iterdir():
+            if child.is_symlink():
+                raise AssertionError("systemd slice cgroup subtree contained a symlink")
+            if child.is_dir():
+                pending.append(child)
+
+
+def _stop_exact_empty_systemd_slice(
+    unit_name: str,
+    expected_cgroup: Path | None,
+    *,
+    timeout: float = 5,
+) -> None:
+    """Stop only the exact test slice after its whole cgroup tree is empty."""
+
+    root = Path("/sys/fs/cgroup").resolve(strict=True)
+    expected = expected_cgroup.resolve(strict=False) if expected_cgroup is not None else None
+
+    def read_properties() -> dict[str, str]:
+        code, output = _run_user_systemctl(
+            [
+                "show",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=ControlGroup",
+                unit_name,
+            ]
+        )
+        if code != 0:
+            raise AssertionError(f"could not inspect exact parent slice {unit_name}: {output}")
+        properties = dict(
+            line.split("=", maxsplit=1) for line in output.splitlines() if "=" in line
+        )
+        if not {"LoadState", "ActiveState", "ControlGroup"}.issubset(properties):
+            raise AssertionError(f"systemd returned incomplete state for parent slice {unit_name}")
+        return properties
+
+    def cgroup_from_properties(properties: dict[str, str]) -> Path | None:
+        control_group = properties["ControlGroup"]
+        if not control_group:
+            if expected is not None and expected.exists():
+                raise AssertionError(
+                    "exact parent-slice cgroup remained after ControlGroup cleared"
+                )
+            return None
+        if not control_group.startswith("/") or ".." in Path(control_group).parts:
+            raise AssertionError("systemd returned an invalid parent-slice ControlGroup")
+        cgroup = (root / control_group.lstrip("/")).resolve(strict=True)
+        if cgroup == root or root not in cgroup.parents:
+            raise AssertionError("systemd parent-slice ControlGroup escaped cgroup-v2 root")
+        if expected is not None and cgroup != expected:
+            raise AssertionError("systemd parent-slice ControlGroup changed identity")
+        return cgroup
+
+    properties = read_properties()
+    if properties["LoadState"] == "not-found":
+        if expected is not None and expected.exists():
+            raise AssertionError("parent-slice cgroup remained after its exact unit disappeared")
+        return
+    cgroup = cgroup_from_properties(properties)
+    if cgroup is not None:
+        _assert_cgroup_subtree_empty(cgroup)
+    if properties["ActiveState"] == "active":
+        if cgroup is None:
+            raise AssertionError("active parent slice had no exact ControlGroup")
+        code, output = _run_user_systemctl(["stop", unit_name])
+        if code != 0:
+            raise AssertionError(f"could not stop exact empty parent slice {unit_name}: {output}")
+    elif properties["ActiveState"] not in {"inactive", "failed"}:
+        raise AssertionError(
+            f"parent slice {unit_name} was in unexpected state {properties['ActiveState']!r}"
+        )
+
+    deadline = time.monotonic() + timeout
+    while True:
+        properties = read_properties()
+        if properties["LoadState"] == "not-found":
+            if expected is not None and expected.exists():
+                raise AssertionError(
+                    "parent-slice cgroup remained after its exact unit disappeared"
+                )
+            return
+        cgroup = cgroup_from_properties(properties)
+        if properties["ActiveState"] in {"inactive", "failed"} and cgroup is None:
+            return
+        if cgroup is not None:
+            _assert_cgroup_subtree_empty(cgroup)
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"exact parent slice remained active after stop: {unit_name}")
+        time.sleep(0.1)
+
+
 def _systemd_scope_is_active(unit_name: str) -> bool:
     code, output = _run_user_systemctl(["show", "--property=ActiveState", "--value", unit_name])
     return code == 0 and output.strip() == "active"
@@ -2004,6 +2124,35 @@ def test_partial_launch_without_runtime_identity_fails_closed() -> None:
     assert "init PID/start-time" in gaps[0]
     assert "init cgroup" in gaps[1]
     assert "systemd scope cgroup" in gaps[2]
+
+
+def test_systemd_parent_slice_cleanup_requires_empty_cgroup_subtree(tmp_path: Path) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    slice_cgroup = cgroup_root / "user-acp-test.slice"
+    child_cgroup = slice_cgroup / "acp-test.scope"
+    child_cgroup.mkdir(parents=True)
+    for cgroup in (slice_cgroup, child_cgroup):
+        (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+        (cgroup / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+
+    _assert_cgroup_subtree_empty(slice_cgroup, cgroup_root=cgroup_root)
+
+    (child_cgroup / "cgroup.procs").write_text("123\n", encoding="ascii")
+    (child_cgroup / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
+    with pytest.raises(AssertionError, match="still contains processes"):
+        _assert_cgroup_subtree_empty(slice_cgroup, cgroup_root=cgroup_root)
+
+
+def test_systemd_parent_slice_cleanup_rejects_cgroup_outside_root(tmp_path: Path) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "cgroup.procs").write_text("", encoding="ascii")
+    (outside / "cgroup.events").write_text("populated 0\nfrozen 0\n", encoding="ascii")
+
+    with pytest.raises(AssertionError, match="escaped"):
+        _assert_cgroup_subtree_empty(outside, cgroup_root=cgroup_root)
 
 
 def test_missing_launcher_handle_is_unknown_unless_reap_receipt_is_positive() -> None:
@@ -3470,6 +3619,16 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     cleanup_errors,
                     "could not restore exact test-owned bundle path after the attack replay",
                     restore_attacked_bundle,
+                ),
+            )
+
+        if not cleanup_errors and launch_submitted:
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not stop exact empty per-container parent slice",
+                lambda: _stop_exact_empty_systemd_slice(
+                    systemd_slice_unit,
+                    systemd_slice_cgroup,
                 ),
             )
 
