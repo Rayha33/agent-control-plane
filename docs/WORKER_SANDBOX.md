@@ -1539,6 +1539,42 @@ path has been implemented or tested; OCI remains fail-closed. Sources:
 [systemd v252 resource control](https://github.com/systemd/systemd/blob/v252/man/systemd.resource-control.xml),
 and [systemd v252 `systemd.kill`](https://github.com/systemd/systemd/blob/v252/man/systemd.kill.xml).
 
+**Attempt-slice stop propagation probe (2026-10-09; opt-in regression).**
+The systemd v252 resource-control contract says units assigned with `Slice=`
+automatically acquire `Requires=` and `After=` dependencies on that slice;
+systemd v252 says a unit with `Requires=` is stopped when its required unit is
+explicitly stopped. Therefore stopping only the wrapper service is insufficient,
+but stopping the exact attempt slice is expected to stop both its monitor service
+and sibling runc scope. This is dependency propagation, not `KillMode=` reaching
+across unit cgroups. Sources:
+[v252 resource control](https://github.com/systemd/systemd/blob/v252/man/systemd.resource-control.xml),
+[v252 unit dependencies](https://github.com/systemd/systemd/blob/v252/man/systemd.unit.xml),
+and [v252 kill behavior](https://github.com/systemd/systemd/blob/v252/man/systemd.kill.xml).
+
+A bounded probe in the task-owned, no-host-mount Lima VM (Lima 2.2.1 VZ,
+Ubuntu 24.04 ARM64, Linux 6.8.0-142, systemd 255.4, active user manager,
+cgroup v2) started a transient service and sibling scope using the candidate
+`user-acp-<sha256>.slice` name. Before stop, systemd-reported `Slice=` values
+matched exactly and both `ControlGroup` paths were direct children of the slice
+`ControlGroup`; each had a non-empty `InvocationID`. Stopping that slice returned
+success. In the recorded opt-in test run, all three units became inactive, each
+recorded cgroup was empty or absent, and the `systemd-run --scope` client exited
+with `-15` (SIGTERM). The regression requires the client to exit before its
+timeout but does not require a particular exit code. It does not assert that
+post-stop `InvocationID` or `ControlGroup` properties are cleared or that the
+cgroup directories are removed. The test-only processes were `/usr/bin/sleep`
+with a 45-second runtime ceiling; exact units were explicitly stopped in a
+finally cleanup as well.
+
+`tests/test_systemd_slice_integration.py` records this as an opt-in regression
+(`ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`). It is not part of default CI and does
+not prove systemd 252 runtime behavior, runc-created scope behavior, race-free
+cleanup, manager-restart recovery, or `run_worker` integration. The v252 primary
+documentation supports the dependency contract; a supported-host v252 live run
+remains a separate verification item. After any stop request, the integrated
+executor still must confirm the exact attempt/service/scope invocation identities
+and prove their cgroups empty before recording `cleanup_verified`.
+
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
 argv for a future executor. It encodes a readonly root, a single non-recursive
