@@ -36,6 +36,7 @@ from agent_control_plane.supervisor.sandbox_workspace import (
     copy_snapshot,
     read_snapshot_files,
 )
+from agent_control_plane.supervisor.store import _authorize_sandbox_reservation_write
 
 
 @pytest.fixture
@@ -182,7 +183,6 @@ def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
     row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
-        "a" * 64,
         **runtime_claims,
     )
     execution_root = Path(row["bundle_path"]).parent
@@ -286,6 +286,8 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     durable = supervisor._sandbox_execution_get(attempt["id"])
     assert durable["launch_plan_required"] == 1
     assert durable["launch_plan_binding_version"] == 1
+    assert durable["bundle_digest"] == journal_module._sandbox_reservation_bundle_digest(durable)
+    assert durable["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_config_digest"] == target.config_sha256
     assert (
         durable["launch_argv_digest"]
@@ -296,11 +298,182 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
+    assert durable["launch_plan"]["version"] == 2
+    assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
     assert journal_module._sandbox_launch_plan_binding_is_self_consistent(durable)
     event_plan = json.loads(event["payload_json"])["launch_plan"]
     assert event_plan == durable["launch_plan"]
     assert supervisor.verify_event_chain()["ok"] is True
+
+    # Existing v1 launch plans did not claim the new reservation-digest
+    # semantics; keep their read-side verification compatible.
+    legacy_plan = json.loads(canonical_json(durable["launch_plan"]))
+    legacy_plan["version"] = 1
+    legacy_plan["reservation"].pop("bundle_digest_semantics")
+    legacy_row = dict(durable)
+    legacy_row["bundle_digest_semantics"] = "legacy-caller-asserted-v0"
+    legacy_row["launch_plan_json"] = canonical_json(legacy_plan)
+    legacy_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_row)
+    legacy_plan["version"] = True
+    legacy_row["launch_plan_json"] = canonical_json(legacy_plan)
+    legacy_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_row)
+
+
+def test_launch_rejects_forged_reservation_bundle_digest(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+
+    # Simulate a tampered/legacy reservation row; the immutable trigger is
+    # tested separately, while this proves launch independently re-derives it.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_execution_identity_immutable")
+        connection.execute(
+            "UPDATE sandbox_executions SET bundle_digest = ? WHERE attempt_id = ?",
+            ("a" * 64, attempt["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as mismatch:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    assert mismatch.value.code == "sandbox_execution_bundle_digest_mismatch"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_launch_rejects_legacy_caller_asserted_reservation_digest(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+
+    # Model a schema-24 reserved row migrated with the legacy default marker.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_execution_identity_immutable")
+        connection.execute(
+            "UPDATE sandbox_executions SET bundle_digest = ?, bundle_digest_semantics = ? "
+            "WHERE attempt_id = ?",
+            ("a" * 64, "legacy-caller-asserted-v0", attempt["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as legacy:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    assert legacy.value.code == "sandbox_execution_legacy_bundle_digest"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_direct_sql_cannot_claim_host_derived_reservation_provenance(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = {
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "execution_id": "forged-execution",
+        "backend": "oci-runc",
+        "container_id": "forged-container",
+        "rootfs_digest": "a" * 64,
+        "rootfs_closure_digest": "b" * 64,
+        "runc_executable_digest": "c" * 64,
+        "runtime_version": "1.3.5",
+        "oci_version": "1.2.1",
+        "bundle_path": f"{repo}/.acp/sandbox-executions/forged/bundle",
+        "state_path": f"{repo}/.acp/sandbox-executions/forged/state",
+    }
+    bundle_digest = journal_module._sandbox_reservation_bundle_digest(execution)
+
+    with supervisor.connect() as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_execution_reservation_authorization_required",
+        ):
+            connection.execute(
+                """
+                INSERT INTO sandbox_executions
+                  (attempt_id, claim_token, execution_id, backend, container_id,
+                   bundle_digest, bundle_digest_semantics, launch_plan_required,
+                   rootfs_digest, rootfs_closure_digest, runc_executable_digest,
+                   runtime_version, oci_version, bundle_path, state_path, phase,
+                   created_at, updated_at)
+                VALUES (?, ?, ?, 'oci-runc', ?, ?, 'oci-reservation-v1', 1,
+                        ?, ?, ?, ?, ?, ?, ?, 'reserved', 'now', 'now')
+                """,
+                (
+                    execution["attempt_id"],
+                    execution["claim_token"],
+                    execution["execution_id"],
+                    execution["container_id"],
+                    bundle_digest,
+                    execution["rootfs_digest"],
+                    execution["rootfs_closure_digest"],
+                    execution["runc_executable_digest"],
+                    execution["runtime_version"],
+                    execution["oci_version"],
+                    execution["bundle_path"],
+                    execution["state_path"],
+                ),
+            )
+
+    assert supervisor._sandbox_execution_get(attempt["id"]) is None
+
+
+def test_v25_bundle_digest_semantics_migration_preserves_and_freezes_legacy_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            """
+            CREATE TABLE sandbox_executions (
+              attempt_id TEXT PRIMARY KEY,
+              claim_token INTEGER NOT NULL,
+              execution_id TEXT NOT NULL,
+              backend TEXT NOT NULL,
+              container_id TEXT NOT NULL,
+              bundle_digest TEXT NOT NULL,
+              rootfs_digest TEXT NOT NULL,
+              rootfs_closure_digest TEXT NOT NULL,
+              runc_executable_digest TEXT NOT NULL,
+              runtime_version TEXT NOT NULL,
+              oci_version TEXT NOT NULL,
+              bundle_path TEXT NOT NULL,
+              state_path TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sandbox_executions VALUES
+              ('attempt-old', 7, 'execution-old', 'oci-runc', 'container-old', ?, ?, ?, ?,
+               '1.3.5', '1.2.1', '/bundle-old', '/state-old', 'now')
+            """,
+            ("f" * 64, "a" * 64, "b" * 64, "c" * 64),
+        )
+
+        migration = dict(MIGRATIONS)[25]
+        migration(connection)
+        migration(connection)
+
+        row = connection.execute(
+            "SELECT bundle_digest, bundle_digest_semantics FROM sandbox_executions "
+            "WHERE attempt_id = 'attempt-old'"
+        ).fetchone()
+        assert row["bundle_digest"] == "f" * 64
+        assert row["bundle_digest_semantics"] == "legacy-caller-asserted-v0"
+        with pytest.raises(sqlite3.IntegrityError, match="identity_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET bundle_digest_semantics = 'oci-reservation-v1' "
+                "WHERE attempt_id = 'attempt-old'"
+            )
+    finally:
+        connection.close()
 
 
 def test_generic_transition_cannot_forge_launch_plan_binding(repo: Path) -> None:
@@ -865,7 +1038,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 24
+    assert SCHEMA_VERSION == 25
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -915,20 +1088,30 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
                 "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
                 (attempt["id"],),
             )
-        with pytest.raises(sqlite3.IntegrityError, match="must_start_reserved"):
-            connection.execute(
-                """
-                INSERT INTO sandbox_executions
-                  (attempt_id, claim_token, execution_id, backend, container_id,
-                   bundle_digest, rootfs_digest, runtime_version, oci_version,
-                   bundle_path, state_path, phase, created_at, updated_at)
-                SELECT attempt_id, claim_token, 'direct-insert', backend, 'direct-container',
-                       bundle_digest, rootfs_digest, runtime_version, oci_version,
-                       bundle_path, state_path, 'cleanup_verified', created_at, updated_at
-                FROM sandbox_executions WHERE attempt_id = ?
-                """,
-                (attempt["id"],),
-            )
+        with _authorize_sandbox_reservation_write(
+            connection,
+            attempt["id"],
+            attempt["claim_token"],
+            "direct-insert",
+            row["bundle_digest"],
+            row["bundle_digest_semantics"],
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="must_start_reserved"):
+                connection.execute(
+                    """
+                    INSERT INTO sandbox_executions
+                      (attempt_id, claim_token, execution_id, backend, container_id,
+                       bundle_digest, bundle_digest_semantics, rootfs_digest,
+                       runtime_version, oci_version, bundle_path, state_path, phase,
+                       created_at, updated_at)
+                    SELECT attempt_id, claim_token, 'direct-insert', backend, 'direct-container',
+                           bundle_digest, bundle_digest_semantics, rootfs_digest,
+                           runtime_version, oci_version, bundle_path, state_path,
+                           'cleanup_verified', created_at, updated_at
+                    FROM sandbox_executions WHERE attempt_id = ?
+                    """,
+                    (attempt["id"],),
+                )
     with supervisor.connect() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="identity_immutable"):
             connection.execute(
@@ -1172,7 +1355,6 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
     row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
-        "a" * 64,
         **runtime_claims,
     )
     assert row["workspace_binding_version"] == 0
@@ -1396,26 +1578,15 @@ def test_reservation_requires_exact_live_fence_and_no_registered_direct_worker(r
         supervisor._sandbox_execution_reserve(
             attempt["id"],
             attempt["claim_token"] + 1,
-            "a" * 64,
             **runtime_claims,
         )
     assert stale.value.code == "stale_fencing_token"
-    with pytest.raises(SupervisorError) as invalid:
-        supervisor._sandbox_execution_reserve(
-            attempt["id"],
-            attempt["claim_token"],
-            "not-a-digest",
-            **runtime_claims,
-        )
-    assert invalid.value.code == "sandbox_execution_invalid"
 
     for field in ("rootfs_closure_digest", "runc_executable_digest"):
         options = dict(runtime_claims)
         options[field] = "not-a-digest"
         with pytest.raises(SupervisorError) as malformed:
-            supervisor._sandbox_execution_reserve(
-                attempt["id"], attempt["claim_token"], "a" * 64, **options
-            )
+            supervisor._sandbox_execution_reserve(attempt["id"], attempt["claim_token"], **options)
         assert malformed.value.code == "sandbox_execution_invalid"
     assert supervisor._sandbox_execution_get(attempt["id"]) is None
 
@@ -1437,7 +1608,6 @@ def test_sandbox_reservation_requires_configured_sealed_runtime_pins(repo: Path)
         supervisor._sandbox_execution_reserve(
             attempt["id"],
             attempt["claim_token"],
-            "a" * 64,
             rootfs_digest="b" * 64,
             rootfs_closure_digest="c" * 64,
             runc_executable_digest="d" * 64,
@@ -1475,7 +1645,6 @@ def test_sandbox_reservation_binds_claims_to_configured_runtime_pins(
         supervisor._sandbox_execution_reserve(
             attempt["id"],
             attempt["claim_token"],
-            "a" * 64,
             **mismatched_claims,
         )
     assert mismatch.value.code == "sandbox_execution_pin_mismatch"
@@ -1639,27 +1808,56 @@ def test_result_import_rechecks_journal_at_result_write_boundary(
         guard_calls += 1
         if guard_calls == 2:
             stamp = "2026-10-04T00:00:00Z"
-            connection.execute(
-                """
-                INSERT INTO sandbox_executions
-                  (attempt_id, claim_token, execution_id, backend, container_id,
-                   bundle_digest, rootfs_digest, rootfs_closure_digest,
-                   runc_executable_digest, runtime_version, oci_version,
-                   bundle_path, state_path, phase, created_at, updated_at)
-                VALUES (?, ?, 'race-execution', 'oci-runc', 'race-container', ?, ?, ?, ?,
-                        'test-runc', '1.2.1', '/bundle', '/state', 'reserved', ?, ?)
-                """,
-                (
-                    attempt_id,
-                    attempt["claim_token"],
-                    "a" * 64,
-                    "b" * 64,
-                    "c" * 64,
-                    "d" * 64,
-                    stamp,
-                    stamp,
-                ),
-            )
+            execution = {
+                "attempt_id": attempt_id,
+                "claim_token": attempt["claim_token"],
+                "execution_id": "race-execution",
+                "backend": "oci-runc",
+                "container_id": "race-container",
+                "rootfs_digest": "a" * 64,
+                "rootfs_closure_digest": "b" * 64,
+                "runc_executable_digest": "c" * 64,
+                "runtime_version": "test-runc",
+                "oci_version": "1.2.1",
+                "bundle_path": "/bundle",
+                "state_path": "/state",
+            }
+            bundle_digest = journal_module._sandbox_reservation_bundle_digest(execution)
+            with _authorize_sandbox_reservation_write(
+                connection,
+                attempt_id,
+                attempt["claim_token"],
+                execution["execution_id"],
+                bundle_digest,
+                "oci-reservation-v1",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO sandbox_executions
+                      (attempt_id, claim_token, execution_id, backend, container_id,
+                       bundle_digest, bundle_digest_semantics, rootfs_digest,
+                       rootfs_closure_digest, runc_executable_digest, runtime_version,
+                       oci_version, bundle_path, state_path, phase, created_at, updated_at)
+                    VALUES (?, ?, ?, 'oci-runc', ?, ?, 'oci-reservation-v1', ?, ?, ?, ?,
+                            ?, ?, ?, 'reserved', ?, ?)
+                    """,
+                    (
+                        execution["attempt_id"],
+                        execution["claim_token"],
+                        execution["execution_id"],
+                        execution["container_id"],
+                        bundle_digest,
+                        execution["rootfs_digest"],
+                        execution["rootfs_closure_digest"],
+                        execution["runc_executable_digest"],
+                        execution["runtime_version"],
+                        execution["oci_version"],
+                        execution["bundle_path"],
+                        execution["state_path"],
+                        stamp,
+                        stamp,
+                    ),
+                )
         original_guard(connection, attempt_id)
 
     monkeypatch.setattr(

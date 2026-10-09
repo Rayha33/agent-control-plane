@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1578,6 +1578,69 @@ def _add_sandbox_launch_plan_binding(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_sandbox_bundle_digest_semantics(connection: sqlite3.Connection) -> None:
+    """Distinguish historical caller-asserted digests from host-derived reservations.
+
+    Existing rows are intentionally tagged legacy rather than rewritten: their original
+    digest provenance cannot be recovered. New reservations opt into the versioned,
+    host-derived meaning, and the identity trigger makes that choice immutable.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before bundle-digest semantics migration"
+        )
+    if "bundle_digest_semantics" not in columns:
+        connection.execute(
+            "ALTER TABLE sandbox_executions ADD COLUMN bundle_digest_semantics "
+            "TEXT NOT NULL DEFAULT 'legacy-caller-asserted-v0' "
+            "CHECK (bundle_digest_semantics IN "
+            "('legacy-caller-asserted-v0', 'oci-reservation-v1'))"
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_reservation_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_reservation_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN acp_sandbox_reservation_authorized(
+          NEW.attempt_id, NEW.claim_token, NEW.execution_id,
+          NEW.bundle_digest, NEW.bundle_digest_semantics
+        ) != 1
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_reservation_authorization_required');
+        END
+        """
+    )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_identity_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_identity_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.attempt_id IS NOT NEW.attempt_id
+          OR OLD.claim_token IS NOT NEW.claim_token
+          OR OLD.execution_id IS NOT NEW.execution_id
+          OR OLD.backend IS NOT NEW.backend
+          OR OLD.container_id IS NOT NEW.container_id
+          OR OLD.bundle_digest IS NOT NEW.bundle_digest
+          OR OLD.bundle_digest_semantics IS NOT NEW.bundle_digest_semantics
+          OR OLD.rootfs_digest IS NOT NEW.rootfs_digest
+          OR OLD.rootfs_closure_digest IS NOT NEW.rootfs_closure_digest
+          OR OLD.runc_executable_digest IS NOT NEW.runc_executable_digest
+          OR OLD.runtime_version IS NOT NEW.runtime_version
+          OR OLD.oci_version IS NOT NEW.oci_version
+          OR OLD.bundle_path IS NOT NEW.bundle_path
+          OR OLD.state_path IS NOT NEW.state_path
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_identity_immutable');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1602,6 +1665,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (22, _add_sandbox_launch_plan_binding),
     (23, _add_agent_intent_revisions),
     (24, _add_agent_intent_attempt_latest_index),
+    (25, _add_sandbox_bundle_digest_semantics),
 )
 
 

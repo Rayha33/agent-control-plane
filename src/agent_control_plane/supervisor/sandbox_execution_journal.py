@@ -52,6 +52,7 @@ from .sandbox_workspace import collect_changes as _collect_changes
 from .store import (
     _authorize_sandbox_exit_receipt_write,
     _authorize_sandbox_launch_plan_write,
+    _authorize_sandbox_reservation_write,
 )
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -59,6 +60,8 @@ _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SYSTEMD_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope)\Z")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_LEGACY_BUNDLE_DIGEST_SEMANTICS = "legacy-caller-asserted-v0"
+_BUNDLE_DIGEST_SEMANTICS = "oci-reservation-v1"
 _PHASES = frozenset(
     {
         "reserved",
@@ -102,36 +105,39 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     argv = list(target.argv)
     argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
     return {
-        "version": 1,
+        "version": 2,
         "reservation": {
-            key: execution[key]
-            for key in (
-                "attempt_id",
-                "claim_token",
-                "execution_id",
-                "backend",
-                "container_id",
-                "bundle_digest",
-                "rootfs_digest",
-                "rootfs_closure_digest",
-                "runc_executable_digest",
-                "runtime_version",
-                "oci_version",
-                "bundle_path",
-                "state_path",
-                "workspace_binding_version",
-                "baseline_manifest_digest",
-                "workspace_root_path",
-                "workspace_root_dev",
-                "workspace_root_ino",
-                "private_path_binding_version",
-                "execution_root_dev",
-                "execution_root_ino",
-                "bundle_root_dev",
-                "bundle_root_ino",
-                "state_root_dev",
-                "state_root_ino",
-            )
+            "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
+            **{
+                key: execution[key]
+                for key in (
+                    "attempt_id",
+                    "claim_token",
+                    "execution_id",
+                    "backend",
+                    "container_id",
+                    "bundle_digest",
+                    "rootfs_digest",
+                    "rootfs_closure_digest",
+                    "runc_executable_digest",
+                    "runtime_version",
+                    "oci_version",
+                    "bundle_path",
+                    "state_path",
+                    "workspace_binding_version",
+                    "baseline_manifest_digest",
+                    "workspace_root_path",
+                    "workspace_root_dev",
+                    "workspace_root_ino",
+                    "private_path_binding_version",
+                    "execution_root_dev",
+                    "execution_root_ino",
+                    "bundle_root_dev",
+                    "bundle_root_ino",
+                    "state_root_dev",
+                    "state_root_ino",
+                )
+            },
         },
         "launch": {
             "mode": target.launch_mode,
@@ -176,6 +182,39 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     }
 
 
+def _sandbox_reservation_bundle_digest(execution: Any) -> str:
+    """Hash host-derived reservation identity, not caller-asserted bundle bytes.
+
+    The launch config does not exist when the reservation is inserted. This
+    versioned digest therefore commits only the immutable execution identity and
+    configured runtime pins. The exact OCI config and argv are bound separately
+    by the later launch-plan receipt; this value is never treated as their hash.
+    """
+
+    material = {
+        "version": 1,
+        "kind": _BUNDLE_DIGEST_SEMANTICS,
+        **{
+            key: execution[key]
+            for key in (
+                "attempt_id",
+                "claim_token",
+                "execution_id",
+                "backend",
+                "container_id",
+                "rootfs_digest",
+                "rootfs_closure_digest",
+                "runc_executable_digest",
+                "runtime_version",
+                "oci_version",
+                "bundle_path",
+                "state_path",
+            )
+        },
+    }
+    return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+
+
 def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
     """Verify the durable plan digest and every reservation identity it commits."""
 
@@ -194,7 +233,8 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
             return False
         if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
             return False
-        if plan.get("version") != 1:
+        plan_version = plan.get("version")
+        if type(plan_version) is not int or plan_version not in {1, 2}:
             return False
         reservation = plan.get("reservation")
         expected_reservation = {
@@ -227,6 +267,14 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
                 "state_root_ino",
             )
         }
+        if plan_version == 2:
+            if row["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
+                return False
+            if row["bundle_digest"] != _sandbox_reservation_bundle_digest(row):
+                return False
+            expected_reservation["bundle_digest_semantics"] = _BUNDLE_DIGEST_SEMANTICS
+        elif row["bundle_digest_semantics"] != _LEGACY_BUNDLE_DIGEST_SEMANTICS:
+            return False
         launch = plan.get("launch")
         if reservation != expected_reservation or not isinstance(launch, dict):
             return False
@@ -457,7 +505,6 @@ class SandboxExecutionJournalMixin:
         self,
         attempt_id: str,
         claim_token: int,
-        bundle_digest: str,
         *,
         rootfs_digest: str,
         rootfs_closure_digest: str,
@@ -470,8 +517,6 @@ class SandboxExecutionJournalMixin:
 
         attempt_id = self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
-        if not isinstance(bundle_digest, str) or _DIGEST.fullmatch(bundle_digest) is None:
-            raise SupervisorError("sandbox_execution_invalid", "bundle digest must be SHA-256")
         if not isinstance(rootfs_digest, str) or _DIGEST.fullmatch(rootfs_digest) is None:
             raise SupervisorError("sandbox_execution_invalid", "rootfs digest must be SHA-256")
         if (
@@ -539,6 +584,22 @@ class SandboxExecutionJournalMixin:
         )
         bundle_path = str(execution_root / "bundle")
         state_path = str(execution_root / "state")
+        bundle_digest = _sandbox_reservation_bundle_digest(
+            {
+                "attempt_id": attempt_id,
+                "claim_token": claim_token,
+                "execution_id": execution_id,
+                "backend": "oci-runc",
+                "container_id": container_id,
+                "rootfs_digest": rootfs_digest,
+                "rootfs_closure_digest": rootfs_closure_digest,
+                "runc_executable_digest": runc_executable_digest,
+                "runtime_version": runtime_version,
+                "oci_version": oci_version,
+                "bundle_path": bundle_path,
+                "state_path": state_path,
+            }
+        )
         stamp = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -554,32 +615,42 @@ class SandboxExecutionJournalMixin:
                     "sandbox execution cannot be reserved beside a registered direct worker",
                 )
             try:
-                connection.execute(
-                    """
-                    INSERT INTO sandbox_executions
-                      (attempt_id, claim_token, execution_id, backend, container_id,
-                       bundle_digest, launch_plan_required, rootfs_digest, rootfs_closure_digest,
-                       runc_executable_digest, runtime_version, oci_version,
-                       bundle_path, state_path, phase, created_at, updated_at)
-                    VALUES (?, ?, ?, 'oci-runc', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
-                    """,
-                    (
-                        attempt_id,
-                        claim_token,
-                        execution_id,
-                        container_id,
-                        bundle_digest,
-                        rootfs_digest,
-                        rootfs_closure_digest,
-                        runc_executable_digest,
-                        runtime_version,
-                        oci_version,
-                        bundle_path,
-                        state_path,
-                        stamp,
-                        stamp,
-                    ),
-                )
+                with _authorize_sandbox_reservation_write(
+                    connection,
+                    attempt_id,
+                    claim_token,
+                    execution_id,
+                    bundle_digest,
+                    _BUNDLE_DIGEST_SEMANTICS,
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO sandbox_executions
+                          (attempt_id, claim_token, execution_id, backend, container_id,
+                           bundle_digest, bundle_digest_semantics, launch_plan_required,
+                           rootfs_digest, rootfs_closure_digest, runc_executable_digest,
+                           runtime_version, oci_version,
+                           bundle_path, state_path, phase, created_at, updated_at)
+                        VALUES (?, ?, ?, 'oci-runc', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+                        """,
+                        (
+                            attempt_id,
+                            claim_token,
+                            execution_id,
+                            container_id,
+                            bundle_digest,
+                            _BUNDLE_DIGEST_SEMANTICS,
+                            rootfs_digest,
+                            rootfs_closure_digest,
+                            runc_executable_digest,
+                            runtime_version,
+                            oci_version,
+                            bundle_path,
+                            state_path,
+                            stamp,
+                            stamp,
+                        ),
+                    )
             except sqlite3.IntegrityError as error:
                 if "UNIQUE constraint failed" in str(error):
                     raise SupervisorError(
@@ -598,6 +669,7 @@ class SandboxExecutionJournalMixin:
                     "backend": "oci-runc",
                     "container_id": container_id,
                     "bundle_digest": bundle_digest,
+                    "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
                     "rootfs_digest": rootfs_digest,
                     "rootfs_closure_digest": rootfs_closure_digest,
                     "runc_executable_digest": runc_executable_digest,
@@ -1580,6 +1652,23 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_transition_invalid",
                 f"expected phase reserved, found {durable_execution['phase']}; fence retained",
+            )
+        if durable_execution["bundle_digest_semantics"] == _LEGACY_BUNDLE_DIGEST_SEMANTICS:
+            raise SupervisorError(
+                "sandbox_execution_legacy_bundle_digest",
+                "legacy caller-asserted reservation digest is not eligible for a new launch",
+            )
+        if durable_execution["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
+            raise SupervisorError(
+                "sandbox_execution_bundle_digest_semantics_invalid",
+                "reservation digest semantics are not recognized",
+            )
+        if durable_execution["bundle_digest"] != _sandbox_reservation_bundle_digest(
+            durable_execution
+        ):
+            raise SupervisorError(
+                "sandbox_execution_bundle_digest_mismatch",
+                "reservation bundle digest does not match its host-derived identity and pins",
             )
         target_paths_match = (
             launch_target.bundle_path == durable_execution["bundle_path"]
