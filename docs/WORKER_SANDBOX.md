@@ -1568,12 +1568,31 @@ finally cleanup as well.
 
 `tests/test_systemd_slice_integration.py` records this as an opt-in regression
 (`ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`). It is not part of default CI and does
-not prove systemd 252 runtime behavior, runc-created scope behavior, race-free
-cleanup, manager-restart recovery, or `run_worker` integration. The v252 primary
-documentation supports the dependency contract; a supported-host v252 live run
-remains a separate verification item. After any stop request, the integrated
-executor still must confirm the exact attempt/service/scope invocation identities
-and prove their cgroups empty before recording `cleanup_verified`.
+not by itself prove runc-created scope behavior, race-free cleanup,
+manager-restart recovery, or `run_worker` integration.
+
+**Exact-floor follow-up (systemd 252.39; 2026-10-09).** The same opt-in probe
+was run from the exact test file in a disposable Lima 2.2.1 VZ Debian 12 ARM64
+guest with `mounts: null` (no host-shared mounts), Linux 6.1.0-53-cloud-arm64,
+cgroup v2, and an active user manager. The guest reported
+`systemd 252 (252.39-1~deb12u2)`. Before stopping the candidate slice, the test
+observed the service and sibling scope assigned to that slice, direct-child
+`ControlGroup` paths, invocation IDs, and populated cgroups. After the stop, the
+slice, service, and scope were inactive; all three recorded cgroups were empty
+or absent; and the scope client exited `-15` (SIGTERM). A separate post-run
+check found the service and scope not loaded, the slice inactive, no
+`/usr/bin/sleep 45` process, and no cgroup directory for the probe slice. The
+guest copy matched the host test SHA-256
+`50198c007b9354dc18f9e2cd75d994d51ca5528e2d8f0cb27d76c7f8fd9cd28f` and
+`oci_worker.py` SHA-256
+`8770605a9dd64ecdd5a167b619462c349d53aae0b7bb59ad08688e202ca0011c`.
+
+This adds live coverage of the unit-dependency/teardown behavior on systemd 252
+as well as 255. It still does not prove runc-created scope behavior, race-free
+cleanup, manager-restart recovery, or `run_worker` integration. After any stop
+request, the integrated executor must independently confirm the exact attempt,
+service, and scope invocation identities and prove their cgroups empty before
+recording `cleanup_verified`.
 
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
