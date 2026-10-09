@@ -992,13 +992,17 @@ def _assert_cgroup_subtree_empty(
                 pending.append(child)
 
 
-def _stop_exact_empty_systemd_slice(
+def _stop_exact_systemd_slice_after_pre_stop_scan(
     unit_name: str,
     expected_cgroup: Path | None,
     *,
     timeout: float = 5,
 ) -> None:
-    """Stop only the exact test slice after its whole cgroup tree is empty."""
+    """Stop the exact test slice after a point-in-time subtree emptiness scan.
+
+    The scan and stop are not atomic against a concurrent same-UID systemd
+    actor adding a unit to this slice.
+    """
 
     root = Path("/sys/fs/cgroup").resolve(strict=True)
     expected = expected_cgroup.resolve(strict=False) if expected_cgroup is not None else None
@@ -3625,8 +3629,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         if not cleanup_errors and launch_submitted:
             _attempt_cleanup(
                 cleanup_errors,
-                "could not stop exact empty per-container parent slice",
-                lambda: _stop_exact_empty_systemd_slice(
+                "could not stop exact per-container parent slice after pre-stop scan",
+                lambda: _stop_exact_systemd_slice_after_pre_stop_scan(
                     systemd_slice_unit,
                     systemd_slice_cgroup,
                 ),

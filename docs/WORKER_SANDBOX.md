@@ -1480,11 +1480,14 @@ and asserted that the exact runc scope
 descendant of that slice. The receipt again reported
 `worker_executor_integrated=false`.
 
-The test teardown now requires `cgroup.events populated=0` and empty
-`cgroup.procs` throughout the exact slice subtree before it stops the parent
-slice; if state is ambiguous, it preserves the attempt evidence. After this
-run, the transient service and runc scope were `not-found`; the parent slice was
-loaded but inactive with an empty `ControlGroup`, and its cgroup path was absent.
+The test teardown performed a sequential, point-in-time scan requiring
+`cgroup.events populated=0` and empty `cgroup.procs` throughout the exact slice
+subtree, then requested stop of that slice; if the observed state was
+ambiguous, it preserved the attempt evidence. The scan and stop are not atomic
+against a concurrent same-UID systemd actor adding a unit between them, and
+this test did not exercise or exclude that race. After this run, the transient
+service and runc scope were `not-found`; the parent slice was loaded but
+inactive with an empty `ControlGroup`, and its cgroup path was absent.
 The test attempt root was absent. Its 4,415-node source snapshot was removed
 only after matching the recorded device/inode and owner/mode, finding no process
 cwd/open-fd/mapped-file references or mountpoints, and using descriptor-relative
