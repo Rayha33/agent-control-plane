@@ -28,6 +28,7 @@ from .oci_worker import (
     RuncLaunchHandle,
     _authorize_runc_launch_gate_release_locked,
     _oci_worker_systemd_slice,
+    _private_directory,
     _revoke_runc_launch_gate_release_locked,
     _runc_client_wait_receipt_is_self_consistent,
     _runc_launch_gate_lock_for_execution,
@@ -1978,6 +1979,94 @@ class SandboxExecutionJournalMixin:
                 raise SupervisorError(
                     "sandbox_execution_launch_handle_required",
                     "running transition requires the exact locked launch handle",
+                )
+            with self.connect() as connection:
+                locked_row = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+            if (
+                locked_row is None
+                or locked_row["claim_token"] != claim_token
+                or locked_row["execution_id"] != row["execution_id"]
+                or locked_row["phase"] != "launched"
+                or not _sandbox_launch_plan_binding_is_self_consistent(locked_row)
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "durable launch plan changed before the running transition",
+                )
+            locked_plan = json.loads(locked_row["launch_plan_json"])
+            locked_launch = locked_plan["launch"]
+            locked_state = locked_launch["state"]
+            expected_source_binding = {
+                "runc_state_root_path": locked_state["path"],
+                "runc_state_root_device": locked_state["device"],
+                "runc_state_root_inode": locked_state["inode"],
+                "runc_pid_file_path": locked_launch["pid_file_path"],
+                "runc_executable_sha256": locked_launch["runc_executable_sha256"],
+            }
+            if any(
+                getattr(attestation, key) != value for key, value in expected_source_binding.items()
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "runc observations do not match the exact durable state root and executable",
+                )
+            try:
+                live_state_root = _private_directory(
+                    expected_source_binding["runc_state_root_path"],
+                    code="sandbox_runtime_attestation_stale",
+                    label="runc state root",
+                )
+                live_state_info = live_state_root.lstat()
+            except (OSError, SupervisorError) as error:
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "durable runc state root is no longer available",
+                ) from error
+            if (
+                str(live_state_root) != expected_source_binding["runc_state_root_path"]
+                or stat.S_ISLNK(live_state_info.st_mode)
+                or not stat.S_ISDIR(live_state_info.st_mode)
+                or (live_state_info.st_dev, live_state_info.st_ino)
+                != (
+                    expected_source_binding["runc_state_root_device"],
+                    expected_source_binding["runc_state_root_inode"],
+                )
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "durable runc state root identity changed before gate release",
+                )
+            locked_expected = {
+                "container_id": locked_row["container_id"],
+                "bundle_path": locked_row["bundle_path"],
+                "monitor_pid": locked_row["monitor_pid"],
+                "monitor_identity": locked_row["monitor_identity"],
+                "runc_client_pid": locked_row["runc_client_pid"],
+                "runc_client_identity": locked_row["runc_client_identity"],
+                "wrapper_unit": locked_row["wrapper_unit"],
+                "wrapper_invocation_id": locked_row["wrapper_invocation_id"],
+                "wrapper_control_group": locked_row["wrapper_cgroup_path"],
+                "attempt_slice_unit": locked_row["attempt_slice_unit"],
+                "attempt_slice_invocation_id": locked_row["attempt_slice_invocation_id"],
+                "attempt_slice_control_group": locked_row["attempt_slice_cgroup_path"],
+                "scope_unit": locked_row["scope_unit"],
+                "scope_invocation_id": locked_row["scope_invocation_id"],
+                "cgroup_path": locked_row["cgroup_path"],
+            }
+            if any(getattr(attestation, key) != value for key, value in locked_expected.items()):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "runtime evidence no longer matches the exact locked launch identities",
+                )
+            locked_resource_limits = locked_launch["resource_limits"]
+            if any(
+                getattr(attestation, key) != value for key, value in locked_resource_limits.items()
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "cgroup limits no longer match the exact locked launch policy",
                 )
             # Revalidate exact live process membership and cgroup limits under
             # the release lock before the durable transition and one-shot permit.

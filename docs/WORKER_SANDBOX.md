@@ -1412,6 +1412,35 @@ provider-authentication evidence, `cleanup_verified` evidence, result-import or
 crash/recovery proof, or a pass of task #2370's integrated-worker criteria;
 `worker_executor_integrated=false`. Keep OCI fail-closed and task #2370 open.
 
+### Trusted runtime-attestation source boundary (2026-10-09; code-only)
+
+`collect_running_runtime_attestation()` no longer accepts caller-provided
+`runc state` or systemd property bytes when issuing the collector provenance
+that the journal requires. It revalidates the configured root-owned runc pin,
+executes `runc state` through the held executable descriptor, resolves only a
+root-owned non-replaceable host `systemctl`, and queries the exact wrapper,
+attempt-slice, and scope units with a fixed property set. Both command paths
+use the existing bounded guardian (three-second deadline and 64 KiB output
+ceiling); the systemd bus path is fixed to the current user's private runtime
+directory. Each collector-issued receipt also binds the state-root
+path/device/inode, exact PID-file path, and pinned runc digest. Under the
+launch-gate lock, the journal compares every source-binding field with the
+durable plan and rechecks the state-root identity before authorizing release.
+Unit names and invocation IDs are validated before commands run. The internal
+observation normalizer can still validate fixture/supplied bytes, but it cannot
+mint journal-accepted collector provenance.
+
+Focused tests exercise command construction, descriptor-bound runc execution,
+source-output parsing, wrong-state-root, wrong-PID-file, and wrong-executable
+rejection, plus the provenance boundary with a fake bounded-command runner.
+They do not prove a live systemd bus, a production monitor service, or restart
+reconciliation. The bus check validates path ownership/type but does not
+authenticate the D-Bus peer or exclude a hostile same-UID host process; the
+future worker boundary must keep the host bus inaccessible. These observations
+are sequential, not a durable monitor. The collector is not wired into
+`run_worker`; the registered OCI path remains fail-closed, and task #2370
+remains open.
+
 ### systemd/runc cgroup composition probe (2026-10-03)
 
 The first wrapper-only test used rootless runc under a transient service with

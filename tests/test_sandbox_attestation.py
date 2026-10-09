@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from agent_control_plane.supervisor import sandbox_attestation
+from agent_control_plane.supervisor import oci_worker, sandbox_attestation
 from agent_control_plane.supervisor.common import SupervisorError, canonical_json
 from agent_control_plane.supervisor.oci_worker import _oci_worker_systemd_slice
 from agent_control_plane.supervisor.sandbox_attestation import (
@@ -297,7 +299,7 @@ def test_private_runc_pid_file_reader_opens_nonblocking_after_fifo_swap(
     assert swapped
 
 
-def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch) -> None:
+def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, monkeypatch) -> None:
     observations = _valid_observations()
     state_root, pid_file = _private_pid_file(tmp_path)
     proc_observations = {
@@ -320,7 +322,7 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
         "read_cgroup_resource_controls",
         lambda _path, **_kwargs: observations["resource_control_files"],
     )
-    receipt = collect_running_runtime_attestation(
+    receipt = sandbox_attestation._collect_running_runtime_attestation_from_observations(
         runc_state=observations["runc_state"],
         pid_file_path=pid_file,
         state_root=state_root,
@@ -348,7 +350,113 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
 
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
+    assert running_attestation_is_self_consistent(receipt)
+    assert not running_attestation_has_collector_provenance(receipt)
+
+
+def test_trusted_collector_reads_pinned_runc_and_exact_systemd_units(tmp_path, monkeypatch) -> None:
+    observations = _valid_observations()
+    state_root, pid_file = _private_pid_file(tmp_path)
+    proc_observations = {
+        101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
+        202: (_proc_stat(202, "S", 1202), _WRAPPER_CGROUP.encode("ascii")),
+        303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
+    }
+    commands: list[tuple[list[str], dict]] = []
+    executable_fd = os.open(os.devnull, os.O_RDONLY)
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    monkeypatch.setattr(
+        sandbox_attestation, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
+    )
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "_trusted_systemd_command_environment",
+        lambda: {"LANG": "C", "LC_ALL": "C"},
+    )
+    monkeypatch.setattr(
+        oci_worker,
+        "_verify_trusted_runc_executable",
+        lambda _pin: Path("/usr/bin/runc"),
+    )
+    monkeypatch.setattr(
+        oci_worker,
+        "_open_verified_runc_executable",
+        lambda _pin: executable_fd,
+    )
+
+    def run_bounded(argv, **kwargs):
+        command = list(argv)
+        commands.append((command, kwargs))
+        if command[0] == "/usr/bin/runc":
+            assert command[1:] == [
+                "--root",
+                str(state_root),
+                "state",
+                "acp-test-container",
+            ]
+            assert kwargs["pass_fds"] == (executable_fd,)
+            assert kwargs["exec_fd"] == executable_fd
+            return 0, observations["runc_state"].decode("utf-8")
+        assert command[:5] == [
+            "/usr/bin/systemctl",
+            "--user",
+            "show",
+            "--no-pager",
+            "--property=ActiveState,ControlGroup,Id,InvocationID",
+        ]
+        assert command[5] == "--"
+        assert kwargs.get("exec_fd") is None
+        return 0, {
+            "acp-worker.service": observations["wrapper_properties"],
+            _ATTEMPT_SLICE_UNIT: observations["attempt_slice_properties"],
+            "acp-container.scope": observations["scope_properties"],
+        }[command[-1]].decode("ascii")
+
+    monkeypatch.setattr(oci_worker, "_run_bounded_command", run_bounded)
+
+    def read_proc(path: str) -> bytes:
+        parts = path.split("/")
+        pid = int(parts[2])
+        before_or_after_stat, cgroup = proc_observations[pid]
+        return b"0::" + cgroup + b"\n" if parts[-1] == "cgroup" else before_or_after_stat
+
+    monkeypatch.setattr(sandbox_attestation, "_read_proc_file", read_proc)
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "read_cgroup_resource_controls",
+        lambda _path, **_kwargs: observations["resource_control_files"],
+    )
+    expected = {
+        key: value
+        for key, value in observations.items()
+        if key
+        not in {
+            "runc_state",
+            "pid_file",
+            "process_snapshots",
+            "wrapper_properties",
+            "attempt_slice_properties",
+            "scope_properties",
+            "resource_control_files",
+        }
+    }
+    runc_pin = SimpleNamespace(sha256="a" * 64)
+    receipt = collect_running_runtime_attestation(
+        runc_executable_pin=runc_pin,
+        state_root=state_root,
+        pid_file_path=pid_file,
+        **expected,
+    )
+
+    assert receipt.init_pid == 303
+    assert receipt.init_identity == "linux:303:1303"
     assert running_attestation_has_collector_provenance(receipt)
+    assert len(commands) == 4
+    assert {command[-1] for command, _kwargs in commands[1:]} == {
+        "acp-worker.service",
+        _ATTEMPT_SLICE_UNIT,
+        "acp-container.scope",
+    }
 
 
 def _write_cgroup_controls(

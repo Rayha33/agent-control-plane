@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from support import init_repo, make_task
@@ -781,6 +782,47 @@ def test_running_transition_rejects_caller_constructed_receipt_before_gate_relea
         os.close(gate_read)
 
 
+@pytest.mark.parametrize("mismatch", ["state_root", "pid_file", "runc_executable"])
+def test_running_transition_rejects_collected_runtime_source_mismatch(
+    repo: Path,
+    mismatch: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        source_override: dict[str, object] = {}
+        if mismatch == "state_root":
+            source_override["state_root_override"] = Path(execution["bundle_path"]).parent
+        elif mismatch == "pid_file":
+            source_override["pid_file_name_override"] = "other.pid"
+        else:
+            source_override["runc_executable_sha256"] = "f" * 64
+        attestation = running_attestation(supervisor, attempt, **source_override)
+
+        assert running_attestation_is_self_consistent(attestation)
+        assert running_attestation_has_collector_provenance(attestation)
+        with pytest.raises(SupervisorError) as rejected:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+
+        assert rejected.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
 def test_running_transition_rejects_forged_cgroup_limit_before_gate_release(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -923,6 +965,17 @@ def test_running_transition_rechecks_process_membership_under_gate_lock(
             journal_module,
             "verify_running_runtime_process_membership",
             verify_membership_under_gate_lock,
+        )
+        verify_private_directory = journal_module._private_directory
+
+        def verify_state_root_under_gate_lock(path, **kwargs):
+            assert handle._gate_lock.locked()
+            return verify_private_directory(path, **kwargs)
+
+        monkeypatch.setattr(
+            journal_module,
+            "_private_directory",
+            verify_state_root_under_gate_lock,
         )
 
         with pytest.raises(SupervisorError) as moved:
@@ -1193,6 +1246,9 @@ def running_attestation(
     init_pid: int = 303,
     *,
     register_collected: bool = True,
+    state_root_override: Path | None = None,
+    pid_file_name_override: str | None = None,
+    runc_executable_sha256: str | None = None,
 ):
     row = supervisor._sandbox_execution_get(attempt["id"])
     assert row is not None and row["phase"] == "launched"
@@ -1303,8 +1359,8 @@ def running_attestation(
     if not register_collected:
         return validate_running_runtime_attestation(**validation_args)
 
-    state_root = Path(row["bundle_path"]).parent
-    pid_file_path = state_root / "init.pid"
+    state_root = state_root_override or Path(row["state_path"])
+    pid_file_path = state_root / (pid_file_name_override or "init.pid")
     pid_file_path.write_bytes(validation_args["pid_file"])
     pid_file_path.chmod(0o600)
 
@@ -1312,11 +1368,7 @@ def running_attestation(
         snapshot = snapshots[int(path.split("/")[2])]
         return snapshot.cgroup if path.endswith("/cgroup") else snapshot.stat_before
 
-    collector_args = {
-        key: value
-        for key, value in validation_args.items()
-        if key not in {"pid_file", "process_snapshots", "resource_control_files"}
-    }
+    collector_args = expected
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sandbox_attestation_module.sys, "platform", "linux")
         patch.setattr(sandbox_attestation_module, "_read_proc_file", read_proc_file)
@@ -1325,11 +1377,49 @@ def running_attestation(
             "read_cgroup_resource_controls",
             lambda _path: resource_control_files,
         )
-        return collect_running_runtime_attestation(
+        patch.setattr(
+            sandbox_attestation_module,
+            "_trusted_systemctl_executable",
+            lambda: Path("/usr/bin/systemctl"),
+        )
+        patch.setattr(
+            sandbox_attestation_module,
+            "_trusted_systemd_command_environment",
+            lambda: {"LANG": "C", "LC_ALL": "C"},
+        )
+        patch.setattr(
+            oci_worker,
+            "_verify_trusted_runc_executable",
+            lambda _pin: Path("/usr/bin/runc"),
+        )
+        executable_fd = os.open(os.devnull, os.O_RDONLY)
+        patch.setattr(
+            oci_worker,
+            "_open_verified_runc_executable",
+            lambda _pin: executable_fd,
+        )
+
+        def run_bounded(argv, **_kwargs):
+            command = list(argv)
+            if command[0] == "/usr/bin/runc":
+                return 0, runc_state.decode("utf-8")
+            return 0, {
+                row["wrapper_unit"]: wrapper_properties,
+                row["attempt_slice_unit"]: attempt_slice_properties,
+                row["scope_unit"]: scope_properties,
+            }[command[-1]].decode("ascii")
+
+        patch.setattr(oci_worker, "_run_bounded_command", run_bounded)
+        attestation = collect_running_runtime_attestation(
             pid_file_path=pid_file_path,
             state_root=state_root,
+            runc_executable_pin=SimpleNamespace(
+                sha256=runc_executable_sha256 or row["runc_executable_digest"]
+            ),
             **collector_args,
         )
+    pid_file_path.unlink()
+    return attestation
 
 
 def record_running(supervisor: GitSupervisor, attempt: dict) -> dict:
