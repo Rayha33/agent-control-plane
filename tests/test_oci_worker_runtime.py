@@ -2454,7 +2454,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     fd_audit: tuple[tuple[int, str], ...] | None = None
     cgroup_path: Path | None = None
     systemd_cgroup_path: Path | None = None
+    systemd_slice_cgroup: Path | None = None
     systemd_unit = f"acp-{container_id}.scope"
+    systemd_slice_unit = oci_worker._oci_worker_systemd_slice(container_id)
     cleanup_errors: list[str] = []
     controls: dict[str, str] = {}
     runtime_policy: dict[str, Any] | None = None
@@ -2893,12 +2895,21 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         init_start = _snapshot_start_time(init_snapshot, init_pid, require_live=True)
         cgroup_path = _snapshot_cgroup_path(init_snapshot)
         systemd_cgroup_path = _systemd_control_group(systemd_unit)
+        systemd_slice_cgroup = _systemd_control_group(systemd_slice_unit)
         if not _systemd_scope_is_active(systemd_unit):
             pytest.fail("exact runc systemd scope was not active before gate release")
         if systemd_cgroup_path is None:
             pytest.fail("exact runc systemd scope did not report a live ControlGroup")
+        if systemd_slice_cgroup is None:
+            pytest.fail(
+                "exact per-container systemd parent slice did not report a live ControlGroup"
+            )
         if systemd_cgroup_path.resolve(strict=True) != cgroup_path.resolve(strict=True):
             pytest.fail("systemd scope ControlGroup did not match the worker init cgroup")
+        if systemd_cgroup_path == systemd_slice_cgroup or not systemd_cgroup_path.is_relative_to(
+            systemd_slice_cgroup
+        ):
+            pytest.fail("runc scope was not contained beneath its exact per-container parent slice")
         state_code, state_output = _safe_run_pinned_runc(
             pin, runc_descriptor, state_root, ["state", container_id]
         )
@@ -3073,6 +3084,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     "effective_runtime_policy": runtime_policy,
                     "cgroup_controls": controls,
                     "cgroup_path": str(cgroup_path),
+                    "systemd_slice_unit": systemd_slice_unit,
+                    "systemd_slice_cgroup": str(systemd_slice_cgroup),
                     "init_file_descriptors": [
                         {"fd": descriptor, "target": target}
                         for descriptor, target in (fd_audit or ())
