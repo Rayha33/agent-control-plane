@@ -444,6 +444,7 @@ def test_v25_bundle_digest_semantics_migration_preserves_and_freezes_legacy_rows
               oci_version TEXT NOT NULL,
               bundle_path TEXT NOT NULL,
               state_path TEXT NOT NULL,
+              phase TEXT NOT NULL DEFAULT 'reserved',
               created_at TEXT NOT NULL
             )
             """
@@ -452,26 +453,47 @@ def test_v25_bundle_digest_semantics_migration_preserves_and_freezes_legacy_rows
             """
             INSERT INTO sandbox_executions VALUES
               ('attempt-old', 7, 'execution-old', 'oci-runc', 'container-old', ?, ?, ?, ?,
-               '1.3.5', '1.2.1', '/bundle-old', '/state-old', 'now')
+               '1.3.5', '1.2.1', '/bundle-old', '/state-old', 'reserved', 'now')
             """,
             ("f" * 64, "a" * 64, "b" * 64, "c" * 64),
         )
 
-        migration = dict(MIGRATIONS)[25]
-        migration(connection)
-        migration(connection)
+        migrations = dict(MIGRATIONS)
+        migrations[25](connection)
+        migrations[25](connection)
+        migrations[26](connection)
+        migrations[26](connection)
 
         row = connection.execute(
-            "SELECT bundle_digest, bundle_digest_semantics FROM sandbox_executions "
+            "SELECT bundle_digest, bundle_digest_semantics, phase, wrapper_cgroup_path, "
+            "attempt_slice_unit, attempt_slice_invocation_id, attempt_slice_cgroup_path "
+            "FROM sandbox_executions "
             "WHERE attempt_id = 'attempt-old'"
         ).fetchone()
         assert row["bundle_digest"] == "f" * 64
         assert row["bundle_digest_semantics"] == "legacy-caller-asserted-v0"
+        assert row["phase"] == "reserved"
+        assert row["wrapper_cgroup_path"] == ""
+        assert row["attempt_slice_unit"] == ""
+        assert row["attempt_slice_invocation_id"] == ""
+        assert row["attempt_slice_cgroup_path"] == ""
         with pytest.raises(sqlite3.IntegrityError, match="identity_immutable"):
             connection.execute(
                 "UPDATE sandbox_executions SET bundle_digest_semantics = 'oci-reservation-v1' "
                 "WHERE attempt_id = 'attempt-old'"
             )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="sandbox_execution_attempt_slice_identity_required"
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'launched' WHERE attempt_id = 'attempt-old'"
+            )
+        assert (
+            connection.execute(
+                "SELECT phase FROM sandbox_executions WHERE attempt_id = 'attempt-old'"
+            ).fetchone()["phase"]
+            == "reserved"
+        )
     finally:
         connection.close()
 
