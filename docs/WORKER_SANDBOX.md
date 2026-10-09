@@ -1361,6 +1361,41 @@ cancel/recovery, Git transfer, or validated result import; it is not acceptance
 criterion #3 or end-to-end sandbox proof. The driver must remain disconnected
 from coding workers and task #2370 stays open.
 
+### NAS-host rootless-runc boundary probe (2026-10-09; partial pass)
+
+The opt-in `test_live_rootless_runc_enforces_minimal_worker_boundary` passed
+once in 7.7 seconds on the NAS (`Linux 6.18.15` x86_64, uid 1000, rootless
+runc 1.3.5, BusyBox 1.35.0, unified cgroup v2). The source branch was verified
+at exact public head `18de1e32c96dd2dc5c319549c349b2a30bc58266`; the test file
+SHA-256 was
+`9a54375ea682aea68ee8ce9630da0b82c264dca89335edbc0abc5fb623487c95` and
+`src/agent_control_plane/supervisor/oci_worker.py` was
+`5aed95084724828544b0c6f09ac17653983caff57f16498fd31950b5b42c4092`. The
+rootless user-namespace preflight succeeded. The no-model invocation cleared
+its environment and used Python 3.11 / pytest 9.1.1; no provider credentials
+or model call were used.
+
+The test observed only `lo`, no IPv4 default route, and one TCP probe that did
+not reach its test-owned host-NIC listener. It denied the specified source
+checkout (including `.git`), sibling worktree, unrelated project, home,
+synthetic config/credential markers, host `/etc/os-release`, `/tmp`, and
+absolute/relative symlink targets. Its FD check asserted exactly descriptors
+0, 1, and 2, with no additional or socket descriptors; pipe targets were
+observed but not asserted. The process had zero capability sets and
+`NoNewPrivs=true`; read-back limits were `cpu.max=50000 100000`,
+`memory.max=134217728`, and `pids.max=16`. The test and separate postflight
+found the attempt tree, `/dev/shm` anchor, exact scope cgroup, and checkout
+canary absent, with no runc process or matching scope remaining.
+
+Pytest emitted a nonfatal warning because the optional Starlette dependency
+was absent, so this invocation did not validate that warning filter or the
+full suite. More importantly, the test used a test-only unjournaled gate
+release. This is partial direct-runc runtime evidence, not a journal-authorized
+launch or registered `run_worker` acceptance. It is not general egress proof,
+provider-authentication evidence, `cleanup_verified` evidence, result-import or
+crash/recovery proof, or a pass of task #2370's integrated-worker criteria;
+`worker_executor_integrated=false`. Keep OCI fail-closed and task #2370 open.
+
 ### systemd/runc cgroup composition probe (2026-10-03)
 
 The first wrapper-only test used rootless runc under a transient service with
