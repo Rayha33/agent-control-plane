@@ -1287,6 +1287,39 @@ or egress, hostile long-running process behavior, cancellation/restart
 recovery, concurrent attempts, result transfer/QC, or end-to-end sandbox
 acceptance; task #2370 remains open.
 
+### Exact-head cleanup revalidation (2026-10-09; pass)
+
+The opt-in live test was rerun from exact PR #42 head
+`1d78813a96af210da4cf096053dff097c6b6e1a8` in a disposable Lima 2.2.1 VZ
+Ubuntu 24.04.5 ARM64 guest (kernel `6.8.0-142-generic`, uid 501) with no host
+mounts. The test file SHA-256 was
+`9a54375ea682aea68ee8ce9630da0b82c264dca89335edbc0abc5fb623487c95`; the
+unchanged OCI worker module was
+`5aed95084724828544b0c6f09ac17653983caff57f16498fd31950b5b42c4092`.
+Root-owned runc 1.3.5 was verified against the official ARM64 release asset
+SHA-256
+`bd843d75a788e612c9df286b1fa519a44fcbb7a7b8d01e2268431433cc7c718c`, with
+Ubuntu dynamic BusyBox 1.36.1. The single invocation of
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed.
+
+The live receipt reported `rootfsPropagation=rprivate`, the expected
+`memory.max=134217728`, `pids.max=16`, and `cpu.max=50000 100000`, all five
+capability sets zero, and `NoNewPrivs=true`. The candidate saw only `lo`; its
+probe could not reach the host-NIC listener. Checkout, sibling-attempt,
+unrelated-project, home/config/credential, host `/etc` and `/tmp` sentinels,
+and absolute/relative symlink targets were denied. Teardown removed the
+attempt tree and checkout canary; postflight found no runc process or ACP
+systemd scope. The guest-only
+`kernel.apparmor_restrict_unprivileged_userns` value was restored from `0` to
+its original `1`.
+
+This rerun exercises the changed test-harness cleanup on its successful live
+path; identity-replacement failures are covered by the focused regressions and
+exact-head CI. The receipt still reports `worker_executor_integrated=false`.
+It is not evidence of `run_worker` isolation, provider authentication or
+egress, result transfer, crash/cancellation recovery, or full task #2370
+acceptance.
+
 ### systemd/runc cgroup composition probe (2026-10-03)
 
 The first wrapper-only test used rootless runc under a transient service with
