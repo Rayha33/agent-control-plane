@@ -1577,8 +1577,10 @@ per-attempt slice for cancellation/recovery. An owner restart, missing or
 reused invocation, unexpected cgroup ancestry, or ambiguous cleanup must leave
 the execution fence held and prohibit result import. A sequential cgroup scan
 followed by stop is still only point-in-time evidence, not an atomic cleanup
-proof. No persistent monitor, manager-restart recovery, or integrated worker
-path has been implemented or tested; OCI remains fail-closed. Sources:
+proof. No durable monitor daemon or integrated worker path has been
+implemented. A narrower probe of a systemd-owned service surviving its parent
+controller's `SIGKILL` under the same active user manager is recorded below;
+manager-restart recovery remains untested and OCI remains fail-closed. Sources:
 [systemd v252 `systemd-run`](https://github.com/systemd/systemd/blob/v252/man/systemd-run.xml),
 [systemd v252 unit dependencies](https://github.com/systemd/systemd/blob/v252/man/systemd.unit.xml),
 [systemd v252 resource control](https://github.com/systemd/systemd/blob/v252/man/systemd.resource-control.xml),
@@ -1638,6 +1640,40 @@ cleanup, manager-restart recovery, or `run_worker` integration. After any stop
 request, the integrated executor must independently confirm the exact attempt,
 service, and scope invocation identities and prove their cgroups empty before
 recording `cleanup_verified`.
+
+**Controller-crash receipt reconciliation probe (systemd 255; 2026-10-09).**
+The opt-in test was extended and run from an exact file copy in the disposable
+Ubuntu 24.04 ARM64 Lima guest above (Linux 6.8.0-142, systemd 255.4, active user
+manager, cgroup v2; no host-shared mounts). A short-lived controller started a
+systemd-owned transient service running only `/usr/bin/sleep 45` in a unique
+attempt slice, then atomically persisted and `fsync`ed a private receipt with
+the exact unit, `InvocationID`, service and slice `ControlGroup`, `MainPID`, and
+controller PID. The parent waited for the post-directory-`fsync` acknowledgment,
+required that PID to match the process handle, then sent `SIGKILL` to that
+controller. A fresh Python process reconciled the receipt against systemd's
+reported unit properties,
+including the unchanged `InvocationID`, `ControlGroup`, `Slice`, and `MainPID`,
+and verified the service cgroup was a direct child of the recorded slice and
+the recorded PID still existed. The probe next started a sibling scope and
+stopped the exact attempt slice; all three units became inactive, all recorded
+cgroups were empty or absent, and the scope client exited `-15` (`SIGTERM`).
+The guest test file matched host SHA-256
+`3d37f45f1b83c9be338f8869280b09c3813d899c55903992732c0561f3123670`. A
+post-run inspection found no probe service/scope, `/usr/bin/sleep 45` process,
+or hashed attempt-slice cgroup. The test finalizer also checks each exact unit's
+non-active/absent state and any recorded cgroup; inability to prove cleanup
+fails the probe.
+
+This demonstrates only that this systemd-owned placeholder service and its
+exact receipt survived abrupt exit of a separate controller process without
+intentionally restarting the user manager, and that stopping the recorded slice
+tears down its service and sibling scope in this test environment. The test
+checks manager availability before launch and uses it again for reconciliation;
+it does not independently attest manager identity across those steps. It does
+not test ACP supervisor restart, a monitor daemon that owns/waits for runc,
+systemd manager restart/logout/reboot, a concurrent cleanup race, runc-created
+scope behavior, or `run_worker` integration. The opt-in test is not default CI
+and does not authorize setting `cleanup_verified`; OCI remains fail-closed.
 
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
