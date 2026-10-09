@@ -1497,6 +1497,48 @@ the slice or prove journal authorization, full attempt descendant containment,
 cancellation/crash recovery, result import, provider egress, or registered
 `run_worker` behavior. Keep OCI fail-closed and task #2370 open.
 
+**2026-10-09 systemd ownership and restart decision (research; not integration).**
+The supported-host assumption is systemd 252, so this check used the v252
+interface docs rather than relying only on current `main`. systemd documents a
+single-writer rule for cgroup v2. In v252, the manager D-Bus interface exposes
+`StartTransientUnit`, `GetUnitByInvocationID`, and `GetUnitByControlGroup`; the
+systemd control-group API documents the unit's `ControlGroup` property. Resolve
+exact unit/invocation identities and read reported properties instead of
+deriving cgroup paths from unit names. `systemd-run` is a wrapper for
+transient-unit creation, not a separate lifecycle owner. Sources:
+[systemd v252 D-Bus interface](https://github.com/systemd/systemd/blob/v252/man/org.freedesktop.systemd1.xml),
+[systemd control-group API](https://systemd.io/CONTROL_GROUP_INTERFACE/), and
+[systemd v252 cgroup delegation guide](https://github.com/systemd/systemd/blob/v252/docs/CGROUP_DELEGATION.md).
+
+The recovery design must not use `systemd-run --scope` as the durable monitor:
+in v252 the command remains a child of the `systemd-run` client and the client
+waits synchronously for it. Instead, the candidate architecture is one
+systemd-owned transient **monitor service** per attempt/fencing epoch under its
+unique attempt slice. That service starts and waits for the pinned foreground
+runc client and persists its own lifecycle receipts. It is intended to outlive
+an ACP supervisor-process restart while the same user manager remains active;
+that recovery property is not yet proven. The runc container scope is a sibling
+unit under the same attempt slice. For the user-manager deployment, verify the
+host's logout/linger and manager-restart behavior rather than assuming
+persistence across logout or reboot.
+The untrusted worker must never receive the host systemd bus socket or a route
+to the control API.
+
+`KillMode=control-group` covers one unit's control group, not a sibling runc
+scope; stopping the wrapper service alone therefore remains insufficient. A
+trusted owner must serialize start/cancel/recovery, query the exact service and
+scope invocation IDs and `ControlGroup` values, and use the manager to stop the
+per-attempt slice for cancellation/recovery. An owner restart, missing or
+reused invocation, unexpected cgroup ancestry, or ambiguous cleanup must leave
+the execution fence held and prohibit result import. A sequential cgroup scan
+followed by stop is still only point-in-time evidence, not an atomic cleanup
+proof. No persistent monitor, manager-restart recovery, or integrated worker
+path has been implemented or tested; OCI remains fail-closed. Sources:
+[systemd v252 `systemd-run`](https://github.com/systemd/systemd/blob/v252/man/systemd-run.xml),
+[systemd v252 unit dependencies](https://github.com/systemd/systemd/blob/v252/man/systemd.unit.xml),
+[systemd v252 resource control](https://github.com/systemd/systemd/blob/v252/man/systemd.resource-control.xml),
+and [systemd v252 `systemd.kill`](https://github.com/systemd/systemd/blob/v252/man/systemd.kill.xml).
+
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
 argv for a future executor. It encodes a readonly root, a single non-recursive
