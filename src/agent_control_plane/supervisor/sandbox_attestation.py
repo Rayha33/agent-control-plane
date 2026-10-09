@@ -15,6 +15,8 @@ import os
 import re
 import stat
 import sys
+import threading
+import weakref
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -24,6 +26,7 @@ from .oci_worker import _oci_worker_systemd_slice
 
 _MAX_OBSERVATION_BYTES = 64 * 1024
 _MAX_PID_FILE_BYTES = 11
+_MAX_CGROUP_CONTROL_BYTES = 128
 _MAX_PID = (1 << 31) - 1
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope|slice)\Z")
@@ -64,6 +67,10 @@ class RunningRuntimeAttestation:
     init_pid: int
     init_identity: str
     runc_state_sha256: str
+    memory_max_bytes: int
+    cpu_quota: int
+    cpu_period: int
+    pids_max: int
     evidence_sha256: str
 
     def audit_payload(self) -> dict[str, Any]:
@@ -88,8 +95,31 @@ class RunningRuntimeAttestation:
             "init_pid": self.init_pid,
             "init_identity": self.init_identity,
             "runc_state_sha256": self.runc_state_sha256,
+            "memory_max_bytes": self.memory_max_bytes,
+            "cpu_quota": self.cpu_quota,
+            "cpu_period": self.cpu_period,
+            "pids_max": self.pids_max,
             "evidence_sha256": self.evidence_sha256,
         }
+
+
+_COLLECTED_ATTESTATION_LOCK = threading.Lock()
+_COLLECTED_ATTESTATIONS: weakref.WeakValueDictionary[int, RunningRuntimeAttestation] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def running_attestation_has_collector_provenance(value: Any) -> bool:
+    """Return true only for the exact object issued by the runtime collector.
+
+    This is an accidental-misuse guard, not an authentication boundary against
+    arbitrary code execution in the supervisor process.
+    """
+
+    if type(value) is not RunningRuntimeAttestation:
+        return False
+    with _COLLECTED_ATTESTATION_LOCK:
+        return _COLLECTED_ATTESTATIONS.get(id(value)) is value
 
 
 def read_linux_process_snapshot(pid: int) -> ProcessSnapshot:
@@ -104,6 +134,150 @@ def read_linux_process_snapshot(pid: int) -> ProcessSnapshot:
     cgroup = _read_proc_file(cgroup_path)
     after = _read_proc_file(stat_path)
     return ProcessSnapshot(stat_before=before, cgroup=cgroup, stat_after=after)
+
+
+def read_cgroup_resource_controls(
+    cgroup_path: str,
+    *,
+    cgroup_root: str | Path = "/sys/fs/cgroup",
+) -> dict[str, bytes]:
+    """Read the exact cgroup-v2 limits through pinned, no-follow directory FDs."""
+
+    if not sys.platform.startswith("linux"):
+        raise _invalid("Linux cgroup resource observations are unavailable on this platform")
+    group = _cgroup_path(cgroup_path, "resource-control cgroup")
+    root = _absolute_path(os.fspath(cgroup_root), "cgroup root")
+    if root == "/sys/fs/cgroup":
+        _require_cgroup2_mount(root)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    if any(not getattr(os, flag, 0) for flag in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")):
+        raise _invalid("safe cgroup directory open flags are unavailable")
+
+    root_fd = -1
+    current_fd = -1
+    try:
+        root_fd = os.open(root, directory_flags)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise _invalid("cgroup root is not a directory")
+        current_fd = root_fd
+        for component in PurePosixPath(group).parts[1:]:
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
+                os.close(next_fd)
+                raise _invalid("cgroup path contains a non-directory component")
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+
+        observations: dict[str, bytes] = {}
+        for name in ("memory.max", "cpu.max", "pids.max"):
+            descriptor = os.open(name, file_flags, dir_fd=current_fd)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise _invalid("cgroup resource control is not a regular file")
+                data = bytearray()
+                while len(data) <= _MAX_CGROUP_CONTROL_BYTES:
+                    chunk = os.read(descriptor, _MAX_CGROUP_CONTROL_BYTES + 1 - len(data))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                raw = bytes(data)
+                _control_line(raw, name)
+                observations[name] = raw
+            finally:
+                os.close(descriptor)
+        return observations
+    except SupervisorError:
+        raise
+    except OSError as error:
+        raise _invalid("cgroup resource controls could not be read safely") from error
+    finally:
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _require_cgroup2_mount(root: str) -> None:
+    """Fail closed unless mountinfo identifies the fixed root as cgroup v2."""
+
+    raw = _read_proc_file("/proc/self/mountinfo")
+    expected = os.fsencode(root)
+    matching_filesystems: list[bytes] = []
+    for line in raw.splitlines():
+        before, separator, after = line.partition(b" - ")
+        fields = before.split()
+        filesystem = after.split()[:1]
+        if not separator or len(fields) < 5 or not filesystem:
+            continue
+        mountpoint = re.sub(
+            rb"\\([0-7]{3})",
+            lambda match: bytes((int(match.group(1), 8),)),
+            fields[4],
+        )
+        if mountpoint == expected:
+            matching_filesystems.append(filesystem[0])
+    if not matching_filesystems or any(value != b"cgroup2" for value in matching_filesystems):
+        raise _invalid("fixed cgroup root is not mounted as cgroup v2")
+
+
+def _control_line(raw: Any, field: str) -> bytes:
+    if not isinstance(raw, bytes) or not raw or len(raw) > _MAX_CGROUP_CONTROL_BYTES:
+        raise _invalid(f"{field} observation is invalid or exceeds its byte limit")
+    line = raw[:-1] if raw.endswith(b"\n") else raw
+    if not line or b"\n" in line or b"\r" in line:
+        raise _invalid(f"{field} observation is not one canonical line")
+    try:
+        line.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise _invalid(f"{field} observation is not ASCII") from error
+    return line
+
+
+def _validate_cgroup_resource_controls(
+    observations: Any,
+    *,
+    expected_memory_max_bytes: int,
+    expected_cpu_quota: int,
+    expected_cpu_period: int,
+    expected_pids_max: int,
+) -> dict[str, int]:
+    expected = {
+        "memory_max_bytes": expected_memory_max_bytes,
+        "cpu_quota": expected_cpu_quota,
+        "cpu_period": expected_cpu_period,
+        "pids_max": expected_pids_max,
+    }
+    if any(
+        type(value) is not int or not 1 <= value <= (1 << 64) - 1 for value in expected.values()
+    ):
+        raise _invalid("expected cgroup resource limits are invalid")
+    if type(observations) is not dict or set(observations) != {
+        "memory.max",
+        "cpu.max",
+        "pids.max",
+    }:
+        raise _invalid("cgroup resource observations are incomplete")
+    expected_lines = {
+        "memory.max": str(expected_memory_max_bytes).encode("ascii"),
+        "cpu.max": f"{expected_cpu_quota} {expected_cpu_period}".encode("ascii"),
+        "pids.max": str(expected_pids_max).encode("ascii"),
+    }
+    for name, expected_line in expected_lines.items():
+        if _control_line(observations[name], name) != expected_line:
+            raise _invalid(f"{name} does not match the exact OCI launch limit")
+    return expected
 
 
 def read_private_runc_pid_file(pid_file_path: str | Path, state_root: str | Path) -> bytes:
@@ -195,6 +369,10 @@ def collect_running_runtime_attestation(
     expected_scope_unit: str,
     expected_scope_invocation_id: str,
     expected_cgroup_path: str,
+    expected_memory_max_bytes: int,
+    expected_cpu_quota: int,
+    expected_cpu_period: int,
+    expected_pids_max: int,
 ) -> RunningRuntimeAttestation:
     """Collect PID-file and live procfs evidence, then bind command outputs.
 
@@ -214,7 +392,8 @@ def collect_running_runtime_attestation(
     if len(set(pids)) != 3:
         raise _invalid("monitor, runc client, and container init PIDs must be distinct")
     process_snapshots = {pid: read_linux_process_snapshot(pid) for pid in pids}
-    return validate_running_runtime_attestation(
+    resource_control_files = read_cgroup_resource_controls(expected_cgroup_path)
+    attestation = validate_running_runtime_attestation(
         runc_state=runc_state,
         pid_file=pid_file,
         process_snapshots=process_snapshots,
@@ -234,7 +413,36 @@ def collect_running_runtime_attestation(
         expected_scope_unit=expected_scope_unit,
         expected_scope_invocation_id=expected_scope_invocation_id,
         expected_cgroup_path=expected_cgroup_path,
+        resource_control_files=resource_control_files,
+        expected_memory_max_bytes=expected_memory_max_bytes,
+        expected_cpu_quota=expected_cpu_quota,
+        expected_cpu_period=expected_cpu_period,
+        expected_pids_max=expected_pids_max,
     )
+    with _COLLECTED_ATTESTATION_LOCK:
+        _COLLECTED_ATTESTATIONS[id(attestation)] = attestation
+    return attestation
+
+
+def verify_running_runtime_resource_controls(attestation: RunningRuntimeAttestation) -> None:
+    """Re-read fixed-root cgroup-v2 controls immediately before gate authorization."""
+
+    if type(attestation) is not RunningRuntimeAttestation:
+        raise _invalid("release-time resource verification requires a typed receipt")
+    try:
+        current = read_cgroup_resource_controls(attestation.cgroup_path)
+        _validate_cgroup_resource_controls(
+            current,
+            expected_memory_max_bytes=attestation.memory_max_bytes,
+            expected_cpu_quota=attestation.cpu_quota,
+            expected_cpu_period=attestation.cpu_period,
+            expected_pids_max=attestation.pids_max,
+        )
+    except SupervisorError as error:
+        raise SupervisorError(
+            "sandbox_runtime_attestation_stale",
+            "live cgroup controls no longer match the collected receipt",
+        ) from error
 
 
 def _valid_private_pid_file(info: os.stat_result) -> bool:
@@ -307,6 +515,11 @@ def validate_running_runtime_attestation(
     expected_scope_unit: str,
     expected_scope_invocation_id: str,
     expected_cgroup_path: str,
+    resource_control_files: dict[str, bytes],
+    expected_memory_max_bytes: int,
+    expected_cpu_quota: int,
+    expected_cpu_period: int,
+    expected_pids_max: int,
 ) -> RunningRuntimeAttestation:
     """Require one exact running runc/container/systemd/procfs identity tuple.
 
@@ -408,6 +621,13 @@ def validate_running_runtime_attestation(
     ):
         raise _invalid("monitor or runc client process identity changed")
 
+    resource_limits = _validate_cgroup_resource_controls(
+        resource_control_files,
+        expected_memory_max_bytes=expected_memory_max_bytes,
+        expected_cpu_quota=expected_cpu_quota,
+        expected_cpu_period=expected_cpu_period,
+        expected_pids_max=expected_pids_max,
+    )
     normalized = {
         "container_id": container_id,
         "bundle_path": bundle_path,
@@ -427,6 +647,7 @@ def validate_running_runtime_attestation(
         "init_pid": expected_init_pid,
         "init_identity": identities[expected_init_pid],
         "runc_state_sha256": hashlib.sha256(runc_state).hexdigest(),
+        **resource_limits,
     }
     evidence_digest = hashlib.sha256(canonical_json(normalized).encode("utf-8")).hexdigest()
     return RunningRuntimeAttestation(**normalized, evidence_sha256=evidence_digest)
@@ -443,6 +664,15 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
         if (
             not _is_sha256(claimed_digest)
             or not _is_sha256(value.runc_state_sha256)
+            or any(
+                type(limit) is not int or not 1 <= limit <= (1 << 64) - 1
+                for limit in (
+                    value.memory_max_bytes,
+                    value.cpu_quota,
+                    value.cpu_period,
+                    value.pids_max,
+                )
+            )
             or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", value.container_id)
             or len({value.monitor_pid, value.runc_client_pid, value.init_pid}) != 3
             or value.wrapper_control_group == value.cgroup_path

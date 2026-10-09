@@ -3522,6 +3522,10 @@ class _RuncLaunchTarget:
     workspace_inode: int | None = None
     pid_file_path: str | None = None
     container_id: str | None = None
+    memory_limit_bytes: int | None = None
+    cpu_quota: int | None = None
+    cpu_period: int | None = None
+    pids_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -4493,6 +4497,11 @@ def _private_bundle_runc_launch_target(
     try:
         config = json.loads(config_json)
         mounts = config["mounts"]
+        resources = config["linux"]["resources"]
+        memory_limit_bytes = resources["memory"]["limit"]
+        cpu_quota = resources["cpu"]["quota"]
+        cpu_period = resources["cpu"]["period"]
+        pids_limit = resources["pids"]["limit"]
         workspace_mounts = [
             mount
             for mount in mounts
@@ -4506,6 +4515,10 @@ def _private_bundle_runc_launch_target(
             or not isinstance(workspace_path, str)
             or not Path(workspace_path).is_absolute()
             or cgroups_path != _oci_worker_cgroups_path(container_id)
+            or any(
+                type(value) is not int or value <= 0
+                for value in (memory_limit_bytes, cpu_quota, cpu_period, pids_limit)
+            )
         ):
             raise ValueError("OCI config does not bind one exact workspace and container ID")
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -4614,6 +4627,10 @@ def _private_bundle_runc_launch_target(
         workspace_inode=workspace_inode,
         pid_file_path=str(pid_file_path),
         container_id=container_id,
+        memory_limit_bytes=memory_limit_bytes,
+        cpu_quota=cpu_quota,
+        cpu_period=cpu_period,
+        pids_limit=pids_limit,
     )
 
 

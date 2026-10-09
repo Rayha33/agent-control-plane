@@ -21,10 +21,13 @@ from agent_control_plane.git_supervisor import (
 )
 from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker
+from agent_control_plane.supervisor import sandbox_attestation as sandbox_attestation_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
 from agent_control_plane.supervisor.common import canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
+    collect_running_runtime_attestation,
+    running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
 )
@@ -175,6 +178,10 @@ def _test_runc_target(
         workspace_inode=execution["workspace_root_ino"],
         pid_file_path=str(Path(state_path) / "init.pid"),
         container_id=container_id or execution["container_id"],
+        memory_limit_bytes=1_073_741_824,
+        cpu_quota=100_000,
+        cpu_period=100_000,
+        pids_limit=256,
     )
 
 
@@ -298,9 +305,15 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
-    assert durable["launch_plan"]["version"] == 3
+    assert durable["launch_plan"]["version"] == 4
     assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
+    assert durable["launch_plan"]["launch"]["resource_limits"] == {
+        "memory_max_bytes": target.memory_limit_bytes,
+        "cpu_quota": target.cpu_quota,
+        "cpu_period": target.cpu_period,
+        "pids_max": target.pids_limit,
+    }
     assert journal_module._sandbox_launch_plan_binding_is_self_consistent(durable)
     event_plan = json.loads(event["payload_json"])["launch_plan"]
     assert event_plan == durable["launch_plan"]
@@ -733,6 +746,141 @@ def test_public_gate_release_requires_exact_durable_running_transition(repo: Pat
         os.close(gate_read)
 
 
+def test_running_transition_rejects_caller_constructed_receipt_before_gate_release(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        caller_constructed = running_attestation(supervisor, attempt, register_collected=False)
+
+        assert running_attestation_is_self_consistent(caller_constructed)
+        assert not running_attestation_has_collector_provenance(caller_constructed)
+        with pytest.raises(SupervisorError) as rejected:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=caller_constructed,
+                runc_handle=handle,
+            )
+
+        assert rejected.value.code == "sandbox_runtime_attestation_invalid"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_running_transition_rejects_forged_cgroup_limit_before_gate_release(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        forged = replace(attestation, memory_max_bytes=attestation.memory_max_bytes + 1)
+        payload = forged.audit_payload()
+        payload.pop("evidence_sha256")
+        forged = replace(
+            forged,
+            evidence_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
+        )
+        # Isolate the durable-limit comparison after the provenance guard; replacing
+        # a collector receipt ordinarily discards its process-local provenance.
+        monkeypatch.setattr(
+            journal_module,
+            "running_attestation_has_collector_provenance",
+            lambda candidate: candidate is forged,
+        )
+
+        with pytest.raises(SupervisorError) as mismatch:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=forged,
+                runc_handle=handle,
+            )
+
+        assert mismatch.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_running_transition_rechecks_live_limits_under_gate_lock(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: {
+                "memory.max": b"1073741825\n",
+                "cpu.max": b"100000 100000\n",
+                "pids.max": b"256\n",
+            },
+        )
+        verify_resources = journal_module.verify_running_runtime_resource_controls
+
+        def verify_resources_under_gate_lock(receipt) -> None:
+            assert handle._gate_lock.locked()
+            verify_resources(receipt)
+
+        monkeypatch.setattr(
+            journal_module,
+            "verify_running_runtime_resource_controls",
+            verify_resources_under_gate_lock,
+        )
+
+        with pytest.raises(SupervisorError) as changed:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+
+        assert changed.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
 def test_stop_before_running_transition_is_rejected_without_gate_release(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
@@ -974,13 +1122,29 @@ def record_exit(supervisor: GitSupervisor, attempt: dict, exit_code: int = 0) ->
     return supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], receipt)
 
 
-def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int = 303):
+def running_attestation(
+    supervisor: GitSupervisor,
+    attempt: dict,
+    init_pid: int = 303,
+    *,
+    register_collected: bool = True,
+):
     row = supervisor._sandbox_execution_get(attempt["id"])
     assert row is not None and row["phase"] == "launched"
     init_start = 1303
     wrapper_cgroup = row["wrapper_cgroup_path"]
     slice_cgroup = row["attempt_slice_cgroup_path"]
     scope_cgroup = row["cgroup_path"]
+    resource_limits = (
+        json.loads(row["launch_plan_json"])["launch"]["resource_limits"]
+        if row["launch_plan_json"]
+        else {
+            "memory_max_bytes": 1_073_741_824,
+            "cpu_quota": 100_000,
+            "cpu_period": 100_000,
+            "pids_max": 256,
+        }
+    )
 
     def stat(pid: int, start: int) -> bytes:
         fields = [b"S", *([b"0"] * 18), str(start).encode("ascii")]
@@ -1009,60 +1173,121 @@ def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int 
             stat(init_pid, init_start),
         ),
     }
-    return validate_running_runtime_attestation(
-        runc_state=json.dumps(
-            {
-                "id": row["container_id"],
-                "status": "running",
-                "pid": init_pid,
-                "bundle": row["bundle_path"],
-            }
-        ).encode("utf-8"),
-        pid_file=f"{init_pid}\n".encode("ascii"),
-        process_snapshots=snapshots,
-        wrapper_properties=(
-            "ActiveState=active\n"
-            f"ControlGroup={wrapper_cgroup}\n"
-            f"Id={row['wrapper_unit']}\n"
-            f"InvocationID={row['wrapper_invocation_id']}\n"
-        ).encode("ascii"),
-        attempt_slice_properties=(
-            "ActiveState=active\n"
-            f"ControlGroup={slice_cgroup}\n"
-            f"Id={row['attempt_slice_unit']}\n"
-            f"InvocationID={row['attempt_slice_invocation_id']}\n"
-        ).encode("ascii"),
-        scope_properties=(
-            "ActiveState=active\n"
-            f"ControlGroup={scope_cgroup}\n"
-            f"Id={row['scope_unit']}\n"
-            f"InvocationID={row['scope_invocation_id']}\n"
-        ).encode("ascii"),
-        expected_container_id=row["container_id"],
-        expected_bundle_path=row["bundle_path"],
-        expected_monitor_pid=row["monitor_pid"],
-        expected_monitor_identity=row["monitor_identity"],
-        expected_runc_client_pid=row["runc_client_pid"],
-        expected_runc_client_identity=row["runc_client_identity"],
-        expected_wrapper_unit=row["wrapper_unit"],
-        expected_wrapper_invocation_id=row["wrapper_invocation_id"],
-        expected_attempt_slice_unit=row["attempt_slice_unit"],
-        expected_attempt_slice_invocation_id=row["attempt_slice_invocation_id"],
-        expected_scope_unit=row["scope_unit"],
-        expected_scope_invocation_id=row["scope_invocation_id"],
-        expected_cgroup_path=scope_cgroup,
-    )
+    resource_control_files = {
+        "memory.max": f"{resource_limits['memory_max_bytes']}\n".encode("ascii"),
+        "cpu.max": (f"{resource_limits['cpu_quota']} {resource_limits['cpu_period']}\n").encode(
+            "ascii"
+        ),
+        "pids.max": f"{resource_limits['pids_max']}\n".encode("ascii"),
+    }
+    expected = {
+        "expected_container_id": row["container_id"],
+        "expected_bundle_path": row["bundle_path"],
+        "expected_monitor_pid": row["monitor_pid"],
+        "expected_monitor_identity": row["monitor_identity"],
+        "expected_runc_client_pid": row["runc_client_pid"],
+        "expected_runc_client_identity": row["runc_client_identity"],
+        "expected_wrapper_unit": row["wrapper_unit"],
+        "expected_wrapper_invocation_id": row["wrapper_invocation_id"],
+        "expected_attempt_slice_unit": row["attempt_slice_unit"],
+        "expected_attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
+        "expected_scope_unit": row["scope_unit"],
+        "expected_scope_invocation_id": row["scope_invocation_id"],
+        "expected_cgroup_path": scope_cgroup,
+        "expected_memory_max_bytes": resource_limits["memory_max_bytes"],
+        "expected_cpu_quota": resource_limits["cpu_quota"],
+        "expected_cpu_period": resource_limits["cpu_period"],
+        "expected_pids_max": resource_limits["pids_max"],
+    }
+    runc_state = json.dumps(
+        {
+            "id": row["container_id"],
+            "status": "running",
+            "pid": init_pid,
+            "bundle": row["bundle_path"],
+        }
+    ).encode("utf-8")
+    wrapper_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={wrapper_cgroup}\n"
+        f"Id={row['wrapper_unit']}\n"
+        f"InvocationID={row['wrapper_invocation_id']}\n"
+    ).encode("ascii")
+    attempt_slice_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={slice_cgroup}\n"
+        f"Id={row['attempt_slice_unit']}\n"
+        f"InvocationID={row['attempt_slice_invocation_id']}\n"
+    ).encode("ascii")
+    scope_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={scope_cgroup}\n"
+        f"Id={row['scope_unit']}\n"
+        f"InvocationID={row['scope_invocation_id']}\n"
+    ).encode("ascii")
+    validation_args = {
+        **expected,
+        "runc_state": runc_state,
+        "pid_file": f"{init_pid}\n".encode("ascii"),
+        "process_snapshots": snapshots,
+        "wrapper_properties": wrapper_properties,
+        "attempt_slice_properties": attempt_slice_properties,
+        "scope_properties": scope_properties,
+        "resource_control_files": resource_control_files,
+    }
+    if not register_collected:
+        return validate_running_runtime_attestation(**validation_args)
+
+    state_root = Path(row["bundle_path"]).parent
+    pid_file_path = state_root / "init.pid"
+    pid_file_path.write_bytes(validation_args["pid_file"])
+    pid_file_path.chmod(0o600)
+
+    def read_proc_file(path: str) -> bytes:
+        snapshot = snapshots[int(path.split("/")[2])]
+        return snapshot.cgroup if path.endswith("/cgroup") else snapshot.stat_before
+
+    collector_args = {
+        key: value
+        for key, value in validation_args.items()
+        if key not in {"pid_file", "process_snapshots", "resource_control_files"}
+    }
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sandbox_attestation_module.sys, "platform", "linux")
+        patch.setattr(sandbox_attestation_module, "_read_proc_file", read_proc_file)
+        patch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: resource_control_files,
+        )
+        return collect_running_runtime_attestation(
+            pid_file_path=pid_file_path,
+            state_root=state_root,
+            **collector_args,
+        )
 
 
 def record_running(supervisor: GitSupervisor, attempt: dict) -> dict:
     handle = attempt.get("_test_runc_handle")
     assert isinstance(handle, oci_worker.RuncLaunchHandle)
-    return supervisor._sandbox_execution_record_running(
-        attempt["id"],
-        attempt["claim_token"],
-        attestation=running_attestation(supervisor, attempt),
-        runc_handle=handle,
-    )
+    attestation = running_attestation(supervisor, attempt)
+    controls = {
+        "memory.max": f"{attestation.memory_max_bytes}\n".encode("ascii"),
+        "cpu.max": f"{attestation.cpu_quota} {attestation.cpu_period}\n".encode("ascii"),
+        "pids.max": f"{attestation.pids_max}\n".encode("ascii"),
+    }
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: controls,
+        )
+        return supervisor._sandbox_execution_record_running(
+            attempt["id"],
+            attempt["claim_token"],
+            attestation=attestation,
+            runc_handle=handle,
+        )
 
 
 def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
@@ -2425,7 +2650,9 @@ def test_private_runtime_path_binding_is_required_and_write_once(repo: Path) -> 
     assert supervisor.verify_event_chain()["ok"] is True
 
 
-def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Path) -> None:
+def test_running_transition_requires_intact_attestation_bound_to_launch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
@@ -2462,6 +2689,15 @@ def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Pa
     assert mismatched_launch.value.code == "sandbox_runtime_attestation_invalid"
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
 
+    monkeypatch.setattr(
+        sandbox_attestation_module,
+        "read_cgroup_resource_controls",
+        lambda _path: {
+            "memory.max": f"{receipt.memory_max_bytes}\n".encode("ascii"),
+            "cpu.max": f"{receipt.cpu_quota} {receipt.cpu_period}\n".encode("ascii"),
+            "pids.max": f"{receipt.pids_max}\n".encode("ascii"),
+        },
+    )
     running = supervisor._sandbox_execution_record_running(
         attempt["id"],
         attempt["claim_token"],

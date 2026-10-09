@@ -2,9 +2,10 @@
 
 Launch and exit records are bound to the pinned-runc process handle and its
 wait receipt. The public OCI-init gate can be released only after the exact
-registered handle is durably recorded as running, but this module does not
-orchestrate a worker lifecycle, authenticate observation provenance, or
-establish a sandbox. A cleanup report is not accepted as cleanup verification.
+registered handle and the exact object issued by the process-local runtime collector are
+durably recorded as running, but this module does not orchestrate a worker
+lifecycle or establish a sandbox. A cleanup report is not accepted as cleanup
+verification.
 The existing reaper and runtime teardown stay fenced until a separate trusted
 verifier advances the journal to ``cleanup_verified``.
 """
@@ -40,7 +41,9 @@ from .oci_worker import (
 )
 from .sandbox_attestation import (
     RunningRuntimeAttestation,
+    running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
+    verify_running_runtime_resource_controls,
 )
 from .sandbox_workspace import (
     _MAX_DURABLE_MANIFEST_BYTES,
@@ -110,7 +113,7 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     argv = list(target.argv)
     argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
     return {
-        "version": 3,
+        "version": 4,
         "reservation": {
             "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
             **{
@@ -183,6 +186,12 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
                 "inode": target.workspace_inode,
             },
             "pid_file_path": target.pid_file_path,
+            "resource_limits": {
+                "memory_max_bytes": target.memory_limit_bytes,
+                "cpu_quota": target.cpu_quota,
+                "cpu_period": target.cpu_period,
+                "pids_max": target.pids_limit,
+            },
         },
     }
 
@@ -239,7 +248,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
             return False
         plan_version = plan.get("version")
-        if type(plan_version) is not int or plan_version not in {1, 2, 3}:
+        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4}:
             return False
         reservation = plan.get("reservation")
         expected_reservation = {
@@ -272,7 +281,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
                 "state_root_ino",
             )
         }
-        if plan_version in {2, 3}:
+        if plan_version in {2, 3, 4}:
             if row["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
                 return False
             if row["bundle_digest"] != _sandbox_reservation_bundle_digest(row):
@@ -303,6 +312,19 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         pid_file_path = launch.get("pid_file_path")
         snapshot = rootfs.get("snapshot")
         if not isinstance(pid_file_path, str) or not isinstance(snapshot, dict):
+            return False
+        resource_limits = launch.get("resource_limits")
+        if plan_version >= 4 and (
+            not isinstance(resource_limits, dict)
+            or set(resource_limits)
+            != {
+                "memory_max_bytes",
+                "cpu_quota",
+                "cpu_period",
+                "pids_max",
+            }
+            or any(type(value) is not int or value <= 0 for value in resource_limits.values())
+        ):
             return False
         argv_shape_matches = (
             isinstance(argv, list)
@@ -1735,6 +1757,15 @@ class SandboxExecutionJournalMixin:
             or Path(launch_target.pid_file_path).parent != Path(durable_execution["state_path"])
             or launch_target.config_sha256 is None
             or _DIGEST.fullmatch(launch_target.config_sha256) is None
+            or any(
+                type(value) is not int or value <= 0
+                for value in (
+                    launch_target.memory_limit_bytes,
+                    launch_target.cpu_quota,
+                    launch_target.cpu_period,
+                    launch_target.pids_limit,
+                )
+            )
             or type(launch_target.rootfs_device) is not int
             or type(launch_target.rootfs_inode) is not int
             or type(launch_target.rootfs_snapshot_device) is not int
@@ -1879,10 +1910,30 @@ class SandboxExecutionJournalMixin:
                 "sandbox_execution_launch_plan_required",
                 "running transition requires a durable trusted launch-plan binding",
             )
-        if not running_attestation_is_self_consistent(attestation):
+        launch_plan = json.loads(row["launch_plan_json"])
+        if launch_plan.get("version") != 4:
+            raise SupervisorError(
+                "sandbox_execution_launch_plan_required",
+                "running transition requires a launch plan with exact cgroup resource limits",
+            )
+        if not running_attestation_is_self_consistent(
+            attestation
+        ) or not running_attestation_has_collector_provenance(attestation):
             raise SupervisorError(
                 "sandbox_runtime_attestation_invalid",
-                "running transition requires a self-consistent typed receipt",
+                "running transition requires the exact self-consistent collector-issued receipt",
+            )
+        expected_resource_limits = launch_plan["launch"]["resource_limits"]
+        attested_resource_limits = {
+            "memory_max_bytes": attestation.memory_max_bytes,
+            "cpu_quota": attestation.cpu_quota,
+            "cpu_period": attestation.cpu_period,
+            "pids_max": attestation.pids_max,
+        }
+        if attested_resource_limits != expected_resource_limits:
+            raise SupervisorError(
+                "sandbox_runtime_attestation_stale",
+                "cgroup resource readback does not match the durable OCI launch policy",
             )
         expected = {
             "container_id": row["container_id"],
@@ -1927,6 +1978,9 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_launch_handle_required",
                     "running transition requires the exact locked launch handle",
                 )
+            # Revalidate live limits under the release lock before the durable
+            # running transition and one-shot permit issue.
+            verify_running_runtime_resource_controls(attestation)
             updated = self._sandbox_execution_transition(
                 attempt_id,
                 claim_token,
@@ -1937,8 +1991,6 @@ class SandboxExecutionJournalMixin:
                 event_payload={"attestation": attestation.audit_payload()},
                 credential=credential,
             )
-            # The same lock covers the durable transition and one-shot permit
-            # issue. A stop/quarantine cannot commit between these operations.
             _authorize_runc_launch_gate_release_locked(
                 locked_handle, attempt_id, claim_token, row["execution_id"]
             )

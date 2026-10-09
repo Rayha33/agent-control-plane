@@ -14,6 +14,7 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
     collect_running_runtime_attestation,
     read_private_runc_pid_file,
+    running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
 )
@@ -84,6 +85,15 @@ def _valid_observations() -> dict:
         "expected_scope_unit": "acp-container.scope",
         "expected_scope_invocation_id": "2" * 32,
         "expected_cgroup_path": _SCOPE_CGROUP,
+        "resource_control_files": {
+            "memory.max": b"1073741824\n",
+            "cpu.max": b"100000 100000\n",
+            "pids.max": b"256\n",
+        },
+        "expected_memory_max_bytes": 1_073_741_824,
+        "expected_cpu_quota": 100_000,
+        "expected_cpu_period": 100_000,
+        "expected_pids_max": 256,
     }
 
 
@@ -117,6 +127,10 @@ def test_attestation_binds_runtime_state_pid_start_identities_and_cgroups() -> N
     assert receipt.attempt_slice_invocation_id == "3" * 32
     assert receipt.attempt_slice_control_group == _ATTEMPT_SLICE_CGROUP
     assert receipt.cgroup_path == _SCOPE_CGROUP
+    assert receipt.memory_max_bytes == 1_073_741_824
+    assert receipt.cpu_quota == 100_000
+    assert receipt.cpu_period == 100_000
+    assert receipt.pids_max == 256
     assert len(receipt.runc_state_sha256) == 64
     assert len(receipt.evidence_sha256) == 64
     assert receipt.audit_payload()["init_identity"] == "linux:303:1303"
@@ -246,6 +260,11 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
         return b"0::" + cgroup + b"\n" if parts[-1] == "cgroup" else before_or_after_stat
 
     monkeypatch.setattr(sandbox_attestation, "_read_proc_file", read_proc)
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "read_cgroup_resource_controls",
+        lambda _path, **_kwargs: observations["resource_control_files"],
+    )
     receipt = collect_running_runtime_attestation(
         runc_state=observations["runc_state"],
         pid_file_path=pid_file,
@@ -266,10 +285,130 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
         expected_scope_unit=observations["expected_scope_unit"],
         expected_scope_invocation_id=observations["expected_scope_invocation_id"],
         expected_cgroup_path=observations["expected_cgroup_path"],
+        expected_memory_max_bytes=observations["expected_memory_max_bytes"],
+        expected_cpu_quota=observations["expected_cpu_quota"],
+        expected_cpu_period=observations["expected_cpu_period"],
+        expected_pids_max=observations["expected_pids_max"],
     )
 
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
+    assert running_attestation_has_collector_provenance(receipt)
+
+
+def _write_cgroup_controls(
+    directory, *, memory=b"1073741824\n", cpu=b"100000 100000\n", pids=b"256\n"
+):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "memory.max").write_bytes(memory)
+    (directory / "cpu.max").write_bytes(cpu)
+    (directory / "pids.max").write_bytes(pids)
+
+
+def test_cgroup_resource_reader_uses_exact_no_follow_cgroup_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    cgroup_root = tmp_path / "cgroup"
+    scope = cgroup_root / _SCOPE_CGROUP.lstrip("/")
+    _write_cgroup_controls(scope)
+
+    assert (
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP, cgroup_root=cgroup_root)
+        == _valid_observations()["resource_control_files"]
+    )
+
+
+def test_cgroup_resource_reader_rejects_symlinked_scope_component(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    cgroup_root = tmp_path / "cgroup"
+    parts = _SCOPE_CGROUP.strip("/").split("/")
+    parent = cgroup_root.joinpath(*parts[:-1])
+    parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    _write_cgroup_controls(outside)
+    (parent / parts[-1]).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SupervisorError, match="could not be read safely"):
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP, cgroup_root=cgroup_root)
+
+
+def test_cgroup_resource_reader_rejects_symlinked_control_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    cgroup_root = tmp_path / "cgroup"
+    scope = cgroup_root / _SCOPE_CGROUP.lstrip("/")
+    scope.mkdir(parents=True)
+    external = tmp_path / "memory-control"
+    external.write_bytes(b"1073741824\n")
+    (scope / "memory.max").symlink_to(external)
+    (scope / "cpu.max").write_bytes(b"100000 100000\n")
+    (scope / "pids.max").write_bytes(b"256\n")
+
+    with pytest.raises(SupervisorError, match="could not be read safely"):
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP, cgroup_root=cgroup_root)
+
+
+@pytest.mark.parametrize(
+    ("filesystem", "accepted"),
+    [(b"cgroup2", True), (b"cgroup", False)],
+)
+def test_cgroup_root_mount_must_be_cgroup_v2(
+    monkeypatch: pytest.MonkeyPatch, filesystem: bytes, accepted: bool
+) -> None:
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "_read_proc_file",
+        lambda _path: b"36 25 0:32 / /sys/fs/cgroup rw - " + filesystem + b" cgroup rw\n",
+    )
+
+    if accepted:
+        sandbox_attestation._require_cgroup2_mount("/sys/fs/cgroup")
+    else:
+        with pytest.raises(SupervisorError, match="not mounted as cgroup v2"):
+            sandbox_attestation._require_cgroup2_mount("/sys/fs/cgroup")
+
+
+def test_default_cgroup_reader_rejects_non_v2_mount_before_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
+    opened: list[str] = []
+    real_open = sandbox_attestation.os.open
+
+    def record_open(path, *args, **kwargs):
+        opened.append(os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "_read_proc_file",
+        lambda _path: b"36 25 0:32 / /sys/fs/cgroup rw - cgroup cgroup rw\n",
+    )
+    monkeypatch.setattr(sandbox_attestation.os, "open", record_open)
+
+    with pytest.raises(SupervisorError, match="not mounted as cgroup v2"):
+        sandbox_attestation.read_cgroup_resource_controls(_SCOPE_CGROUP)
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("memory.max", b"1073741825\n"),
+        ("cpu.max", b"100000 100001\n"),
+        ("pids.max", b"257\n"),
+    ],
+)
+def test_runtime_attestation_rejects_cgroup_control_mismatch(name: str, value: bytes) -> None:
+    observations = _valid_observations()
+    observations["resource_control_files"][name] = value
+
+    with pytest.raises(SupervisorError, match="exact OCI launch limit"):
+        validate_running_runtime_attestation(**observations)
 
 
 def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:
@@ -280,6 +419,7 @@ def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:
     forged = replace(forged, evidence_sha256=recomputed)
 
     assert running_attestation_is_self_consistent(forged)
+    assert not running_attestation_has_collector_provenance(forged)
 
 
 @pytest.mark.parametrize(

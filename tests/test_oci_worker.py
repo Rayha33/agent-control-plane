@@ -998,6 +998,7 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     workspace_mount = next(
         mount for mount in config["mounts"] if mount["destination"] == "/workspace"
     )
+    resources = config["linux"]["resources"]
 
     assert bound.argv[2] == "/proc/self/fd/66"
     assert bound.argv[6] == "/proc/self/fd/64"
@@ -1005,6 +1006,10 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     assert workspace_mount["source"] == "/dev/shm/acp-acp-worker-123-workspace"
     assert target.state_path == str(state_root)
     assert target.workspace_path == str(workspace.root)
+    assert target.memory_limit_bytes == resources["memory"]["limit"]
+    assert target.cpu_quota == resources["cpu"]["quota"]
+    assert target.cpu_period == resources["cpu"]["period"]
+    assert target.pids_limit == resources["pids"]["limit"]
     assert bound.config_sha256 == hashlib.sha256(config_json).hexdigest()
     assert config_json != binding.config_json
 
