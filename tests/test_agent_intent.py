@@ -424,7 +424,7 @@ def test_active_intent_list_reports_its_attempt_limit(
 
 
 def test_intent_schema_migration_is_versioned_and_installs_immutability_guards() -> None:
-    assert SCHEMA_VERSION == 25
+    assert SCHEMA_VERSION == 26
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE attempts(id TEXT PRIMARY KEY)")
 
@@ -461,7 +461,7 @@ def test_latest_intent_revision_index_uses_attempt_and_revision_order() -> None:
     connection.close()
 
 
-def test_schema_22_control_database_upgrades_to_intent_schema_25(repo: Path) -> None:
+def test_schema_22_control_database_upgrades_to_schema_26(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     with supervisor.connect() as connection:
         for trigger in (
@@ -477,7 +477,7 @@ def test_schema_22_control_database_upgrades_to_intent_schema_25(repo: Path) -> 
     upgraded = GitSupervisor(repo)
     assert upgraded.schema_version_on_open == 22
     read_only = GitSupervisor(repo, read_only=True)
-    assert read_only.schema_version_on_open == 25
+    assert read_only.schema_version_on_open == 26
     with read_only.connect() as connection:
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_intent_revisions'"

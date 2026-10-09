@@ -298,7 +298,7 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
-    assert durable["launch_plan"]["version"] == 2
+    assert durable["launch_plan"]["version"] == 3
     assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
     assert journal_module._sandbox_launch_plan_binding_is_self_consistent(durable)
@@ -306,8 +306,8 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     assert event_plan == durable["launch_plan"]
     assert supervisor.verify_event_chain()["ok"] is True
 
-    # Existing v1 launch plans did not claim the new reservation-digest
-    # semantics; keep their read-side verification compatible.
+    # Earlier plan versions did not bind an attempt-slice identity and cannot
+    # authorize the stronger current launch/running evidence.
     legacy_plan = json.loads(canonical_json(durable["launch_plan"]))
     legacy_plan["version"] = 1
     legacy_plan["reservation"].pop("bundle_digest_semantics")
@@ -317,7 +317,7 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     legacy_row["launch_plan_digest"] = hashlib.sha256(
         legacy_row["launch_plan_json"].encode("utf-8")
     ).hexdigest()
-    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_row)
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_row)
     legacy_plan["version"] = True
     legacy_row["launch_plan_json"] = canonical_json(legacy_plan)
     legacy_row["launch_plan_digest"] = hashlib.sha256(
@@ -509,6 +509,10 @@ def test_generic_transition_cannot_forge_launch_plan_binding(repo: Path) -> None
     assert row["phase"] == "reserved"
     assert row["launch_plan_binding_version"] == 0
     assert row["launch_plan_json"] == ""
+    assert row["wrapper_cgroup_path"] == ""
+    assert row["attempt_slice_unit"] == ""
+    assert row["attempt_slice_invocation_id"] == ""
+    assert row["attempt_slice_cgroup_path"] == ""
 
 
 @pytest.mark.parametrize("mismatch", ["config", "argv"])
@@ -884,6 +888,10 @@ def record_launch(
         assert execution is not None
         runc_handle = _test_runc_handle(target=_test_runc_target(execution))
     attempt["_test_runc_handle"] = runc_handle
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None
+    slice_unit = oci_worker._oci_worker_systemd_slice(execution["container_id"])
+    slice_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/" + slice_unit
     return supervisor._sandbox_execution_record_launch(
         attempt["id"],
         attempt["claim_token"],
@@ -892,14 +900,26 @@ def record_launch(
         runc_handle=runc_handle,
         wrapper_unit="acp-worker.service",
         wrapper_invocation_id="1" * 32,
+        wrapper_cgroup_path=f"{slice_cgroup}/acp-worker.service",
+        attempt_slice_unit=slice_unit,
+        attempt_slice_invocation_id="3" * 32,
+        attempt_slice_cgroup_path=slice_cgroup,
         scope_unit="acp-container.scope",
         scope_invocation_id="2" * 32,
-        cgroup_path=("/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope"),
+        cgroup_path=f"{slice_cgroup}/acp-container.scope",
     )
 
 
 def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTarget) -> dict:
     plan = journal_module._sandbox_launch_plan_material(execution, target)
+    slice_unit = oci_worker._oci_worker_systemd_slice(target.container_id)
+    slice_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/" + slice_unit
+    plan["launch"]["systemd_ownership"] = {
+        "wrapper_control_group": f"{slice_cgroup}/acp-worker.service",
+        "attempt_slice_unit": slice_unit,
+        "attempt_slice_invocation_id": "3" * 32,
+        "attempt_slice_control_group": slice_cgroup,
+    }
     plan_json = canonical_json(plan)
     argv_digest = hashlib.sha256(canonical_json(list(target.argv)).encode("utf-8")).hexdigest()
     return {
@@ -909,9 +929,13 @@ def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTar
         "runc_client_identity": "linux:202:1202",
         "wrapper_unit": "acp-worker.service",
         "wrapper_invocation_id": "1" * 32,
+        "wrapper_cgroup_path": f"{slice_cgroup}/acp-worker.service",
+        "attempt_slice_unit": slice_unit,
+        "attempt_slice_invocation_id": "3" * 32,
+        "attempt_slice_cgroup_path": slice_cgroup,
         "scope_unit": "acp-container.scope",
         "scope_invocation_id": "2" * 32,
-        "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope",
+        "cgroup_path": f"{slice_cgroup}/acp-container.scope",
         "launch_plan_binding_version": 1,
         "launch_plan_json": plan_json,
         "launch_config_digest": target.config_sha256,
@@ -932,7 +956,8 @@ def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int 
     row = supervisor._sandbox_execution_get(attempt["id"])
     assert row is not None and row["phase"] == "launched"
     init_start = 1303
-    wrapper_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-worker.service"
+    wrapper_cgroup = row["wrapper_cgroup_path"]
+    slice_cgroup = row["attempt_slice_cgroup_path"]
     scope_cgroup = row["cgroup_path"]
 
     def stat(pid: int, start: int) -> bytes:
@@ -979,6 +1004,12 @@ def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int 
             f"Id={row['wrapper_unit']}\n"
             f"InvocationID={row['wrapper_invocation_id']}\n"
         ).encode("ascii"),
+        attempt_slice_properties=(
+            "ActiveState=active\n"
+            f"ControlGroup={slice_cgroup}\n"
+            f"Id={row['attempt_slice_unit']}\n"
+            f"InvocationID={row['attempt_slice_invocation_id']}\n"
+        ).encode("ascii"),
         scope_properties=(
             "ActiveState=active\n"
             f"ControlGroup={scope_cgroup}\n"
@@ -993,6 +1024,8 @@ def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int 
         expected_runc_client_identity=row["runc_client_identity"],
         expected_wrapper_unit=row["wrapper_unit"],
         expected_wrapper_invocation_id=row["wrapper_invocation_id"],
+        expected_attempt_slice_unit=row["attempt_slice_unit"],
+        expected_attempt_slice_invocation_id=row["attempt_slice_invocation_id"],
         expected_scope_unit=row["scope_unit"],
         expected_scope_invocation_id=row["scope_invocation_id"],
         expected_cgroup_path=scope_cgroup,
@@ -1038,7 +1071,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 25
+    assert SCHEMA_VERSION == 26
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -1369,7 +1402,8 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
             sqlite3.IntegrityError,
             match=(
                 "workspace_binding_required|private_paths_required|"
-                "sandbox_execution_launch_plan_required|phase_transition_invalid"
+                "sandbox_execution_launch_plan_required|attempt_slice_identity_required|"
+                "phase_transition_invalid"
             ),
         ),
     ):
@@ -2398,12 +2432,12 @@ def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Pa
         stale,
         evidence_sha256=hashlib.sha256(canonical_json(stale_payload).encode("utf-8")).hexdigest(),
     )
-    assert running_attestation_is_self_consistent(stale)
+    assert not running_attestation_is_self_consistent(stale)
     with pytest.raises(SupervisorError) as mismatched_launch:
         supervisor._sandbox_execution_record_running(
             attempt["id"], attempt["claim_token"], attestation=stale
         )
-    assert mismatched_launch.value.code == "sandbox_runtime_attestation_stale"
+    assert mismatched_launch.value.code == "sandbox_runtime_attestation_invalid"
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
 
     running = supervisor._sandbox_execution_record_running(

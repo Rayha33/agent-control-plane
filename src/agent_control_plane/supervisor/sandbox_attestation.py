@@ -20,12 +20,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .common import SupervisorError, canonical_json
+from .oci_worker import _oci_worker_systemd_slice
 
 _MAX_OBSERVATION_BYTES = 64 * 1024
 _MAX_PID_FILE_BYTES = 11
 _MAX_PID = (1 << 31) - 1
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
-_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope)\Z")
+_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope|slice)\Z")
 _LINUX_IDENTITY = re.compile(r"linux:([1-9][0-9]*):(0|[1-9][0-9]*)\Z")
 _PID_FILE = re.compile(rb"([1-9][0-9]{0,9})\n?\Z")
 _LIVE_PROCESS_STATES = frozenset({b"R", b"S", b"D", b"T", b"t", b"W", b"K", b"P", b"I"})
@@ -54,6 +55,9 @@ class RunningRuntimeAttestation:
     wrapper_unit: str
     wrapper_invocation_id: str
     wrapper_control_group: str
+    attempt_slice_unit: str
+    attempt_slice_invocation_id: str
+    attempt_slice_control_group: str
     scope_unit: str
     scope_invocation_id: str
     cgroup_path: str
@@ -75,6 +79,9 @@ class RunningRuntimeAttestation:
             "wrapper_unit": self.wrapper_unit,
             "wrapper_invocation_id": self.wrapper_invocation_id,
             "wrapper_control_group": self.wrapper_control_group,
+            "attempt_slice_unit": self.attempt_slice_unit,
+            "attempt_slice_invocation_id": self.attempt_slice_invocation_id,
+            "attempt_slice_control_group": self.attempt_slice_control_group,
             "scope_unit": self.scope_unit,
             "scope_invocation_id": self.scope_invocation_id,
             "cgroup_path": self.cgroup_path,
@@ -173,6 +180,7 @@ def collect_running_runtime_attestation(
     pid_file_path: str | Path,
     state_root: str | Path,
     wrapper_properties: bytes,
+    attempt_slice_properties: bytes,
     scope_properties: bytes,
     expected_container_id: str,
     expected_bundle_path: str,
@@ -182,6 +190,8 @@ def collect_running_runtime_attestation(
     expected_runc_client_identity: str,
     expected_wrapper_unit: str,
     expected_wrapper_invocation_id: str,
+    expected_attempt_slice_unit: str,
+    expected_attempt_slice_invocation_id: str,
     expected_scope_unit: str,
     expected_scope_invocation_id: str,
     expected_cgroup_path: str,
@@ -209,6 +219,7 @@ def collect_running_runtime_attestation(
         pid_file=pid_file,
         process_snapshots=process_snapshots,
         wrapper_properties=wrapper_properties,
+        attempt_slice_properties=attempt_slice_properties,
         scope_properties=scope_properties,
         expected_container_id=expected_container_id,
         expected_bundle_path=expected_bundle_path,
@@ -218,6 +229,8 @@ def collect_running_runtime_attestation(
         expected_runc_client_identity=expected_runc_client_identity,
         expected_wrapper_unit=expected_wrapper_unit,
         expected_wrapper_invocation_id=expected_wrapper_invocation_id,
+        expected_attempt_slice_unit=expected_attempt_slice_unit,
+        expected_attempt_slice_invocation_id=expected_attempt_slice_invocation_id,
         expected_scope_unit=expected_scope_unit,
         expected_scope_invocation_id=expected_scope_invocation_id,
         expected_cgroup_path=expected_cgroup_path,
@@ -279,6 +292,7 @@ def validate_running_runtime_attestation(
     pid_file: bytes,
     process_snapshots: dict[int, ProcessSnapshot],
     wrapper_properties: bytes,
+    attempt_slice_properties: bytes,
     scope_properties: bytes,
     expected_container_id: str,
     expected_bundle_path: str,
@@ -288,6 +302,8 @@ def validate_running_runtime_attestation(
     expected_runc_client_identity: str,
     expected_wrapper_unit: str,
     expected_wrapper_invocation_id: str,
+    expected_attempt_slice_unit: str,
+    expected_attempt_slice_invocation_id: str,
     expected_scope_unit: str,
     expected_scope_invocation_id: str,
     expected_cgroup_path: str,
@@ -318,8 +334,12 @@ def validate_running_runtime_attestation(
         expected_runc_client_identity, runc_client_pid, "runc client identity"
     )
     wrapper_unit = _unit(expected_wrapper_unit, ".service", "wrapper unit")
+    attempt_slice_unit = _unit(expected_attempt_slice_unit, ".slice", "attempt slice unit")
     scope_unit = _unit(expected_scope_unit, ".scope", "scope unit")
     wrapper_invocation_id = _invocation(expected_wrapper_invocation_id, "wrapper invocation ID")
+    attempt_slice_invocation_id = _invocation(
+        expected_attempt_slice_invocation_id, "attempt slice invocation ID"
+    )
     scope_invocation_id = _invocation(expected_scope_invocation_id, "scope invocation ID")
     expected_scope = _cgroup_path(expected_cgroup_path, "expected scope cgroup")
     if PurePosixPath(expected_scope).name != scope_unit:
@@ -336,20 +356,32 @@ def validate_running_runtime_attestation(
         raise _invalid("runc state does not match the expected running container")
 
     wrapper = _parse_unit_properties(wrapper_properties)
+    attempt_slice = _parse_unit_properties(attempt_slice_properties)
     scope = _parse_unit_properties(scope_properties)
     if (
         wrapper["ActiveState"] != "active"
         or wrapper["Id"] != wrapper_unit
         or wrapper["InvocationID"] != wrapper_invocation_id
+        or attempt_slice["ActiveState"] != "active"
+        or attempt_slice["Id"] != attempt_slice_unit
+        or attempt_slice["InvocationID"] != attempt_slice_invocation_id
         or scope["ActiveState"] != "active"
         or scope["Id"] != scope_unit
         or scope["InvocationID"] != scope_invocation_id
     ):
         raise _invalid("systemd unit state or invocation identity changed")
     wrapper_cgroup = _cgroup_path(wrapper["ControlGroup"], "wrapper cgroup")
+    attempt_slice_cgroup = _cgroup_path(attempt_slice["ControlGroup"], "attempt slice cgroup")
     scope_cgroup = _cgroup_path(scope["ControlGroup"], "scope cgroup")
-    if wrapper_cgroup == scope_cgroup or scope_cgroup != expected_scope:
-        raise _invalid("systemd cgroup paths do not match the expected execution")
+    if (
+        wrapper_cgroup == scope_cgroup
+        or scope_cgroup != expected_scope
+        or attempt_slice_unit != _oci_worker_systemd_slice(container_id)
+        or PurePosixPath(attempt_slice_cgroup).name != attempt_slice_unit
+        or PurePosixPath(wrapper_cgroup).parent.as_posix() != attempt_slice_cgroup
+        or PurePosixPath(scope_cgroup).parent.as_posix() != attempt_slice_cgroup
+    ):
+        raise _invalid("wrapper and scope are not children of the exact attempt slice")
 
     expected_pids = {monitor_pid, runc_client_pid, expected_init_pid}
     if set(process_snapshots) != expected_pids:
@@ -386,6 +418,9 @@ def validate_running_runtime_attestation(
         "wrapper_unit": wrapper_unit,
         "wrapper_invocation_id": wrapper_invocation_id,
         "wrapper_control_group": wrapper_cgroup,
+        "attempt_slice_unit": attempt_slice_unit,
+        "attempt_slice_invocation_id": attempt_slice_invocation_id,
+        "attempt_slice_control_group": attempt_slice_cgroup,
         "scope_unit": scope_unit,
         "scope_invocation_id": scope_invocation_id,
         "cgroup_path": scope_cgroup,
@@ -411,7 +446,13 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
             or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", value.container_id)
             or len({value.monitor_pid, value.runc_client_pid, value.init_pid}) != 3
             or value.wrapper_control_group == value.cgroup_path
+            or value.attempt_slice_unit != _oci_worker_systemd_slice(value.container_id)
             or PurePosixPath(value.cgroup_path).name != value.scope_unit
+            or PurePosixPath(value.attempt_slice_control_group).name != value.attempt_slice_unit
+            or PurePosixPath(value.wrapper_control_group).parent.as_posix()
+            != value.attempt_slice_control_group
+            or PurePosixPath(value.cgroup_path).parent.as_posix()
+            != value.attempt_slice_control_group
         ):
             return False
         if (
@@ -428,10 +469,16 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
             or _cgroup_path(value.cgroup_path, "scope cgroup") != value.cgroup_path
             or _cgroup_path(value.wrapper_control_group, "wrapper cgroup")
             != value.wrapper_control_group
+            or _cgroup_path(value.attempt_slice_control_group, "attempt slice cgroup")
+            != value.attempt_slice_control_group
             or _unit(value.wrapper_unit, ".service", "wrapper unit") != value.wrapper_unit
+            or _unit(value.attempt_slice_unit, ".slice", "attempt slice unit")
+            != value.attempt_slice_unit
             or _unit(value.scope_unit, ".scope", "scope unit") != value.scope_unit
             or _invocation(value.wrapper_invocation_id, "wrapper invocation ID")
             != value.wrapper_invocation_id
+            or _invocation(value.attempt_slice_invocation_id, "attempt slice invocation ID")
+            != value.attempt_slice_invocation_id
             or _invocation(value.scope_invocation_id, "scope invocation ID")
             != value.scope_invocation_id
         ):

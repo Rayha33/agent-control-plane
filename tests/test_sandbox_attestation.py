@@ -9,6 +9,7 @@ import pytest
 
 from agent_control_plane.supervisor import sandbox_attestation
 from agent_control_plane.supervisor.common import SupervisorError, canonical_json
+from agent_control_plane.supervisor.oci_worker import _oci_worker_systemd_slice
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
     collect_running_runtime_attestation,
@@ -17,8 +18,12 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     validate_running_runtime_attestation,
 )
 
-_WRAPPER_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-worker.service"
-_SCOPE_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope"
+_ATTEMPT_SLICE_UNIT = _oci_worker_systemd_slice("acp-test-container")
+_ATTEMPT_SLICE_CGROUP = (
+    f"/user.slice/user-1000.slice/user@1000.service/app.slice/{_ATTEMPT_SLICE_UNIT}"
+)
+_WRAPPER_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/acp-worker.service"
+_SCOPE_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/acp-container.scope"
 
 
 def _proc_stat(pid: int, state: str, start: int, comm: str = "worker (gate)") -> bytes:
@@ -58,6 +63,11 @@ def _valid_observations() -> dict:
         "wrapper_properties": _properties(
             unit="acp-worker.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP
         ),
+        "attempt_slice_properties": _properties(
+            unit=_ATTEMPT_SLICE_UNIT,
+            invocation="3" * 32,
+            cgroup=_ATTEMPT_SLICE_CGROUP,
+        ),
         "scope_properties": _properties(
             unit="acp-container.scope", invocation="2" * 32, cgroup=_SCOPE_CGROUP
         ),
@@ -69,6 +79,8 @@ def _valid_observations() -> dict:
         "expected_runc_client_identity": "linux:202:1202",
         "expected_wrapper_unit": "acp-worker.service",
         "expected_wrapper_invocation_id": "1" * 32,
+        "expected_attempt_slice_unit": _ATTEMPT_SLICE_UNIT,
+        "expected_attempt_slice_invocation_id": "3" * 32,
         "expected_scope_unit": "acp-container.scope",
         "expected_scope_invocation_id": "2" * 32,
         "expected_cgroup_path": _SCOPE_CGROUP,
@@ -101,6 +113,9 @@ def test_attestation_binds_runtime_state_pid_start_identities_and_cgroups() -> N
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
     assert receipt.wrapper_control_group == _WRAPPER_CGROUP
+    assert receipt.attempt_slice_unit == _ATTEMPT_SLICE_UNIT
+    assert receipt.attempt_slice_invocation_id == "3" * 32
+    assert receipt.attempt_slice_control_group == _ATTEMPT_SLICE_CGROUP
     assert receipt.cgroup_path == _SCOPE_CGROUP
     assert len(receipt.runc_state_sha256) == 64
     assert len(receipt.evidence_sha256) == 64
@@ -236,6 +251,7 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
         pid_file_path=pid_file,
         state_root=state_root,
         wrapper_properties=observations["wrapper_properties"],
+        attempt_slice_properties=observations["attempt_slice_properties"],
         scope_properties=observations["scope_properties"],
         expected_container_id=observations["expected_container_id"],
         expected_bundle_path=observations["expected_bundle_path"],
@@ -245,6 +261,8 @@ def test_collector_reads_pid_and_proc_observations_itself(tmp_path, monkeypatch)
         expected_runc_client_identity=observations["expected_runc_client_identity"],
         expected_wrapper_unit=observations["expected_wrapper_unit"],
         expected_wrapper_invocation_id=observations["expected_wrapper_invocation_id"],
+        expected_attempt_slice_unit=observations["expected_attempt_slice_unit"],
+        expected_attempt_slice_invocation_id=observations["expected_attempt_slice_invocation_id"],
         expected_scope_unit=observations["expected_scope_unit"],
         expected_scope_invocation_id=observations["expected_scope_invocation_id"],
         expected_cgroup_path=observations["expected_cgroup_path"],
@@ -361,6 +379,36 @@ def test_attestation_rejects_process_cgroup_escape_and_non_live_pid() -> None:
     )
     with pytest.raises(SupervisorError, match="no longer live"):
         validate_running_runtime_attestation(**observations)
+
+
+def test_attestation_rejects_units_outside_the_exact_attempt_slice() -> None:
+    observations = _valid_observations()
+    other_scope_cgroup = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        "user-acp-unexpected.slice/acp-container.scope"
+    )
+    observations["scope_properties"] = _properties(
+        unit="acp-container.scope", invocation="2" * 32, cgroup=other_scope_cgroup
+    )
+    observations["expected_cgroup_path"] = other_scope_cgroup
+    observations["process_snapshots"][303] = replace(
+        observations["process_snapshots"][303],
+        cgroup=f"0::{other_scope_cgroup}\n".encode("ascii"),
+    )
+
+    with pytest.raises(SupervisorError, match="exact attempt slice"):
+        validate_running_runtime_attestation(**observations)
+
+
+def test_attestation_rejects_attempt_slice_invocation_reuse() -> None:
+    with pytest.raises(SupervisorError, match="invocation identity changed"):
+        _validate(
+            attempt_slice_properties=_properties(
+                unit=_ATTEMPT_SLICE_UNIT,
+                invocation="4" * 32,
+                cgroup=_ATTEMPT_SLICE_CGROUP,
+            )
+        )
 
 
 def test_attestation_rejects_duplicate_unified_cgroup_hierarchy() -> None:

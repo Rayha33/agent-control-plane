@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1641,6 +1641,116 @@ def _add_sandbox_bundle_digest_semantics(connection: sqlite3.Connection) -> None
     )
 
 
+def _add_sandbox_attempt_slice_identity(connection: sqlite3.Connection) -> None:
+    """Persist the exact per-attempt slice that owns the wrapper and runc scope."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before attempt-slice identity migration"
+        )
+    additions = (
+        ("wrapper_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+        ("attempt_slice_unit", "TEXT NOT NULL DEFAULT ''"),
+        ("attempt_slice_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("attempt_slice_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.wrapper_cgroup_path != ''
+          OR NEW.attempt_slice_unit != ''
+          OR NEW.attempt_slice_invocation_id != ''
+          OR NEW.attempt_slice_cgroup_path != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_must_start_without_slice_identity');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_immutable
+        BEFORE UPDATE ON sandbox_executions
+        WHEN (OLD.wrapper_cgroup_path != ''
+              AND NEW.wrapper_cgroup_path IS NOT OLD.wrapper_cgroup_path)
+          OR (OLD.attempt_slice_unit != ''
+              AND NEW.attempt_slice_unit IS NOT OLD.attempt_slice_unit)
+          OR (OLD.attempt_slice_invocation_id != ''
+              AND NEW.attempt_slice_invocation_id IS NOT OLD.attempt_slice_invocation_id)
+          OR (OLD.attempt_slice_cgroup_path != ''
+              AND NEW.attempt_slice_cgroup_path IS NOT OLD.attempt_slice_cgroup_path)
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_attempt_slice_identity_immutable');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_phase_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_phase_guard
+        BEFORE UPDATE ON sandbox_executions
+        WHEN OLD.phase = NEW.phase AND (
+          OLD.wrapper_cgroup_path IS NOT NEW.wrapper_cgroup_path
+          OR OLD.attempt_slice_unit IS NOT NEW.attempt_slice_unit
+          OR OLD.attempt_slice_invocation_id IS NOT NEW.attempt_slice_invocation_id
+          OR OLD.attempt_slice_cgroup_path IS NOT NEW.attempt_slice_cgroup_path
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_slice_identity_requires_phase_transition');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_attempt_slice_transition_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_attempt_slice_transition_guard
+        BEFORE UPDATE ON sandbox_executions
+        WHEN (
+          OLD.wrapper_cgroup_path = ''
+          AND OLD.attempt_slice_unit = ''
+          AND OLD.attempt_slice_invocation_id = ''
+          AND OLD.attempt_slice_cgroup_path = ''
+          AND (
+            NEW.wrapper_cgroup_path != ''
+            OR NEW.attempt_slice_unit != ''
+            OR NEW.attempt_slice_invocation_id != ''
+            OR NEW.attempt_slice_cgroup_path != ''
+          )
+          AND NOT (OLD.phase = 'reserved' AND NEW.phase = 'launched')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_slice_identity_requires_launch');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_launch_requires_attempt_slice")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_attempt_slice
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            NEW.wrapper_cgroup_path = ''
+            OR NEW.attempt_slice_unit = ''
+            OR substr(NEW.attempt_slice_unit, -6) != '.slice'
+            OR length(NEW.attempt_slice_invocation_id) != 32
+            OR NEW.attempt_slice_invocation_id GLOB '*[^0-9a-f]*'
+            OR NEW.attempt_slice_cgroup_path = ''
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_attempt_slice_identity_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1666,6 +1776,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (23, _add_agent_intent_revisions),
     (24, _add_agent_intent_attempt_latest_index),
     (25, _add_sandbox_bundle_digest_semantics),
+    (26, _add_sandbox_attempt_slice_identity),
 )
 
 

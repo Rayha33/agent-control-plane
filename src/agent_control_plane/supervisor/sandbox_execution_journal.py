@@ -26,6 +26,7 @@ from .common import CLEANUP_FENCE_EPOCH, SupervisorError, canonical_json, utc_no
 from .oci_worker import (
     RuncLaunchHandle,
     _authorize_runc_launch_gate_release_locked,
+    _oci_worker_systemd_slice,
     _revoke_runc_launch_gate_release_locked,
     _runc_client_wait_receipt_is_self_consistent,
     _runc_launch_gate_lock_for_execution,
@@ -58,7 +59,7 @@ from .store import (
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_SYSTEMD_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope)\Z")
+_SYSTEMD_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope|slice)\Z")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _LEGACY_BUNDLE_DIGEST_SEMANTICS = "legacy-caller-asserted-v0"
 _BUNDLE_DIGEST_SEMANTICS = "oci-reservation-v1"
@@ -83,6 +84,10 @@ _TRANSITION_FIELDS = {
             "runc_client_identity",
             "wrapper_unit",
             "wrapper_invocation_id",
+            "wrapper_cgroup_path",
+            "attempt_slice_unit",
+            "attempt_slice_invocation_id",
+            "attempt_slice_cgroup_path",
             "scope_unit",
             "scope_invocation_id",
             "cgroup_path",
@@ -105,7 +110,7 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     argv = list(target.argv)
     argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
     return {
-        "version": 2,
+        "version": 3,
         "reservation": {
             "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
             **{
@@ -234,7 +239,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
             return False
         plan_version = plan.get("version")
-        if type(plan_version) is not int or plan_version not in {1, 2}:
+        if type(plan_version) is not int or plan_version not in {1, 2, 3}:
             return False
         reservation = plan.get("reservation")
         expected_reservation = {
@@ -267,7 +272,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
                 "state_root_ino",
             )
         }
-        if plan_version == 2:
+        if plan_version in {2, 3}:
             if row["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
                 return False
             if row["bundle_digest"] != _sandbox_reservation_bundle_digest(row):
@@ -277,6 +282,16 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
             return False
         launch = plan.get("launch")
         if reservation != expected_reservation or not isinstance(launch, dict):
+            return False
+        if plan_version < 3:
+            return False
+        systemd_ownership = launch.get("systemd_ownership")
+        if systemd_ownership != {
+            "wrapper_control_group": row["wrapper_cgroup_path"],
+            "attempt_slice_unit": row["attempt_slice_unit"],
+            "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
+            "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
+        }:
             return False
         argv = launch.get("argv")
         bundle = launch.get("bundle")
@@ -1577,6 +1592,10 @@ class SandboxExecutionJournalMixin:
         runc_handle: RuncLaunchHandle,
         wrapper_unit: str,
         wrapper_invocation_id: str,
+        wrapper_cgroup_path: str,
+        attempt_slice_unit: str,
+        attempt_slice_invocation_id: str,
+        attempt_slice_cgroup_path: str,
         scope_unit: str,
         scope_invocation_id: str,
         cgroup_path: str,
@@ -1605,6 +1624,12 @@ class SandboxExecutionJournalMixin:
         wrapper_invocation_id = self._sandbox_invocation_id(
             wrapper_invocation_id, "wrapper_invocation_id"
         )
+        attempt_slice_unit = self._sandbox_systemd_unit(
+            attempt_slice_unit, "attempt_slice_unit", ".slice"
+        )
+        attempt_slice_invocation_id = self._sandbox_invocation_id(
+            attempt_slice_invocation_id, "attempt_slice_invocation_id"
+        )
         scope_unit = self._sandbox_systemd_unit(scope_unit, "scope_unit", ".scope")
         scope_invocation_id = self._sandbox_invocation_id(
             scope_invocation_id, "scope_invocation_id"
@@ -1613,16 +1638,34 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_invalid", "monitor, runc client, and scope identities conflict"
             )
+        wrapper_cgroup_path = self._sandbox_text(
+            wrapper_cgroup_path, "wrapper_cgroup_path", limit=4096
+        )
+        attempt_slice_cgroup_path = self._sandbox_text(
+            attempt_slice_cgroup_path, "attempt_slice_cgroup_path", limit=4096
+        )
         cgroup_path = self._sandbox_text(cgroup_path, "cgroup_path", limit=4096)
+        wrapper_cgroup = PurePosixPath(wrapper_cgroup_path)
+        attempt_slice_cgroup = PurePosixPath(attempt_slice_cgroup_path)
         cgroup = PurePosixPath(cgroup_path)
+        cgroup_paths = (wrapper_cgroup, attempt_slice_cgroup, cgroup)
         if (
-            not cgroup.is_absolute()
-            or cgroup.as_posix() != cgroup_path
-            or any(part in {".", ".."} for part in cgroup.parts)
+            any(not path.is_absolute() or path.as_posix() != str(path) for path in cgroup_paths)
+            or any(part in {".", ".."} for path in cgroup_paths for part in path.parts)
+            or wrapper_cgroup.name != wrapper_unit
+            or attempt_slice_cgroup.name != attempt_slice_unit
+            or wrapper_cgroup.parent != attempt_slice_cgroup
+            or cgroup.parent != attempt_slice_cgroup
             or cgroup.name != scope_unit
         ):
             raise SupervisorError(
-                "sandbox_execution_invalid", "cgroup path must name the exact recorded scope"
+                "sandbox_execution_invalid",
+                "wrapper and scope cgroups must be direct children of the exact attempt slice",
+            )
+        if attempt_slice_unit != _oci_worker_systemd_slice(launch_target.container_id):
+            raise SupervisorError(
+                "sandbox_execution_launch_target_mismatch",
+                "attempt slice does not match the pinned runc container identity",
             )
         with self.connect() as connection:
             durable_execution = connection.execute(
@@ -1708,6 +1751,12 @@ class SandboxExecutionJournalMixin:
                 "pinned-runc launch target does not match the exact durable reservation",
             )
         launch_plan = _sandbox_launch_plan_material(durable_execution, launch_target)
+        launch_plan["launch"]["systemd_ownership"] = {
+            "wrapper_control_group": wrapper_cgroup_path,
+            "attempt_slice_unit": attempt_slice_unit,
+            "attempt_slice_invocation_id": attempt_slice_invocation_id,
+            "attempt_slice_control_group": attempt_slice_cgroup_path,
+        }
         launch_plan_json = canonical_json(launch_plan)
         launch_config_digest = launch_target.config_sha256
         launch_argv_digest = hashlib.sha256(
@@ -1724,6 +1773,10 @@ class SandboxExecutionJournalMixin:
             "runc_client_identity": runc_client_identity,
             "wrapper_unit": wrapper_unit,
             "wrapper_invocation_id": wrapper_invocation_id,
+            "wrapper_cgroup_path": wrapper_cgroup_path,
+            "attempt_slice_unit": attempt_slice_unit,
+            "attempt_slice_invocation_id": attempt_slice_invocation_id,
+            "attempt_slice_cgroup_path": attempt_slice_cgroup_path,
             "scope_unit": scope_unit,
             "scope_invocation_id": scope_invocation_id,
             "cgroup_path": cgroup_path,
@@ -1840,6 +1893,10 @@ class SandboxExecutionJournalMixin:
             "runc_client_identity": row["runc_client_identity"],
             "wrapper_unit": row["wrapper_unit"],
             "wrapper_invocation_id": row["wrapper_invocation_id"],
+            "wrapper_control_group": row["wrapper_cgroup_path"],
+            "attempt_slice_unit": row["attempt_slice_unit"],
+            "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
+            "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
             "scope_unit": row["scope_unit"],
             "scope_invocation_id": row["scope_invocation_id"],
             "cgroup_path": row["cgroup_path"],
