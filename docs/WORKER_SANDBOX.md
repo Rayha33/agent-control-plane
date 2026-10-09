@@ -1427,6 +1427,36 @@ positive state-root, PID-identity, and systemd-scope absence checks. This is
 cleanup evidence for that disposable fixture only, not supervisor-managed
 crash/cancel recovery or release of an ACP execution fence.
 
+**2026-10-09 wrapper and parent-slice follow-up (architecture evidence only).**
+The exact-source opt-in test was rerun under a transient user service with
+`Delegate=yes`, `KillMode=control-group`, and a 90-second runtime bound. It
+passed once on the NAS using source snapshot `f9de9b16b06cc776565192f71a7117b234daf883`
+(test SHA-256 `9a54375ea682aea68ee8ce9630da0b82c264dca89335edbc0abc5fb623487c95`)
+and the committed `uv.lock` (`uv --frozen`). Host: Linux 6.18.15 x86_64,
+systemd 252, uid 1000, rootless runc 1.3.5, BusyBox 1.35.0. The service got a
+sanitized environment and no provider credentials. The emitted evidence again
+reported `worker_executor_integrated=false`; this remains the test-only,
+unjournaled direct-runc gate, not a registered worker lifecycle.
+
+The new evidence also sharpens the containment gap: the runc scope was reported
+under `user@1000.service/user.slice/`, whereas a separate ordinary transient
+user service was under `user@1000.service/app.slice/`. `Delegate=yes` on that
+wrapper therefore does not make its `KillMode=control-group` cover the
+systemd-created runc scope. This matches runc's documented
+`linux.cgroupsPath=[slice]:[prefix]:[name]` placement contract and the current
+compiler's fixed `user.slice:acp:<container-id>` value
+([runc systemd cgroup documentation](https://github.com/opencontainers/runc/blob/main/docs/systemd.md)).
+
+A bounded no-model `sleep` probe then placed both a transient service and a
+transient scope beneath one unique `user-acp-…slice`; their reported cgroup
+paths were descendants of that slice. Stopping the parent slice transitioned
+both units to inactive. This validates a possible per-attempt containment
+mechanism, not process-absence proof, OCI cleanup, crash recovery, or ACP
+integration. The executor still needs to bind a unique parent slice to the
+attempt, put its supervisor and runc scope there, and provide restart-safe
+recovery that proves all descendants and runtime state absent before writing
+`cleanup_verified`. Keep OCI fail-closed and task #2370 open.
+
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
 argv for a future executor. It encodes a readonly root, a single non-recursive
