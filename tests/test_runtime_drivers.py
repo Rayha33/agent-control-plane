@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3003,6 +3006,125 @@ def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
     assert "--bounding-set=-all" in script
     assert script.index("remount,bind,ro") < script.index("chroot")
     assert script.index("chroot") < script.index("--bounding-set=-all")
+
+
+def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
+    tmp_path: Path,
+) -> None:
+    """Measure the real resource driver; this is not registered-worker proof."""
+
+    if os.environ.get("ACP_RUN_NAMESPACE_INTEGRATION") != "1":
+        pytest.skip("set ACP_RUN_NAMESPACE_INTEGRATION=1 on a disposable supported Linux host")
+    if not sys.platform.startswith("linux"):
+        pytest.skip("NamespaceRuntimeDriver integration requires Linux user namespaces")
+
+    assert os.geteuid() != 0, "the live namespace driver must be exercised rootlessly"
+    assert Path("/sys/fs/cgroup/cgroup.controllers").is_file(), "unified cgroup v2 is required"
+    attempt_id = f"live-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    # The driver makes /tmp private before bind-mounting its inputs. Keep this
+    # source outside /tmp so the live probe exercises a viable host path.
+    worktree = Path.home() / f".acp-live-worktree-{uuid.uuid4().hex}"
+    worktree.mkdir()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (worktree / "fake-agent.sh").write_text(
+        "#!/bin/sh\n"
+        "{\n"
+        "  printf 'inner_pid=%s\\n' \"$$\"\n"
+        "  printf 'home=%s\\n' \"$HOME\"\n"
+        "  printf 'cwd=%s\\n' \"$PWD\"\n"
+        "  if [ -r /etc/os-release ]; then echo host_etc_os_release=readable; "
+        "else echo host_etc_os_release=absent; fi\n"
+        "  if touch /workspace/should-not-write 2>/dev/null; then "
+        "echo workspace_write=allowed; else echo workspace_write=denied; fi\n"
+        "} > /work/acp-agent-marker\n"
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    driver_context = DriverContext(
+        attempt_id=attempt_id,
+        task_id="task-2370-live-probe",
+        runtime_dir=runtime_dir,
+        expires_at=int(time.time()) + 90,
+        secret=b"test-secret",
+        environment={
+            "ACP_ATTEMPT_ID": attempt_id,
+            "ACP_WORKTREE": str(worktree),
+            "ACP_REPO_ROOT": str(worktree),
+        },
+    )
+    driver = namespace_driver(
+        payload="/bin/sh /workspace/fake-agent.sh",
+        unit_prefix="acp-ns-it",
+        wall_clock_seconds="60",
+    )
+    unit = driver._unit(driver_context)
+    marker = None
+    marker_host_pid = None
+
+    try:
+        launch = driver.setup(driver_context, run_trusted)
+        assert launch.get("exit_code") == 0, launch
+        present, observation = driver.probe(driver_context, run_trusted)
+        assert present is True, observation
+        assert observation.get("systemd_unit_invocation_id")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and marker is None:
+            shown = run_trusted(
+                [
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "--property=MainPID",
+                    "--property=ControlGroup",
+                ],
+                runtime_dir,
+                {},
+                10,
+                None,
+            )
+            assert shown.get("exit_code") == 0, shown
+            properties = dict(
+                line.split("=", 1) for line in shown.get("stdout", "").splitlines() if "=" in line
+            )
+            control_group = properties.get("ControlGroup", "")
+            assert control_group.startswith("/user.slice/"), properties
+            cgroup_procs = Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+            pids = {
+                int(value)
+                for value in cgroup_procs.read_text(encoding="ascii").splitlines()
+                if value.isdigit()
+            }
+            for pid in sorted(pids):
+                try:
+                    marker = Path(f"/proc/{pid}/root/work/acp-agent-marker").read_text(
+                        encoding="utf-8"
+                    )
+                    marker_host_pid = pid
+                    break
+                except OSError:
+                    pass
+            if marker is None:
+                time.sleep(0.05)
+
+        assert marker is not None and marker_host_pid is not None, observation
+        observed = dict(line.split("=", 1) for line in marker.splitlines() if "=" in line)
+        assert observed["home"] == "/work"
+        assert observed["cwd"] == "/work"
+        assert observed["host_etc_os_release"] == "readable"
+        assert observed["workspace_write"] == "denied"
+        assert int(observed["inner_pid"]) > 0
+        assert os.readlink(f"/proc/{marker_host_pid}/ns/pid") != os.readlink("/proc/self/ns/pid")
+        assert not (worktree / "should-not-write").exists()
+    finally:
+        try:
+            driver.teardown(driver_context, run_trusted)
+            present_after, cleanup_observation = driver.probe(driver_context, run_trusted)
+            assert driver.cleanup_is_proven(present_after, cleanup_observation), cleanup_observation
+        finally:
+            shutil.rmtree(worktree)
 
 
 def test_namespace_runtime_exports_only_sandbox_paths_to_the_service(tmp_path: Path) -> None:
