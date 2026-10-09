@@ -1452,10 +1452,47 @@ transient scope beneath one unique `user-acp-…slice`; their reported cgroup
 paths were descendants of that slice. Stopping the parent slice transitioned
 both units to inactive. This validates a possible per-attempt containment
 mechanism, not process-absence proof, OCI cleanup, crash recovery, or ACP
-integration. The executor still needs to bind a unique parent slice to the
-attempt, put its supervisor and runc scope there, and provide restart-safe
-recovery that proves all descendants and runtime state absent before writing
+integration. The policy compiler now binds each runc scope beneath a unique
+parent slice, but neither the supervisor wrapper nor a journal-authorized
+launch is placed there. The executor still needs a restart-safe lifecycle that
+proves all attempt descendants and runtime state absent before writing
 `cleanup_verified`. Keep OCI fail-closed and task #2370 open.
+
+**2026-10-09 exact-source per-container slice binding and teardown (not worker integration).**
+Commit `fbb205e3d714f9e7bcd73a3e1026d5a8338d412a` makes the policy compiler emit
+`linux.cgroupsPath=user-acp-<sha256(container-id)>.slice:acp:<container-id>`.
+The complete-policy validator and private-bundle launch check require that exact
+deterministic slice, rejecting the former shared `user.slice` parent and a slice
+derived from another container ID. The opt-in test at that exact commit has
+source SHA-256 `8770605a9dd64ecdd5a167b619462c349d53aae0b7bb59ad08688e202ca0011c`
+and test SHA-256
+`93656c531a20a517a829b1249950107323921dd6e324ff69e58c266f67c6731a`.
+
+On 2026-10-09, the opt-in test passed once on that exact snapshot; the bounded
+systemd service ran for 6.997 seconds under a transient user service
+with `Delegate=yes`, `KillMode=control-group`, a 300-second runtime bound,
+sanitized environment, no provider credentials, `uv run --frozen`, and runc
+1.3.5 pinned. Host: Linux 6.18.15 x86_64, systemd 252, BusyBox 1.35.0. The
+runtime receipt reported
+`user-acp-55dc0feb0b79615c6d1288993f4427ce709c4f84413b457ae7050b71c054936e.slice`
+and asserted that the exact runc scope
+`acp-acp-live-28cbdd46b9ed4876b63220b5d90c501f.scope` `ControlGroup` was a
+descendant of that slice. The receipt again reported
+`worker_executor_integrated=false`.
+
+The test teardown now requires `cgroup.events populated=0` and empty
+`cgroup.procs` throughout the exact slice subtree before it stops the parent
+slice; if state is ambiguous, it preserves the attempt evidence. After this
+run, the transient service and runc scope were `not-found`; the parent slice was
+loaded but inactive with an empty `ControlGroup`, and its cgroup path was absent.
+The test attempt root was absent. Its 4,415-node source snapshot was removed
+only after matching the recorded device/inode and owner/mode, finding no process
+cwd/open-fd/mapped-file references or mountpoints, and using descriptor-relative
+symlink-safe removal. This proves scope placement and test teardown for the
+compiled policy on one NAS host only. It does not place the supervisor inside
+the slice or prove journal authorization, full attempt descendant containment,
+cancellation/crash recovery, result import, provider egress, or registered
+`run_worker` behavior. Keep OCI fail-closed and task #2370 open.
 
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
