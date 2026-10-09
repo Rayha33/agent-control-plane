@@ -3025,26 +3025,8 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
     # The driver makes /tmp private before bind-mounting its inputs. Keep this
     # source outside /tmp so the live probe exercises a viable host path.
     worktree = Path.home() / f".acp-live-worktree-{uuid.uuid4().hex}"
-    worktree.mkdir()
-    worktree_stat = worktree.lstat()
-    assert stat.S_ISDIR(worktree_stat.st_mode)
-    worktree_identity = (worktree_stat.st_dev, worktree_stat.st_ino)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    (worktree / "fake-agent.sh").write_text(
-        "#!/bin/sh\n"
-        "{\n"
-        "  printf 'inner_pid=%s\\n' \"$$\"\n"
-        "  printf 'home=%s\\n' \"$HOME\"\n"
-        "  printf 'cwd=%s\\n' \"$PWD\"\n"
-        "  if [ -r /etc/os-release ]; then echo host_etc_os_release=readable; "
-        "else echo host_etc_os_release=absent; fi\n"
-        "  if touch /workspace/should-not-write 2>/dev/null; then "
-        "echo workspace_write=allowed; else echo workspace_write=denied; fi\n"
-        "} > /work/acp-agent-marker\n"
-        "sleep 30\n",
-        encoding="utf-8",
-    )
     driver_context = DriverContext(
         attempt_id=attempt_id,
         task_id="task-2370-live-probe",
@@ -3065,8 +3047,32 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
     unit = driver._unit(driver_context)
     marker = None
     marker_host_pid = None
+    worktree_identity = None
+    parent_fd = os.open(
+        worktree.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
 
     try:
+        os.mkdir(worktree.name, mode=0o700, dir_fd=parent_fd)
+        worktree_stat = os.stat(worktree.name, dir_fd=parent_fd, follow_symlinks=False)
+        assert stat.S_ISDIR(worktree_stat.st_mode)
+        worktree_identity = (worktree_stat.st_dev, worktree_stat.st_ino)
+        (worktree / "fake-agent.sh").write_text(
+            "#!/bin/sh\n"
+            "{\n"
+            "  printf 'inner_pid=%s\\n' \"$$\"\n"
+            "  printf 'home=%s\\n' \"$HOME\"\n"
+            "  printf 'cwd=%s\\n' \"$PWD\"\n"
+            "  if [ -r /etc/os-release ]; then echo host_etc_os_release=readable; "
+            "else echo host_etc_os_release=absent; fi\n"
+            "  if touch /workspace/should-not-write 2>/dev/null; then "
+            "echo workspace_write=allowed; else echo workspace_write=denied; fi\n"
+            "} > /work/acp-agent-marker\n"
+            "sleep 30\n",
+            encoding="utf-8",
+        )
+
         launch = driver.setup(driver_context, run_trusted)
         assert launch.get("exit_code") == 0, launch
         present, observation = driver.probe(driver_context, run_trusted)
@@ -3133,13 +3139,21 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             driver.teardown(driver_context, run_trusted)
             present_after, cleanup_observation = driver.probe(driver_context, run_trusted)
             cleanup_proven = driver.cleanup_is_proven(present_after, cleanup_observation)
-            assert cleanup_proven, cleanup_observation
+            assert cleanup_proven, (cleanup_observation, str(worktree))
         finally:
-            if cleanup_proven:
-                current_stat = worktree.lstat()
-                assert stat.S_ISDIR(current_stat.st_mode)
-                assert (current_stat.st_dev, current_stat.st_ino) == worktree_identity
-                shutil.rmtree(worktree)
+            try:
+                if cleanup_proven and worktree_identity is not None:
+                    assert shutil.rmtree.avoids_symlink_attacks, "fd-safe rmtree is unavailable"
+                    current_stat = os.stat(
+                        worktree.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    assert stat.S_ISDIR(current_stat.st_mode)
+                    assert (current_stat.st_dev, current_stat.st_ino) == worktree_identity
+                    shutil.rmtree(worktree.name, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
 
 
 def test_namespace_runtime_exports_only_sandbox_paths_to_the_service(tmp_path: Path) -> None:
