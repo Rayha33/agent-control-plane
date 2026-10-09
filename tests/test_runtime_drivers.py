@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -3025,6 +3026,9 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
     # source outside /tmp so the live probe exercises a viable host path.
     worktree = Path.home() / f".acp-live-worktree-{uuid.uuid4().hex}"
     worktree.mkdir()
+    worktree_stat = worktree.lstat()
+    assert stat.S_ISDIR(worktree_stat.st_mode)
+    worktree_identity = (worktree_stat.st_dev, worktree_stat.st_ino)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
     (worktree / "fake-agent.sh").write_text(
@@ -3090,8 +3094,13 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
                 line.split("=", 1) for line in shown.get("stdout", "").splitlines() if "=" in line
             )
             control_group = properties.get("ControlGroup", "")
-            assert control_group.startswith("/user.slice/"), properties
-            cgroup_procs = Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+            group_parts = Path(control_group.lstrip("/")).parts
+            assert group_parts and group_parts[0] == "user.slice", properties
+            assert all(part not in {"", ".", ".."} for part in group_parts), properties
+            cgroup_root = Path("/sys/fs/cgroup").resolve()
+            cgroup_dir = cgroup_root.joinpath(*group_parts).resolve()
+            assert cgroup_dir.is_relative_to(cgroup_root), properties
+            cgroup_procs = cgroup_dir / "cgroup.procs"
             pids = {
                 int(value)
                 for value in cgroup_procs.read_text(encoding="ascii").splitlines()
@@ -3119,12 +3128,18 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
         assert os.readlink(f"/proc/{marker_host_pid}/ns/pid") != os.readlink("/proc/self/ns/pid")
         assert not (worktree / "should-not-write").exists()
     finally:
+        cleanup_proven = False
         try:
             driver.teardown(driver_context, run_trusted)
             present_after, cleanup_observation = driver.probe(driver_context, run_trusted)
-            assert driver.cleanup_is_proven(present_after, cleanup_observation), cleanup_observation
+            cleanup_proven = driver.cleanup_is_proven(present_after, cleanup_observation)
+            assert cleanup_proven, cleanup_observation
         finally:
-            shutil.rmtree(worktree)
+            if cleanup_proven:
+                current_stat = worktree.lstat()
+                assert stat.S_ISDIR(current_stat.st_mode)
+                assert (current_stat.st_dev, current_stat.st_ino) == worktree_identity
+                shutil.rmtree(worktree)
 
 
 def test_namespace_runtime_exports_only_sandbox_paths_to_the_service(tmp_path: Path) -> None:

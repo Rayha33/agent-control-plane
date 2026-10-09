@@ -1327,7 +1327,7 @@ and ran it against the unchanged `runtime_drivers.py` from PR #42 source commit
 `7b5c9acd787b4f946936ca8193d79b875567e788` (module SHA-256
 `20ab594a414574d8575c437be54821fe681b0dbe2749ebff089dccc2dcec2852`). The
 test file used for the run had SHA-256
-`45b4be77b29e655d69f1b5e0b1be4a4a8599128e7528fac589b9857708f857a2`. The
+`187bcaa4f0e63a5f2942caf453d793e05cb83ab77fdd3738de8560a14eb51520`. The
 test ran rootlessly as uid 501 in a disposable Lima 2.2.1 VZ Ubuntu 24.04.5
 ARM64 guest (kernel `6.8.0-142-generic`, Python 3.12.3, pytest 7.4.4), using
 unified cgroup v2. `ACP_RUN_NAMESPACE_INTEGRATION=1` selected this single
@@ -1342,9 +1342,13 @@ namespace, `HOME=/work`, and cwd `/work`. It also confirmed `/workspace` was
 read-only and that host `/etc/os-release` remained readable. `teardown()` plus
 the driver's independent postflight proved the exact unit absent; afterward
 the guest setting was restored, no matching service remained, and the unique
-fixture directory was removed. The observed `/tmp` setup initially obscured a
-fixture placed under `/tmp`; the regression now keeps that disposable source
-outside `/tmp`, matching the driver's private-tmpfs mount sequence.
+fixture directory was removed only after positive cleanup proof and a
+device/inode identity check. If cleanup cannot be proven, the test retains the
+fixture for inspection. The observed `/tmp` setup initially obscured a fixture
+placed under `/tmp`; the regression now keeps that disposable source outside
+`/tmp`, matching the driver's private-tmpfs mount sequence. Cgroup paths from
+the unit are checked for traversal and resolved beneath the cgroup-v2 root
+before their process list is read.
 
 **Interpretation:** this proves that the resource driver can host and clean up
 a generic no-model payload in the measured guest. It simultaneously confirms
