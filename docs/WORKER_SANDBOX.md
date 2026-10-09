@@ -787,6 +787,22 @@ inside test modules; it is not shipped as a production helper and is not
 evidence of a supervised worker path. `run_worker` remains fail-closed for
 configured OCI; no supervisor-managed runc launch or result import is claimed.
 
+**Release-time process/cgroup recheck (2026-10-09; guard hardening only).**
+Before the journal records `running` or authorizes the one-shot gate permit, it
+now re-reads `/proc/<pid>/stat`, `/proc/<pid>/cgroup`, and `/proc/<pid>/stat`
+for the recorded monitor, runc client, and container init while holding the
+exact launch-gate lock. Each process must retain its collected start identity
+and live state; monitor and runc client must remain in the wrapper cgroup, and
+init must remain in the recorded runc scope. The same release-locked path also
+re-reads the cgroup-v2 memory, CPU, and PID limits. Synthetic regressions cover
+PID reuse, process exit, cgroup movement, gate-lock ordering, and a shut gate on
+drift. These sequential reads narrow a stale-receipt window; they are not an
+atomic procfs/cgroup snapshot, and process exit or movement after the reads
+remains a race. Runc state and systemd invocation properties are still supplied
+by the future caller and are not re-queried here. No production worker calls
+this path: OCI `run_worker` remains fail-closed and end-to-end worker isolation
+is unproven.
+
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
    measured host was Debian 12,

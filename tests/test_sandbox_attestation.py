@@ -17,6 +17,7 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
+    verify_running_runtime_process_membership,
 )
 
 _ATTEMPT_SLICE_UNIT = _oci_worker_systemd_slice("acp-test-container")
@@ -134,6 +135,60 @@ def test_attestation_binds_runtime_state_pid_start_identities_and_cgroups() -> N
     assert len(receipt.runc_state_sha256) == 64
     assert len(receipt.evidence_sha256) == 64
     assert receipt.audit_payload()["init_identity"] == "linux:303:1303"
+
+
+def test_release_verifier_rereads_all_execution_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    receipt = _validate()
+    snapshots = _valid_observations()["process_snapshots"]
+    observed: list[int] = []
+
+    def read_snapshot(pid: int) -> ProcessSnapshot:
+        observed.append(pid)
+        return snapshots[pid]
+
+    monkeypatch.setattr(sandbox_attestation, "read_linux_process_snapshot", read_snapshot)
+    verify_running_runtime_process_membership(receipt)
+
+    assert set(observed) == {receipt.monitor_pid, receipt.runc_client_pid, receipt.init_pid}
+    assert len(observed) == 3
+
+
+@pytest.mark.parametrize("drift", ["pid_reuse", "moved_cgroup", "exited"])
+def test_release_verifier_rejects_process_identity_or_cgroup_drift(
+    drift: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = _validate()
+    snapshots = _valid_observations()["process_snapshots"]
+    init = snapshots[receipt.init_pid]
+    if drift == "pid_reuse":
+        changed = ProcessSnapshot(
+            _proc_stat(receipt.init_pid, "S", 9999),
+            init.cgroup,
+            _proc_stat(receipt.init_pid, "S", 9999),
+        )
+    elif drift == "moved_cgroup":
+        changed = ProcessSnapshot(
+            init.stat_before,
+            b"0::/user.slice/foreign.scope\n",
+            init.stat_after,
+        )
+    else:
+        changed = ProcessSnapshot(
+            _proc_stat(receipt.init_pid, "Z", 1303),
+            init.cgroup,
+            _proc_stat(receipt.init_pid, "Z", 1303),
+        )
+    snapshots[receipt.init_pid] = changed
+    monkeypatch.setattr(
+        sandbox_attestation,
+        "read_linux_process_snapshot",
+        lambda pid: snapshots[pid],
+    )
+
+    with pytest.raises(SupervisorError) as stale:
+        verify_running_runtime_process_membership(receipt)
+
+    assert stale.value.code == "sandbox_runtime_attestation_stale"
 
 
 def test_private_runc_pid_file_reader_accepts_stable_file(tmp_path) -> None:

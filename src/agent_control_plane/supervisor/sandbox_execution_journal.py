@@ -43,6 +43,7 @@ from .sandbox_attestation import (
     RunningRuntimeAttestation,
     running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
+    verify_running_runtime_process_membership,
     verify_running_runtime_resource_controls,
 )
 from .sandbox_workspace import (
@@ -1978,9 +1979,10 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_launch_handle_required",
                     "running transition requires the exact locked launch handle",
                 )
-            # Revalidate live limits under the release lock before the durable
-            # running transition and one-shot permit issue.
+            # Revalidate exact live process membership and cgroup limits under
+            # the release lock before the durable transition and one-shot permit.
             verify_running_runtime_resource_controls(attestation)
+            verify_running_runtime_process_membership(attestation)
             updated = self._sandbox_execution_transition(
                 attempt_id,
                 claim_token,

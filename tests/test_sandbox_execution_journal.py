@@ -881,6 +881,71 @@ def test_running_transition_rechecks_live_limits_under_gate_lock(
         os.close(gate_read)
 
 
+def test_running_transition_rechecks_process_membership_under_gate_lock(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: {
+                "memory.max": f"{attestation.memory_max_bytes}\n".encode("ascii"),
+                "cpu.max": f"{attestation.cpu_quota} {attestation.cpu_period}\n".encode("ascii"),
+                "pids.max": f"{attestation.pids_max}\n".encode("ascii"),
+            },
+        )
+
+        def read_moved_process(pid: int) -> ProcessSnapshot:
+            snapshot = _live_process_snapshot(attestation, pid)
+            if pid == attestation.init_pid:
+                return replace(snapshot, cgroup=b"0::/user.slice/foreign.scope\n")
+            return snapshot
+
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_linux_process_snapshot",
+            read_moved_process,
+        )
+        verify_membership = journal_module.verify_running_runtime_process_membership
+
+        def verify_membership_under_gate_lock(receipt) -> None:
+            assert handle._gate_lock.locked()
+            verify_membership(receipt)
+
+        monkeypatch.setattr(
+            journal_module,
+            "verify_running_runtime_process_membership",
+            verify_membership_under_gate_lock,
+        )
+
+        with pytest.raises(SupervisorError) as moved:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+
+        assert moved.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
 def test_stop_before_running_transition_is_rejected_without_gate_release(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
@@ -1282,12 +1347,40 @@ def record_running(supervisor: GitSupervisor, attempt: dict) -> dict:
             "read_cgroup_resource_controls",
             lambda _path: controls,
         )
+        patch.setattr(
+            sandbox_attestation_module,
+            "read_linux_process_snapshot",
+            lambda pid: _live_process_snapshot(attestation, pid),
+        )
         return supervisor._sandbox_execution_record_running(
             attempt["id"],
             attempt["claim_token"],
             attestation=attestation,
             runc_handle=handle,
         )
+
+
+def _live_process_snapshot(attestation, pid: int) -> ProcessSnapshot:
+    expected = {
+        attestation.monitor_pid: (
+            attestation.monitor_identity,
+            attestation.wrapper_control_group,
+        ),
+        attestation.runc_client_pid: (
+            attestation.runc_client_identity,
+            attestation.wrapper_control_group,
+        ),
+        attestation.init_pid: (attestation.init_identity, attestation.cgroup_path),
+    }
+    identity, cgroup = expected[pid]
+    start_time = identity.rsplit(":", 1)[1]
+    fields = [b"S", *([b"0"] * 18), start_time.encode("ascii")]
+    raw_stat = f"{pid} (worker (gate)) ".encode("ascii") + b" ".join(fields) + b"\n"
+    return ProcessSnapshot(
+        stat_before=raw_stat,
+        cgroup=f"0::{cgroup}\n".encode("ascii"),
+        stat_after=raw_stat,
+    )
 
 
 def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
@@ -2697,6 +2790,11 @@ def test_running_transition_requires_intact_attestation_bound_to_launch(
             "cpu.max": f"{receipt.cpu_quota} {receipt.cpu_period}\n".encode("ascii"),
             "pids.max": f"{receipt.pids_max}\n".encode("ascii"),
         },
+    )
+    monkeypatch.setattr(
+        sandbox_attestation_module,
+        "read_linux_process_snapshot",
+        lambda pid: _live_process_snapshot(receipt, pid),
     )
     running = supervisor._sandbox_execution_record_running(
         attempt["id"],

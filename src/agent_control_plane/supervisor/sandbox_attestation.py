@@ -445,6 +445,50 @@ def verify_running_runtime_resource_controls(attestation: RunningRuntimeAttestat
         ) from error
 
 
+def verify_running_runtime_process_membership(attestation: RunningRuntimeAttestation) -> None:
+    """Re-read execution PIDs and cgroups before the journal authorizes init release.
+
+    These sequential procfs observations narrow the gap between initial
+    collection and gate authorization; they are not an atomic snapshot and do
+    not authenticate caller-supplied runc or systemd command output.
+    """
+
+    if not running_attestation_is_self_consistent(attestation):
+        raise _invalid("release-time process verification requires a self-consistent receipt")
+    expected_processes = (
+        (attestation.monitor_pid, attestation.monitor_identity, attestation.wrapper_control_group),
+        (
+            attestation.runc_client_pid,
+            attestation.runc_client_identity,
+            attestation.wrapper_control_group,
+        ),
+        (attestation.init_pid, attestation.init_identity, attestation.cgroup_path),
+    )
+    try:
+        for pid, expected_identity, expected_cgroup in expected_processes:
+            snapshot = read_linux_process_snapshot(pid)
+            if type(snapshot) is not ProcessSnapshot:
+                raise _invalid("release-time process observation has an unexpected type")
+            before_pid, before_state, before_start = _parse_proc_stat(snapshot.stat_before)
+            after_pid, after_state, after_start = _parse_proc_stat(snapshot.stat_after)
+            if (
+                before_pid != pid
+                or after_pid != pid
+                or before_start != after_start
+                or before_state.encode("ascii") not in _LIVE_PROCESS_STATES
+                or after_state.encode("ascii") not in _LIVE_PROCESS_STATES
+                or f"linux:{pid}:{before_start}" != expected_identity
+            ):
+                raise _invalid("live execution process identity changed after collection")
+            if _parse_proc_cgroup(snapshot.cgroup) != expected_cgroup:
+                raise _invalid("live execution process cgroup membership changed after collection")
+    except SupervisorError as error:
+        raise SupervisorError(
+            "sandbox_runtime_attestation_stale",
+            "live process identities or cgroup membership no longer match the collected receipt",
+        ) from error
+
+
 def _valid_private_pid_file(info: os.stat_result) -> bool:
     return (
         stat.S_ISREG(info.st_mode)
