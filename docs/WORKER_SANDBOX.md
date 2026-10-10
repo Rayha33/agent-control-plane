@@ -1439,6 +1439,17 @@ The root controller list does not prove per-user delegation or limit
 enforcement, and this probe establishes no workspace, credential, egress,
 cleanup, or worker-isolation property.
 
+**Credential and host-socket isolation gate.** Namespace and cgroup capability
+checks do not establish which Unix socket paths a worker can reach. The
+integrated no-model probe must capture the worker's effective uid, gid,
+supplementary groups, and open descriptors; it must hide or deny host
+container-engine, system/user D-Bus, SSH-agent, and credential-agent sockets,
+then prove those endpoints are unavailable while any explicitly supplied
+test-only socket remains usable. Environment-variable filtering and a socket
+path's filesystem mode are not substitutes for this negative runtime test.
+Do not enable the OCI worker path until the integrated executor proves this
+boundary together with the other gates below.
+
 This preflight proves namespace creation prerequisites and prevents the
 measured failed-unit case; it does not verify the later mount/chroot prelude or
 establish a coding-worker boundary. Separately, `run_worker` still refuses any
