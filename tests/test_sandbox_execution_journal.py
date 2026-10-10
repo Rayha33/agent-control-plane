@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from support import init_repo, make_task
@@ -21,10 +22,13 @@ from agent_control_plane.git_supervisor import (
 )
 from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker
+from agent_control_plane.supervisor import sandbox_attestation as sandbox_attestation_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
 from agent_control_plane.supervisor.common import canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
+    collect_running_runtime_attestation,
+    running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
 )
@@ -36,6 +40,7 @@ from agent_control_plane.supervisor.sandbox_workspace import (
     copy_snapshot,
     read_snapshot_files,
 )
+from agent_control_plane.supervisor.store import _authorize_sandbox_reservation_write
 
 
 @pytest.fixture
@@ -174,6 +179,10 @@ def _test_runc_target(
         workspace_inode=execution["workspace_root_ino"],
         pid_file_path=str(Path(state_path) / "init.pid"),
         container_id=container_id or execution["container_id"],
+        memory_limit_bytes=1_073_741_824,
+        cpu_quota=100_000,
+        cpu_period=100_000,
+        pids_limit=256,
     )
 
 
@@ -182,7 +191,6 @@ def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
     row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
-        "a" * 64,
         **runtime_claims,
     )
     execution_root = Path(row["bundle_path"]).parent
@@ -286,6 +294,8 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     durable = supervisor._sandbox_execution_get(attempt["id"])
     assert durable["launch_plan_required"] == 1
     assert durable["launch_plan_binding_version"] == 1
+    assert durable["bundle_digest"] == journal_module._sandbox_reservation_bundle_digest(durable)
+    assert durable["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_config_digest"] == target.config_sha256
     assert (
         durable["launch_argv_digest"]
@@ -296,11 +306,239 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
+    assert durable["launch_plan"]["version"] == 5
+    assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
+    assert durable["launch_plan"]["launch"]["resource_limits"] == {
+        "memory_max_bytes": target.memory_limit_bytes,
+        "cpu_quota": target.cpu_quota,
+        "cpu_period": target.cpu_period,
+        "pids_max": target.pids_limit,
+    }
     assert journal_module._sandbox_launch_plan_binding_is_self_consistent(durable)
     event_plan = json.loads(event["payload_json"])["launch_plan"]
     assert event_plan == durable["launch_plan"]
     assert supervisor.verify_event_chain()["ok"] is True
+
+    # Version 4 remains auditable under its original ownership evidence, but
+    # does not carry the split-monitor placement contract required for running.
+    legacy_v4_plan = json.loads(canonical_json(durable["launch_plan"]))
+    legacy_v4_plan["version"] = 4
+    legacy_v4_plan["launch"]["systemd_ownership"].pop("monitor_placement")
+    old_wrapper_cgroup = f"{durable['attempt_slice_cgroup_path']}/{durable['wrapper_unit']}"
+    legacy_v4_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = old_wrapper_cgroup
+    legacy_v4_row = dict(durable)
+    legacy_v4_row["wrapper_cgroup_path"] = old_wrapper_cgroup
+    legacy_v4_row["launch_plan_json"] = canonical_json(legacy_v4_plan)
+    legacy_v4_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_v4_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_v4_row)
+
+    sibling_monitor_cgroup = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        f"{oci_worker._oci_worker_systemd_slice('sibling-attempt')}/{durable['wrapper_unit']}"
+    )
+    sibling_plan = json.loads(canonical_json(durable["launch_plan"]))
+    sibling_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = sibling_monitor_cgroup
+    sibling_row = dict(durable)
+    sibling_row["wrapper_cgroup_path"] = sibling_monitor_cgroup
+    sibling_row["launch_plan_json"] = canonical_json(sibling_plan)
+    sibling_row["launch_plan_digest"] = hashlib.sha256(
+        sibling_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(sibling_row)
+
+    # Earlier plan versions did not bind an attempt-slice identity and cannot
+    # authorize the stronger current launch/running evidence.
+    legacy_plan = json.loads(canonical_json(durable["launch_plan"]))
+    legacy_plan["version"] = 1
+    legacy_plan["reservation"].pop("bundle_digest_semantics")
+    legacy_row = dict(durable)
+    legacy_row["bundle_digest_semantics"] = "legacy-caller-asserted-v0"
+    legacy_row["launch_plan_json"] = canonical_json(legacy_plan)
+    legacy_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_row)
+    legacy_plan["version"] = True
+    legacy_row["launch_plan_json"] = canonical_json(legacy_plan)
+    legacy_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_row)
+
+
+def test_launch_rejects_forged_reservation_bundle_digest(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+
+    # Simulate a tampered/legacy reservation row; the immutable trigger is
+    # tested separately, while this proves launch independently re-derives it.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_execution_identity_immutable")
+        connection.execute(
+            "UPDATE sandbox_executions SET bundle_digest = ? WHERE attempt_id = ?",
+            ("a" * 64, attempt["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as mismatch:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    assert mismatch.value.code == "sandbox_execution_bundle_digest_mismatch"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_launch_rejects_legacy_caller_asserted_reservation_digest(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+
+    # Model a schema-24 reserved row migrated with the legacy default marker.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_execution_identity_immutable")
+        connection.execute(
+            "UPDATE sandbox_executions SET bundle_digest = ?, bundle_digest_semantics = ? "
+            "WHERE attempt_id = ?",
+            ("a" * 64, "legacy-caller-asserted-v0", attempt["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as legacy:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    assert legacy.value.code == "sandbox_execution_legacy_bundle_digest"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_direct_sql_cannot_claim_host_derived_reservation_provenance(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = {
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "execution_id": "forged-execution",
+        "backend": "oci-runc",
+        "container_id": "forged-container",
+        "rootfs_digest": "a" * 64,
+        "rootfs_closure_digest": "b" * 64,
+        "runc_executable_digest": "c" * 64,
+        "runtime_version": "1.3.5",
+        "oci_version": "1.2.1",
+        "bundle_path": f"{repo}/.acp/sandbox-executions/forged/bundle",
+        "state_path": f"{repo}/.acp/sandbox-executions/forged/state",
+    }
+    bundle_digest = journal_module._sandbox_reservation_bundle_digest(execution)
+
+    with supervisor.connect() as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_execution_reservation_authorization_required",
+        ):
+            connection.execute(
+                """
+                INSERT INTO sandbox_executions
+                  (attempt_id, claim_token, execution_id, backend, container_id,
+                   bundle_digest, bundle_digest_semantics, launch_plan_required,
+                   rootfs_digest, rootfs_closure_digest, runc_executable_digest,
+                   runtime_version, oci_version, bundle_path, state_path, phase,
+                   created_at, updated_at)
+                VALUES (?, ?, ?, 'oci-runc', ?, ?, 'oci-reservation-v1', 1,
+                        ?, ?, ?, ?, ?, ?, ?, 'reserved', 'now', 'now')
+                """,
+                (
+                    execution["attempt_id"],
+                    execution["claim_token"],
+                    execution["execution_id"],
+                    execution["container_id"],
+                    bundle_digest,
+                    execution["rootfs_digest"],
+                    execution["rootfs_closure_digest"],
+                    execution["runc_executable_digest"],
+                    execution["runtime_version"],
+                    execution["oci_version"],
+                    execution["bundle_path"],
+                    execution["state_path"],
+                ),
+            )
+
+    assert supervisor._sandbox_execution_get(attempt["id"]) is None
+
+
+def test_v25_bundle_digest_semantics_migration_preserves_and_freezes_legacy_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            """
+            CREATE TABLE sandbox_executions (
+              attempt_id TEXT PRIMARY KEY,
+              claim_token INTEGER NOT NULL,
+              execution_id TEXT NOT NULL,
+              backend TEXT NOT NULL,
+              container_id TEXT NOT NULL,
+              bundle_digest TEXT NOT NULL,
+              rootfs_digest TEXT NOT NULL,
+              rootfs_closure_digest TEXT NOT NULL,
+              runc_executable_digest TEXT NOT NULL,
+              runtime_version TEXT NOT NULL,
+              oci_version TEXT NOT NULL,
+              bundle_path TEXT NOT NULL,
+              state_path TEXT NOT NULL,
+              phase TEXT NOT NULL DEFAULT 'reserved',
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sandbox_executions VALUES
+              ('attempt-old', 7, 'execution-old', 'oci-runc', 'container-old', ?, ?, ?, ?,
+               '1.3.5', '1.2.1', '/bundle-old', '/state-old', 'reserved', 'now')
+            """,
+            ("f" * 64, "a" * 64, "b" * 64, "c" * 64),
+        )
+
+        migrations = dict(MIGRATIONS)
+        migrations[25](connection)
+        migrations[25](connection)
+        migrations[26](connection)
+        migrations[26](connection)
+
+        row = connection.execute(
+            "SELECT bundle_digest, bundle_digest_semantics, phase, wrapper_cgroup_path, "
+            "attempt_slice_unit, attempt_slice_invocation_id, attempt_slice_cgroup_path "
+            "FROM sandbox_executions "
+            "WHERE attempt_id = 'attempt-old'"
+        ).fetchone()
+        assert row["bundle_digest"] == "f" * 64
+        assert row["bundle_digest_semantics"] == "legacy-caller-asserted-v0"
+        assert row["phase"] == "reserved"
+        assert row["wrapper_cgroup_path"] == ""
+        assert row["attempt_slice_unit"] == ""
+        assert row["attempt_slice_invocation_id"] == ""
+        assert row["attempt_slice_cgroup_path"] == ""
+        with pytest.raises(sqlite3.IntegrityError, match="identity_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET bundle_digest_semantics = 'oci-reservation-v1' "
+                "WHERE attempt_id = 'attempt-old'"
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="sandbox_execution_attempt_slice_identity_required"
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'launched' WHERE attempt_id = 'attempt-old'"
+            )
+        assert (
+            connection.execute(
+                "SELECT phase FROM sandbox_executions WHERE attempt_id = 'attempt-old'"
+            ).fetchone()["phase"]
+            == "reserved"
+        )
+    finally:
+        connection.close()
 
 
 def test_generic_transition_cannot_forge_launch_plan_binding(repo: Path) -> None:
@@ -336,6 +574,10 @@ def test_generic_transition_cannot_forge_launch_plan_binding(repo: Path) -> None
     assert row["phase"] == "reserved"
     assert row["launch_plan_binding_version"] == 0
     assert row["launch_plan_json"] == ""
+    assert row["wrapper_cgroup_path"] == ""
+    assert row["attempt_slice_unit"] == ""
+    assert row["attempt_slice_invocation_id"] == ""
+    assert row["attempt_slice_cgroup_path"] == ""
 
 
 @pytest.mark.parametrize("mismatch", ["config", "argv"])
@@ -534,6 +776,258 @@ def test_public_gate_release_requires_exact_durable_running_transition(repo: Pat
         os.close(gate_read)
 
 
+def test_running_transition_rejects_caller_constructed_receipt_before_gate_release(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        caller_constructed = running_attestation(supervisor, attempt, register_collected=False)
+
+        assert running_attestation_is_self_consistent(caller_constructed)
+        assert not running_attestation_has_collector_provenance(caller_constructed)
+        with pytest.raises(SupervisorError) as rejected:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=caller_constructed,
+                runc_handle=handle,
+            )
+
+        assert rejected.value.code == "sandbox_runtime_attestation_invalid"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+@pytest.mark.parametrize("mismatch", ["state_root", "pid_file", "runc_executable"])
+def test_running_transition_rejects_collected_runtime_source_mismatch(
+    repo: Path,
+    mismatch: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        source_override: dict[str, object] = {}
+        if mismatch == "state_root":
+            source_override["state_root_override"] = Path(execution["bundle_path"]).parent
+        elif mismatch == "pid_file":
+            source_override["pid_file_name_override"] = "other.pid"
+        else:
+            source_override["runc_executable_sha256"] = "f" * 64
+        attestation = running_attestation(supervisor, attempt, **source_override)
+
+        assert running_attestation_is_self_consistent(attestation)
+        assert running_attestation_has_collector_provenance(attestation)
+        with pytest.raises(SupervisorError) as rejected:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+
+        assert rejected.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_running_transition_rejects_forged_cgroup_limit_before_gate_release(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        forged = replace(attestation, memory_max_bytes=attestation.memory_max_bytes + 1)
+        payload = forged.audit_payload()
+        payload.pop("evidence_sha256")
+        forged = replace(
+            forged,
+            evidence_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
+        )
+        # Isolate the durable-limit comparison after the provenance guard; replacing
+        # a collector receipt ordinarily discards its process-local provenance.
+        monkeypatch.setattr(
+            journal_module,
+            "running_attestation_has_collector_provenance",
+            lambda candidate: candidate is forged,
+        )
+
+        with pytest.raises(SupervisorError) as mismatch:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=forged,
+                runc_handle=handle,
+            )
+
+        assert mismatch.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_running_transition_rechecks_live_limits_under_gate_lock(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: {
+                "memory.max": b"1073741825\n",
+                "cpu.max": b"100000 100000\n",
+                "pids.max": b"256\n",
+            },
+        )
+        verify_resources = journal_module.verify_running_runtime_resource_controls
+
+        def verify_resources_under_gate_lock(receipt) -> None:
+            assert handle._gate_lock.locked()
+            verify_resources(receipt)
+
+        monkeypatch.setattr(
+            journal_module,
+            "verify_running_runtime_resource_controls",
+            verify_resources_under_gate_lock,
+        )
+
+        with pytest.raises(SupervisorError) as changed:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+
+        assert changed.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_running_transition_rechecks_process_membership_under_gate_lock(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: {
+                "memory.max": f"{attestation.memory_max_bytes}\n".encode("ascii"),
+                "cpu.max": f"{attestation.cpu_quota} {attestation.cpu_period}\n".encode("ascii"),
+                "pids.max": f"{attestation.pids_max}\n".encode("ascii"),
+            },
+        )
+
+        def read_moved_process(pid: int) -> ProcessSnapshot:
+            snapshot = _live_process_snapshot(attestation, pid)
+            if pid == attestation.init_pid:
+                return replace(snapshot, cgroup=b"0::/user.slice/foreign.scope\n")
+            return snapshot
+
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_linux_process_snapshot",
+            read_moved_process,
+        )
+        verify_membership = journal_module.verify_running_runtime_process_membership
+
+        def verify_membership_under_gate_lock(receipt) -> None:
+            assert handle._gate_lock.locked()
+            verify_membership(receipt)
+
+        monkeypatch.setattr(
+            journal_module,
+            "verify_running_runtime_process_membership",
+            verify_membership_under_gate_lock,
+        )
+        verify_private_directory = journal_module._private_directory
+
+        def verify_state_root_under_gate_lock(path, **kwargs):
+            assert handle._gate_lock.locked()
+            return verify_private_directory(path, **kwargs)
+
+        monkeypatch.setattr(
+            journal_module,
+            "_private_directory",
+            verify_state_root_under_gate_lock,
+        )
+
+        with pytest.raises(SupervisorError) as moved:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+
+        assert moved.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
 def test_stop_before_running_transition_is_rejected_without_gate_release(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
@@ -705,12 +1199,18 @@ def record_launch(
     attempt: dict,
     *,
     runc_handle: oci_worker.RuncLaunchHandle | None = None,
+    wrapper_cgroup_path: str | None = None,
 ) -> dict:
     if runc_handle is None:
         execution = supervisor._sandbox_execution_get(attempt["id"])
         assert execution is not None
         runc_handle = _test_runc_handle(target=_test_runc_target(execution))
     attempt["_test_runc_handle"] = runc_handle
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None
+    slice_unit = oci_worker._oci_worker_systemd_slice(execution["container_id"])
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    slice_cgroup = common_cgroup + "/" + slice_unit
     return supervisor._sandbox_execution_record_launch(
         attempt["id"],
         attempt["claim_token"],
@@ -719,14 +1219,50 @@ def record_launch(
         runc_handle=runc_handle,
         wrapper_unit="acp-worker.service",
         wrapper_invocation_id="1" * 32,
+        wrapper_cgroup_path=wrapper_cgroup_path or f"{common_cgroup}/acp-worker.service",
+        attempt_slice_unit=slice_unit,
+        attempt_slice_invocation_id="3" * 32,
+        attempt_slice_cgroup_path=slice_cgroup,
         scope_unit="acp-container.scope",
         scope_invocation_id="2" * 32,
-        cgroup_path=("/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope"),
+        cgroup_path=f"{slice_cgroup}/acp-container.scope",
     )
+
+
+def test_launch_rejects_monitor_in_sibling_attempt_slice(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    sibling_monitor_path = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        f"user-acp-{'f' * 64}.slice/acp-worker.service"
+    )
+
+    with pytest.raises(SupervisorError) as invalid:
+        record_launch(
+            supervisor,
+            attempt,
+            runc_handle=handle,
+            wrapper_cgroup_path=sibling_monitor_path,
+        )
+
+    assert invalid.value.code == "sandbox_execution_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
 def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTarget) -> dict:
     plan = journal_module._sandbox_launch_plan_material(execution, target)
+    slice_unit = oci_worker._oci_worker_systemd_slice(target.container_id)
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    slice_cgroup = common_cgroup + "/" + slice_unit
+    plan["launch"]["systemd_ownership"] = {
+        "wrapper_control_group": f"{common_cgroup}/acp-worker.service",
+        "monitor_placement": "outside_attempt_slice",
+        "attempt_slice_unit": slice_unit,
+        "attempt_slice_invocation_id": "3" * 32,
+        "attempt_slice_control_group": slice_cgroup,
+    }
     plan_json = canonical_json(plan)
     argv_digest = hashlib.sha256(canonical_json(list(target.argv)).encode("utf-8")).hexdigest()
     return {
@@ -736,9 +1272,13 @@ def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTar
         "runc_client_identity": "linux:202:1202",
         "wrapper_unit": "acp-worker.service",
         "wrapper_invocation_id": "1" * 32,
+        "wrapper_cgroup_path": f"{common_cgroup}/acp-worker.service",
+        "attempt_slice_unit": slice_unit,
+        "attempt_slice_invocation_id": "3" * 32,
+        "attempt_slice_cgroup_path": slice_cgroup,
         "scope_unit": "acp-container.scope",
         "scope_invocation_id": "2" * 32,
-        "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-container.scope",
+        "cgroup_path": f"{slice_cgroup}/acp-container.scope",
         "launch_plan_binding_version": 1,
         "launch_plan_json": plan_json,
         "launch_config_digest": target.config_sha256,
@@ -755,12 +1295,32 @@ def record_exit(supervisor: GitSupervisor, attempt: dict, exit_code: int = 0) ->
     return supervisor._sandbox_execution_record_exit(attempt["id"], attempt["claim_token"], receipt)
 
 
-def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int = 303):
+def running_attestation(
+    supervisor: GitSupervisor,
+    attempt: dict,
+    init_pid: int = 303,
+    *,
+    register_collected: bool = True,
+    state_root_override: Path | None = None,
+    pid_file_name_override: str | None = None,
+    runc_executable_sha256: str | None = None,
+):
     row = supervisor._sandbox_execution_get(attempt["id"])
     assert row is not None and row["phase"] == "launched"
     init_start = 1303
-    wrapper_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-worker.service"
+    wrapper_cgroup = row["wrapper_cgroup_path"]
+    slice_cgroup = row["attempt_slice_cgroup_path"]
     scope_cgroup = row["cgroup_path"]
+    resource_limits = (
+        json.loads(row["launch_plan_json"])["launch"]["resource_limits"]
+        if row["launch_plan_json"]
+        else {
+            "memory_max_bytes": 1_073_741_824,
+            "cpu_quota": 100_000,
+            "cpu_period": 100_000,
+            "pids_max": 256,
+        }
+    )
 
     def stat(pid: int, start: int) -> bytes:
         fields = [b"S", *([b"0"] * 18), str(start).encode("ascii")]
@@ -789,51 +1349,182 @@ def running_attestation(supervisor: GitSupervisor, attempt: dict, init_pid: int 
             stat(init_pid, init_start),
         ),
     }
-    return validate_running_runtime_attestation(
-        runc_state=json.dumps(
-            {
-                "id": row["container_id"],
-                "status": "running",
-                "pid": init_pid,
-                "bundle": row["bundle_path"],
-            }
-        ).encode("utf-8"),
-        pid_file=f"{init_pid}\n".encode("ascii"),
-        process_snapshots=snapshots,
-        wrapper_properties=(
-            "ActiveState=active\n"
-            f"ControlGroup={wrapper_cgroup}\n"
-            f"Id={row['wrapper_unit']}\n"
-            f"InvocationID={row['wrapper_invocation_id']}\n"
-        ).encode("ascii"),
-        scope_properties=(
-            "ActiveState=active\n"
-            f"ControlGroup={scope_cgroup}\n"
-            f"Id={row['scope_unit']}\n"
-            f"InvocationID={row['scope_invocation_id']}\n"
-        ).encode("ascii"),
-        expected_container_id=row["container_id"],
-        expected_bundle_path=row["bundle_path"],
-        expected_monitor_pid=row["monitor_pid"],
-        expected_monitor_identity=row["monitor_identity"],
-        expected_runc_client_pid=row["runc_client_pid"],
-        expected_runc_client_identity=row["runc_client_identity"],
-        expected_wrapper_unit=row["wrapper_unit"],
-        expected_wrapper_invocation_id=row["wrapper_invocation_id"],
-        expected_scope_unit=row["scope_unit"],
-        expected_scope_invocation_id=row["scope_invocation_id"],
-        expected_cgroup_path=scope_cgroup,
-    )
+    resource_control_files = {
+        "memory.max": f"{resource_limits['memory_max_bytes']}\n".encode("ascii"),
+        "cpu.max": (f"{resource_limits['cpu_quota']} {resource_limits['cpu_period']}\n").encode(
+            "ascii"
+        ),
+        "pids.max": f"{resource_limits['pids_max']}\n".encode("ascii"),
+    }
+    expected = {
+        "expected_container_id": row["container_id"],
+        "expected_bundle_path": row["bundle_path"],
+        "expected_monitor_pid": row["monitor_pid"],
+        "expected_monitor_identity": row["monitor_identity"],
+        "expected_runc_client_pid": row["runc_client_pid"],
+        "expected_runc_client_identity": row["runc_client_identity"],
+        "expected_wrapper_unit": row["wrapper_unit"],
+        "expected_wrapper_invocation_id": row["wrapper_invocation_id"],
+        "expected_attempt_slice_unit": row["attempt_slice_unit"],
+        "expected_attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
+        "expected_scope_unit": row["scope_unit"],
+        "expected_scope_invocation_id": row["scope_invocation_id"],
+        "expected_cgroup_path": scope_cgroup,
+        "expected_memory_max_bytes": resource_limits["memory_max_bytes"],
+        "expected_cpu_quota": resource_limits["cpu_quota"],
+        "expected_cpu_period": resource_limits["cpu_period"],
+        "expected_pids_max": resource_limits["pids_max"],
+    }
+    runc_state = json.dumps(
+        {
+            "id": row["container_id"],
+            "status": "running",
+            "pid": init_pid,
+            "bundle": row["bundle_path"],
+        }
+    ).encode("utf-8")
+    wrapper_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={wrapper_cgroup}\n"
+        f"Id={row['wrapper_unit']}\n"
+        f"InvocationID={row['wrapper_invocation_id']}\n"
+    ).encode("ascii")
+    attempt_slice_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={slice_cgroup}\n"
+        f"Id={row['attempt_slice_unit']}\n"
+        f"InvocationID={row['attempt_slice_invocation_id']}\n"
+    ).encode("ascii")
+    scope_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={scope_cgroup}\n"
+        f"Id={row['scope_unit']}\n"
+        f"InvocationID={row['scope_invocation_id']}\n"
+    ).encode("ascii")
+    validation_args = {
+        **expected,
+        "runc_state": runc_state,
+        "pid_file": f"{init_pid}\n".encode("ascii"),
+        "process_snapshots": snapshots,
+        "wrapper_properties": wrapper_properties,
+        "attempt_slice_properties": attempt_slice_properties,
+        "scope_properties": scope_properties,
+        "resource_control_files": resource_control_files,
+    }
+    if not register_collected:
+        return validate_running_runtime_attestation(**validation_args)
+
+    state_root = state_root_override or Path(row["state_path"])
+    pid_file_path = state_root / (pid_file_name_override or "init.pid")
+    pid_file_path.write_bytes(validation_args["pid_file"])
+    pid_file_path.chmod(0o600)
+
+    def read_proc_file(path: str) -> bytes:
+        snapshot = snapshots[int(path.split("/")[2])]
+        return snapshot.cgroup if path.endswith("/cgroup") else snapshot.stat_before
+
+    collector_args = expected
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sandbox_attestation_module.sys, "platform", "linux")
+        patch.setattr(sandbox_attestation_module, "_read_proc_file", read_proc_file)
+        patch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: resource_control_files,
+        )
+        patch.setattr(
+            sandbox_attestation_module,
+            "_trusted_systemctl_executable",
+            lambda: Path("/usr/bin/systemctl"),
+        )
+        patch.setattr(
+            sandbox_attestation_module,
+            "_trusted_systemd_command_environment",
+            lambda: {"LANG": "C", "LC_ALL": "C"},
+        )
+        patch.setattr(
+            oci_worker,
+            "_verify_trusted_runc_executable",
+            lambda _pin: Path("/usr/bin/runc"),
+        )
+        executable_fd = os.open(os.devnull, os.O_RDONLY)
+        patch.setattr(
+            oci_worker,
+            "_open_verified_runc_executable",
+            lambda _pin: executable_fd,
+        )
+
+        def run_bounded(argv, **_kwargs):
+            command = list(argv)
+            if command[0] == "/usr/bin/runc":
+                return 0, runc_state.decode("utf-8")
+            return 0, {
+                row["wrapper_unit"]: wrapper_properties,
+                row["attempt_slice_unit"]: attempt_slice_properties,
+                row["scope_unit"]: scope_properties,
+            }[command[-1]].decode("ascii")
+
+        patch.setattr(oci_worker, "_run_bounded_command", run_bounded)
+        attestation = collect_running_runtime_attestation(
+            pid_file_path=pid_file_path,
+            state_root=state_root,
+            runc_executable_pin=SimpleNamespace(
+                sha256=runc_executable_sha256 or row["runc_executable_digest"]
+            ),
+            **collector_args,
+        )
+    pid_file_path.unlink()
+    return attestation
 
 
 def record_running(supervisor: GitSupervisor, attempt: dict) -> dict:
     handle = attempt.get("_test_runc_handle")
     assert isinstance(handle, oci_worker.RuncLaunchHandle)
-    return supervisor._sandbox_execution_record_running(
-        attempt["id"],
-        attempt["claim_token"],
-        attestation=running_attestation(supervisor, attempt),
-        runc_handle=handle,
+    attestation = running_attestation(supervisor, attempt)
+    controls = {
+        "memory.max": f"{attestation.memory_max_bytes}\n".encode("ascii"),
+        "cpu.max": f"{attestation.cpu_quota} {attestation.cpu_period}\n".encode("ascii"),
+        "pids.max": f"{attestation.pids_max}\n".encode("ascii"),
+    }
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: controls,
+        )
+        patch.setattr(
+            sandbox_attestation_module,
+            "read_linux_process_snapshot",
+            lambda pid: _live_process_snapshot(attestation, pid),
+        )
+        return supervisor._sandbox_execution_record_running(
+            attempt["id"],
+            attempt["claim_token"],
+            attestation=attestation,
+            runc_handle=handle,
+        )
+
+
+def _live_process_snapshot(attestation, pid: int) -> ProcessSnapshot:
+    expected = {
+        attestation.monitor_pid: (
+            attestation.monitor_identity,
+            attestation.wrapper_control_group,
+        ),
+        attestation.runc_client_pid: (
+            attestation.runc_client_identity,
+            attestation.wrapper_control_group,
+        ),
+        attestation.init_pid: (attestation.init_identity, attestation.cgroup_path),
+    }
+    identity, cgroup = expected[pid]
+    start_time = identity.rsplit(":", 1)[1]
+    fields = [b"S", *([b"0"] * 18), start_time.encode("ascii")]
+    raw_stat = f"{pid} (worker (gate)) ".encode("ascii") + b" ".join(fields) + b"\n"
+    return ProcessSnapshot(
+        stat_before=raw_stat,
+        cgroup=f"0::{cgroup}\n".encode("ascii"),
+        stat_after=raw_stat,
     )
 
 
@@ -844,6 +1535,26 @@ def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
         ).fetchone()
     assert row is not None
     return supervisor._sandbox_cleanup_receipt(row)
+
+
+def synthesize_cleanup_verified_for_downstream_test(
+    supervisor: GitSupervisor, attempt_id: str
+) -> None:
+    """Bypass the unavailable verifier only to exercise post-cleanup consumers."""
+
+    row = supervisor._sandbox_execution_get(attempt_id)
+    assert row is not None and row["phase"] == "cleanup_reported"
+    Path(row["bundle_path"]).rmdir()
+    Path(row["state_path"]).rmdir()
+    with supervisor.connect() as connection:
+        # Production has no cleanup_verified writer. Dropping this guard is
+        # strictly test-only and is not evidence of cleanup verification.
+        connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
+        connection.execute(
+            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
+            (attempt_id,),
+        )
+        connection.commit()
 
 
 def result_fixture(attempt: dict, tmp_path: Path):
@@ -865,7 +1576,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 24
+    assert SCHEMA_VERSION == 27
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -915,20 +1626,30 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
                 "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
                 (attempt["id"],),
             )
-        with pytest.raises(sqlite3.IntegrityError, match="must_start_reserved"):
-            connection.execute(
-                """
-                INSERT INTO sandbox_executions
-                  (attempt_id, claim_token, execution_id, backend, container_id,
-                   bundle_digest, rootfs_digest, runtime_version, oci_version,
-                   bundle_path, state_path, phase, created_at, updated_at)
-                SELECT attempt_id, claim_token, 'direct-insert', backend, 'direct-container',
-                       bundle_digest, rootfs_digest, runtime_version, oci_version,
-                       bundle_path, state_path, 'cleanup_verified', created_at, updated_at
-                FROM sandbox_executions WHERE attempt_id = ?
-                """,
-                (attempt["id"],),
-            )
+        with _authorize_sandbox_reservation_write(
+            connection,
+            attempt["id"],
+            attempt["claim_token"],
+            "direct-insert",
+            row["bundle_digest"],
+            row["bundle_digest_semantics"],
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="must_start_reserved"):
+                connection.execute(
+                    """
+                    INSERT INTO sandbox_executions
+                      (attempt_id, claim_token, execution_id, backend, container_id,
+                       bundle_digest, bundle_digest_semantics, rootfs_digest,
+                       runtime_version, oci_version, bundle_path, state_path, phase,
+                       created_at, updated_at)
+                    SELECT attempt_id, claim_token, 'direct-insert', backend, 'direct-container',
+                           bundle_digest, bundle_digest_semantics, rootfs_digest,
+                           runtime_version, oci_version, bundle_path, state_path,
+                           'cleanup_verified', created_at, updated_at
+                    FROM sandbox_executions WHERE attempt_id = ?
+                    """,
+                    (attempt["id"],),
+                )
     with supervisor.connect() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="identity_immutable"):
             connection.execute(
@@ -1172,7 +1893,6 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
     row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
-        "a" * 64,
         **runtime_claims,
     )
     assert row["workspace_binding_version"] == 0
@@ -1187,7 +1907,8 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
             sqlite3.IntegrityError,
             match=(
                 "workspace_binding_required|private_paths_required|"
-                "sandbox_execution_launch_plan_required|phase_transition_invalid"
+                "sandbox_execution_launch_plan_required|attempt_slice_identity_required|"
+                "phase_transition_invalid"
             ),
         ),
     ):
@@ -1396,26 +2117,15 @@ def test_reservation_requires_exact_live_fence_and_no_registered_direct_worker(r
         supervisor._sandbox_execution_reserve(
             attempt["id"],
             attempt["claim_token"] + 1,
-            "a" * 64,
             **runtime_claims,
         )
     assert stale.value.code == "stale_fencing_token"
-    with pytest.raises(SupervisorError) as invalid:
-        supervisor._sandbox_execution_reserve(
-            attempt["id"],
-            attempt["claim_token"],
-            "not-a-digest",
-            **runtime_claims,
-        )
-    assert invalid.value.code == "sandbox_execution_invalid"
 
     for field in ("rootfs_closure_digest", "runc_executable_digest"):
         options = dict(runtime_claims)
         options[field] = "not-a-digest"
         with pytest.raises(SupervisorError) as malformed:
-            supervisor._sandbox_execution_reserve(
-                attempt["id"], attempt["claim_token"], "a" * 64, **options
-            )
+            supervisor._sandbox_execution_reserve(attempt["id"], attempt["claim_token"], **options)
         assert malformed.value.code == "sandbox_execution_invalid"
     assert supervisor._sandbox_execution_get(attempt["id"]) is None
 
@@ -1437,7 +2147,6 @@ def test_sandbox_reservation_requires_configured_sealed_runtime_pins(repo: Path)
         supervisor._sandbox_execution_reserve(
             attempt["id"],
             attempt["claim_token"],
-            "a" * 64,
             rootfs_digest="b" * 64,
             rootfs_closure_digest="c" * 64,
             runc_executable_digest="d" * 64,
@@ -1475,7 +2184,6 @@ def test_sandbox_reservation_binds_claims_to_configured_runtime_pins(
         supervisor._sandbox_execution_reserve(
             attempt["id"],
             attempt["claim_token"],
-            "a" * 64,
             **mismatched_claims,
         )
     assert mismatch.value.code == "sandbox_execution_pin_mismatch"
@@ -1639,27 +2347,56 @@ def test_result_import_rechecks_journal_at_result_write_boundary(
         guard_calls += 1
         if guard_calls == 2:
             stamp = "2026-10-04T00:00:00Z"
-            connection.execute(
-                """
-                INSERT INTO sandbox_executions
-                  (attempt_id, claim_token, execution_id, backend, container_id,
-                   bundle_digest, rootfs_digest, rootfs_closure_digest,
-                   runc_executable_digest, runtime_version, oci_version,
-                   bundle_path, state_path, phase, created_at, updated_at)
-                VALUES (?, ?, 'race-execution', 'oci-runc', 'race-container', ?, ?, ?, ?,
-                        'test-runc', '1.2.1', '/bundle', '/state', 'reserved', ?, ?)
-                """,
-                (
-                    attempt_id,
-                    attempt["claim_token"],
-                    "a" * 64,
-                    "b" * 64,
-                    "c" * 64,
-                    "d" * 64,
-                    stamp,
-                    stamp,
-                ),
-            )
+            execution = {
+                "attempt_id": attempt_id,
+                "claim_token": attempt["claim_token"],
+                "execution_id": "race-execution",
+                "backend": "oci-runc",
+                "container_id": "race-container",
+                "rootfs_digest": "a" * 64,
+                "rootfs_closure_digest": "b" * 64,
+                "runc_executable_digest": "c" * 64,
+                "runtime_version": "test-runc",
+                "oci_version": "1.2.1",
+                "bundle_path": "/bundle",
+                "state_path": "/state",
+            }
+            bundle_digest = journal_module._sandbox_reservation_bundle_digest(execution)
+            with _authorize_sandbox_reservation_write(
+                connection,
+                attempt_id,
+                attempt["claim_token"],
+                execution["execution_id"],
+                bundle_digest,
+                "oci-reservation-v1",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO sandbox_executions
+                      (attempt_id, claim_token, execution_id, backend, container_id,
+                       bundle_digest, bundle_digest_semantics, rootfs_digest,
+                       rootfs_closure_digest, runc_executable_digest, runtime_version,
+                       oci_version, bundle_path, state_path, phase, created_at, updated_at)
+                    VALUES (?, ?, ?, 'oci-runc', ?, ?, 'oci-reservation-v1', ?, ?, ?, ?,
+                            ?, ?, ?, 'reserved', ?, ?)
+                    """,
+                    (
+                        execution["attempt_id"],
+                        execution["claim_token"],
+                        execution["execution_id"],
+                        execution["container_id"],
+                        bundle_digest,
+                        execution["rootfs_digest"],
+                        execution["rootfs_closure_digest"],
+                        execution["runc_executable_digest"],
+                        execution["runtime_version"],
+                        execution["oci_version"],
+                        execution["bundle_path"],
+                        execution["state_path"],
+                        stamp,
+                        stamp,
+                    ),
+                )
         original_guard(connection, attempt_id)
 
     monkeypatch.setattr(
@@ -2171,7 +2908,9 @@ def test_private_runtime_path_binding_is_required_and_write_once(repo: Path) -> 
     assert supervisor.verify_event_chain()["ok"] is True
 
 
-def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Path) -> None:
+def test_running_transition_requires_intact_attestation_bound_to_launch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
@@ -2200,14 +2939,28 @@ def test_running_transition_requires_intact_attestation_bound_to_launch(repo: Pa
         stale,
         evidence_sha256=hashlib.sha256(canonical_json(stale_payload).encode("utf-8")).hexdigest(),
     )
-    assert running_attestation_is_self_consistent(stale)
+    assert not running_attestation_is_self_consistent(stale)
     with pytest.raises(SupervisorError) as mismatched_launch:
         supervisor._sandbox_execution_record_running(
             attempt["id"], attempt["claim_token"], attestation=stale
         )
-    assert mismatched_launch.value.code == "sandbox_runtime_attestation_stale"
+    assert mismatched_launch.value.code == "sandbox_runtime_attestation_invalid"
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
 
+    monkeypatch.setattr(
+        sandbox_attestation_module,
+        "read_cgroup_resource_controls",
+        lambda _path: {
+            "memory.max": f"{receipt.memory_max_bytes}\n".encode("ascii"),
+            "cpu.max": f"{receipt.cpu_quota} {receipt.cpu_period}\n".encode("ascii"),
+            "pids.max": f"{receipt.pids_max}\n".encode("ascii"),
+        },
+    )
+    monkeypatch.setattr(
+        sandbox_attestation_module,
+        "read_linux_process_snapshot",
+        lambda pid: _live_process_snapshot(receipt, pid),
+    )
     running = supervisor._sandbox_execution_record_running(
         attempt["id"],
         attempt["claim_token"],
@@ -2304,6 +3057,15 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
 
+    with pytest.raises(SupervisorError) as unverified:
+        supervisor._sandbox_execution_capture_result_candidate(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert unverified.value.code == "sandbox_result_evidence_unverified"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
+
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+
     captured = supervisor._sandbox_execution_capture_result_candidate(
         attempt["id"], attempt["claim_token"]
     )
@@ -2361,13 +3123,66 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
         supervisor.import_worker_result(
             attempt["id"], attempt["claim_token"], binding["baseline"], change_set
         )
-    assert imported.value.code == "sandbox_result_unverified"
+    assert imported.value.code == "sandbox_result_import_route_required"
     with supervisor.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
     reopened = GitSupervisor(repo)
     persisted = reopened._sandbox_execution_get(attempt["id"])
     assert persisted["result_candidate"] == candidate
     assert persisted["result_candidate_digest"] == captured["candidate_digest"]
+
+
+def test_schema27_migration_moves_candidate_write_guard_to_verified_cleanup(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+    record_exit(supervisor, attempt)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+    )
+
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_result_candidate_write_once")
+        # Recreate the schema-26 predicate and version marker to exercise the
+        # forward migration on a database containing an unverified row.
+        connection.execute(
+            """
+            CREATE TRIGGER sandbox_result_candidate_write_once
+            BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+              result_candidate_digest ON sandbox_executions
+            WHEN OLD.result_candidate_version = 0
+              AND NEW.result_candidate_version = 1
+              AND OLD.phase = 'cleanup_reported'
+            BEGIN
+              SELECT RAISE(ABORT, 'sandbox_result_candidate_immutable');
+            END
+            """
+        )
+        connection.execute("UPDATE meta SET value = '26' WHERE key = 'schema_version'")
+        connection.commit()
+
+    upgraded = GitSupervisor(repo)
+    assert upgraded.schema_version_on_open == 26
+    with upgraded.connect() as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'sandbox_result_candidate_write_once'"
+        ).fetchone()
+        assert trigger is not None
+        assert "cleanup_verified" in trigger["sql"]
+        assert "cleanup_reported" not in trigger["sql"]
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_result_candidate_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET result_candidate_version = 1, "
+                "result_candidate_json = ?, result_candidate_digest = ? WHERE attempt_id = ?",
+                (
+                    '{"authorization":"none","status":"unverified"}',
+                    "0" * 64,
+                    attempt["id"],
+                ),
+            )
 
 
 def test_sandbox_import_route_fails_closed_before_cleanup_verification(repo: Path) -> None:
@@ -2428,19 +3243,13 @@ def test_sandbox_import_uses_distinct_source_and_recovers_published_ref(
     supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
-    supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
 
-    # Exercise the downstream import boundary with a synthetic already-verified
-    # journal state. No production method currently writes cleanup_verified, so
-    # this is not cleanup-verifier or live-runtime evidence.
-    Path(row["bundle_path"]).rmdir()
-    Path(row["state_path"]).rmdir()
+    # Exercise downstream import only with a synthetic already-verified
+    # journal state. No production method writes cleanup_verified, so this is
+    # not cleanup-verifier or live-runtime evidence.
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+    supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
     with supervisor.connect() as connection:
-        connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
-        connection.execute(
-            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
-            (attempt["id"],),
-        )
         # Model a corrupt/legacy mixed-source journal with a different claim
         # token and result digest; healthy-schema guards normally prevent it.
         connection.execute("DROP TRIGGER result_import_direct_source_insert_guard")
@@ -2566,6 +3375,8 @@ def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> No
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
 
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+
     first = supervisor._sandbox_execution_capture_result_candidate(
         attempt["id"], attempt["claim_token"]
     )
@@ -2652,10 +3463,12 @@ def test_persisted_pre_schema17_cleanup_receipt_replays_but_never_proves_cleanup
 
     workspace = Path(supervisor._sandbox_execution_get(attempt["id"])["workspace_root_path"])
     (workspace / "alpha.txt").write_text("legacy cleanup receipt candidate\n", encoding="utf-8")
-    candidate = supervisor._sandbox_execution_capture_result_candidate(
-        attempt["id"], attempt["claim_token"]
-    )
-    assert candidate["candidate"]["cleanup"]["status"] == "unverified"
+    with pytest.raises(SupervisorError) as unverified_candidate:
+        supervisor._sandbox_execution_capture_result_candidate(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert unverified_candidate.value.code == "sandbox_result_evidence_unverified"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
 
     current_receipt = cleanup_receipt(supervisor, attempt["id"])
     with pytest.raises(SupervisorError) as replace_legacy:

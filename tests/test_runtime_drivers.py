@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2160,6 +2164,10 @@ def recording_runner(stdout_for: dict[str, str] | None = None):
     return runner, calls
 
 
+def namespace_unit_argv(calls: list[list[str]]) -> list[str]:
+    return next(call for call in calls if Path(call[0]).name == "systemd-run")
+
+
 # /bin/sh is root-owned on both macOS and Linux, so it satisfies the trust
 # boundary in a parse test without needing systemd present.
 TRUSTED_BIN = "/bin/sh"
@@ -2188,7 +2196,7 @@ def test_namespace_runtime_never_uses_a_scope(tmp_path: Path) -> None:
     driver = namespace_driver()
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--scope" not in argv
     assert "--property=KillMode=control-group" in argv
 
@@ -2197,7 +2205,7 @@ def test_namespace_runtime_applies_every_quota_as_a_unit_property(tmp_path: Path
     driver = namespace_driver()
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--property=MemoryMax=64M" in argv
     assert "--property=TasksMax=16" in argv
     assert "--property=CPUQuota=50%" in argv
@@ -2208,7 +2216,11 @@ def test_namespace_runtime_denies_egress_by_default(tmp_path: Path) -> None:
     driver = namespace_driver()
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    preflight = calls[0]
+    assert Path(preflight[0]).name == "unshare"
+    assert preflight[1:7] == ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--net"]
+    assert preflight[7:] == ["--", "/bin/sh", "-c", "exit 0"]
+    argv = namespace_unit_argv(calls)
     assert "/usr/bin/unshare" in argv and "--net" in argv
     # 🔴 Detaching a netns needs CAP_SYS_ADMIN: plain `unshare --net` fails
     # EPERM unprivileged, the unit never starts, and a "can the host reach it"
@@ -2225,7 +2237,8 @@ def test_namespace_runtime_egress_allow_skips_only_the_network_namespace(tmp_pat
     driver = namespace_driver(egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    assert "--net" not in calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--net" not in argv
     assert "--mount" in argv and "--pid" in argv and "--fork" in argv
 
@@ -2940,7 +2953,7 @@ def test_namespace_runtime_disk_quota_is_a_sized_tmpfs(tmp_path: Path) -> None:
     driver = namespace_driver(disk_max="16M", egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--mount" in argv  # a tmpfs needs the mount namespace
     script = argv[-1]
     assert " -t tmpfs -o size=16M,mode=0700 tmpfs /tmp" in script
@@ -2966,11 +2979,37 @@ def test_namespace_runtime_reenters_the_writable_layer_after_mounting_it(tmp_pat
     assert script.index("cd ") < script.index("/bin/sleep 30")
 
 
+def test_namespace_runtime_fails_before_unit_when_rootless_namespaces_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver()
+    calls: list[list[str]] = []
+
+    def unavailable_runner(argv, *_args):  # type: ignore[no-untyped-def]
+        calls.append(list(argv))
+        assert Path(argv[0]).name == "unshare"
+        return {
+            "argv": list(argv),
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "write failed /proc/self/uid_map: Operation not permitted",
+            "timed_out": False,
+        }
+
+    with pytest.raises(DriverError) as error:
+        driver.setup(context(tmp_path), unavailable_runner)
+
+    assert error.value.code == "namespace_unavailable"
+    assert "refusing to start the runtime unit" in str(error.value)
+    assert len(calls) == 1
+    assert calls[0][1:7] == ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--net"]
+
+
 def test_namespace_runtime_combines_disk_quota_with_read_only_base(tmp_path: Path) -> None:
     driver = namespace_driver(disk_max="32M", read_only_paths="/opt/base", egress="deny")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     script = argv[-1]
     # one mount namespace serves both, and the netns is still applied
     assert argv.count("--mount") == 1 and "--net" in argv
@@ -2983,7 +3022,7 @@ def test_namespace_runtime_without_disk_max_uses_a_safe_default(tmp_path: Path) 
     driver = namespace_driver(egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    assert "size=64M" in calls[0][-1]
+    assert "size=64M" in namespace_unit_argv(calls)[-1]
 
 
 def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
@@ -2992,7 +3031,7 @@ def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
     driver = namespace_driver(egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     script = argv[-1]
 
     assert "/tmp/acp-root" in script
@@ -3005,11 +3044,200 @@ def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
     assert script.index("chroot") < script.index("--bounding-set=-all")
 
 
+def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
+    tmp_path: Path,
+) -> None:
+    """Measure the real resource driver; this is not registered-worker proof."""
+
+    if os.environ.get("ACP_RUN_NAMESPACE_INTEGRATION") != "1":
+        pytest.skip("set ACP_RUN_NAMESPACE_INTEGRATION=1 on a disposable supported Linux host")
+    if not sys.platform.startswith("linux"):
+        pytest.skip("NamespaceRuntimeDriver integration requires Linux user namespaces")
+
+    assert os.geteuid() != 0, "the live namespace driver must be exercised rootlessly"
+    assert Path("/sys/fs/cgroup/cgroup.controllers").is_file(), "unified cgroup v2 is required"
+    attempt_id = f"live-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    # The driver makes /tmp private before bind-mounting its inputs. Keep this
+    # source outside /tmp so the live probe exercises a viable host path.
+    worktree = Path.home() / f".acp-live-worktree-{uuid.uuid4().hex}"
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    driver_context = DriverContext(
+        attempt_id=attempt_id,
+        task_id="task-2370-live-probe",
+        runtime_dir=runtime_dir,
+        expires_at=int(time.time()) + 90,
+        secret=b"test-secret",
+        environment={
+            "ACP_ATTEMPT_ID": attempt_id,
+            "ACP_WORKTREE": str(worktree),
+            "ACP_REPO_ROOT": str(worktree),
+        },
+    )
+    driver = namespace_driver(
+        payload="/bin/sh /workspace/fake-agent.sh",
+        unit_prefix="acp-ns-it",
+        wall_clock_seconds="60",
+    )
+    unit = driver._unit(driver_context)
+    marker = None
+    marker_host_pid = None
+    worktree_identity = None
+    parent_fd = os.open(
+        worktree.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+
+    try:
+        os.mkdir(worktree.name, mode=0o700, dir_fd=parent_fd)
+        worktree_stat = os.stat(worktree.name, dir_fd=parent_fd, follow_symlinks=False)
+        assert stat.S_ISDIR(worktree_stat.st_mode)
+        worktree_identity = (worktree_stat.st_dev, worktree_stat.st_ino)
+        (worktree / "fake-agent.sh").write_text(
+            "#!/bin/sh\n"
+            "{\n"
+            "  printf 'inner_pid=%s\\n' \"$$\"\n"
+            "  printf 'home=%s\\n' \"$HOME\"\n"
+            "  printf 'cwd=%s\\n' \"$PWD\"\n"
+            "  if [ -r /etc/os-release ]; then echo host_etc_os_release=readable; "
+            "else echo host_etc_os_release=absent; fi\n"
+            "  if touch /workspace/should-not-write 2>/dev/null; then "
+            "echo workspace_write=allowed; else echo workspace_write=denied; fi\n"
+            "} > /work/acp-agent-marker\n"
+            "sleep 30\n",
+            encoding="utf-8",
+        )
+
+        launch = driver.setup(driver_context, run_trusted)
+        assert launch.get("exit_code") == 0, launch
+        present, observation = driver.probe(driver_context, run_trusted)
+        assert present is True, observation
+        assert observation.get("systemd_unit_invocation_id")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and marker is None:
+            shown = run_trusted(
+                [
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "--property=MainPID",
+                    "--property=ControlGroup",
+                ],
+                runtime_dir,
+                {},
+                10,
+                None,
+            )
+            assert shown.get("exit_code") == 0, shown
+            properties = dict(
+                line.split("=", 1) for line in shown.get("stdout", "").splitlines() if "=" in line
+            )
+            control_group = properties.get("ControlGroup", "")
+            group_parts = Path(control_group.lstrip("/")).parts
+            assert group_parts and group_parts[0] == "user.slice", properties
+            assert all(part not in {"", ".", ".."} for part in group_parts), properties
+            cgroup_root = Path("/sys/fs/cgroup").resolve()
+            cgroup_dir = cgroup_root.joinpath(*group_parts).resolve()
+            assert cgroup_dir.is_relative_to(cgroup_root), properties
+            cgroup_procs = cgroup_dir / "cgroup.procs"
+            pids = {
+                int(value)
+                for value in cgroup_procs.read_text(encoding="ascii").splitlines()
+                if value.isdigit()
+            }
+            for pid in sorted(pids):
+                try:
+                    marker = Path(f"/proc/{pid}/root/work/acp-agent-marker").read_text(
+                        encoding="utf-8"
+                    )
+                    marker_host_pid = pid
+                    break
+                except OSError:
+                    pass
+            if marker is None:
+                time.sleep(0.05)
+
+        assert marker is not None and marker_host_pid is not None, observation
+        observed = dict(line.split("=", 1) for line in marker.splitlines() if "=" in line)
+        assert observed["home"] == "/work"
+        assert observed["cwd"] == "/work"
+        assert observed["host_etc_os_release"] == "readable"
+        assert observed["workspace_write"] == "denied"
+        assert int(observed["inner_pid"]) > 0
+        assert os.readlink(f"/proc/{marker_host_pid}/ns/pid") != os.readlink("/proc/self/ns/pid")
+        assert not (worktree / "should-not-write").exists()
+    finally:
+        cleanup_proven = False
+        try:
+            driver.teardown(driver_context, run_trusted)
+            present_after, cleanup_observation = driver.probe(driver_context, run_trusted)
+            cleanup_proven = driver.cleanup_is_proven(present_after, cleanup_observation)
+            assert cleanup_proven, (cleanup_observation, str(worktree))
+        finally:
+            try:
+                if cleanup_proven and worktree_identity is not None:
+                    assert shutil.rmtree.avoids_symlink_attacks, "fd-safe rmtree is unavailable"
+                    current_stat = os.stat(
+                        worktree.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    assert stat.S_ISDIR(current_stat.st_mode)
+                    assert (current_stat.st_dev, current_stat.st_ino) == worktree_identity
+                    shutil.rmtree(worktree.name, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+
+
+def test_live_namespace_runtime_refuses_unit_when_rootless_namespaces_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    if os.environ.get("ACP_RUN_NAMESPACE_INTEGRATION") != "1":
+        pytest.skip("set ACP_RUN_NAMESPACE_INTEGRATION=1 on a disposable Linux host")
+    if not sys.platform.startswith("linux"):
+        pytest.skip("NamespaceRuntimeDriver integration requires Linux user namespaces")
+
+    attempt_id = f"preflight-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    driver_context = context(tmp_path, attempt_id=attempt_id)
+    driver = namespace_driver(
+        payload="/bin/true",
+        unit_prefix="acp-ns-preflight-it",
+        wall_clock_seconds="60",
+    )
+    present_before, before_observation = driver.probe(driver_context, run_trusted)
+    if before_observation.get("exit_code") != 0 or present_before is not False:
+        pytest.skip("a working systemd --user manager with no matching unit is required")
+
+    capability = run_trusted(
+        driver._namespace_preflight_argv(),
+        driver_context.runtime_dir,
+        driver._env(driver_context),
+        10,
+        None,
+    )
+    if capability.get("exit_code") == 0 and not capability.get("timed_out"):
+        pytest.skip("rootless namespace prerequisites are available on this host")
+
+    try:
+        with pytest.raises(DriverError) as error:
+            driver.setup(driver_context, run_trusted)
+        assert error.value.code == "namespace_unavailable"
+        present_after, observation = driver.probe(driver_context, run_trusted)
+        assert present_after is False
+        assert observation.get("absence_proved_by") == "systemd-unit-not-found"
+    finally:
+        driver.teardown(driver_context, run_trusted)
+        cleaned, cleanup_observation = driver.probe(driver_context, run_trusted)
+        assert driver.cleanup_is_proven(cleaned, cleanup_observation)
+
+
 def test_namespace_runtime_exports_only_sandbox_paths_to_the_service(tmp_path: Path) -> None:
     driver = namespace_driver(egress="allow", read_only_paths="/opt/base")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
 
     assert "--working-directory=/" in argv
     assert "--setenv=ACP_WORKTREE=/workspace" in argv

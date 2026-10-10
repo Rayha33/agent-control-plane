@@ -221,6 +221,53 @@ def test_qc_latest_lookup_index_migration_is_idempotent() -> None:
     connection.close()
 
 
+def test_v26_attempt_slice_identity_migration_is_idempotent_and_fail_closed() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE sandbox_executions (phase TEXT NOT NULL)")
+
+    migration = dict(MIGRATIONS)[26]
+    migration(connection)
+    migration(connection)
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    assert {
+        "wrapper_cgroup_path",
+        "attempt_slice_unit",
+        "attempt_slice_invocation_id",
+        "attempt_slice_cgroup_path",
+    }.issubset(columns)
+
+    connection.execute("INSERT INTO sandbox_executions (phase) VALUES ('reserved')")
+    with pytest.raises(sqlite3.IntegrityError, match="slice_identity_requires_launch"):
+        connection.execute(
+            "UPDATE sandbox_executions SET attempt_slice_unit = 'user-acp-old.slice' "
+            "WHERE phase = 'reserved'"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_slice_identity_required"):
+        connection.execute(
+            "UPDATE sandbox_executions SET phase = 'launched' WHERE phase = 'reserved'"
+        )
+
+    connection.execute(
+        """
+        UPDATE sandbox_executions
+        SET phase = 'launched',
+            wrapper_cgroup_path = '/user.slice/attempt.slice/worker.service',
+            attempt_slice_unit = 'attempt.slice',
+            attempt_slice_invocation_id = ?,
+            attempt_slice_cgroup_path = '/user.slice/attempt.slice'
+        WHERE phase = 'reserved'
+        """,
+        ("1" * 32,),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="slice_identity_"):
+        connection.execute(
+            "UPDATE sandbox_executions SET attempt_slice_unit = 'other.slice' "
+            "WHERE phase = 'launched'"
+        )
+    connection.close()
+
+
 def test_v7_read_only_open_requires_qc_latest_index_migration(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     with supervisor.connect() as connection:

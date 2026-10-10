@@ -2,9 +2,10 @@
 
 Launch and exit records are bound to the pinned-runc process handle and its
 wait receipt. The public OCI-init gate can be released only after the exact
-registered handle is durably recorded as running, but this module does not
-orchestrate a worker lifecycle, authenticate observation provenance, or
-establish a sandbox. A cleanup report is not accepted as cleanup verification.
+registered handle and the exact object issued by the process-local runtime collector are
+durably recorded as running, but this module does not orchestrate a worker
+lifecycle or establish a sandbox. A cleanup report is not accepted as cleanup
+verification.
 The existing reaper and runtime teardown stay fenced until a separate trusted
 verifier advances the journal to ``cleanup_verified``.
 """
@@ -26,6 +27,8 @@ from .common import CLEANUP_FENCE_EPOCH, SupervisorError, canonical_json, utc_no
 from .oci_worker import (
     RuncLaunchHandle,
     _authorize_runc_launch_gate_release_locked,
+    _oci_worker_systemd_slice,
+    _private_directory,
     _revoke_runc_launch_gate_release_locked,
     _runc_client_wait_receipt_is_self_consistent,
     _runc_launch_gate_lock_for_execution,
@@ -39,7 +42,10 @@ from .oci_worker import (
 )
 from .sandbox_attestation import (
     RunningRuntimeAttestation,
+    running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
+    verify_running_runtime_process_membership,
+    verify_running_runtime_resource_controls,
 )
 from .sandbox_workspace import (
     _MAX_DURABLE_MANIFEST_BYTES,
@@ -52,13 +58,17 @@ from .sandbox_workspace import collect_changes as _collect_changes
 from .store import (
     _authorize_sandbox_exit_receipt_write,
     _authorize_sandbox_launch_plan_write,
+    _authorize_sandbox_reservation_write,
 )
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_SYSTEMD_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope)\Z")
+_SYSTEMD_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope|slice)\Z")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_ATTEMPT_SLICE_COMPONENT = re.compile(r"user-acp-[0-9a-f]{64}\.slice\Z")
+_LEGACY_BUNDLE_DIGEST_SEMANTICS = "legacy-caller-asserted-v0"
+_BUNDLE_DIGEST_SEMANTICS = "oci-reservation-v1"
 _PHASES = frozenset(
     {
         "reserved",
@@ -80,6 +90,10 @@ _TRANSITION_FIELDS = {
             "runc_client_identity",
             "wrapper_unit",
             "wrapper_invocation_id",
+            "wrapper_cgroup_path",
+            "attempt_slice_unit",
+            "attempt_slice_invocation_id",
+            "attempt_slice_cgroup_path",
             "scope_unit",
             "scope_invocation_id",
             "cgroup_path",
@@ -102,36 +116,39 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     argv = list(target.argv)
     argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
     return {
-        "version": 1,
+        "version": 5,
         "reservation": {
-            key: execution[key]
-            for key in (
-                "attempt_id",
-                "claim_token",
-                "execution_id",
-                "backend",
-                "container_id",
-                "bundle_digest",
-                "rootfs_digest",
-                "rootfs_closure_digest",
-                "runc_executable_digest",
-                "runtime_version",
-                "oci_version",
-                "bundle_path",
-                "state_path",
-                "workspace_binding_version",
-                "baseline_manifest_digest",
-                "workspace_root_path",
-                "workspace_root_dev",
-                "workspace_root_ino",
-                "private_path_binding_version",
-                "execution_root_dev",
-                "execution_root_ino",
-                "bundle_root_dev",
-                "bundle_root_ino",
-                "state_root_dev",
-                "state_root_ino",
-            )
+            "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
+            **{
+                key: execution[key]
+                for key in (
+                    "attempt_id",
+                    "claim_token",
+                    "execution_id",
+                    "backend",
+                    "container_id",
+                    "bundle_digest",
+                    "rootfs_digest",
+                    "rootfs_closure_digest",
+                    "runc_executable_digest",
+                    "runtime_version",
+                    "oci_version",
+                    "bundle_path",
+                    "state_path",
+                    "workspace_binding_version",
+                    "baseline_manifest_digest",
+                    "workspace_root_path",
+                    "workspace_root_dev",
+                    "workspace_root_ino",
+                    "private_path_binding_version",
+                    "execution_root_dev",
+                    "execution_root_ino",
+                    "bundle_root_dev",
+                    "bundle_root_ino",
+                    "state_root_dev",
+                    "state_root_ino",
+                )
+            },
         },
         "launch": {
             "mode": target.launch_mode,
@@ -172,8 +189,71 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
                 "inode": target.workspace_inode,
             },
             "pid_file_path": target.pid_file_path,
+            "resource_limits": {
+                "memory_max_bytes": target.memory_limit_bytes,
+                "cpu_quota": target.cpu_quota,
+                "cpu_period": target.cpu_period,
+                "pids_max": target.pids_limit,
+            },
         },
     }
+
+
+def _sandbox_reservation_bundle_digest(execution: Any) -> str:
+    """Hash host-derived reservation identity, not caller-asserted bundle bytes.
+
+    The launch config does not exist when the reservation is inserted. This
+    versioned digest therefore commits only the immutable execution identity and
+    configured runtime pins. The exact OCI config and argv are bound separately
+    by the later launch-plan receipt; this value is never treated as their hash.
+    """
+
+    material = {
+        "version": 1,
+        "kind": _BUNDLE_DIGEST_SEMANTICS,
+        **{
+            key: execution[key]
+            for key in (
+                "attempt_id",
+                "claim_token",
+                "execution_id",
+                "backend",
+                "container_id",
+                "rootfs_digest",
+                "rootfs_closure_digest",
+                "runc_executable_digest",
+                "runtime_version",
+                "oci_version",
+                "bundle_path",
+                "state_path",
+            )
+        },
+    }
+    return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def _sandbox_v5_cgroup_topology_is_self_consistent(row: Any) -> bool:
+    """Require the trusted monitor to survive an exact worker-slice stop."""
+
+    try:
+        monitor = PurePosixPath(row["wrapper_cgroup_path"])
+        attempt_slice = PurePosixPath(row["attempt_slice_cgroup_path"])
+        scope = PurePosixPath(row["cgroup_path"])
+        paths = (monitor, attempt_slice, scope)
+        return (
+            all(path.is_absolute() and path.as_posix() == str(path) for path in paths)
+            and all(part not in {".", ".."} for path in paths for part in path.parts)
+            and monitor.name == row["wrapper_unit"]
+            and attempt_slice.name == row["attempt_slice_unit"]
+            and scope.name == row["scope_unit"]
+            and row["attempt_slice_unit"] == _oci_worker_systemd_slice(row["container_id"])
+            and not monitor.is_relative_to(attempt_slice)
+            and not attempt_slice.is_relative_to(monitor)
+            and not any(_ATTEMPT_SLICE_COMPONENT.fullmatch(part) for part in monitor.parts)
+            and scope.parent == attempt_slice
+        )
+    except (KeyError, TypeError, ValueError, SupervisorError):
+        return False
 
 
 def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
@@ -194,7 +274,8 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
             return False
         if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
             return False
-        if plan.get("version") != 1:
+        plan_version = plan.get("version")
+        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4, 5}:
             return False
         reservation = plan.get("reservation")
         expected_reservation = {
@@ -227,8 +308,31 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
                 "state_root_ino",
             )
         }
+        if plan_version in {2, 3, 4, 5}:
+            if row["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
+                return False
+            if row["bundle_digest"] != _sandbox_reservation_bundle_digest(row):
+                return False
+            expected_reservation["bundle_digest_semantics"] = _BUNDLE_DIGEST_SEMANTICS
+        elif row["bundle_digest_semantics"] != _LEGACY_BUNDLE_DIGEST_SEMANTICS:
+            return False
         launch = plan.get("launch")
         if reservation != expected_reservation or not isinstance(launch, dict):
+            return False
+        if plan_version < 3:
+            return False
+        systemd_ownership = launch.get("systemd_ownership")
+        expected_systemd_ownership = {
+            "wrapper_control_group": row["wrapper_cgroup_path"],
+            "attempt_slice_unit": row["attempt_slice_unit"],
+            "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
+            "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
+        }
+        if plan_version >= 5:
+            expected_systemd_ownership["monitor_placement"] = "outside_attempt_slice"
+        if systemd_ownership != expected_systemd_ownership:
+            return False
+        if plan_version >= 5 and not _sandbox_v5_cgroup_topology_is_self_consistent(row):
             return False
         argv = launch.get("argv")
         bundle = launch.get("bundle")
@@ -240,6 +344,19 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         pid_file_path = launch.get("pid_file_path")
         snapshot = rootfs.get("snapshot")
         if not isinstance(pid_file_path, str) or not isinstance(snapshot, dict):
+            return False
+        resource_limits = launch.get("resource_limits")
+        if plan_version >= 4 and (
+            not isinstance(resource_limits, dict)
+            or set(resource_limits)
+            != {
+                "memory_max_bytes",
+                "cpu_quota",
+                "cpu_period",
+                "pids_max",
+            }
+            or any(type(value) is not int or value <= 0 for value in resource_limits.values())
+        ):
             return False
         argv_shape_matches = (
             isinstance(argv, list)
@@ -457,7 +574,6 @@ class SandboxExecutionJournalMixin:
         self,
         attempt_id: str,
         claim_token: int,
-        bundle_digest: str,
         *,
         rootfs_digest: str,
         rootfs_closure_digest: str,
@@ -470,8 +586,6 @@ class SandboxExecutionJournalMixin:
 
         attempt_id = self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
-        if not isinstance(bundle_digest, str) or _DIGEST.fullmatch(bundle_digest) is None:
-            raise SupervisorError("sandbox_execution_invalid", "bundle digest must be SHA-256")
         if not isinstance(rootfs_digest, str) or _DIGEST.fullmatch(rootfs_digest) is None:
             raise SupervisorError("sandbox_execution_invalid", "rootfs digest must be SHA-256")
         if (
@@ -539,6 +653,22 @@ class SandboxExecutionJournalMixin:
         )
         bundle_path = str(execution_root / "bundle")
         state_path = str(execution_root / "state")
+        bundle_digest = _sandbox_reservation_bundle_digest(
+            {
+                "attempt_id": attempt_id,
+                "claim_token": claim_token,
+                "execution_id": execution_id,
+                "backend": "oci-runc",
+                "container_id": container_id,
+                "rootfs_digest": rootfs_digest,
+                "rootfs_closure_digest": rootfs_closure_digest,
+                "runc_executable_digest": runc_executable_digest,
+                "runtime_version": runtime_version,
+                "oci_version": oci_version,
+                "bundle_path": bundle_path,
+                "state_path": state_path,
+            }
+        )
         stamp = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -554,32 +684,42 @@ class SandboxExecutionJournalMixin:
                     "sandbox execution cannot be reserved beside a registered direct worker",
                 )
             try:
-                connection.execute(
-                    """
-                    INSERT INTO sandbox_executions
-                      (attempt_id, claim_token, execution_id, backend, container_id,
-                       bundle_digest, launch_plan_required, rootfs_digest, rootfs_closure_digest,
-                       runc_executable_digest, runtime_version, oci_version,
-                       bundle_path, state_path, phase, created_at, updated_at)
-                    VALUES (?, ?, ?, 'oci-runc', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
-                    """,
-                    (
-                        attempt_id,
-                        claim_token,
-                        execution_id,
-                        container_id,
-                        bundle_digest,
-                        rootfs_digest,
-                        rootfs_closure_digest,
-                        runc_executable_digest,
-                        runtime_version,
-                        oci_version,
-                        bundle_path,
-                        state_path,
-                        stamp,
-                        stamp,
-                    ),
-                )
+                with _authorize_sandbox_reservation_write(
+                    connection,
+                    attempt_id,
+                    claim_token,
+                    execution_id,
+                    bundle_digest,
+                    _BUNDLE_DIGEST_SEMANTICS,
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO sandbox_executions
+                          (attempt_id, claim_token, execution_id, backend, container_id,
+                           bundle_digest, bundle_digest_semantics, launch_plan_required,
+                           rootfs_digest, rootfs_closure_digest, runc_executable_digest,
+                           runtime_version, oci_version,
+                           bundle_path, state_path, phase, created_at, updated_at)
+                        VALUES (?, ?, ?, 'oci-runc', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+                        """,
+                        (
+                            attempt_id,
+                            claim_token,
+                            execution_id,
+                            container_id,
+                            bundle_digest,
+                            _BUNDLE_DIGEST_SEMANTICS,
+                            rootfs_digest,
+                            rootfs_closure_digest,
+                            runc_executable_digest,
+                            runtime_version,
+                            oci_version,
+                            bundle_path,
+                            state_path,
+                            stamp,
+                            stamp,
+                        ),
+                    )
             except sqlite3.IntegrityError as error:
                 if "UNIQUE constraint failed" in str(error):
                     raise SupervisorError(
@@ -598,6 +738,7 @@ class SandboxExecutionJournalMixin:
                     "backend": "oci-runc",
                     "container_id": container_id,
                     "bundle_digest": bundle_digest,
+                    "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
                     "rootfs_digest": rootfs_digest,
                     "rootfs_closure_digest": rootfs_closure_digest,
                     "runc_executable_digest": runc_executable_digest,
@@ -1011,7 +1152,7 @@ class SandboxExecutionJournalMixin:
             if (
                 execution is None
                 or execution["execution_id"] != binding["execution_id"]
-                or execution["phase"] not in {"cleanup_reported", "cleanup_verified"}
+                or execution["phase"] != "cleanup_verified"
                 or execution["runc_exit_code"] != 0
                 or execution["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or execution["baseline_root_path"] != str(baseline_root)
@@ -1023,7 +1164,7 @@ class SandboxExecutionJournalMixin:
             ):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
-                    "candidate capture requires the exact exited, cleanup-reported workspace",
+                    "candidate capture requires the exact cleanup-verified workspace",
                 )
             task = self._task_row(connection, attempt["task_id"])
             write_set_rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
@@ -1059,7 +1200,7 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_not_found", "execution reservation is missing"
                 )
             if (
-                row["phase"] not in {"cleanup_reported", "cleanup_verified"}
+                row["phase"] != "cleanup_verified"
                 or row["runc_exit_code"] != 0
                 or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or row["workspace_binding_version"] != 1
@@ -1073,7 +1214,7 @@ class SandboxExecutionJournalMixin:
             ):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
-                    "candidate result is not bound to the exited execution workspace",
+                    "candidate result is not bound to the cleanup-verified execution workspace",
                 )
             task = self._task_row(connection, attempt["task_id"])
             current_write_set_rules = self._write_set_rules(
@@ -1168,7 +1309,7 @@ class SandboxExecutionJournalMixin:
                 SET result_candidate_version = 1, result_candidate_json = ?,
                     result_candidate_digest = ?, updated_at = ?
                 WHERE attempt_id = ? AND claim_token = ?
-                  AND phase IN ('cleanup_reported', 'cleanup_verified')
+                  AND phase = 'cleanup_verified'
                   AND result_candidate_version = 0
                 """,
                 (encoded, digest, utc_now(), attempt_id, claim_token),
@@ -1505,6 +1646,10 @@ class SandboxExecutionJournalMixin:
         runc_handle: RuncLaunchHandle,
         wrapper_unit: str,
         wrapper_invocation_id: str,
+        wrapper_cgroup_path: str,
+        attempt_slice_unit: str,
+        attempt_slice_invocation_id: str,
+        attempt_slice_cgroup_path: str,
         scope_unit: str,
         scope_invocation_id: str,
         cgroup_path: str,
@@ -1533,6 +1678,12 @@ class SandboxExecutionJournalMixin:
         wrapper_invocation_id = self._sandbox_invocation_id(
             wrapper_invocation_id, "wrapper_invocation_id"
         )
+        attempt_slice_unit = self._sandbox_systemd_unit(
+            attempt_slice_unit, "attempt_slice_unit", ".slice"
+        )
+        attempt_slice_invocation_id = self._sandbox_invocation_id(
+            attempt_slice_invocation_id, "attempt_slice_invocation_id"
+        )
         scope_unit = self._sandbox_systemd_unit(scope_unit, "scope_unit", ".scope")
         scope_invocation_id = self._sandbox_invocation_id(
             scope_invocation_id, "scope_invocation_id"
@@ -1541,16 +1692,37 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_invalid", "monitor, runc client, and scope identities conflict"
             )
+        wrapper_cgroup_path = self._sandbox_text(
+            wrapper_cgroup_path, "wrapper_cgroup_path", limit=4096
+        )
+        attempt_slice_cgroup_path = self._sandbox_text(
+            attempt_slice_cgroup_path, "attempt_slice_cgroup_path", limit=4096
+        )
         cgroup_path = self._sandbox_text(cgroup_path, "cgroup_path", limit=4096)
+        wrapper_cgroup = PurePosixPath(wrapper_cgroup_path)
+        attempt_slice_cgroup = PurePosixPath(attempt_slice_cgroup_path)
         cgroup = PurePosixPath(cgroup_path)
+        cgroup_paths = (wrapper_cgroup, attempt_slice_cgroup, cgroup)
         if (
-            not cgroup.is_absolute()
-            or cgroup.as_posix() != cgroup_path
-            or any(part in {".", ".."} for part in cgroup.parts)
+            any(not path.is_absolute() or path.as_posix() != str(path) for path in cgroup_paths)
+            or any(part in {".", ".."} for path in cgroup_paths for part in path.parts)
+            or wrapper_cgroup.name != wrapper_unit
+            or attempt_slice_cgroup.name != attempt_slice_unit
+            or wrapper_cgroup == attempt_slice_cgroup
+            or wrapper_cgroup.is_relative_to(attempt_slice_cgroup)
+            or attempt_slice_cgroup.is_relative_to(wrapper_cgroup)
+            or any(_ATTEMPT_SLICE_COMPONENT.fullmatch(part) for part in wrapper_cgroup.parts)
+            or cgroup.parent != attempt_slice_cgroup
             or cgroup.name != scope_unit
         ):
             raise SupervisorError(
-                "sandbox_execution_invalid", "cgroup path must name the exact recorded scope"
+                "sandbox_execution_invalid",
+                "trusted monitor must be outside the worker slice and scope inside it",
+            )
+        if attempt_slice_unit != _oci_worker_systemd_slice(launch_target.container_id):
+            raise SupervisorError(
+                "sandbox_execution_launch_target_mismatch",
+                "attempt slice does not match the pinned runc container identity",
             )
         with self.connect() as connection:
             durable_execution = connection.execute(
@@ -1581,6 +1753,23 @@ class SandboxExecutionJournalMixin:
                 "sandbox_execution_transition_invalid",
                 f"expected phase reserved, found {durable_execution['phase']}; fence retained",
             )
+        if durable_execution["bundle_digest_semantics"] == _LEGACY_BUNDLE_DIGEST_SEMANTICS:
+            raise SupervisorError(
+                "sandbox_execution_legacy_bundle_digest",
+                "legacy caller-asserted reservation digest is not eligible for a new launch",
+            )
+        if durable_execution["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
+            raise SupervisorError(
+                "sandbox_execution_bundle_digest_semantics_invalid",
+                "reservation digest semantics are not recognized",
+            )
+        if durable_execution["bundle_digest"] != _sandbox_reservation_bundle_digest(
+            durable_execution
+        ):
+            raise SupervisorError(
+                "sandbox_execution_bundle_digest_mismatch",
+                "reservation bundle digest does not match its host-derived identity and pins",
+            )
         target_paths_match = (
             launch_target.bundle_path == durable_execution["bundle_path"]
             and launch_target.bundle_device == durable_execution["bundle_root_dev"]
@@ -1603,6 +1792,15 @@ class SandboxExecutionJournalMixin:
             or Path(launch_target.pid_file_path).parent != Path(durable_execution["state_path"])
             or launch_target.config_sha256 is None
             or _DIGEST.fullmatch(launch_target.config_sha256) is None
+            or any(
+                type(value) is not int or value <= 0
+                for value in (
+                    launch_target.memory_limit_bytes,
+                    launch_target.cpu_quota,
+                    launch_target.cpu_period,
+                    launch_target.pids_limit,
+                )
+            )
             or type(launch_target.rootfs_device) is not int
             or type(launch_target.rootfs_inode) is not int
             or type(launch_target.rootfs_snapshot_device) is not int
@@ -1619,6 +1817,13 @@ class SandboxExecutionJournalMixin:
                 "pinned-runc launch target does not match the exact durable reservation",
             )
         launch_plan = _sandbox_launch_plan_material(durable_execution, launch_target)
+        launch_plan["launch"]["systemd_ownership"] = {
+            "wrapper_control_group": wrapper_cgroup_path,
+            "monitor_placement": "outside_attempt_slice",
+            "attempt_slice_unit": attempt_slice_unit,
+            "attempt_slice_invocation_id": attempt_slice_invocation_id,
+            "attempt_slice_control_group": attempt_slice_cgroup_path,
+        }
         launch_plan_json = canonical_json(launch_plan)
         launch_config_digest = launch_target.config_sha256
         launch_argv_digest = hashlib.sha256(
@@ -1635,6 +1840,10 @@ class SandboxExecutionJournalMixin:
             "runc_client_identity": runc_client_identity,
             "wrapper_unit": wrapper_unit,
             "wrapper_invocation_id": wrapper_invocation_id,
+            "wrapper_cgroup_path": wrapper_cgroup_path,
+            "attempt_slice_unit": attempt_slice_unit,
+            "attempt_slice_invocation_id": attempt_slice_invocation_id,
+            "attempt_slice_cgroup_path": attempt_slice_cgroup_path,
             "scope_unit": scope_unit,
             "scope_invocation_id": scope_invocation_id,
             "cgroup_path": cgroup_path,
@@ -1737,12 +1946,33 @@ class SandboxExecutionJournalMixin:
                 "sandbox_execution_launch_plan_required",
                 "running transition requires a durable trusted launch-plan binding",
             )
-        if not running_attestation_is_self_consistent(attestation):
+        launch_plan = json.loads(row["launch_plan_json"])
+        if launch_plan.get("version") != 5:
+            raise SupervisorError(
+                "sandbox_execution_launch_plan_required",
+                "running transition requires a version-5 plan with a separate trusted monitor cgroup",
+            )
+        if not running_attestation_is_self_consistent(
+            attestation
+        ) or not running_attestation_has_collector_provenance(attestation):
             raise SupervisorError(
                 "sandbox_runtime_attestation_invalid",
-                "running transition requires a self-consistent typed receipt",
+                "running transition requires the exact self-consistent collector-issued receipt",
+            )
+        expected_resource_limits = launch_plan["launch"]["resource_limits"]
+        attested_resource_limits = {
+            "memory_max_bytes": attestation.memory_max_bytes,
+            "cpu_quota": attestation.cpu_quota,
+            "cpu_period": attestation.cpu_period,
+            "pids_max": attestation.pids_max,
+        }
+        if attested_resource_limits != expected_resource_limits:
+            raise SupervisorError(
+                "sandbox_runtime_attestation_stale",
+                "cgroup resource readback does not match the durable OCI launch policy",
             )
         expected = {
+            "monitor_placement": "outside_attempt_slice",
             "container_id": row["container_id"],
             "bundle_path": row["bundle_path"],
             "monitor_pid": row["monitor_pid"],
@@ -1751,6 +1981,10 @@ class SandboxExecutionJournalMixin:
             "runc_client_identity": row["runc_client_identity"],
             "wrapper_unit": row["wrapper_unit"],
             "wrapper_invocation_id": row["wrapper_invocation_id"],
+            "wrapper_control_group": row["wrapper_cgroup_path"],
+            "attempt_slice_unit": row["attempt_slice_unit"],
+            "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
+            "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
             "scope_unit": row["scope_unit"],
             "scope_invocation_id": row["scope_invocation_id"],
             "cgroup_path": row["cgroup_path"],
@@ -1781,6 +2015,99 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_launch_handle_required",
                     "running transition requires the exact locked launch handle",
                 )
+            with self.connect() as connection:
+                locked_row = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+            if (
+                locked_row is None
+                or locked_row["claim_token"] != claim_token
+                or locked_row["execution_id"] != row["execution_id"]
+                or locked_row["phase"] != "launched"
+                or not _sandbox_launch_plan_binding_is_self_consistent(locked_row)
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "durable launch plan changed before the running transition",
+                )
+            locked_plan = json.loads(locked_row["launch_plan_json"])
+            locked_launch = locked_plan["launch"]
+            locked_state = locked_launch["state"]
+            expected_source_binding = {
+                "runc_state_root_path": locked_state["path"],
+                "runc_state_root_device": locked_state["device"],
+                "runc_state_root_inode": locked_state["inode"],
+                "runc_pid_file_path": locked_launch["pid_file_path"],
+                "runc_executable_sha256": locked_launch["runc_executable_sha256"],
+            }
+            if any(
+                getattr(attestation, key) != value for key, value in expected_source_binding.items()
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "runc observations do not match the exact durable state root and executable",
+                )
+            try:
+                live_state_root = _private_directory(
+                    expected_source_binding["runc_state_root_path"],
+                    code="sandbox_runtime_attestation_stale",
+                    label="runc state root",
+                )
+                live_state_info = live_state_root.lstat()
+            except (OSError, SupervisorError) as error:
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "durable runc state root is no longer available",
+                ) from error
+            if (
+                str(live_state_root) != expected_source_binding["runc_state_root_path"]
+                or stat.S_ISLNK(live_state_info.st_mode)
+                or not stat.S_ISDIR(live_state_info.st_mode)
+                or (live_state_info.st_dev, live_state_info.st_ino)
+                != (
+                    expected_source_binding["runc_state_root_device"],
+                    expected_source_binding["runc_state_root_inode"],
+                )
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "durable runc state root identity changed before gate release",
+                )
+            locked_expected = {
+                "monitor_placement": "outside_attempt_slice",
+                "container_id": locked_row["container_id"],
+                "bundle_path": locked_row["bundle_path"],
+                "monitor_pid": locked_row["monitor_pid"],
+                "monitor_identity": locked_row["monitor_identity"],
+                "runc_client_pid": locked_row["runc_client_pid"],
+                "runc_client_identity": locked_row["runc_client_identity"],
+                "wrapper_unit": locked_row["wrapper_unit"],
+                "wrapper_invocation_id": locked_row["wrapper_invocation_id"],
+                "wrapper_control_group": locked_row["wrapper_cgroup_path"],
+                "attempt_slice_unit": locked_row["attempt_slice_unit"],
+                "attempt_slice_invocation_id": locked_row["attempt_slice_invocation_id"],
+                "attempt_slice_control_group": locked_row["attempt_slice_cgroup_path"],
+                "scope_unit": locked_row["scope_unit"],
+                "scope_invocation_id": locked_row["scope_invocation_id"],
+                "cgroup_path": locked_row["cgroup_path"],
+            }
+            if any(getattr(attestation, key) != value for key, value in locked_expected.items()):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "runtime evidence no longer matches the exact locked launch identities",
+                )
+            locked_resource_limits = locked_launch["resource_limits"]
+            if any(
+                getattr(attestation, key) != value for key, value in locked_resource_limits.items()
+            ):
+                raise SupervisorError(
+                    "sandbox_runtime_attestation_stale",
+                    "cgroup limits no longer match the exact locked launch policy",
+                )
+            # Revalidate exact live process membership and cgroup limits under
+            # the release lock before the durable transition and one-shot permit.
+            verify_running_runtime_resource_controls(attestation)
+            verify_running_runtime_process_membership(attestation)
             updated = self._sandbox_execution_transition(
                 attempt_id,
                 claim_token,
@@ -1791,8 +2118,6 @@ class SandboxExecutionJournalMixin:
                 event_payload={"attestation": attestation.audit_payload()},
                 credential=credential,
             )
-            # The same lock covers the durable transition and one-shot permit
-            # issue. A stop/quarantine cannot commit between these operations.
             _authorize_runc_launch_gate_release_locked(
                 locked_handle, attempt_id, claim_token, row["execution_id"]
             )

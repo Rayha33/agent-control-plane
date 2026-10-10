@@ -26,6 +26,9 @@ _SANDBOX_EXIT_RECEIPT_AUTHORIZATION: ContextVar[
 _SANDBOX_LAUNCH_PLAN_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str, str, str]] | None
 ] = ContextVar("acp_sandbox_launch_plan_authorization", default=None)
+_SANDBOX_RESERVATION_AUTHORIZATION: ContextVar[
+    tuple[int, tuple[str, int, str, str, str]] | None
+] = ContextVar("acp_sandbox_reservation_authorization", default=None)
 
 
 @contextmanager
@@ -181,6 +184,58 @@ def _sandbox_launch_plan_authorized_for(connection: sqlite3.Connection):
     return authorized
 
 
+@contextmanager
+def _authorize_sandbox_reservation_write(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    bundle_digest: str,
+    bundle_digest_semantics: str,
+) -> Iterator[None]:
+    """Scope one new reservation insert to the validated host-derived tuple."""
+
+    fields = (
+        attempt_id,
+        claim_token,
+        execution_id,
+        bundle_digest,
+        bundle_digest_semantics,
+    )
+    token = _SANDBOX_RESERVATION_AUTHORIZATION.set((id(connection), fields))
+    try:
+        yield
+    finally:
+        _SANDBOX_RESERVATION_AUTHORIZATION.reset(token)
+
+
+def _sandbox_reservation_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        bundle_digest: str,
+        bundle_digest_semantics: str,
+    ) -> int:
+        authorization = _SANDBOX_RESERVATION_AUTHORIZATION.get()
+        expected = (
+            attempt_id,
+            claim_token,
+            execution_id,
+            bundle_digest,
+            bundle_digest_semantics,
+        )
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
+
+
 class StoreMixin:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -203,6 +258,11 @@ class StoreMixin:
                 7,
                 _sandbox_launch_plan_authorized_for(connection),
             )
+            connection.create_function(
+                "acp_sandbox_reservation_authorized",
+                5,
+                _sandbox_reservation_authorized_for(connection),
+            )
             try:
                 yield connection
             finally:
@@ -219,6 +279,11 @@ class StoreMixin:
             "acp_sandbox_launch_plan_authorized",
             7,
             _sandbox_launch_plan_authorized_for(connection),
+        )
+        connection.create_function(
+            "acp_sandbox_reservation_authorized",
+            5,
+            _sandbox_reservation_authorized_for(connection),
         )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")

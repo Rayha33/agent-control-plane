@@ -998,6 +998,7 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     workspace_mount = next(
         mount for mount in config["mounts"] if mount["destination"] == "/workspace"
     )
+    resources = config["linux"]["resources"]
 
     assert bound.argv[2] == "/proc/self/fd/66"
     assert bound.argv[6] == "/proc/self/fd/64"
@@ -1005,6 +1006,10 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     assert workspace_mount["source"] == "/dev/shm/acp-acp-worker-123-workspace"
     assert target.state_path == str(state_root)
     assert target.workspace_path == str(workspace.root)
+    assert target.memory_limit_bytes == resources["memory"]["limit"]
+    assert target.cpu_quota == resources["cpu"]["quota"]
+    assert target.cpu_period == resources["cpu"]["period"]
+    assert target.pids_limit == resources["pids"]["limit"]
     assert bound.config_sha256 == hashlib.sha256(config_json).hexdigest()
     assert config_json != binding.config_json
 
@@ -1634,6 +1639,11 @@ def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) ->
         (("mounts", 1, "options", 4), "nr_inodes=0"),
         (("mounts", 3, "options", 3), "size=9223372036854775808"),
         (("mounts", 4, "options", 3), "size=" + ("9" * 5000)),
+        (("linux", "cgroupsPath"), "user.slice:acp:acp-worker-123"),
+        (
+            ("linux", "cgroupsPath"),
+            f"user-acp-{hashlib.sha256(b'acp-worker-124').hexdigest()}.slice:acp:acp-worker-123",
+        ),
     ],
     ids=(
         "root-readonly-int-alias",
@@ -1645,6 +1655,8 @@ def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) ->
         "dev-tmpfs-unbounded-inodes",
         "tmpfs-over-int64",
         "tmpfs-unbounded-decimal",
+        "shared-user-parent-slice",
+        "parent-slice-bound-to-different-container",
     ),
 )
 def test_complete_oci_worker_policy_rejects_type_confusion_and_unbounded_tmpfs(
@@ -1751,7 +1763,9 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
         "pids": {"limit": 32},
         "devices": [{"allow": False, "access": "rwm"}],
     }
-    assert linux["cgroupsPath"] == "user.slice:acp:acp-worker-123"
+    expected_slice = f"user-acp-{hashlib.sha256(b'acp-worker-123').hexdigest()}.slice"
+    assert linux["cgroupsPath"] == f"{expected_slice}:acp:acp-worker-123"
+    assert oci_worker._oci_worker_cgroups_path("acp-worker-124") != linux["cgroupsPath"]
     assert linux["rootfsPropagation"] == "private"
     assert "architectures" not in linux["seccomp"]
     assert linux["uidMappings"][0] == {"containerID": 0, "hostID": os.geteuid(), "size": 1}

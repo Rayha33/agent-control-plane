@@ -64,6 +64,23 @@ _MAX_ROOTFS_ENTRIES = 200_000
 _MAX_ROOTFS_BYTES = 8 * 1024 * 1024 * 1024
 _MAX_ROOTFS_SNAPSHOT_BYTES = 256 * 1024 * 1024
 _ROOTFS_SNAPSHOT_OVERHEAD_BYTES = 4 * 1024 * 1024
+
+
+def _oci_worker_systemd_slice(container_id: str) -> str:
+    """Return the deterministic, per-container user slice for a rootless runc scope."""
+
+    if not isinstance(container_id, str) or _CONTAINER_ID.fullmatch(container_id) is None:
+        raise SupervisorError("invalid_oci_worker_policy", "OCI container ID is invalid")
+    digest = hashlib.sha256(container_id.encode("ascii")).hexdigest()
+    return f"user-acp-{digest}.slice"
+
+
+def _oci_worker_cgroups_path(container_id: str) -> str:
+    """Bind a runc scope to a unique parent slice, never the shared user.slice."""
+
+    return f"{_oci_worker_systemd_slice(container_id)}:acp:{container_id}"
+
+
 _MAX_ROOTFS_PATH_BYTES = 4096
 _MAX_ROOTFS_DEPTH = 256
 _ROOTFS_CLOSURE_SCHEMA = "acp-oci-rootfs-closure-v1"
@@ -2852,7 +2869,7 @@ def build_oci_worker_config(
                     "devices": [{"allow": False, "access": "rwm"}],
                 },
                 "seccomp": _worker_seccomp_profile(),
-                "cgroupsPath": f"user.slice:acp:{container_id}",
+                "cgroupsPath": _oci_worker_cgroups_path(container_id),
                 "rootfsPropagation": "private",
                 "maskedPaths": [
                     "/proc/kcore",
@@ -3140,10 +3157,12 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
     ):
         reject()
     cgroups_path = linux.get("cgroupsPath")
+    parts = cgroups_path.split(":") if isinstance(cgroups_path, str) else ()
     if (
-        not isinstance(cgroups_path, str)
-        or not cgroups_path.startswith("user.slice:acp:")
-        or _CONTAINER_ID.fullmatch(cgroups_path.removeprefix("user.slice:acp:")) is None
+        len(parts) != 3
+        or parts[1] != "acp"
+        or _CONTAINER_ID.fullmatch(parts[2]) is None
+        or parts[0] != _oci_worker_systemd_slice(parts[2])
     ):
         reject()
 
@@ -3503,6 +3522,10 @@ class _RuncLaunchTarget:
     workspace_inode: int | None = None
     pid_file_path: str | None = None
     container_id: str | None = None
+    memory_limit_bytes: int | None = None
+    cpu_quota: int | None = None
+    cpu_period: int | None = None
+    pids_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -4474,6 +4497,11 @@ def _private_bundle_runc_launch_target(
     try:
         config = json.loads(config_json)
         mounts = config["mounts"]
+        resources = config["linux"]["resources"]
+        memory_limit_bytes = resources["memory"]["limit"]
+        cpu_quota = resources["cpu"]["quota"]
+        cpu_period = resources["cpu"]["period"]
+        pids_limit = resources["pids"]["limit"]
         workspace_mounts = [
             mount
             for mount in mounts
@@ -4486,7 +4514,11 @@ def _private_bundle_runc_launch_target(
             or workspace_mounts[0].get("type") != "bind"
             or not isinstance(workspace_path, str)
             or not Path(workspace_path).is_absolute()
-            or cgroups_path != f"user.slice:acp:{container_id}"
+            or cgroups_path != _oci_worker_cgroups_path(container_id)
+            or any(
+                type(value) is not int or value <= 0
+                for value in (memory_limit_bytes, cpu_quota, cpu_period, pids_limit)
+            )
         ):
             raise ValueError("OCI config does not bind one exact workspace and container ID")
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -4595,6 +4627,10 @@ def _private_bundle_runc_launch_target(
         workspace_inode=workspace_inode,
         pid_file_path=str(pid_file_path),
         container_id=container_id,
+        memory_limit_bytes=memory_limit_bytes,
+        cpu_quota=cpu_quota,
+        cpu_period=cpu_period,
+        pids_limit=pids_limit,
     )
 
 
