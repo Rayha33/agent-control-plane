@@ -1728,6 +1728,16 @@ transient-unit creation, not a separate lifecycle owner. Sources:
 [systemd control-group API](https://systemd.io/CONTROL_GROUP_INTERFACE/), and
 [systemd v252 cgroup delegation guide](https://github.com/systemd/systemd/blob/v252/docs/CGROUP_DELEGATION.md).
 
+The v252 D-Bus XML declares `GetUnitByInvocationID` and
+`GetUnitByControlGroup`, but comments that both methods are not documented; it
+also marks the `InvocationID` property undocumented. Do not treat these
+declarations as compatibility guarantees. The monitor should query the
+durable exact unit name and compare the returned `Id`, `InvocationID`,
+`ControlGroup`, `Slice`, and state with its receipt; any unavailable or
+mismatched identity keeps the attempt fenced. Required property readback must
+be tested for each supported systemd version, and reverse-lookup methods need
+an explicit version/behavior test before use.
+
 The recovery design must not use `systemd-run --scope` as the durable monitor:
 in v252 the command remains a child of the `systemd-run` client and the client
 waits synchronously for it. Instead, the candidate architecture is one
