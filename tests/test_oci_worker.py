@@ -650,11 +650,11 @@ def test_runc_version_probe_requires_the_exact_release_and_uses_a_clean_environm
         os.fstat(descriptor)
         assert argv == [str(pin.path), "--version"]
         calls.append((argv, kwargs))
-        return 0, "runc version 1.3.5\nspec: 1.2.1\n"
+        return 0, "runc version 1.5.2\nspec: 1.2.1\n"
 
     monkeypatch.setattr(oci_worker, "_run_bounded_command", fake_run)
 
-    assert oci_worker._probe_trusted_runc_version(pin, "1.3.5") == "1.3.5"
+    assert oci_worker._probe_trusted_runc_version(pin, "1.5.2") == "1.5.2"
     argv, kwargs = calls[0]
     assert argv[1] == "--version"
     assert len(kwargs["pass_fds"]) == 1
@@ -680,18 +680,18 @@ def test_pinned_runc_adapter_uses_recursive_private_for_exact_probed_release(
     def fake_run(argv: list[str], **kwargs: Any) -> tuple[int, str]:
         os.fstat(kwargs["exec_fd"])
         calls.append((argv, kwargs))
-        return 0, "runc version 1.3.5\nspec: 1.2.1\n"
+        return 0, "runc version 1.5.2\nspec: 1.2.1\n"
 
     monkeypatch.setattr(oci_worker, "_run_bounded_command", fake_run)
     config = compile_config(bundle, workspace)
 
     adapted = oci_worker._apply_pinned_runc_recursive_private_policy(
-        config, pin, expected_version="1.3.5"
+        config, pin, expected_version="1.5.2"
     )
     adapted_config = json.loads(adapted.config_json)
 
     assert adapted.executable is pin
-    assert adapted.version == "1.3.5"
+    assert adapted.version == "1.5.2"
     assert adapted_config["linux"]["rootfsPropagation"] == "rprivate"
     configured_rootfs = oci_worker.rootfs_tree_manifest(bundle / "rootfs")
     assert adapted.rootfs_sha256 == configured_rootfs["rootfs_sha256"]
@@ -711,10 +711,10 @@ def test_pinned_runc_worker_config_rejects_a_different_executable_pin(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
 
     with pytest.raises(SupervisorError, match="exact executable") as error:
@@ -732,10 +732,10 @@ def test_pinned_worker_diagnostic_uses_bound_executable_and_exact_config_bytes(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle_root, workspace_snapshot), pin, expected_version="1.3.5"
+        compile_config(bundle_root, workspace_snapshot), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -794,10 +794,10 @@ def test_private_bundle_launcher_reaps_client_on_setup_failure(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -846,10 +846,10 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -897,11 +897,11 @@ def test_pinned_spawn_rejects_rootfs_changed_after_config_compilation_before_lau
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     config = compile_config(bundle, workspace)
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        config, pin, expected_version="1.3.5"
+        config, pin, expected_version="1.5.2"
     )
     configured_rootfs = oci_worker.rootfs_tree_manifest(bundle / "rootfs")
     assert binding.rootfs_sha256 == configured_rootfs["rootfs_sha256"]
@@ -950,10 +950,10 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -1058,10 +1058,10 @@ def test_same_uid_can_replace_diagnostic_bundle_config_after_validation(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -1122,7 +1122,7 @@ def test_pinned_runc_adapter_rejects_unregistered_config_before_probe(
 
     with pytest.raises(SupervisorError, match="compiler-issued OCI config") as error:
         oci_worker._apply_pinned_runc_recursive_private_policy(
-            config, pin, expected_version="1.3.5"
+            config, pin, expected_version="1.5.2"
         )
 
     assert error.value.code == "invalid_oci_worker_policy"
@@ -1147,15 +1147,16 @@ def test_pinned_runc_adapter_rejects_mutated_compiler_config_before_probe(
 
     with pytest.raises(SupervisorError, match="mutated after build") as error:
         oci_worker._apply_pinned_runc_recursive_private_policy(
-            config, pin, expected_version="1.3.5"
+            config, pin, expected_version="1.5.2"
         )
 
     assert error.value.code == "invalid_oci_worker_policy"
     assert not probe_called
 
 
+@pytest.mark.parametrize("unsupported_version", ["1.3.5", "1.3.6", "1.4.3"])
 def test_pinned_runc_adapter_rejects_other_versions_before_probe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsupported_version: str
 ) -> None:
     pin = pinned_runc(tmp_path)
     probe_called = False
@@ -1171,7 +1172,7 @@ def test_pinned_runc_adapter_rejects_other_versions_before_probe(
         oci_worker._apply_pinned_runc_recursive_private_policy(
             {"linux": {"rootfsPropagation": "private"}},
             pin,
-            expected_version="1.3.6",
+            expected_version=unsupported_version,
         )
 
     assert error.value.code == "invalid_oci_runtime_version"
@@ -1193,7 +1194,7 @@ def test_pinned_runc_adapter_rejects_a_different_observed_release(
 
     with pytest.raises(SupervisorError) as error:
         oci_worker._apply_pinned_runc_recursive_private_policy(
-            config, pin, expected_version="1.3.5"
+            config, pin, expected_version="1.5.2"
         )
 
     assert error.value.code == "invalid_oci_runtime_version"
@@ -1203,10 +1204,10 @@ def test_pinned_runc_adapter_rejects_a_different_observed_release(
 @pytest.mark.parametrize(
     ("stdout", "returncode", "expected_version"),
     [
-        ("runc version 1.3.5\nspec: 1.2.1", 0, "1.3.4"),
-        ("runc version 1.3.5-rc1", 0, "1.3.5"),
-        ("not runc", 0, "1.3.5"),
-        ("runc version 1.3.5", 1, "1.3.5"),
+        ("runc version 1.5.2\nspec: 1.2.1", 0, "1.3.4"),
+        ("runc version 1.5.2-rc1", 0, "1.5.2"),
+        ("not runc", 0, "1.5.2"),
+        ("runc version 1.5.2", 1, "1.5.2"),
     ],
 )
 def test_runc_version_probe_fails_closed(
@@ -1377,7 +1378,7 @@ def test_runc_version_probe_fails_closed_without_linux_fd_exec(tmp_path: Path) -
     pin = pinned_runc(tmp_path)
 
     with pytest.raises(SupervisorError, match="require Linux fd-based execve") as error:
-        oci_worker._probe_trusted_runc_version(pin, "1.3.5")
+        oci_worker._probe_trusted_runc_version(pin, "1.5.2")
 
     assert error.value.code == "invalid_oci_runtime_version"
 

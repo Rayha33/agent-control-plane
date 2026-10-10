@@ -27,6 +27,53 @@ retaining that gate. No `run_worker` path yet connects launch to the durable
 journal, runtime attestation, cleanup verification, or result import. This
 record does not authorize `externalSandbox` for ACP workers.
 
+**Runtime security requalification (2026-10-10).** The implementation and prior
+live evidence were pinned to runc 1.3.5. Upstream lists `<=1.3.5`, `<=1.4.2`,
+and `<=1.5.0-rc.2` as affected by
+[GHSA-xjvp-4fhw-gc47](https://github.com/opencontainers/runc/security/advisories/GHSA-xjvp-4fhw-gc47),
+with fixes in 1.3.6, 1.4.3, and 1.5.0-rc.3. We evaluated the patched 1.3 and
+1.4 lines at source level and selected 1.5.2, the latest stable release at
+selection time (1.6.0-rc.1 is a prerelease). Both [1.4.3](https://github.com/opencontainers/runc/blob/v1.4.3/libcontainer/specconv/spec_linux.go#L2290-L2294)
+and [1.5.2](https://github.com/opencontainers/runc/blob/v1.5.2/libcontainer/specconv/spec_linux.go#L2290-L2294)
+retain the adapter's `rprivate` to `MS_PRIVATE|MS_REC` mapping. The
+[1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+also includes a workaround for a cgroup-v2 device-rules kernel bug present in
+Linux 6.17. The adapter contract now targets exact runc 1.5.2 and its upstream
+`runc.amd64` digest
+`sha256:599f6f94ff8c5057241eff0d54c3c74f95c34935b6457b33fe545defc61e9488`.
+That upstream digest is verified when the dedicated CI job acquires its test
+binary. Production configuration validates the exact release string and pins
+the configured executable's observed bytes; it does not hard-code this upstream
+asset digest, so deployments remain responsible for sourcing and configuring
+their own trusted runc binary.
+The opt-in live boundary probe passed on 2026-10-10 in a disposable Lima VZ
+guest (Ubuntu 24.04.5 LTS, aarch64, kernel 6.8.0-142-generic), using the
+upstream `runc.arm64` asset with digest
+`sha256:d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+It launched a bounded BusyBox payload through `spawn_pinned_runc()` and verified
+the read-only private root, expected mount policy, CPU/memory/PID cgroup
+readback, zero effective capabilities, `NoNewPrivs`, a loopback-only network
+namespace, and that a host-NIC listener was not reached. The probe denied host
+checkout, sibling and unrelated project, home/config/credential, `/etc`, `/tmp`
+file and Unix-socket paths, and absolute/relative symlink escapes. It also
+passed the same-UID bundle/config and state/workspace path-replacement attacks;
+the exact runc scope, process, cgroup, and test-owned temporary paths were
+verified absent after teardown. BusyBox is installed as the dynamic package so
+the test can audit and copy its exact loader/library closure.
+
+This is primitive-level evidence, not end-to-end worker acceptance: it does
+not launch through `run_worker()`, supply model credentials, establish a
+provider egress policy, or test unattended supervisor-restart recovery and
+result import. `run_worker()` remains fail-closed as
+`sandbox_executor_unavailable`. This manual guest run is not exact-head hosted
+Actions evidence for the live probe. Any hosted job must install dependencies
+before relaxing Ubuntu's `kernel.apparmor_restrict_unprivileged_userns`, do so
+only on a secret-free disposable VM, install and verify its restore trap before
+the sysctl change, and fail on missing user-namespace or delegated-cgroup
+prerequisites rather than accepting a skip. Its archived checkout must carry a
+`.git` pointer to the real checkout gitdir so host-metadata denial is
+non-vacuous.
+
 **Descriptor transport primitive (2026-10-04; not integrated).** The trusted
 process trampoline now accepts an internal `fd3_source` and maps that open
 descriptor to fd 3 only in the command child, after ACP records the target PID

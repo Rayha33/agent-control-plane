@@ -359,7 +359,7 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
 ) -> None:
     write_config(repo)
     rootfs, rootfs_digest = append_oci_config(
-        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"'
+        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"'
     )
     pin = object()
     calls: list[tuple[str, str]] = []
@@ -370,8 +370,8 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
 
     def fake_probe(executable, expected_version: str) -> str:
         assert executable is pin
-        assert expected_version == "1.3.5"
-        return "1.3.5"
+        assert expected_version == "1.5.2"
+        return "1.5.2"
 
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", fake_pin)
     monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", fake_probe)
@@ -379,7 +379,7 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     supervisor = GitSupervisor(repo)
 
     assert supervisor.config.oci_runc_executable is pin
-    assert supervisor.config.oci_runc_version == "1.3.5"
+    assert supervisor.config.oci_runc_version == "1.5.2"
     assert supervisor.config.oci_rootfs_pin.path == rootfs.resolve()
     assert supervisor.config.oci_rootfs_pin.sha256 == rootfs_digest
     assert (
@@ -389,6 +389,32 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     assert calls == [("/usr/bin/runc", str(repo.resolve()))]
 
 
+@pytest.mark.parametrize("unsupported_version", ["1.3.5", "1.3.6", "1.4.3"])
+def test_oci_runc_config_rejects_non_pinned_runc_before_opening_runtime(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, unsupported_version: str
+) -> None:
+    write_config(repo)
+    append_oci_config(
+        repo,
+        f'runc_executable = "/usr/bin/runc"\nrunc_version = "{unsupported_version}"',
+    )
+    opened: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        opened.append("runtime")
+        pytest.fail("unsupported runc version must be rejected before opening runtime files")
+
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_rootfs", forbidden)
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", forbidden)
+    monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", forbidden)
+
+    with pytest.raises(SupervisorError, match="supported exact release 1.5.2") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
+    assert not opened
+
+
 def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> None:
     write_config(repo)
     rootfs, digest = _create_test_oci_rootfs(repo)
@@ -396,7 +422,7 @@ def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> Non
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write(
             '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
-            'runc_version = "1.3.5"\n'
+            'runc_version = "1.5.2"\n'
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
             f"rootfs_closure_sha256 = {json.dumps(closure_digest)}\n"
@@ -415,7 +441,7 @@ def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write(
             '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
-            'runc_version = "1.3.5"\n'
+            'runc_version = "1.5.2"\n'
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
             f"rootfs_closure_sha256 = {json.dumps('0' * 64)}\n"
@@ -430,7 +456,7 @@ def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
 def test_oci_config_requires_a_rootfs_path_and_digest(repo: Path) -> None:
     write_config(repo)
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
-        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"\n')
 
     with pytest.raises(
         SupervisorError, match="requires runc_executable.*rootfs_sha256.*rootfs_closure_sha256"
@@ -444,7 +470,7 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(repo)
-    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"')
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
     pin = object()
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
     monkeypatch.setattr(
@@ -485,14 +511,14 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
 @pytest.mark.parametrize(
     ("entry", "message"),
     [
-        ('runc_executable = "runc"\nrunc_version = "1.3.5"', "absolute path"),
+        ('runc_executable = "runc"\nrunc_version = "1.5.2"', "absolute path"),
         ('runc_executable = "/usr/bin/runc"\nrunc_version = "latest"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-01"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a..b"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a."', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5+meta."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-01"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-a..b"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-a."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2+meta."', "release version"),
         (
-            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\nextra = true',
+            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"\nextra = true',
             "requires runc_executable",
         ),
     ],
