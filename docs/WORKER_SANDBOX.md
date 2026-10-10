@@ -1713,16 +1713,31 @@ normal bounded fake payload (no model or provider credentials),
 Ubuntu image labels device-node bind mounts' devtmpfs source as `devtmpfs`
 and omits `relatime`; the validator now accepts only the source labels
 `udev`/`devtmpfs` and only the exact `rw,nosuid` option set with optional
-`relatime`. It still rejects arbitrary source labels or options and checks
-the root/filesystem, filesystem device identity, shared devtmpfs identity,
-device numbers, read-only proc masks, cgroup limits, PID namespace, and
-bundle/path replacement attacks. The default guest AppArmor userns restriction
-was `1`; a 10-minute systemd restore timer was armed before a temporary
-guest-only change to `0`, and a shell exit trap restored and read back `1`.
-Independent postflight confirmed the setting was `1`, the attempt tree absent,
-no runc process, and the user manager active; the fallback timer remained armed
-to repeat the same safe restore. Neither the Mac host nor NAS policy was
-changed.
+`relatime`. It rejects unapproved source labels and every other per-mount
+option set. This exact allowlist applies to mountinfo's per-mount options; for
+these device binds the validator separately requires `rw` and rejects `ro` in
+`super_options`, but does not exact-allowlist other superblock options. It also
+checks the root/filesystem, filesystem device identity, shared devtmpfs
+identity, device numbers, read-only proc masks, cgroup limits, PID namespace,
+and bundle/path replacement attacks. The default guest AppArmor userns
+restriction was `1`; a 10-minute systemd restore timer was armed before a
+temporary guest-only change to `0`, and a shell exit trap restored and read
+back `1`. At the end of this focused run, independent postflight confirmed the
+setting was `1`, the live attempt tree absent, no runc process, and the user
+manager active; its fallback timer remained armed to repeat the same safe
+restore. Neither the Mac host nor NAS policy was changed.
+
+As a follow-up on the same guest snapshot and exact source hashes above, the
+entire `tests/test_oci_worker_runtime.py` module was run with
+`ACP_RUN_OCI_INTEGRATION=1`: **47 passed in 5.67 seconds**, including the live
+rootless-runc test (not skipped). For this run, two 10-minute fallback restore
+timers were armed before the guest-only sysctl change; the shell exit path
+restored and read back `1`, and both timers were stopped only after that
+readback. Postflight found the user manager active and no runc process. The
+exact pytest directory for the live test had no `live-oci-attempt` child. Three
+separate pytest fixture directories deliberately retained marker entries after
+adversarial cleanup tests; those fixtures were preserved, not mistaken for a
+live-attempt leak or deleted.
 
 This is a successful low-level OCI-boundary probe on a second Linux/kernel
 profile, not end-to-end supervised-worker acceptance. It does not connect the
