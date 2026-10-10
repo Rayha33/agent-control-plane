@@ -661,6 +661,7 @@ class QcMixin:
                         fence_sha = sha256(str(submission["resource_tokens_json"]).encode("utf-8"))
                         receipt, target_env, blocked = runtime_target_phase(
                             definitions=phase_targets,
+                            commands=self.config.qc_commands,
                             runtime_environment=runtime_env,
                             driver_resources=self.driver_resources(submission["attempt_id"]),
                             attempt_id=str(submission["attempt_id"]),
@@ -687,8 +688,14 @@ class QcMixin:
                         packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
                         packet_hash = sha256(packet_path.read_bytes())
                         if blocked:
+                            blocking_reason = receipt.get("blocking_reason")
+                            if blocking_reason == "runtime_target_command_binding_unavailable":
+                                raise SupervisorError(
+                                    blocking_reason,
+                                    "QC requires command network binding, but no trusted executor can prove it",
+                                )
                             raise SupervisorError(
-                                "runtime_target_identity_mismatch",
+                                str(blocking_reason or "runtime_target_identity_mismatch"),
                                 "required QC runtime target identity is missing or mismatched",
                             )
                         runtime_env.update(phase_context or {})

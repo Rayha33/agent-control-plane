@@ -3447,6 +3447,59 @@ def test_whitespace_gate_configuration_fails_closed(
     assert captured.value.code == "invalid_config"
 
 
+def append_api_runtime_target(repo: Path, phases: list[str]) -> None:
+    with (repo / "acp.toml").open("a", encoding="utf-8") as config:
+        config.write(
+            '\n[[runtime.drivers]]\nname = "api"\nkind = "browser_profile"\n'
+            '\n[[runtime.targets]]\nname = "api"\nport_env = "APP_PORT"\n'
+            f'driver = "api"\nphases = {json.dumps(phases)}\n'
+        )
+
+
+@pytest.mark.parametrize(
+    ("qc_commands", "integration_commands", "target_phase"),
+    [
+        (["pass"] * 129, [python_command("pass")], "qc"),
+        ([python_command("pass")], ["pass"] * 129, "integration"),
+        (["x" * 65537], [python_command("pass")], "qc"),
+        ([python_command("pass")], ["x" * 65537], "integration"),
+    ],
+)
+def test_gate_command_set_limits_are_enforced_when_target_receipts_are_enabled(
+    repo: Path,
+    qc_commands: list[str],
+    integration_commands: list[str],
+    target_phase: str,
+) -> None:
+    write_config(
+        repo,
+        qc_commands,
+        integration_commands,
+        runtime_ports={"APP_PORT": (43123, 43123)},
+    )
+    append_api_runtime_target(repo, [target_phase])
+    with pytest.raises(SupervisorError) as captured:
+        GitSupervisor(repo)
+    assert captured.value.code == "invalid_config"
+
+
+def test_command_set_limits_preserve_non_target_config_compatibility(repo: Path) -> None:
+    write_config(repo, ["pass"] * 129, ["pass"] * 129)
+    GitSupervisor(repo)
+
+    repo = repo / "targeted-qc-only"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    write_config(
+        repo,
+        [python_command("pass")],
+        ["pass"] * 129,
+        runtime_ports={"APP_PORT": (43123, 43123)},
+    )
+    append_api_runtime_target(repo, ["qc"])
+    GitSupervisor(repo)
+
+
 def test_runtime_configuration_rejects_unsafe_names_and_blank_hooks(repo: Path) -> None:
     write_config(repo, runtime_ports={"bad-name": (41000, 41001)})
     with pytest.raises(SupervisorError) as unsafe:

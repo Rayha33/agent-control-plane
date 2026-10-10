@@ -13,7 +13,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,12 @@ from typing import Any
 from .common import SupervisorError, canonical_json, sha256
 
 TARGET_CONTRACT = "acp-runtime-target-v1"
+COMMAND_SET_SCOPE = (
+    "configured deterministic QC/integration gate commands only; excludes critic, "
+    "runtime setup, and runtime teardown commands"
+)
+MAX_COMMAND_SET_COUNT = 128
+MAX_COMMAND_LENGTH = 65536
 IDENTITY_FIELDS = (
     "attempt_id",
     "task_id",
@@ -52,6 +58,7 @@ class RuntimeTargetDefinition:
     phases: tuple[str, ...]
     required: bool
     schema_version: str | None
+    require_command_binding: bool
 
 
 def parse_runtime_target_definitions(
@@ -78,6 +85,7 @@ def parse_runtime_target_definitions(
         "phases",
         "required",
         "schema_version",
+        "require_command_binding",
     }
     for entry in raw:
         if not isinstance(entry, dict) or set(entry) - allowed_keys:
@@ -147,6 +155,12 @@ def parse_runtime_target_definitions(
             raise SupervisorError(
                 "invalid_config", f"runtime target {name} required must be boolean"
             )
+        require_command_binding = entry.get("require_command_binding", False)
+        if not isinstance(require_command_binding, bool):
+            raise SupervisorError(
+                "invalid_config",
+                f"runtime target {name} require_command_binding must be boolean",
+            )
         schema_version = entry.get("schema_version")
         if schema_version is not None and (
             not isinstance(schema_version, str)
@@ -168,6 +182,7 @@ def parse_runtime_target_definitions(
                 phases=tuple(phases),
                 required=required,
                 schema_version=schema_version,
+                require_command_binding=require_command_binding,
             )
         )
         names.add(name)
@@ -179,6 +194,7 @@ def parse_runtime_target_definitions(
 def runtime_target_phase(
     *,
     definitions: tuple[RuntimeTargetDefinition, ...],
+    commands: Sequence[str],
     runtime_environment: Mapping[str, str],
     driver_resources: list[Mapping[str, Any]],
     attempt_id: str,
@@ -210,6 +226,7 @@ def runtime_target_phase(
         raise SupervisorError(
             "runtime_target_fence_invalid", "target claim fence digest is invalid"
         )
+    command_set_sha256 = _command_set_sha256(commands)
     resources = {str(item.get("driver", "")): item for item in driver_resources}
     manifest_targets: list[dict[str, Any]] = []
     receipt_targets: list[dict[str, Any]] = []
@@ -261,6 +278,17 @@ def runtime_target_phase(
         if definition.schema_version is not None:
             expected["schema_version"] = definition.schema_version
 
+        resource_snapshots = [_resource_binding_snapshot("service", definition.driver, resources)]
+        if definition.database_driver:
+            resource_snapshots.append(
+                _resource_binding_snapshot("database", definition.database_driver, resources)
+            )
+        if definition.queue_driver:
+            resource_snapshots.append(
+                _resource_binding_snapshot("queue", definition.queue_driver, resources)
+            )
+        resource_snapshot_sha256 = sha256(canonical_json(resource_snapshots).encode("utf-8"))
+
         endpoint = f"http://127.0.0.1:{port}" if port else None
         observed, probe_status = (
             probe_target_identity(port, definition.identity_path) if port else ({}, "invalid_port")
@@ -292,22 +320,38 @@ def runtime_target_phase(
         if missing_driver:
             missing_expected.append("driver_resource_id")
         missing_expected.extend(missing_related)
+        command_binding_status = (
+            "unknown" if definition.require_command_binding else "not_requested"
+        )
+        if definition.require_command_binding:
+            missing_expected.append("command_network_binding")
         if mismatches:
             status = "mismatch"
-        elif probe_status != "ok" or missing_expected or missing_observed:
+        elif (
+            probe_status != "ok"
+            or missing_expected
+            or missing_observed
+            or definition.require_command_binding
+        ):
             status = "unknown"
         else:
             status = "corroborated"
-        target_blocked = definition.required and status != "corroborated"
+        target_blocked = (definition.required and status != "corroborated") or (
+            definition.require_command_binding
+        )
         blocked = blocked or target_blocked
         entry = {
             "name": definition.name,
             "required": definition.required,
+            "require_command_binding": definition.require_command_binding,
+            "command_binding_status": command_binding_status,
             "status": status,
             "verified": False,
             "expected": expected,
             "observed": _receipt_identity(observed, expected),
             "host_identity": host_identity,
+            "resource_snapshots": resource_snapshots,
+            "resource_snapshot_sha256": resource_snapshot_sha256,
             "probe_status": probe_status,
             "missing_evidence": sorted(set(missing_expected + missing_observed)),
             "mismatches": mismatches,
@@ -324,13 +368,29 @@ def runtime_target_phase(
                 "endpoint": endpoint,
                 "expected": expected,
                 "host_identity": host_identity,
+                "resource_snapshots": resource_snapshots,
+                "resource_snapshot_sha256": resource_snapshot_sha256,
                 "identity_path": definition.identity_path,
                 "required": definition.required,
+                "require_command_binding": definition.require_command_binding,
+                "command_binding_status": command_binding_status,
                 "status": status,
                 "verified": False,
             }
         )
 
+    limitations = [
+        "app-reported identity is corroborating only",
+        "no OS process/container-to-socket attribution was performed",
+        "no network policy proved which endpoint each test command used",
+    ]
+    if any(
+        definition.require_command_binding and phase in definition.phases
+        for definition in definitions
+    ):
+        limitations.append(
+            "required command network binding is unavailable; the phase is blocked as unknown"
+        )
     manifest = {
         "contract": "acp-runtime-target-manifest-v1",
         "receipt_id": receipt_id,
@@ -340,12 +400,11 @@ def runtime_target_phase(
         "reservation_fence_sha256": reservation_fence_sha256,
         "phase": phase,
         "source_revision": source_revision,
+        "command_set_scope": COMMAND_SET_SCOPE,
+        "command_set_sha256": command_set_sha256,
+        "command_count": len(commands),
         "targets": manifest_targets,
-        "limitations": [
-            "app-reported identity is corroborating only",
-            "no OS process/container-to-socket attribution was performed",
-            "no network policy proved which endpoint each test command used",
-        ],
+        "limitations": limitations,
     }
     manifest_bytes = (canonical_json(manifest) + "\n").encode("utf-8")
     manifest_path = _write_manifest(runtime_dir, receipt_id, phase, manifest_bytes)
@@ -370,7 +429,20 @@ def runtime_target_phase(
         "reservation_fence_sha256": reservation_fence_sha256,
         "phase": phase,
         "source_revision": source_revision,
+        "command_set_scope": COMMAND_SET_SCOPE,
+        "command_set_sha256": command_set_sha256,
+        "command_count": len(commands),
         "status": "blocked" if blocked else "complete",
+        "blocking_reason": (
+            "runtime_target_command_binding_unavailable"
+            if any(
+                definition.require_command_binding and phase in definition.phases
+                for definition in definitions
+            )
+            else "runtime_target_identity_mismatch"
+            if blocked
+            else None
+        ),
         "verified": False,
         "manifest_path": str(manifest_path),
         "manifest_sha256": manifest_sha256,
@@ -380,6 +452,30 @@ def runtime_target_phase(
     receipt["evidence_id"] = f"{receipt_id}:runtime-target:{phase}"
     receipt["evidence_sha256"] = sha256(canonical_json(receipt).encode("utf-8"))
     return receipt, target_env, blocked
+
+
+def _command_set_sha256(commands: Sequence[str]) -> str:
+    """Hash the exact ordered shell commands named for this preflight.
+
+    This is plan provenance only. It does not prove which executable bytes ran,
+    which environment reached the process, or which endpoint the process used.
+    """
+
+    if isinstance(commands, (str, bytes)) or not isinstance(commands, Sequence):
+        raise SupervisorError(
+            "runtime_target_commands_invalid", "phase commands must be a sequence"
+        )
+    if len(commands) > MAX_COMMAND_SET_COUNT or any(
+        not isinstance(command, str) or len(command) > MAX_COMMAND_LENGTH for command in commands
+    ):
+        raise SupervisorError("runtime_target_commands_invalid", "phase command set is invalid")
+    payload = {
+        "contract": "acp-command-set-v1",
+        "scope": COMMAND_SET_SCOPE,
+        "runner": "supervisor-shell-c-v1",
+        "commands": list(commands),
+    }
+    return sha256(canonical_json(payload).encode("utf-8"))
 
 
 def probe_target_identity(port: int, identity_path: str) -> tuple[dict[str, Any], str]:
@@ -490,6 +586,53 @@ def _host_resource_identity(resource: Mapping[str, Any] | None) -> dict[str, Any
         "status": "host_captured",
         "container_ids": container_ids,
         "process_identity": process_identity,
+    }
+
+
+def _resource_binding_snapshot(
+    role: str,
+    driver_name: str,
+    resources: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return an allowlisted snapshot of one target's configured resource.
+
+    Resource IDs alone can stay stable across a driver-observed container or
+    systemd service replacement. Preserve any host-captured identities supplied
+    by the driver separately; never copy raw driver output or credential
+    evidence. These snapshots improve provenance, but do not prove command
+    routing or independently re-probe the resource.
+    """
+
+    resource = resources.get(driver_name)
+    if not isinstance(resource, Mapping):
+        resource = None
+    resource_id = resource.get("resource_id") if resource else None
+    if (
+        not isinstance(resource_id, str)
+        or not resource_id
+        or len(resource_id) > 256
+        or any(ord(char) < 32 for char in resource_id)
+    ):
+        resource_id = None
+    kind = resource.get("kind") if resource else None
+    if not isinstance(kind, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,47}", kind):
+        kind = None
+    state = resource.get("state") if resource else None
+    if not isinstance(state, str) or state not in {
+        "active",
+        "stopped",
+        "quarantined",
+        "setup_failed",
+        "unknown",
+    }:
+        state = "unknown"
+    return {
+        "role": role,
+        "driver": driver_name,
+        "resource_id": resource_id,
+        "kind": kind,
+        "state": state,
+        "host_identity": _host_resource_identity(resource),
     }
 
 

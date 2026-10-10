@@ -34,6 +34,7 @@ def target_definition(**overrides: Any) -> runtime_targets.RuntimeTargetDefiniti
         "phases": ["qc", "integration"],
         "required": True,
         "schema_version": "v7",
+        "require_command_binding": False,
     }
     entry.update(overrides)
     return runtime_targets.parse_runtime_target_definitions(
@@ -50,6 +51,14 @@ def driver_resources() -> list[dict[str, Any]]:
             "kind": "docker_compose",
             "resource_id": "api-project-attempt-17",
             "state": "active",
+            "evidence": {
+                "proof": {
+                    "observation": {
+                        "stdout": "0123456789ab\n",
+                        "stderr": "private driver diagnostic",
+                    }
+                }
+            },
         },
         {
             "driver": "postgres",
@@ -62,6 +71,14 @@ def driver_resources() -> list[dict[str, Any]]:
             "kind": "docker_compose",
             "resource_id": "queue-project-attempt-17",
             "state": "active",
+            "evidence": {
+                "proof": {
+                    "observation": {
+                        "stdout": "fedcba987654\n",
+                        "stderr": "private queue diagnostic",
+                    }
+                }
+            },
         },
     ]
 
@@ -84,6 +101,7 @@ def expected_report(
         "source_revision": source_revision,
         "port": port,
         "driver_resource_id": "api-project-attempt-17",
+        "container_id": "0123456789ab",
         "database_namespace": "acp_attempt_17",
         "schema_version": "v7",
         "queue_namespace": "queue-project-attempt-17",
@@ -97,6 +115,8 @@ def evaluate_target(
     *,
     probe_status: str = "ok",
     resources: list[dict[str, Any]] | None = None,
+    require_command_binding: bool = False,
+    commands: tuple[str, ...] = ("pytest -q",),
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     observed = expected_report() if report is None else report
     monkeypatch.setattr(
@@ -105,7 +125,8 @@ def evaluate_target(
         lambda _port, _path: (observed, probe_status),
     )
     return runtime_targets.runtime_target_phase(
-        definitions=(target_definition(),),
+        definitions=(target_definition(require_command_binding=require_command_binding),),
+        commands=commands,
         runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(tmp_path)},
         driver_resources=driver_resources() if resources is None else resources,
         attempt_id="attempt-17",
@@ -140,13 +161,83 @@ def test_matching_app_report_is_only_corroboration_and_manifest_is_read_only(
     assert target["expected"]["queue_namespace"] == "queue-project-attempt-17"
     assert manifest["phase"] == "qc"
     assert manifest["source_revision"] == SOURCE_REVISION
+    assert manifest["command_set_scope"] == runtime_targets.COMMAND_SET_SCOPE
+    assert manifest["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
+    assert receipt["command_set_scope"] == manifest["command_set_scope"]
+    assert receipt["command_set_sha256"] == manifest["command_set_sha256"]
+    assert manifest["command_count"] == 1
     assert manifest["targets"][0]["endpoint"] == "http://127.0.0.1:43123"
+    snapshots = manifest["targets"][0]["resource_snapshots"]
+    assert [snapshot["role"] for snapshot in snapshots] == ["service", "database", "queue"]
+    assert snapshots[0]["host_identity"]["container_ids"] == ["0123456789ab"]
+    assert snapshots[1]["host_identity"]["status"] == "unknown"
+    assert snapshots[2]["host_identity"]["container_ids"] == ["fedcba987654"]
+    assert manifest["targets"][0]["resource_snapshot_sha256"] == sha256(
+        canonical_json(snapshots).encode("utf-8")
+    )
+    assert receipt["targets"][0]["resource_snapshots"] == snapshots
+    assert (
+        receipt["targets"][0]["resource_snapshot_sha256"]
+        == manifest["targets"][0]["resource_snapshot_sha256"]
+    )
+    assert "private driver diagnostic" not in manifest_path.read_text(encoding="utf-8")
+    assert "private queue diagnostic" not in manifest_path.read_text(encoding="utf-8")
+    assert "private driver diagnostic" not in canonical_json(receipt)
+    assert "private queue diagnostic" not in canonical_json(receipt)
     assert environment["ACP_TARGET_API_URL"] == "http://127.0.0.1:43123"
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o400
     assert (
         hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         == environment["ACP_RUNTIME_TARGETS_SHA256"]
     )
+
+
+def test_required_command_network_binding_is_unknown_and_blocks_matching_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path, monkeypatch, require_command_binding=True
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is True
+    assert receipt["status"] == "blocked"
+    assert receipt["exit_code"] == 1
+    assert receipt["blocking_reason"] == "runtime_target_command_binding_unavailable"
+    assert receipt["verified"] is False
+    assert target["status"] == "unknown"
+    assert target["command_binding_status"] == "unknown"
+    assert "command_network_binding" in target["missing_evidence"]
+    assert receipt["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
+
+
+def test_command_set_digest_binds_order_and_exact_shell_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _, _ = evaluate_target(tmp_path, monkeypatch, commands=("pytest -q", "ruff check ."))
+    second_dir = tmp_path / "reordered"
+    second_dir.mkdir()
+    second, _, _ = evaluate_target(second_dir, monkeypatch, commands=("ruff check .", "pytest -q"))
+    third_dir = tmp_path / "edited"
+    third_dir.mkdir()
+    third, _, _ = evaluate_target(third_dir, monkeypatch, commands=("pytest -q -x", "ruff check ."))
+
+    assert (
+        len(
+            {first["command_set_sha256"], second["command_set_sha256"], third["command_set_sha256"]}
+        )
+        == 3
+    )
+    assert first["verified"] is second["verified"] is third["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "commands",
+    ["pytest", ("pytest", 3), ("x" * 65537,), tuple("x" for _ in range(129))],
+)
+def test_invalid_command_set_is_rejected(commands: Any) -> None:
+    with pytest.raises(SupervisorError, match="phase command"):
+        runtime_targets._command_set_sha256(commands)
 
 
 @pytest.mark.parametrize(
@@ -345,6 +436,87 @@ def test_single_host_captured_container_must_match_the_app_report(
     assert "container_id" in receipt["targets"][0]["mismatches"]
 
 
+def test_resource_snapshot_digest_changes_when_related_host_identity_evidence_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _, _ = evaluate_target(tmp_path, monkeypatch)
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    resources = driver_resources()
+    resources[2]["evidence"] = {
+        "proof": {"observation": {"stdout": "aaaaaaaaaaaa\n", "stderr": "ignored"}}
+    }
+    second, _, _ = evaluate_target(replacement_dir, monkeypatch, resources=resources)
+
+    first_queue = first["targets"][0]["resource_snapshots"][2]
+    second_queue = second["targets"][0]["resource_snapshots"][2]
+    assert first_queue["resource_id"] == second_queue["resource_id"]
+    assert first_queue["host_identity"]["container_ids"] == ["fedcba987654"]
+    assert second_queue["host_identity"]["container_ids"] == ["aaaaaaaaaaaa"]
+    assert (
+        first["targets"][0]["resource_snapshot_sha256"]
+        != second["targets"][0]["resource_snapshot_sha256"]
+    )
+    assert second["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "private-evidence-sentinel",
+        ["private-list-evidence-sentinel"],
+        {"proof": {"observation": "private-observation-sentinel"}},
+        {
+            "proof": {
+                "observation": {
+                    "stdout": "private-driver-output-sentinel",
+                    "stderr": "private-driver-stderr-sentinel",
+                }
+            }
+        },
+        {
+            "proof": {
+                "observation": {
+                    "stdout": "x" * 8193,
+                    "stderr": "private-oversize-stderr-sentinel",
+                }
+            }
+        },
+    ],
+)
+def test_resource_snapshot_malformed_or_untrusted_evidence_fails_closed_and_is_not_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evidence: Any
+) -> None:
+    resources = driver_resources()
+    resources[0]["evidence"] = evidence
+    receipt, environment, _blocked = evaluate_target(tmp_path, monkeypatch, resources=resources)
+
+    target = receipt["targets"][0]
+    snapshot = target["resource_snapshots"][0]
+    assert snapshot["host_identity"] == {
+        "status": "unknown",
+        "container_ids": [],
+        "process_identity": None,
+    }
+    assert target["resource_snapshot_sha256"] == sha256(
+        canonical_json(target["resource_snapshots"]).encode("utf-8")
+    )
+    serialized = canonical_json(receipt)
+    manifest = Path(environment["ACP_RUNTIME_TARGETS_FILE"]).read_text(encoding="utf-8")
+    for sentinel in (
+        "private-evidence-sentinel",
+        "private-list-evidence-sentinel",
+        "private-observation-sentinel",
+        "private-driver-output-sentinel",
+        "private-driver-stderr-sentinel",
+        "private-oversize-stderr-sentinel",
+    ):
+        assert sentinel not in serialized
+        assert sentinel not in manifest
+    assert "x" * 8193 not in serialized
+    assert "x" * 8193 not in manifest
+
+
 @pytest.mark.parametrize(
     ("entry", "port_envs", "driver_names"),
     [
@@ -367,6 +539,16 @@ def test_single_host_captured_container_must_match_the_app_report(
         ),
         (
             {"name": "api", "port_env": "APP_PORT", "driver": "api", "unexpected": "value"},
+            {"APP_PORT"},
+            {"api"},
+        ),
+        (
+            {
+                "name": "api",
+                "port_env": "APP_PORT",
+                "driver": "api",
+                "require_command_binding": "yes",
+            },
             {"APP_PORT"},
             {"api"},
         ),
@@ -398,14 +580,22 @@ def test_target_names_must_not_alias_environment_variables() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stale_qc_worktree", "pause_phase"),
-    [(False, None), (True, None), (False, "qc"), (False, "integration")],
+    ("stale_qc_worktree", "pause_phase", "strict_binding_phase"),
+    [
+        (False, None, None),
+        (True, None, None),
+        (False, "qc", None),
+        (False, "integration", None),
+        (False, None, "qc"),
+        (False, None, "integration"),
+    ],
 )
 def test_qc_and_integration_receive_claim_fenced_target_receipts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stale_qc_worktree: bool,
     pause_phase: str | None,
+    strict_binding_phase: str | None,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -415,9 +605,11 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         port = probe.getsockname()[1]
     gate_started = tmp_path / "target-gate-started"
     gate_release = tmp_path / "target-gate-release"
+    command_entered = tmp_path / "target-command-entered"
     gate = python_command(
         "import hashlib, json, os, stat, time\n"
         "from pathlib import Path\n"
+        f"Path({str(command_entered)!r}).write_text('entered')\n"
         "p = Path(os.environ['ACP_RUNTIME_TARGETS_FILE'])\n"
         "raw = p.read_bytes()\n"
         "m = json.loads(raw)\n"
@@ -435,13 +627,21 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         f"    assert Path({str(gate_release)!r}).exists(), 'restart race gate was not released'\n"
         "Path(os.environ['ACP_RUNTIME_DIR'], 'target-gate-ran').write_text(os.environ['ACP_PHASE'])"
     )
-    write_config(repo, qc_commands=[gate], integration_commands=[gate])
+    qc_command = python_command("pass") if strict_binding_phase == "integration" else gate
+    write_config(repo, qc_commands=[qc_command], integration_commands=[gate])
+    target_phases = (
+        [strict_binding_phase] if strict_binding_phase is not None else ["qc", "integration"]
+    )
+    target_phase_text = json.dumps(target_phases)
+    strict_binding_text = (
+        "require_command_binding = true\n" if strict_binding_phase is not None else ""
+    )
     with (repo / "acp.toml").open("a", encoding="utf-8") as config:
         config.write(
             f"\n[runtime.ports]\nAPP_PORT = [{port}, {port}]\n"
             '\n[[runtime.drivers]]\nname = "api"\nkind = "browser_profile"\n'
             '\n[[runtime.targets]]\nname = "api"\nport_env = "APP_PORT"\n'
-            'driver = "api"\nphases = ["qc", "integration"]\n'
+            f'driver = "api"\nphases = {target_phase_text}\n{strict_binding_text}'
         )
     supervisor = GitSupervisor(repo)
     concurrent_supervisor = GitSupervisor(repo)
@@ -543,6 +743,23 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         qc_result = run_with_restart_race(
             "qc", lambda: supervisor.run_qc(submission["id"], "independent-qc")
         )
+        if strict_binding_phase == "qc":
+            assert qc_result["verdict"] == "block"
+            with supervisor.connect() as connection:
+                qc = connection.execute(
+                    "SELECT id, results_json FROM qc_runs "
+                    "WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
+                    (submission["id"],),
+                ).fetchone()
+            qc_receipt = next(
+                item
+                for item in json.loads(qc["results_json"])
+                if item.get("kind") == "runtime_target_preflight"
+            )
+            assert qc_receipt["blocking_reason"] == ("runtime_target_command_binding_unavailable")
+            assert qc_receipt["targets"][0]["status"] == "unknown"
+            assert not command_entered.exists(), "strict QC command was launched"
+            return
         if stale_qc_worktree:
             assert qc_result["verdict"] == "block"
             with supervisor.connect() as connection:
@@ -572,9 +789,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 item.get("sha256") == qc_receipt["evidence_sha256"]
                 for item in packet["evidence_catalog"]
             )
-            assert not (
-                Path(attempt["runtime"]["environment"]["ACP_RUNTIME_DIR"]) / "target-gate-ran"
-            ).exists()
+            assert not command_entered.exists(), "stale QC command was launched"
             return
         assert qc_result["verdict"] == "pass", qc_result.get("findings")
         with supervisor.connect() as connection:
@@ -584,18 +799,41 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 (submission["id"],),
             ).fetchone()
         qc_results = json.loads(qc["results_json"])
-        qc_receipt = next(
+        qc_target_receipts = [
             item for item in qc_results if item.get("kind") == "runtime_target_preflight"
-        )
-        assert qc_receipt["phase"] == "qc"
-        assert qc_receipt["source_revision"] == submission["commit_sha"]
-        assert qc_receipt["claim_token"] == attempt["claim_token"]
-        assert qc_receipt["targets"][0]["status"] == "corroborated"
-        assert qc_receipt["verified"] is False
+        ]
+        if strict_binding_phase == "integration":
+            assert qc_target_receipts == []
+        else:
+            qc_receipt = qc_target_receipts[0]
+            assert qc_receipt["phase"] == "qc"
+            assert qc_receipt["source_revision"] == submission["commit_sha"]
+            assert qc_receipt["claim_token"] == attempt["claim_token"]
+            assert qc_receipt["targets"][0]["status"] == "corroborated"
+            assert qc_receipt["verified"] is False
 
         integrated = run_with_restart_race(
             "integration", lambda: supervisor.integrate(attempt["task_id"])
         )
+        if strict_binding_phase == "integration":
+            assert integrated["verdict"] == "failed"
+            with supervisor.connect() as connection:
+                integration = connection.execute(
+                    "SELECT results_json FROM integrations "
+                    "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (attempt["task_id"],),
+                ).fetchone()
+            integration_receipt = next(
+                item
+                for item in json.loads(integration["results_json"])
+                if item.get("kind") == "runtime_target_preflight"
+            )
+            assert integration_receipt["blocking_reason"] == (
+                "runtime_target_command_binding_unavailable"
+            )
+            assert integration_receipt["targets"][0]["status"] == "unknown"
+            assert not command_entered.exists(), "strict integration command was launched"
+            return
         assert integrated["verdict"] == "pass", integrated["error"]
         with supervisor.connect() as connection:
             integration = connection.execute(
