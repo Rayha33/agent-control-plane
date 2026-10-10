@@ -1940,6 +1940,36 @@ systemd manager restart/logout/reboot, a concurrent cleanup race, runc-created
 scope behavior, or `run_worker` integration. The opt-in test is not default CI
 and does not authorize setting `cleanup_verified`; OCI remains fail-closed.
 
+**PID-start-identity receipt revalidation (2026-10-10; exact-source replay).**
+Receipt schema v3 records the Linux process identity
+`linux:<MainPID>:<starttime>` using ACP's PID-reuse-resistant process helper.
+Receipt parsing rejects malformed or PID-mismatched identities, and a fresh
+reconciler compares the current process start identity after checking the
+systemd-reported unit identity. A deterministic regression keeps all mocked
+systemd properties, including `MainPID`, unchanged while changing the start
+identity; reconciliation rejects it. This simulates PID reuse at the identity
+boundary, not actual kernel PID reuse.
+
+The exact updated test file and package wheel were replayed in the disposable
+no-host-mount Lima guest above (Ubuntu 24.04.5 ARM64, Linux 6.8.0-142,
+systemd 255.4, Python 3.12.3, active user manager, cgroup v2). The test file
+SHA-256 was
+`282427fbbe67345ee3d8c404c35a110ce3cc55c7cbe7344e2469fe76e1f966f0` and the
+package wheel SHA-256 was
+`b285d3c387b36acb05652d63b331f2e27f40d5ac57e679607cf336fb68a82134`; both
+matched between host and guest. The opt-in pytest passed (1 passed), and a
+direct script replay returned `monitor_reconciled_after_controller_sigkill`,
+`monitor_survived_worker_slice_stop`, and `cgroups_empty` as true. The unique
+service and scope became `not-found`/`inactive`, the attempt slice became
+`inactive`, their three recorded cgroup paths were absent, the recorded monitor
+PID was absent, and the scope client exited `-15` (`SIGTERM`). The host's exact
+commit `ad63e2d` also passed all four Ubuntu/macOS × Python 3.11/3.12 CI jobs
+(run `38085103683`). This is still a `/usr/bin/sleep 45` placeholder and
+controller-process recovery only: it does not prove kernel PID reuse,
+fencing-epoch binding, an ACP monitor owning runc, cleanup/result-import
+integration, manager restart/logout/reboot recovery, or `run_worker`; OCI
+remains fail-closed.
+
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
 argv for a future executor. It encodes a readonly root, a single non-recursive
