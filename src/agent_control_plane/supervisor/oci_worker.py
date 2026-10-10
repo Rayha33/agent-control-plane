@@ -93,7 +93,7 @@ _DEFAULT_DEV_TMPFS_INODES = 64
 _MAX_RUNC_LAUNCH_PAYLOAD_BYTES = 64 * 1024
 _RUNC_NAMESPACE_SETUP_TIMEOUT_SECONDS = 5.0
 _MOUNT_DESTINATIONS = ("/proc", "/dev", "/workspace", "/tmp", "/home/agent")
-_RUNC_RECURSIVE_PRIVATE_VERSION = "1.3.5"
+_RUNC_RECURSIVE_PRIVATE_VERSION = "1.5.2"
 _LAUNCH_GATE_SCRIPT = 'IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@"'
 _RUNC_FD_LAUNCHER = r"""
 import json
@@ -3177,7 +3177,7 @@ def _apply_pinned_runc_recursive_private_policy(
 
     The portable OCI compiler emits the standard rootfsPropagation value
     "private". On the supported runc release, that leaves propagation state on
-    nested runtime mounts. Runc 1.3.5 accepts the implementation-specific
+    nested runtime mounts. Runc 1.5.2 accepts the implementation-specific
     spelling "rprivate" and maps it to MS_PRIVATE|MS_REC. Keep that extension
     out of the generic compiler and refuse it for every other pinned release.
     """
@@ -3185,7 +3185,7 @@ def _apply_pinned_runc_recursive_private_policy(
     if expected_version != _RUNC_RECURSIVE_PRIVATE_VERSION:
         raise SupervisorError(
             "invalid_oci_runtime_version",
-            "recursive rootfs propagation currently requires pinned runc 1.3.5",
+            "recursive rootfs propagation currently requires pinned runc 1.5.2",
         )
     compiled_config, rootfs_sha256, rootfs_closure_sha256 = _compiler_issued_oci_worker_config(
         config
@@ -3264,7 +3264,7 @@ def _verify_pinned_runc_worker_config(
         )
     if version != _RUNC_RECURSIVE_PRIVATE_VERSION:
         raise SupervisorError(
-            "invalid_oci_runtime_version", "runc worker config requires pinned runc 1.3.5"
+            "invalid_oci_runtime_version", "runc worker config requires pinned runc 1.5.2"
         )
     _verify_trusted_runc_executable(executable)
     observed_version = _probe_trusted_runc_version(executable, version)

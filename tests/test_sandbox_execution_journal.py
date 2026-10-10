@@ -306,7 +306,7 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
-    assert durable["launch_plan"]["version"] == 4
+    assert durable["launch_plan"]["version"] == 5
     assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
     assert durable["launch_plan"]["launch"]["resource_limits"] == {
@@ -319,6 +319,35 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     event_plan = json.loads(event["payload_json"])["launch_plan"]
     assert event_plan == durable["launch_plan"]
     assert supervisor.verify_event_chain()["ok"] is True
+
+    # Version 4 remains auditable under its original ownership evidence, but
+    # does not carry the split-monitor placement contract required for running.
+    legacy_v4_plan = json.loads(canonical_json(durable["launch_plan"]))
+    legacy_v4_plan["version"] = 4
+    legacy_v4_plan["launch"]["systemd_ownership"].pop("monitor_placement")
+    old_wrapper_cgroup = f"{durable['attempt_slice_cgroup_path']}/{durable['wrapper_unit']}"
+    legacy_v4_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = old_wrapper_cgroup
+    legacy_v4_row = dict(durable)
+    legacy_v4_row["wrapper_cgroup_path"] = old_wrapper_cgroup
+    legacy_v4_row["launch_plan_json"] = canonical_json(legacy_v4_plan)
+    legacy_v4_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_v4_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_v4_row)
+
+    sibling_monitor_cgroup = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        f"{oci_worker._oci_worker_systemd_slice('sibling-attempt')}/{durable['wrapper_unit']}"
+    )
+    sibling_plan = json.loads(canonical_json(durable["launch_plan"]))
+    sibling_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = sibling_monitor_cgroup
+    sibling_row = dict(durable)
+    sibling_row["wrapper_cgroup_path"] = sibling_monitor_cgroup
+    sibling_row["launch_plan_json"] = canonical_json(sibling_plan)
+    sibling_row["launch_plan_digest"] = hashlib.sha256(
+        sibling_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(sibling_row)
 
     # Earlier plan versions did not bind an attempt-slice identity and cannot
     # authorize the stronger current launch/running evidence.
@@ -1170,6 +1199,7 @@ def record_launch(
     attempt: dict,
     *,
     runc_handle: oci_worker.RuncLaunchHandle | None = None,
+    wrapper_cgroup_path: str | None = None,
 ) -> dict:
     if runc_handle is None:
         execution = supervisor._sandbox_execution_get(attempt["id"])
@@ -1179,7 +1209,8 @@ def record_launch(
     execution = supervisor._sandbox_execution_get(attempt["id"])
     assert execution is not None
     slice_unit = oci_worker._oci_worker_systemd_slice(execution["container_id"])
-    slice_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/" + slice_unit
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    slice_cgroup = common_cgroup + "/" + slice_unit
     return supervisor._sandbox_execution_record_launch(
         attempt["id"],
         attempt["claim_token"],
@@ -1188,7 +1219,7 @@ def record_launch(
         runc_handle=runc_handle,
         wrapper_unit="acp-worker.service",
         wrapper_invocation_id="1" * 32,
-        wrapper_cgroup_path=f"{slice_cgroup}/acp-worker.service",
+        wrapper_cgroup_path=wrapper_cgroup_path or f"{common_cgroup}/acp-worker.service",
         attempt_slice_unit=slice_unit,
         attempt_slice_invocation_id="3" * 32,
         attempt_slice_cgroup_path=slice_cgroup,
@@ -1198,12 +1229,36 @@ def record_launch(
     )
 
 
+def test_launch_rejects_monitor_in_sibling_attempt_slice(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    sibling_monitor_path = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        f"user-acp-{'f' * 64}.slice/acp-worker.service"
+    )
+
+    with pytest.raises(SupervisorError) as invalid:
+        record_launch(
+            supervisor,
+            attempt,
+            runc_handle=handle,
+            wrapper_cgroup_path=sibling_monitor_path,
+        )
+
+    assert invalid.value.code == "sandbox_execution_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
 def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTarget) -> dict:
     plan = journal_module._sandbox_launch_plan_material(execution, target)
     slice_unit = oci_worker._oci_worker_systemd_slice(target.container_id)
-    slice_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/" + slice_unit
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    slice_cgroup = common_cgroup + "/" + slice_unit
     plan["launch"]["systemd_ownership"] = {
-        "wrapper_control_group": f"{slice_cgroup}/acp-worker.service",
+        "wrapper_control_group": f"{common_cgroup}/acp-worker.service",
+        "monitor_placement": "outside_attempt_slice",
         "attempt_slice_unit": slice_unit,
         "attempt_slice_invocation_id": "3" * 32,
         "attempt_slice_control_group": slice_cgroup,
@@ -1217,7 +1272,7 @@ def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTar
         "runc_client_identity": "linux:202:1202",
         "wrapper_unit": "acp-worker.service",
         "wrapper_invocation_id": "1" * 32,
-        "wrapper_cgroup_path": f"{slice_cgroup}/acp-worker.service",
+        "wrapper_cgroup_path": f"{common_cgroup}/acp-worker.service",
         "attempt_slice_unit": slice_unit,
         "attempt_slice_invocation_id": "3" * 32,
         "attempt_slice_cgroup_path": slice_cgroup,
@@ -1482,6 +1537,26 @@ def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
     return supervisor._sandbox_cleanup_receipt(row)
 
 
+def synthesize_cleanup_verified_for_downstream_test(
+    supervisor: GitSupervisor, attempt_id: str
+) -> None:
+    """Bypass the unavailable verifier only to exercise post-cleanup consumers."""
+
+    row = supervisor._sandbox_execution_get(attempt_id)
+    assert row is not None and row["phase"] == "cleanup_reported"
+    Path(row["bundle_path"]).rmdir()
+    Path(row["state_path"]).rmdir()
+    with supervisor.connect() as connection:
+        # Production has no cleanup_verified writer. Dropping this guard is
+        # strictly test-only and is not evidence of cleanup verification.
+        connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
+        connection.execute(
+            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
+            (attempt_id,),
+        )
+        connection.commit()
+
+
 def result_fixture(attempt: dict, tmp_path: Path):
     baseline = copy_snapshot(attempt["worktree"], tmp_path / "baseline")
     output = copy_snapshot(attempt["worktree"], tmp_path / "worker-output").root
@@ -1501,7 +1576,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 26
+    assert SCHEMA_VERSION == 27
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -2982,6 +3057,15 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
 
+    with pytest.raises(SupervisorError) as unverified:
+        supervisor._sandbox_execution_capture_result_candidate(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert unverified.value.code == "sandbox_result_evidence_unverified"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
+
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+
     captured = supervisor._sandbox_execution_capture_result_candidate(
         attempt["id"], attempt["claim_token"]
     )
@@ -3039,13 +3123,66 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
         supervisor.import_worker_result(
             attempt["id"], attempt["claim_token"], binding["baseline"], change_set
         )
-    assert imported.value.code == "sandbox_result_unverified"
+    assert imported.value.code == "sandbox_result_import_route_required"
     with supervisor.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
     reopened = GitSupervisor(repo)
     persisted = reopened._sandbox_execution_get(attempt["id"])
     assert persisted["result_candidate"] == candidate
     assert persisted["result_candidate_digest"] == captured["candidate_digest"]
+
+
+def test_schema27_migration_moves_candidate_write_guard_to_verified_cleanup(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+    record_exit(supervisor, attempt)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+    )
+
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_result_candidate_write_once")
+        # Recreate the schema-26 predicate and version marker to exercise the
+        # forward migration on a database containing an unverified row.
+        connection.execute(
+            """
+            CREATE TRIGGER sandbox_result_candidate_write_once
+            BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+              result_candidate_digest ON sandbox_executions
+            WHEN OLD.result_candidate_version = 0
+              AND NEW.result_candidate_version = 1
+              AND OLD.phase = 'cleanup_reported'
+            BEGIN
+              SELECT RAISE(ABORT, 'sandbox_result_candidate_immutable');
+            END
+            """
+        )
+        connection.execute("UPDATE meta SET value = '26' WHERE key = 'schema_version'")
+        connection.commit()
+
+    upgraded = GitSupervisor(repo)
+    assert upgraded.schema_version_on_open == 26
+    with upgraded.connect() as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'sandbox_result_candidate_write_once'"
+        ).fetchone()
+        assert trigger is not None
+        assert "cleanup_verified" in trigger["sql"]
+        assert "cleanup_reported" not in trigger["sql"]
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_result_candidate_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET result_candidate_version = 1, "
+                "result_candidate_json = ?, result_candidate_digest = ? WHERE attempt_id = ?",
+                (
+                    '{"authorization":"none","status":"unverified"}',
+                    "0" * 64,
+                    attempt["id"],
+                ),
+            )
 
 
 def test_sandbox_import_route_fails_closed_before_cleanup_verification(repo: Path) -> None:
@@ -3106,19 +3243,13 @@ def test_sandbox_import_uses_distinct_source_and_recovers_published_ref(
     supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
-    supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
 
-    # Exercise the downstream import boundary with a synthetic already-verified
-    # journal state. No production method currently writes cleanup_verified, so
-    # this is not cleanup-verifier or live-runtime evidence.
-    Path(row["bundle_path"]).rmdir()
-    Path(row["state_path"]).rmdir()
+    # Exercise downstream import only with a synthetic already-verified
+    # journal state. No production method writes cleanup_verified, so this is
+    # not cleanup-verifier or live-runtime evidence.
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+    supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
     with supervisor.connect() as connection:
-        connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
-        connection.execute(
-            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
-            (attempt["id"],),
-        )
         # Model a corrupt/legacy mixed-source journal with a different claim
         # token and result digest; healthy-schema guards normally prevent it.
         connection.execute("DROP TRIGGER result_import_direct_source_insert_guard")
@@ -3244,6 +3375,8 @@ def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> No
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
 
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+
     first = supervisor._sandbox_execution_capture_result_candidate(
         attempt["id"], attempt["claim_token"]
     )
@@ -3330,10 +3463,12 @@ def test_persisted_pre_schema17_cleanup_receipt_replays_but_never_proves_cleanup
 
     workspace = Path(supervisor._sandbox_execution_get(attempt["id"])["workspace_root_path"])
     (workspace / "alpha.txt").write_text("legacy cleanup receipt candidate\n", encoding="utf-8")
-    candidate = supervisor._sandbox_execution_capture_result_candidate(
-        attempt["id"], attempt["claim_token"]
-    )
-    assert candidate["candidate"]["cleanup"]["status"] == "unverified"
+    with pytest.raises(SupervisorError) as unverified_candidate:
+        supervisor._sandbox_execution_capture_result_candidate(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert unverified_candidate.value.code == "sandbox_result_evidence_unverified"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
 
     current_receipt = cleanup_receipt(supervisor, attempt["id"])
     with pytest.raises(SupervisorError) as replace_legacy:

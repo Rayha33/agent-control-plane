@@ -166,6 +166,12 @@ class ConfigMixin:
                 raise SupervisorError(
                     "invalid_config", "sandbox.oci.runc_version must be an exact release version"
                 )
+            if requested_runc_version != oci_worker._RUNC_RECURSIVE_PRIVATE_VERSION:
+                raise SupervisorError(
+                    "invalid_config",
+                    "sandbox.oci.runc_version must be the supported exact release "
+                    f"{oci_worker._RUNC_RECURSIVE_PRIVATE_VERSION}",
+                )
             if not isinstance(raw_rootfs_path, str) or not raw_rootfs_path.strip():
                 raise SupervisorError(
                     "invalid_config", "sandbox.oci.rootfs_path must be an absolute path"

@@ -515,7 +515,7 @@ def _validate_worker_mount_policy(
         "/tmp": ("tmpfs", "rw"),
         "/home/agent": ("tmpfs", "rw"),
     }
-    expected_runc_135_mounts = {
+    expected_runc_152_mounts = {
         "/dev/full": ("/full", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
         "/dev/null": ("/null", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
         "/dev/random": ("/random", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
@@ -532,19 +532,19 @@ def _validate_worker_mount_policy(
             {"ro", "nodev", "noexec", "nosuid", "relatime"},
         ),
     }
-    expected_runc_135_optional_mounts = {
+    expected_runc_152_optional_mounts = {
         "/proc/latency_stats": ("/null", "devtmpfs", "udev", {"rw", "nosuid", "relatime"}),
     }
     actual_mountpoints = set(mounts)
     base_mountpoints = set(expected_mounts)
     extra_mountpoints = actual_mountpoints - base_mountpoints
-    if extra_mountpoints and expected_runc_version != "1.3.5":
+    if extra_mountpoints and expected_runc_version != "1.5.2":
         unexpected_mountpoints = sorted(extra_mountpoints)
     else:
-        known_runc_135_mountpoints = set(expected_runc_135_mounts) | set(
-            expected_runc_135_optional_mounts
+        known_runc_152_mountpoints = set(expected_runc_152_mounts) | set(
+            expected_runc_152_optional_mounts
         )
-        unexpected_mountpoints = sorted(extra_mountpoints - known_runc_135_mountpoints)
+        unexpected_mountpoints = sorted(extra_mountpoints - known_runc_152_mountpoints)
     if unexpected_mountpoints:
         unexpected = {
             target: {
@@ -559,7 +559,7 @@ def _validate_worker_mount_policy(
             for target in unexpected_mountpoints
         }
         raise AssertionError(f"worker mountinfo contains unexpected mountpoints: {unexpected}")
-    if expected_runc_version == "1.3.5":
+    if expected_runc_version == "1.5.2":
         propagating_mounts = {
             target: list(mount.optional_fields)
             for target, mount in mounts.items()
@@ -567,23 +567,23 @@ def _validate_worker_mount_policy(
         }
         if propagating_mounts:
             raise AssertionError(
-                f"worker runc 1.3.5 mounts retain propagation fields: {propagating_mounts}"
+                f"worker runc 1.5.2 mounts retain propagation fields: {propagating_mounts}"
             )
-        missing_defaults = sorted(set(expected_runc_135_mounts) - extra_mountpoints)
+        missing_defaults = sorted(set(expected_runc_152_mounts) - extra_mountpoints)
         if missing_defaults:
             raise AssertionError(
-                f"runc 1.3.5 mountinfo omits exact default mounts: {missing_defaults}"
+                f"runc 1.5.2 mountinfo omits exact default mounts: {missing_defaults}"
             )
-        verified_runc_135_mounts = {
-            **expected_runc_135_mounts,
+        verified_runc_152_mounts = {
+            **expected_runc_152_mounts,
             **{
                 target: expected
-                for target, expected in expected_runc_135_optional_mounts.items()
+                for target, expected in expected_runc_152_optional_mounts.items()
                 if target in extra_mountpoints
             },
         }
         device_mount_ids: set[tuple[int, int]] = set()
-        for target, (root, filesystem, source, options) in verified_runc_135_mounts.items():
+        for target, (root, filesystem, source, options) in verified_runc_152_mounts.items():
             observed = mounts[target]
             if (observed.root, observed.filesystem, observed.source) != (
                 root,
@@ -682,8 +682,8 @@ def _validate_worker_mount_policy(
                 "super_options": sorted(observed.super_options),
             }
         )
-    if expected_runc_version == "1.3.5":
-        for target in verified_runc_135_mounts:
+    if expected_runc_version == "1.5.2":
+        for target in verified_runc_152_mounts:
             observed = mounts[target]
             observed_mounts.append(
                 {
@@ -700,7 +700,7 @@ def _validate_worker_mount_policy(
     return observed_mounts
 
 
-_WORKER_RUNC_135_DEVICE_NODES = {
+_WORKER_RUNC_152_DEVICE_NODES = {
     "/dev/full": ("/dev/full", (1, 7)),
     "/dev/null": ("/dev/null", (1, 3)),
     "/dev/random": ("/dev/random", (1, 8)),
@@ -749,7 +749,7 @@ def _audit_worker_init_device_mount_identities(
         stat_path = os.stat
     observed: dict[str, dict[str, Any]] = {}
     process_root = Path(f"/proc/{pid}/root")
-    for target, (host_path, expected_device_number) in _WORKER_RUNC_135_DEVICE_NODES.items():
+    for target, (host_path, expected_device_number) in _WORKER_RUNC_152_DEVICE_NODES.items():
         try:
             host_info = stat_path(Path(host_path), follow_symlinks=False)
             guest_info = stat_path(process_root / target.lstrip("/"), follow_symlinks=False)
@@ -863,7 +863,7 @@ def _audit_worker_init_runtime_policy(
             raise AssertionError("worker init PID/start-time changed during runtime policy audit")
         if _snapshot_cgroup_path(snapshot).resolve(strict=True) != expected_cgroup:
             raise AssertionError("worker init cgroup changed during runtime policy audit")
-        if expected_runc_version == "1.3.5" and _snapshot_tty_number(snapshot, pid) != 0:
+        if expected_runc_version == "1.5.2" and _snapshot_tty_number(snapshot, pid) != 0:
             raise AssertionError("worker init has a controlling terminal while /dev/tty is mounted")
 
     def read_bounded(path: Path, limit: int, label: str) -> bytes:
@@ -892,7 +892,7 @@ def _audit_worker_init_runtime_policy(
     )
     device_identities = (
         _audit_worker_init_device_mount_identities(pid, mounts)
-        if expected_runc_version == "1.3.5"
+        if expected_runc_version == "1.5.2"
         else {}
     )
     verify_identity()
@@ -1522,7 +1522,7 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
     with pytest.raises(AssertionError, match="unexpected mountpoints"):
         _validate_worker_mount_policy({**mounts, "/var/agent-data": mount("tmpfs", {"rw"})})
 
-    runc_135_mounts = dict(mounts)
+    runc_152_mounts = dict(mounts)
     dev_id = (0, 55)
     proc_id = (0, 56)
     for target, root in (
@@ -1535,7 +1535,7 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
         ("/proc/kcore", "/null"),
         ("/proc/keys", "/null"),
     ):
-        runc_135_mounts[target] = mount(
+        runc_152_mounts[target] = mount(
             "devtmpfs",
             {"rw", "nosuid", "relatime"},
             root=root,
@@ -1547,7 +1547,7 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
         ("/proc/sys", "/sys"),
         ("/proc/sysrq-trigger", "/sysrq-trigger"),
     ):
-        runc_135_mounts[target] = mount(
+        runc_152_mounts[target] = mount(
             "proc",
             {"ro", "nodev", "noexec", "nosuid", "relatime"},
             root=root,
@@ -1555,16 +1555,16 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
             device_id=proc_id,
             super_options={"ro"},
         )
-    runc_135_mounts["/proc"] = mount(
+    runc_152_mounts["/proc"] = mount(
         "proc",
         {"ro", "nosuid", "nodev", "noexec"},
         device_id=proc_id,
     )
     accepted_defaults = _validate_worker_mount_policy(
-        runc_135_mounts,
-        expected_runc_version="1.3.5",
+        runc_152_mounts,
+        expected_runc_version="1.5.2",
     )
-    assert {mount["target"] for mount in accepted_defaults} == set(runc_135_mounts)
+    assert {mount["target"] for mount in accepted_defaults} == set(runc_152_mounts)
 
     latency_stats_mask = mount(
         "devtmpfs",
@@ -1574,21 +1574,21 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
         device_id=dev_id,
         super_options={"rw", "size=1024"},
     )
-    runc_135_with_latency_stats = {
-        **runc_135_mounts,
+    runc_152_with_latency_stats = {
+        **runc_152_mounts,
         "/proc/latency_stats": latency_stats_mask,
     }
     accepted_with_latency_stats = _validate_worker_mount_policy(
-        runc_135_with_latency_stats,
-        expected_runc_version="1.3.5",
+        runc_152_with_latency_stats,
+        expected_runc_version="1.5.2",
     )
     assert {mount["target"] for mount in accepted_with_latency_stats} == set(
-        runc_135_with_latency_stats
+        runc_152_with_latency_stats
     )
     with pytest.raises(AssertionError, match="root/filesystem/source"):
         _validate_worker_mount_policy(
             {
-                **runc_135_with_latency_stats,
+                **runc_152_with_latency_stats,
                 "/proc/latency_stats": mount(
                     "devtmpfs",
                     {"rw", "nosuid", "relatime"},
@@ -1598,24 +1598,24 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
                     super_options={"rw", "size=1024"},
                 ),
             },
-            expected_runc_version="1.3.5",
+            expected_runc_version="1.5.2",
         )
     with pytest.raises(AssertionError, match="unexpected mountpoints"):
         _validate_worker_mount_policy(
             {
-                **runc_135_with_latency_stats,
+                **runc_152_with_latency_stats,
                 "/proc/unexpected": latency_stats_mask,
             },
-            expected_runc_version="1.3.5",
+            expected_runc_version="1.5.2",
         )
     with pytest.raises(AssertionError, match="unexpected mountpoints"):
-        _validate_worker_mount_policy(runc_135_mounts)
+        _validate_worker_mount_policy(runc_152_mounts)
     with pytest.raises(AssertionError, match="unexpected mountpoints"):
-        _validate_worker_mount_policy(runc_135_mounts, expected_runc_version="1.4.0")
+        _validate_worker_mount_policy(runc_152_mounts, expected_runc_version="1.4.0")
     with pytest.raises(AssertionError, match="root/filesystem/source"):
         _validate_worker_mount_policy(
             {
-                **runc_135_mounts,
+                **runc_152_mounts,
                 "/dev/null": mount(
                     "devtmpfs",
                     {"rw"},
@@ -1625,12 +1625,12 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
                     super_options={"rw"},
                 ),
             },
-            expected_runc_version="1.3.5",
+            expected_runc_version="1.5.2",
         )
     with pytest.raises(AssertionError, match="propagation fields"):
         _validate_worker_mount_policy(
             {
-                **runc_135_mounts,
+                **runc_152_mounts,
                 "/dev/null": mount(
                     "devtmpfs",
                     {"rw", "nosuid", "relatime"},
@@ -1641,7 +1641,7 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
                     optional_fields=("master:10",),
                 ),
             },
-            expected_runc_version="1.3.5",
+            expected_runc_version="1.5.2",
         )
     with pytest.raises(AssertionError, match="fresh procfs rooted at /"):
         _validate_worker_mount_policy(
@@ -1710,7 +1710,7 @@ def test_worker_default_device_mounts_require_exact_host_inode_identity() -> Non
     mounts: dict[str, _WorkerMountInfo] = {}
     host_stats: dict[str, Any] = {}
     for index, (target, (host_path, device_number)) in enumerate(
-        _WORKER_RUNC_135_DEVICE_NODES.items(), start=1
+        _WORKER_RUNC_152_DEVICE_NODES.items(), start=1
     ):
         host_stat = host_stats.get(host_path)
         if host_stat is None:
@@ -1741,7 +1741,7 @@ def test_worker_default_device_mounts_require_exact_host_inode_identity() -> Non
         return stats[path]
 
     observed = _audit_worker_init_device_mount_identities(pid, mounts, stat_path=stat_path)
-    assert set(observed) == set(_WORKER_RUNC_135_DEVICE_NODES)
+    assert set(observed) == set(_WORKER_RUNC_152_DEVICE_NODES)
 
     null_guest = Path(f"/proc/{pid}/root/dev/null")
     stats[null_guest] = SimpleNamespace(
@@ -2328,6 +2328,7 @@ if /bin/busybox cat {q["credential"]} > /workspace/credential.txt; then exit 39;
 if /bin/busybox cat {q["host_tmp"]} > /workspace/host-tmp.txt; then exit 40; fi
 if /bin/busybox touch {q["host_tmp"]}; then exit 41; fi
 test ! -e /tmp/{host_tmp_rel}
+if test -e {q["host_unix_socket"]} || test -L {q["host_unix_socket"]}; then exit 46; fi
 
 # Absolute and parent-relative symlinks must remain inside the container root.
 /bin/busybox ln -s {q["host_tmp"]} /workspace/absolute-host-tmp
@@ -2547,6 +2548,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     host_config_file = fixture_root / "host-home" / ".codex" / "config-marker.toml"
     credential_file = fixture_root / "host-home" / ".ssh" / "synthetic-key-marker"
     host_tmp_file = fixture_root / "host-tmp-sentinel"
+    # AF_UNIX sockaddr paths are short on Linux; keep this host-only marker
+    # directly under /tmp with a UUID instead of nesting it in the fixture tree.
+    host_unix_socket = Path("/tmp") / f"acp-{uuid.uuid4().hex}.sock"
     fixture_root.mkdir(mode=0o700)
     fixture_root.chmod(0o700)
     record_attempt_child(fixture_root)
@@ -2579,6 +2583,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         "host_config": host_config_file,
         "credential": credential_file,
         "host_tmp": host_tmp_file,
+        "host_unix_socket": host_unix_socket,
     }
     host_tmp_relative = str(host_tmp_file.resolve().relative_to(Path("/tmp")))
 
@@ -2595,6 +2600,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         pytest.fail("route selection did not identify a non-loopback host NIC address")
 
     listener: socket.socket | None = None
+    unix_socket_listener: socket.socket | None = None
+    host_unix_socket_identity: tuple[int, int] | None = None
     opened_runc_descriptor: int | None = None
     runc_descriptor: int | None = None
     run_handle: oci_worker.RuncLaunchHandle | None = None
@@ -2647,6 +2654,16 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         listener.listen(1)
         listener.setblocking(False)
         host_network_port = listener.getsockname()[1]
+
+        if os.path.lexists(host_unix_socket):
+            pytest.fail("unique host Unix-socket sentinel path already exists")
+        unix_socket_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        unix_socket_listener.bind(str(host_unix_socket))
+        socket_info = host_unix_socket.lstat()
+        host_unix_socket_identity = (socket_info.st_dev, socket_info.st_ino)
+        if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.geteuid():
+            pytest.fail("host Unix-socket sentinel is not a test-owned socket")
+        unix_socket_listener.listen(1)
 
         opened_runc_descriptor = oci_worker._open_verified_runc_executable(pin)
         runc_descriptor = fcntl.fcntl(opened_runc_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
@@ -3253,6 +3270,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                         "synthetic host config and credential sentinels",
                         "host /etc/os-release",
                         "host /tmp sentinel",
+                        "host /tmp Unix-socket sentinel",
                         "absolute and relative symlink targets",
                     ],
                     "checkout_write_probe": "unique test-owned canary; removed during teardown",
@@ -3703,8 +3721,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                 else:
                     cleanup_errors.append("private bundle cleanup identity journal diverged")
             if state_root_present is False:
-                if attempt_child_identities.get("runc-state-pinned") == original_state_identity:
-                    del attempt_child_identities["runc-state-pinned"]
+                if attempt_child_identities.get(state_root.name) == original_state_identity:
+                    del attempt_child_identities[state_root.name]
                 else:
                     cleanup_errors.append("private state cleanup identity journal diverged")
             if bundle_present or state_root_present:
@@ -3713,6 +3731,31 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         # Descriptor cleanup is an unconditional outermost stage.
         if listener is not None:
             _attempt_cleanup(cleanup_errors, "could not close host-only listener", listener.close)
+        if unix_socket_listener is not None:
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not close host Unix-socket sentinel",
+                unix_socket_listener.close,
+            )
+        if host_unix_socket_identity is not None:
+
+            def remove_exact_host_unix_socket() -> None:
+                info = host_unix_socket.lstat()
+                if (
+                    not stat.S_ISSOCK(info.st_mode)
+                    or (info.st_dev, info.st_ino) != host_unix_socket_identity
+                    or info.st_uid != os.geteuid()
+                ):
+                    raise AssertionError("host Unix-socket sentinel identity changed")
+                host_unix_socket.unlink()
+
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not remove exact host Unix-socket sentinel",
+                remove_exact_host_unix_socket,
+            )
+            if os.path.lexists(host_unix_socket):
+                cleanup_errors.append("host Unix-socket sentinel remained after cleanup")
         close_fd(
             "could not close pinned runc descriptor",
             runc_descriptor if runc_descriptor is not None else -1,

@@ -66,6 +66,7 @@ _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SYSTEMD_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope|slice)\Z")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_ATTEMPT_SLICE_COMPONENT = re.compile(r"user-acp-[0-9a-f]{64}\.slice\Z")
 _LEGACY_BUNDLE_DIGEST_SEMANTICS = "legacy-caller-asserted-v0"
 _BUNDLE_DIGEST_SEMANTICS = "oci-reservation-v1"
 _PHASES = frozenset(
@@ -115,7 +116,7 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     argv = list(target.argv)
     argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
     return {
-        "version": 4,
+        "version": 5,
         "reservation": {
             "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
             **{
@@ -231,6 +232,30 @@ def _sandbox_reservation_bundle_digest(execution: Any) -> str:
     return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
+def _sandbox_v5_cgroup_topology_is_self_consistent(row: Any) -> bool:
+    """Require the trusted monitor to survive an exact worker-slice stop."""
+
+    try:
+        monitor = PurePosixPath(row["wrapper_cgroup_path"])
+        attempt_slice = PurePosixPath(row["attempt_slice_cgroup_path"])
+        scope = PurePosixPath(row["cgroup_path"])
+        paths = (monitor, attempt_slice, scope)
+        return (
+            all(path.is_absolute() and path.as_posix() == str(path) for path in paths)
+            and all(part not in {".", ".."} for path in paths for part in path.parts)
+            and monitor.name == row["wrapper_unit"]
+            and attempt_slice.name == row["attempt_slice_unit"]
+            and scope.name == row["scope_unit"]
+            and row["attempt_slice_unit"] == _oci_worker_systemd_slice(row["container_id"])
+            and not monitor.is_relative_to(attempt_slice)
+            and not attempt_slice.is_relative_to(monitor)
+            and not any(_ATTEMPT_SLICE_COMPONENT.fullmatch(part) for part in monitor.parts)
+            and scope.parent == attempt_slice
+        )
+    except (KeyError, TypeError, ValueError, SupervisorError):
+        return False
+
+
 def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
     """Verify the durable plan digest and every reservation identity it commits."""
 
@@ -250,7 +275,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
             return False
         plan_version = plan.get("version")
-        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4}:
+        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4, 5}:
             return False
         reservation = plan.get("reservation")
         expected_reservation = {
@@ -283,7 +308,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
                 "state_root_ino",
             )
         }
-        if plan_version in {2, 3, 4}:
+        if plan_version in {2, 3, 4, 5}:
             if row["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
                 return False
             if row["bundle_digest"] != _sandbox_reservation_bundle_digest(row):
@@ -297,12 +322,17 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         if plan_version < 3:
             return False
         systemd_ownership = launch.get("systemd_ownership")
-        if systemd_ownership != {
+        expected_systemd_ownership = {
             "wrapper_control_group": row["wrapper_cgroup_path"],
             "attempt_slice_unit": row["attempt_slice_unit"],
             "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
             "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
-        }:
+        }
+        if plan_version >= 5:
+            expected_systemd_ownership["monitor_placement"] = "outside_attempt_slice"
+        if systemd_ownership != expected_systemd_ownership:
+            return False
+        if plan_version >= 5 and not _sandbox_v5_cgroup_topology_is_self_consistent(row):
             return False
         argv = launch.get("argv")
         bundle = launch.get("bundle")
@@ -1122,7 +1152,7 @@ class SandboxExecutionJournalMixin:
             if (
                 execution is None
                 or execution["execution_id"] != binding["execution_id"]
-                or execution["phase"] not in {"cleanup_reported", "cleanup_verified"}
+                or execution["phase"] != "cleanup_verified"
                 or execution["runc_exit_code"] != 0
                 or execution["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or execution["baseline_root_path"] != str(baseline_root)
@@ -1134,7 +1164,7 @@ class SandboxExecutionJournalMixin:
             ):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
-                    "candidate capture requires the exact exited, cleanup-reported workspace",
+                    "candidate capture requires the exact cleanup-verified workspace",
                 )
             task = self._task_row(connection, attempt["task_id"])
             write_set_rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
@@ -1170,7 +1200,7 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_not_found", "execution reservation is missing"
                 )
             if (
-                row["phase"] not in {"cleanup_reported", "cleanup_verified"}
+                row["phase"] != "cleanup_verified"
                 or row["runc_exit_code"] != 0
                 or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or row["workspace_binding_version"] != 1
@@ -1184,7 +1214,7 @@ class SandboxExecutionJournalMixin:
             ):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
-                    "candidate result is not bound to the exited execution workspace",
+                    "candidate result is not bound to the cleanup-verified execution workspace",
                 )
             task = self._task_row(connection, attempt["task_id"])
             current_write_set_rules = self._write_set_rules(
@@ -1279,7 +1309,7 @@ class SandboxExecutionJournalMixin:
                 SET result_candidate_version = 1, result_candidate_json = ?,
                     result_candidate_digest = ?, updated_at = ?
                 WHERE attempt_id = ? AND claim_token = ?
-                  AND phase IN ('cleanup_reported', 'cleanup_verified')
+                  AND phase = 'cleanup_verified'
                   AND result_candidate_version = 0
                 """,
                 (encoded, digest, utc_now(), attempt_id, claim_token),
@@ -1678,13 +1708,16 @@ class SandboxExecutionJournalMixin:
             or any(part in {".", ".."} for path in cgroup_paths for part in path.parts)
             or wrapper_cgroup.name != wrapper_unit
             or attempt_slice_cgroup.name != attempt_slice_unit
-            or wrapper_cgroup.parent != attempt_slice_cgroup
+            or wrapper_cgroup == attempt_slice_cgroup
+            or wrapper_cgroup.is_relative_to(attempt_slice_cgroup)
+            or attempt_slice_cgroup.is_relative_to(wrapper_cgroup)
+            or any(_ATTEMPT_SLICE_COMPONENT.fullmatch(part) for part in wrapper_cgroup.parts)
             or cgroup.parent != attempt_slice_cgroup
             or cgroup.name != scope_unit
         ):
             raise SupervisorError(
                 "sandbox_execution_invalid",
-                "wrapper and scope cgroups must be direct children of the exact attempt slice",
+                "trusted monitor must be outside the worker slice and scope inside it",
             )
         if attempt_slice_unit != _oci_worker_systemd_slice(launch_target.container_id):
             raise SupervisorError(
@@ -1786,6 +1819,7 @@ class SandboxExecutionJournalMixin:
         launch_plan = _sandbox_launch_plan_material(durable_execution, launch_target)
         launch_plan["launch"]["systemd_ownership"] = {
             "wrapper_control_group": wrapper_cgroup_path,
+            "monitor_placement": "outside_attempt_slice",
             "attempt_slice_unit": attempt_slice_unit,
             "attempt_slice_invocation_id": attempt_slice_invocation_id,
             "attempt_slice_control_group": attempt_slice_cgroup_path,
@@ -1913,10 +1947,10 @@ class SandboxExecutionJournalMixin:
                 "running transition requires a durable trusted launch-plan binding",
             )
         launch_plan = json.loads(row["launch_plan_json"])
-        if launch_plan.get("version") != 4:
+        if launch_plan.get("version") != 5:
             raise SupervisorError(
                 "sandbox_execution_launch_plan_required",
-                "running transition requires a launch plan with exact cgroup resource limits",
+                "running transition requires a version-5 plan with a separate trusted monitor cgroup",
             )
         if not running_attestation_is_self_consistent(
             attestation
@@ -1938,6 +1972,7 @@ class SandboxExecutionJournalMixin:
                 "cgroup resource readback does not match the durable OCI launch policy",
             )
         expected = {
+            "monitor_placement": "outside_attempt_slice",
             "container_id": row["container_id"],
             "bundle_path": row["bundle_path"],
             "monitor_pid": row["monitor_pid"],
@@ -2039,6 +2074,7 @@ class SandboxExecutionJournalMixin:
                     "durable runc state root identity changed before gate release",
                 )
             locked_expected = {
+                "monitor_placement": "outside_attempt_slice",
                 "container_id": locked_row["container_id"],
                 "bundle_path": locked_row["bundle_path"],
                 "monitor_pid": locked_row["monitor_pid"],

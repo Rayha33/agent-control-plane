@@ -26,7 +26,8 @@ _ATTEMPT_SLICE_UNIT = _oci_worker_systemd_slice("acp-test-container")
 _ATTEMPT_SLICE_CGROUP = (
     f"/user.slice/user-1000.slice/user@1000.service/app.slice/{_ATTEMPT_SLICE_UNIT}"
 )
-_WRAPPER_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/acp-worker.service"
+_MONITOR_PARENT_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+_WRAPPER_CGROUP = f"{_MONITOR_PARENT_CGROUP}/acp-worker.service"
 _SCOPE_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/acp-container.scope"
 
 
@@ -123,6 +124,7 @@ def test_attestation_binds_runtime_state_pid_start_identities_and_cgroups() -> N
     receipt = _validate()
 
     assert receipt.container_id == "acp-test-container"
+    assert receipt.monitor_placement == "outside_attempt_slice"
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
     assert receipt.wrapper_control_group == _WRAPPER_CGROUP
@@ -701,6 +703,64 @@ def test_attestation_rejects_units_outside_the_exact_attempt_slice() -> None:
 
     with pytest.raises(SupervisorError, match="exact attempt slice"):
         validate_running_runtime_attestation(**observations)
+
+
+@pytest.mark.parametrize(
+    "monitor_cgroup",
+    [
+        f"{_ATTEMPT_SLICE_CGROUP}/acp-worker.service",
+        f"{_ATTEMPT_SLICE_CGROUP}/nested/acp-worker.service",
+        f"{_MONITOR_PARENT_CGROUP}/user-acp-{'f' * 64}.slice/acp-worker.service",
+        _MONITOR_PARENT_CGROUP,
+    ],
+)
+def test_attestation_rejects_monitor_inside_or_owning_worker_slice(monitor_cgroup: str) -> None:
+    observations = _valid_observations()
+    observations["wrapper_properties"] = _properties(
+        unit="acp-worker.service", invocation="1" * 32, cgroup=monitor_cgroup
+    )
+    for pid in (101, 202):
+        observations["process_snapshots"][pid] = replace(
+            observations["process_snapshots"][pid],
+            cgroup=f"0::{monitor_cgroup}\n".encode("ascii"),
+        )
+
+    with pytest.raises(SupervisorError, match="separate cgroups"):
+        validate_running_runtime_attestation(**observations)
+
+
+def test_self_consistency_rejects_monitor_cgroup_moved_into_worker_slice() -> None:
+    receipt = _validate()
+    forged = replace(
+        receipt,
+        wrapper_control_group=f"{_ATTEMPT_SLICE_CGROUP}/acp-worker.service",
+    )
+    payload = forged.audit_payload()
+    payload.pop("evidence_sha256")
+    forged = replace(
+        forged,
+        evidence_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
+    )
+
+    assert not running_attestation_is_self_consistent(forged)
+
+
+def test_self_consistency_rejects_monitor_inside_sibling_attempt_slice() -> None:
+    receipt = _validate()
+    forged = replace(
+        receipt,
+        wrapper_control_group=(
+            f"{_MONITOR_PARENT_CGROUP}/user-acp-{'f' * 64}.slice/acp-worker.service"
+        ),
+    )
+    payload = forged.audit_payload()
+    payload.pop("evidence_sha256")
+    forged = replace(
+        forged,
+        evidence_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
+    )
+
+    assert not running_attestation_is_self_consistent(forged)
 
 
 def test_attestation_rejects_attempt_slice_invocation_reuse() -> None:

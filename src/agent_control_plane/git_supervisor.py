@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1751,6 +1751,47 @@ def _add_sandbox_attempt_slice_identity(connection: sqlite3.Connection) -> None:
     )
 
 
+def _require_verified_cleanup_before_candidate_capture(connection: sqlite3.Connection) -> None:
+    """Keep mutable workspace scans behind the final cleanup phase."""
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_result_candidate_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_result_candidate_write_once
+        BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+          result_candidate_digest ON sandbox_executions
+        WHEN (
+          OLD.result_candidate_version = 0 AND NOT (
+            NEW.result_candidate_version = 1
+            AND NEW.result_candidate_json != ''
+            AND length(NEW.result_candidate_json) <= 65536
+            AND length(NEW.result_candidate_digest) = 64
+            AND OLD.phase = 'cleanup_verified' AND NEW.phase = 'cleanup_verified'
+            AND NEW.runc_exit_code = 0
+            AND NEW.runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+            AND NEW.workspace_binding_version = 1
+            AND NEW.baseline_manifest_digest != ''
+            AND NEW.workspace_root_path != ''
+            AND NEW.workspace_root_dev IS NOT NULL
+            AND NEW.workspace_root_ino IS NOT NULL
+            AND NEW.cleanup_receipt_json != '{}'
+            AND instr(NEW.result_candidate_json, '"authorization":"none"') > 0
+            AND instr(NEW.result_candidate_json, '"status":"unverified"') > 0
+          )
+        ) OR (
+          OLD.result_candidate_version != 0 AND (
+            NEW.result_candidate_version IS NOT OLD.result_candidate_version
+            OR NEW.result_candidate_json IS NOT OLD.result_candidate_json
+            OR NEW.result_candidate_digest IS NOT OLD.result_candidate_digest
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_result_candidate_immutable');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1777,6 +1818,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (24, _add_agent_intent_attempt_latest_index),
     (25, _add_sandbox_bundle_digest_semantics),
     (26, _add_sandbox_attempt_slice_identity),
+    (27, _require_verified_cleanup_before_candidate_capture),
 )
 
 

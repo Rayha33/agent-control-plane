@@ -1459,6 +1459,19 @@ class NamespaceRuntimeDriver(ResourceDriver):
                 "invalid_config",
                 f"driver {self.definition.name!r} needs a payload to run inside the runtime",
             )
+        preflight = runner(
+            self._namespace_preflight_argv(),
+            context.runtime_dir,
+            self._env(context),
+            self._timeout(),
+            None,
+        )
+        if preflight.get("exit_code") != 0 or preflight.get("timed_out"):
+            raise DriverError(
+                "namespace_unavailable",
+                "required rootless user, mount, PID, or network namespace is unavailable; "
+                "refusing to start the runtime unit",
+            )
         argv = [
             str(self.definition.executable),
             "--user",
@@ -1796,6 +1809,19 @@ class NamespaceRuntimeDriver(ResourceDriver):
 
     def _unshare(self) -> str:
         return self.definition.option("unshare_path", "/usr/bin/unshare") or "/usr/bin/unshare"
+
+    def _namespace_preflight_argv(self) -> list[str]:
+        argv = [
+            self._unshare(),
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+        ]
+        if self._egress_denied():
+            argv.append("--net")
+        return [*argv, "--", self._shell(), "-c", "exit 0"]
 
     def _shell(self) -> str:
         # Only used to run the read-only bind prelude before exec'ing the
