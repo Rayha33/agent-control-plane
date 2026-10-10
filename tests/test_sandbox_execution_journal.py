@@ -233,6 +233,26 @@ def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
     )
 
 
+def test_sandbox_container_id_binds_full_execution_identity() -> None:
+    first_execution = "12345678-0000-4000-8000-000000000001"
+    second_execution = "12345678-0000-4000-8000-000000000002"
+
+    assert first_execution[:8] == second_execution[:8]
+    first = journal_module._sandbox_container_id("a" * 64, 7, first_execution)
+    retry = journal_module._sandbox_container_id("a" * 64, 7, first_execution)
+    different_execution = journal_module._sandbox_container_id("a" * 64, 7, second_execution)
+    different_claim = journal_module._sandbox_container_id("a" * 64, 8, first_execution)
+    different_attempt = journal_module._sandbox_container_id("b" * 64, 7, first_execution)
+
+    assert first == retry
+    assert first != different_execution
+    assert first != different_claim
+    assert first != different_attempt
+    assert len(first) == 64
+    assert first.startswith("acp-")
+    assert all(character in "0123456789abcdef" for character in first[4:])
+
+
 def test_launch_record_requires_pinned_runc_handle(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
@@ -1822,6 +1842,9 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     assert row["workspace_root_path"].endswith("/workspace")
     assert row["claim_token"] == attempt["claim_token"]
     assert row["backend"] == "oci-runc"
+    assert row["container_id"] == journal_module._sandbox_container_id(
+        row["attempt_id"], row["claim_token"], row["execution_id"]
+    )
     assert row["runtime_version"] == "1.3.5"
     assert row["oci_version"] == "1.2.1"
     assert row["rootfs_digest"] == supervisor.config.oci_rootfs_pin.sha256

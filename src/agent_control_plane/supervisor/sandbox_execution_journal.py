@@ -111,6 +111,24 @@ _TRANSITION_FIELDS = {
 }
 
 
+def _sandbox_container_id(attempt_id: str, claim_token: int, execution_id: str) -> str:
+    """Derive a runtime ID from the full fenced execution identity.
+
+    The digest suffix avoids using a short execution-ID prefix as the only
+    discriminator between different attempts in a shared runc state root.
+    """
+
+    identity = canonical_json(
+        {
+            "attempt_id": attempt_id,
+            "claim_token": claim_token,
+            "execution_id": execution_id,
+        }
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"acp-{digest[:60]}"
+
+
 def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]:
     """Canonical, durable projection of a registered runc handle and reservation."""
 
@@ -648,7 +666,7 @@ class SandboxExecutionJournalMixin:
             )
 
         execution_id = str(uuid.uuid4())
-        container_id = f"acp-{attempt_id[:24]}-{claim_token}-{execution_id[:8]}"
+        container_id = _sandbox_container_id(attempt_id, claim_token, execution_id)
         execution_root = (
             self.state_dir.resolve() / "sandbox-executions" / f"{attempt_id}-{claim_token}"
         )

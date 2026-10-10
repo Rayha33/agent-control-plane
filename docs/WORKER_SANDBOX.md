@@ -676,6 +676,9 @@ execution remains unavailable and fail-closed.
 Schema 14 introduced a private, per-attempt `sandbox_executions` journal. Reservation
 binds the current claim token, an ACP-generated container ID, attempt-specific
 bundle/state paths, the bundle and rootfs digests, and exact runc/OCI versions.
+New container IDs are `acp-` plus a 240-bit SHA-256 prefix over the canonical
+full `(attempt_id, claim_token, execution_id)` tuple; they do not use a short
+execution-ID prefix as a cross-attempt discriminator.
 The transition contract keeps the ACP monitor, attached runc client, and
 container-init PID/start identities separate, and also records the wrapper and
 scope unit names plus InvocationIDs and exact cgroup path. SQLite prevents edits
