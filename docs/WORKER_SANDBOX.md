@@ -1465,7 +1465,52 @@ Linux with live opt-in unset (the two live tests were explicitly skipped).
 Postflight found no matching systemd unit or fixture worktree, and the guest
 policy still read back as `1`.
 
-The exact tested source and test SHA-256 values are
+The driver now also accepts an optional `apparmor_profile` name. When set,
+preflight and the service's actual namespace command are both wrapped with the
+trusted `/usr/bin/aa-exec` (or configured trusted `apparmor_exec_path`) and the
+same named profile. This intentionally does not use systemd's
+`AppArmorProfile=` unit property: systemd documents mandatory-access-control
+properties as unavailable to per-user service managers
+([systemd.exec(5)](https://manpages.ubuntu.com/manpages/noble/man5/systemd.exec.5.html)),
+while ACP launches transient user services. The profile is not invented or installed by ACP; it
+must already exist and be administrator-reviewed. Names are restricted to a
+single plain token. This lets a host grant the namespace helper an explicit
+user-namespace policy without turning off Ubuntu's global AppArmor restriction.
+Do not copy the disposable test profile into production without independent
+review: the Ubuntu `lxc-unshare` profile used for local validation is an
+`unconfined` profile with a `userns` rule, not a complete ACP confinement
+policy. A missing or insufficient profile fails closed: a missing profile
+fails preflight before unit launch; a profile that permits preflight but not
+the full mount sequence can still make unit setup fail, after which normal
+teardown and positive-absence verification remain required.
+
+**AppArmor-profile live recheck (2026-10-10; pass).** Exact source SHA-256
+`e4a0cd58f8f6f5bf4491febe88926ac31586b21ee88c9f1c5643a79e18bf8aeb` and test
+SHA-256 `398950fd966a202e06a21de1b888b970969e2259fde89c0762fbb03445b9b588`
+were copied into the no-host-share Lima 2.2.1 VZ Ubuntu 24.04.5 ARM64 guest.
+With `ACP_RUN_NAMESPACE_INTEGRATION=1`,
+`ACP_NAMESPACE_TEST_APPARMOR_PROFILE=lxc-unshare`, and
+`ACP_NAMESPACE_TEST_APPARMOR_EXEC=/usr/bin/aa-exec`, the exact live test passed
+(`1 passed, 107 deselected in 0.12s`) and the full Linux `tests/test_runtime_drivers.py` module
+passed (`106 passed, 2 opt-in integration tests skipped`). The guest remained
+rootless (uid 501), on kernel `6.8.0-142-generic` / systemd 255.4, with unified
+cgroup v2 and `kernel.apparmor_restrict_unprivileged_userns=1` before and after;
+no global AppArmor setting was changed. The live test reads
+`/proc/<host-pid>/attr/current` for the process holding the payload marker and
+asserts that its effective label matches the configured profile name; the guest
+reported `lxc-unshare (unconfined)`. Postflight found no matching ACP unit,
+fixture worktree, or worker service. The payload again confirmed
+`workspace_write=denied` while host `/etc/os-release` remained readable.
+
+This proves the named profile transition reaches the payload process under this
+Ubuntu policy; it does not establish that the selected profile is restrictive
+or suitable for production. It also does not make the workspace mutable or hide
+the host's enumerated `/etc`, and it does not exercise registered `run_worker`,
+cancellation/recovery, Git transfer, or result import. The feature therefore
+improves platform compatibility only; #2370 remains open and OCI worker
+execution remains fail-closed.
+
+For the earlier sysctl-based live run, the tested source and test SHA-256 values are
 `66e937ec6cc2a4b11bd6c8f526695a7c94dc45d642865391355418f72e4e5ba3` and
 `2a6afa465ece4426b8f599dac8be59426454228d82c6b9358b98ecadfd8b2e38`.
 Environment: Lima 2.2.1 VZ, Ubuntu 24.04.5 ARM64, kernel `6.8.0-142-generic`,
