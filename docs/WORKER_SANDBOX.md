@@ -1745,6 +1745,28 @@ markers: `test_checkout_write_probe_clea1/checkout-write-probe`,
 replacement marker entries remain by design; these fixture directories are
 distinct from the live test's attempt tree and were preserved, not deleted.
 
+**Ubuntu 26.04 systemd 259 monitor/attestation primitive recheck (2026-10-11; pass).**
+In the same no-host-mount Lima guest (Ubuntu 26.04 ARM64, Linux
+`7.0.0-34-generic`, systemd 259.5, Python 3.14.4, pytest 9.1.1, cgroup v2),
+the exact `tests/test_systemd_slice_integration.py` SHA-256
+`94eb48cc486c1e174d697ec01767701576a257f52a7a52bb74359773fbbba7e9` was run
+with `ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`; the two selected live tests passed
+(2 passed, 3 deselected, 0.48 seconds). The first test killed its creating
+controller, reconciled the exact service receipt from a fresh controller, and
+verified the monitor service survived stopping the worker slice while the scope
+cgroup emptied. The second verified that the live systemd attestation rejects
+a restarted wrapper. The imported `sandbox_attestation.py` and `oci_worker.py`
+SHA-256 values were `c64ef56def1dc4cd9fc58c2db62560b6f1da33076483c2b460dee78ad3044b22`
+and `7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`.
+Postflight found the user manager running, no matching `acp-live-*` or
+`user-acp-*.slice` units, and no `/usr/bin/sleep 90` or `runc` process.
+
+These systemd tests use placeholder sleep processes, and their scope is started
+by an external controller; they do not test a monitor that owns the runc client
+and its wait/reconciliation. This extends primitive-level coverage to systemd
+259.5 only; it is not durable monitor integration, supervisor-restart recovery,
+or registered `run_worker()` acceptance.
+
 This is a successful low-level OCI-boundary probe on a second Linux/kernel
 profile, not end-to-end supervised-worker acceptance. It does not connect the
 container launch to registered `run_worker`, provide least-privilege provider
