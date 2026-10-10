@@ -1470,6 +1470,7 @@ def running_attestation(
         f"ControlGroup={wrapper_cgroup}\n"
         f"Id={row['wrapper_unit']}\n"
         f"InvocationID={row['wrapper_invocation_id']}\n"
+        f"MainPID={row['monitor_pid']}\n"
     ).encode("ascii")
     attempt_slice_properties = (
         "ActiveState=active\n"

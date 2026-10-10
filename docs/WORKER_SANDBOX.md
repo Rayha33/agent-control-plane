@@ -1970,6 +1970,20 @@ fencing-epoch binding, an ACP monitor owning runc, cleanup/result-import
 integration, manager restart/logout/reboot recovery, or `run_worker`; OCI
 remains fail-closed.
 
+**Systemd monitor MainPID binding (2026-10-10; source-level gate).** The
+trusted runtime collector now requests `MainPID` for the wrapper service and
+requires it to equal the expected monitor PID. Existing procfs observations
+then bind that PID to its kernel start identity and the service cgroup; absent
+or mismatched `MainPID` fails attestation. Slice and scope queries do not ask
+for the service-only property. Unit regressions cover missing and mismatched
+values and verify the collector requests it only for the wrapper. This closes
+the attestation ambiguity where another process in the same wrapper cgroup
+could be passed as the monitor. Systemd and procfs observations are sequential,
+not an atomic snapshot, so concurrent unit replacement between observations is
+not ruled out. This does not establish that a production ACP monitor owns or
+waits for runc, is crash-recoverable, or is connected to `run_worker`; OCI
+remains fail-closed.
+
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
 argv for a future executor. It encodes a readonly root, a single non-recursive

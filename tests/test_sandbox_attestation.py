@@ -36,10 +36,20 @@ def _proc_stat(pid: int, state: str, start: int, comm: str = "worker (gate)") ->
     return f"{pid} ({comm}) ".encode("ascii") + b" ".join(fields) + b"\n"
 
 
-def _properties(*, unit: str, invocation: str, cgroup: str, active: str = "active") -> bytes:
-    return f"ActiveState={active}\nControlGroup={cgroup}\nId={unit}\nInvocationID={invocation}\n".encode(
-        "ascii"
+def _properties(
+    *,
+    unit: str,
+    invocation: str,
+    cgroup: str,
+    active: str = "active",
+    main_pid: int | None = None,
+) -> bytes:
+    properties = (
+        f"ActiveState={active}\nControlGroup={cgroup}\nId={unit}\nInvocationID={invocation}\n"
     )
+    if main_pid is not None:
+        properties += f"MainPID={main_pid}\n"
+    return properties.encode("ascii")
 
 
 def _valid_observations() -> dict:
@@ -66,7 +76,10 @@ def _valid_observations() -> dict:
             for pid in pids
         },
         "wrapper_properties": _properties(
-            unit="acp-worker.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP
+            unit="acp-worker.service",
+            invocation="1" * 32,
+            cgroup=_WRAPPER_CGROUP,
+            main_pid=101,
         ),
         "attempt_slice_properties": _properties(
             unit=_ATTEMPT_SLICE_UNIT,
@@ -399,13 +412,16 @@ def test_trusted_collector_reads_pinned_runc_and_exact_systemd_units(tmp_path, m
             assert kwargs["pass_fds"] == (executable_fd,)
             assert kwargs["exec_fd"] == executable_fd
             return 0, observations["runc_state"].decode("utf-8")
-        assert command[:5] == [
+        assert command[:4] == [
             "/usr/bin/systemctl",
             "--user",
             "show",
             "--no-pager",
-            "--property=ActiveState,ControlGroup,Id,InvocationID",
         ]
+        expected_properties = "ActiveState,ControlGroup,Id,InvocationID"
+        if command[-1] == "acp-worker.service":
+            expected_properties += ",MainPID"
+        assert command[4] == f"--property={expected_properties}"
         assert command[5] == "--"
         assert kwargs.get("exec_fd") is None
         return 0, {
@@ -629,6 +645,19 @@ def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:
             _properties(unit="different.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP),
         ),
         (
+            "wrapper_properties",
+            _properties(
+                unit="acp-worker.service",
+                invocation="1" * 32,
+                cgroup=_WRAPPER_CGROUP,
+                main_pid=202,
+            ),
+        ),
+        (
+            "wrapper_properties",
+            _properties(unit="acp-worker.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP),
+        ),
+        (
             "scope_properties",
             _properties(unit="acp-container.scope", invocation="2" * 32, cgroup="/other/scope"),
         ),
@@ -717,7 +746,10 @@ def test_attestation_rejects_units_outside_the_exact_attempt_slice() -> None:
 def test_attestation_rejects_monitor_inside_or_owning_worker_slice(monitor_cgroup: str) -> None:
     observations = _valid_observations()
     observations["wrapper_properties"] = _properties(
-        unit="acp-worker.service", invocation="1" * 32, cgroup=monitor_cgroup
+        unit="acp-worker.service",
+        invocation="1" * 32,
+        cgroup=monitor_cgroup,
+        main_pid=101,
     )
     for pid in (101, 202):
         observations["process_snapshots"][pid] = replace(

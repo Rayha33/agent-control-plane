@@ -516,25 +516,23 @@ def collect_running_runtime_attestation(
     finally:
         os.close(runc_fd)
 
-    properties = {
-        unit: _run_trusted_runtime_command(
+    properties = {}
+    for unit in (wrapper_unit, attempt_slice_unit, scope_unit):
+        requested_properties = "ActiveState,ControlGroup,Id,InvocationID"
+        if unit == wrapper_unit:
+            requested_properties += ",MainPID"
+        properties[unit] = _run_trusted_runtime_command(
             [
                 str(systemctl_path),
                 "--user",
                 "show",
                 "--no-pager",
-                "--property=ActiveState,ControlGroup,Id,InvocationID",
+                f"--property={requested_properties}",
                 "--",
                 unit,
             ],
             environment=environment,
         )
-        for unit in (
-            wrapper_unit,
-            attempt_slice_unit,
-            scope_unit,
-        )
-    }
 
     attestation = _collect_running_runtime_attestation_from_observations(
         runc_state=runc_state,
@@ -928,13 +926,14 @@ def validate_running_runtime_attestation(
     ):
         raise _invalid("runc state does not match the expected running container")
 
-    wrapper = _parse_unit_properties(wrapper_properties)
+    wrapper = _parse_unit_properties(wrapper_properties, require_main_pid=True)
     attempt_slice = _parse_unit_properties(attempt_slice_properties)
     scope = _parse_unit_properties(scope_properties)
     if (
         wrapper["ActiveState"] != "active"
         or wrapper["Id"] != wrapper_unit
         or wrapper["InvocationID"] != wrapper_invocation_id
+        or wrapper.get("MainPID") != str(monitor_pid)
         or attempt_slice["ActiveState"] != "active"
         or attempt_slice["Id"] != attempt_slice_unit
         or attempt_slice["InvocationID"] != attempt_slice_invocation_id
@@ -1183,7 +1182,7 @@ def _parse_proc_cgroup(raw: bytes) -> str:
     return _cgroup_path(unified[0], "proc cgroup")
 
 
-def _parse_unit_properties(raw: bytes) -> dict[str, str]:
+def _parse_unit_properties(raw: bytes, *, require_main_pid: bool = False) -> dict[str, str]:
     _bounded(raw, "systemd properties")
     try:
         lines = raw.decode("ascii").splitlines()
@@ -1195,7 +1194,10 @@ def _parse_unit_properties(raw: bytes) -> dict[str, str]:
         if not separator or not key or value != value.strip() or key in properties:
             raise _invalid("systemd properties are malformed or duplicated")
         properties[key] = value
-    if set(properties) != {"ActiveState", "ControlGroup", "Id", "InvocationID"}:
+    expected = {"ActiveState", "ControlGroup", "Id", "InvocationID"}
+    if require_main_pid:
+        expected.add("MainPID")
+    if set(properties) != expected:
         raise _invalid("systemd properties are incomplete or unexpected")
     return properties
 
