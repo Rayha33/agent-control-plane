@@ -1393,6 +1393,35 @@ cancel/recovery, Git transfer, or validated result import; it is not acceptance
 criterion #3 or end-to-end sandbox proof. The driver must remain disconnected
 from coding workers and task #2370 stays open.
 
+**AppArmor precondition recheck (2026-10-10; same disposable guest).** The
+first invocation under the guest's default
+`kernel.apparmor_restrict_unprivileged_userns=1` policy failed closed before
+the payload: `unshare --user --map-root-user true` returned
+`write failed /proc/self/uid_map: Operation not permitted`, the transient
+service entered `failed`, and the kernel audit log attributed user-namespace
+creation to AppArmor's `unprivileged_userns` profile. This is an environment
+prerequisite failure, not a successful runtime probe. After confirming that
+this VZ guest had no host-shared folders and no active user services, the
+setting was temporarily changed to `0` only inside that disposable guest; the
+single live test passed, then an EXIT trap restored the original value `1`.
+The full `tests/test_runtime_drivers.py` module also passed in the guest with
+the live test opt-in unset (so the live case was explicitly skipped). The
+source and test SHA-256 values matched this branch exactly
+(`20ab594a414574d8575c437be54821fe681b0dbe2749ebff089dccc2dcec2852` and
+`a127d774dba706a7ebd1c7f04361e9dfa1af50200342421b83b790241736fad1`); the
+tested checkout was commit `33a31a780f16fa3d17f25fbbb3d4c7eab9580e4a`.
+Postflight found no matching systemd unit or fixture worktree, and the guest
+policy still read back as `1` after the full module run.
+Do not change this AppArmor setting on a shared host to make the test pass:
+the host policy must already permit rootless user namespaces for this live
+probe. A future worker executor must detect and report an unavailable
+user-namespace prerequisite before launching candidate code; the current
+resource-driver probe instead reaches a failed transient unit. Separately,
+`run_worker` still refuses any OCI-configured worker before heartbeat,
+reservation, or `Popen`; focused test
+`test_oci_configured_worker_fails_closed_before_host_fallback` passed on this
+source. That proves refusal rather than a working OCI worker executor.
+
 ### NAS-host rootless-runc boundary probe (2026-10-09; partial pass)
 
 The opt-in `test_live_rootless_runc_enforces_minimal_worker_boundary` passed
