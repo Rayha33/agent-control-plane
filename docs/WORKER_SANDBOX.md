@@ -1393,32 +1393,44 @@ cancel/recovery, Git transfer, or validated result import; it is not acceptance
 criterion #3 or end-to-end sandbox proof. The driver must remain disconnected
 from coding workers and task #2370 stays open.
 
-**AppArmor precondition recheck (2026-10-10; same disposable guest).** The
-first invocation under the guest's default
-`kernel.apparmor_restrict_unprivileged_userns=1` policy failed closed before
-the payload: `unshare --user --map-root-user true` returned
-`write failed /proc/self/uid_map: Operation not permitted`, the transient
-service entered `failed`, and the kernel audit log attributed user-namespace
-creation to AppArmor's `unprivileged_userns` profile. This is an environment
-prerequisite failure, not a successful runtime probe. After confirming that
-this VZ guest had no host-shared folders and no active user services, the
-setting was temporarily changed to `0` only inside that disposable guest; the
-single live test passed, then an EXIT trap restored the original value `1`.
-The full `tests/test_runtime_drivers.py` module also passed in the guest with
-the live test opt-in unset (so the live case was explicitly skipped). The
-source and test SHA-256 values matched this branch exactly
-(`20ab594a414574d8575c437be54821fe681b0dbe2749ebff089dccc2dcec2852` and
-`a127d774dba706a7ebd1c7f04361e9dfa1af50200342421b83b790241736fad1`); the
-tested checkout was commit `33a31a780f16fa3d17f25fbbb3d4c7eab9580e4a`.
+**AppArmor prerequisite and preflight hardening (2026-10-10; same disposable
+guest).** Before the change below, the guest's default
+`kernel.apparmor_restrict_unprivileged_userns=1` policy caused
+`unshare --user --map-root-user true` to fail with
+`write failed /proc/self/uid_map: Operation not permitted`; systemd then
+created a transient unit that failed before the payload. The kernel audit log
+attributed user-namespace creation to AppArmor's `unprivileged_userns` profile.
+This is a host prerequisite failure, not a successful runtime probe.
+
+`NamespaceRuntimeDriver.setup` now runs the exact required rootless namespace
+combination (`--user --map-root-user --mount --pid --fork`, plus `--net` when
+egress is denied) with a trusted no-op command before invoking `systemd-run`.
+A nonzero or timed-out preflight raises typed `namespace_unavailable`; no
+transient unit is started. Opt-in live test
+`test_live_namespace_runtime_refuses_unit_when_rootless_namespaces_are_unavailable`
+passed under the guest's default policy and verified positive
+`systemd-unit-not-found` absence afterward. To recheck the supported positive
+path, the sysctl was temporarily changed to `0` only inside this no-host-share
+VZ guest; the live generic-payload test passed, and an EXIT trap restored the
+original value `1`. The full `tests/test_runtime_drivers.py` module passed on
+Linux with live opt-in unset (the two live tests were explicitly skipped).
 Postflight found no matching systemd unit or fixture worktree, and the guest
-policy still read back as `1` after the full module run.
-Do not change this AppArmor setting on a shared host to make the test pass:
-the host policy must already permit rootless user namespaces for this live
-probe. A future worker executor must detect and report an unavailable
-user-namespace prerequisite before launching candidate code; the current
-resource-driver probe instead reaches a failed transient unit. Separately,
-`run_worker` still refuses any OCI-configured worker before heartbeat,
-reservation, or `Popen`; focused test
+policy still read back as `1`.
+
+The exact tested source and test SHA-256 values are
+`66e937ec6cc2a4b11bd6c8f526695a7c94dc45d642865391355418f72e4e5ba3` and
+`2a6afa465ece4426b8f599dac8be59426454228d82c6b9358b98ecadfd8b2e38`.
+Environment: Lima 2.2.1 VZ, Ubuntu 24.04.5 ARM64, kernel `6.8.0-142-generic`,
+systemd 255.4, uid 501, Python 3.12.3, pytest 9.1.1, unified cgroup v2; the
+guest had no host-shared folders. The test venv used the project's declared
+development extras, not the exact `uv.lock` environment; hosted CI remains the
+locked-dependency matrix. Never relax this AppArmor setting on a shared host
+to make a test pass.
+
+This preflight proves namespace creation prerequisites and prevents the
+measured failed-unit case; it does not verify the later mount/chroot prelude or
+establish a coding-worker boundary. Separately, `run_worker` still refuses any
+OCI-configured worker before heartbeat, reservation, or `Popen`; focused test
 `test_oci_configured_worker_fails_closed_before_host_fallback` passed on this
 source. That proves refusal rather than a working OCI worker executor.
 
