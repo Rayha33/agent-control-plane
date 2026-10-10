@@ -2328,6 +2328,7 @@ if /bin/busybox cat {q["credential"]} > /workspace/credential.txt; then exit 39;
 if /bin/busybox cat {q["host_tmp"]} > /workspace/host-tmp.txt; then exit 40; fi
 if /bin/busybox touch {q["host_tmp"]}; then exit 41; fi
 test ! -e /tmp/{host_tmp_rel}
+if test -e {q["host_unix_socket"]} || test -L {q["host_unix_socket"]}; then exit 46; fi
 
 # Absolute and parent-relative symlinks must remain inside the container root.
 /bin/busybox ln -s {q["host_tmp"]} /workspace/absolute-host-tmp
@@ -2547,6 +2548,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     host_config_file = fixture_root / "host-home" / ".codex" / "config-marker.toml"
     credential_file = fixture_root / "host-home" / ".ssh" / "synthetic-key-marker"
     host_tmp_file = fixture_root / "host-tmp-sentinel"
+    host_unix_socket = fixture_root / "host-unix-sentinel.sock"
     fixture_root.mkdir(mode=0o700)
     fixture_root.chmod(0o700)
     record_attempt_child(fixture_root)
@@ -2579,6 +2581,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         "host_config": host_config_file,
         "credential": credential_file,
         "host_tmp": host_tmp_file,
+        "host_unix_socket": host_unix_socket,
     }
     host_tmp_relative = str(host_tmp_file.resolve().relative_to(Path("/tmp")))
 
@@ -2595,6 +2598,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         pytest.fail("route selection did not identify a non-loopback host NIC address")
 
     listener: socket.socket | None = None
+    unix_socket_listener: socket.socket | None = None
+    host_unix_socket_identity: tuple[int, int] | None = None
     opened_runc_descriptor: int | None = None
     runc_descriptor: int | None = None
     run_handle: oci_worker.RuncLaunchHandle | None = None
@@ -2647,6 +2652,16 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         listener.listen(1)
         listener.setblocking(False)
         host_network_port = listener.getsockname()[1]
+
+        if os.path.lexists(host_unix_socket):
+            pytest.fail("unique host Unix-socket sentinel path already exists")
+        unix_socket_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        unix_socket_listener.bind(str(host_unix_socket))
+        unix_socket_listener.listen(1)
+        socket_info = host_unix_socket.lstat()
+        if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.geteuid():
+            pytest.fail("host Unix-socket sentinel is not a test-owned socket")
+        host_unix_socket_identity = (socket_info.st_dev, socket_info.st_ino)
 
         opened_runc_descriptor = oci_worker._open_verified_runc_executable(pin)
         runc_descriptor = fcntl.fcntl(opened_runc_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
@@ -3713,6 +3728,31 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         # Descriptor cleanup is an unconditional outermost stage.
         if listener is not None:
             _attempt_cleanup(cleanup_errors, "could not close host-only listener", listener.close)
+        if unix_socket_listener is not None:
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not close host Unix-socket sentinel",
+                unix_socket_listener.close,
+            )
+        if host_unix_socket_identity is not None:
+
+            def remove_exact_host_unix_socket() -> None:
+                info = host_unix_socket.lstat()
+                if (
+                    not stat.S_ISSOCK(info.st_mode)
+                    or (info.st_dev, info.st_ino) != host_unix_socket_identity
+                    or info.st_uid != os.geteuid()
+                ):
+                    raise AssertionError("host Unix-socket sentinel identity changed")
+                host_unix_socket.unlink()
+
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not remove exact host Unix-socket sentinel",
+                remove_exact_host_unix_socket,
+            )
+            if os.path.lexists(host_unix_socket):
+                cleanup_errors.append("host Unix-socket sentinel remained after cleanup")
         close_fd(
             "could not close pinned runc descriptor",
             runc_descriptor if runc_descriptor is not None else -1,
