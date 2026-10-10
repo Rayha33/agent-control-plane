@@ -586,16 +586,27 @@ def _validate_worker_mount_policy(
         device_mount_ids: set[tuple[int, int]] = set()
         for target, (root, filesystem, source, options) in verified_runc_152_mounts.items():
             observed = mounts[target]
-            if (observed.root, observed.filesystem, observed.source) != (
-                root,
-                filesystem,
-                source,
+            expected_sources = {source}
+            if filesystem == "devtmpfs":
+                # Ubuntu/systemd hosts label the same device filesystem either
+                # "udev" or "devtmpfs". Filesystem device and device-node
+                # identity checks below remain authoritative; reject other labels.
+                expected_sources.add("devtmpfs")
+            if (
+                observed.root != root
+                or observed.filesystem != filesystem
+                or observed.source not in expected_sources
             ):
                 raise AssertionError(
                     f"worker default mount {target} has unexpected root/filesystem/source: "
                     f"{observed.root!r}/{observed.filesystem!r}/{observed.source!r}"
                 )
-            if observed.mount_options != frozenset(options):
+            allowed_mount_options = {frozenset(options)}
+            if filesystem == "devtmpfs":
+                # Device-node bind mounts may omit relatime when the host's
+                # devtmpfs does. Keep rw/nosuid and reject all other variants.
+                allowed_mount_options.add(frozenset(options - {"relatime"}))
+            if observed.mount_options not in allowed_mount_options:
                 raise AssertionError(
                     f"worker default mount {target} has unexpected mount options "
                     f"{sorted(observed.mount_options)}"
@@ -1567,6 +1578,44 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
     )
     assert {mount["target"] for mount in accepted_defaults} == set(runc_152_mounts)
 
+    devtmpfs_source_mounts = {
+        target: mount(
+            "devtmpfs",
+            set(observed.mount_options),
+            root=observed.root,
+            source="devtmpfs",
+            device_id=observed.device_id,
+            super_options=set(observed.super_options),
+            optional_fields=observed.optional_fields,
+        )
+        for target, observed in runc_152_mounts.items()
+        if observed.filesystem == "devtmpfs"
+    }
+    accepted_devtmpfs_source = _validate_worker_mount_policy(
+        {**runc_152_mounts, **devtmpfs_source_mounts},
+        expected_runc_version="1.5.2",
+    )
+    assert {mount["target"] for mount in accepted_devtmpfs_source} == set(runc_152_mounts)
+
+    devtmpfs_without_relatime = {
+        target: mount(
+            "devtmpfs",
+            set(observed.mount_options) - {"relatime"},
+            root=observed.root,
+            source=observed.source,
+            device_id=observed.device_id,
+            super_options=set(observed.super_options),
+            optional_fields=observed.optional_fields,
+        )
+        for target, observed in runc_152_mounts.items()
+        if observed.filesystem == "devtmpfs"
+    }
+    accepted_without_relatime = _validate_worker_mount_policy(
+        {**runc_152_mounts, **devtmpfs_without_relatime},
+        expected_runc_version="1.5.2",
+    )
+    assert {mount["target"] for mount in accepted_without_relatime} == set(runc_152_mounts)
+
     latency_stats_mask = mount(
         "devtmpfs",
         {"rw", "nosuid", "relatime"},
@@ -1595,6 +1644,36 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
                     {"rw", "nosuid", "relatime"},
                     root="/latency_stats",
                     source="udev",
+                    device_id=dev_id,
+                    super_options={"rw", "size=1024"},
+                ),
+            },
+            expected_runc_version="1.5.2",
+        )
+    with pytest.raises(AssertionError, match="mount options"):
+        _validate_worker_mount_policy(
+            {
+                **runc_152_mounts,
+                "/dev/null": mount(
+                    "devtmpfs",
+                    {"rw", "nosuid", "relatime", "noexec"},
+                    root="/null",
+                    source="udev",
+                    device_id=dev_id,
+                    super_options={"rw", "size=1024"},
+                ),
+            },
+            expected_runc_version="1.5.2",
+        )
+    with pytest.raises(AssertionError, match="root/filesystem/source"):
+        _validate_worker_mount_policy(
+            {
+                **runc_152_mounts,
+                "/dev/null": mount(
+                    "devtmpfs",
+                    {"rw", "nosuid", "relatime"},
+                    root="/null",
+                    source="unexpected-source",
                     device_id=dev_id,
                     super_options={"rw", "size=1024"},
                 ),

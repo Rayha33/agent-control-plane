@@ -1690,6 +1690,47 @@ development extras, not the exact `uv.lock` environment; hosted CI remains the
 locked-dependency matrix. Never relax this AppArmor setting on a shared host
 to make a test pass.
 
+**Ubuntu 26.04 rootless OCI boundary recheck (2026-10-11; pass).** To avoid
+the active NAS I/O alert and leave the two existing ACP VMs untouched, the
+source was copied into a new Lima 2.2.1 VZ `--plain` guest with no host mounts
+or port forwards. The tested snapshot was based on PR-42 commit
+`cedfecdaa59affb19edd68a2d8173be2b1f17b5d`, with only
+`tests/test_oci_worker_runtime.py` overlaid; `oci_worker.py` SHA-256 was
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`, and the
+tested file SHA-256 was
+`4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`. The
+guest was Ubuntu 26.04 ARM64, kernel `7.0.0-34-generic`, systemd 259.5, uid
+501, Python 3.14.4, pytest 9.1.1, and unified cgroup v2. The installed
+`runc.arm64` came from the [official runc v1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+after its SHA-256 matched the release-asset digest
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+Dynamic BusyBox 1.37.0-7ubuntu1 was separately extracted from the signed
+Ubuntu package so the test could audit and copy its loader/library closure.
+
+With `ACP_RUN_OCI_INTEGRATION=1`, runc 1.5.2 explicitly pinned, and the test's
+normal bounded fake payload (no model or provider credentials),
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1. The
+Ubuntu image labels device-node bind mounts' devtmpfs source as `devtmpfs`
+and omits `relatime`; the validator now accepts only the source labels
+`udev`/`devtmpfs` and only the exact `rw,nosuid` option set with optional
+`relatime`. It still rejects arbitrary source labels or options and checks
+the root/filesystem, filesystem device identity, shared devtmpfs identity,
+device numbers, read-only proc masks, cgroup limits, PID namespace, and
+bundle/path replacement attacks. The default guest AppArmor userns restriction
+was `1`; a 10-minute systemd restore timer was armed before a temporary
+guest-only change to `0`, and a shell exit trap restored and read back `1`.
+Independent postflight confirmed the setting was `1`, the attempt tree absent,
+no runc process, and the user manager active; the fallback timer remained armed
+to repeat the same safe restore. Neither the Mac host nor NAS policy was
+changed.
+
+This is a successful low-level OCI-boundary probe on a second Linux/kernel
+profile, not end-to-end supervised-worker acceptance. It does not connect the
+container launch to registered `run_worker`, provide least-privilege provider
+authentication/egress, or demonstrate supervisor-crash recovery, cancellation,
+and result import. `run_worker()` therefore remains fail-closed with
+`sandbox_executor_unavailable`; task #2370 remains open.
+
 **Target NAS capability spot check (2026-10-10; no unit or worker started).**
 From the regular uid-1000 account on `DXP4800PLUS-RING` (`Linux 6.18.15
 x86_64`), the exact default-deny namespace flags, including `--net`, ran a
