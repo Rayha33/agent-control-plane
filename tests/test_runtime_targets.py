@@ -51,6 +51,14 @@ def driver_resources() -> list[dict[str, Any]]:
             "kind": "docker_compose",
             "resource_id": "api-project-attempt-17",
             "state": "active",
+            "evidence": {
+                "proof": {
+                    "observation": {
+                        "stdout": "0123456789ab\n",
+                        "stderr": "private driver diagnostic",
+                    }
+                }
+            },
         },
         {
             "driver": "postgres",
@@ -63,6 +71,14 @@ def driver_resources() -> list[dict[str, Any]]:
             "kind": "docker_compose",
             "resource_id": "queue-project-attempt-17",
             "state": "active",
+            "evidence": {
+                "proof": {
+                    "observation": {
+                        "stdout": "fedcba987654\n",
+                        "stderr": "private queue diagnostic",
+                    }
+                }
+            },
         },
     ]
 
@@ -85,6 +101,7 @@ def expected_report(
         "source_revision": source_revision,
         "port": port,
         "driver_resource_id": "api-project-attempt-17",
+        "container_id": "0123456789ab",
         "database_namespace": "acp_attempt_17",
         "schema_version": "v7",
         "queue_namespace": "queue-project-attempt-17",
@@ -150,6 +167,23 @@ def test_matching_app_report_is_only_corroboration_and_manifest_is_read_only(
     assert receipt["command_set_sha256"] == manifest["command_set_sha256"]
     assert manifest["command_count"] == 1
     assert manifest["targets"][0]["endpoint"] == "http://127.0.0.1:43123"
+    snapshots = manifest["targets"][0]["resource_snapshots"]
+    assert [snapshot["role"] for snapshot in snapshots] == ["service", "database", "queue"]
+    assert snapshots[0]["host_identity"]["container_ids"] == ["0123456789ab"]
+    assert snapshots[1]["host_identity"]["status"] == "unknown"
+    assert snapshots[2]["host_identity"]["container_ids"] == ["fedcba987654"]
+    assert manifest["targets"][0]["resource_snapshot_sha256"] == sha256(
+        canonical_json(snapshots).encode("utf-8")
+    )
+    assert receipt["targets"][0]["resource_snapshots"] == snapshots
+    assert (
+        receipt["targets"][0]["resource_snapshot_sha256"]
+        == manifest["targets"][0]["resource_snapshot_sha256"]
+    )
+    assert "private driver diagnostic" not in manifest_path.read_text(encoding="utf-8")
+    assert "private queue diagnostic" not in manifest_path.read_text(encoding="utf-8")
+    assert "private driver diagnostic" not in canonical_json(receipt)
+    assert "private queue diagnostic" not in canonical_json(receipt)
     assert environment["ACP_TARGET_API_URL"] == "http://127.0.0.1:43123"
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o400
     assert (
@@ -400,6 +434,87 @@ def test_single_host_captured_container_must_match_the_app_report(
     )
     assert blocked is True
     assert "container_id" in receipt["targets"][0]["mismatches"]
+
+
+def test_resource_snapshot_digest_changes_when_related_host_identity_evidence_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _, _ = evaluate_target(tmp_path, monkeypatch)
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    resources = driver_resources()
+    resources[2]["evidence"] = {
+        "proof": {"observation": {"stdout": "aaaaaaaaaaaa\n", "stderr": "ignored"}}
+    }
+    second, _, _ = evaluate_target(replacement_dir, monkeypatch, resources=resources)
+
+    first_queue = first["targets"][0]["resource_snapshots"][2]
+    second_queue = second["targets"][0]["resource_snapshots"][2]
+    assert first_queue["resource_id"] == second_queue["resource_id"]
+    assert first_queue["host_identity"]["container_ids"] == ["fedcba987654"]
+    assert second_queue["host_identity"]["container_ids"] == ["aaaaaaaaaaaa"]
+    assert (
+        first["targets"][0]["resource_snapshot_sha256"]
+        != second["targets"][0]["resource_snapshot_sha256"]
+    )
+    assert second["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "private-evidence-sentinel",
+        ["private-list-evidence-sentinel"],
+        {"proof": {"observation": "private-observation-sentinel"}},
+        {
+            "proof": {
+                "observation": {
+                    "stdout": "private-driver-output-sentinel",
+                    "stderr": "private-driver-stderr-sentinel",
+                }
+            }
+        },
+        {
+            "proof": {
+                "observation": {
+                    "stdout": "x" * 8193,
+                    "stderr": "private-oversize-stderr-sentinel",
+                }
+            }
+        },
+    ],
+)
+def test_resource_snapshot_malformed_or_untrusted_evidence_fails_closed_and_is_not_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evidence: Any
+) -> None:
+    resources = driver_resources()
+    resources[0]["evidence"] = evidence
+    receipt, environment, _blocked = evaluate_target(tmp_path, monkeypatch, resources=resources)
+
+    target = receipt["targets"][0]
+    snapshot = target["resource_snapshots"][0]
+    assert snapshot["host_identity"] == {
+        "status": "unknown",
+        "container_ids": [],
+        "process_identity": None,
+    }
+    assert target["resource_snapshot_sha256"] == sha256(
+        canonical_json(target["resource_snapshots"]).encode("utf-8")
+    )
+    serialized = canonical_json(receipt)
+    manifest = Path(environment["ACP_RUNTIME_TARGETS_FILE"]).read_text(encoding="utf-8")
+    for sentinel in (
+        "private-evidence-sentinel",
+        "private-list-evidence-sentinel",
+        "private-observation-sentinel",
+        "private-driver-output-sentinel",
+        "private-driver-stderr-sentinel",
+        "private-oversize-stderr-sentinel",
+    ):
+        assert sentinel not in serialized
+        assert sentinel not in manifest
+    assert "x" * 8193 not in serialized
+    assert "x" * 8193 not in manifest
 
 
 @pytest.mark.parametrize(

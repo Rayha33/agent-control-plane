@@ -278,6 +278,17 @@ def runtime_target_phase(
         if definition.schema_version is not None:
             expected["schema_version"] = definition.schema_version
 
+        resource_snapshots = [_resource_binding_snapshot("service", definition.driver, resources)]
+        if definition.database_driver:
+            resource_snapshots.append(
+                _resource_binding_snapshot("database", definition.database_driver, resources)
+            )
+        if definition.queue_driver:
+            resource_snapshots.append(
+                _resource_binding_snapshot("queue", definition.queue_driver, resources)
+            )
+        resource_snapshot_sha256 = sha256(canonical_json(resource_snapshots).encode("utf-8"))
+
         endpoint = f"http://127.0.0.1:{port}" if port else None
         observed, probe_status = (
             probe_target_identity(port, definition.identity_path) if port else ({}, "invalid_port")
@@ -339,6 +350,8 @@ def runtime_target_phase(
             "expected": expected,
             "observed": _receipt_identity(observed, expected),
             "host_identity": host_identity,
+            "resource_snapshots": resource_snapshots,
+            "resource_snapshot_sha256": resource_snapshot_sha256,
             "probe_status": probe_status,
             "missing_evidence": sorted(set(missing_expected + missing_observed)),
             "mismatches": mismatches,
@@ -355,6 +368,8 @@ def runtime_target_phase(
                 "endpoint": endpoint,
                 "expected": expected,
                 "host_identity": host_identity,
+                "resource_snapshots": resource_snapshots,
+                "resource_snapshot_sha256": resource_snapshot_sha256,
                 "identity_path": definition.identity_path,
                 "required": definition.required,
                 "require_command_binding": definition.require_command_binding,
@@ -571,6 +586,53 @@ def _host_resource_identity(resource: Mapping[str, Any] | None) -> dict[str, Any
         "status": "host_captured",
         "container_ids": container_ids,
         "process_identity": process_identity,
+    }
+
+
+def _resource_binding_snapshot(
+    role: str,
+    driver_name: str,
+    resources: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return an allowlisted snapshot of one target's configured resource.
+
+    Resource IDs alone can stay stable across a driver-observed container or
+    systemd service replacement. Preserve any host-captured identities supplied
+    by the driver separately; never copy raw driver output or credential
+    evidence. These snapshots improve provenance, but do not prove command
+    routing or independently re-probe the resource.
+    """
+
+    resource = resources.get(driver_name)
+    if not isinstance(resource, Mapping):
+        resource = None
+    resource_id = resource.get("resource_id") if resource else None
+    if (
+        not isinstance(resource_id, str)
+        or not resource_id
+        or len(resource_id) > 256
+        or any(ord(char) < 32 for char in resource_id)
+    ):
+        resource_id = None
+    kind = resource.get("kind") if resource else None
+    if not isinstance(kind, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,47}", kind):
+        kind = None
+    state = resource.get("state") if resource else None
+    if not isinstance(state, str) or state not in {
+        "active",
+        "stopped",
+        "quarantined",
+        "setup_failed",
+        "unknown",
+    }:
+        state = "unknown"
+    return {
+        "role": role,
+        "driver": driver_name,
+        "resource_id": resource_id,
+        "kind": kind,
+        "state": state,
+        "host_identity": _host_resource_identity(resource),
     }
 
 

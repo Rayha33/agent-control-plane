@@ -66,6 +66,15 @@ invocation ID, ACP includes them as `host_identity` evidence and compares a
 single known ID if the app reports `container_id` or `process_identity`. If the
 driver cannot expose that identity, the receipt says
 `host_identity.status = "unknown"`; ACP does not invent a PID or container ID.
+Each target receipt also carries allowlisted `resource_snapshots` for its API,
+database, and queue drivers, including their resource IDs and any host-captured
+container or systemd invocation identities. A `resource_snapshot_sha256` binds
+that exact snapshot into the target manifest and receipt. ACP omits raw driver
+stdout/stderr and credential data. If the driver's supplied evidence contains a
+changed host identity, that change alters the snapshot digest even when the
+resource ID is stable. This is a snapshot of supplied driver evidence, not a
+live revalidation: it cannot detect a replacement the driver has not observed,
+and it does not prove that QC/integration reached those resources.
 
 During a target-aware restart ACP supplies the attempt/task/claim identity,
 phase, phase checkout, and exact source revision to the trusted runtime drivers
@@ -76,7 +85,9 @@ pass through the fields its service needs. Test commands receive
 `ACP_RUNTIME_TARGETS_SHA256`. The manifest is created mode `0400` outside the
 checkout and the receipt records its hash. These permissions and hashes detect
 accidental mutation; a same-UID command is not prevented from changing the
-file.
+file. The `acp-runtime-target-manifest-v1` object is extensible: consumers
+must ignore unknown fields, while incompatible changes to required fields or
+their meaning require a new contract version.
 
 QC and integration hold the task-operation lock continuously across target preflight
 and their configured commands. Public runtime restart and recovery acquire that same
@@ -96,8 +107,10 @@ missing evidence blocks the phase before tests. A missing response or field is
 `unknown`, not a match. Receipts are stored with the QC or integration run and
 include the attempt, task, claim counter, digest of the resource fencing-token
 map, phase, source revision, expected endpoint, driver resource state, available
-host identity, and expected-versus-observed identity fields. Secret values, arbitrary response
-bodies, process command lines, credentials, and endpoint tokens are not stored.
+host identity snapshots for each configured service/database/queue resource,
+and expected-versus-observed app identity fields. Secret values, arbitrary
+response bodies, process command lines, credentials, and endpoint tokens are not
+stored.
 
 An exact report is labeled `corroborated`, with `verified: false`. The service
 controls its own report; this contract does not authenticate that report, prove
