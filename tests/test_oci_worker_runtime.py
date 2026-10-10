@@ -2316,11 +2316,27 @@ def _probe_script(
     host_tmp_relative: str,
     host_network_ip: str,
     host_network_port: int,
+    worker_apparmor_profile: str | None = None,
 ) -> str:
     q = {name: shell_quote(str(path)) for name, path in host_paths.items()}
     host_tmp_rel = shell_quote(host_tmp_relative)
     net_ip = shell_quote(host_network_ip)
     net_port = shell_quote(str(host_network_port))
+    apparmor_probe = "worker_apparmor=not-configured"
+    if worker_apparmor_profile is not None:
+        expected_profile = shell_quote(f"{worker_apparmor_profile} (enforce)")
+        apparmor_probe = f"""worker_apparmor=$(/bin/busybox cat /proc/self/attr/current)
+test "$worker_apparmor" = {expected_profile}
+if /bin/busybox unshare -U -r /bin/busybox true > /workspace/userns-denial.txt 2>&1; then
+  exit 50
+else
+  worker_userns_error=$(/bin/busybox cat /workspace/userns-denial.txt)
+fi
+case "$worker_userns_error" in
+  *"Operation not permitted"*|*"Permission denied"*) ;;
+  *) exit 51 ;;
+esac
+"""
     return f"""set -eu
 # Stop at a second host-controlled file gate. The host performs the FD audit.
 /bin/busybox touch /workspace/fd-audit-ready
@@ -2369,7 +2385,8 @@ else
   network_rc=$?
 fi
 
-printf 'network_probe_rc=%s\\ninterfaces=%s\\n' "$network_rc" "$interfaces" > /workspace/isolation-result.txt
+{apparmor_probe}
+printf 'network_probe_rc=%s\\ninterfaces=%s\\nworker_apparmor=%s\\n' "$network_rc" "$interfaces" "$worker_apparmor" > /workspace/isolation-result.txt
 """
 
 
@@ -2410,6 +2427,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     expected_version = os.environ.get("ACP_OCI_TEST_RUNC_VERSION")
     if not expected_version:
         pytest.fail("set ACP_OCI_TEST_RUNC_VERSION to the exact approved runc release")
+    apparmor_profile = os.environ.get("ACP_OCI_TEST_APPARMOR_PROFILE") or None
 
     repo_root = Path(__file__).resolve().parents[1]
     if not repo_root.is_relative_to(Path("/tmp")):
@@ -2694,6 +2712,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             host_tmp_relative=host_tmp_relative,
             host_network_ip=host_network_ip,
             host_network_port=host_network_port,
+            worker_apparmor_profile=apparmor_profile,
         )
         config = oci_worker.build_oci_worker_config(
             bundle_root,
@@ -2707,6 +2726,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             cpu_period_us=_CONTAINER_CPU_PERIOD_US,
             tmpfs_bytes=8 * 1024 * 1024,
             home_bytes=2 * 1024 * 1024,
+            apparmor_profile=apparmor_profile,
         )
         worker_config = oci_worker._apply_pinned_runc_recursive_private_policy(
             config, pin, expected_version=observed_version
@@ -3081,6 +3101,17 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             )
 
         init_pid = int(read_private_runc_pid_file(pid_file, state_root))
+        if apparmor_profile is not None:
+            apparmor_label_path = Path(f"/proc/{init_pid}/attr/current")
+            try:
+                apparmor_label = apparmor_label_path.read_text(encoding="utf-8").strip()
+            except OSError as error:
+                pytest.fail(f"could not read worker AppArmor label before gate release: {error}")
+            if apparmor_label != f"{apparmor_profile} (enforce)":
+                pytest.fail(
+                    f"runc worker AppArmor label mismatch: {apparmor_label!r} "
+                    f"!= {apparmor_profile!r} (enforce)"
+                )
         init_snapshot = read_linux_process_snapshot(init_pid)
         init_start = _snapshot_start_time(init_snapshot, init_pid, require_live=True)
         cgroup_path = _snapshot_cgroup_path(init_snapshot)
@@ -3217,6 +3248,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         result_fields = dict(line.split("=", 1) for line in result.splitlines())
         assert int(result_fields["network_probe_rc"]) != 0
         assert result_fields["interfaces"] == "lo"
+        if apparmor_profile is not None:
+            assert result_fields["worker_apparmor"] == f"{apparmor_profile} (enforce)"
+            assert (workspace / "userns-denial.txt").is_file()
         assert (workspace / "result.txt").read_text(encoding="ascii") == "candidate result\n"
         assert (workspace / "absolute-host-tmp").is_symlink()
         assert (workspace / "relative-host-tmp").is_symlink()

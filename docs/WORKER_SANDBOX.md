@@ -1502,11 +1502,70 @@ a production-ready profile. The packaged `runc` profile is unconfined apart
 from naming and its userns rule, and this replay placed the entire pytest
 controller and descendants under that label. It therefore does not prove the
 permission is restricted to the trusted setup helper or absent from the worker.
-Next, design and test an explicit helper-to-worker profile transition before
-using this route in production. The executor is still not wired to registered
-`run_worker`; lifecycle ownership, cleanup verification, credential/provider
-egress, result import, and full task #2370 acceptance remain open. Keep OCI
-`run_worker` fail-closed.
+The profile-separated prototype below addresses that low-level boundary, but
+does not provide a production profile or policy lifecycle. The executor is
+still not wired to registered `run_worker`; lifecycle ownership, cleanup
+verification, credential/provider egress, result import, and full task #2370
+acceptance remain open. Keep OCI `run_worker` fail-closed.
+
+### OCI helper/worker AppArmor profile separation (2026-10-10; bounded pass)
+
+The OCI compiler now optionally emits the standard `process.apparmorProfile`
+field. The [OCI Runtime Specification v1.2.1](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config.md)
+defines this as a Linux process profile name, and pinned [runc v1.5.2 applies
+the profile during init, before exec](https://github.com/opencontainers/runc/blob/v1.5.2/libcontainer/standard_init_linux.go#L1016).
+The compiler validates a single plain profile name; it does not load, verify,
+attest to, or audit the named policy. The name must refer to a profile already
+loaded by the host, and the actual runtime must still be independently checked.
+
+In the disposable no-host-share guest above, a temporary **confined** enforce
+profile named `acp-worker-qc` (flags `attach_disconnected,mediate_deleted`, no
+`userns` rule) was loaded from stdin. A direct probe without the worker's
+seccomp filter distinguished the profiles: `unshare --user --map-root-user`
+under the packaged `runc` profile succeeded, while the same command under
+`acp-worker-qc` failed with `Operation not permitted`. This is consistent with
+the [AppArmor user-namespace policy](https://apparmor.net/man/4.0/apparmor.d/).
+An earlier scratch profile using `flags=(unconfined)` but omitting `userns`
+unexpectedly still allowed the operation with the global restriction enabled;
+absence of a rule in an unconfined profile is not a worker denial. Do not use
+that profile shape for this separation.
+
+The exact `oci_worker.py` and `test_oci_worker_runtime.py` overlay passed the
+opt-in rootless live test using pinned `runc-1.5.2` and
+`ACP_OCI_TEST_APPARMOR_PROFILE=acp-worker-qc`. The host read
+`/proc/<init-pid>/attr/current` and asserted `acp-worker-qc (enforce)` before
+releasing the candidate-code gate; the payload independently read its own
+label. The guest test environment was Python 3.12.3 / pytest 9.1.1. Its
+user-namespace attempt was denied, though the worker seccomp policy
+also denies namespace syscalls, so that payload result alone cannot attribute
+the denial to AppArmor. The preceding direct no-seccomp contrast isolates the
+AppArmor result. Tested file SHA-256 values:
+
+- `src/agent_control_plane/supervisor/oci_worker.py`:
+  `1a5559be722334c5797e2d908621a289adea11e55e46c69b16c43cbfbcdeedfd`
+- `tests/test_oci_worker.py`:
+  `b53e107889dd984c5f279ead9f542a20d9aaa929c5571833f6ad9b006b3f15ec`
+- `tests/test_oci_worker_runtime.py`:
+  `40ed1181d28ca585907a52c555b353a8a768a95373f4f8728a6a1972011eeb17`
+
+`tests/test_oci_worker.py` was also overlaid (hash above), but its compiler
+unit tests were exercised by the local suite rather than this live runtime
+test. After the guest replay, the source docstring alone was clarified to state
+that the compiler does not provision or attest to the named profile. The final
+local source SHA-256 is
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`; these
+comment-only bytes were not recopied to the guest. The full local suite passed
+on the final source tree.
+
+Postflight confirmed `kernel.apparmor_restrict_unprivileged_userns=1`, removed
+the temporary profile, and found no matching runc/unshare processes, ACP systemd
+units, or live-attempt tree. This establishes optional OCI-field compilation
+and profile application for this pinned low-level replay—not production policy
+provisioning/discovery, integration with registered `run_worker`, complete
+cleanup/recovery, or result handling. The temporary profile was intentionally
+minimal for the experiment and is not production policy. Keep OCI `run_worker`
+fail-closed until those remaining boundaries are independently implemented
+and verified.
 
 ### NamespaceRuntimeDriver live payload boundary (2026-10-09; pass)
 

@@ -116,7 +116,13 @@ def _pin_test_rootfs(rootfs: Path) -> oci_worker._TrustedRootfs:
     )
 
 
-def compile_config(bundle: Path, workspace: Snapshot, *, private_git: bool = False) -> dict:
+def compile_config(
+    bundle: Path,
+    workspace: Snapshot,
+    *,
+    private_git: bool = False,
+    apparmor_profile: str | None = None,
+) -> dict:
     rootfs = bundle / "rootfs"
     rootfs_pin = _pin_test_rootfs(rootfs)
     return build_oci_worker_config(
@@ -129,6 +135,7 @@ def compile_config(bundle: Path, workspace: Snapshot, *, private_git: bool = Fal
         pids_limit=32,
         cpu_quota_us=100_000,
         private_git=private_git,
+        apparmor_profile=apparmor_profile,
     )
 
 
@@ -1771,6 +1778,27 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
     assert "architectures" not in linux["seccomp"]
     assert linux["uidMappings"][0] == {"containerID": 0, "hostID": os.geteuid(), "size": 1}
     assert linux["gidMappings"][0] == {"containerID": 0, "hostID": os.getegid(), "size": 1}
+
+
+def test_oci_policy_can_bind_an_explicit_worker_apparmor_profile(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+
+    config = compile_config(bundle, workspace, apparmor_profile="acp-worker-test")
+
+    assert config["process"]["apparmorProfile"] == "acp-worker-test"
+    oci_worker._validate_complete_oci_worker_policy(json.loads(json.dumps(config)))
+
+
+@pytest.mark.parametrize("profile", ["", "../escape", "profile name", "x\\ny", ":ns://worker"])
+def test_oci_policy_rejects_unsafe_worker_apparmor_profile_name(
+    tmp_path: Path, profile: str
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+
+    with pytest.raises(SupervisorError, match="AppArmor profile name is invalid") as error:
+        compile_config(bundle, workspace, apparmor_profile=profile)
+
+    assert error.value.code == "invalid_oci_worker_policy"
 
 
 def test_oci_worker_seccomp_profile_is_native_only_and_denies_high_risk_syscalls() -> None:

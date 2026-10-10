@@ -55,6 +55,7 @@ from .common import SupervisorError
 from .sandbox_workspace import Snapshot, read_snapshot_files
 
 _CONTAINER_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
+_APPARMOR_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _MIN_MEMORY_BYTES = 16 * 1024 * 1024
 _MAX_PIDS = 65_536
 _MAX_UINT32 = (1 << 32) - 1
@@ -2623,6 +2624,7 @@ def build_oci_worker_config(
     tmpfs_bytes: int = _DEFAULT_TMPFS_BYTES,
     home_bytes: int = _DEFAULT_HOME_BYTES,
     private_git: bool = False,
+    apparmor_profile: str | None = None,
     host_uid: int | None = None,
     host_gid: int | None = None,
 ) -> dict[str, Any]:
@@ -2640,14 +2642,20 @@ def build_oci_worker_config(
     execing candidate code. The runc caller must map the trusted pipe read end
     to fd 3, pass exactly that descriptor with ``--preserve-fds 1``, and release
     its paired writer only after durable journal and runtime identity checks.
-    This compiler does not release the gate or prove that the runtime applies
-    the requested policy.
+    ``apparmor_profile``, when supplied, only names a preloaded profile; this
+    compiler does not provision or audit its policy, or verify that the runtime
+    applied it. This compiler also does not release the gate.
     """
 
     if os.geteuid() == 0:
         raise SupervisorError(
             "invalid_oci_worker_policy", "OCI worker config must be built by a non-root caller"
         )
+    if apparmor_profile is not None and (
+        not isinstance(apparmor_profile, str)
+        or _APPARMOR_PROFILE_NAME.fullmatch(apparmor_profile) is None
+    ):
+        raise SupervisorError("invalid_oci_worker_policy", "OCI AppArmor profile name is invalid")
     if type(workspace_snapshot) is not Snapshot:
         raise SupervisorError(
             "invalid_oci_workspace",
@@ -2807,6 +2815,7 @@ def build_oci_worker_config(
                 ],
                 "env": env,
                 "cwd": "/workspace",
+                **({"apparmorProfile": apparmor_profile} if apparmor_profile is not None else {}),
                 "noNewPrivileges": True,
                 "rlimits": [
                     {"type": "RLIMIT_CORE", "hard": 0, "soft": 0},
@@ -2926,7 +2935,7 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
         reject()
 
     process = config.get("process")
-    if type(process) is not dict or set(process) != {
+    required_process_keys = {
         "terminal",
         "user",
         "args",
@@ -2935,7 +2944,16 @@ def _validate_complete_oci_worker_policy(config: dict[str, Any]) -> None:
         "noNewPrivileges",
         "rlimits",
         "capabilities",
-    }:
+    }
+    if type(process) is not dict or set(process) not in (
+        required_process_keys,
+        required_process_keys | {"apparmorProfile"},
+    ):
+        reject()
+    if "apparmorProfile" in process and (
+        not isinstance(process["apparmorProfile"], str)
+        or _APPARMOR_PROFILE_NAME.fullmatch(process["apparmorProfile"]) is None
+    ):
         reject()
     if (
         process.get("terminal") is not False
