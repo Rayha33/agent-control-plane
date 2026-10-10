@@ -253,6 +253,31 @@ def test_sandbox_container_id_binds_full_execution_identity() -> None:
     assert all(character in "0123456789abcdef" for character in first[4:])
 
 
+def test_existing_legacy_container_id_is_not_recomputed_on_read(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    legacy_container_id = (
+        f"acp-{execution['attempt_id'][:24]}-{execution['claim_token']}-"
+        f"{execution['execution_id'][:8]}"
+    )
+    assert legacy_container_id != execution["container_id"]
+
+    # Model the pre-full-identity identifier in the current schema. The
+    # production identity trigger correctly forbids changing this field.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_execution_identity_immutable")
+        connection.execute(
+            "UPDATE sandbox_executions SET container_id = ? WHERE attempt_id = ?",
+            (legacy_container_id, attempt["id"]),
+        )
+
+    reopened = GitSupervisor(repo)
+    stored = reopened._sandbox_execution_get(attempt["id"])
+    assert stored is not None
+    assert stored["container_id"] == legacy_container_id
+
+
 def test_launch_record_requires_pinned_runc_handle(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
