@@ -35,7 +35,12 @@ from ..trust_bundles import (
     verify_bundle_pin,
 )
 from .common import RuntimePortPool, SupervisorError, utc_now
-from .runtime_targets import RuntimeTargetDefinition, parse_runtime_target_definitions
+from .runtime_targets import (
+    MAX_COMMAND_LENGTH,
+    MAX_COMMAND_SET_COUNT,
+    RuntimeTargetDefinition,
+    parse_runtime_target_definitions,
+)
 
 
 @dataclass(frozen=True)
@@ -412,6 +417,19 @@ class ConfigMixin:
             port_envs={pool.env_name for pool in runtime_port_pools},
             driver_names={definition.name for definition in runtime_drivers},
         )
+        receipt_phases = {phase for target in runtime_targets for phase in target.phases}
+        for phase, commands in (
+            ("qc", qc_commands),
+            ("integration", integration_commands),
+        ):
+            if phase in receipt_phases and (
+                len(commands) > MAX_COMMAND_SET_COUNT
+                or any(len(command) > MAX_COMMAND_LENGTH for command in commands)
+            ):
+                raise SupervisorError(
+                    "invalid_config",
+                    f"{phase} gate command set exceeds runtime-target receipt limits",
+                )
         # Loaded here so a reviewer's command obeys the same trust rule as the
         # legacy single critic, and so a bad policy fails at construction.
         policy = load_policy(

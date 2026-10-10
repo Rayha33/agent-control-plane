@@ -13,7 +13,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,12 @@ from typing import Any
 from .common import SupervisorError, canonical_json, sha256
 
 TARGET_CONTRACT = "acp-runtime-target-v1"
+COMMAND_SET_SCOPE = (
+    "configured deterministic QC/integration gate commands only; excludes critic, "
+    "runtime setup, and runtime teardown commands"
+)
+MAX_COMMAND_SET_COUNT = 128
+MAX_COMMAND_LENGTH = 65536
 IDENTITY_FIELDS = (
     "attempt_id",
     "task_id",
@@ -188,6 +194,7 @@ def parse_runtime_target_definitions(
 def runtime_target_phase(
     *,
     definitions: tuple[RuntimeTargetDefinition, ...],
+    commands: Sequence[str],
     runtime_environment: Mapping[str, str],
     driver_resources: list[Mapping[str, Any]],
     attempt_id: str,
@@ -219,6 +226,7 @@ def runtime_target_phase(
         raise SupervisorError(
             "runtime_target_fence_invalid", "target claim fence digest is invalid"
         )
+    command_set_sha256 = _command_set_sha256(commands)
     resources = {str(item.get("driver", "")): item for item in driver_resources}
     manifest_targets: list[dict[str, Any]] = []
     receipt_targets: list[dict[str, Any]] = []
@@ -377,6 +385,9 @@ def runtime_target_phase(
         "reservation_fence_sha256": reservation_fence_sha256,
         "phase": phase,
         "source_revision": source_revision,
+        "command_set_scope": COMMAND_SET_SCOPE,
+        "command_set_sha256": command_set_sha256,
+        "command_count": len(commands),
         "targets": manifest_targets,
         "limitations": limitations,
     }
@@ -403,6 +414,9 @@ def runtime_target_phase(
         "reservation_fence_sha256": reservation_fence_sha256,
         "phase": phase,
         "source_revision": source_revision,
+        "command_set_scope": COMMAND_SET_SCOPE,
+        "command_set_sha256": command_set_sha256,
+        "command_count": len(commands),
         "status": "blocked" if blocked else "complete",
         "blocking_reason": (
             "runtime_target_command_binding_unavailable"
@@ -423,6 +437,30 @@ def runtime_target_phase(
     receipt["evidence_id"] = f"{receipt_id}:runtime-target:{phase}"
     receipt["evidence_sha256"] = sha256(canonical_json(receipt).encode("utf-8"))
     return receipt, target_env, blocked
+
+
+def _command_set_sha256(commands: Sequence[str]) -> str:
+    """Hash the exact ordered shell commands named for this preflight.
+
+    This is plan provenance only. It does not prove which executable bytes ran,
+    which environment reached the process, or which endpoint the process used.
+    """
+
+    if isinstance(commands, (str, bytes)) or not isinstance(commands, Sequence):
+        raise SupervisorError(
+            "runtime_target_commands_invalid", "phase commands must be a sequence"
+        )
+    if len(commands) > MAX_COMMAND_SET_COUNT or any(
+        not isinstance(command, str) or len(command) > MAX_COMMAND_LENGTH for command in commands
+    ):
+        raise SupervisorError("runtime_target_commands_invalid", "phase command set is invalid")
+    payload = {
+        "contract": "acp-command-set-v1",
+        "scope": COMMAND_SET_SCOPE,
+        "runner": "supervisor-shell-c-v1",
+        "commands": list(commands),
+    }
+    return sha256(canonical_json(payload).encode("utf-8"))
 
 
 def probe_target_identity(port: int, identity_path: str) -> tuple[dict[str, Any], str]:

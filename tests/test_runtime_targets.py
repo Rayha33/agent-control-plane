@@ -99,6 +99,7 @@ def evaluate_target(
     probe_status: str = "ok",
     resources: list[dict[str, Any]] | None = None,
     require_command_binding: bool = False,
+    commands: tuple[str, ...] = ("pytest -q",),
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     observed = expected_report() if report is None else report
     monkeypatch.setattr(
@@ -108,6 +109,7 @@ def evaluate_target(
     )
     return runtime_targets.runtime_target_phase(
         definitions=(target_definition(require_command_binding=require_command_binding),),
+        commands=commands,
         runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(tmp_path)},
         driver_resources=driver_resources() if resources is None else resources,
         attempt_id="attempt-17",
@@ -142,6 +144,11 @@ def test_matching_app_report_is_only_corroboration_and_manifest_is_read_only(
     assert target["expected"]["queue_namespace"] == "queue-project-attempt-17"
     assert manifest["phase"] == "qc"
     assert manifest["source_revision"] == SOURCE_REVISION
+    assert manifest["command_set_scope"] == runtime_targets.COMMAND_SET_SCOPE
+    assert manifest["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
+    assert receipt["command_set_scope"] == manifest["command_set_scope"]
+    assert receipt["command_set_sha256"] == manifest["command_set_sha256"]
+    assert manifest["command_count"] == 1
     assert manifest["targets"][0]["endpoint"] == "http://127.0.0.1:43123"
     assert environment["ACP_TARGET_API_URL"] == "http://127.0.0.1:43123"
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o400
@@ -167,6 +174,36 @@ def test_required_command_network_binding_is_unknown_and_blocks_matching_target(
     assert target["status"] == "unknown"
     assert target["command_binding_status"] == "unknown"
     assert "command_network_binding" in target["missing_evidence"]
+    assert receipt["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
+
+
+def test_command_set_digest_binds_order_and_exact_shell_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _, _ = evaluate_target(tmp_path, monkeypatch, commands=("pytest -q", "ruff check ."))
+    second_dir = tmp_path / "reordered"
+    second_dir.mkdir()
+    second, _, _ = evaluate_target(second_dir, monkeypatch, commands=("ruff check .", "pytest -q"))
+    third_dir = tmp_path / "edited"
+    third_dir.mkdir()
+    third, _, _ = evaluate_target(third_dir, monkeypatch, commands=("pytest -q -x", "ruff check ."))
+
+    assert (
+        len(
+            {first["command_set_sha256"], second["command_set_sha256"], third["command_set_sha256"]}
+        )
+        == 3
+    )
+    assert first["verified"] is second["verified"] is third["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "commands",
+    ["pytest", ("pytest", 3), ("x" * 65537,), tuple("x" for _ in range(129))],
+)
+def test_invalid_command_set_is_rejected(commands: Any) -> None:
+    with pytest.raises(SupervisorError, match="phase command"):
+        runtime_targets._command_set_sha256(commands)
 
 
 @pytest.mark.parametrize(

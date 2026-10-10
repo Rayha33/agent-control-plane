@@ -246,6 +246,7 @@ class IntegrationMixin:
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
                     receipt, target_env, blocked = runtime_target_phase(
                         definitions=phase_targets,
+                        commands=self.config.integration_commands,
                         runtime_environment=runtime_env,
                         driver_resources=self.driver_resources(submission["attempt_id"]),
                         attempt_id=str(submission["attempt_id"]),

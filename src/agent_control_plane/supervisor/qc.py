@@ -661,6 +661,7 @@ class QcMixin:
                         fence_sha = sha256(str(submission["resource_tokens_json"]).encode("utf-8"))
                         receipt, target_env, blocked = runtime_target_phase(
                             definitions=phase_targets,
+                            commands=self.config.qc_commands,
                             runtime_environment=runtime_env,
                             driver_resources=self.driver_resources(submission["attempt_id"]),
                             attempt_id=str(submission["attempt_id"]),

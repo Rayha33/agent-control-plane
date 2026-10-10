@@ -70,6 +70,22 @@ real database or queue behavior, broker restart recovery, or production worker
 execution. Until those gates pass, the production target remains `unknown` and
 strict QC/integration stays blocked.
 
+Runtime-target preflight receipts now include `command_set_sha256` and the command
+count plus `command_set_scope`, which explicitly limits the digest to the configured
+deterministic QC/integration gate commands for that phase. It excludes the critic
+command and runtime setup/teardown commands. The digest uses contract
+`acp-command-set-v1` over the ordered exact shell-command strings, the scope, and
+the supervisor shell-runner contract. Do not embed credentials in command strings;
+use the separate credential handles. The digest makes this planned command set
+auditable alongside the attempt/task/claim/phase/source and resource identities.
+For a phase with runtime-target receipts enabled, config loading limits its
+hashed gate command set to 128 commands and each command to 65,536 characters.
+Phases without target receipts retain the existing configuration behavior.
+It is not execution attestation: it does not bind executable bytes, the effective
+environment, workspace immutability, or the process's live network namespace.
+`require_command_binding=true` therefore remains `unknown` and blocks command
+execution until a trusted executor supplies those proofs.
+
 ## Claims that must not be conflated
 
 1. **Allocation:** ACP assigned a port, database/schema, queue, or unit name.
