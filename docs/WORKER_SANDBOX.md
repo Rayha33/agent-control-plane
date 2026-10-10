@@ -1427,6 +1427,18 @@ development extras, not the exact `uv.lock` environment; hosted CI remains the
 locked-dependency matrix. Never relax this AppArmor setting on a shared host
 to make a test pass.
 
+**Target NAS capability spot check (2026-10-10; no unit or worker started).**
+From the regular uid-1000 account on `DXP4800PLUS-RING` (`Linux 6.18.15
+x86_64`), the exact default-deny namespace flags, including `--net`, ran a
+trusted `/bin/sh -c "exit 0"` no-op and returned exit 0. The user's
+`default.target` was active. The AppArmor userns sysctl path was absent on this
+host (unlike the disposable Lima guest); `/sys/fs/cgroup/cgroup.controllers`
+listed `cpuset cpu io memory hugetlb pids rdma misc`. This was a direct
+capability probe, not `NamespaceRuntimeDriver`, `systemd-run`, or `run_worker`.
+The root controller list does not prove per-user delegation or limit
+enforcement, and this probe establishes no workspace, credential, egress,
+cleanup, or worker-isolation property.
+
 This preflight proves namespace creation prerequisites and prevents the
 measured failed-unit case; it does not verify the later mount/chroot prelude or
 establish a coding-worker boundary. Separately, `run_worker` still refuses any
