@@ -114,3 +114,7 @@ cross-attempt isolation has been implemented. The positive enforcement backend
 remains tracked by the open ACP coordination task #2523.
 Projects that do not configure `runtime.targets` keep their existing QC and
 integration behavior and make no target-identity claim.
+
+The reviewed Linux broker direction and its security/acceptance boundary are in
+[Command-binding broker design](command-binding-broker.md). That document is a
+proposal, not a supported backend; strict command binding remains unavailable.
