@@ -53,9 +53,10 @@ upstream `runc.arm64` asset with digest
 It launched a bounded BusyBox payload through `spawn_pinned_runc()` and verified
 the read-only private root, expected mount policy, CPU/memory/PID cgroup
 readback, zero effective capabilities, `NoNewPrivs`, a loopback-only network
-namespace, and that a host-NIC listener was not reached. The probe denied host
-checkout, sibling and unrelated project, home/config/credential, `/etc`, `/tmp`
-file and Unix-socket paths, and absolute/relative symlink escapes. It also
+namespace, and that a host-NIC listener was not reached. Checks confirmed that
+host checkout, sibling and unrelated project, home/config/credential, `/etc`,
+and `/tmp` file paths were denied; the exact host Unix-socket sentinel path was
+not visible; and absolute/relative symlink escapes were denied. The probe also
 passed the same-UID bundle/config and state/workspace path-replacement attacks;
 the exact runc scope, process, cgroup, and test-owned temporary paths were
 verified absent after teardown. BusyBox is installed as the dynamic package so
