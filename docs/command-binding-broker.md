@@ -62,6 +62,13 @@ opt-in and creates only uniquely named transient units on a disposable host;
 on Ubuntu the marker is created as root with:
 `printf '%s\n' 'acp-systemd-network-binding-v1' | sudo tee /run/acp-disposable-systemd-test >/dev/null && sudo chmod 600 /run/acp-disposable-systemd-test`.
 
+The checked-in test file at PR #43 head `bb379e73fa284801ddbdec2db391268c11430da0`
+(SHA-256 `42cd9dc1dab1e3dd0643ec5fd79d6e9479f3126bb6c34cff5caad0436f333aa3`)
+was replayed in that VM on the same date: `1 passed in 6.94s`. Postflight found
+no loaded `acp-netbind-*` units or matching system.slice cgroups; the temporary
+root-owned opt-in marker and copied test file were removed. This replay still
+covers only the primitive-level contract described above.
+
 This is evidence for a systemd primitive with local HTTP fakes—not proof that
 ACP launches real app/DB/queue services or QC/integration commands through it.
 It does not establish broker authorization, immutable policy on an installed
