@@ -15,33 +15,51 @@ adversarial review rejected the proposed single-UID descendant tree as an ACP
 backend.
 
 A follow-up disposable-VM probe on the same date used systemd 255 transient
-units with distinct `DynamicUser=yes` identities. A service unit and a QC
-command joined one attempt holder's `PrivateNetwork` namespace: the QC reached
-its own loopback HTTP service, while a command joined to a second attempt could
-not reach that endpoint. In the first attempt, a worker unit with
+units with distinct `DynamicUser=yes` identities. Its first iteration used
+`NetworkNamespacePath=/proc/<holder-pid>/ns/net`; that supports the explicit
+namespace-path mechanism only, not the proposed `JoinsNamespaceOf=` mechanism.
+The checked-in harness now exercises the proposed mechanism directly: each
+service and phase unit sets both `PrivateNetwork=yes` and
+`JoinsNamespaceOf=<exact-holder>.service`, with exactly one listed active
+holder. The phase reached its attempt's loopback HTTP service, while a phase
+joining the other attempt could not reach that endpoint. In the first attempt,
+a worker unit with
 `ProtectProc=invisible` could not read or signal the holder (`ENOENT` for the
 holder's `/proc` entry; `EPERM` for signal), and `InaccessiblePaths=` blocked
 connections to `/run/systemd/private` and `/run/dbus/system_bus_socket`
-(`EACCES`). Its own HTTP request still succeeded; `systemd-run --system` failed
-with `Permission denied`. This supports a separate-UID/unit design and the
-specific boundary properties tested. Dynamic UIDs are runtime identities, not
-durable attempt identities; bind authorization and receipts to the attempt
-generation and each unit's `InvocationID`, never only to a numeric UID.
+(`EACCES`). Its own HTTP request still succeeded. The harness requires
+`systemd-run --system` to report `Permission denied` and then verifies the
+unique attempted unit remains `LoadState=not-found` with no `MainPID`; any other
+error is not accepted as proof of denial. This supports a separate-UID/unit
+design and the specific boundary properties tested. Dynamic UIDs are runtime
+identities, not durable attempt identities; bind authorization and receipts to
+the attempt generation and each unit's `InvocationID`, never only to a numeric
+UID or namespace inode.
 
 The opt-in regression harness `tests/test_systemd_network_binding_integration.py`
 repeated this on 2026-10-10 in the disposable Ubuntu 24.04 VM (kernel
-6.8.0-142-generic, systemd 255, cgroup v2): `1 passed in 5.76s`. Two concurrent
+6.8.0-142-generic, systemd 255, cgroup v2): `1 passed in 6.82s`. It requires
+root plus the exact root-owned `/run/acp-disposable-systemd-test` marker before
+it can create any transient unit. It preflights all random unit names as
+unused, rechecks each name before launch, and tears down only units whose
+`systemd-run` creation succeeded. Two concurrent
 attempt holders had separate `PrivateNetwork=yes` namespaces; separate
 `DynamicUser=yes` fake app, database/schema, and queue services joined each
 holder namespace on distinct per-attempt ports. Commands positively validated
 their own three identities and wrote only their own fake DB/queue state. A
 healthy response from attempt A while expecting B failed before mutation; a
-command in A targeting B's three ports could reach none of them. The test
-observed each phase PID's network namespace from the host, confirmed the
+command in A targeting B's three ports could reach none of them. A root-owned
+holder restart changed its systemd `InvocationID` but, on this systemd 255
+host, retained the same network-namespace inode. This is direct evidence that
+an inode check alone does not detect a unit restart: the old binding must be
+invalidated by the changed `InvocationID`, followed by fresh target validation.
+The test observed each phase PID's network namespace from the host, confirmed the
 untrusted command could not inspect or signal its holder or invoke
 `systemd-run --system`, and checked exact-unit cleanup by inactive/MainPID state
 plus `cgroup.events populated 0` or cgroup removal. The test is explicitly
-opt-in and creates only uniquely named transient units on a disposable host.
+opt-in and creates only uniquely named transient units on a disposable host;
+on Ubuntu the marker is created as root with:
+`printf 'acp-systemd-network-binding-v1\n' | sudo tee /run/acp-disposable-systemd-test >/dev/null && sudo chmod 600 /run/acp-disposable-systemd-test`.
 
 This is evidence for a systemd primitive with local HTTP fakes—not proof that
 ACP launches real app/DB/queue services or QC/integration commands through it.
@@ -161,7 +179,12 @@ ship it:
 systemd provides relevant primitives, including `PrivateNetwork=`,
 `JoinsNamespaceOf=`, execution/filesystem restrictions, and cgroup resource
 controls. These are separate mechanisms and must be composed and verified by
-the broker. `NoNewPrivileges=` does not prevent a process from asking a separate
+the broker. The v255 namespace-joining contract states that both the joining
+and target units need the matching namespace setting, and that the selected
+namespace is undefined if multiple listed active units have different
+namespaces; the broker must keep the join target singular and verify live
+identities ([systemd v255 unit docs](https://github.com/systemd/systemd/blob/v255/man/systemd.unit.xml#L3588-L3617)).
+`NoNewPrivileges=` does not prevent a process from asking a separate
 IPC service to start work, and read-only filesystem settings do not alone hide
 Unix sockets. See [systemd execution and sandboxing directives](https://github.com/systemd/systemd/blob/main/man/systemd.exec.xml),
 [unit namespace joining](https://github.com/systemd/systemd/blob/main/man/systemd.unit.xml),
