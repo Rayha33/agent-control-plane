@@ -1445,6 +1445,69 @@ It is not evidence of `run_worker` isolation, provider authentication or
 egress, result transfer, crash/cancellation recovery, or full task #2370
 acceptance.
 
+### AppArmor-gated OCI boundary replay on runc 1.5.2 (2026-10-10; pass)
+
+The exact `d22483ce6c566df514936c83f7bd500a7f1fb594` source and test were
+copied into the no-host-share Lima guest `acp-oci-qc-20261009` (Ubuntu 24.04.5
+ARM64, Linux `6.8.0-142-generic`, cgroup v2, active user manager, Python
+3.12.3, pytest 7.4.4). The 48-file package-source tree digest was
+`6f0c9f40249f42ffc22ad61274f8a0837c3d76b21a66da8be12f875bf83aaa1a`; the
+tested `oci_worker.py` SHA-256 was
+`d3891165e4ec1b11c4997188cfdea3108e3fb8edff17a0ec7f92f5d541d1991d`, and
+`test_oci_worker_runtime.py` was
+`697b39229d436cf65bf0984921ed4513e1d47d3fa324938d4af34317f177e824`. A
+separate root-owned `/usr/local/bin/runc-1.5.2` was installed from the
+[official runc v1.5.2 ARM64 release asset](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+only after its SHA-256 matched the GitHub release API digest
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`;
+the pre-existing runc binary was not replaced. BusyBox was 1.36.1.
+
+With the guest's default `kernel.apparmor_restrict_unprivileged_userns=1`,
+the live integration attempt from an unconfined shell stopped before runc exec:
+the private bundle helper received `EPERM` at mount-namespace setup (phase 4).
+A direct `unshare` check also failed under that policy. The guest already had
+AppArmor 4.0.1's packaged `/etc/apparmor.d/runc` profile (SHA-256
+`e97400404d8b8e85ce3e458558105ec218276efab10b355c7a6086a90ad0b4c6`): it is
+`flags=(unconfined)` with an explicit `userns,` rule. The upstream AppArmor
+[user-namespace policy notes](https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction)
+describe this per-profile permission path. `aa-exec -p runc -- unshare
+--user --map-root-user --mount --fork -- /bin/true` passed while the sysctl
+remained `1`.
+
+The first profile replay exposed an unclosed `Popen` pipe when private-bundle
+setup failed before a launch handle could be returned. `_reap_failed_runc_launch`
+now closes the caller-unreachable stdin/stdout/stderr handles in `finally`, with
+a regression test. Only `oci_worker.py` and `test_oci_worker_runtime.py` were
+then overlaid into the same guest; their tested SHA-256 values were
+`60e5b1ef264de00be2c486a55f3db4eccd211a7b94fbe8207486e1688428778c` and
+`d15ff55c5f4202655f51158bf9a907588708df5b10457f8d5db54fe2da5a7d44`.
+With the sysctl still `1`, the exact live test
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1 under
+`aa-exec -p runc`, with resource warnings visible and none emitted. Postflight
+found no attempt tree, matching user slice, or runc process; the user manager
+remained active and the sysctl remained `1`. No host settings were changed.
+
+After that guest replay, the source received a compatibility-only adjustment:
+cleanup now uses `getattr(..., None)` for optional Popen stream attributes so
+structural process doubles without those attributes do not mask the bounded
+reap error. The final local source SHA-256 is
+`020f35c85285740fa0df6c78e05b12eae1c1860df01240a0bd99141ebe7faa7e`; it was
+not overlaid or replayed in the guest. The final source passed both focused
+cleanup tests locally, including
+`test_failed_runc_launch_cleanup_reports_bounded_unreaped_child`.
+
+This proves the low-level test can run with the default sysctl when its caller
+is assigned a profile granting user-namespace creation; it does not establish
+a production-ready profile. The packaged `runc` profile is unconfined apart
+from naming and its userns rule, and this replay placed the entire pytest
+controller and descendants under that label. It therefore does not prove the
+permission is restricted to the trusted setup helper or absent from the worker.
+Next, design and test an explicit helper-to-worker profile transition before
+using this route in production. The executor is still not wired to registered
+`run_worker`; lifecycle ownership, cleanup verification, credential/provider
+egress, result import, and full task #2370 acceptance remain open. Keep OCI
+`run_worker` fail-closed.
+
 ### NamespaceRuntimeDriver live payload boundary (2026-10-09; pass)
 
 Added opt-in regression `test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps`

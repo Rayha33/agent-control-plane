@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 import select
@@ -2128,6 +2129,25 @@ def test_partial_launch_without_runtime_identity_fails_closed() -> None:
     assert "init PID/start-time" in gaps[0]
     assert "init cgroup" in gaps[1]
     assert "systemd scope cgroup" in gaps[2]
+
+
+def test_failed_runc_launch_closes_unreturned_pipe_handles(monkeypatch: pytest.MonkeyPatch) -> None:
+    class PopenWithPipes:
+        pid = 123
+
+        def __init__(self) -> None:
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+
+    process = PopenWithPipes()
+    monkeypatch.setattr(oci_worker, "_kill_process_group", lambda _process: None)
+
+    oci_worker._reap_failed_runc_launch(process)  # type: ignore[arg-type]
+
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
 
 
 def test_systemd_parent_slice_cleanup_requires_empty_cgroup_subtree(tmp_path: Path) -> None:

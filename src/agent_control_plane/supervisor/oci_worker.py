@@ -4075,27 +4075,41 @@ class _RuncLaunchSubmissionUnverified(SupervisorError):
 
 
 def _reap_failed_runc_launch(process: subprocess.Popen[bytes]) -> None:
-    """Bound launch-failure cleanup and report when the client cannot be reaped."""
+    """Bound failed-launch cleanup and close pipe handles the caller never receives."""
 
     try:
-        _kill_process_group(process)
-        return
-    except BaseException:
-        if process.poll() is not None:
+        try:
+            _kill_process_group(process)
             return
-    try:
-        process.kill()
-    except OSError:
-        # The process may have exited between poll() and kill(). A bounded
-        # wait below distinguishes that race from an unreaped live child.
-        pass
-    try:
-        process.wait(timeout=1)
-    except BaseException as error:
-        raise SupervisorError(
-            "sandbox_launch_cleanup_unverified",
-            f"runc launcher pid {process.pid} could not be reaped after launch failure",
-        ) from error
+        except BaseException:
+            if process.poll() is not None:
+                return
+        try:
+            process.kill()
+        except OSError:
+            # The process may have exited between poll() and kill(). A bounded
+            # wait below distinguishes that race from an unreaped live child.
+            pass
+        try:
+            process.wait(timeout=1)
+        except BaseException as error:
+            raise SupervisorError(
+                "sandbox_launch_cleanup_unverified",
+                f"runc launcher pid {process.pid} could not be reaped after launch failure",
+            ) from error
+    finally:
+        for stream in (
+            getattr(process, "stdin", None),
+            getattr(process, "stdout", None),
+            getattr(process, "stderr", None),
+        ):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    # Cleanup still reports process-reap state; a closed pipe
+                    # is not evidence that the child itself was reaped.
+                    pass
 
 
 def _spawn_pinned_runc(
