@@ -1734,10 +1734,16 @@ rootless-runc test (not skipped). For this run, two 10-minute fallback restore
 timers were armed before the guest-only sysctl change; the shell exit path
 restored and read back `1`, and both timers were stopped only after that
 readback. Postflight found the user manager active and no runc process. The
-exact pytest directory for the live test had no `live-oci-attempt` child. Three
-separate pytest fixture directories deliberately retained marker entries after
-adversarial cleanup tests; those fixtures were preserved, not mistaken for a
-live-attempt leak or deleted.
+live test's exact pytest directory
+`/tmp/pytest-of-rayha/pytest-7/test_live_rootless_runc_enforc0` had no
+`live-oci-attempt` child. A read-only scan of `/tmp/pytest-of-rayha/pytest-7`
+found four adversarial pytest fixtures that intentionally retained their
+markers: `test_checkout_write_probe_clea1/checkout-write-probe`,
+`test_private_attempt_tree_clea1/live-oci-attempt`,
+`test_private_attempt_tree_clea2/live-oci-attempt`, and
+`test_private_attempt_tree_fina0/live-oci-attempt`. Their unexpected or
+replacement marker entries remain by design; these fixture directories are
+distinct from the live test's attempt tree and were preserved, not deleted.
 
 This is a successful low-level OCI-boundary probe on a second Linux/kernel
 profile, not end-to-end supervised-worker acceptance. It does not connect the
