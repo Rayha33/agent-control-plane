@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import sqlite3
 import threading
@@ -51,6 +52,25 @@ def repo(tmp_path: Path) -> Path:
 def claimed(supervisor: GitSupervisor, path: str = "alpha.txt") -> dict:
     task = make_task(supervisor, path, title="sandbox journal test")
     return supervisor.claim(task["id"], "sandbox-worker")
+
+
+def _request_stop_from_fresh_process(
+    repo: Path,
+    attempt_id: str,
+    claim_token: int,
+    reason: str,
+    result_sender,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    try:
+        updated = supervisor._sandbox_execution_request_stop(attempt_id, claim_token, reason)
+    except SupervisorError as error:
+        row = supervisor._sandbox_execution_get(attempt_id)
+        result_sender.send((error.code, row["phase"] if row else None))
+    else:
+        result_sender.send(("ok", updated["phase"]))
+    finally:
+        result_sender.close()
 
 
 def configure_test_sandbox_pins(supervisor: GitSupervisor) -> None:
@@ -1075,6 +1095,68 @@ def test_stop_after_running_transition_revokes_unconsumed_gate_permit(repo: Path
         os.set_blocking(gate_read, False)
         with pytest.raises(BlockingIOError):
             os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+@pytest.mark.parametrize("phase_before_reconnect", ["running", "stopping"])
+def test_reconnected_supervisor_without_monitor_handle_does_not_claim_stop_applied(
+    repo: Path, phase_before_reconnect: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    reason = "cancel after supervisor reconnect"
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        assert record_running(supervisor, attempt)["phase"] == "running"
+        if phase_before_reconnect == "stopping":
+            assert (
+                supervisor._sandbox_execution_request_stop(
+                    attempt["id"], attempt["claim_token"], reason
+                )["phase"]
+                == "stopping"
+            )
+
+        # A spawned interpreter shares the SQLite journal but has no access to
+        # the monitor's process-local handle registry or gate lock.
+        context = multiprocessing.get_context("spawn")
+        result_receiver, result_sender = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_request_stop_from_fresh_process,
+            args=(repo, attempt["id"], attempt["claim_token"], reason, result_sender),
+        )
+        process.start()
+        result_sender.close()
+        try:
+            assert result_receiver.poll(10), (
+                "fresh supervisor process did not return its stop result"
+            )
+            result = result_receiver.recv()
+            process.join(timeout=10)
+            assert not process.is_alive(), "fresh supervisor process did not exit"
+            assert process.exitcode == 0
+            assert result == ("sandbox_execution_monitor_unavailable", phase_before_reconnect)
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            result_receiver.close()
+
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == phase_before_reconnect
+        if phase_before_reconnect == "running":
+            handle.release_gate()
+            assert os.read(gate_read, 3) == b"go\n"
+        else:
+            with pytest.raises(SupervisorError) as revoked:
+                handle.release_gate()
+            assert revoked.value.code == "sandbox_launch_gate_not_authorized"
+            os.set_blocking(gate_read, False)
+            with pytest.raises(BlockingIOError):
+                os.read(gate_read, 3)
     finally:
         handle.close_gate()
         os.close(gate_read)

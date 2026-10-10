@@ -3578,8 +3578,9 @@ def _runc_launch_gate_lock_for_execution(
 
     The registry lock is released before waiting for the handle lock, matching
     ``release_gate``'s handle-then-registry order and avoiding lock inversion.
-    A missing handle is safe: without a live registered handle no caller can
-    release that execution's gate.
+    A missing handle means this process cannot synchronize with the gate. It
+    does not prove that another process has no monitor-owned handle; callers
+    that request stop must fail closed when the local handle is unavailable.
     """
 
     binding = (attempt_id, claim_token, execution_id)

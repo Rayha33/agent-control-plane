@@ -2159,6 +2159,11 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_transition_conflict",
                     "durable execution identity changed while requesting stop",
                 )
+            if row["phase"] in {"running", "stopping"} and locked_handle is None:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_unavailable",
+                    "the monitor-owned launch handle is unavailable in this process; stop state is unchanged",
+                )
             if row["phase"] == "stopping":
                 if row["stop_reason"] != reason:
                     raise SupervisorError(
