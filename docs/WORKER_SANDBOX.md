@@ -391,6 +391,51 @@ first OS-boundary proof should use a registered no-model fake worker; each
 provider adapter must then prove its own auth and egress contract before launch
 is enabled. No provider adapter or `externalSandbox` opt-in is selected yet.
 
+### Lifecycle ownership decision (2026-10-10)
+
+The durable owner must be a systemd-managed transient **service** for each
+attempt/fencing epoch, not the API process, its `systemd-run` client, or a
+transient scope around a client-launched monitor. Put that service in a
+dedicated monitor slice outside the worker attempt slice. It owns the pinned
+runc launch handle and its one-shot init gate, observes the exact worker scope,
+and is the only component allowed to advance launch/running/exit journal
+receipts. Give each execution a non-reusable unit identity bound to the
+attempt, claim token, and execution ID. The manager's unit name alone is not
+enough: durable adoption must also match the exact invocation ID, control-group
+path, main-process start identity, and journaled fencing epoch. If any evidence
+is absent or conflicts, classify the execution as unknown and retain the
+attempt fence.
+
+The worker scope is a separate systemd object: launch rootless runc with the
+qualified systemd cgroup driver into the exact attempt slice, then independently
+reconcile/stop that scope and container. `KillMode=control-group` governs the
+processes in its own service unit; it is not evidence that a sibling runc scope
+was killed. A controller restart may reconnect to the still-active exact
+monitor service, but a new controller must never reconstruct the monitor's
+in-process runc handle or gate from a PID, path, or self-reported receipt. This
+only covers a controller-process restart while the system manager remains
+alive: a `systemd --user` manager normally terminates its services after the
+last login session ends unless lingering is enabled. The deployment preflight
+must therefore prove the chosen manager's lifetime (for example, require
+lingering for a user manager); this is not a reboot-survival claim. If the
+monitor is gone, recovery must use a separate trusted cleanup/reconciliation
+path to prove the exact init identity absent, the stopped container deleted,
+the state entry absent, and the worker cgroup empty before recording
+`cleanup_verified` or importing results. Ambiguous cleanup stays fenced.
+
+This choice is consistent with systemd's distinct transient service/scope
+lifecycles and unit-level cgroup controls ([`systemd-run(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
+[`systemd.kill(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html),
+[`systemd.resource-control(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)).
+The opt-in [`test_systemd_slice_integration.py`](../tests/test_systemd_slice_integration.py)
+does prove that a systemd-owned monitor service can be reconciled after its
+controller is SIGKILLed and can survive a separate worker-slice stop. Its own
+module documentation correctly limits that evidence: it does not launch or
+attest the ACP OCI worker, recover its runc handle, exercise authenticated
+cancellation, or verify cleanup/result import. The service-owner pattern is
+therefore the integration direction, not a completed executor; `run_worker`
+remains fail-closed.
+
 ## Threat model
 
 Assume the worker command, model-generated scripts, project files, symlinks,
@@ -2035,9 +2080,12 @@ integrated, and `externalSandbox` remains disabled.
   for the same fencing epoch and refused for a later one. Only a valid bounded
   diff may reach the existing QC path.
 - **Lifecycle:** test cancellation, abrupt supervisor restart, timeout,
-  failed systemd setup, stale unit, and concurrent attempts. A missing or
-  ambiguous unit identity is `unknown` and retains the fence; it is not cleanup
-  proof. After a stopped container, explicitly run `runc delete` and verify
+  failed systemd setup, stale unit, and concurrent attempts. Separately test
+  controller death while the system manager stays live and the selected
+  `systemd --user` manager's logout/linger lifecycle on a disposable host; a
+  manager shutdown or vanished unit is not proof of worker cleanup. A missing
+  or ambiguous unit identity is `unknown` and retains the fence; it is not
+  cleanup proof. After a stopped container, explicitly run `runc delete` and verify
   that its exact ID is absent from the configured runc state root and its
   cgroup/unit is absent before releasing the fence. Preflight every required
   cgroup controller and verify configured resource limits by reading them back
