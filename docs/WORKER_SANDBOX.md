@@ -648,8 +648,8 @@ same-UID process with raw database-write access. A future executor must keep the
 supervisor database outside the worker's mount namespace.
 
 **Versioned result-candidate evidence (schema 16; non-authorizing).** After a
-successful recorded runc-client exit and an exact `cleanup_reported` row, the
-host can reopen the durable workspace binding, scan the mutable tree through
+successful recorded runc-client exit and cleanup verification, the host can
+reopen the durable workspace binding, scan the mutable tree through
 `collect_changes` against the task's current write set, and recheck the saved
 workspace root device/inode. The write-once version-1 receipt binds the
 attempt, claim token, execution ID, baseline and workspace paths/device/inode,
@@ -660,6 +660,22 @@ and `cleanup.status: unverified`; its SHA-256 is an integrity checksum, not a
 signature, independent attestation, or import authority. An identical retry is
 idempotent; a changed workspace result conflicts with the stored candidate
 instead of replacing it.
+
+**Candidate-capture quiescence gate (2026-10-10; fail-closed hardening).** The
+capture API now requires `cleanup_verified` both before scanning the mutable
+workspace and again before persisting the candidate; `cleanup_reported` alone
+is rejected without writing a receipt. This closes the supported-API path that
+could run while cleanup was still unverified and a surviving process might
+still mutate the workspace. Schema 27 migrates the write-once SQLite trigger
+to enforce the same `cleanup_verified` phase. There is still no production writer for
+`cleanup_verified`, so production candidate capture remains unavailable. Tests
+that exercise downstream capture/import deliberately synthesize that phase by
+dropping the transition trigger and remove the private bundle/state directories;
+they are not verifier, monitor, or live-runtime evidence. A future verifier
+must establish durable workspace quiescence and bind its own immutable proof
+digest to candidate/import evidence before this gate can become reachable in
+production. The unkeyed cleanup-report digest remains insufficient for that
+purpose.
 
 For journaled sandbox attempts, import, recovery, and submission require a
 matching candidate receipt in addition to the existing `cleanup_verified` gate.

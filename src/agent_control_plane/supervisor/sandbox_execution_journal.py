@@ -1122,7 +1122,7 @@ class SandboxExecutionJournalMixin:
             if (
                 execution is None
                 or execution["execution_id"] != binding["execution_id"]
-                or execution["phase"] not in {"cleanup_reported", "cleanup_verified"}
+                or execution["phase"] != "cleanup_verified"
                 or execution["runc_exit_code"] != 0
                 or execution["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or execution["baseline_root_path"] != str(baseline_root)
@@ -1134,7 +1134,7 @@ class SandboxExecutionJournalMixin:
             ):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
-                    "candidate capture requires the exact exited, cleanup-reported workspace",
+                    "candidate capture requires the exact cleanup-verified workspace",
                 )
             task = self._task_row(connection, attempt["task_id"])
             write_set_rules = self._write_set_rules(task, self._case_sensitive_paths(connection))
@@ -1170,7 +1170,7 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_not_found", "execution reservation is missing"
                 )
             if (
-                row["phase"] not in {"cleanup_reported", "cleanup_verified"}
+                row["phase"] != "cleanup_verified"
                 or row["runc_exit_code"] != 0
                 or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or row["workspace_binding_version"] != 1
@@ -1184,7 +1184,7 @@ class SandboxExecutionJournalMixin:
             ):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
-                    "candidate result is not bound to the exited execution workspace",
+                    "candidate result is not bound to the cleanup-verified execution workspace",
                 )
             task = self._task_row(connection, attempt["task_id"])
             current_write_set_rules = self._write_set_rules(
@@ -1279,7 +1279,7 @@ class SandboxExecutionJournalMixin:
                 SET result_candidate_version = 1, result_candidate_json = ?,
                     result_candidate_digest = ?, updated_at = ?
                 WHERE attempt_id = ? AND claim_token = ?
-                  AND phase IN ('cleanup_reported', 'cleanup_verified')
+                  AND phase = 'cleanup_verified'
                   AND result_candidate_version = 0
                 """,
                 (encoded, digest, utc_now(), attempt_id, claim_token),

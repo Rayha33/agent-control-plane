@@ -1482,6 +1482,26 @@ def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
     return supervisor._sandbox_cleanup_receipt(row)
 
 
+def synthesize_cleanup_verified_for_downstream_test(
+    supervisor: GitSupervisor, attempt_id: str
+) -> None:
+    """Bypass the unavailable verifier only to exercise post-cleanup consumers."""
+
+    row = supervisor._sandbox_execution_get(attempt_id)
+    assert row is not None and row["phase"] == "cleanup_reported"
+    Path(row["bundle_path"]).rmdir()
+    Path(row["state_path"]).rmdir()
+    with supervisor.connect() as connection:
+        # Production has no cleanup_verified writer. Dropping this guard is
+        # strictly test-only and is not evidence of cleanup verification.
+        connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
+        connection.execute(
+            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
+            (attempt_id,),
+        )
+        connection.commit()
+
+
 def result_fixture(attempt: dict, tmp_path: Path):
     baseline = copy_snapshot(attempt["worktree"], tmp_path / "baseline")
     output = copy_snapshot(attempt["worktree"], tmp_path / "worker-output").root
@@ -1501,7 +1521,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 26
+    assert SCHEMA_VERSION == 27
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -2982,6 +3002,15 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
 
+    with pytest.raises(SupervisorError) as unverified:
+        supervisor._sandbox_execution_capture_result_candidate(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert unverified.value.code == "sandbox_result_evidence_unverified"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
+
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+
     captured = supervisor._sandbox_execution_capture_result_candidate(
         attempt["id"], attempt["claim_token"]
     )
@@ -3039,13 +3068,66 @@ def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: P
         supervisor.import_worker_result(
             attempt["id"], attempt["claim_token"], binding["baseline"], change_set
         )
-    assert imported.value.code == "sandbox_result_unverified"
+    assert imported.value.code == "sandbox_result_import_route_required"
     with supervisor.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM result_imports").fetchone()[0] == 0
     reopened = GitSupervisor(repo)
     persisted = reopened._sandbox_execution_get(attempt["id"])
     assert persisted["result_candidate"] == candidate
     assert persisted["result_candidate_digest"] == captured["candidate_digest"]
+
+
+def test_schema27_migration_moves_candidate_write_guard_to_verified_cleanup(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+    record_exit(supervisor, attempt)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+    )
+
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_result_candidate_write_once")
+        # Recreate the schema-26 predicate and version marker to exercise the
+        # forward migration on a database containing an unverified row.
+        connection.execute(
+            """
+            CREATE TRIGGER sandbox_result_candidate_write_once
+            BEFORE UPDATE OF result_candidate_version, result_candidate_json,
+              result_candidate_digest ON sandbox_executions
+            WHEN OLD.result_candidate_version = 0
+              AND NEW.result_candidate_version = 1
+              AND OLD.phase = 'cleanup_reported'
+            BEGIN
+              SELECT RAISE(ABORT, 'sandbox_result_candidate_immutable');
+            END
+            """
+        )
+        connection.execute("UPDATE meta SET value = '26' WHERE key = 'schema_version'")
+        connection.commit()
+
+    upgraded = GitSupervisor(repo)
+    assert upgraded.schema_version_on_open == 26
+    with upgraded.connect() as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'sandbox_result_candidate_write_once'"
+        ).fetchone()
+        assert trigger is not None
+        assert "cleanup_verified" in trigger["sql"]
+        assert "cleanup_reported" not in trigger["sql"]
+        with pytest.raises(sqlite3.IntegrityError, match="sandbox_result_candidate_immutable"):
+            connection.execute(
+                "UPDATE sandbox_executions SET result_candidate_version = 1, "
+                "result_candidate_json = ?, result_candidate_digest = ? WHERE attempt_id = ?",
+                (
+                    '{"authorization":"none","status":"unverified"}',
+                    "0" * 64,
+                    attempt["id"],
+                ),
+            )
 
 
 def test_sandbox_import_route_fails_closed_before_cleanup_verification(repo: Path) -> None:
@@ -3106,19 +3188,13 @@ def test_sandbox_import_uses_distinct_source_and_recovers_published_ref(
     supervisor._sandbox_execution_record_cleanup_report(
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
-    supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
 
-    # Exercise the downstream import boundary with a synthetic already-verified
-    # journal state. No production method currently writes cleanup_verified, so
-    # this is not cleanup-verifier or live-runtime evidence.
-    Path(row["bundle_path"]).rmdir()
-    Path(row["state_path"]).rmdir()
+    # Exercise downstream import only with a synthetic already-verified
+    # journal state. No production method writes cleanup_verified, so this is
+    # not cleanup-verifier or live-runtime evidence.
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+    supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
     with supervisor.connect() as connection:
-        connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
-        connection.execute(
-            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
-            (attempt["id"],),
-        )
         # Model a corrupt/legacy mixed-source journal with a different claim
         # token and result digest; healthy-schema guards normally prevent it.
         connection.execute("DROP TRIGGER result_import_direct_source_insert_guard")
@@ -3244,6 +3320,8 @@ def test_result_candidate_is_idempotent_but_cannot_be_replaced(repo: Path) -> No
         attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
     )
 
+    synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
+
     first = supervisor._sandbox_execution_capture_result_candidate(
         attempt["id"], attempt["claim_token"]
     )
@@ -3330,10 +3408,12 @@ def test_persisted_pre_schema17_cleanup_receipt_replays_but_never_proves_cleanup
 
     workspace = Path(supervisor._sandbox_execution_get(attempt["id"])["workspace_root_path"])
     (workspace / "alpha.txt").write_text("legacy cleanup receipt candidate\n", encoding="utf-8")
-    candidate = supervisor._sandbox_execution_capture_result_candidate(
-        attempt["id"], attempt["claim_token"]
-    )
-    assert candidate["candidate"]["cleanup"]["status"] == "unverified"
+    with pytest.raises(SupervisorError) as unverified_candidate:
+        supervisor._sandbox_execution_capture_result_candidate(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert unverified_candidate.value.code == "sandbox_result_evidence_unverified"
+    assert supervisor._sandbox_execution_get(attempt["id"])["result_candidate_version"] == 0
 
     current_receipt = cleanup_receipt(supervisor, attempt["id"])
     with pytest.raises(SupervisorError) as replace_legacy:
