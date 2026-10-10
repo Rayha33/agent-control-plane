@@ -48,18 +48,19 @@ attempt holders had separate `PrivateNetwork=yes` namespaces; separate
 holder namespace on distinct per-attempt ports. Commands positively validated
 their own three identities and wrote only their own fake DB/queue state. A
 healthy response from attempt A while expecting B failed before mutation; a
-command in A targeting B's three ports could reach none of them. A root-owned
-holder restart changed its systemd `InvocationID` but, on this systemd 255
-host, retained the same network-namespace inode. This is direct evidence that
-an inode check alone does not detect a unit restart: the old binding must be
-invalidated by the changed `InvocationID`, followed by fresh target validation.
+command in A targeting B's three ports could reach none of them. A root-authorized
+restart of the transient holder unit changed its systemd `InvocationID` but, on
+this systemd 255 host, retained the same network-namespace inode. This is direct
+evidence that an inode check alone does not detect a unit restart: the old
+binding must be invalidated by the changed `InvocationID`, followed by fresh
+target validation.
 The test observed each phase PID's network namespace from the host, confirmed the
 untrusted command could not inspect or signal its holder or invoke
 `systemd-run --system`, and checked exact-unit cleanup by inactive/MainPID state
 plus `cgroup.events populated 0` or cgroup removal. The test is explicitly
 opt-in and creates only uniquely named transient units on a disposable host;
 on Ubuntu the marker is created as root with:
-`printf 'acp-systemd-network-binding-v1\n' | sudo tee /run/acp-disposable-systemd-test >/dev/null && sudo chmod 600 /run/acp-disposable-systemd-test`.
+`printf '%s\n' 'acp-systemd-network-binding-v1' | sudo tee /run/acp-disposable-systemd-test >/dev/null && sudo chmod 600 /run/acp-disposable-systemd-test`.
 
 This is evidence for a systemd primitive with local HTTP fakes—not proof that
 ACP launches real app/DB/queue services or QC/integration commands through it.

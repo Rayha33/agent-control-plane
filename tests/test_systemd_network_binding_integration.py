@@ -1,10 +1,10 @@
-"""Opt-in proof of systemd attempt-to-command network namespace binding.
+r"""Opt-in proof of systemd attempt-to-command network namespace binding.
 
 Run only on a disposable Linux host with systemd 247+, an active system manager,
 and cgroup v2 as root. Before opt-in, create the root-owned marker (the test
 refuses to run without it):
 ``ACP_RUN_SYSTEMD_NETWORK_BINDING_INTEGRATION=1 pytest -q tests/test_systemd_network_binding_integration.py``
-``printf 'acp-systemd-network-binding-v1\\n' | sudo tee /run/acp-disposable-systemd-test >/dev/null && sudo chmod 600 /run/acp-disposable-systemd-test``
+``printf '%s\n' 'acp-systemd-network-binding-v1' | sudo tee /run/acp-disposable-systemd-test >/dev/null && sudo chmod 600 /run/acp-disposable-systemd-test``
 
 This exercises a systemd primitive with local fake app, DB/schema, and queue
 services. It proves that commands join one exact attempt namespace, sibling
