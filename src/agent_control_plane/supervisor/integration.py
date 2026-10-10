@@ -261,8 +261,14 @@ class IntegrationMixin:
                     )
                     results.append(receipt)
                     if blocked:
+                        blocking_reason = receipt.get("blocking_reason")
+                        if blocking_reason == "runtime_target_command_binding_unavailable":
+                            raise SupervisorError(
+                                blocking_reason,
+                                "integration requires command network binding, but no trusted executor can prove it",
+                            )
                         raise SupervisorError(
-                            "runtime_target_identity_mismatch",
+                            str(blocking_reason or "runtime_target_identity_mismatch"),
                             "required integration runtime target identity is missing or mismatched",
                         )
                 for command in self.config.integration_commands:

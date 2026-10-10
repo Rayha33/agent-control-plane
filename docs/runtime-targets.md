@@ -34,7 +34,8 @@ required = true
 `http://127.0.0.1:<allocated-port>`, never from an arbitrary URL. `driver` and the optional database/queue
 drivers must be configured trusted drivers. `phases` may contain `qc`,
 `integration`, or both. `required` defaults to true. `schema_version` is an
-optional expected value.
+optional expected value. `require_command_binding` is a separate strict opt-in
+that defaults to false.
 
 The identity endpoint must return a small JSON object with
 `contract: "acp-runtime-target-v1"`. Required fields for a fully corroborated
@@ -104,6 +105,12 @@ which process owns the listening socket, prove that the app connected to the
 reported database/queue, or enforce that an arbitrary test command uses the
 declared endpoint. The endpoint and manifest are available for the command to
 use, but a command may ignore them. Use OS-level process/container attribution
-and network policy when those stronger guarantees are required. Projects that
-do not configure `runtime.targets` keep their existing QC and integration
-behavior and make no target-identity claim.
+and network policy when those stronger guarantees are required. At present,
+there is no trusted phase-command network executor. Therefore a target with
+`require_command_binding = true` records `command_binding_status: "unknown"` and
+blocks QC or integration before its commands run, even if the app's identity
+report matches. This strict mode is a fail-closed guard, not proof that
+cross-attempt isolation has been implemented. The positive enforcement backend
+remains tracked by the open ACP coordination task #2523.
+Projects that do not configure `runtime.targets` keep their existing QC and
+integration behavior and make no target-identity claim.

@@ -52,6 +52,7 @@ class RuntimeTargetDefinition:
     phases: tuple[str, ...]
     required: bool
     schema_version: str | None
+    require_command_binding: bool
 
 
 def parse_runtime_target_definitions(
@@ -78,6 +79,7 @@ def parse_runtime_target_definitions(
         "phases",
         "required",
         "schema_version",
+        "require_command_binding",
     }
     for entry in raw:
         if not isinstance(entry, dict) or set(entry) - allowed_keys:
@@ -147,6 +149,12 @@ def parse_runtime_target_definitions(
             raise SupervisorError(
                 "invalid_config", f"runtime target {name} required must be boolean"
             )
+        require_command_binding = entry.get("require_command_binding", False)
+        if not isinstance(require_command_binding, bool):
+            raise SupervisorError(
+                "invalid_config",
+                f"runtime target {name} require_command_binding must be boolean",
+            )
         schema_version = entry.get("schema_version")
         if schema_version is not None and (
             not isinstance(schema_version, str)
@@ -168,6 +176,7 @@ def parse_runtime_target_definitions(
                 phases=tuple(phases),
                 required=required,
                 schema_version=schema_version,
+                require_command_binding=require_command_binding,
             )
         )
         names.add(name)
@@ -292,17 +301,31 @@ def runtime_target_phase(
         if missing_driver:
             missing_expected.append("driver_resource_id")
         missing_expected.extend(missing_related)
+        command_binding_status = (
+            "unknown" if definition.require_command_binding else "not_requested"
+        )
+        if definition.require_command_binding:
+            missing_expected.append("command_network_binding")
         if mismatches:
             status = "mismatch"
-        elif probe_status != "ok" or missing_expected or missing_observed:
+        elif (
+            probe_status != "ok"
+            or missing_expected
+            or missing_observed
+            or definition.require_command_binding
+        ):
             status = "unknown"
         else:
             status = "corroborated"
-        target_blocked = definition.required and status != "corroborated"
+        target_blocked = (definition.required and status != "corroborated") or (
+            definition.require_command_binding
+        )
         blocked = blocked or target_blocked
         entry = {
             "name": definition.name,
             "required": definition.required,
+            "require_command_binding": definition.require_command_binding,
+            "command_binding_status": command_binding_status,
             "status": status,
             "verified": False,
             "expected": expected,
@@ -326,11 +349,25 @@ def runtime_target_phase(
                 "host_identity": host_identity,
                 "identity_path": definition.identity_path,
                 "required": definition.required,
+                "require_command_binding": definition.require_command_binding,
+                "command_binding_status": command_binding_status,
                 "status": status,
                 "verified": False,
             }
         )
 
+    limitations = [
+        "app-reported identity is corroborating only",
+        "no OS process/container-to-socket attribution was performed",
+        "no network policy proved which endpoint each test command used",
+    ]
+    if any(
+        definition.require_command_binding and phase in definition.phases
+        for definition in definitions
+    ):
+        limitations.append(
+            "required command network binding is unavailable; the phase is blocked as unknown"
+        )
     manifest = {
         "contract": "acp-runtime-target-manifest-v1",
         "receipt_id": receipt_id,
@@ -341,11 +378,7 @@ def runtime_target_phase(
         "phase": phase,
         "source_revision": source_revision,
         "targets": manifest_targets,
-        "limitations": [
-            "app-reported identity is corroborating only",
-            "no OS process/container-to-socket attribution was performed",
-            "no network policy proved which endpoint each test command used",
-        ],
+        "limitations": limitations,
     }
     manifest_bytes = (canonical_json(manifest) + "\n").encode("utf-8")
     manifest_path = _write_manifest(runtime_dir, receipt_id, phase, manifest_bytes)
@@ -371,6 +404,16 @@ def runtime_target_phase(
         "phase": phase,
         "source_revision": source_revision,
         "status": "blocked" if blocked else "complete",
+        "blocking_reason": (
+            "runtime_target_command_binding_unavailable"
+            if any(
+                definition.require_command_binding and phase in definition.phases
+                for definition in definitions
+            )
+            else "runtime_target_identity_mismatch"
+            if blocked
+            else None
+        ),
         "verified": False,
         "manifest_path": str(manifest_path),
         "manifest_sha256": manifest_sha256,
