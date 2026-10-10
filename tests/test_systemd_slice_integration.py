@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from agent_control_plane.supervisor.oci_worker import _oci_worker_systemd_slice
@@ -140,6 +140,8 @@ def _read_monitor_receipt(path: Path) -> dict[str, Any]:
         "invocation_id",
         "control_group",
         "main_pid",
+        "monitor_slice_unit",
+        "monitor_slice_control_group",
         "slice_unit",
         "slice_control_group",
     }
@@ -147,7 +149,7 @@ def _read_monitor_receipt(path: Path) -> dict[str, Any]:
         not isinstance(receipt, dict)
         or set(receipt) != expected
         or type(receipt["version"]) is not int
-        or receipt["version"] != 1
+        or receipt["version"] != 2
     ):
         raise RuntimeError("monitor receipt has an unsupported shape")
     if (
@@ -160,7 +162,14 @@ def _read_monitor_receipt(path: Path) -> dict[str, Any]:
         or any(char not in "0123456789abcdef" for char in receipt["invocation_id"])
         or not all(
             isinstance(receipt[name], str) and receipt[name]
-            for name in ("unit", "control_group", "slice_unit", "slice_control_group")
+            for name in (
+                "unit",
+                "control_group",
+                "monitor_slice_unit",
+                "monitor_slice_control_group",
+                "slice_unit",
+                "slice_control_group",
+            )
         )
     ):
         raise RuntimeError("monitor receipt contains an invalid identity")
@@ -171,17 +180,18 @@ def _start_monitor_controller(
     systemd_run: str,
     systemctl: str,
     service_unit: str,
+    monitor_slice_unit: str,
     slice_unit: str,
     receipt_path: Path,
 ) -> None:
-    """Old-controller subprocess: start a systemd-owned sleep service and fsync its receipt."""
+    """Start the trusted monitor outside the worker slice and fsync its receipt."""
 
     _run(
         [
             systemd_run,
             "--user",
             f"--unit={service_unit}",
-            f"--slice={slice_unit}",
+            f"--slice={monitor_slice_unit}",
             "--property=Type=exec",
             "--property=KillMode=control-group",
             "--property=RuntimeMaxSec=45s",
@@ -190,24 +200,33 @@ def _start_monitor_controller(
         ]
     )
     service = _wait_active(systemctl, service_unit)
+    monitor_slice = _wait_active(systemctl, monitor_slice_unit)
+    _run([systemctl, "--user", "start", slice_unit])
     attempt_slice = _wait_active(systemctl, slice_unit)
     if (
         service.get("Id") != service_unit
-        or service.get("Slice") != slice_unit
+        or service.get("Slice") != monitor_slice_unit
         or service.get("LoadState") != "loaded"
         or not service.get("InvocationID")
         or not service.get("ControlGroup")
+        or not monitor_slice.get("ControlGroup")
         or not attempt_slice.get("ControlGroup")
+        or PurePosixPath(service["ControlGroup"]).parent.as_posix() != monitor_slice["ControlGroup"]
+        or PurePosixPath(service["ControlGroup"]).is_relative_to(
+            PurePosixPath(attempt_slice["ControlGroup"])
+        )
     ):
         raise RuntimeError(f"systemd monitor identity is incomplete: {service}")
     main_pid = int(service.get("MainPID", "0"))
     receipt = {
-        "version": 1,
+        "version": 2,
         "controller_pid": os.getpid(),
         "unit": service_unit,
         "invocation_id": service["InvocationID"],
         "control_group": service["ControlGroup"],
         "main_pid": main_pid,
+        "monitor_slice_unit": monitor_slice_unit,
+        "monitor_slice_control_group": monitor_slice["ControlGroup"],
         "slice_unit": slice_unit,
         "slice_control_group": attempt_slice["ControlGroup"],
     }
@@ -225,6 +244,7 @@ def _reconcile_monitor_after_restart(systemctl: str, receipt_path: Path) -> dict
 
     receipt = _read_monitor_receipt(receipt_path)
     service = _unit_properties(systemctl, receipt["unit"])
+    monitor_slice = _unit_properties(systemctl, receipt["monitor_slice_unit"])
     attempt_slice = _unit_properties(systemctl, receipt["slice_unit"])
     expected_service = {
         "Id": receipt["unit"],
@@ -232,8 +252,13 @@ def _reconcile_monitor_after_restart(systemctl: str, receipt_path: Path) -> dict
         "ActiveState": "active",
         "InvocationID": receipt["invocation_id"],
         "ControlGroup": receipt["control_group"],
-        "Slice": receipt["slice_unit"],
+        "Slice": receipt["monitor_slice_unit"],
         "MainPID": str(receipt["main_pid"]),
+    }
+    expected_monitor_slice = {
+        "Id": receipt["monitor_slice_unit"],
+        "LoadState": "loaded",
+        "ControlGroup": receipt["monitor_slice_control_group"],
     }
     expected_slice = {
         "Id": receipt["slice_unit"],
@@ -243,21 +268,35 @@ def _reconcile_monitor_after_restart(systemctl: str, receipt_path: Path) -> dict
     }
     if any(service.get(key) != value for key, value in expected_service.items()):
         raise RuntimeError(f"monitor service no longer matches its durable receipt: {service}")
+    if any(monitor_slice.get(key) != value for key, value in expected_monitor_slice.items()):
+        raise RuntimeError(f"monitor slice no longer matches its durable receipt: {monitor_slice}")
     if any(attempt_slice.get(key) != value for key, value in expected_slice.items()):
         raise RuntimeError(f"attempt slice no longer matches its durable receipt: {attempt_slice}")
-    if Path(service["ControlGroup"]).parent.as_posix() != attempt_slice["ControlGroup"]:
-        raise RuntimeError("monitor service cgroup is not a direct child of the recorded slice")
+    monitor_cgroup = PurePosixPath(service["ControlGroup"])
+    attempt_cgroup = PurePosixPath(attempt_slice["ControlGroup"])
+    if (
+        monitor_cgroup.parent.as_posix() != monitor_slice["ControlGroup"]
+        or monitor_cgroup.is_relative_to(attempt_cgroup)
+        or attempt_cgroup.is_relative_to(monitor_cgroup)
+    ):
+        raise RuntimeError("trusted monitor and worker attempt slice are not separated")
     if not Path(f"/proc/{receipt['main_pid']}").is_dir():
         raise RuntimeError("recorded systemd monitor MainPID is no longer present")
     if os.getpid() == receipt["controller_pid"]:
         raise RuntimeError("reconciliation unexpectedly ran in the original controller process")
-    return {"receipt": receipt, "service": service, "slice": attempt_slice}
+    return {
+        "receipt": receipt,
+        "service": service,
+        "monitor_slice": monitor_slice,
+        "slice": attempt_slice,
+    }
 
 
 def _crash_controller_and_reconcile(
     systemd_run: str,
     systemctl: str,
     service_unit: str,
+    monitor_slice_unit: str,
     slice_unit: str,
     receipt_path: Path,
 ) -> dict[str, Any]:
@@ -269,6 +308,7 @@ def _crash_controller_and_reconcile(
             systemd_run,
             systemctl,
             service_unit,
+            monitor_slice_unit,
             slice_unit,
             str(receipt_path),
         ],
@@ -340,14 +380,16 @@ def _crash_controller_and_reconcile(
 
 def test_monitor_receipt_round_trips_as_private_durable_identity(tmp_path: Path) -> None:
     receipt = {
-        "version": 1,
+        "version": 2,
         "controller_pid": 101,
         "unit": "acp-monitor-test.service",
         "invocation_id": "a" * 32,
-        "control_group": "/user.slice/user-1000.slice/acp-monitor-test.service",
+        "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
         "main_pid": 102,
+        "monitor_slice_unit": "app.slice",
+        "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
         "slice_unit": "user-acp-test.slice",
-        "slice_control_group": "/user.slice/user-1000.slice/user-acp-test.slice",
+        "slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp-test.slice",
     }
     path = tmp_path / "monitor-receipt.json"
 
@@ -361,14 +403,16 @@ def test_monitor_receipt_rejects_symlinks_and_boolean_versions(tmp_path: Path) -
     import pytest
 
     receipt = {
-        "version": 1,
+        "version": 2,
         "controller_pid": 101,
         "unit": "acp-monitor-test.service",
         "invocation_id": "a" * 32,
-        "control_group": "/user.slice/user-1000.slice/acp-monitor-test.service",
+        "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
         "main_pid": 102,
+        "monitor_slice_unit": "app.slice",
+        "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
         "slice_unit": "user-acp-test.slice",
-        "slice_control_group": "/user.slice/user-1000.slice/user-acp-test.slice",
+        "slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp-test.slice",
     }
     target = tmp_path / "receipt-target.json"
     link = tmp_path / "receipt-link.json"
@@ -449,6 +493,7 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
     token = uuid.uuid4().hex
     container_id = f"acp-slice-probe-{token}"
     slice_unit = _oci_worker_systemd_slice(container_id)
+    monitor_slice_unit = "app.slice"
     service_unit = f"acp-monitor-probe-{token}.service"
     scope_unit = f"acp-scope-probe-{token}.scope"
     scope_client: subprocess.Popen[str] | None = None
@@ -460,18 +505,25 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
             systemd_run,
             systemctl,
             service_unit,
+            monitor_slice_unit,
             slice_unit,
             receipt_path,
         )
         monitor_receipt = monitor_reconciliation["receipt"]
         pre_stop[slice_unit] = _wait_active(systemctl, slice_unit)
+        pre_stop[monitor_slice_unit] = _unit_properties(systemctl, monitor_slice_unit)
         pre_stop[service_unit] = _wait_active(systemctl, service_unit)
+        if (
+            pre_stop[monitor_slice_unit].get("ControlGroup")
+            != monitor_receipt["monitor_slice_control_group"]
+        ):
+            raise AssertionError("monitor service parent slice differs from its receipt")
         expected_service_identity = {
             "Id": monitor_receipt["unit"],
             "InvocationID": monitor_receipt["invocation_id"],
             "ControlGroup": monitor_receipt["control_group"],
             "MainPID": str(monitor_receipt["main_pid"]),
-            "Slice": monitor_receipt["slice_unit"],
+            "Slice": monitor_receipt["monitor_slice_unit"],
         }
         if any(
             pre_stop[service_unit].get(key) != expected
@@ -498,29 +550,54 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
         )
 
         pre_stop[scope_unit] = _wait_active(systemctl, scope_unit, scope_client)
-        slice_cgroup = pre_stop[slice_unit]["ControlGroup"]
+        attempt_slice_cgroup = pre_stop[slice_unit]["ControlGroup"]
+        monitor_slice_cgroup = pre_stop[monitor_slice_unit]["ControlGroup"]
+        if pre_stop[service_unit].get("Slice") != monitor_slice_unit:
+            raise AssertionError(f"monitor is not assigned to {monitor_slice_unit}")
+        if PurePosixPath(pre_stop[service_unit]["ControlGroup"]).parent.as_posix() != (
+            monitor_slice_cgroup
+        ):
+            raise AssertionError("monitor service is not a direct child of its trusted slice")
+        if pre_stop[scope_unit].get("Slice") != slice_unit:
+            raise AssertionError(f"worker scope is not assigned to {slice_unit}")
+        if PurePosixPath(pre_stop[scope_unit]["ControlGroup"]).parent.as_posix() != (
+            attempt_slice_cgroup
+        ):
+            raise AssertionError("worker scope is not a direct child of its attempt slice")
+        if PurePosixPath(pre_stop[service_unit]["ControlGroup"]).is_relative_to(
+            PurePosixPath(attempt_slice_cgroup)
+        ):
+            raise AssertionError("trusted monitor is inside the cancellable worker slice")
         for unit in (service_unit, scope_unit):
             properties = pre_stop[unit]
-            if properties.get("Slice") != slice_unit:
-                raise AssertionError(f"{unit} is not assigned to {slice_unit}: {properties}")
-            if Path(properties["ControlGroup"]).parent.as_posix() != slice_cgroup:
-                raise AssertionError(f"{unit} is not a direct cgroup child of {slice_unit}")
             if not properties.get("InvocationID"):
                 raise AssertionError(f"{unit} has no systemd InvocationID")
             if _cgroup_is_empty(properties["ControlGroup"]):
                 raise AssertionError(f"{unit} has no process in its active cgroup")
 
         _run([systemctl, "--user", "stop", slice_unit])
-        for unit in (slice_unit, service_unit, scope_unit):
+        for unit in (slice_unit, scope_unit):
             post_stop[unit] = _wait_inactive(systemctl, unit)
             if not _cgroup_is_empty(pre_stop[unit]["ControlGroup"]):
                 raise AssertionError(
                     f"cgroup still contains processes after stopping {slice_unit}: {unit}"
                 )
+        surviving_monitor = _unit_properties(systemctl, service_unit)
+        if any(
+            surviving_monitor.get(key) != expected
+            for key, expected in expected_service_identity.items()
+        ) or _cgroup_is_empty(pre_stop[service_unit]["ControlGroup"]):
+            raise AssertionError(
+                "trusted monitor did not survive worker-slice cancellation with exact identity"
+            )
         if scope_client is None or scope_client.wait(timeout=_WAIT_SECONDS) is None:
             raise AssertionError(
                 "the systemd-run scope client did not exit after stopping its slice"
             )
+        _run([systemctl, "--user", "stop", service_unit])
+        post_stop[service_unit] = _wait_inactive(systemctl, service_unit)
+        if not _cgroup_is_empty(pre_stop[service_unit]["ControlGroup"]):
+            raise AssertionError("monitor service cgroup remained populated after its own stop")
 
         return {
             "systemd_user_manager": manager_state,
@@ -537,12 +614,13 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
             "monitor_reconciled_after_controller_sigkill": True,
             "monitor_invocation_id": monitor_receipt["invocation_id"],
             "monitor_main_pid": monitor_receipt["main_pid"],
+            "monitor_survived_worker_slice_stop": True,
             "cgroups_empty": True,
             "scope_client_exit_code": scope_client.returncode,
         }
     finally:
         cleanup_errors: list[str] = []
-        for unit in (slice_unit, service_unit, scope_unit):
+        for unit in (slice_unit, scope_unit, service_unit):
             try:
                 subprocess.run(
                     [systemctl, "--user", "stop", unit],
@@ -588,6 +666,7 @@ def test_systemd_monitor_reconciles_after_controller_crash_and_slice_stops_units
         pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
     evidence = _probe(tmp_path)
     assert evidence["monitor_reconciled_after_controller_sigkill"] is True
+    assert evidence["monitor_survived_worker_slice_stop"] is True
     assert evidence["cgroups_empty"] is True
     assert set(evidence["post_stop_states"].values()) <= {"inactive", "failed", "not-found"}
 
@@ -595,9 +674,9 @@ def test_systemd_monitor_reconciles_after_controller_crash_and_slice_stops_units
 if __name__ == "__main__":
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--monitor-controller":
-        if len(arguments) != 6:
-            raise SystemExit("monitor-controller mode requires five arguments")
-        _start_monitor_controller(*arguments[1:5], Path(arguments[5]))
+        if len(arguments) != 7:
+            raise SystemExit("monitor-controller mode requires six arguments")
+        _start_monitor_controller(*arguments[1:6], Path(arguments[6]))
     elif arguments and arguments[0] == "--reconcile-monitor":
         if len(arguments) != 3:
             raise SystemExit("reconcile-monitor mode requires two arguments")

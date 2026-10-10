@@ -31,6 +31,7 @@ _MAX_CGROUP_CONTROL_BYTES = 128
 _RUNTIME_COMMAND_TIMEOUT_SECONDS = 3.0
 _MAX_PID = (1 << 31) - 1
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_ATTEMPT_SLICE_COMPONENT = re.compile(r"user-acp-[0-9a-f]{64}\.slice\Z")
 _UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|scope|slice)\Z")
 _LINUX_IDENTITY = re.compile(r"linux:([1-9][0-9]*):(0|[1-9][0-9]*)\Z")
 _PID_FILE = re.compile(rb"([1-9][0-9]{0,9})\n?\Z")
@@ -51,6 +52,7 @@ class ProcessSnapshot:
 class RunningRuntimeAttestation:
     """Normalized evidence accepted by the sandbox execution journal."""
 
+    monitor_placement: str
     container_id: str
     bundle_path: str
     monitor_pid: int
@@ -84,6 +86,7 @@ class RunningRuntimeAttestation:
         """Return the bounded, normalized receipt recorded with the transition."""
 
         return {
+            "monitor_placement": self.monitor_placement,
             "container_id": self.container_id,
             "bundle_path": self.bundle_path,
             "monitor_pid": self.monitor_pid,
@@ -943,15 +946,23 @@ def validate_running_runtime_attestation(
     wrapper_cgroup = _cgroup_path(wrapper["ControlGroup"], "wrapper cgroup")
     attempt_slice_cgroup = _cgroup_path(attempt_slice["ControlGroup"], "attempt slice cgroup")
     scope_cgroup = _cgroup_path(scope["ControlGroup"], "scope cgroup")
+    monitor_cgroup_path = PurePosixPath(wrapper_cgroup)
+    attempt_slice_path = PurePosixPath(attempt_slice_cgroup)
+    monitor_is_in_worker_slice = monitor_cgroup_path.is_relative_to(attempt_slice_path)
+    worker_slice_is_in_monitor = attempt_slice_path.is_relative_to(monitor_cgroup_path)
+    monitor_is_in_any_attempt_slice = any(
+        _ATTEMPT_SLICE_COMPONENT.fullmatch(part) is not None for part in monitor_cgroup_path.parts
+    )
+    if monitor_is_in_worker_slice or worker_slice_is_in_monitor or monitor_is_in_any_attempt_slice:
+        raise _invalid("trusted monitor and worker attempt slice do not have separate cgroups")
     if (
         wrapper_cgroup == scope_cgroup
         or scope_cgroup != expected_scope
         or attempt_slice_unit != _oci_worker_systemd_slice(container_id)
         or PurePosixPath(attempt_slice_cgroup).name != attempt_slice_unit
-        or PurePosixPath(wrapper_cgroup).parent.as_posix() != attempt_slice_cgroup
         or PurePosixPath(scope_cgroup).parent.as_posix() != attempt_slice_cgroup
     ):
-        raise _invalid("wrapper and scope are not children of the exact attempt slice")
+        raise _invalid("scope is not a direct child of the exact attempt slice")
 
     expected_pids = {monitor_pid, runc_client_pid, expected_init_pid}
     if set(process_snapshots) != expected_pids:
@@ -993,6 +1004,7 @@ def validate_running_runtime_attestation(
         executable_sha256=runc_executable_sha256,
     )
     normalized = {
+        "monitor_placement": "outside_attempt_slice",
         "container_id": container_id,
         "bundle_path": bundle_path,
         "monitor_pid": monitor_pid,
@@ -1040,12 +1052,21 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
             )
             or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", value.container_id)
             or len({value.monitor_pid, value.runc_client_pid, value.init_pid}) != 3
+            or value.monitor_placement != "outside_attempt_slice"
             or value.wrapper_control_group == value.cgroup_path
             or value.attempt_slice_unit != _oci_worker_systemd_slice(value.container_id)
             or PurePosixPath(value.cgroup_path).name != value.scope_unit
             or PurePosixPath(value.attempt_slice_control_group).name != value.attempt_slice_unit
-            or PurePosixPath(value.wrapper_control_group).parent.as_posix()
-            != value.attempt_slice_control_group
+            or PurePosixPath(value.wrapper_control_group).is_relative_to(
+                PurePosixPath(value.attempt_slice_control_group)
+            )
+            or PurePosixPath(value.attempt_slice_control_group).is_relative_to(
+                PurePosixPath(value.wrapper_control_group)
+            )
+            or any(
+                _ATTEMPT_SLICE_COMPONENT.fullmatch(part) is not None
+                for part in PurePosixPath(value.wrapper_control_group).parts
+            )
             or PurePosixPath(value.cgroup_path).parent.as_posix()
             != value.attempt_slice_control_group
         ):

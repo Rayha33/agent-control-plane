@@ -1574,35 +1574,52 @@ transient-unit creation, not a separate lifecycle owner. Sources:
 The recovery design must not use `systemd-run --scope` as the durable monitor:
 in v252 the command remains a child of the `systemd-run` client and the client
 waits synchronously for it. Instead, the candidate architecture is one
-systemd-owned transient **monitor service** per attempt/fencing epoch under its
-unique attempt slice. That service starts and waits for the pinned foreground
-runc client and persists its own lifecycle receipts. It is intended to outlive
-an ACP supervisor-process restart while the same user manager remains active;
-that recovery property is not yet proven. The runc container scope is a sibling
-unit under the same attempt slice. For the user-manager deployment, verify the
-host's logout/linger and manager-restart behavior rather than assuming
+systemd-owned transient **monitor service** per attempt/fencing epoch, outside
+the unique worker attempt slice. That trusted service owns the pinned
+foreground-runc client, gate authorization, wait, and durable lifecycle
+receipts. The runc-created scope and container init belong inside the exact
+attempt slice; the monitor service must not. Stopping the worker slice must
+terminate the scope while leaving the trusted monitor alive to reap runc,
+observe teardown, and record cleanup. The service is intended to outlive an ACP
+supervisor-process restart while the same user manager remains active; that
+recovery property is not yet proven. For the user-manager deployment, verify
+the host's logout/linger and manager-restart behavior rather than assuming
 persistence across logout or reboot.
 The untrusted worker must never receive the host systemd bus socket or a route
 to the control API.
 
-`KillMode=control-group` covers one unit's control group, not a sibling runc
-scope; stopping the wrapper service alone therefore remains insufficient. A
-trusted owner must serialize start/cancel/recovery, query the exact service and
-scope invocation IDs and `ControlGroup` values, and use the manager to stop the
-per-attempt slice for cancellation/recovery. An owner restart, missing or
-reused invocation, unexpected cgroup ancestry, or ambiguous cleanup must leave
-the execution fence held and prohibit result import. A sequential cgroup scan
-followed by stop is still only point-in-time evidence, not an atomic cleanup
-proof. No durable monitor daemon or integrated worker path has been
-implemented. A narrower probe of a systemd-owned service surviving its parent
-controller's `SIGKILL` under the same active user manager is recorded below;
-manager-restart recovery remains untested and OCI remains fail-closed. Sources:
+`KillMode=control-group` covers one unit's control group, not an runc scope in
+the separate worker slice; stopping the monitor service alone is therefore
+insufficient. The trusted service must serialize start/cancel/recovery, query
+the exact monitor and scope invocation IDs and `ControlGroup` values, and use
+the manager to stop only the exact per-attempt worker slice. An owner restart,
+missing or reused invocation, unexpected cgroup ancestry, or ambiguous cleanup
+must leave the execution fence held and prohibit result import. A sequential
+cgroup scan followed by stop is still only point-in-time evidence, not an
+atomic cleanup proof. No durable monitor service or integrated worker path has
+been implemented. The earlier same-slice probe below is historical; the new
+split-placement probe validates that the trusted service survives stopping the
+worker slice, but it uses `/usr/bin/sleep` and an external scope controller,
+not a monitor that owns runc wait/reconciliation. Manager-restart recovery
+remains untested and OCI remains fail-closed. Sources:
 [systemd v252 `systemd-run`](https://github.com/systemd/systemd/blob/v252/man/systemd-run.xml),
 [systemd v252 unit dependencies](https://github.com/systemd/systemd/blob/v252/man/systemd.unit.xml),
 [systemd v252 resource control](https://github.com/systemd/systemd/blob/v252/man/systemd.resource-control.xml),
 and [systemd v252 `systemd.kill`](https://github.com/systemd/systemd/blob/v252/man/systemd.kill.xml).
 
-**Attempt-slice stop propagation probe (2026-10-09; opt-in regression).**
+**Version-5 placement contract (2026-10-10; source tests only).** The running
+attestation and launch-plan version 5 now require the trusted wrapper/monitor
+cgroup to be disjoint from the exact per-attempt slice; only the runc scope is
+required to be a direct child of that slice. This rejects both a monitor inside
+the worker slice and a monitor cgroup that would own the worker slice. Older
+launch-plan versions remain readable for audit, but cannot enter the running
+phase under the new contract. Unit tests verify the accepted split and reject
+wrong-slice nesting. The opt-in disposable-VM probe below also validates the
+split cgroup placement and monitor survival at the systemd primitive level.
+There is still no integrated service launcher or production monitor, and the
+public `run_worker` OCI route remains fail-closed.
+
+**Historical same-slice stop propagation probe (2026-10-09; opt-in regression).**
 The systemd v252 resource-control contract says units assigned with `Slice=`
 automatically acquire `Requires=` and `After=` dependencies on that slice;
 systemd v252 says a unit with `Requires=` is stopped when its required unit is
@@ -1628,6 +1645,26 @@ post-stop `InvocationID` or `ControlGroup` properties are cleared or that the
 cgroup directories are removed. The test-only processes were `/usr/bin/sleep`
 with a 45-second runtime ceiling; exact units were explicitly stopped in a
 finally cleanup as well.
+
+**Split monitor/worker slice probe (2026-10-10; opt-in regression).** The
+updated opt-in test assigns the transient trusted service to `app.slice` and a
+separate transient scope to the generated `user-acp-<sha256>.slice`. The
+service's exact `InvocationID`, `MainPID`, and `ControlGroup` were durably
+recorded; a fresh controller reconciled those values after the creating
+controller received `SIGKILL`. On the disposable no-host-mount Lima VM (Lima
+2.2.1 VZ, Ubuntu 24.04 ARM64, Linux 6.8.0-142, systemd 255.4, Python 3.12.3,
+active user manager, cgroup v2), the opt-in test passed (3 passed). Systemd
+reported the service directly under `app.slice` and the scope directly under
+the exact attempt slice. Stopping the attempt slice made the scope inactive
+and emptied its cgroup while the monitor service remained active with its
+recorded identity and a populated cgroup; explicitly stopping the monitor then
+emptied its cgroup too. In the recorded run, the scope client exited `-15`
+(SIGTERM); the test requires exit before timeout, not that exact code. The
+service and payload are still `/usr/bin/sleep`, and the controller starts the
+scope independently: this proves cgroup placement, controller-crash receipt
+reconciliation, and slice-stop survival only—not monitor-owned wait/reaping,
+OCI enforcement, production cleanup verification, supervisor recovery, or
+result transfer.
 
 `tests/test_systemd_slice_integration.py` records this as an opt-in regression
 (`ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`). It is not part of default CI and does

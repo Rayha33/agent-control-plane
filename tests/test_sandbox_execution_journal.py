@@ -306,7 +306,7 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
-    assert durable["launch_plan"]["version"] == 4
+    assert durable["launch_plan"]["version"] == 5
     assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
     assert durable["launch_plan"]["launch"]["resource_limits"] == {
@@ -319,6 +319,35 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     event_plan = json.loads(event["payload_json"])["launch_plan"]
     assert event_plan == durable["launch_plan"]
     assert supervisor.verify_event_chain()["ok"] is True
+
+    # Version 4 remains auditable under its original ownership evidence, but
+    # does not carry the split-monitor placement contract required for running.
+    legacy_v4_plan = json.loads(canonical_json(durable["launch_plan"]))
+    legacy_v4_plan["version"] = 4
+    legacy_v4_plan["launch"]["systemd_ownership"].pop("monitor_placement")
+    old_wrapper_cgroup = f"{durable['attempt_slice_cgroup_path']}/{durable['wrapper_unit']}"
+    legacy_v4_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = old_wrapper_cgroup
+    legacy_v4_row = dict(durable)
+    legacy_v4_row["wrapper_cgroup_path"] = old_wrapper_cgroup
+    legacy_v4_row["launch_plan_json"] = canonical_json(legacy_v4_plan)
+    legacy_v4_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_v4_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_v4_row)
+
+    sibling_monitor_cgroup = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        f"{oci_worker._oci_worker_systemd_slice('sibling-attempt')}/{durable['wrapper_unit']}"
+    )
+    sibling_plan = json.loads(canonical_json(durable["launch_plan"]))
+    sibling_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = sibling_monitor_cgroup
+    sibling_row = dict(durable)
+    sibling_row["wrapper_cgroup_path"] = sibling_monitor_cgroup
+    sibling_row["launch_plan_json"] = canonical_json(sibling_plan)
+    sibling_row["launch_plan_digest"] = hashlib.sha256(
+        sibling_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(sibling_row)
 
     # Earlier plan versions did not bind an attempt-slice identity and cannot
     # authorize the stronger current launch/running evidence.
@@ -1170,6 +1199,7 @@ def record_launch(
     attempt: dict,
     *,
     runc_handle: oci_worker.RuncLaunchHandle | None = None,
+    wrapper_cgroup_path: str | None = None,
 ) -> dict:
     if runc_handle is None:
         execution = supervisor._sandbox_execution_get(attempt["id"])
@@ -1179,7 +1209,8 @@ def record_launch(
     execution = supervisor._sandbox_execution_get(attempt["id"])
     assert execution is not None
     slice_unit = oci_worker._oci_worker_systemd_slice(execution["container_id"])
-    slice_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/" + slice_unit
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    slice_cgroup = common_cgroup + "/" + slice_unit
     return supervisor._sandbox_execution_record_launch(
         attempt["id"],
         attempt["claim_token"],
@@ -1188,7 +1219,7 @@ def record_launch(
         runc_handle=runc_handle,
         wrapper_unit="acp-worker.service",
         wrapper_invocation_id="1" * 32,
-        wrapper_cgroup_path=f"{slice_cgroup}/acp-worker.service",
+        wrapper_cgroup_path=wrapper_cgroup_path or f"{common_cgroup}/acp-worker.service",
         attempt_slice_unit=slice_unit,
         attempt_slice_invocation_id="3" * 32,
         attempt_slice_cgroup_path=slice_cgroup,
@@ -1198,12 +1229,36 @@ def record_launch(
     )
 
 
+def test_launch_rejects_monitor_in_sibling_attempt_slice(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    sibling_monitor_path = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+        f"user-acp-{'f' * 64}.slice/acp-worker.service"
+    )
+
+    with pytest.raises(SupervisorError) as invalid:
+        record_launch(
+            supervisor,
+            attempt,
+            runc_handle=handle,
+            wrapper_cgroup_path=sibling_monitor_path,
+        )
+
+    assert invalid.value.code == "sandbox_execution_invalid"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
 def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTarget) -> dict:
     plan = journal_module._sandbox_launch_plan_material(execution, target)
     slice_unit = oci_worker._oci_worker_systemd_slice(target.container_id)
-    slice_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/" + slice_unit
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    slice_cgroup = common_cgroup + "/" + slice_unit
     plan["launch"]["systemd_ownership"] = {
-        "wrapper_control_group": f"{slice_cgroup}/acp-worker.service",
+        "wrapper_control_group": f"{common_cgroup}/acp-worker.service",
+        "monitor_placement": "outside_attempt_slice",
         "attempt_slice_unit": slice_unit,
         "attempt_slice_invocation_id": "3" * 32,
         "attempt_slice_control_group": slice_cgroup,
@@ -1217,7 +1272,7 @@ def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTar
         "runc_client_identity": "linux:202:1202",
         "wrapper_unit": "acp-worker.service",
         "wrapper_invocation_id": "1" * 32,
-        "wrapper_cgroup_path": f"{slice_cgroup}/acp-worker.service",
+        "wrapper_cgroup_path": f"{common_cgroup}/acp-worker.service",
         "attempt_slice_unit": slice_unit,
         "attempt_slice_invocation_id": "3" * 32,
         "attempt_slice_cgroup_path": slice_cgroup,
