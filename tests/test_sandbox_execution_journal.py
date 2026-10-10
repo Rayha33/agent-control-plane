@@ -49,6 +49,15 @@ def repo(tmp_path: Path) -> Path:
     return init_repo(tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def no_host_systemd_for_journal_unit_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep synthetic journal tests independent of the host's systemd manager."""
+
+    monkeypatch.setattr(
+        journal_module, "verify_running_runtime_systemd_units", lambda _receipt: None
+    )
+
+
 def claimed(supervisor: GitSupervisor, path: str = "alpha.txt") -> dict:
     task = make_task(supervisor, path, title="sandbox journal test")
     return supervisor.claim(task["id"], "sandbox-worker")
@@ -1036,6 +1045,148 @@ def test_running_transition_rechecks_process_membership_under_gate_lock(
             )
 
         assert moved.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+@pytest.mark.parametrize(
+    ("changed_unit", "changed_property"),
+    [
+        (None, None),
+        ("wrapper", "MainPID"),
+        ("wrapper", "InvocationID"),
+        ("wrapper", "ControlGroup"),
+        ("slice", "InvocationID"),
+        ("scope", "InvocationID"),
+    ],
+)
+def test_running_transition_rechecks_systemd_identity_under_gate_lock(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_unit: str | None,
+    changed_property: str | None,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        controls = {
+            "memory.max": f"{attestation.memory_max_bytes}\n".encode("ascii"),
+            "cpu.max": f"{attestation.cpu_quota} {attestation.cpu_period}\n".encode("ascii"),
+            "pids.max": f"{attestation.pids_max}\n".encode("ascii"),
+        }
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_cgroup_resource_controls",
+            lambda _path: controls,
+        )
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "read_linux_process_snapshot",
+            lambda pid: _live_process_snapshot(attestation, pid),
+        )
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "_trusted_systemctl_executable",
+            lambda: Path("/usr/bin/systemctl"),
+        )
+        monkeypatch.setattr(
+            sandbox_attestation_module,
+            "_trusted_systemd_command_environment",
+            lambda: {"LANG": "C", "LC_ALL": "C"},
+        )
+
+        def run_systemctl(argv, **_kwargs) -> bytes:
+            unit = argv[-1]
+            if unit == attestation.wrapper_unit:
+                values = {
+                    "ActiveState": "active",
+                    "ControlGroup": attestation.wrapper_control_group,
+                    "Id": attestation.wrapper_unit,
+                    "InvocationID": attestation.wrapper_invocation_id,
+                    "MainPID": str(attestation.monitor_pid),
+                }
+            elif unit == attestation.attempt_slice_unit:
+                values = {
+                    "ActiveState": "active",
+                    "ControlGroup": attestation.attempt_slice_control_group,
+                    "Id": attestation.attempt_slice_unit,
+                    "InvocationID": attestation.attempt_slice_invocation_id,
+                }
+            else:
+                assert unit == attestation.scope_unit
+                values = {
+                    "ActiveState": "active",
+                    "ControlGroup": attestation.cgroup_path,
+                    "Id": attestation.scope_unit,
+                    "InvocationID": attestation.scope_invocation_id,
+                }
+            unit_names = {
+                "wrapper": attestation.wrapper_unit,
+                "slice": attestation.attempt_slice_unit,
+                "scope": attestation.scope_unit,
+            }
+            if (
+                changed_unit is not None
+                and changed_property is not None
+                and unit == unit_names[changed_unit]
+            ):
+                if changed_property == "MainPID":
+                    values[changed_property] = str(attestation.monitor_pid + 1)
+                elif changed_property == "InvocationID":
+                    values[changed_property] = "f" * 32
+                elif changed_property == "ControlGroup":
+                    values[changed_property] += "/replaced"
+                else:
+                    raise AssertionError(f"unexpected systemd property: {changed_property}")
+            return "".join(f"{key}={value}\n" for key, value in values.items()).encode("ascii")
+
+        monkeypatch.setattr(
+            sandbox_attestation_module, "_run_trusted_runtime_command", run_systemctl
+        )
+        verify_systemd = sandbox_attestation_module.verify_running_runtime_systemd_units
+
+        def verify_under_gate_lock(receipt) -> None:
+            assert handle._gate_lock.locked()
+            verify_systemd(receipt)
+
+        monkeypatch.setattr(
+            journal_module, "verify_running_runtime_systemd_units", verify_under_gate_lock
+        )
+
+        if changed_property is None:
+            running = supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+            assert running["phase"] == "running"
+            handle.release_gate()
+            assert os.read(gate_read, 3) == b"go\n"
+            return
+
+        with pytest.raises(SupervisorError) as stale:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=attestation,
+                runc_handle=handle,
+            )
+
+        assert stale.value.code == "sandbox_runtime_attestation_stale"
         assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
         with pytest.raises(SupervisorError) as rejected:
             handle.release_gate()

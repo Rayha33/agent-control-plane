@@ -907,10 +907,10 @@ re-reads the cgroup-v2 memory, CPU, and PID limits. Synthetic regressions cover
 PID reuse, process exit, cgroup movement, gate-lock ordering, and a shut gate on
 drift. These sequential reads narrow a stale-receipt window; they are not an
 atomic procfs/cgroup snapshot, and process exit or movement after the reads
-remains a race. Runc state and systemd invocation properties are still supplied
-by the future caller and are not re-queried here. No production worker calls
-this path: OCI `run_worker` remains fail-closed and end-to-end worker isolation
-is unproven.
+remains a race. At the time of this 2026-10-09 change, systemd invocation
+properties were not re-queried at release; the 2026-10-10 release-time identity
+gate below adds that check. No production worker calls this path: OCI
+`run_worker` remains fail-closed and end-to-end worker isolation is unproven.
 
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
@@ -1978,11 +1978,47 @@ or mismatched `MainPID` fails attestation. Slice and scope queries do not ask
 for the service-only property. Unit regressions cover missing and mismatched
 values and verify the collector requests it only for the wrapper. This closes
 the attestation ambiguity where another process in the same wrapper cgroup
-could be passed as the monitor. Systemd and procfs observations are sequential,
-not an atomic snapshot, so concurrent unit replacement between observations is
-not ruled out. This does not establish that a production ACP monitor owns or
-waits for runc, is crash-recoverable, or is connected to `run_worker`; OCI
-remains fail-closed.
+could be passed as the monitor. The collector re-queries all three exact units
+after process and cgroup sampling, requires systemd properties to be byte-identical,
+then rechecks process membership and resource controls before issuing collector
+provenance. At the journal's gate-release boundary, the same launch-gate lock
+now protects another exact wrapper/slice/scope property read, including wrapper
+`MainPID`; drift leaves the row at `launched` and the one-shot gate closed.
+Systemd, procfs, and cgroup reads remain sequential, not an atomic snapshot; an
+ABA transition or change after the final read is not ruled out. This narrows the
+observation window, not a kernel-level race. It does not establish that a
+production ACP monitor owns or waits for runc, is crash-recoverable, or is
+connected to `run_worker`; OCI remains fail-closed.
+
+**Gate-release systemd identity recheck (2026-10-10; exact-source live replay).**
+The journal now re-reads the exact wrapper service, attempt slice, and runc
+scope while holding the launch-gate lock, immediately before the durable
+`launched` to `running` transition and one-shot gate authorization. A new
+opt-in regression starts unique transient units under the disposable user
+manager, builds a self-consistent test receipt from their live unit properties
+and process snapshots, accepts the original identities, restarts the wrapper,
+and requires the old receipt to fail with `sandbox_runtime_attestation_stale`.
+Its runc-state and resource-limit bytes are fixtures: this proves the trusted
+`systemctl` observation path and replacement rejection, not a live runc launch
+or resource enforcement. The test's `finally` gate stops the exact scope,
+attempt slice, and wrapper and verifies their cgroups empty or absent.
+
+The exact test and source copy ran in the no-host-share Lima 2.2.1 VZ guest
+`acp-sandbox-monitor-20261010` (Ubuntu 24.04.5 LTS ARM64, Linux 6.8.0-142,
+systemd 255.4, Python 3.12.3, active user manager, cgroup v2). The live test
+alone passed (`1 passed, 4 deselected`) in 0.18 seconds; the complete opt-in
+systemd test file passed (`5 passed`) in 0.50 seconds. The test file SHA-256 was
+`94eb48cc486c1e174d697ec01767701576a257f52a7a52bb74359773fbbba7e9`; the
+48-file `src/agent_control_plane` Python-source manifest SHA-256 was
+`d59e1d78a9150a5c2a962831b4d35aef9d82bfb5f34e88f0b2c5d6cdf24ab710` on both
+host and guest. The test cleanup asserts that each exact unit is no longer
+active/activating/deactivating and each recorded cgroup is empty or absent. A
+separate postflight `systemctl --user list-units --all` query found no loaded
+probe service or scope; that loaded-state observation is not an assertion in
+the test. This remains a test of the systemd verifier in isolation: it does
+not establish durable monitor recovery, production cleanup verification, real
+runc scope behavior, result import, or `run_worker` integration. OCI remains
+fail-closed.
 
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`

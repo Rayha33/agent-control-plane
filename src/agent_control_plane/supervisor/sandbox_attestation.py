@@ -516,12 +516,13 @@ def collect_running_runtime_attestation(
     finally:
         os.close(runc_fd)
 
-    properties = {}
-    for unit in (wrapper_unit, attempt_slice_unit, scope_unit):
+    units = (wrapper_unit, attempt_slice_unit, scope_unit)
+
+    def read_unit_properties(unit: str) -> bytes:
         requested_properties = "ActiveState,ControlGroup,Id,InvocationID"
         if unit == wrapper_unit:
             requested_properties += ",MainPID"
-        properties[unit] = _run_trusted_runtime_command(
+        return _run_trusted_runtime_command(
             [
                 str(systemctl_path),
                 "--user",
@@ -533,6 +534,8 @@ def collect_running_runtime_attestation(
             ],
             environment=environment,
         )
+
+    properties = {unit: read_unit_properties(unit) for unit in units}
 
     attestation = _collect_running_runtime_attestation_from_observations(
         runc_state=runc_state,
@@ -564,6 +567,13 @@ def collect_running_runtime_attestation(
         runc_pid_file_path=pid_file_path,
         runc_executable_sha256=runc_executable_sha256,
     )
+    for unit in units:
+        if read_unit_properties(unit) != properties[unit]:
+            raise _invalid(
+                "systemd unit identity changed while runtime observations were collected"
+            )
+    verify_running_runtime_process_membership(attestation)
+    verify_running_runtime_resource_controls(attestation)
     try:
         state_root_info_after = private_state_root.lstat()
     except OSError as error:
@@ -751,6 +761,74 @@ def verify_running_runtime_resource_controls(attestation: RunningRuntimeAttestat
         raise SupervisorError(
             "sandbox_runtime_attestation_stale",
             "live cgroup controls no longer match the collected receipt",
+        ) from error
+
+
+def verify_running_runtime_systemd_units(attestation: RunningRuntimeAttestation) -> None:
+    """Re-read exact systemd ownership identities immediately before gate release."""
+
+    if type(attestation) is not RunningRuntimeAttestation:
+        raise _invalid("release-time systemd verification requires a typed receipt")
+    if not running_attestation_is_self_consistent(attestation):
+        raise _invalid("release-time systemd verification requires a self-consistent receipt")
+    units = (
+        (
+            attestation.wrapper_unit,
+            {
+                "ActiveState": "active",
+                "ControlGroup": attestation.wrapper_control_group,
+                "Id": attestation.wrapper_unit,
+                "InvocationID": attestation.wrapper_invocation_id,
+                "MainPID": str(attestation.monitor_pid),
+            },
+            True,
+        ),
+        (
+            attestation.attempt_slice_unit,
+            {
+                "ActiveState": "active",
+                "ControlGroup": attestation.attempt_slice_control_group,
+                "Id": attestation.attempt_slice_unit,
+                "InvocationID": attestation.attempt_slice_invocation_id,
+            },
+            False,
+        ),
+        (
+            attestation.scope_unit,
+            {
+                "ActiveState": "active",
+                "ControlGroup": attestation.cgroup_path,
+                "Id": attestation.scope_unit,
+                "InvocationID": attestation.scope_invocation_id,
+            },
+            False,
+        ),
+    )
+    try:
+        systemctl_path = _trusted_systemctl_executable()
+        environment = _trusted_systemd_command_environment()
+        for unit, expected, require_main_pid in units:
+            requested_properties = "ActiveState,ControlGroup,Id,InvocationID"
+            if require_main_pid:
+                requested_properties += ",MainPID"
+            raw = _run_trusted_runtime_command(
+                [
+                    str(systemctl_path),
+                    "--user",
+                    "show",
+                    "--no-pager",
+                    f"--property={requested_properties}",
+                    "--",
+                    unit,
+                ],
+                environment=environment,
+            )
+            if _parse_unit_properties(raw, require_main_pid=require_main_pid) != expected:
+                raise _invalid("live systemd unit identity changed after runtime collection")
+    except SupervisorError as error:
+        raise SupervisorError(
+            "sandbox_runtime_attestation_stale",
+            "live systemd unit identities no longer match the collected receipt",
         ) from error
 
 

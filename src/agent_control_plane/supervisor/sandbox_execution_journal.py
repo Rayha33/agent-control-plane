@@ -46,6 +46,7 @@ from .sandbox_attestation import (
     running_attestation_is_self_consistent,
     verify_running_runtime_process_membership,
     verify_running_runtime_resource_controls,
+    verify_running_runtime_systemd_units,
 )
 from .sandbox_workspace import (
     _MAX_DURABLE_MANIFEST_BYTES,
@@ -2108,6 +2109,7 @@ class SandboxExecutionJournalMixin:
             # the release lock before the durable transition and one-shot permit.
             verify_running_runtime_resource_controls(attestation)
             verify_running_runtime_process_membership(attestation)
+            verify_running_runtime_systemd_units(attestation)
             updated = self._sandbox_execution_transition(
                 attempt_id,
                 claim_token,
