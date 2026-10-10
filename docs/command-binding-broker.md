@@ -9,9 +9,10 @@ lifecycle probe, stopping two exact root-created services with
 `KillMode=control-group` removed all recorded owner/server/phase-child PIDs;
 the manager then reported the units not-found with an empty `ControlGroup`
 field. That probe did not sample each unit's `cgroup.events`, so per-unit
-cgroup emptiness remains an acceptance gate. Neither probe tested an ACP broker
-or an untrusted worker boundary. Independent adversarial review rejected the
-proposed single-UID descendant tree as an ACP backend.
+cgroup emptiness remained an acceptance gate at that point. These low-level
+probes did not exercise an ACP broker or production worker path. Independent
+adversarial review rejected the proposed single-UID descendant tree as an ACP
+backend.
 
 A follow-up disposable-VM probe on the same date used systemd 255 transient
 units with distinct `DynamicUser=yes` identities. A service unit and a QC
@@ -25,10 +26,30 @@ connections to `/run/systemd/private` and `/run/dbus/system_bus_socket`
 with `Permission denied`. This supports a separate-UID/unit design and the
 specific boundary properties tested. Dynamic UIDs are runtime identities, not
 durable attempt identities; bind authorization and receipts to the attempt
-generation and each unit's `InvocationID`, never only to a numeric UID. It still
-does not implement the ACP broker, prove installed policy cannot drift, or cover
-filesystem/workspace access, DB/queue writes, restart recovery, or production
-worker execution.
+generation and each unit's `InvocationID`, never only to a numeric UID.
+
+The opt-in regression harness `tests/test_systemd_network_binding_integration.py`
+repeated this on 2026-10-10 in the disposable Ubuntu 24.04 VM (kernel
+6.8.0-142-generic, systemd 255, cgroup v2): `1 passed in 5.76s`. Two concurrent
+attempt holders had separate `PrivateNetwork=yes` namespaces; separate
+`DynamicUser=yes` fake app, database/schema, and queue services joined each
+holder namespace on distinct per-attempt ports. Commands positively validated
+their own three identities and wrote only their own fake DB/queue state. A
+healthy response from attempt A while expecting B failed before mutation; a
+command in A targeting B's three ports could reach none of them. The test
+observed each phase PID's network namespace from the host, confirmed the
+untrusted command could not inspect or signal its holder or invoke
+`systemd-run --system`, and checked exact-unit cleanup by inactive/MainPID state
+plus `cgroup.events populated 0` or cgroup removal. The test is explicitly
+opt-in and creates only uniquely named transient units on a disposable host.
+
+This is evidence for a systemd primitive with local HTTP fakes—not proof that
+ACP launches real app/DB/queue services or QC/integration commands through it.
+It does not establish broker authorization, immutable policy on an installed
+host, task/claim/fence/source-command binding, filesystem/workspace isolation,
+real database or queue behavior, broker restart recovery, or production worker
+execution. Until those gates pass, the production target remains `unknown` and
+strict QC/integration stays blocked.
 
 ## Claims that must not be conflated
 
