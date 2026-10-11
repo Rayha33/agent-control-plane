@@ -59,6 +59,20 @@ copied test file, and three packages installed solely for pytest on the
 disposable VM were removed. This remains primitive-level evidence, not a
 supported ACP executor result.
 
+**Current-source follow-up (2026-10-11):** the updated checked-in harness at
+PR #43 commit `ddac29f33085cc5c84eddd349510b578aabfa8fc` (test-file SHA-256
+`e10b2db67f552e85237833ed4d8809f96e953b833a0d3f0a2a914c9341d0b9e8`) was
+rerun on the same disposable Ubuntu 26.04.1 guest: kernel
+`7.0.0-34-generic`, systemd `259.5`, Python `3.14.4`, cgroup v2. The opt-in
+suite passed `26 passed in 6.88s`, including its manager-denial and cleanup
+regressions plus the live two-attempt binding probe. That probe rejected
+sibling-port access and a healthy wrong-attempt identity before fake DB/queue
+writes, checked manager-socket denial and holder visibility/signaling, then
+verified restart invalidation and exact unit/cgroup cleanup. Postflight found no
+`acp-netbind-*` units, cgroups, or test fixtures; the root-owned opt-in marker
+and copied source snapshot were removed. No packages were installed for this
+run. This still proves only the systemd primitive, not an ACP command executor.
+
 This is evidence for a systemd primitive with local HTTP fakes—not proof that
 ACP launches real app/DB/queue services or QC/integration commands through it.
 It does not establish broker authorization, immutable policy on an installed
