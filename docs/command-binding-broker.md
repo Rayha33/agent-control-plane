@@ -59,6 +59,33 @@ copied test file, and three packages installed solely for pytest on the
 disposable VM were removed. This remains primitive-level evidence, not a
 supported ACP executor result.
 
+**Hosted root-probe admission gate (design; not yet implemented, 2026-10-11):**
+A live GitHub API read reports `agent/2523-network-binding` as unprotected and
+the repository has no active rulesets. Do not run the opt-in probe as root from
+this ref until repository review and push restrictions are configured and
+verified. GitHub-hosted Linux VM runners provide passwordless `sudo`;
+`ubuntu-slim` is an unprivileged container runner and is unsuitable for this
+systemd probe. The branch name alone is not a trust boundary, and a pushed
+workflow can execute code from its checkout. A future hosted probe should run
+only on a protected ref and for an explicitly trusted actor. It should avoid
+pull-request triggers that execute fork-controlled code with root access,
+declare only `contents: read`, disable
+checkout credential persistence and dependency caches, install dependencies
+without elevation, then run only the exact opt-in test as root. Require a
+machine-readable result with exactly one pass and no skips, failures, or
+errors; a skipped job or test is not evidence. `github.ref_protected` only
+indicates that some branch protection or ruleset applies, so inspect the
+configured review and push restrictions separately. When enabled on a
+GitHub-hosted multi-CPU Ubuntu runner, each job uses a fresh VM. This gate
+provides repeatable primitive-level evidence only, not broker/worker
+integration or production command/network binding.
+
+See GitHub's [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
+[workflow security guidance](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target),
+[`ref_protected` context](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#github-context),
+[protected-branch controls](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches),
+and [dependency-cache security](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching).
+
 **Current-source follow-up (2026-10-11):** the updated checked-in harness at
 PR #43 commit `ddac29f33085cc5c84eddd349510b578aabfa8fc` (test-file SHA-256
 `e10b2db67f552e85237833ed4d8809f96e953b833a0d3f0a2a914c9341d0b9e8`) was
