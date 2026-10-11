@@ -48,6 +48,9 @@ from .sandbox_attestation import (
     verify_running_runtime_resource_controls,
     verify_running_runtime_systemd_units,
 )
+from .sandbox_monitor_receipt import (
+    sandbox_monitor_service_unit as _sandbox_monitor_service_unit,
+)
 from .sandbox_workspace import (
     _MAX_DURABLE_MANIFEST_BYTES,
     _restore_snapshot_from_record,
@@ -127,13 +130,6 @@ def _sandbox_container_id(attempt_id: str, claim_token: int, execution_id: str) 
     )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return f"acp-{digest[:60]}"
-
-
-def _sandbox_monitor_service_unit(attempt_id: str, claim_token: int, execution_id: str) -> str:
-    """Return the non-reusable systemd service identity for one fenced execution."""
-
-    container_id = _sandbox_container_id(attempt_id, claim_token, execution_id)
-    return f"acp-monitor-{container_id.removeprefix('acp-')}.service"
 
 
 def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]:

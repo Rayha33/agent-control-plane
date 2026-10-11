@@ -423,6 +423,20 @@ path to prove the exact init identity absent, the stopped container deleted,
 the state entry absent, and the worker cgroup empty before recording
 `cleanup_verified` or importing results. Ambiguous cleanup stays fenced.
 
+**Production monitor receipt codec (2026-10-11; identity primitive only).** The
+durable receipt codec and exact service-reconciliation checks now live in
+`supervisor/sandbox_monitor_receipt.py` and are consumed by the opt-in systemd
+integration probe. A receipt binds the monitor unit and worker slice to the
+full `(attempt_id, claim_token, execution_id)` tuple, plus InvocationID,
+ControlGroup, and the monitor PID start identity. Receipt files are bounded,
+canonical, no-follow reads from an owner-private directory and create-only
+writes; an exact replay is idempotent, while a conflicting replacement is
+rejected. Reconnect requires exact active service/slice properties and a fresh
+PID-start identity match. This is a reusable production identity primitive,
+not a monitor launcher or worker executor: the integration probe still uses a
+placeholder service, does not transfer a live runc handle, and does not attest
+cleanup or result import. `run_worker()` remains fail-closed.
+
 This choice is consistent with systemd's distinct transient service/scope
 lifecycles and unit-level cgroup controls ([`systemd-run(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
 [`systemd.kill(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html),
