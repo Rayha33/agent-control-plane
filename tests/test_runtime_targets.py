@@ -628,7 +628,12 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         "Path(os.environ['ACP_RUNTIME_DIR'], 'target-gate-ran').write_text(os.environ['ACP_PHASE'])"
     )
     qc_command = python_command("pass") if strict_binding_phase == "integration" else gate
-    write_config(repo, qc_commands=[qc_command], integration_commands=[gate])
+    second_gate_command = python_command("pass")
+    write_config(
+        repo,
+        qc_commands=[qc_command, second_gate_command],
+        integration_commands=[gate, second_gate_command],
+    )
     target_phases = (
         [strict_binding_phase] if strict_binding_phase is not None else ["qc", "integration"]
     )
@@ -811,6 +816,22 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             assert qc_receipt["claim_token"] == attempt["claim_token"]
             assert qc_receipt["targets"][0]["status"] == "corroborated"
             assert qc_receipt["verified"] is False
+            qc_gate_results = [
+                item for item in qc_results if item.get("runtime_target_preflight_link")
+            ]
+            assert len(qc_gate_results) == 2
+            assert [item["command"] for item in qc_gate_results] == [
+                qc_command,
+                second_gate_command,
+            ]
+            for index, result in enumerate(qc_gate_results, start=1):
+                assert result["runtime_target_preflight_link"] == {
+                    "evidence_id": qc_receipt["evidence_id"],
+                    "evidence_sha256": qc_receipt["evidence_sha256"],
+                    "command_set_sha256": qc_receipt["command_set_sha256"],
+                    "command_count": 2,
+                    "command_index": index,
+                }
 
         integrated = run_with_restart_race(
             "integration", lambda: supervisor.integrate(attempt["task_id"])
@@ -850,6 +871,22 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         assert integration_receipt["claim_token"] == attempt["claim_token"]
         assert integration_receipt["targets"][0]["status"] == "corroborated"
         assert integration_receipt["verified"] is False
+        integration_gate_results = [
+            item for item in integration_results if item.get("runtime_target_preflight_link")
+        ]
+        assert len(integration_gate_results) == 2
+        assert [item["command"] for item in integration_gate_results] == [
+            gate,
+            second_gate_command,
+        ]
+        for index, result in enumerate(integration_gate_results, start=1):
+            assert result["runtime_target_preflight_link"] == {
+                "evidence_id": integration_receipt["evidence_id"],
+                "evidence_sha256": integration_receipt["evidence_sha256"],
+                "command_set_sha256": integration_receipt["command_set_sha256"],
+                "command_count": 2,
+                "command_index": index,
+            }
     finally:
         server.shutdown()
         server.server_close()

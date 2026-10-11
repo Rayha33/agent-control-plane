@@ -168,6 +168,7 @@ class IntegrationMixin:
         verdict = "failed"
         commit: str | None = None
         error_message = ""
+        target_preflight_link: dict[str, Any] | None = None
         try:
             if (
                 self._git_text("cat-file", "-t", submission["commit_sha"]) != "commit"
@@ -261,6 +262,12 @@ class IntegrationMixin:
                         receipt_id=integration_id,
                     )
                     results.append(receipt)
+                    target_preflight_link = {
+                        "evidence_id": receipt["evidence_id"],
+                        "evidence_sha256": receipt["evidence_sha256"],
+                        "command_set_sha256": receipt["command_set_sha256"],
+                        "command_count": receipt["command_count"],
+                    }
                     if blocked:
                         blocking_reason = receipt.get("blocking_reason")
                         if blocking_reason == "runtime_target_command_binding_unavailable":
@@ -272,7 +279,7 @@ class IntegrationMixin:
                             str(blocking_reason or "runtime_target_identity_mismatch"),
                             "required integration runtime target identity is missing or mismatched",
                         )
-                for command in self.config.integration_commands:
+                for command_index, command in enumerate(self.config.integration_commands, start=1):
                     self._restore_integration_workspace(
                         worktree,
                         integration_commit,
@@ -291,6 +298,11 @@ class IntegrationMixin:
                         command_environment,
                         pass_fds=(operation_guard_fd,),
                     )
+                    if target_preflight_link is not None:
+                        result["runtime_target_preflight_link"] = {
+                            **target_preflight_link,
+                            "command_index": command_index,
+                        }
                     results.append(result)
                     if result["exit_code"]:
                         raise SupervisorError(

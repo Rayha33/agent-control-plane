@@ -598,6 +598,7 @@ class QcMixin:
         acceptance_coverage: list[dict[str, Any]] = []
         critic_verdict = "pass"
         packet: dict[str, Any] | None = None
+        target_preflight_link: dict[str, Any] | None = None
         packet_hash = sha256(b"")
         try:
             self._assert_safe_git_execution_config()
@@ -674,6 +675,12 @@ class QcMixin:
                             receipt_id=qc_id,
                         )
                         results.append(receipt)
+                        target_preflight_link = {
+                            "evidence_id": receipt["evidence_id"],
+                            "evidence_sha256": receipt["evidence_sha256"],
+                            "command_set_sha256": receipt["command_set_sha256"],
+                            "command_count": receipt["command_count"],
+                        }
                         packet["runtime_target_preflight"] = receipt
                         packet["evidence_catalog"].append(
                             {
@@ -708,6 +715,11 @@ class QcMixin:
                     self._phase_runtime_env(runtime_env, "qc", qc_dir),
                     pass_fds=(operation_guard_fd,),
                 )
+                if target_preflight_link is not None:
+                    result["runtime_target_preflight_link"] = {
+                        **target_preflight_link,
+                        "command_index": index,
+                    }
                 evidence_id = f"{qc_id}:command:{index:03d}"
                 result["evidence_id"] = evidence_id
                 result["evidence_sha256"] = sha256(
@@ -725,6 +737,15 @@ class QcMixin:
                         "sha256": result["evidence_sha256"],
                         "command": command,
                         "exit_code": result["exit_code"],
+                        **(
+                            {
+                                "runtime_target_preflight_link": result[
+                                    "runtime_target_preflight_link"
+                                ]
+                            }
+                            if target_preflight_link is not None
+                            else {}
+                        ),
                     }
                 )
                 if result["exit_code"]:

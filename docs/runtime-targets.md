@@ -112,6 +112,16 @@ and expected-versus-observed app identity fields. Secret values, arbitrary
 response bodies, process command lines, credentials, and endpoint tokens are not
 stored.
 
+When a target preflight exists, each configured QC/integration gate-command
+result links to its exact preflight evidence ID and SHA-256, the planned
+command-set digest/count, and its 1-based position in that set. This makes the
+plan-to-result relationship directly auditable; it does not attest executable
+bytes, effective environment, or which endpoint the process actually used. The
+digest is not reversible: for a complete run, compare the ordered command
+results with it; for an interrupted or early-failed run, retain the exact
+configuration used for that run to recover commands that never produced a
+result.
+
 An exact report is labeled `corroborated`, with `verified: false`. The service
 controls its own report; this contract does not authenticate that report, prove
 which process owns the listening socket, prove that the app connected to the
@@ -121,10 +131,12 @@ use, but a command may ignore them. Use OS-level process/container attribution
 and network policy when those stronger guarantees are required. At present,
 there is no trusted phase-command network executor. Therefore a target with
 `require_command_binding = true` records `command_binding_status: "unknown"` and
-blocks QC or integration before its commands run, even if the app's identity
-report matches. This strict mode is a fail-closed guard, not proof that
-cross-attempt isolation has been implemented. The positive enforcement backend
-remains tracked by the open ACP coordination task #2523.
+blocks before the configured deterministic QC/integration gate commands run,
+even if the app's identity report matches. Runtime restart and target preflight
+occur first; integration also performs its internal merge before this block.
+This strict mode is a fail-closed guard, not proof that cross-attempt isolation
+has been implemented. The positive enforcement backend remains tracked by the
+open ACP coordination task #2523.
 Projects that do not configure `runtime.targets` keep their existing QC and
 integration behavior and make no target-identity claim.
 
