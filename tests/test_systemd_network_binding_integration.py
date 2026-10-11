@@ -121,9 +121,31 @@ def _properties(systemctl: str, unit: str) -> dict[str, str]:
             "--property=MainPID",
             "--property=Result",
             "--property=ExecMainStatus",
+            "--property=Description",
         ]
     )
     return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def _unit_belongs_to_run(state: dict[str, str], owner_description: str) -> bool:
+    """Match a loaded unit stamped with this test invocation's correlation tag."""
+
+    return state.get("LoadState") == "loaded" and state.get("Description") == owner_description
+
+
+@pytest.mark.parametrize(
+    ("state", "owner_description", "expected"),
+    [
+        ({"LoadState": "loaded", "Description": "run-a"}, "run-a", True),
+        ({"LoadState": "loaded", "Description": "run-b"}, "run-a", False),
+        ({"LoadState": "not-found", "Description": "run-a"}, "run-a", False),
+        ({"LoadState": "loaded"}, "run-a", False),
+    ],
+)
+def test_cleanup_ownership_requires_exact_loaded_run_description(
+    state: dict[str, str], owner_description: str, expected: bool
+) -> None:
+    assert _unit_belongs_to_run(state, owner_description) is expected
 
 
 def _wait_active(systemctl: str, unit: str) -> dict[str, str]:
@@ -357,7 +379,6 @@ def _start_unit(
     unit: str,
     command: list[str],
     properties: list[str],
-    created_units: list[str],
 ) -> None:
     if _properties(systemctl, f"{unit}.service").get("LoadState") != "not-found":
         raise RuntimeError(f"refusing to start pre-existing transient unit {unit}.service")
@@ -372,11 +393,11 @@ def _start_unit(
             *command,
         ]
     )
-    created_units.append(unit)
 
 
-def _unit_properties(*, joins_namespace_of: str | None = None) -> list[str]:
+def _unit_properties(*, owner_description: str, joins_namespace_of: str | None = None) -> list[str]:
     properties = [
+        f"Description={owner_description}",
         "Type=exec",
         "DynamicUser=yes",
         "KillMode=control-group",
@@ -401,7 +422,7 @@ def _run_command_unit(
     systemd_run: str,
     systemctl: str,
     journalctl: str,
-    created_units: list[str],
+    owner_description: str,
     unit: str,
     holder_unit: str,
     holder_pid: int,
@@ -424,8 +445,10 @@ def _run_command_unit(
         systemctl,
         unit,
         ["/usr/bin/python3", "-I", "-c", script],
-        _unit_properties(joins_namespace_of=f"{holder_unit}.service"),
-        created_units,
+        _unit_properties(
+            owner_description=owner_description,
+            joins_namespace_of=f"{holder_unit}.service",
+        ),
     )
     systemd_unit = f"{unit}.service"
     state = _wait_active(systemctl, systemd_unit)
@@ -496,6 +519,7 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
         ("state-b", "state", attempt_b, attempt_b, attempt_b),
     )
     phase_units = {name: f"acp-netbind-{name}-{suffix}" for name, *_ in phase_specs}
+    owner_description = f"ACP disposable network-binding test {suffix}"
     restart_phase_name = "holder-restarted"
     phase_units[restart_phase_name] = f"acp-netbind-{restart_phase_name}-{suffix}"
     forbidden_units = {name: f"acp-netbind-forbidden-{name}-{suffix}" for name in (*phase_units,)}
@@ -516,7 +540,6 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
         *phase_units.values(),
         *forbidden_units.values(),
     ]
-    created_units: list[str] = []
     try:
         for unit in reserved_units:
             if _properties(systemctl, f"{unit}.service").get("LoadState") != "not-found":
@@ -533,8 +556,7 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
                 systemctl,
                 holder,
                 [sleep, "infinity"],
-                _unit_properties(),
-                created_units,
+                _unit_properties(owner_description=owner_description),
             )
         state_a = _wait_active(systemctl, f"{holder_a}.service")
         state_b = _wait_active(systemctl, f"{holder_b}.service")
@@ -568,8 +590,10 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
                         "-c",
                         _resource_server_script(ports_by_attempt[attempt][role], attempt, role),
                     ],
-                    _unit_properties(joins_namespace_of=f"{holder}.service"),
-                    created_units,
+                    _unit_properties(
+                        owner_description=owner_description,
+                        joins_namespace_of=f"{holder}.service",
+                    ),
                 )
                 state = _wait_active(systemctl, f"{unit}.service")
                 resource_states[attempt][role] = state
@@ -587,7 +611,7 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
                 systemd_run=systemd_run,
                 systemctl=systemctl,
                 journalctl=journalctl,
-                created_units=created_units,
+                owner_description=owner_description,
                 unit=phase_units[name],
                 holder_unit=holder_a if endpoint_attempt == attempt_a else holder_b,
                 holder_pid=pid_by_attempt[endpoint_attempt],
@@ -665,7 +689,7 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
             systemd_run=systemd_run,
             systemctl=systemctl,
             journalctl=journalctl,
-            created_units=created_units,
+            owner_description=owner_description,
             unit=phase_units[restart_phase_name],
             holder_unit=holder_a,
             holder_pid=int(restarted_holder["MainPID"]),
@@ -745,10 +769,22 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
             )
     finally:
         cleanup_errors: list[str] = []
+        owned_units: list[str] = []
         control_groups: dict[str, str] = {}
-        for unit in created_units:
+        for unit in reserved_units:
             try:
-                control_group = _properties(systemctl, f"{unit}.service").get("ControlGroup", "")
+                state = _properties(systemctl, f"{unit}.service")
+                # systemd-run may return a client error after the manager has
+                # accepted the transient unit. Scan every preflight-reserved
+                # name, but clean only units carrying this run's unique
+                # manager-side Description. A coincidentally named foreign
+                # unit with a different description is not stopped. This is a
+                # correlation tag, not an authorization boundary against a
+                # hostile actor that can mutate system-manager units.
+                if not _unit_belongs_to_run(state, owner_description):
+                    continue
+                owned_units.append(unit)
+                control_group = state.get("ControlGroup", "")
                 if control_group:
                     expected_group = f"/system.slice/{unit}.service"
                     if control_group != expected_group:
@@ -757,9 +793,11 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
                         control_groups[unit] = control_group
             except Exception as error:
                 cleanup_errors.append(f"{unit}: could not capture ControlGroup: {error}")
-        for unit in reversed(created_units):
+        for unit in reversed(owned_units):
             try:
-                if _properties(systemctl, f"{unit}.service").get("LoadState") != "loaded":
+                state = _properties(systemctl, f"{unit}.service")
+                if not _unit_belongs_to_run(state, owner_description):
+                    cleanup_errors.append(f"{unit}: ownership description changed before cleanup")
                     continue
                 _run(
                     [systemctl, "--system", "stop", f"{unit}.service"],
@@ -772,9 +810,12 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
                     )
             except Exception as error:
                 cleanup_errors.append(f"{unit}: {error}")
-        for unit in created_units:
+        for unit in owned_units:
             try:
                 state = _properties(systemctl, f"{unit}.service")
+                if state.get("LoadState") != "not-found":
+                    cleanup_errors.append(f"{unit}: unit remains loaded after cleanup: {state}")
+                    continue
                 if state.get("ActiveState") == "active" or state.get("MainPID", "0") != "0":
                     cleanup_errors.append(
                         f"{unit}: still active with MainPID={state.get('MainPID')}"
