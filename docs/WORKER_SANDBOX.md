@@ -472,6 +472,43 @@ execution journal, provisioned with a durable capability, or used by
 `run_worker()` remains fail-closed, and the lifecycle acceptance criteria below
 remain open.
 
+**Systemd-owned monitor IPC live slice (2026-10-11; test-only monitor).** The
+opt-in `test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_scope`
+now composes the production receipt codec, control-key store, and authenticated
+Unix-socket IPC with a real transient user-systemd service. That test-only
+monitor places a `/usr/bin/sleep` scope in the exact per-attempt worker slice,
+while its own service remains in the separate `user-acp.slice`. A separate
+controller writes and validates the durable service receipt, performs an
+authenticated status call, then is killed with `SIGKILL`. The fresh controller
+reconciles the exact unit InvocationID, ControlGroup, MainPID/start identity,
+and slice placement, reads the durable capability, obtains authenticated
+status, and cancels the exact scope. Repeating the same cancellation request ID
+returns the original response; the worker PID and scope cgroup are absent while
+the monitor remains active. Status reports `unknown` for activation drift even
+when a same-name scope is inactive. Teardown snapshots each unit cgroup before
+placement assertions, verifies the original cgroups are empty, and retains the
+private fixture if a launched unit lacks a captured cgroup.
+
+The exact replay passed all five tests in
+`tests/test_systemd_slice_integration.py` (one identity-drift unit test and four
+opt-in live tests) and all twelve
+`tests/test_sandbox_monitor_ipc.py` tests on the dedicated no-host-share Lima
+guest `acp-sandbox-monitor-20261010`: Ubuntu 24.04.5 LTS ARM64, Linux
+`6.8.0-142-generic`, systemd `255.4`, Python `3.12.3`, cgroup v2, and an active
+user manager. The controller/monitor IPC test source SHA-256 is
+`5445863306b6c0eb04ea7ca6f45e1cc2e27722f5dc6df4409cbda71d7bc3809c`; the
+production IPC module is `72f7eea3f9cde1ffacd264465a2ac960f683f78d0279384fc5d797a18bc39a89`,
+and the receipt/key module is
+`9bb50e5c52fcfeffd494a7f0b7e1489e43b598c24a8542e0d0fa8131020dbe29`. Guest
+and checkout hashes matched. Postflight found zero failed units, zero probe
+units, zero runc processes, and zero temporary control directories.
+
+This is an IPC/service-lifecycle integration proof only. The monitor is still a
+test helper, and its owned process is not an OCI container. It does not prove a
+production monitor owning `RuncLaunchHandle`, journal-authorized gate release,
+OCI scope enforcement, `cleanup_verified`, result import, provider auth/egress,
+or the registered `run_worker()` path. `run_worker()` remains fail-closed.
+
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the
 supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)

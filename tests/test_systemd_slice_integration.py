@@ -1,10 +1,10 @@
-"""Opt-in proof for systemd-owned service receipt recovery and attempt-slice teardown.
+"""Opt-in proofs for systemd-owned monitor identity, IPC, and slice teardown.
 
 Run with ``ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`` on a disposable Linux host
-with an active user systemd manager and cgroup v2. It verifies receipt-based
-service identity reconciliation after controller-process exit and unit/cgroup
-teardown only; it does not integrate or attest the supervised OCI worker
-lifecycle.
+with an active user systemd manager and cgroup v2. The control-channel case
+uses a test-only monitor service and ``/usr/bin/sleep`` scope to exercise the
+production receipt and authenticated IPC code after controller-process exit.
+It does not launch or attest the supervised OCI worker or its runc handle.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -31,8 +32,13 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     validate_running_runtime_attestation,
     verify_running_runtime_systemd_units,
 )
+from agent_control_plane.supervisor.sandbox_monitor_ipc import (
+    SandboxMonitorControlClient,
+    SandboxMonitorControlServer,
+)
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
+    load_or_create_sandbox_monitor_control_key,
     read_sandbox_monitor_receipt,
     sandbox_attempt_slice_unit,
     sandbox_container_id,
@@ -43,6 +49,38 @@ from agent_control_plane.supervisor.sandbox_monitor_receipt import (
 
 _ENABLED = os.environ.get("ACP_RUN_SYSTEMD_SLICE_INTEGRATION") == "1"
 _WAIT_SECONDS = 8.0
+_SYSTEMD_ACTIVATION_PROPERTIES = ("Id", "InvocationID", "ControlGroup", "Slice")
+
+
+def _same_systemd_activation(expected: dict[str, str], observed: dict[str, str]) -> bool:
+    return all(
+        bool(expected.get(name)) and observed.get(name) == expected[name]
+        for name in _SYSTEMD_ACTIVATION_PROPERTIES
+    )
+
+
+def _monitor_scope_phase(
+    expected: dict[str, str],
+    observed: dict[str, str],
+    *,
+    worker_identity_matches: bool,
+    worker_process_absent: bool,
+    worker_in_scope: bool,
+) -> str:
+    if (
+        _same_systemd_activation(expected, observed)
+        and observed.get("ActiveState") == "active"
+        and worker_identity_matches
+        and worker_in_scope
+    ):
+        return "running"
+    if (
+        _same_systemd_activation(expected, observed)
+        and observed.get("ActiveState") == "inactive"
+        and worker_process_absent
+    ):
+        return "exited"
+    return "unknown"
 
 
 def _environment() -> dict[str, str]:
@@ -174,6 +212,245 @@ def _start_monitor_controller(
     _write_monitor_receipt(receipt_path, receipt)
     # The parent kills this controller after the durable receipt is visible.
     # The transient service must remain owned by systemd, not this process.
+    print("receipt-durable", flush=True)
+    time.sleep(60)
+
+
+def _serve_control_monitor(
+    systemctl: str,
+    scope_unit: str,
+    control_directory: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+) -> None:
+    """Test-only monitor: own a systemd scope and expose the production IPC."""
+
+    (control_directory / "scope-launching").touch(mode=0o600)
+    scope_client = subprocess.Popen(
+        [
+            shutil.which("systemd-run", path=_environment()["PATH"]) or "systemd-run",
+            "--user",
+            "--scope",
+            f"--unit={scope_unit}",
+            f"--slice={sandbox_attempt_slice_unit(attempt_id, claim_token, execution_id)}",
+            "/usr/bin/sleep",
+            "90",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env=_environment(),
+    )
+    scope = _wait_active(systemctl, scope_unit, scope_client)
+    # systemd scopes do not promise a MainPID property. The retained
+    # systemd-run client PID is the command PID for this exact scope.
+    worker_pid = scope_client.pid
+    worker_identity = ProcessMixin._process_identity(worker_pid)
+
+    def worker_in_exact_scope() -> bool:
+        try:
+            worker_cgroup = Path(f"/proc/{worker_pid}/cgroup").read_text(encoding="ascii")
+        except OSError:
+            return False
+        return any(
+            line.endswith(f":{scope['ControlGroup']}") for line in worker_cgroup.splitlines()
+        )
+
+    scope_identity = {name: scope.get(name, "") for name in _SYSTEMD_ACTIVATION_PROPERTIES}
+    if (
+        worker_pid <= 0
+        or worker_identity is None
+        or not all(scope_identity.values())
+        or not worker_in_exact_scope()
+    ):
+        scope_client.terminate()
+        scope_client.wait(timeout=_WAIT_SECONDS)
+        raise RuntimeError("monitor-owned scope lacks its exact live command identity")
+    (control_directory / "scope-ready").touch(mode=0o600)
+
+    def status() -> dict[str, Any]:
+        current = _unit_properties(systemctl, scope_unit)
+        current_worker_identity = ProcessMixin._process_identity(worker_pid)
+        phase = _monitor_scope_phase(
+            scope_identity,
+            current,
+            worker_identity_matches=current_worker_identity == worker_identity,
+            worker_process_absent=current_worker_identity is None,
+            worker_in_scope=worker_in_exact_scope(),
+        )
+        if phase == "running":
+            return {"phase": "running", "worker_pid": worker_pid}
+        if phase == "exited":
+            return {"phase": "exited", "worker_pid": worker_pid, "worker_exit_code": 0}
+        return {"phase": "unknown"}
+
+    def cancel() -> dict[str, Any]:
+        current = _unit_properties(systemctl, scope_unit)
+        if (
+            not _same_systemd_activation(scope_identity, current)
+            or current.get("ActiveState") != "active"
+            or ProcessMixin._process_identity(worker_pid) != worker_identity
+            or not worker_in_exact_scope()
+        ):
+            raise RuntimeError("monitor refuses to cancel a changed worker-scope identity")
+        _run([systemctl, "--user", "stop", scope_unit])
+        scope_client.wait(timeout=_WAIT_SECONDS)
+        current = _wait_inactive(systemctl, scope_unit)
+        if current.get("ActiveState") in {"active", "activating", "deactivating"}:
+            raise RuntimeError("monitor did not stop its exact worker scope")
+        if not _cgroup_is_empty(scope_identity["ControlGroup"]):
+            raise RuntimeError("monitor worker scope cgroup remained populated")
+        if ProcessMixin._process_identity(worker_pid) is not None:
+            raise RuntimeError("monitor worker PID survived its exact scope stop")
+        return {
+            "phase": "exited",
+            "worker_pid": worker_pid,
+            "worker_exit_code": scope_client.returncode,
+        }
+
+    identity = (attempt_id, claim_token, execution_id)
+    key = load_or_create_sandbox_monitor_control_key(
+        control_directory,
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+    )
+    server = SandboxMonitorControlServer(
+        socket_path=control_directory / "monitor.sock",
+        request_directory=control_directory,
+        key=key,
+        expected_identity=identity,
+        expected_uid=os.geteuid(),
+        status_provider=status,
+        cancel_action=cancel,
+    )
+    (control_directory / "server-bound").touch(mode=0o600)
+    signal.signal(signal.SIGTERM, lambda *_args: server.close())
+    server.serve_forever()
+    if scope_client.poll() is None:
+        scope_client.terminate()
+        try:
+            scope_client.wait(timeout=_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            scope_client.kill()
+            scope_client.wait(timeout=_WAIT_SECONDS)
+
+
+def _start_control_monitor_controller(
+    systemd_run: str,
+    systemctl: str,
+    service_unit: str,
+    monitor_slice_unit: str,
+    attempt_slice_unit: str,
+    scope_unit: str,
+    control_directory: Path,
+    receipt_path: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+) -> None:
+    """Launch the test monitor service, attest it, and acknowledge durable receipt."""
+
+    (control_directory / "attempt-slice-launching").touch(mode=0o600)
+    _run([systemctl, "--user", "start", attempt_slice_unit])
+    environment = _environment()
+    command = [
+        systemd_run,
+        "--user",
+        f"--unit={service_unit}",
+        f"--slice={monitor_slice_unit}",
+        "--property=Type=exec",
+        "--property=KillMode=control-group",
+        "--property=RuntimeMaxSec=90s",
+    ]
+    for name in ("PYTHONPATH", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        value = environment.get(name)
+        if value:
+            command.append(f"--setenv={name}={value}")
+    command.extend(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--control-monitor-service",
+            systemctl,
+            scope_unit,
+            str(control_directory),
+            attempt_id,
+            str(claim_token),
+            execution_id,
+        ]
+    )
+    (control_directory / "monitor-service-launching").touch(mode=0o600)
+    _run(command)
+    service = _wait_active(systemctl, service_unit)
+    monitor_slice = _wait_active(systemctl, monitor_slice_unit)
+    attempt_slice = _wait_active(systemctl, attempt_slice_unit)
+    if (
+        service.get("Id") != service_unit
+        or service.get("Slice") != monitor_slice_unit
+        or not service.get("InvocationID")
+        or not service.get("ControlGroup")
+        or PurePosixPath(service["ControlGroup"]).parent.as_posix() != monitor_slice["ControlGroup"]
+        or PurePosixPath(service["ControlGroup"]).is_relative_to(
+            PurePosixPath(attempt_slice["ControlGroup"])
+        )
+    ):
+        raise RuntimeError(f"monitor service identity or placement is incomplete: {service}")
+    main_pid = int(service.get("MainPID", "0"))
+    main_identity = ProcessMixin._process_identity(main_pid)
+    if main_pid <= 0 or main_pid == os.getpid() or main_identity is None:
+        raise RuntimeError("monitor service lacks a distinct live PID-start identity")
+
+    socket_path = control_directory / "monitor.sock"
+    deadline = time.monotonic() + _WAIT_SECONDS
+    while not socket_path.is_socket():
+        if time.monotonic() >= deadline:
+            properties = _unit_properties(systemctl, service_unit)
+            progress = sorted(path.name for path in control_directory.iterdir())
+            diagnostic_path = control_directory / "monitor-error.txt"
+            diagnostic = (
+                diagnostic_path.read_text(encoding="utf-8") if diagnostic_path.is_file() else ""
+            )
+            raise RuntimeError(
+                "monitor service did not bind its control socket: "
+                f"properties={properties}; progress={progress}; diagnostic={diagnostic}"
+            )
+        time.sleep(0.02)
+    receipt = SandboxMonitorReceipt(
+        version=1,
+        controller_pid=os.getpid(),
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+        unit=service_unit,
+        invocation_id=service["InvocationID"],
+        control_group=service["ControlGroup"],
+        main_pid=main_pid,
+        main_identity=main_identity,
+        monitor_slice_unit=monitor_slice_unit,
+        monitor_slice_control_group=monitor_slice["ControlGroup"],
+        attempt_slice_unit=attempt_slice_unit,
+        attempt_slice_control_group=attempt_slice["ControlGroup"],
+    )
+    _write_monitor_receipt(receipt_path, receipt.as_dict())
+    key = load_or_create_sandbox_monitor_control_key(
+        control_directory,
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+    )
+    client = SandboxMonitorControlClient(
+        receipt=receipt,
+        socket_path=socket_path,
+        key=key,
+        expected_uid=os.geteuid(),
+    )
+    response = client.status()
+    if response.outcome != "ok" or response.payload.get("phase") != "running":
+        raise RuntimeError("monitor did not return authenticated running status")
     print("receipt-durable", flush=True)
     time.sleep(60)
 
@@ -625,6 +902,48 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
             raise RuntimeError(message)
 
 
+def test_monitor_scope_phase_requires_exact_activation_even_after_exit() -> None:
+    expected = {
+        "Id": "acp-worker.scope",
+        "InvocationID": "original-invocation",
+        "ControlGroup": "/user.slice/user-acp.slice/acp-worker.scope",
+        "Slice": "user-acp.slice",
+    }
+    exited = {**expected, "ActiveState": "inactive"}
+    assert (
+        _monitor_scope_phase(
+            expected,
+            exited,
+            worker_identity_matches=False,
+            worker_process_absent=True,
+            worker_in_scope=False,
+        )
+        == "exited"
+    )
+    for name in _SYSTEMD_ACTIVATION_PROPERTIES:
+        replacement = {**exited, name: f"replacement-{name}"}
+        assert (
+            _monitor_scope_phase(
+                expected,
+                replacement,
+                worker_identity_matches=False,
+                worker_process_absent=True,
+                worker_in_scope=False,
+            )
+            == "unknown"
+        )
+    assert (
+        _monitor_scope_phase(
+            expected,
+            exited,
+            worker_identity_matches=False,
+            worker_process_absent=False,
+            worker_in_scope=False,
+        )
+        == "unknown"
+    )
+
+
 def test_systemd_monitor_reconciles_after_controller_crash_and_slice_stops_units(
     tmp_path: Path,
 ) -> None:
@@ -866,6 +1185,231 @@ def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
             raise RuntimeError(message)
 
 
+def test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_scope() -> None:
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the opt-in systemd monitor IPC test requires Linux cgroup v2")
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+
+    token = uuid.uuid4().hex
+    attempt_id = f"ipc-{token[:16]}"
+    claim_token = 1
+    execution_id = token
+    service_unit = sandbox_monitor_service_unit(attempt_id, claim_token, execution_id)
+    attempt_slice_unit = sandbox_attempt_slice_unit(attempt_id, claim_token, execution_id)
+    monitor_slice_unit = "user-acp.slice"
+    scope_unit = f"acp-ipc-scope-{token}.scope"
+    runtime_directory_value = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_directory_value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for the user-systemd probe")
+    runtime_directory = Path(runtime_directory_value)
+    control_directory = Path(tempfile.mkdtemp(prefix="acp-mipc-", dir=runtime_directory))
+    os.chmod(control_directory, 0o700)
+    directory_identity = control_directory.stat()
+    receipt_path = control_directory / "monitor-receipt.json"
+    socket_path = control_directory / "monitor.sock"
+    controller: subprocess.Popen[str] | None = None
+    cleanup_errors: list[str] = []
+    active: dict[str, dict[str, str]] = {}
+    try:
+        controller = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--start-control-monitor",
+                systemd_run,
+                systemctl,
+                service_unit,
+                monitor_slice_unit,
+                attempt_slice_unit,
+                scope_unit,
+                str(control_directory),
+                str(receipt_path),
+                attempt_id,
+                str(claim_token),
+                execution_id,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_environment(),
+        )
+        deadline = time.monotonic() + _WAIT_SECONDS * 2
+        while not receipt_path.exists():
+            if controller.poll() is not None:
+                _, stderr = controller.communicate()
+                raise RuntimeError(
+                    f"monitor controller exited {controller.returncode} before receipt: "
+                    f"{stderr.strip()}"
+                )
+            if time.monotonic() >= deadline:
+                raise RuntimeError("monitor controller did not persist its receipt in time")
+            time.sleep(0.05)
+        if controller.stdout is None:
+            raise RuntimeError("monitor controller has no durability acknowledgment pipe")
+        with selectors.DefaultSelector() as selector:
+            selector.register(controller.stdout, selectors.EVENT_READ)
+            if not selector.select(timeout=_WAIT_SECONDS):
+                raise RuntimeError("monitor controller did not acknowledge authenticated status")
+            if controller.stdout.readline().strip() != "receipt-durable":
+                raise RuntimeError("monitor controller exited before its durability acknowledgment")
+        controller.send_signal(signal.SIGKILL)
+        stdout, stderr = controller.communicate(timeout=_WAIT_SECONDS)
+        if controller.returncode != -signal.SIGKILL:
+            raise RuntimeError(
+                f"monitor controller did not die abruptly: rc={controller.returncode}; "
+                f"stdout={stdout.strip()}; stderr={stderr.strip()}"
+            )
+        controller = None
+
+        reconciliation = _reconcile_monitor_after_restart(systemctl, receipt_path)
+        receipt = SandboxMonitorReceipt.from_dict(reconciliation["receipt"])
+        service = _wait_active(systemctl, service_unit)
+        active[service_unit] = service
+        attempt_slice = _wait_active(systemctl, attempt_slice_unit)
+        active[attempt_slice_unit] = attempt_slice
+        scope = _wait_active(systemctl, scope_unit)
+        active[scope_unit] = scope
+        if (
+            service.get("Slice") != monitor_slice_unit
+            or PurePosixPath(service["ControlGroup"]).parent.as_posix()
+            != reconciliation["monitor_slice"]["ControlGroup"]
+            or scope.get("Slice") != attempt_slice_unit
+            or PurePosixPath(scope["ControlGroup"]).parent.as_posix()
+            != attempt_slice["ControlGroup"]
+            or PurePosixPath(service["ControlGroup"]).is_relative_to(
+                PurePosixPath(attempt_slice["ControlGroup"])
+            )
+        ):
+            raise AssertionError("monitor service and worker scope are not isolated siblings")
+        key = load_or_create_sandbox_monitor_control_key(
+            control_directory,
+            attempt_id=attempt_id,
+            claim_token=claim_token,
+            execution_id=execution_id,
+        )
+        client = SandboxMonitorControlClient(
+            receipt=receipt,
+            socket_path=socket_path,
+            key=key,
+            expected_uid=os.geteuid(),
+        )
+        status = client.status()
+        if status.outcome != "ok" or status.payload.get("phase") != "running":
+            raise AssertionError(f"reconnected monitor status was not authenticated: {status}")
+        worker_pid = status.payload.get("worker_pid")
+        if type(worker_pid) is not int or ProcessMixin._process_identity(worker_pid) is None:
+            raise AssertionError("monitor status did not identify a live worker process")
+        worker_cgroup = Path(f"/proc/{worker_pid}/cgroup").read_text(encoding="ascii")
+        if not any(
+            line.endswith(f":{scope['ControlGroup']}") for line in worker_cgroup.splitlines()
+        ):
+            raise AssertionError("monitor-reported worker PID is outside the exact scope cgroup")
+
+        request_id = uuid.uuid4().hex
+        cancelled = client.cancel(request_id)
+        replayed = client.cancel(request_id)
+        if (
+            cancelled.outcome != "ok"
+            or cancelled.payload.get("phase") != "exited"
+            or cancelled.payload.get("worker_pid") != worker_pid
+            or replayed != cancelled
+        ):
+            raise AssertionError(
+                "monitor cancellation was not exact, durable, and idempotent: "
+                f"cancelled={cancelled!r}; replayed={replayed!r}"
+            )
+        scope = _wait_inactive(systemctl, scope_unit)
+        if scope.get("ActiveState") in {"active", "activating", "deactivating"}:
+            raise AssertionError("monitor cancellation left the exact worker scope active")
+        if not _cgroup_is_empty(scope.get("ControlGroup", "")):
+            raise AssertionError("monitor cancellation left the worker scope cgroup populated")
+        if ProcessMixin._process_identity(worker_pid) is not None:
+            raise AssertionError("monitor cancellation left its worker process alive")
+        service = _wait_active(systemctl, service_unit)
+        if service.get("InvocationID") != receipt.invocation_id:
+            raise AssertionError("monitor service changed while its worker scope was stopped")
+        if ProcessMixin._process_identity(receipt.main_pid) != receipt.main_identity:
+            raise AssertionError("monitor process identity changed during cancellation")
+    finally:
+        if controller is not None and controller.poll() is None:
+            controller.kill()
+            controller.communicate(timeout=_WAIT_SECONDS)
+        launch_markers = {
+            scope_unit: "scope-launching",
+            service_unit: "monitor-service-launching",
+            attempt_slice_unit: "attempt-slice-launching",
+        }
+        for unit in (scope_unit, service_unit, attempt_slice_unit):
+            try:
+                original = active.get(unit)
+                before_stop = _unit_properties(systemctl, unit)
+                if original is None and before_stop.get("ControlGroup"):
+                    original = before_stop
+                    active[unit] = before_stop
+                if (control_directory / launch_markers[unit]).exists() and not (
+                    original and original.get("ControlGroup")
+                ):
+                    cleanup_errors.append(
+                        f"{unit} was launched but its original cgroup was not captured"
+                    )
+                subprocess.run(
+                    [systemctl, "--user", "stop", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_WAIT_SECONDS,
+                    env=_environment(),
+                )
+                inactive = _wait_inactive(systemctl, unit)
+                if inactive.get("ActiveState") in {"active", "activating", "deactivating"}:
+                    cleanup_errors.append(f"{unit} remained active: {inactive}")
+                for control_group in {
+                    inactive.get("ControlGroup", ""),
+                    active.get(unit, {}).get("ControlGroup", ""),
+                } - {""}:
+                    if not _cgroup_is_empty(control_group):
+                        cleanup_errors.append(f"{unit} retained populated cgroup {control_group}")
+                if inactive.get("ActiveState") == "failed":
+                    _run([systemctl, "--user", "reset-failed", unit])
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify {unit} cleanup: {error}")
+        try:
+            after = control_directory.lstat()
+            if (
+                (after.st_dev, after.st_ino)
+                != (directory_identity.st_dev, directory_identity.st_ino)
+                or after.st_uid != os.geteuid()
+                or control_directory.is_symlink()
+                or (after.st_mode & 0o777) != 0o700
+            ):
+                cleanup_errors.append("monitor IPC fixture directory identity changed")
+        except OSError as error:
+            cleanup_errors.append(f"monitor IPC fixture directory could not be verified: {error}")
+        if cleanup_errors:
+            raise RuntimeError(
+                "monitor IPC integration cleanup was not verified; fixture retained: "
+                + "; ".join(cleanup_errors)
+            )
+        shutil.rmtree(control_directory)
+
+
 if __name__ == "__main__":
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--monitor-controller":
@@ -878,6 +1422,42 @@ if __name__ == "__main__":
             int(arguments[8]),
             arguments[9],
         )
+    elif arguments and arguments[0] == "--start-control-monitor":
+        if len(arguments) != 12:
+            raise SystemExit("start-control-monitor mode requires eleven arguments")
+        _start_control_monitor_controller(
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+            arguments[6],
+            Path(arguments[7]),
+            Path(arguments[8]),
+            arguments[9],
+            int(arguments[10]),
+            arguments[11],
+        )
+    elif arguments and arguments[0] == "--control-monitor-service":
+        if len(arguments) != 7:
+            raise SystemExit("control-monitor-service mode requires six arguments")
+        try:
+            _serve_control_monitor(
+                arguments[1],
+                arguments[2],
+                Path(arguments[3]),
+                arguments[4],
+                int(arguments[5]),
+                arguments[6],
+            )
+        except BaseException:
+            diagnostic_path = Path(arguments[3]) / "monitor-error.txt"
+            try:
+                with diagnostic_path.open("x", encoding="utf-8") as stream:
+                    stream.write(traceback.format_exc())
+            except OSError:
+                pass
+            raise
     elif arguments and arguments[0] == "--reconcile-monitor":
         if len(arguments) != 3:
             raise SystemExit("reconcile-monitor mode requires two arguments")
