@@ -585,11 +585,11 @@ fail-closed.
 
 ### Cleanup proof boundary (2026-10-11; architecture/QC decision)
 
-Do not add a standalone observer that writes `cleanup_verified`. The current
-`cleanup_reported` receipt is an identity-bound template: its observations are
-null, and it contains no trusted receipt for the exact pinned `runc delete`
-invocation or its exit. `runc --root` selects the runtime state store, while
-`runc state` and `runc list` are read commands; absence from a later query does
+Do not add an observer that writes `cleanup_verified` from absence checks alone.
+The current `cleanup_reported` receipt is an identity-bound template: its
+observations are null, and it contains no trusted receipt for the exact pinned
+`runc delete` invocation or its exit. `runc --root` selects the runtime state
+store, while `runc state` and `runc list` are read commands; absence from a later query does
 not prove which actor performed deletion or that no actor can recreate state
 before the journal commit. The command semantics are documented by upstream
 [runc](https://github.com/opencontainers/runc/blob/main/man/runc.8.md) and
@@ -624,6 +624,30 @@ observation, and commit. Until this owner/serialization path exists, keep
 `cleanup_verified` transitions guarded and OCI `run_worker` fail-closed. This
 decision deliberately does not add a cleanup collector: a typed snapshot would
 not solve the missing action provenance or close the probe-to-commit race.
+
+**Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
+systemd documents that `ExecStopPost=` also runs after unexpected service exit.
+In the task's disposable Ubuntu guest (kernel `6.8.0-142-generic`,
+systemd `255.4-1ubuntu8.17`), an exact `systemd-run --user --wait` probe observed
+the hook under `<unit-cgroup>/.control`; systemd may place delegated hooks there.
+Only after the hook and wait returned
+did `systemctl show` report `LoadState=not-found`, `ActiveState=inactive`,
+`MainPID=0`, and empty `ControlGroup` and `InvocationID`. Thus `ExecStopPost=`
+cannot certify that its own unit or cgroup is absent. The monitor main process
+must durably persist an immutable receipt for its pinned `runc delete` action
+and wait result before exiting. A finalizer must run after the complete stop
+job (including any `ExecStopPost=`) returns, verify the pre-bound unit/process
+identities and empty cgroup/private paths, and require that action receipt as
+well as those fresh observations before committing `cleanup_verified`. The
+captured InvocationID must remain bound to the unique fencing-epoch unit name;
+a missing or contradictory live unit state is not, by itself, evidence of a
+matching stop. A crash before the action receipt is durable remains ambiguous;
+later `runc state` absence must not trigger a retry or release the fence. The
+opt-in regression is
+`test_exec_stop_post_is_not_final_unit_absence_evidence`; this is systemd
+lifecycle evidence only, not a cleanup verifier or integrated-worker proof.
+See upstream [systemd service lifecycle documentation](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml)
+and [cgroup delegation documentation](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md).
 
 ## Threat model
 

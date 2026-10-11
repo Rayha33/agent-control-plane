@@ -639,6 +639,107 @@ def test_systemd_monitor_reconciles_after_controller_crash_and_slice_stops_units
     assert set(evidence["post_stop_states"].values()) <= {"inactive", "failed", "not-found"}
 
 
+def test_exec_stop_post_is_not_final_unit_absence_evidence() -> None:
+    """A post-stop hook can persist action evidence, but cannot certify its own absence."""
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("the opt-in systemd teardown test requires Linux")
+
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+
+    token = uuid.uuid4().hex
+    unit = f"acp-stop-post-{token}.service"
+    hook_cgroup = ""
+    service_cgroup = ""
+    output_lines: list[str] = []
+    try:
+        completed = _run(
+            [
+                systemd_run,
+                "--user",
+                "--wait",
+                "--pipe",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "--property=Delegate=yes",
+                '--property=ExecStopPost=/bin/sh -c "cat /proc/self/cgroup"',
+                "/usr/bin/true",
+            ]
+        )
+        output_lines = (completed.stdout + "\n" + completed.stderr).splitlines()
+        invocation_line = next(
+            (line for line in output_lines if line.startswith("Running as unit: ")), ""
+        )
+        expected_prefix = f"Running as unit: {unit}; invocation ID: "
+        if not invocation_line.startswith(expected_prefix):
+            raise RuntimeError("systemd-run did not return the exact transient unit invocation")
+        invocation_id = invocation_line.removeprefix(expected_prefix)
+        if len(invocation_id) != 32 or any(
+            character not in "0123456789abcdef" for character in invocation_id
+        ):
+            raise RuntimeError("systemd-run returned a malformed invocation ID")
+
+        cgroup_line = next((line for line in output_lines if line.startswith("0::/")), "")
+        if not cgroup_line:
+            raise RuntimeError("ExecStopPost did not report its live cgroup")
+        hook_cgroup = cgroup_line.removeprefix("0::")
+        hook_path = PurePosixPath(hook_cgroup)
+        if unit in hook_path.parts:
+            unit_index = hook_path.parts.index(unit)
+            service_cgroup = PurePosixPath(*hook_path.parts[: unit_index + 1]).as_posix()
+        if hook_path.name != ".control" or hook_path.parent.name != unit:
+            raise RuntimeError(
+                f"ExecStopPost did not run in the expected service control subgroup: {hook_cgroup}"
+            )
+
+        after_stop = _unit_properties(systemctl, unit)
+        if (
+            after_stop.get("LoadState") != "not-found"
+            or after_stop.get("ActiveState") != "inactive"
+            or after_stop.get("MainPID") != "0"
+            or after_stop.get("ControlGroup") != ""
+            or after_stop.get("InvocationID") != ""
+        ):
+            raise RuntimeError(
+                f"post-stop unit properties were inconsistent for {unit}: {after_stop}"
+            )
+        if not _cgroup_is_empty(hook_path.parent.as_posix()):
+            raise RuntimeError(f"the service cgroup remained populated after stop: {hook_cgroup}")
+        assert invocation_id != after_stop.get("InvocationID")
+    finally:
+        if not service_cgroup:
+            cgroup_line = next((line for line in output_lines if line.startswith("0::/")), "")
+            if cgroup_line:
+                hook_path = PurePosixPath(cgroup_line.removeprefix("0::"))
+                if unit in hook_path.parts:
+                    unit_index = hook_path.parts.index(unit)
+                    service_cgroup = PurePosixPath(*hook_path.parts[: unit_index + 1]).as_posix()
+            if not service_cgroup:
+                service_cgroup = _unit_properties(systemctl, unit).get("ControlGroup", "")
+        subprocess.run(
+            [systemctl, "--user", "stop", unit],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_WAIT_SECONDS,
+            env=_environment(),
+        )
+        inactive = _wait_inactive(systemctl, unit)
+        if inactive.get("ActiveState") in {"active", "activating", "deactivating"}:
+            raise RuntimeError(f"transient post-stop probe remained active: {inactive}")
+        if service_cgroup and not _cgroup_is_empty(service_cgroup):
+            raise RuntimeError(
+                f"transient post-stop probe cgroup was not cleaned: {service_cgroup}"
+            )
+
+
 def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
     import pytest
 
