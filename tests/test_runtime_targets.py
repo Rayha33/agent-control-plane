@@ -23,6 +23,7 @@ from agent_control_plane.supervisor import runtime_targets
 from agent_control_plane.supervisor.common import canonical_json, sha256
 
 SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+LIVE_SAMPLED_AT = "2026-10-11T14:00:00+00:00"
 
 
 def target_definition(**overrides: Any) -> runtime_targets.RuntimeTargetDefinition:
@@ -85,6 +86,34 @@ def driver_resources() -> list[dict[str, Any]]:
     ]
 
 
+def namespace_driver_resources(invocation_id: str) -> list[dict[str, Any]]:
+    resources = driver_resources()
+    resources[0]["kind"] = "namespace_runtime"
+    resources[0]["evidence"] = {
+        "proof": {"observation": {"systemd_unit_invocation_id": invocation_id}}
+    }
+    return resources
+
+
+def live_namespace_sample(invocation_id: str | None) -> dict[str, Any]:
+    available = invocation_id is not None
+    return {
+        "sampled_at": LIVE_SAMPLED_AT,
+        "source": "systemd user unit / cgroup",
+        "available": available,
+        "drivers": [
+            {
+                "driver": "api",
+                "active_state": "active" if available else "inactive",
+                "present": available,
+                "available": available,
+                "identity_available": available,
+                "systemd_unit_invocation_id": invocation_id,
+            }
+        ],
+    }
+
+
 def expected_report(
     *,
     phase: str = "qc",
@@ -117,7 +146,11 @@ def evaluate_target(
     *,
     probe_status: str = "ok",
     resources: list[dict[str, Any]] | None = None,
+    live_runtime_sample: dict[str, Any] | None = None,
+    baseline_receipt: dict[str, Any] | None = None,
+    receipt_id: str = "qc-run-17",
     require_command_binding: bool = False,
+    required: bool = True,
     commands: tuple[str, ...] = ("pytest -q",),
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     observed = expected_report() if report is None else report
@@ -127,10 +160,16 @@ def evaluate_target(
         lambda _port, _path: (observed, probe_status),
     )
     return runtime_targets.runtime_target_phase(
-        definitions=(target_definition(require_command_binding=require_command_binding),),
+        definitions=(
+            target_definition(
+                required=required,
+                require_command_binding=require_command_binding,
+            ),
+        ),
         commands=commands,
         runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(tmp_path)},
         driver_resources=driver_resources() if resources is None else resources,
+        live_runtime_sample=live_runtime_sample,
         attempt_id="attempt-17",
         task_id="task-17",
         claim_token=9,
@@ -138,7 +177,8 @@ def evaluate_target(
         phase="qc",
         source_revision=SOURCE_REVISION,
         runtime_dir=tmp_path,
-        receipt_id="qc-run-17",
+        receipt_id=receipt_id,
+        baseline_receipt=baseline_receipt,
     )
 
 
@@ -256,6 +296,120 @@ def test_required_target_revalidation_blocks_replaced_host_resource(
     assert target["status"] == "mismatch"
     assert "resource_snapshot_sha256" in target["mismatches"]
     assert receipt["verified"] is False
+
+
+def test_namespace_runtime_revalidation_binds_live_invocation_id_and_blocks_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_id = "0123456789abcdef0123456789abcdef"
+    replacement_id = "fedcba9876543210fedcba9876543210"
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = original_id
+    preflight, environment, blocked = evaluate_target(
+        tmp_path / "preflight",
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(original_id),
+        live_runtime_sample=live_namespace_sample(original_id),
+    )
+
+    assert blocked is False
+    assert preflight["verified"] is False
+    assert preflight["live_runtime_sampled_at"] == LIVE_SAMPLED_AT
+    assert preflight["targets"][0]["expected"]["process_identity"] == original_id
+    assert (
+        preflight["targets"][0]["resource_snapshots"][0]["live_systemd_invocation_id"]
+        == original_id
+    )
+    manifest = json.loads(Path(environment["ACP_RUNTIME_TARGETS_FILE"]).read_text())
+    assert manifest["live_runtime_sampled_at"] == LIVE_SAMPLED_AT
+
+    replacement_report = expected_report()
+    replacement_report.pop("container_id")
+    replacement_report["process_identity"] = replacement_id
+    monkeypatch.setattr(
+        runtime_targets,
+        "probe_target_identity",
+        lambda _port, _path: (replacement_report, "ok"),
+    )
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    receipt, _environment, replacement_blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(replacement_dir)},
+        driver_resources=namespace_driver_resources(replacement_id),
+        live_runtime_sample=live_namespace_sample(replacement_id),
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=replacement_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert replacement_blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_resource_replaced"
+    assert target["expected"]["process_identity"] == replacement_id
+    assert target["resource_snapshot_matches_preflight"] is False
+    assert target["mismatches"] == ["resource_snapshot_sha256"]
+    assert target["live_runtime_identity_unavailable"] is False
+    assert receipt["resource_replacement_detected"] is True
+
+
+@pytest.mark.parametrize("live_id", [None, "not-a-systemd-invocation-id"])
+def test_namespace_runtime_target_fails_closed_without_live_invocation_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_id: str | None
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = invocation_id
+
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path,
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(invocation_id),
+        live_runtime_sample=live_namespace_sample(live_id),
+    )
+
+    assert blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_live_identity_unavailable"
+    assert receipt["targets"][0]["status"] == "unknown"
+    assert receipt["targets"][0]["live_runtime_identity_unavailable"] is True
+    assert "api.live_systemd_invocation_id" in receipt["targets"][0]["missing_evidence"]
+    assert receipt["targets"][0]["expected"].get("process_identity") is None
+    assert receipt["verified"] is False
+
+
+def test_optional_namespace_target_keeps_identity_failure_diagnostic_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = invocation_id
+
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path,
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(invocation_id),
+        live_runtime_sample=live_namespace_sample(None),
+        required=False,
+    )
+
+    assert blocked is False
+    assert receipt["status"] == "complete"
+    assert receipt["blocking_reason"] is None
+    assert receipt["targets"][0]["status"] == "unknown"
+    assert receipt["targets"][0]["live_runtime_identity_unavailable"] is True
 
 
 def test_target_revalidation_rejects_receipt_from_another_execution(
@@ -704,6 +858,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         "assert m['phase'] == os.environ['ACP_PHASE']\n"
         "assert m['claim_token'] == int(os.environ['ACP_CLAIM_TOKEN'])\n"
         "assert m['source_revision'] == os.environ['ACP_SOURCE_REVISION']\n"
+        "assert m['live_runtime_sampled_at']\n"
         "assert m['targets'][0]['endpoint'] == os.environ['ACP_TARGET_API_URL']\n"
         f"if os.environ['ACP_PHASE'] == {pause_phase!r}:\n"
         f"    Path({str(gate_started)!r}).write_text('started')\n"
@@ -752,19 +907,24 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         if (
             replacement_state["armed"]
             and attempt_id == attempt["id"]
-            and not fresh
-            and isinstance(rows, list)
+            and (
+                isinstance(rows, list)
+                or isinstance(rows, dict)
+                and isinstance(rows.get("resources"), list)
+            )
         ):
             replacement_state["armed"] = False
+            is_snapshot = isinstance(rows, dict)
+            resource_rows = rows["resources"] if is_snapshot else rows
             replaced_rows = []
-            for item in rows:
+            for item in resource_rows:
                 if item.get("driver") == "api":
                     replacement_id = f"{item['resource_id']}-replaced"
                     context["driver_resource_id"] = replacement_id
                     replaced_rows.append({**item, "resource_id": replacement_id})
                 else:
                     replaced_rows.append(item)
-            return replaced_rows
+            return {**rows, "resources": replaced_rows} if is_snapshot else replaced_rows
         return rows
 
     monkeypatch.setattr(supervisor, "driver_resources", replaced_driver_resources)

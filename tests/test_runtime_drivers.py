@@ -2619,6 +2619,10 @@ def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
     assert sample["available"] is True
     assert sample["sampled_at"].endswith("+00:00")
     assert sample["drivers"][0]["present"] is True
+    assert sample["drivers"][0]["identity_available"] is True
+    assert sample["drivers"][0]["systemd_unit_invocation_id"] == (
+        "0123456789abcdef0123456789abcdef"
+    )
     assert sample["drivers"][0]["usage"]["tasks_current"] == 5
     assert sample["drivers"][0]["usage"]["memory_current_bytes"] == 3145728
     assert sample["drivers"][0]["usage"]["cpu_usage_ns"] == 123456789
@@ -2660,6 +2664,8 @@ def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
     assert inactive["drivers"][0]["present"] is False
     assert inactive["drivers"][0]["active_state"] == "inactive"
     assert inactive["drivers"][0]["error_code"] is None
+    assert inactive["drivers"][0]["identity_available"] is False
+    assert inactive["drivers"][0]["systemd_unit_invocation_id"] is None
     assert inactive["drivers"][0]["usage"]["tasks_current"] is None
     assert acp_snapshot() == before_inactive
 

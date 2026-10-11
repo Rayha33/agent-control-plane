@@ -45,6 +45,7 @@ _NAME = re.compile(r"[a-z][a-z0-9_-]{0,47}\Z")
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
 _REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _MAX_IDENTITY_BYTES = 8192
+_UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00\Z")
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,7 @@ def runtime_target_phase(
     source_revision: str,
     runtime_dir: Path,
     receipt_id: str,
+    live_runtime_sample: Mapping[str, Any] | None = None,
     baseline_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     """Probe configured loopback targets and write a read-only manifest.
@@ -213,11 +215,11 @@ def runtime_target_phase(
     remain unknown. Required targets block unless every declared identity field
     matches; even a full match is only corroboration because the app controls its
     own report. When baseline resource hashes are supplied, a required target
-    also blocks if its latest persisted trusted-driver evidence differs from the
-    phase preflight. This rereads stored rows; it does not rerun the host probe,
-    so it detects drift only when reflected in persisted evidence. The live
-    endpoint identity probe is separate, and neither sample closes the race
-    between checking and command execution.
+    also blocks if its latest trusted-driver evidence differs from the phase
+    preflight. Namespace-runtime resources additionally require a current,
+    successful systemd invocation-ID sample; a missing or stale identity blocks
+    a required target. These samples detect unit replacement but do not prove
+    command routing or close the race between checking and command execution.
     """
 
     if phase not in {"qc", "integration"}:
@@ -288,10 +290,16 @@ def runtime_target_phase(
             str(name): str(value) for name, value in baseline_hashes.items()
         }
     resources = {str(item.get("driver", "")): item for item in driver_resources}
+    live_systemd_invocation_ids, live_runtime_sampled_at = _live_systemd_invocation_ids(
+        live_runtime_sample
+    )
     manifest_targets: list[dict[str, Any]] = []
     receipt_targets: list[dict[str, Any]] = []
     blocked = False
     resource_replacement_blocked = False
+    live_runtime_identity_unavailable = False
+    live_runtime_identity_mismatch_detected = False
+    live_runtime_identity_sampled = False
     for definition in definitions:
         if phase not in definition.phases:
             continue
@@ -304,6 +312,44 @@ def runtime_target_phase(
             port = 0
         driver = resources.get(definition.driver)
         host_identity = _host_resource_identity(driver)
+        target_resource_names = [definition.driver]
+        if definition.database_driver:
+            target_resource_names.append(definition.database_driver)
+        if definition.queue_driver:
+            target_resource_names.append(definition.queue_driver)
+        namespace_resource_names = [
+            name
+            for name in target_resource_names
+            if (resource := resources.get(name)) and resource.get("kind") == "namespace_runtime"
+        ]
+        live_runtime_identity_sampled = live_runtime_identity_sampled or bool(
+            namespace_resource_names
+        )
+        missing_live_runtime_identities = [
+            name for name in namespace_resource_names if name not in live_systemd_invocation_ids
+        ]
+        mismatched_persisted_live_identities = [
+            name
+            for name in namespace_resource_names
+            if (stored_identity := _host_resource_identity(resources.get(name))["process_identity"])
+            and (live_identity := live_systemd_invocation_ids.get(name))
+            and stored_identity != live_identity
+        ]
+        if definition.required or definition.require_command_binding:
+            live_runtime_identity_unavailable = live_runtime_identity_unavailable or bool(
+                missing_live_runtime_identities
+            )
+            live_runtime_identity_mismatch_detected = (
+                live_runtime_identity_mismatch_detected
+                or bool(mismatched_persisted_live_identities)
+            )
+        if driver and driver.get("kind") == "namespace_runtime":
+            live_process_identity = live_systemd_invocation_ids.get(definition.driver)
+            host_identity = {
+                **host_identity,
+                "status": "host_captured" if live_process_identity else "unknown",
+                "process_identity": live_process_identity,
+            }
         expected: dict[str, Any] = {
             "attempt_id": attempt_id,
             "task_id": task_id,
@@ -321,6 +367,8 @@ def runtime_target_phase(
             expected["container_id"] = host_identity["container_ids"][0]
         if host_identity["process_identity"]:
             expected["process_identity"] = host_identity["process_identity"]
+        elif driver and driver.get("kind") == "namespace_runtime":
+            expected["process_identity"] = None
         related_resources: dict[str, Mapping[str, Any] | None] = {}
         if definition.database_driver:
             related_resources["database_namespace"] = resources.get(definition.database_driver)
@@ -339,14 +387,22 @@ def runtime_target_phase(
         if definition.schema_version is not None:
             expected["schema_version"] = definition.schema_version
 
-        resource_snapshots = [_resource_binding_snapshot("service", definition.driver, resources)]
+        resource_snapshots = [
+            _resource_binding_snapshot(
+                "service", definition.driver, resources, live_systemd_invocation_ids
+            )
+        ]
         if definition.database_driver:
             resource_snapshots.append(
-                _resource_binding_snapshot("database", definition.database_driver, resources)
+                _resource_binding_snapshot(
+                    "database", definition.database_driver, resources, live_systemd_invocation_ids
+                )
             )
         if definition.queue_driver:
             resource_snapshots.append(
-                _resource_binding_snapshot("queue", definition.queue_driver, resources)
+                _resource_binding_snapshot(
+                    "queue", definition.queue_driver, resources, live_systemd_invocation_ids
+                )
             )
         resource_snapshot_sha256 = sha256(canonical_json(resource_snapshots).encode("utf-8"))
         resource_snapshot_matches_preflight = (
@@ -362,12 +418,17 @@ def runtime_target_phase(
         observed = _safe_identity(observed)
         expected_fields = [key for key, value in expected.items() if value is not None]
         missing_expected = [key for key in expected if expected[key] is None]
+        missing_expected.extend(
+            f"{name}.live_systemd_invocation_id" for name in missing_live_runtime_identities
+        )
         missing_observed = [key for key in expected_fields if key not in observed]
         mismatches = [
             key for key in expected_fields if key in observed and observed[key] != expected[key]
         ]
         if resource_snapshot_matches_preflight is False:
             mismatches.append("resource_snapshot_sha256")
+        if mismatched_persisted_live_identities:
+            mismatches.append("persisted_live_systemd_invocation_id")
         if (
             host_identity["container_ids"]
             and "container_id" in observed
@@ -409,7 +470,10 @@ def runtime_target_phase(
         )
         blocked = blocked or target_blocked
         resource_replacement_blocked = resource_replacement_blocked or (
-            definition.required and resource_snapshot_matches_preflight is False
+            definition.required
+            and resource_snapshot_matches_preflight is False
+            and not missing_live_runtime_identities
+            and not mismatched_persisted_live_identities
         )
         entry = {
             "name": definition.name,
@@ -424,6 +488,9 @@ def runtime_target_phase(
             "resource_snapshots": resource_snapshots,
             "resource_snapshot_sha256": resource_snapshot_sha256,
             "resource_snapshot_matches_preflight": resource_snapshot_matches_preflight,
+            "live_runtime_identity_unavailable": bool(missing_live_runtime_identities),
+            "live_runtime_identity_mismatch": bool(mismatched_persisted_live_identities),
+            "live_runtime_sampled_at": live_runtime_sampled_at,
             "probe_status": probe_status,
             "missing_evidence": sorted(set(missing_expected + missing_observed)),
             "mismatches": mismatches,
@@ -457,6 +524,11 @@ def runtime_target_phase(
         "no OS process/container-to-socket attribution was performed",
         "no network policy proved which endpoint each test command used",
     ]
+    if live_runtime_identity_sampled:
+        limitations.append(
+            "live systemd invocation IDs detect sampled unit-incarnation changes only; "
+            "they do not bind command traffic or close the check-to-launch race"
+        )
     if any(
         definition.require_command_binding and phase in definition.phases
         for definition in definitions
@@ -478,6 +550,7 @@ def runtime_target_phase(
         "command_count": len(commands),
         "baseline_evidence_id": baseline_evidence_id,
         "baseline_evidence_sha256": baseline_evidence_sha256,
+        "live_runtime_sampled_at": live_runtime_sampled_at,
         "targets": manifest_targets,
         "limitations": limitations,
     }
@@ -513,21 +586,30 @@ def runtime_target_phase(
         "command_count": len(commands),
         "baseline_evidence_id": baseline_evidence_id,
         "baseline_evidence_sha256": baseline_evidence_sha256,
+        "live_runtime_sampled_at": live_runtime_sampled_at,
         "status": "blocked" if blocked else "complete",
         "blocking_reason": (
             "runtime_target_command_binding_unavailable"
-            if any(
+            if blocked
+            and any(
                 definition.require_command_binding and phase in definition.phases
                 for definition in definitions
             )
+            else "runtime_target_live_identity_unavailable"
+            if blocked and live_runtime_identity_unavailable
+            else "runtime_target_live_identity_mismatch"
+            if blocked and live_runtime_identity_mismatch_detected
             else "runtime_target_resource_replaced"
-            if resource_replacement_blocked
+            if blocked and resource_replacement_blocked
             else "runtime_target_identity_mismatch"
             if blocked
             else None
         ),
         "resource_replacement_detected": any(
-            target["resource_snapshot_matches_preflight"] is False for target in receipt_targets
+            target["resource_snapshot_matches_preflight"] is False
+            and not target["live_runtime_identity_unavailable"]
+            and not target["live_runtime_identity_mismatch"]
+            for target in receipt_targets
         ),
         "verified": False,
         "manifest_path": str(manifest_path),
@@ -638,6 +720,45 @@ def _receipt_identity(observed: Mapping[str, Any], expected: Mapping[str, Any]) 
     return safe
 
 
+def _live_systemd_invocation_ids(
+    sample: Mapping[str, Any] | None,
+) -> tuple[dict[str, str], str | None]:
+    """Keep only validated invocation IDs from a current successful unit sample."""
+
+    if not isinstance(sample, Mapping):
+        return {}, None
+    sampled_at = sample.get("sampled_at")
+    if not isinstance(sampled_at, str) or not _UTC_TIMESTAMP.fullmatch(sampled_at):
+        return {}, None
+    drivers = sample.get("drivers")
+    if not isinstance(drivers, list):
+        return {}, sampled_at
+    identities: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for driver in drivers:
+        if not isinstance(driver, Mapping):
+            continue
+        name = driver.get("driver")
+        invocation_id = driver.get("systemd_unit_invocation_id")
+        if (
+            not isinstance(name, str)
+            or not _NAME.fullmatch(name)
+            or driver.get("identity_available") is not True
+            or driver.get("available") is not True
+            or driver.get("present") is not True
+            or driver.get("active_state") != "active"
+            or not isinstance(invocation_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", invocation_id)
+        ):
+            continue
+        if name in identities and identities[name] != invocation_id:
+            identities.pop(name, None)
+            ambiguous.add(name)
+        elif name not in ambiguous:
+            identities[name] = invocation_id
+    return identities, sampled_at
+
+
 def _host_resource_identity(resource: Mapping[str, Any] | None) -> dict[str, Any]:
     """Extract narrowly typed identity captured by a trusted runtime-driver probe."""
 
@@ -679,15 +800,16 @@ def _resource_binding_snapshot(
     role: str,
     driver_name: str,
     resources: Mapping[str, Mapping[str, Any]],
+    live_systemd_invocation_ids: Mapping[str, str],
 ) -> dict[str, Any]:
     """Return an allowlisted snapshot of one target's configured resource.
 
     Resource IDs alone can stay stable across a driver-observed container or
-    systemd service replacement. Preserve any host-captured identities supplied
-    by the driver separately; never copy raw driver output or credential
-    evidence. Repeated phase checks compare these snapshots to the preflight to
-    detect sampled replacement, but do not prove command routing or close the
-    race between the check and command execution.
+    systemd service replacement. Preserve host-captured evidence and the current
+    validated systemd invocation ID separately; never copy raw driver output or
+    credential evidence. Repeated phase checks compare these snapshots to the
+    preflight to detect sampled replacement, but do not prove command routing or
+    close the race between the check and command execution.
     """
 
     resource = resources.get(driver_name)
@@ -713,7 +835,7 @@ def _resource_binding_snapshot(
         "unknown",
     }:
         state = "unknown"
-    return {
+    snapshot = {
         "role": role,
         "driver": driver_name,
         "resource_id": resource_id,
@@ -721,6 +843,9 @@ def _resource_binding_snapshot(
         "state": state,
         "host_identity": _host_resource_identity(resource),
     }
+    if kind == "namespace_runtime":
+        snapshot["live_systemd_invocation_id"] = live_systemd_invocation_ids.get(driver_name)
+    return snapshot
 
 
 def _write_manifest(runtime_dir: Path, receipt_id: str, phase: str, content: bytes) -> Path:

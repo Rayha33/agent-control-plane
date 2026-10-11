@@ -98,17 +98,21 @@ environment, workspace immutability, or the process's live network namespace.
 execution until a trusted executor supplies those proofs.
 
 **Sampled freshness guard (2026-10-11):** when a non-strict phase has a successful
-runtime-target preflight, ACP repeats the live app identity probe and rereads the
-latest persisted trusted runtime-driver resource evidence before each configured
-QC/integration command. The resource reread does not rerun the host probe: a
-replacement is detected only if the changed state is reflected in those stored
-rows. Each `runtime_target_revalidation` receipt references
-the exact preflight receipt and command-plan digest. A changed required-target
-resource snapshot or failed/mismatched identity check blocks that command before
-launch. This detects sampled replacement after preflight; it is not atomic with
-command launch, does not constrain which endpoint the command can reach, and
-does not make a target verified. A command can race the sample or ignore the
-provided manifest. `require_command_binding=true` remains fail-closed until the
+runtime-target preflight, ACP repeats the live app identity probe and refreshes
+the trusted runtime-driver resource view before each configured QC/integration
+command. For `namespace_runtime` resources, this invokes the read-only systemd
+probe and requires a valid active `InvocationID`; the ID is bound into the target
+resource snapshot and its hash. The sample time is recorded separately on the
+overall manifest and receipt and covered by their full evidence hashes; it is
+not part of `resource_snapshot_sha256`. Missing or inconsistent live identity
+blocks a required target, while a changed invocation ID invalidates the
+preflight snapshot. Other driver kinds, including Docker, still use their
+latest persisted trusted-driver evidence. Each `runtime_target_revalidation`
+receipt references the exact preflight receipt and command-plan digest. This
+detects sampled unit replacement after preflight; it is not atomic with command
+launch, does not constrain which endpoint the command can reach, and does not
+make a target verified. A command can race the sample or ignore the provided
+manifest. `require_command_binding=true` remains fail-closed until the
 broker-owned executor enforces and attests command networking.
 
 ## Claims that must not be conflated

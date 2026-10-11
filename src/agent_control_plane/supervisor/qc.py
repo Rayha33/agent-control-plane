@@ -661,11 +661,15 @@ class QcMixin:
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
                     if phase_targets:
                         fence_sha = sha256(str(submission["resource_tokens_json"]).encode("utf-8"))
+                        driver_resource_rows, live_runtime_sample = (
+                            self._runtime_target_driver_snapshot(submission["attempt_id"])
+                        )
                         receipt, target_env, blocked = runtime_target_phase(
                             definitions=phase_targets,
                             commands=self.config.qc_commands,
                             runtime_environment=runtime_env,
-                            driver_resources=self.driver_resources(submission["attempt_id"]),
+                            driver_resources=driver_resource_rows,
+                            live_runtime_sample=live_runtime_sample,
                             attempt_id=str(submission["attempt_id"]),
                             task_id=str(submission["task_id"]),
                             claim_token=int(attempt["claim_token"]),
@@ -713,11 +717,15 @@ class QcMixin:
                 self._restore_candidate(qc_dir, submission["commit_sha"])
                 target_freshness_link: dict[str, Any] | None = None
                 if target_preflight_receipt is not None:
+                    driver_resource_rows, live_runtime_sample = (
+                        self._runtime_target_driver_snapshot(submission["attempt_id"])
+                    )
                     freshness_receipt, freshness_env, freshness_blocked = runtime_target_phase(
                         definitions=phase_targets,
                         commands=self.config.qc_commands,
                         runtime_environment=runtime_env,
-                        driver_resources=self.driver_resources(submission["attempt_id"]),
+                        driver_resources=driver_resource_rows,
+                        live_runtime_sample=live_runtime_sample,
                         attempt_id=str(submission["attempt_id"]),
                         task_id=str(submission["task_id"]),
                         claim_token=int(attempt["claim_token"]),

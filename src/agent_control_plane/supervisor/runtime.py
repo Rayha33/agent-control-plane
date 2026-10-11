@@ -734,6 +734,21 @@ class RuntimeMixin:
             "live_sample": self._fresh_runtime_usage_sample(attempt_id),
         }
 
+    def _runtime_target_driver_snapshot(
+        self, attempt_id: str
+    ) -> tuple[list[dict[str, Any]], Mapping[str, Any] | None]:
+        """Return persisted resource rows together with their read-only live sample."""
+
+        snapshot = self.driver_resources(attempt_id, fresh=True)
+        if not isinstance(snapshot, Mapping):
+            return snapshot if isinstance(snapshot, list) else [], None
+        resources = snapshot.get("resources")
+        live_sample = snapshot.get("live_sample")
+        return (
+            resources if isinstance(resources, list) else [],
+            live_sample if isinstance(live_sample, Mapping) else None,
+        )
+
     def _fresh_runtime_usage_sample(self, attempt_id: str) -> dict[str, Any]:
         """Read current cgroup counters without persisting probe evidence."""
 
@@ -798,6 +813,14 @@ class RuntimeMixin:
                 error_code = "systemd_absence_conflict"
             if error_code is None and not observation_ok:
                 error_code = "runtime_probe_unavailable"
+            live_invocation_id = observation.get("systemd_unit_invocation_id")
+            identity_available = bool(
+                observation_ok
+                and active_state == "active"
+                and error_code is None
+                and isinstance(live_invocation_id, str)
+                and re.fullmatch(r"[0-9a-f]{32}", live_invocation_id)
+            )
             drivers.append(
                 {
                     "driver": item.driver,
@@ -805,6 +828,14 @@ class RuntimeMixin:
                     "present": present,
                     "available": available,
                     "error_code": error_code,
+                    # Expose only the live unit incarnation when systemd
+                    # returned a clean, active observation. Persisted setup
+                    # evidence can lag a restart and must not stand in for this
+                    # read-only identity sample.
+                    "systemd_unit_invocation_id": (
+                        live_invocation_id if identity_available else None
+                    ),
+                    "identity_available": identity_available,
                     # systemd can return useful-looking partial stdout alongside
                     # an error, and inactive-unit counters can reflect stale
                     # state. Only an active, successful probe is a current sample.

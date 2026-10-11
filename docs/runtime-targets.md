@@ -67,14 +67,19 @@ single known ID if the app reports `container_id` or `process_identity`. If the
 driver cannot expose that identity, the receipt says
 `host_identity.status = "unknown"`; ACP does not invent a PID or container ID.
 Each target receipt also carries allowlisted `resource_snapshots` for its API,
-database, and queue drivers, including their resource IDs and any host-captured
-container or systemd invocation identities. A `resource_snapshot_sha256` binds
-that exact snapshot into the target manifest and receipt. ACP omits raw driver
-stdout/stderr and credential data. If the driver's supplied evidence contains a
-changed host identity, that change alters the snapshot digest even when the
-resource ID is stable. This is a snapshot of supplied driver evidence, not a
-live revalidation: it cannot detect a replacement the driver has not observed,
-and it does not prove that QC/integration reached those resources.
+database, and queue drivers. These bind resource IDs and stored host identities
+to the target receipt with `resource_snapshot_sha256`. For
+`namespace_runtime` drivers, both preflight and each pre-command revalidation
+also run the existing read-only systemd probe and include its validated active
+`InvocationID` in the target resource snapshot and its hash. The sample time is
+recorded separately on the overall manifest and receipt and covered by their
+full evidence hashes; it is not part of `resource_snapshot_sha256`. A missing, malformed, inactive,
+or inconsistent live ID blocks a required target; a changed ID changes the
+snapshot even if the unit name is stable. Other driver kinds, including Docker,
+still use their latest persisted trusted-driver identity evidence. ACP omits raw
+driver stdout/stderr and credential data. This is sampled lifecycle evidence,
+not socket attribution: it does not prove that QC/integration reached those
+resources or close the race between sampling and command launch.
 
 During a target-aware restart ACP supplies the attempt/task/claim identity,
 phase, phase checkout, and exact source revision to the trusted runtime drivers
