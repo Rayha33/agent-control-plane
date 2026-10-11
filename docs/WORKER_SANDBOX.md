@@ -540,6 +540,29 @@ their process-local provenance. This naming guard narrows one adoption/replay
 ambiguity but does not implement monitor startup, authenticated reconnect, or
 worker execution.
 
+**Write-ahead runc submission latch (schema v28; fail-closed primitive).** A
+supervised monitor must now commit a one-time receipt for the exact pinned
+private-bundle target immediately before the launcher's exec acknowledgement.
+The `reserved -> launched` journal transition requires that receipt, and the
+SQLite write guard prevents a second authorization for the same fenced
+execution. If the monitor dies after the latch but before it records the
+returned process handle, a restarted process cannot resubmit; it must reconcile
+the exact runtime state or retain the attempt fence. This deliberately favors
+duplicate-launch safety over automatic retry when the crash point is ambiguous.
+The callback returns a process-local capability that the private launcher
+stores in the registry record for the exact returned handle; journal recording
+checks object identity against that handle. Before sending the exec
+acknowledgement, the launcher rejects missing, unrelated, or differently
+targeted callback results. A capability minted after an unjournaled handle
+already exists cannot be paired with it. Unit coverage exercises
+commit-before-marker ordering, post-launch pairing rejection, invalid callback
+results, and cross-process at-most-once authorization. It does not substitute
+for a live Linux launcher test.
+The callback and journal primitive are not wired to `run_worker`, and no
+production monitor owns the callback yet. They do not prove restart recovery,
+cleanup, cancellation, or worker isolation; OCI worker execution remains
+fail-closed.
+
 ### Cleanup proof boundary (2026-10-11; architecture/QC decision)
 
 Do not add a standalone observer that writes `cleanup_verified`. The current

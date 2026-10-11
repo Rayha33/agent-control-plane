@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import sqlite3
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -82,6 +83,52 @@ def _request_stop_from_fresh_process(
         result_sender.close()
 
 
+def _retry_launch_submission_from_fresh_process(
+    repo: Path,
+    attempt_id: str,
+    claim_token: int,
+    target: oci_worker._RuncLaunchTarget,
+    result_sender,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    try:
+        supervisor._sandbox_execution_authorize_launch_submission(
+            attempt_id,
+            claim_token,
+            launch_target=target,
+        )
+    except SupervisorError as error:
+        result_sender.send(error.code)
+    else:
+        result_sender.send("unexpected_second_submission_authorized")
+    finally:
+        result_sender.close()
+
+
+def _race_launch_submission_from_fresh_process(
+    repo: Path,
+    attempt_id: str,
+    claim_token: int,
+    target: oci_worker._RuncLaunchTarget,
+    start_event,
+    result_sender,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    start_event.wait(timeout=10)
+    try:
+        submission = supervisor._sandbox_execution_authorize_launch_submission(
+            attempt_id,
+            claim_token,
+            launch_target=target,
+        )
+    except SupervisorError as error:
+        result_sender.send(("error", error.code))
+    else:
+        result_sender.send(("ok", submission.submission_id))
+    finally:
+        result_sender.close()
+
+
 def configure_test_sandbox_pins(supervisor: GitSupervisor) -> None:
     if (
         supervisor.config.oci_rootfs_pin is not None
@@ -128,6 +175,36 @@ class _TestRuncProcess:
         self.returncode: int | None = None
 
 
+_TEST_RUNC_LAUNCH_SPECS: dict[int, tuple[weakref.ReferenceType, dict[str, object]]] = {}
+
+
+def _test_runc_launch_spec(handle: oci_worker.RuncLaunchHandle) -> dict[str, object] | None:
+    registered = _TEST_RUNC_LAUNCH_SPECS.get(id(handle))
+    if registered is None or registered[0]() is not handle:
+        return None
+    return registered[1]
+
+
+def _register_test_runc_launch(
+    handle: oci_worker.RuncLaunchHandle,
+    *,
+    launch_submission: object | None,
+) -> None:
+    spec = _test_runc_launch_spec(handle)
+    assert spec is not None
+
+    oci_worker._register_runc_launch_handle(
+        handle,
+        process=spec["process"],
+        process_identity=spec["identity"],
+        target=spec["target"],
+        launch_submission=launch_submission,
+        _test_waitpid=spec["test_waitpid"],
+        _test_identity_reader=spec["identity_reader"],
+    )
+    _TEST_RUNC_LAUNCH_SPECS.pop(id(handle), None)
+
+
 def _test_runc_handle(
     *,
     target: oci_worker._RuncLaunchTarget | None = None,
@@ -148,13 +225,23 @@ def _test_runc_handle(
         def test_waitpid(pid: int, _options: int) -> tuple[int, int]:
             return pid, exit_code << 8
 
-        oci_worker._register_runc_launch_handle(
-            handle,
-            process=process,
-            process_identity=identity,
-            target=target,
-            _test_waitpid=test_waitpid,
-            _test_identity_reader=lambda pid: identity if pid == process.pid else None,
+        handle_id = id(handle)
+
+        def discard(reference: weakref.ReferenceType) -> None:
+            current = _TEST_RUNC_LAUNCH_SPECS.get(handle_id)
+            if current is not None and current[0] is reference:
+                _TEST_RUNC_LAUNCH_SPECS.pop(handle_id, None)
+
+        reference = weakref.ref(handle, discard)
+        _TEST_RUNC_LAUNCH_SPECS[id(handle)] = (
+            reference,
+            {
+                "process": process,
+                "identity": identity,
+                "target": target,
+                "test_waitpid": test_waitpid,
+                "identity_reader": lambda pid: identity if pid == process.pid else None,
+            },
         )
     return handle
 
@@ -315,16 +402,111 @@ def test_wrong_first_attempt_cannot_claim_runc_handle_provenance(repo: Path) -> 
     first_attempt = claimed(supervisor)
     first_execution = reserve(supervisor, first_attempt)
     second_attempt = claimed(supervisor, "beta.txt")
-    second_execution = reserve(supervisor, second_attempt)
+    reserve(supervisor, second_attempt)
     handle = _test_runc_handle(target=_test_runc_target(first_execution))
+    assert record_launch(supervisor, first_attempt, runc_handle=handle)["phase"] == "launched"
 
     with pytest.raises(SupervisorError) as wrong_first_binding:
         record_launch(supervisor, second_attempt, runc_handle=handle)
 
     assert wrong_first_binding.value.code == "sandbox_execution_launch_target_mismatch"
     assert supervisor._sandbox_execution_get(second_attempt["id"])["phase"] == "reserved"
-    assert record_launch(supervisor, first_attempt, runc_handle=handle)["phase"] == "launched"
-    assert second_execution["phase"] == "reserved"
+
+
+def test_launch_submission_commit_precedes_fake_runc_exec_marker(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+
+    # This models the launcher's callback boundary: the durable transaction
+    # commits before the fake runc marker and its exact handle are registered.
+    def authorize_before_exec(launch_target):
+        submission = supervisor._sandbox_execution_authorize_launch_submission(
+            attempt["id"], attempt["claim_token"], launch_target=launch_target
+        )
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable is not None
+        assert durable["phase"] == "reserved"
+        assert durable["launch_submission_id"] == submission.submission_id
+        return submission
+
+    submission = oci_worker._authorize_runc_submission_before_exec(authorize_before_exec, target)
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+
+    fake_runc_exec_marker = f"exec-ack:{submission.submission_id}"
+    handle = _test_runc_handle(target=target)
+    _register_test_runc_launch(handle, launch_submission=submission)
+    attempt["_test_launch_submission"] = submission
+    assert fake_runc_exec_marker == f"exec-ack:{durable['launch_submission_id']}"
+    assert oci_worker._runc_launch_submission_is_bound_to_handle(handle, submission)
+
+    assert record_launch(supervisor, attempt, runc_handle=handle)["phase"] == "launched"
+
+
+@pytest.mark.parametrize("callback_result", ["none", "unrelated", "other_target"])
+def test_private_launcher_rejects_missing_or_mismatched_capability_before_exec_ack(
+    repo: Path,
+    callback_result: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+    fake_exec_ack: list[str] = []
+
+    def authorize(launch_target):
+        if callback_result == "none":
+            return None
+        if callback_result == "unrelated":
+            return object()
+        wrong_target = replace(launch_target, config_sha256="c" * 64)
+        return supervisor._sandbox_execution_authorize_launch_submission(
+            attempt["id"],
+            attempt["claim_token"],
+            launch_target=wrong_target,
+        )
+
+    with pytest.raises(SupervisorError) as rejected:
+        submission = oci_worker._authorize_runc_submission_before_exec(authorize, target)
+        fake_exec_ack.append(f"exec-ack:{submission.submission_id}")
+
+    assert rejected.value.code == "sandbox_execution_launch_submission_required"
+    assert fake_exec_ack == []
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+    assert durable["phase"] == "reserved"
+    if callback_result == "other_target":
+        assert durable["launch_submission_id"]
+    else:
+        assert durable["launch_submission_id"] == ""
+
+
+def test_post_launch_authorization_cannot_be_paired_with_existing_handle(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+    handle = _test_runc_handle(target=target)
+
+    # Model an unjournaled submission first, then an attacker attempting to
+    # authorize the same target after the handle already exists.
+    _register_test_runc_launch(handle, launch_submission=None)
+    submission = supervisor._sandbox_execution_authorize_launch_submission(
+        attempt["id"], attempt["claim_token"], launch_target=target
+    )
+    attempt["_test_launch_submission"] = submission
+
+    assert not oci_worker._runc_launch_submission_is_bound_to_handle(handle, submission)
+    with pytest.raises(SupervisorError) as rejected:
+        record_launch(supervisor, attempt, runc_handle=handle)
+
+    assert rejected.value.code == "sandbox_execution_launch_submission_required"
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+    assert durable["phase"] == "reserved"
+    assert durable["launch_submission_id"] == submission.submission_id
 
 
 def test_diagnostic_runc_handle_cannot_be_recorded_as_supervised(repo: Path) -> None:
@@ -639,6 +821,9 @@ def test_generic_transition_cannot_forge_launch_plan_binding(repo: Path) -> None
     execution = reserve(supervisor, attempt)
     target = _test_runc_target(execution)
     updates = launch_transition_updates(execution, target)
+    supervisor._sandbox_execution_authorize_launch_submission(
+        attempt["id"], attempt["claim_token"], launch_target=target
+    )
 
     with pytest.raises(sqlite3.IntegrityError, match="sandbox_launch_plan_binding_required"):
         supervisor._sandbox_execution_transition(
@@ -679,6 +864,9 @@ def test_launch_transition_rejects_mismatched_config_or_argv(repo: Path, mismatc
     execution = reserve(supervisor, attempt)
     target = _test_runc_target(execution)
     updates = launch_transition_updates(execution, target)
+    supervisor._sandbox_execution_authorize_launch_submission(
+        attempt["id"], attempt["claim_token"], launch_target=target
+    )
     plan = json.loads(updates["launch_plan_json"])
     if mismatch == "config":
         plan["launch"]["config_sha256"] = "f" * 64
@@ -820,7 +1008,10 @@ def test_concurrent_launch_plan_binding_has_one_durable_winner(repo: Path) -> No
     errors = [value for kind, value in results if kind == "error"]
     assert len(errors) == 1
     assert isinstance(errors[0], SupervisorError)
-    assert errors[0].code == "sandbox_execution_transition_invalid"
+    assert errors[0].code in {
+        "sandbox_execution_transition_invalid",
+        "sandbox_execution_launch_submission_exists",
+    }
     durable = supervisor._sandbox_execution_get(attempt["id"])
     assert durable["phase"] == "launched"
     assert durable["launch_plan_binding_version"] == 1
@@ -1505,6 +1696,36 @@ def record_launch(
     attempt["_test_runc_handle"] = runc_handle
     execution = supervisor._sandbox_execution_get(attempt["id"])
     assert execution is not None
+    launch_record = oci_worker._runc_launch_record(runc_handle)
+    launch_target = (
+        launch_record.target
+        if launch_record is not None
+        else (_test_runc_launch_spec(runc_handle) or {}).get("target")
+    )
+    launch_submission = attempt.get("_test_launch_submission")
+    if launch_record is None and launch_target is not None:
+        if launch_target.launch_mode == "private_bundle" and launch_submission is None:
+            # The synthetic launcher calls the durable callback first, then
+            # captures its returned capability in the exact registered handle.
+            launch_submission = supervisor._sandbox_execution_authorize_launch_submission(
+                attempt["id"],
+                attempt["claim_token"],
+                launch_target=launch_target,
+            )
+            attempt["_test_launch_submission"] = launch_submission
+        _register_test_runc_launch(
+            runc_handle,
+            launch_submission=launch_submission,
+        )
+        launch_record = oci_worker._runc_launch_record(runc_handle)
+    if launch_record is not None and launch_submission is None:
+        launch_submission = launch_record.launch_submission
+    if launch_target is None and launch_record is not None:
+        launch_target = launch_record.target
+    if launch_target is not None and launch_submission is None:
+        launch_submission = attempt.get("_test_launch_submission")
+    if launch_submission is not None:
+        attempt["_test_launch_submission"] = launch_submission
     slice_unit = oci_worker._oci_worker_systemd_slice(execution["container_id"])
     common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
     wrapper_unit = wrapper_unit or journal_module._sandbox_monitor_service_unit(
@@ -1517,6 +1738,7 @@ def record_launch(
         monitor_pid=101,
         monitor_identity="linux:101:1101",
         runc_handle=runc_handle,
+        launch_submission=launch_submission,
         wrapper_unit=wrapper_unit,
         wrapper_invocation_id="1" * 32,
         wrapper_cgroup_path=wrapper_cgroup_path or f"{common_cgroup}/{wrapper_unit}",
@@ -1527,6 +1749,114 @@ def record_launch(
         scope_invocation_id="2" * 32,
         cgroup_path=f"{slice_cgroup}/acp-container.scope",
     )
+
+
+def test_launch_submission_is_not_retried_after_monitor_restart(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+
+    # Model the monitor's durable callback immediately before runc submission,
+    # then lose its process-local capability before record_launch can commit.
+    submission = supervisor._sandbox_execution_authorize_launch_submission(
+        attempt["id"], attempt["claim_token"], launch_target=target
+    )
+    stranded = supervisor._sandbox_execution_get(attempt["id"])
+    assert stranded is not None
+    assert stranded["phase"] == "reserved"
+    assert stranded["launch_submission_id"] == submission.submission_id
+    assert stranded["launch_submission_digest"] == submission.submission_digest
+    assert stranded["launch_submission_at"]
+
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_retry_launch_submission_from_fresh_process,
+        args=(repo, attempt["id"], attempt["claim_token"], target, child),
+    )
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(10)
+        retry_result = parent.recv()
+    finally:
+        parent.close()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+    assert process.exitcode == 0
+    assert retry_result == "sandbox_execution_launch_submission_exists"
+    after_restart = supervisor._sandbox_execution_get(attempt["id"])
+    assert after_restart is not None
+    assert after_restart["phase"] == "reserved"
+    assert after_restart["launch_submission_id"] == submission.submission_id
+
+
+def test_concurrent_fresh_processes_consume_only_one_launch_submission(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    workers = []
+    receivers = []
+
+    for _ in range(2):
+        parent, child = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_race_launch_submission_from_fresh_process,
+            args=(repo, attempt["id"], attempt["claim_token"], target, start_event, child),
+        )
+        process.start()
+        child.close()
+        workers.append(process)
+        receivers.append(parent)
+
+    start_event.set()
+    try:
+        results = []
+        for receiver in receivers:
+            assert receiver.poll(15)
+            results.append(receiver.recv())
+    finally:
+        for receiver in receivers:
+            receiver.close()
+        for process in workers:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert [process.exitcode for process in workers] == [0, 0]
+    assert [kind for kind, _value in results].count("ok") == 1
+    assert results.count(("error", "sandbox_execution_launch_submission_exists")) == 1
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+    assert durable["phase"] == "reserved"
+    assert durable["launch_submission_id"]
+    assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_sql_cannot_forge_launch_submission(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+
+    with supervisor.connect() as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_launch_submission_must_be_authorized_once",
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET launch_submission_id = ?, "
+                "launch_submission_digest = ?, launch_submission_at = ? WHERE attempt_id = ?",
+                ("a" * 32, "b" * 64, "2026-10-11T00:00:00+00:00", attempt["id"]),
+            )
+
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
 def test_launch_rejects_monitor_in_sibling_attempt_slice(repo: Path) -> None:
@@ -1932,7 +2262,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 27
+    assert SCHEMA_VERSION == 28
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -2267,7 +2597,7 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
             match=(
                 "workspace_binding_required|private_paths_required|"
                 "sandbox_execution_launch_plan_required|attempt_slice_identity_required|"
-                "phase_transition_invalid"
+                "sandbox_execution_launch_submission_required|phase_transition_invalid"
             ),
         ),
     ):
@@ -3187,6 +3517,7 @@ def test_runc_wait_receipt_must_match_durable_pid_start_identity(repo: Path) -> 
     execution = supervisor._sandbox_execution_get(attempt["id"])
     assert execution is not None
     wrong_handle = _test_runc_handle(target=_test_runc_target(execution), start_ticks=9999)
+    _register_test_runc_launch(wrong_handle, launch_submission=None)
     oci_worker._runc_launch_handle_bind_execution(
         wrong_handle,
         attempt["id"],

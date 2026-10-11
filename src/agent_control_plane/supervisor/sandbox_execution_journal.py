@@ -17,9 +17,12 @@ import json
 import re
 import sqlite3
 import stat
+import threading
 import time
 import uuid
+import weakref
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -29,6 +32,7 @@ from .oci_worker import (
     _authorize_runc_launch_gate_release_locked,
     _oci_worker_systemd_slice,
     _private_directory,
+    _register_runc_launch_submission_target,
     _revoke_runc_launch_gate_release_locked,
     _runc_client_wait_receipt_is_self_consistent,
     _runc_launch_gate_lock_for_execution,
@@ -37,8 +41,10 @@ from .oci_worker import (
     _runc_launch_handle_is_self_consistent,
     _runc_launch_pid,
     _runc_launch_process_identity,
+    _runc_launch_submission_is_bound_to_handle,
     _runc_launch_target,
     _RuncClientWaitReceipt,
+    _RuncLaunchTarget,
 )
 from .sandbox_attestation import (
     RunningRuntimeAttestation,
@@ -62,6 +68,7 @@ from .sandbox_workspace import collect_changes as _collect_changes
 from .store import (
     _authorize_sandbox_exit_receipt_write,
     _authorize_sandbox_launch_plan_write,
+    _authorize_sandbox_launch_submission_write,
     _authorize_sandbox_reservation_write,
 )
 
@@ -112,6 +119,130 @@ _TRANSITION_FIELDS = {
     ("running", "stopping"): frozenset({"stop_reason"}),
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
 }
+
+
+@dataclass(eq=False, frozen=True, slots=True, weakref_slot=True)
+class _SandboxLaunchSubmission:
+    """Process-local authority returned only after the durable pre-runc latch."""
+
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    submission_id: str
+    submission_digest: str
+
+
+_SANDBOX_LAUNCH_SUBMISSIONS: dict[
+    int, tuple[weakref.ReferenceType[_SandboxLaunchSubmission], tuple[str, int, str, str, str]]
+] = {}
+_SANDBOX_LAUNCH_SUBMISSIONS_LOCK = threading.Lock()
+
+
+def _register_sandbox_launch_submission(
+    submission: _SandboxLaunchSubmission,
+) -> None:
+    key = id(submission)
+    fields = (
+        submission.attempt_id,
+        submission.claim_token,
+        submission.execution_id,
+        submission.submission_id,
+        submission.submission_digest,
+    )
+
+    def discard(reference: weakref.ReferenceType[_SandboxLaunchSubmission]) -> None:
+        with _SANDBOX_LAUNCH_SUBMISSIONS_LOCK:
+            current = _SANDBOX_LAUNCH_SUBMISSIONS.get(key)
+            if current is not None and current[0] is reference:
+                _SANDBOX_LAUNCH_SUBMISSIONS.pop(key, None)
+
+    reference = weakref.ref(submission, discard)
+    with _SANDBOX_LAUNCH_SUBMISSIONS_LOCK:
+        _SANDBOX_LAUNCH_SUBMISSIONS[key] = (reference, fields)
+
+
+def _sandbox_launch_submission_is_self_consistent(
+    submission: Any,
+    *,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    submission_digest: str,
+) -> bool:
+    if type(submission) is not _SandboxLaunchSubmission:
+        return False
+    expected = (
+        attempt_id,
+        claim_token,
+        execution_id,
+        submission.submission_id,
+        submission_digest,
+    )
+    with _SANDBOX_LAUNCH_SUBMISSIONS_LOCK:
+        registered = _SANDBOX_LAUNCH_SUBMISSIONS.get(id(submission))
+        return (
+            registered is not None and registered[0]() is submission and registered[1] == expected
+        )
+
+
+def _sandbox_launch_submission_digest(row: Any, target: _RuncLaunchTarget) -> str:
+    """Bind the one-use launch latch to the exact descriptor-backed runc target."""
+
+    if type(target) is not _RuncLaunchTarget or target.launch_mode != "private_bundle":
+        raise SupervisorError(
+            "sandbox_execution_launch_target_mismatch",
+            "launch submission requires the pinned private-bundle runc target",
+        )
+    expected_paths = (
+        (target.bundle_path, row["bundle_path"]),
+        (target.bundle_device, row["bundle_root_dev"]),
+        (target.bundle_inode, row["bundle_root_ino"]),
+        (target.rootfs_path, str(Path(row["bundle_path"]) / "rootfs")),
+        (target.rootfs_sha256, row["rootfs_digest"]),
+        (target.rootfs_closure_sha256, row["rootfs_closure_digest"]),
+        (target.state_path, row["state_path"]),
+        (target.state_device, row["state_root_dev"]),
+        (target.state_inode, row["state_root_ino"]),
+        (target.workspace_path, row["workspace_root_path"]),
+        (target.workspace_device, row["workspace_root_dev"]),
+        (target.workspace_inode, row["workspace_root_ino"]),
+        (target.container_id, row["container_id"]),
+        (target.runc_executable_sha256, row["runc_executable_digest"]),
+    )
+    if (
+        any(actual != expected for actual, expected in expected_paths)
+        or target.pid_file_path is None
+        or Path(target.pid_file_path).parent != Path(row["state_path"])
+        or not isinstance(target.config_sha256, str)
+        or _DIGEST.fullmatch(target.config_sha256) is None
+        or not isinstance(target.argv, tuple)
+        or any(not isinstance(value, str) or not value for value in target.argv)
+        or any(
+            type(value) is not int or value <= 0
+            for value in (
+                target.memory_limit_bytes,
+                target.cpu_quota,
+                target.cpu_period,
+                target.pids_limit,
+            )
+        )
+    ):
+        raise SupervisorError(
+            "sandbox_execution_launch_target_mismatch",
+            "pre-runc target does not match the exact durable reservation",
+        )
+    target_fields = {
+        name: (list(value) if name == "argv" else value)
+        for name, value in ((name, getattr(target, name)) for name in target.__dataclass_fields__)
+    }
+    material = {
+        "version": 1,
+        "attempt_id": row["attempt_id"],
+        "claim_token": row["claim_token"],
+        "execution_id": row["execution_id"],
+        "target": target_fields,
+    }
+    return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
 def _sandbox_container_id(attempt_id: str, claim_token: int, execution_id: str) -> str:
@@ -1638,6 +1769,15 @@ class SandboxExecutionJournalMixin:
                         "sandbox_execution_content_pins_required",
                         "sandbox launch requires pinned rootfs closure and runc executable digests",
                     )
+                if (
+                    not row["launch_submission_id"]
+                    or not row["launch_submission_digest"]
+                    or not row["launch_submission_at"]
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_launch_submission_required",
+                        "launch transition requires the durable pre-runc submission latch",
+                    )
             fields = ", ".join(f"{name} = ?" for name in updates)
             changed = connection.execute(
                 f"UPDATE sandbox_executions SET {fields}, phase = ?, updated_at = ? "
@@ -1673,6 +1813,132 @@ class SandboxExecutionJournalMixin:
             ).fetchone()
         return self._sandbox_execution_view(updated)
 
+    def _sandbox_execution_authorize_launch_submission(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        *,
+        launch_target: _RuncLaunchTarget,
+        credential: str | None = None,
+    ) -> _SandboxLaunchSubmission:
+        """Durably consume the one launch opportunity immediately before runc exec.
+
+        The caller invokes this from the launcher's pre-submission callback. The
+        commit intentionally precedes the byte that releases the private launcher
+        into ``execve``. If the monitor dies after the commit, the attempt stays
+        fenced and cannot be submitted a second time until an exact reconciler can
+        prove what happened.
+        """
+
+        attempt_id = self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if attempt["status"] != "working":
+                raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+            self._authenticate_attempt(connection, attempt, credential)
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if not row:
+                raise SupervisorError("sandbox_execution_not_found", "execution was not reserved")
+            if row["claim_token"] != claim_token:
+                raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
+            if row["phase"] != "reserved":
+                raise SupervisorError(
+                    "sandbox_execution_transition_invalid",
+                    f"expected phase reserved, found {row['phase']}; fence retained",
+                )
+            if row["launch_submission_id"] or row["launch_submission_at"]:
+                raise SupervisorError(
+                    "sandbox_execution_launch_submission_exists",
+                    "this fenced execution already consumed its only runc submission opportunity",
+                )
+            if row["launch_plan_required"] != 1:
+                raise SupervisorError(
+                    "sandbox_execution_launch_plan_required",
+                    "launch submission requires the fully pinned workspace and runtime reservation",
+                )
+            if row["workspace_binding_version"] != 1:
+                raise SupervisorError(
+                    "sandbox_workspace_unbound",
+                    "launch submission requires a durable baseline/workspace binding",
+                )
+            if row["private_path_binding_version"] != 1:
+                raise SupervisorError(
+                    "sandbox_private_path_unbound",
+                    "launch submission requires exact private bundle/state directory identities",
+                )
+            if any(
+                _DIGEST.fullmatch(row[name] or "") is None
+                for name in ("rootfs_closure_digest", "runc_executable_digest")
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_content_pins_required",
+                    "launch submission requires pinned rootfs closure and runc executable digests",
+                )
+            submission_digest = _sandbox_launch_submission_digest(row, launch_target)
+            submission_id = uuid.uuid4().hex
+            submission = _SandboxLaunchSubmission(
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                execution_id=row["execution_id"],
+                submission_id=submission_id,
+                submission_digest=submission_digest,
+            )
+            _register_sandbox_launch_submission(submission)
+            try:
+                with _authorize_sandbox_launch_submission_write(
+                    connection,
+                    attempt_id,
+                    claim_token,
+                    row["execution_id"],
+                    submission_id,
+                    submission_digest,
+                ):
+                    changed = connection.execute(
+                        "UPDATE sandbox_executions SET launch_submission_id = ?, "
+                        "launch_submission_digest = ?, launch_submission_at = ?, updated_at = ? "
+                        "WHERE attempt_id = ? AND claim_token = ? AND phase = 'reserved' "
+                        "AND launch_submission_id = '' AND launch_submission_digest = '' "
+                        "AND launch_submission_at = ''",
+                        (
+                            submission_id,
+                            submission_digest,
+                            utc_now(),
+                            utc_now(),
+                            attempt_id,
+                            claim_token,
+                        ),
+                    ).rowcount
+                if changed != 1:
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "launch submission latch changed concurrently; attempt fence retained",
+                    )
+                self._event(
+                    connection,
+                    "sandbox.execution_launch_submission_authorized",
+                    attempt["agent_id"],
+                    {
+                        "attempt_id": attempt_id,
+                        "claim_token": claim_token,
+                        "execution_id": row["execution_id"],
+                        "submission_id": submission_id,
+                        "submission_digest": submission_digest,
+                        "boundary": "before_private_runc_exec_ack",
+                    },
+                )
+            except BaseException:
+                with _SANDBOX_LAUNCH_SUBMISSIONS_LOCK:
+                    registered = _SANDBOX_LAUNCH_SUBMISSIONS.get(id(submission))
+                    if registered is not None and registered[0]() is submission:
+                        _SANDBOX_LAUNCH_SUBMISSIONS.pop(id(submission), None)
+                raise
+        _register_runc_launch_submission_target(submission, launch_target)
+        return submission
+
     def _sandbox_execution_record_launch(
         self,
         attempt_id: str,
@@ -1681,6 +1947,7 @@ class SandboxExecutionJournalMixin:
         monitor_pid: int,
         monitor_identity: str,
         runc_handle: RuncLaunchHandle,
+        launch_submission: _SandboxLaunchSubmission,
         wrapper_unit: str,
         wrapper_invocation_id: str,
         wrapper_cgroup_path: str,
@@ -1797,6 +2064,25 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_transition_invalid",
                 f"expected phase reserved, found {durable_execution['phase']}; fence retained",
+            )
+        submission_digest = _sandbox_launch_submission_digest(durable_execution, launch_target)
+        if (
+            durable_execution["launch_submission_id"]
+            != getattr(launch_submission, "submission_id", None)
+            or durable_execution["launch_submission_digest"] != submission_digest
+            or not durable_execution["launch_submission_at"]
+            or not _sandbox_launch_submission_is_self_consistent(
+                launch_submission,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                execution_id=durable_execution["execution_id"],
+                submission_digest=submission_digest,
+            )
+            or not _runc_launch_submission_is_bound_to_handle(runc_handle, launch_submission)
+        ):
+            raise SupervisorError(
+                "sandbox_execution_launch_submission_required",
+                "launch recording requires the exact process-local pre-runc submission capability",
             )
         if durable_execution["bundle_digest_semantics"] == _LEGACY_BUNDLE_DIGEST_SEMANTICS:
             raise SupervisorError(
