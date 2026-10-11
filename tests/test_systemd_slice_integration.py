@@ -11,11 +11,9 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import selectors
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +30,15 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     read_linux_process_snapshot,
     validate_running_runtime_attestation,
     verify_running_runtime_systemd_units,
+)
+from agent_control_plane.supervisor.sandbox_monitor_receipt import (
+    SandboxMonitorReceipt,
+    read_sandbox_monitor_receipt,
+    sandbox_attempt_slice_unit,
+    sandbox_container_id,
+    sandbox_monitor_service_unit,
+    validate_monitor_service_reconciliation,
+    write_sandbox_monitor_receipt,
 )
 
 _ENABLED = os.environ.get("ACP_RUN_SYSTEMD_SLICE_INTEGRATION") == "1"
@@ -89,104 +96,13 @@ def _unit_properties(systemctl: str, unit: str) -> dict[str, str]:
 
 
 def _write_monitor_receipt(path: Path, receipt: dict[str, Any]) -> None:
-    """Persist the test controller's exact systemd identity before it is killed."""
+    """Use the production codec for the test controller's durable receipt."""
 
-    encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("ascii")
-    if len(encoded) > 4096:
-        raise RuntimeError("monitor receipt exceeded its bounded size")
-    temporary = path.with_name(f".{path.name}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-    descriptor = os.open(temporary, flags, 0o600)
-    try:
-        view = memoryview(encoded)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short write while persisting monitor receipt")
-            view = view[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
-    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    write_sandbox_monitor_receipt(path, SandboxMonitorReceipt.from_dict(receipt))
 
 
 def _read_monitor_receipt(path: Path) -> dict[str, Any]:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        info = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or info.st_mode & 0o077
-            or info.st_size <= 0
-            or info.st_size > 4096
-        ):
-            raise RuntimeError("monitor receipt is not a bounded private regular file")
-        chunks: list[bytes] = []
-        remaining = 4097
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 4096))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        encoded = b"".join(chunks)
-        if len(encoded) != info.st_size or len(encoded) > 4096:
-            raise RuntimeError("monitor receipt changed or exceeded its bound while reading")
-    finally:
-        os.close(descriptor)
-    receipt = json.loads(encoded.decode("ascii"))
-    expected = {
-        "version",
-        "controller_pid",
-        "unit",
-        "invocation_id",
-        "control_group",
-        "main_pid",
-        "main_identity",
-        "monitor_slice_unit",
-        "monitor_slice_control_group",
-        "slice_unit",
-        "slice_control_group",
-    }
-    if (
-        not isinstance(receipt, dict)
-        or set(receipt) != expected
-        or type(receipt["version"]) is not int
-        or receipt["version"] != 3
-    ):
-        raise RuntimeError("monitor receipt has an unsupported shape")
-    if (
-        type(receipt["controller_pid"]) is not int
-        or receipt["controller_pid"] <= 0
-        or type(receipt["main_pid"]) is not int
-        or receipt["main_pid"] <= 0
-        or not isinstance(receipt["main_identity"], str)
-        or re.fullmatch(rf"linux:{receipt['main_pid']}:[1-9][0-9]*", receipt["main_identity"])
-        is None
-        or not isinstance(receipt["invocation_id"], str)
-        or len(receipt["invocation_id"]) != 32
-        or any(char not in "0123456789abcdef" for char in receipt["invocation_id"])
-        or not all(
-            isinstance(receipt[name], str) and receipt[name]
-            for name in (
-                "unit",
-                "control_group",
-                "monitor_slice_unit",
-                "monitor_slice_control_group",
-                "slice_unit",
-                "slice_control_group",
-            )
-        )
-    ):
-        raise RuntimeError("monitor receipt contains an invalid identity")
-    return receipt
+    return read_sandbox_monitor_receipt(path).as_dict()
 
 
 def _start_monitor_controller(
@@ -196,6 +112,9 @@ def _start_monitor_controller(
     monitor_slice_unit: str,
     slice_unit: str,
     receipt_path: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
 ) -> None:
     """Start the trusted monitor outside the worker slice and fsync its receipt."""
 
@@ -233,8 +152,11 @@ def _start_monitor_controller(
     main_pid = int(service.get("MainPID", "0"))
     main_identity = ProcessMixin._process_identity(main_pid)
     receipt = {
-        "version": 3,
+        "version": 1,
         "controller_pid": os.getpid(),
+        "attempt_id": attempt_id,
+        "claim_token": claim_token,
+        "execution_id": execution_id,
         "unit": service_unit,
         "invocation_id": service["InvocationID"],
         "control_group": service["ControlGroup"],
@@ -242,8 +164,8 @@ def _start_monitor_controller(
         "main_identity": main_identity,
         "monitor_slice_unit": monitor_slice_unit,
         "monitor_slice_control_group": monitor_slice["ControlGroup"],
-        "slice_unit": slice_unit,
-        "slice_control_group": attempt_slice["ControlGroup"],
+        "attempt_slice_unit": slice_unit,
+        "attempt_slice_control_group": attempt_slice["ControlGroup"],
     }
     if main_pid <= 0 or main_pid == os.getpid() or main_identity is None:
         raise RuntimeError(
@@ -259,50 +181,20 @@ def _start_monitor_controller(
 def _reconcile_monitor_after_restart(systemctl: str, receipt_path: Path) -> dict[str, Any]:
     """Fresh-controller subprocess: adopt only the exact recorded unit activation."""
 
-    receipt = _read_monitor_receipt(receipt_path)
-    service = _unit_properties(systemctl, receipt["unit"])
-    monitor_slice = _unit_properties(systemctl, receipt["monitor_slice_unit"])
-    attempt_slice = _unit_properties(systemctl, receipt["slice_unit"])
-    expected_service = {
-        "Id": receipt["unit"],
-        "LoadState": "loaded",
-        "ActiveState": "active",
-        "InvocationID": receipt["invocation_id"],
-        "ControlGroup": receipt["control_group"],
-        "Slice": receipt["monitor_slice_unit"],
-        "MainPID": str(receipt["main_pid"]),
-    }
-    expected_monitor_slice = {
-        "Id": receipt["monitor_slice_unit"],
-        "LoadState": "loaded",
-        "ControlGroup": receipt["monitor_slice_control_group"],
-    }
-    expected_slice = {
-        "Id": receipt["slice_unit"],
-        "LoadState": "loaded",
-        "ActiveState": "active",
-        "ControlGroup": receipt["slice_control_group"],
-    }
-    if any(service.get(key) != value for key, value in expected_service.items()):
-        raise RuntimeError(f"monitor service no longer matches its durable receipt: {service}")
-    if any(monitor_slice.get(key) != value for key, value in expected_monitor_slice.items()):
-        raise RuntimeError(f"monitor slice no longer matches its durable receipt: {monitor_slice}")
-    if any(attempt_slice.get(key) != value for key, value in expected_slice.items()):
-        raise RuntimeError(f"attempt slice no longer matches its durable receipt: {attempt_slice}")
-    monitor_cgroup = PurePosixPath(service["ControlGroup"])
-    attempt_cgroup = PurePosixPath(attempt_slice["ControlGroup"])
-    if (
-        monitor_cgroup.parent.as_posix() != monitor_slice["ControlGroup"]
-        or monitor_cgroup.is_relative_to(attempt_cgroup)
-        or attempt_cgroup.is_relative_to(monitor_cgroup)
-    ):
-        raise RuntimeError("trusted monitor and worker attempt slice are not separated")
-    if ProcessMixin._process_identity(receipt["main_pid"]) != receipt["main_identity"]:
-        raise RuntimeError("recorded systemd monitor PID start identity changed or is absent")
-    if os.getpid() == receipt["controller_pid"]:
-        raise RuntimeError("reconciliation unexpectedly ran in the original controller process")
+    receipt = read_sandbox_monitor_receipt(receipt_path)
+    service = _unit_properties(systemctl, receipt.unit)
+    monitor_slice = _unit_properties(systemctl, receipt.monitor_slice_unit)
+    attempt_slice = _unit_properties(systemctl, receipt.attempt_slice_unit)
+    validate_monitor_service_reconciliation(
+        receipt,
+        service,
+        monitor_slice,
+        attempt_slice,
+        observed_main_identity=ProcessMixin._process_identity(receipt.main_pid),
+        reconciler_pid=os.getpid(),
+    )
     return {
-        "receipt": receipt,
+        "receipt": receipt.as_dict(),
         "service": service,
         "monitor_slice": monitor_slice,
         "slice": attempt_slice,
@@ -316,6 +208,9 @@ def _crash_controller_and_reconcile(
     monitor_slice_unit: str,
     slice_unit: str,
     receipt_path: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
 ) -> dict[str, Any]:
     controller = subprocess.Popen(
         [
@@ -328,6 +223,9 @@ def _crash_controller_and_reconcile(
             monitor_slice_unit,
             slice_unit,
             str(receipt_path),
+            attempt_id,
+            str(claim_token),
+            execution_id,
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -393,117 +291,6 @@ def _crash_controller_and_reconcile(
     if evidence.get("receipt") != receipt:
         raise RuntimeError("fresh reconciler did not consume the exact durable receipt")
     return evidence
-
-
-def test_monitor_receipt_round_trips_as_private_durable_identity(tmp_path: Path) -> None:
-    receipt = {
-        "version": 3,
-        "controller_pid": 101,
-        "unit": "acp-monitor-test.service",
-        "invocation_id": "a" * 32,
-        "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
-        "main_pid": 102,
-        "main_identity": "linux:102:12345",
-        "monitor_slice_unit": "app.slice",
-        "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
-        "slice_unit": "user-acp-test.slice",
-        "slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp-test.slice",
-    }
-    path = tmp_path / "monitor-receipt.json"
-
-    _write_monitor_receipt(path, receipt)
-
-    assert path.stat().st_mode & 0o777 == 0o600
-    assert _read_monitor_receipt(path) == receipt
-
-
-def test_monitor_receipt_rejects_symlinks_and_boolean_versions(tmp_path: Path) -> None:
-    import pytest
-
-    receipt = {
-        "version": 3,
-        "controller_pid": 101,
-        "unit": "acp-monitor-test.service",
-        "invocation_id": "a" * 32,
-        "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
-        "main_pid": 102,
-        "main_identity": "linux:102:12345",
-        "monitor_slice_unit": "app.slice",
-        "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
-        "slice_unit": "user-acp-test.slice",
-        "slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp-test.slice",
-    }
-    target = tmp_path / "receipt-target.json"
-    link = tmp_path / "receipt-link.json"
-    _write_monitor_receipt(target, receipt)
-    link.symlink_to(target)
-    with pytest.raises(OSError):
-        _read_monitor_receipt(link)
-
-    invalid = dict(receipt, version=True)
-    invalid_path = tmp_path / "boolean-version.json"
-    invalid_path.write_text(json.dumps(invalid), encoding="ascii")
-    invalid_path.chmod(0o600)
-    with pytest.raises(RuntimeError, match="unsupported shape"):
-        _read_monitor_receipt(invalid_path)
-
-    invalid_identity = dict(receipt, main_identity="linux:103:12345")
-    invalid_identity_path = tmp_path / "mismatched-main-identity.json"
-    invalid_identity_path.write_text(json.dumps(invalid_identity), encoding="ascii")
-    invalid_identity_path.chmod(0o600)
-    with pytest.raises(RuntimeError, match="invalid identity"):
-        _read_monitor_receipt(invalid_identity_path)
-
-
-def test_monitor_reconciliation_rejects_reused_main_pid(tmp_path: Path, monkeypatch: Any) -> None:
-    import pytest
-
-    receipt = {
-        "version": 3,
-        "controller_pid": os.getpid() + 1,
-        "unit": "acp-monitor-test.service",
-        "invocation_id": "a" * 32,
-        "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
-        "main_pid": 102,
-        "main_identity": "linux:102:12345",
-        "monitor_slice_unit": "app.slice",
-        "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
-        "slice_unit": "user-acp-test.slice",
-        "slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp-test.slice",
-    }
-    properties = {
-        receipt["unit"]: {
-            "Id": receipt["unit"],
-            "LoadState": "loaded",
-            "ActiveState": "active",
-            "InvocationID": receipt["invocation_id"],
-            "ControlGroup": receipt["control_group"],
-            "Slice": receipt["monitor_slice_unit"],
-            "MainPID": str(receipt["main_pid"]),
-        },
-        receipt["monitor_slice_unit"]: {
-            "Id": receipt["monitor_slice_unit"],
-            "LoadState": "loaded",
-            "ControlGroup": receipt["monitor_slice_control_group"],
-        },
-        receipt["slice_unit"]: {
-            "Id": receipt["slice_unit"],
-            "LoadState": "loaded",
-            "ActiveState": "active",
-            "ControlGroup": receipt["slice_control_group"],
-        },
-    }
-    receipt_path = tmp_path / "monitor-receipt.json"
-    _write_monitor_receipt(receipt_path, receipt)
-    monkeypatch.setattr(
-        sys.modules[__name__],
-        "_unit_properties",
-        lambda systemctl, unit: properties[unit],
-    )
-    monkeypatch.setattr(ProcessMixin, "_process_identity", lambda pid: "linux:102:12346")
-
-    with pytest.raises(RuntimeError, match="PID start identity changed"):
-        _reconcile_monitor_after_restart("systemctl", receipt_path)
 
 
 def _wait_active(systemctl: str, unit: str, client: subprocess.Popen[str] | None = None):
@@ -660,10 +447,19 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
         raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
 
     token = uuid.uuid4().hex
-    container_id = f"acp-slice-probe-{token}"
-    slice_unit = _oci_worker_systemd_slice(container_id)
-    monitor_slice_unit = "app.slice"
-    service_unit = f"acp-monitor-probe-{token}.service"
+    attempt_id = f"probe-{token[:16]}"
+    claim_token = 1
+    execution_id = token
+    container_id = sandbox_container_id(attempt_id, claim_token, execution_id)
+    slice_unit = sandbox_attempt_slice_unit(attempt_id, claim_token, execution_id)
+    if slice_unit != _oci_worker_systemd_slice(container_id):
+        raise AssertionError("monitor receipt and runc derive different attempt slices")
+    # Per-attempt slice names are `user-acp-<digest>.slice`, which systemd
+    # nests beneath this shared parent. Keep the durable monitor service in
+    # that same parent but outside the attempt slice so worker-slice teardown
+    # cannot stop its owner.
+    monitor_slice_unit = "user-acp.slice"
+    service_unit = sandbox_monitor_service_unit(attempt_id, claim_token, execution_id)
     scope_unit = f"acp-scope-probe-{token}.scope"
     scope_client: subprocess.Popen[str] | None = None
     pre_stop: dict[str, dict[str, str]] = {}
@@ -677,6 +473,9 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
             monitor_slice_unit,
             slice_unit,
             receipt_path,
+            attempt_id,
+            claim_token,
+            execution_id,
         )
         monitor_receipt = monitor_reconciliation["receipt"]
         pre_stop[slice_unit] = _wait_active(systemctl, slice_unit)
@@ -969,9 +768,15 @@ def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
 if __name__ == "__main__":
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--monitor-controller":
-        if len(arguments) != 7:
-            raise SystemExit("monitor-controller mode requires six arguments")
-        _start_monitor_controller(*arguments[1:6], Path(arguments[6]))
+        if len(arguments) != 10:
+            raise SystemExit("monitor-controller mode requires nine arguments")
+        _start_monitor_controller(
+            *arguments[1:6],
+            Path(arguments[6]),
+            arguments[7],
+            int(arguments[8]),
+            arguments[9],
+        )
     elif arguments and arguments[0] == "--reconcile-monitor":
         if len(arguments) != 3:
             raise SystemExit("reconcile-monitor mode requires two arguments")

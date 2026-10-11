@@ -380,7 +380,7 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
         == hashlib.sha256(canonical_json(durable["launch_plan"]).encode("utf-8")).hexdigest()
     )
     assert durable["launch_plan"]["reservation"]["bundle_digest"] == execution["bundle_digest"]
-    assert durable["launch_plan"]["version"] == 5
+    assert durable["launch_plan"]["version"] == 6
     assert durable["launch_plan"]["reservation"]["bundle_digest_semantics"] == "oci-reservation-v1"
     assert durable["launch_plan"]["launch"]["argv"] == list(target.argv)
     assert durable["launch_plan"]["launch"]["resource_limits"] == {
@@ -393,6 +393,24 @@ def test_launch_binds_rootfs_pins_and_persists_exact_config_digest(repo: Path) -
     event_plan = json.loads(event["payload_json"])["launch_plan"]
     assert event_plan == durable["launch_plan"]
     assert supervisor.verify_event_chain()["ok"] is True
+
+    # Version 5 keeps its previous monitor-unit semantics so already-recorded
+    # plans remain readable after the version 6 identity strengthening.
+    legacy_v5_plan = json.loads(canonical_json(durable["launch_plan"]))
+    legacy_v5_plan["version"] = 5
+    legacy_v5_row = dict(durable)
+    legacy_v5_row["wrapper_unit"] = "acp-worker.service"
+    legacy_v5_row["wrapper_cgroup_path"] = (
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-worker.service"
+    )
+    legacy_v5_plan["launch"]["systemd_ownership"]["wrapper_control_group"] = legacy_v5_row[
+        "wrapper_cgroup_path"
+    ]
+    legacy_v5_row["launch_plan_json"] = canonical_json(legacy_v5_plan)
+    legacy_v5_row["launch_plan_digest"] = hashlib.sha256(
+        legacy_v5_row["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+    assert journal_module._sandbox_launch_plan_binding_is_self_consistent(legacy_v5_row)
 
     # Version 4 remains auditable under its original ownership evidence, but
     # does not carry the split-monitor placement contract required for running.
@@ -1477,6 +1495,7 @@ def record_launch(
     attempt: dict,
     *,
     runc_handle: oci_worker.RuncLaunchHandle | None = None,
+    wrapper_unit: str | None = None,
     wrapper_cgroup_path: str | None = None,
 ) -> dict:
     if runc_handle is None:
@@ -1488,6 +1507,9 @@ def record_launch(
     assert execution is not None
     slice_unit = oci_worker._oci_worker_systemd_slice(execution["container_id"])
     common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    wrapper_unit = wrapper_unit or journal_module._sandbox_monitor_service_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
     slice_cgroup = common_cgroup + "/" + slice_unit
     return supervisor._sandbox_execution_record_launch(
         attempt["id"],
@@ -1495,9 +1517,9 @@ def record_launch(
         monitor_pid=101,
         monitor_identity="linux:101:1101",
         runc_handle=runc_handle,
-        wrapper_unit="acp-worker.service",
+        wrapper_unit=wrapper_unit,
         wrapper_invocation_id="1" * 32,
-        wrapper_cgroup_path=wrapper_cgroup_path or f"{common_cgroup}/acp-worker.service",
+        wrapper_cgroup_path=wrapper_cgroup_path or f"{common_cgroup}/{wrapper_unit}",
         attempt_slice_unit=slice_unit,
         attempt_slice_invocation_id="3" * 32,
         attempt_slice_cgroup_path=slice_cgroup,
@@ -1529,13 +1551,68 @@ def test_launch_rejects_monitor_in_sibling_attempt_slice(repo: Path) -> None:
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
+def test_monitor_service_unit_is_bound_to_full_fenced_execution_identity() -> None:
+    identity = ("attempt-1", 7, "execution-1")
+    expected = journal_module._sandbox_monitor_service_unit(*identity)
+
+    assert expected.startswith("acp-monitor-")
+    assert expected.endswith(".service")
+    assert journal_module._sandbox_monitor_service_unit("attempt-2", 7, "execution-1") != expected
+    assert journal_module._sandbox_monitor_service_unit("attempt-1", 8, "execution-1") != expected
+    assert journal_module._sandbox_monitor_service_unit("attempt-1", 7, "execution-2") != expected
+
+
+def test_launch_rejects_monitor_service_reused_for_another_execution(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+
+    with pytest.raises(SupervisorError) as rejected:
+        record_launch(
+            supervisor,
+            attempt,
+            runc_handle=handle,
+            wrapper_unit="acp-monitor-reused.service",
+        )
+
+    assert rejected.value.code == "sandbox_execution_monitor_identity_mismatch"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_adoption_rejects_a_self_consistent_plan_with_reused_monitor_unit(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+
+    forged = dict(durable)
+    forged["wrapper_unit"] = "acp-monitor-reused.service"
+    forged["wrapper_cgroup_path"] = (
+        str(Path(durable["wrapper_cgroup_path"]).parent) + "/" + forged["wrapper_unit"]
+    )
+    plan = json.loads(durable["launch_plan_json"])
+    plan["launch"]["systemd_ownership"]["wrapper_control_group"] = forged["wrapper_cgroup_path"]
+    forged["launch_plan_json"] = canonical_json(plan)
+    forged["launch_plan_digest"] = hashlib.sha256(
+        forged["launch_plan_json"].encode("utf-8")
+    ).hexdigest()
+
+    assert not journal_module._sandbox_launch_plan_binding_is_self_consistent(forged)
+
+
 def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTarget) -> dict:
     plan = journal_module._sandbox_launch_plan_material(execution, target)
     slice_unit = oci_worker._oci_worker_systemd_slice(target.container_id)
     common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
     slice_cgroup = common_cgroup + "/" + slice_unit
+    wrapper_unit = journal_module._sandbox_monitor_service_unit(
+        execution["attempt_id"], execution["claim_token"], execution["execution_id"]
+    )
     plan["launch"]["systemd_ownership"] = {
-        "wrapper_control_group": f"{common_cgroup}/acp-worker.service",
+        "wrapper_control_group": f"{common_cgroup}/{wrapper_unit}",
         "monitor_placement": "outside_attempt_slice",
         "attempt_slice_unit": slice_unit,
         "attempt_slice_invocation_id": "3" * 32,
@@ -1548,9 +1625,9 @@ def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTar
         "monitor_identity": "linux:101:1101",
         "runc_client_pid": 202,
         "runc_client_identity": "linux:202:1202",
-        "wrapper_unit": "acp-worker.service",
+        "wrapper_unit": wrapper_unit,
         "wrapper_invocation_id": "1" * 32,
-        "wrapper_cgroup_path": f"{common_cgroup}/acp-worker.service",
+        "wrapper_cgroup_path": f"{common_cgroup}/{wrapper_unit}",
         "attempt_slice_unit": slice_unit,
         "attempt_slice_invocation_id": "3" * 32,
         "attempt_slice_cgroup_path": slice_cgroup,

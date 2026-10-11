@@ -483,6 +483,8 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
     marker = repo / "host-fallback-worker-ran"
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
 
     def heartbeat_must_not_run(*_args, **_kwargs):
         pytest.fail("configured OCI fallback must fail before worker heartbeat")
@@ -505,7 +507,10 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     assert error.value.code == "sandbox_executor_unavailable"
     assert "refusing host fallback" in str(error.value)
     assert not marker.exists()
-    assert supervisor.attempt(attempt["id"])["pid"] is None
+    attempt_after = supervisor.attempt(attempt["id"])
+    assert attempt_after["pid"] is None
+    assert attempt_after["updated_at"] == attempt_before["updated_at"]
+    assert not worker_log.exists()
 
 
 @pytest.mark.parametrize(

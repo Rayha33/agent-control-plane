@@ -48,6 +48,9 @@ from .sandbox_attestation import (
     verify_running_runtime_resource_controls,
     verify_running_runtime_systemd_units,
 )
+from .sandbox_monitor_receipt import (
+    sandbox_monitor_service_unit as _sandbox_monitor_service_unit,
+)
 from .sandbox_workspace import (
     _MAX_DURABLE_MANIFEST_BYTES,
     _restore_snapshot_from_record,
@@ -135,7 +138,7 @@ def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]
     argv = list(target.argv)
     argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
     return {
-        "version": 5,
+        "version": 6,
         "reservation": {
             "bundle_digest_semantics": _BUNDLE_DIGEST_SEMANTICS,
             **{
@@ -275,6 +278,19 @@ def _sandbox_v5_cgroup_topology_is_self_consistent(row: Any) -> bool:
         return False
 
 
+def _sandbox_v6_monitor_identity_is_self_consistent(row: Any) -> bool:
+    """Require the service name to be derived from the full execution fence."""
+
+    try:
+        return _sandbox_v5_cgroup_topology_is_self_consistent(row) and row[
+            "wrapper_unit"
+        ] == _sandbox_monitor_service_unit(
+            row["attempt_id"], row["claim_token"], row["execution_id"]
+        )
+    except (KeyError, TypeError, ValueError, SupervisorError):
+        return False
+
+
 def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
     """Verify the durable plan digest and every reservation identity it commits."""
 
@@ -294,7 +310,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         if hashlib.sha256(raw_plan.encode("utf-8")).hexdigest() != row["launch_plan_digest"]:
             return False
         plan_version = plan.get("version")
-        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4, 5}:
+        if type(plan_version) is not int or plan_version not in {1, 2, 3, 4, 5, 6}:
             return False
         reservation = plan.get("reservation")
         expected_reservation = {
@@ -327,7 +343,7 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
                 "state_root_ino",
             )
         }
-        if plan_version in {2, 3, 4, 5}:
+        if plan_version in {2, 3, 4, 5, 6}:
             if row["bundle_digest_semantics"] != _BUNDLE_DIGEST_SEMANTICS:
                 return False
             if row["bundle_digest"] != _sandbox_reservation_bundle_digest(row):
@@ -352,6 +368,8 @@ def _sandbox_launch_plan_binding_is_self_consistent(row: Any) -> bool:
         if systemd_ownership != expected_systemd_ownership:
             return False
         if plan_version >= 5 and not _sandbox_v5_cgroup_topology_is_self_consistent(row):
+            return False
+        if plan_version >= 6 and not _sandbox_v6_monitor_identity_is_self_consistent(row):
             return False
         argv = launch.get("argv")
         bundle = launch.get("bundle")
@@ -1752,6 +1770,14 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
         if durable_execution["claim_token"] != claim_token:
             raise SupervisorError("stale_fencing_token", "claim token is stale")
+        expected_wrapper_unit = _sandbox_monitor_service_unit(
+            attempt_id, claim_token, durable_execution["execution_id"]
+        )
+        if wrapper_unit != expected_wrapper_unit:
+            raise SupervisorError(
+                "sandbox_execution_monitor_identity_mismatch",
+                "monitor service unit is not bound to this fenced execution",
+            )
         if durable_execution["launch_plan_required"] != 1:
             raise SupervisorError(
                 "sandbox_execution_launch_plan_required",
@@ -1966,10 +1992,10 @@ class SandboxExecutionJournalMixin:
                 "running transition requires a durable trusted launch-plan binding",
             )
         launch_plan = json.loads(row["launch_plan_json"])
-        if launch_plan.get("version") != 5:
+        if launch_plan.get("version") not in {5, 6}:
             raise SupervisorError(
                 "sandbox_execution_launch_plan_required",
-                "running transition requires a version-5 plan with a separate trusted monitor cgroup",
+                "running transition requires a supported plan with a separate trusted monitor cgroup",
             )
         if not running_attestation_is_self_consistent(
             attestation

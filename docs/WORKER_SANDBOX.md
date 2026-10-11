@@ -423,6 +423,98 @@ path to prove the exact init identity absent, the stopped container deleted,
 the state entry absent, and the worker cgroup empty before recording
 `cleanup_verified` or importing results. Ambiguous cleanup stays fenced.
 
+**Production monitor receipt codec (2026-10-11; identity primitive only).** The
+durable receipt codec and exact service-reconciliation checks now live in
+`supervisor/sandbox_monitor_receipt.py` and are consumed by the opt-in systemd
+integration probe. A receipt binds the monitor unit and worker slice to the
+full `(attempt_id, claim_token, execution_id)` tuple, plus InvocationID,
+ControlGroup, and the monitor PID start identity. Receipt files are bounded,
+canonical, no-follow reads from an owner-private directory and create-only
+writes; an exact replay is idempotent, while a conflicting replacement is
+rejected. Reconnect requires exact active service/slice properties and a fresh
+PID-start identity match. This is a reusable production identity primitive,
+not a monitor launcher or worker executor: the integration probe still uses a
+placeholder service, does not transfer a live runc handle, and does not attest
+cleanup or result import. `run_worker()` remains fail-closed.
+
+**Monitor control-request codec (2026-10-11; authentication primitive only).**
+The same module now encodes a bounded canonical-JSON request authenticated by a
+fixed 32-byte HMAC-SHA-256 capability. The MAC covers the full fenced execution
+tuple, a request ID, the operation, and (for `start`) the exact launch-plan
+digest. The schema permits only `start`, `status`, and `cancel`; it has no field
+for arbitrary argv, environment, path, UID, or systemd property. The request ID
+is only a deduplication key: this codec does not persist replay state, provide
+Unix-socket peer credentials, store/deliver the secret, or execute any action.
+An eventual monitor server must authenticate the peer, load the expected tuple
+and launch plan from private durable state, reject replays transactionally, and
+authorize each operation before acting. The capability must remain host-private
+and outside all worker mounts. This is not an authenticated reconnect service or
+an executor; no systemd unit, runc handle, gate, cancellation, or cleanup is
+controlled by these functions. `run_worker()` remains fail-closed.
+
+**Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
+unchanged).** Do not treat the existing namespace resource driver as the
+supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)
+launches the candidate through the process trampoline with the attempt worktree
+as `cwd` but does not enter the namespace resource-driver path or an outer
+filesystem/network namespace. When OCI is configured it refuses the launch
+rather than falling back to host execution. [`NamespaceRuntimeDriver`](../src/agent_control_plane/runtime_drivers.py)
+is a separate systemd resource-payload path: it requires rootless user/mount/PID
+namespaces (plus a network namespace for deny-egress), mounts `ACP_WORKTREE`
+read-only at `/workspace`, provides a separate writable `/work`, and currently
+bind-mounts host `/usr`, `/bin`, `/sbin`, `/lib*`, and `/etc` read-only. Those
+properties do not meet the coding-agent contract: writable attempt files,
+private Git metadata, an audited runtime closure, and no broad host `/usr` or
+`/etc` exposure. Reuse is rejected until those gaps are closed and measured.
+
+Codex's `externalSandbox` is not an enforcement mechanism: App Server
+documentation says to use it only when the server process is already
+sandboxed, because it skips Codex's own sandbox for the command. The supported
+boundary must therefore be independently enforced around each attempt before
+that policy is considered. In particular, if Codex App Server remains the
+trusted host-side harness, do not use `externalSandbox` on the assumption that
+it isolates only a child command; it disables Codex's own command sandbox and
+does not create the attempt boundary ([Codex App Server](https://learn.chatgpt.com/docs/app-server),
+[Agent approvals and security](https://learn.chatgpt.com/docs/agent-approvals-security)).
+The first architecture candidate is a provider-independent ACP executor
+contract running in a per-attempt Linux namespace, with the trusted harness,
+credential broker, and result importer outside that namespace. The worker gets
+only an attempt-private writable file tree, a minimal generated `/etc`, an
+audited read-only executable/library closure, and no host home, temp, socket,
+credential, or shared Git-object paths. Attempt egress is denied by default;
+trusted harness/model traffic remains outside the attempt namespace, and any
+worker-side provider access must go through an independently authenticated,
+narrowly scoped broker. This namespace candidate trusts the target host kernel:
+Linux namespaces isolate selected resources, not the kernel itself. If host
+kernel compromise is in scope, require a disposable VM/microVM (or another
+separate-kernel boundary) before accepting the design; namespace-only tests do
+not prove kernel-escape resistance. A snapshot/patch is validated and staged by the host-side
+supervisor; candidate processes never receive the shared checkout's `.git`
+pointer or object database. This is a hypothesis to prove, not implemented
+behavior. OpenAI's self-hosted executor is a provider-specific alternative:
+the harness remains outside the environment and the inside environment key is
+limited to environment-connection actions (not other API actions), but the key
+itself is readable by agent-generated code; the cited documentation does not
+establish that a key is restricted to exactly one environment ([Self-hosted
+sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)).
+
+Current source-level constraints and deployment evidence:
+
+| Item | Current evidence | Required before launch |
+| --- | --- | --- |
+| OS/runtime | Linux user, mount, PID, and optionally network namespaces; systemd user service and delegated cgroup v2 are required by the current resource driver. | Disposable target-host probe of namespace, cgroup, systemd-manager lifetime, and mount policy. |
+| Kernel/distribution | **MISSING** for the target NAS; no live-host version or capability result is claimed. Namespace isolation also trusts the host kernel. | Record exact kernel/distribution and required namespace/cgroup settings from an approved disposable Linux lane; use a VM/microVM if the host kernel is not in the trust boundary. |
+| Codex adapter | The repository has no pinned Codex CLI/App Server in this execution path. The current App Server docs describe stdio/Unix socket transports; WebSocket transport is marked experimental/unsupported. | Pin an exact binary/version and protocol schema, then test it inside the proven boundary without a model call. |
+| Authentication | No host Codex config, OAuth file, API key, or Git credential may be mounted into the candidate tree. | Prove a brokered/least-privilege auth path or reject the adapter; no credential material has been tested here. |
+
+Until those versions and isolation tests are available, the architecture decision
+is **NO-GO for production worker integration**. Do not set `externalSandbox`,
+do not mount host credential/config paths, and do not change the fail-closed
+`run_worker()` behavior. Remaining proof includes base/sibling/home/tmp/credential
+denials (including symlink escapes), process-visibility and socket/network
+checks, isolated Git result transfer, crash/cancel cleanup, and exact-head
+Linux CI. The current receipt codec proves none of those controls.
+
 This choice is consistent with systemd's distinct transient service/scope
 lifecycles and unit-level cgroup controls ([`systemd-run(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
 [`systemd.kill(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html),
@@ -435,6 +527,60 @@ attest the ACP OCI worker, recover its runc handle, exercise authenticated
 cancellation, or verify cleanup/result import. The service-owner pattern is
 therefore the integration direction, not a completed executor; `run_worker`
 remains fail-closed.
+
+New v6 launch plans derive the monitor unit name from the complete
+`(attempt_id, claim_token, execution_id)` identity; the journal rejects launch
+receipts that reuse a generic service name. Existing v5 plans retain their previous
+read/validation semantics. The unit name is only a collision-resistant
+lookup key: adoption still requires its exact systemd invocation ID, cgroup,
+and live monitor identity, plus the durable launch-plan binding. The monitor
+must load and revalidate operator configuration in its own process; serializing
+the caller's `_PinnedRuncWorkerConfig` or `RuncLaunchHandle` would not transfer
+their process-local provenance. This naming guard narrows one adoption/replay
+ambiguity but does not implement monitor startup, authenticated reconnect, or
+worker execution.
+
+### Cleanup proof boundary (2026-10-11; architecture/QC decision)
+
+Do not add a standalone observer that writes `cleanup_verified`. The current
+`cleanup_reported` receipt is an identity-bound template: its observations are
+null, and it contains no trusted receipt for the exact pinned `runc delete`
+invocation or its exit. `runc --root` selects the runtime state store, while
+`runc state` and `runc list` are read commands; absence from a later query does
+not prove which actor performed deletion or that no actor can recreate state
+before the journal commit. The command semantics are documented by upstream
+[runc](https://github.com/opencontainers/runc/blob/main/man/runc.8.md) and
+[runc-delete](https://github.com/opencontainers/runc/blob/main/man/runc-delete.8.md).
+Bind the delete action, kernel wait result, and post-delete observations to the
+same fenced monitor execution; no observation-only receipt may release the
+attempt fence.
+
+Systemd absence checks must also be conjunctive. `systemctl show` can succeed
+for an unknown unit and report `LoadState=not-found`
+([systemd issue #1105](https://github.com/systemd/systemd/issues/1105)); an
+upstream edge report also demonstrates `LoadState=not-found` alongside
+`ActiveState=active`
+([systemd issue #43442](https://github.com/systemd/systemd/issues/43442)).
+Therefore `not-found` alone is not cleanup evidence. First bind the expected
+unit name, invocation ID, control group, and (for the monitor) main-process
+start identity to the durable launch receipt. Then query that exact unit name:
+if it is `not-found`, require the response to be internally consistent
+(`ActiveState=inactive`, empty `ControlGroup` and `InvocationID`; for the
+monitor service, `MainPID=0`) and independently verify the original PID-start
+identities are absent. Also verify the exact attempt cgroup subtree and private
+paths are empty/absent under their recorded root identities. Any command error,
+timeout, permission gap, reused/mismatched identity, or contradictory property
+retains the fence.
+
+Those checks are still point-in-time observations. The verifier may commit only
+after the monitor has durably recorded its exact delete/wait outcome and can no
+longer launch, stop, or recreate execution resources for that fencing epoch.
+Serialize final verification and the immutable proof-digest journal transition
+against that owner; inject crashes and state/unit ABA changes between delete,
+observation, and commit. Until this owner/serialization path exists, keep
+`cleanup_verified` transitions guarded and OCI `run_worker` fail-closed. This
+decision deliberately does not add a cleanup collector: a typed snapshot would
+not solve the missing action provenance or close the probe-to-commit race.
 
 ## Threat model
 
