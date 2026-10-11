@@ -9,6 +9,7 @@ It does not launch or attest the supervised OCI worker or its runc handle.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import selectors
@@ -1405,6 +1406,307 @@ def test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_sc
                 + "; ".join(cleanup_errors)
             )
         shutil.rmtree(control_directory)
+
+
+def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
+    """Prove the systemd credential handoff primitive with a fake secret only."""
+
+    import stat
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the opt-in systemd credential test requires Linux cgroup v2")
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    version_line = _run([systemctl, "--version"]).stdout.splitlines()[0]
+    try:
+        systemd_version = int(version_line.split()[1].split(".", 1)[0])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError("systemd version could not be read") from error
+    if systemd_version < 252:
+        raise RuntimeError("the supported systemd credential probe requires version 252 or newer")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+    runtime_directory_value = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_directory_value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for the user-systemd credential probe")
+
+    token = uuid.uuid4().hex
+    unit = f"acp-credential-probe-{token}.service"
+    runtime_directory = Path(runtime_directory_value)
+    existing = _unit_properties(systemctl, unit)
+    if existing.get("LoadState") != "not-found":
+        raise RuntimeError(f"random credential probe unit already exists: {existing!r}")
+
+    private_directory = Path(tempfile.mkdtemp(prefix="acp-credential-", dir=runtime_directory))
+    directory_identity = private_directory.lstat()
+    credential_source = private_directory / "credential-source"
+    result_path = private_directory / "probe-result.json"
+    secret = (uuid.uuid4().hex + uuid.uuid4().hex).encode("ascii")
+    launch_attempted = False
+    observed_unit: dict[str, str] = {}
+    captured_main_pid = 0
+    captured_main_identity: str | None = None
+    cleanup_errors: list[str] = []
+    try:
+        if (
+            directory_identity.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_identity.st_mode) != 0o700
+            or not stat.S_ISDIR(directory_identity.st_mode)
+        ):
+            raise AssertionError("credential fixture directory is not private to the current user")
+        descriptor = os.open(
+            credential_source,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            if os.write(descriptor, secret) != len(secret):
+                raise RuntimeError("fake credential source write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        source_info = credential_source.lstat()
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_uid != os.geteuid()
+            or stat.S_IMODE(source_info.st_mode) != 0o600
+        ):
+            raise AssertionError("fake credential source is not private to the current user")
+        expected_digest = hashlib.sha256(secret).hexdigest()
+        probe = (
+            "import hashlib,json,os,stat,sys; from pathlib import Path; "
+            "credential_path=Path(os.environ['CREDENTIALS_DIRECTORY'])/'launch'; "
+            "credential=credential_path.read_bytes(); "
+            "report={'sha256':hashlib.sha256(credential).hexdigest(), "
+            "'secret_in_environment':any(credential.decode('ascii') in value "
+            "for value in os.environ.values()), "
+            "'credential_read_only':(stat.S_IMODE(credential_path.stat().st_mode)&0o222)==0, "
+            "'credential_owner_uid':credential_path.stat().st_uid}; "
+            "Path(sys.argv[1]).write_text(json.dumps(report),encoding='ascii'); "
+            "import time; time.sleep(60)"
+        )
+        launch_attempted = True
+        launch_result = _run(
+            [
+                systemd_run,
+                "--user",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "--property=RuntimeMaxSec=90s",
+                f"--property=LoadCredential=launch:{credential_source}",
+                "--no-block",
+                sys.executable,
+                "-c",
+                probe,
+                str(result_path),
+            ],
+            timeout=10.0,
+        )
+        if secret.decode("ascii") in launch_result.stdout + launch_result.stderr:
+            raise AssertionError("systemd-run output exposed the fake credential")
+        observed_unit = _wait_active(systemctl, unit)
+        if (
+            observed_unit.get("LoadState") != "loaded"
+            or observed_unit.get("Id") != unit
+            or not observed_unit.get("InvocationID")
+            or not observed_unit.get("ControlGroup")
+            or observed_unit.get("ActiveState") != "active"
+        ):
+            raise AssertionError(
+                "systemd did not expose the exact active credential-probe identity"
+            )
+        main_pid = int(observed_unit.get("MainPID", "0"))
+        main_identity = ProcessMixin._process_identity(main_pid) if main_pid > 0 else None
+        if main_identity is None:
+            raise AssertionError("credential-probe service process identity was not observable")
+        captured_main_pid = main_pid
+        captured_main_identity = main_identity
+        result_deadline = time.monotonic() + _WAIT_SECONDS
+        while not result_path.is_file() and time.monotonic() < result_deadline:
+            time.sleep(0.05)
+        if not result_path.is_file():
+            raise AssertionError("monitor service did not read the supplied fake credential")
+        observed = json.loads(result_path.read_text(encoding="ascii"))
+        expected = {
+            "sha256": expected_digest,
+            "secret_in_environment": False,
+            "credential_read_only": True,
+            "credential_owner_uid": os.geteuid(),
+        }
+        if observed != expected:
+            raise AssertionError(f"systemd credential handoff differed: {observed!r}")
+    finally:
+        # Preserve the private fixture unless the exact transient unit is terminal,
+        # its captured cgroups are empty, and its main process is gone.
+        deadline = time.monotonic() + _WAIT_SECONDS
+        control_groups: set[str] = set()
+        process_identities: set[tuple[int, str]] = set()
+        invocation_id = observed_unit.get("InvocationID", "")
+        if launch_attempted and (
+            observed_unit.get("Id") != unit
+            or not invocation_id
+            or not observed_unit.get("ControlGroup")
+        ):
+            cleanup_errors.append("the exact launched service identity was not captured")
+        if observed_unit.get("ControlGroup"):
+            control_groups.add(observed_unit["ControlGroup"])
+        if captured_main_pid > 0 and captured_main_identity is not None:
+            process_identities.add((captured_main_pid, captured_main_identity))
+        elif launch_attempted:
+            cleanup_errors.append("the pre-stop credential-probe process identity was not captured")
+        try:
+            observed_pid = int(observed_unit.get("MainPID", "0"))
+            observed_identity = (
+                ProcessMixin._process_identity(observed_pid) if observed_pid > 0 else None
+            )
+            if observed_identity is not None:
+                process_identities.add((observed_pid, observed_identity))
+        except (OSError, ValueError):
+            cleanup_errors.append("the captured credential-probe MainPID could not be verified")
+        if launch_attempted:
+            try:
+                subprocess.run(
+                    [systemctl, "--user", "stop", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(2.0, _WAIT_SECONDS),
+                    env=_environment(),
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not stop exact credential-probe unit: {error}")
+        terminal = False
+        last: dict[str, str] = {}
+        while time.monotonic() < deadline:
+            try:
+                last = _unit_properties(systemctl, unit)
+                load_state = last.get("LoadState")
+                if load_state == "loaded":
+                    if last.get("Id") != unit:
+                        cleanup_errors.append("systemd credential probe unit ID changed")
+                        break
+                    current_invocation = last.get("InvocationID", "")
+                    if invocation_id and current_invocation and current_invocation != invocation_id:
+                        cleanup_errors.append("systemd credential probe invocation changed")
+                        break
+                    invocation_id = invocation_id or current_invocation
+                    if last.get("ControlGroup"):
+                        control_groups.add(last["ControlGroup"])
+                    try:
+                        main_pid = int(last.get("MainPID", "0"))
+                    except ValueError:
+                        cleanup_errors.append("systemd credential probe MainPID was invalid")
+                        break
+                    if main_pid > 0:
+                        identity = ProcessMixin._process_identity(main_pid)
+                        if identity is not None:
+                            process_identities.add((main_pid, identity))
+                    active_state = last.get("ActiveState")
+                    if active_state == "failed":
+                        subprocess.run(
+                            [systemctl, "--user", "reset-failed", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                    elif active_state in {"active", "activating", "deactivating"}:
+                        subprocess.run(
+                            [systemctl, "--user", "stop", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                    elif active_state != "inactive" or main_pid != 0:
+                        cleanup_errors.append(
+                            f"systemd credential probe has unknown active state: {last!r}"
+                        )
+                        break
+                    terminal = False
+                elif load_state == "not-found":
+                    terminal = True
+                else:
+                    cleanup_errors.append(
+                        f"systemd credential probe has unknown load state: {last!r}"
+                    )
+                    break
+                cgroups_empty = all(_cgroup_is_empty(group) for group in control_groups)
+                processes_gone = all(
+                    ProcessMixin._process_identity(pid) != identity
+                    for pid, identity in process_identities
+                )
+                if terminal and cgroups_empty and processes_gone:
+                    break
+                terminal = False
+            except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify systemd credential probe cleanup: {error}")
+                break
+            time.sleep(0.05)
+        else:
+            cleanup_errors.append(
+                f"systemd credential probe did not reach a verified terminal state: {last!r}"
+            )
+        if not terminal:
+            if not cleanup_errors:
+                cleanup_errors.append(f"systemd credential probe remained non-terminal: {last!r}")
+        for control_group in control_groups:
+            try:
+                if not _cgroup_is_empty(control_group):
+                    cleanup_errors.append(
+                        f"systemd credential probe retained populated cgroup {control_group}"
+                    )
+            except (OSError, RuntimeError, AssertionError) as error:
+                cleanup_errors.append(f"could not verify credential-probe cgroup: {error}")
+        if any(
+            ProcessMixin._process_identity(pid) == identity for pid, identity in process_identities
+        ):
+            cleanup_errors.append("systemd credential probe process identity remained alive")
+        try:
+            after = private_directory.lstat()
+            if (
+                (after.st_dev, after.st_ino)
+                != (directory_identity.st_dev, directory_identity.st_ino)
+                or after.st_uid != os.geteuid()
+                or not stat.S_ISDIR(after.st_mode)
+                or stat.S_IMODE(after.st_mode) != 0o700
+                or private_directory.is_symlink()
+            ):
+                cleanup_errors.append("credential fixture directory identity changed")
+            else:
+                for entry in private_directory.iterdir():
+                    info = entry.lstat()
+                    if (
+                        entry.name not in {"credential-source", "probe-result.json"}
+                        or not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or entry.is_symlink()
+                    ):
+                        cleanup_errors.append(
+                            f"credential fixture entry was not expected: {entry.name}"
+                        )
+        except OSError as error:
+            cleanup_errors.append(f"credential fixture directory could not be verified: {error}")
+        if cleanup_errors:
+            raise RuntimeError(
+                "systemd credential probe cleanup was not verified; "
+                f"private fixture retained at {private_directory}: " + "; ".join(cleanup_errors)
+            ) from sys.exc_info()[1]
+        shutil.rmtree(private_directory)
 
 
 if __name__ == "__main__":

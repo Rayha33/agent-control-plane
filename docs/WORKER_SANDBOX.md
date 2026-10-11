@@ -2749,3 +2749,47 @@ integration. The OCI test does not exercise `run_worker`, monitor ownership,
 durable journal transitions, provider authentication, Git/result transfer, or
 supervisor-restart cancellation/recovery. The configured-OCI `run_worker`
 route remains fail-closed, and the broader proof gates above remain open.
+
+### systemd credential handoff primitive (2026-10-11; opt-in proof only)
+
+The supported systemd 252 contract provides `LoadCredential=`: a service reads
+the credential from a read-only file under `$CREDENTIALS_DIRECTORY`, with
+access limited to that unit's UID and root. The same version's documentation
+explicitly warns that unit environment variables are not a secret channel
+because they are exposed through D-Bus and propagated down the process tree.
+This makes `LoadCredential=` a viable *monitor-service handoff primitive*; it
+does not isolate secrets from other trusted processes running as the same host
+UID, and it does not permit the worker to inherit the credential directory or
+descriptor. See the pinned [systemd v252 execution
+contract](https://github.com/systemd/systemd/blob/v252/man/systemd.exec.xml#L2259-L2266)
+and [credential contract](https://github.com/systemd/systemd/blob/v252/man/systemd.exec.xml#L2717-L2735).
+
+`test_live_systemd_loadcredential_is_read_only_and_not_environment` now
+performs an opt-in no-model test with a randomly generated fake value in the
+dedicated disposable VM. On Ubuntu 26.04.1 ARM64, Linux 7.0.0-34, Python 3.14.4,
+systemd 259.5, cgroup v2, and a running user manager, the exact copied test
+source (SHA-256
+`d086b4de4ad7b6916b0c5d657c829fe4808993d9d94d8bf87a599bffcf62740f`) passed
+(`1 passed in 0.10s`). The child read the credential, verified the per-unit
+file was read-only and user-owned, and returned only its digest and boolean
+checks; the test also checked that the value was absent from the child
+environment and `systemd-run` output. It captures the exact live unit,
+invocation, process identity, and cgroup before stopping the service; cleanup
+requires the exact transient unit to become `not-found`, the captured process
+identity to be absent, and captured cgroups to be empty. The private fixture is
+retained if any of those checks fail. Post-run inspection found no transient
+unit, process, cgroup, or fixture directory. This proves systemd's
+credential-file transport only—not provider authentication, worker access
+separation, secret rotation, or the production monitor path, which does not
+yet use `LoadCredential=`.
+
+Do not equate `Restart=on-failure` with ACP recovery. systemd documents restart
+as a stop followed by a start and subjects it to start-rate limits; the monitor
+must re-read the exact journaled fencing epoch and reconcile the exact units
+before it can observe or cancel a worker. A service restart must never blindly
+repeat the launch request. The service's credential-source lifetime and
+restart behavior still need an exact systemd-252 live test, followed by
+monitor-owned `RuncLaunchHandle` lifecycle and registered-worker integration.
+See the pinned [systemd v252 service restart
+semantics](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L493-L495)
+and [restart rate-limit behavior](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L818-L823).
