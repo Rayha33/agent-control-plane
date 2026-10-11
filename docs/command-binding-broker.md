@@ -18,56 +18,46 @@ A follow-up disposable-VM probe on the same date used systemd 255 transient
 units with distinct `DynamicUser=yes` identities. Its first iteration used
 `NetworkNamespacePath=/proc/<holder-pid>/ns/net`; that supports the explicit
 namespace-path mechanism only, not the proposed `JoinsNamespaceOf=` mechanism.
-The checked-in harness now exercises the proposed mechanism directly: each
-service and phase unit sets both `PrivateNetwork=yes` and
-`JoinsNamespaceOf=<exact-holder>.service`, with exactly one listed active
-holder. The phase reached its attempt's loopback HTTP service, while a phase
-joining the other attempt could not reach that endpoint. In the first attempt,
-a worker unit with
-`ProtectProc=invisible` could not read or signal the holder (`ENOENT` for the
-holder's `/proc` entry; `EPERM` for signal), and `InaccessiblePaths=` blocked
-connections to `/run/systemd/private` and `/run/dbus/system_bus_socket`
-(`EACCES`). Its own HTTP request still succeeded. The harness requires
-`systemd-run --system` to report `Permission denied` and then verifies the
-unique attempted unit remains `LoadState=not-found` with no `MainPID`; any other
-error is not accepted as proof of denial. This supports a separate-UID/unit
-design and the specific boundary properties tested. Dynamic UIDs are runtime
-identities, not durable attempt identities; bind authorization and receipts to
-the attempt generation and each unit's `InvocationID`, never only to a numeric
-UID or namespace inode.
+Dynamic UIDs are runtime identities, not durable attempt identities; bind
+authorization and receipts to the attempt generation and each unit's
+`InvocationID`, never only to a numeric UID or namespace inode.
 
-The opt-in regression harness `tests/test_systemd_network_binding_integration.py`
-repeated this on 2026-10-10 in the disposable Ubuntu 24.04 VM (kernel
-6.8.0-142-generic, systemd 255, cgroup v2): `1 passed in 6.82s`. It requires
-root plus the exact root-owned `/run/acp-disposable-systemd-test` marker before
-it can create any transient unit. It preflights all random unit names as
-unused, rechecks each name before launch, and tears down only units whose
-`systemd-run` creation succeeded. Two concurrent
-attempt holders had separate `PrivateNetwork=yes` namespaces; separate
-`DynamicUser=yes` fake app, database/schema, and queue services joined each
-holder namespace on distinct per-attempt ports. Commands positively validated
-their own three identities and wrote only their own fake DB/queue state. A
-healthy response from attempt A while expecting B failed before mutation; a
-command in A targeting B's three ports could reach none of them. A root-authorized
-restart of the transient holder unit changed its systemd `InvocationID` but, on
-this systemd 255 host, retained the same network-namespace inode. This is direct
-evidence that an inode check alone does not detect a unit restart: the old
-binding must be invalidated by the changed `InvocationID`, followed by fresh
-target validation.
-The test observed each phase PID's network namespace from the host, confirmed the
-untrusted command could not inspect or signal its holder or invoke
-`systemd-run --system`, and checked exact-unit cleanup by inactive/MainPID state
-plus `cgroup.events populated 0` or cgroup removal. The test is explicitly
-opt-in and creates only uniquely named transient units on a disposable host;
-on Ubuntu the marker is created as root with:
+**Validation correction (2026-10-11):** an adversarial audit found that the
+original harness read `journalctl --output=cat`. systemd can include its own
+`Starting` record with the complete `python -c` command source in that output,
+so source-code marker strings could satisfy assertions without being emitted by
+the phase process. The original manager check looked for a generic
+`permission denied` phrase plus a nonzero result, but did not require the phrase
+to occur in a manager-connection diagnostic. The earlier systemd 255 harness
+results and their command-output, denied-manager, endpoint-reachability, and
+holder-visibility assertions are withdrawn as evidence. The separate
+`NetworkNamespacePath=` experiment does not establish `JoinsNamespaceOf=`
+behavior.
+
+The corrected opt-in harness parses journal JSON and accepts output only from
+records whose `_SYSTEMD_UNIT` and `_PID` match the observed phase unit and
+`MainPID`. It fails if the phase process emits no journal records. Its manager
+probe requires a nonzero exit plus both a manager-connection failure context
+and a recognized access-denial diagnostic; regression tests reject unrelated
+CLI errors, connection refusal, and a denial phrase in the wrong context. On
+2026-10-11, the exact checked-in test file at commit
+`d4bd2f773042ed6a237cec4cc0307f4098674362` (SHA-256
+`8c35c1b6b6e39d4da62a6054003ac4ded8ef48c950b6ebf1a84aaee09e609565`) ran on a
+disposable Ubuntu 26.04.1 VM (kernel `7.0.0-34`, systemd `259.5`, cgroup v2):
+`8 passed in 6.84s` (seven diagnostic-check unit cases and one opt-in live test).
+The manager diagnostic was `Failed to connect to system scope bus via local
+transport: Operation not permitted`. The live test observed phase output from
+the phase PID, confirmed sibling attempt ports were unreachable, rejected a
+healthy wrong-attempt response before fake DB/queue mutation, checked the
+holder's process visibility/signaling boundary, and verified exact transient
+unit/cgroup cleanup. It requires root plus the exact root-owned
+`/run/acp-disposable-systemd-test` marker before creating transient units; on
+Ubuntu the marker is created as root with:
 `printf '%s\n' 'acp-systemd-network-binding-v1' | sudo tee /run/acp-disposable-systemd-test >/dev/null && sudo chmod 600 /run/acp-disposable-systemd-test`.
-
-The checked-in test file at PR #43 head `bb379e73fa284801ddbdec2db391268c11430da0`
-(SHA-256 `42cd9dc1dab1e3dd0643ec5fd79d6e9479f3126bb6c34cff5caad0436f333aa3`)
-was replayed in that VM on the same date: `1 passed in 6.94s`. Postflight found
-no loaded `acp-netbind-*` units or matching system.slice cgroups; the temporary
-root-owned opt-in marker and copied test file were removed. This replay still
-covers only the primitive-level contract described above.
+Postflight found no `acp-netbind-*` units or matching cgroups, and the marker,
+copied test file, and three packages installed solely for pytest on the
+disposable VM were removed. This remains primitive-level evidence, not a
+supported ACP executor result.
 
 This is evidence for a systemd primitive with local HTTP fakes—not proof that
 ACP launches real app/DB/queue services or QC/integration commands through it.
