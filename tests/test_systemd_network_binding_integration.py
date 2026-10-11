@@ -133,6 +133,18 @@ def _unit_belongs_to_run(state: dict[str, str], owner_description: str) -> bool:
     return state.get("LoadState") == "loaded" and state.get("Description") == owner_description
 
 
+def _unit_cleanup_is_proven(state: dict[str, str]) -> bool:
+    """Require a consistent unloaded-unit response, not just ``not-found``."""
+
+    return (
+        state.get("LoadState") == "not-found"
+        and state.get("ActiveState") == "inactive"
+        and state.get("ControlGroup") == ""
+        and state.get("InvocationID") == ""
+        and state.get("MainPID") == "0"
+    )
+
+
 @pytest.mark.parametrize(
     ("state", "owner_description", "expected"),
     [
@@ -146,6 +158,47 @@ def test_cleanup_ownership_requires_exact_loaded_run_description(
     state: dict[str, str], owner_description: str, expected: bool
 ) -> None:
     assert _unit_belongs_to_run(state, owner_description) is expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("LoadState", "loaded"),
+        ("ActiveState", "active"),
+        ("ActiveState", "activating"),
+        ("ActiveState", "deactivating"),
+        ("ActiveState", "reloading"),
+        ("ActiveState", "failed"),
+        ("ControlGroup", "/system.slice/foreign.service"),
+        ("InvocationID", "a" * 32),
+        ("MainPID", "123"),
+    ],
+)
+def test_cleanup_rejects_inconsistent_not_found_unit_state(field: str, value: str) -> None:
+    state = {
+        "LoadState": "not-found",
+        "ActiveState": "inactive",
+        "ControlGroup": "",
+        "InvocationID": "",
+        "MainPID": "0",
+    }
+    state[field] = value
+    assert not _unit_cleanup_is_proven(state)
+
+
+@pytest.mark.parametrize(
+    "missing", ["LoadState", "ActiveState", "ControlGroup", "InvocationID", "MainPID"]
+)
+def test_cleanup_requires_every_absence_property(missing: str) -> None:
+    state = {
+        "LoadState": "not-found",
+        "ActiveState": "inactive",
+        "ControlGroup": "",
+        "InvocationID": "",
+        "MainPID": "0",
+    }
+    del state[missing]
+    assert not _unit_cleanup_is_proven(state)
 
 
 def _wait_active(systemctl: str, unit: str) -> dict[str, str]:
@@ -813,12 +866,9 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
         for unit in owned_units:
             try:
                 state = _properties(systemctl, f"{unit}.service")
-                if state.get("LoadState") != "not-found":
-                    cleanup_errors.append(f"{unit}: unit remains loaded after cleanup: {state}")
-                    continue
-                if state.get("ActiveState") == "active" or state.get("MainPID", "0") != "0":
+                if not _unit_cleanup_is_proven(state):
                     cleanup_errors.append(
-                        f"{unit}: still active with MainPID={state.get('MainPID')}"
+                        f"{unit}: unit absence is contradictory or unproven: {state}"
                     )
             except Exception as error:
                 cleanup_errors.append(f"{unit}: post-cleanup check failed: {error}")
