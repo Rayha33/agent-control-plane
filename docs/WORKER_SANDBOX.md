@@ -437,20 +437,40 @@ not a monitor launcher or worker executor: the integration probe still uses a
 placeholder service, does not transfer a live runc handle, and does not attest
 cleanup or result import. `run_worker()` remains fail-closed.
 
-**Monitor control-request codec (2026-10-11; authentication primitive only).**
-The same module now encodes a bounded canonical-JSON request authenticated by a
-fixed 32-byte HMAC-SHA-256 capability. The MAC covers the full fenced execution
-tuple, a request ID, the operation, and (for `start`) the exact launch-plan
-digest. The schema permits only `start`, `status`, and `cancel`; it has no field
-for arbitrary argv, environment, path, UID, or systemd property. The request ID
-is only a deduplication key: this codec does not persist replay state, provide
-Unix-socket peer credentials, store/deliver the secret, or execute any action.
-An eventual monitor server must authenticate the peer, load the expected tuple
-and launch plan from private durable state, reject replays transactionally, and
-authorize each operation before acting. The capability must remain host-private
-and outside all worker mounts. This is not an authenticated reconnect service or
-an executor; no systemd unit, runc handle, gate, cancellation, or cleanup is
-controlled by these functions. `run_worker()` remains fail-closed.
+**Monitor control IPC slice (2026-10-11; not wired to the worker executor).**
+`supervisor/sandbox_monitor_ipc.py` adds a Linux Unix-domain server/client around
+the request codec. The server checks `SO_PEERCRED` UID and HMAC-fences the full
+execution tuple; the client checks peer UID against the configured service
+owner and pins PID plus fresh `/proc` start-time identity to the durable monitor
+receipt. Status/cancel responses are bounded, allow-listed,
+HMAC-authenticated values. The durable request ledger
+applies to cancellation only: it creates a mode-0600 acceptance record and
+fsyncs it before invoking the monitor-owned handler, then creates a signed
+response record. The controller can reuse the same cancellation request ID to
+retry; exact retries return the original response. An accepted cancellation
+without a durable response returns `unknown` and is never re-applied. Read-only
+status polling does not consume ledger capacity. Cancellation requires the
+caller to provide and retain a stable 32-hex request ID before sending, so an
+ambiguous timeout can be retried with the exact same ID; the client does not
+hide a generated ID that the caller could not recover. The ledger is bounded
+to 256 cancellation IDs per attempt. The socket and ledger require owner-private
+mode-0700 directories; a pre-existing socket path is not removed or replaced.
+The server rejects a second concurrent `serve_forever()` loop and cannot be
+restarted after its serving loop exits, including unexpected exits.
+
+The IPC permits only `status` and `cancel`: systemd starts the monitor service,
+so a controller request cannot ask an already-running service to launch a
+worker. Callers must first reconcile exact systemd service/slice properties
+against the receipt. The monitor-side cancel callback must act only on its
+retained execution handle and exact worker slice, and must be idempotent. The
+32-byte capability remains host-private and outside all worker mounts.
+
+This is now a concrete transport/replay primitive, not the production monitor
+service: it is not yet launched by systemd, connected to the runc handle or
+execution journal, provisioned with a durable capability, or used by
+`run_worker()`. It proves neither cancellation nor cleanup nor result import.
+`run_worker()` remains fail-closed, and the lifecycle acceptance criteria below
+remain open.
 
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the

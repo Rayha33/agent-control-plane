@@ -29,7 +29,7 @@ _MAX_CONTROL_REQUEST_BYTES = 4096
 _CONTROL_KEY_BYTES = 32
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
-_CONTROL_OPERATIONS = frozenset({"start", "status", "cancel"})
+_CONTROL_OPERATIONS = frozenset({"status", "cancel"})
 
 
 class SandboxMonitorReceiptError(ValueError):
@@ -115,7 +115,6 @@ def _validate_control_request_fields(value: Any) -> None:
         "execution_id",
         "request_id",
         "operation",
-        "launch_plan_sha256",
         "mac",
     }
     if not isinstance(value, dict) or set(value) != expected:
@@ -129,16 +128,6 @@ def _validate_control_request_fields(value: Any) -> None:
     operation = value["operation"]
     if not isinstance(operation, str) or operation not in _CONTROL_OPERATIONS:
         raise SandboxMonitorReceiptError("monitor control operation is not allowed")
-    plan_digest = value["launch_plan_sha256"]
-    if operation == "start":
-        if not isinstance(plan_digest, str) or _DIGEST.fullmatch(plan_digest) is None:
-            raise SandboxMonitorReceiptError(
-                "monitor start request requires an exact launch-plan digest"
-            )
-    elif plan_digest is not None:
-        raise SandboxMonitorReceiptError(
-            "non-start monitor control request must not carry a launch-plan digest"
-        )
     mac = value["mac"]
     if not isinstance(mac, str) or _DIGEST.fullmatch(mac) is None:
         raise SandboxMonitorReceiptError("monitor control authentication tag is invalid")
@@ -160,7 +149,6 @@ class SandboxMonitorControlRequest:
     execution_id: str
     request_id: str
     operation: str
-    launch_plan_sha256: str | None
     mac: str
     version: int = 1
 
@@ -175,7 +163,6 @@ class SandboxMonitorControlRequest:
             "execution_id": self.execution_id,
             "request_id": self.request_id,
             "operation": self.operation,
-            "launch_plan_sha256": self.launch_plan_sha256,
             "mac": self.mac,
         }
 
@@ -188,7 +175,6 @@ def encode_sandbox_monitor_control_request(
     request_id: str,
     operation: str,
     key: bytes,
-    launch_plan_sha256: str | None = None,
 ) -> bytes:
     """Encode an HMAC-authenticated monitor request with a strict fixed schema.
 
@@ -205,7 +191,6 @@ def encode_sandbox_monitor_control_request(
         "execution_id": execution_id,
         "request_id": request_id,
         "operation": operation,
-        "launch_plan_sha256": launch_plan_sha256,
     }
     candidate = {**material, "mac": "0" * 64}
     _validate_control_request_fields(candidate)
@@ -221,7 +206,6 @@ def decode_sandbox_monitor_control_request(
     *,
     key: bytes,
     expected_identity: tuple[str, int, str],
-    expected_launch_plan_sha256: str | None = None,
 ) -> SandboxMonitorControlRequest:
     """Verify a canonical request and fence it to the durable execution identity.
 
@@ -258,29 +242,12 @@ def decode_sandbox_monitor_control_request(
     observed_identity = (decoded["attempt_id"], decoded["claim_token"], decoded["execution_id"])
     if observed_identity != expected_identity:
         raise SandboxMonitorReceiptError("monitor control request is fenced to another execution")
-    if decoded["operation"] == "start":
-        if (
-            not isinstance(expected_launch_plan_sha256, str)
-            or _DIGEST.fullmatch(expected_launch_plan_sha256) is None
-        ):
-            raise SandboxMonitorReceiptError(
-                "monitor start authorization requires a trusted launch-plan digest"
-            )
-        if not hmac.compare_digest(decoded["launch_plan_sha256"], expected_launch_plan_sha256):
-            raise SandboxMonitorReceiptError(
-                "monitor start request does not match the durable launch plan"
-            )
-    elif expected_launch_plan_sha256 is not None:
-        raise SandboxMonitorReceiptError(
-            "expected launch-plan digest is only valid for a monitor start request"
-        )
     return SandboxMonitorControlRequest(
         attempt_id=decoded["attempt_id"],
         claim_token=decoded["claim_token"],
         execution_id=decoded["execution_id"],
         request_id=decoded["request_id"],
         operation=decoded["operation"],
-        launch_plan_sha256=decoded["launch_plan_sha256"],
         mac=decoded["mac"],
         version=decoded["version"],
     )
