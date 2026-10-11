@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1792,6 +1792,91 @@ def _require_verified_cleanup_before_candidate_capture(connection: sqlite3.Conne
     )
 
 
+def _add_sandbox_launch_submission_receipt(connection: sqlite3.Connection) -> None:
+    """Latch the exact runc submission before the external launch boundary.
+
+    The durable marker is deliberately one-way. If the monitor dies after this
+    transaction but before recording the returned handle, a restarted monitor may
+    not launch again; it must reconcile the exact runtime state or retain the
+    fence. Old reservations remain empty and therefore cannot be launched by a
+    newer binary without going through the new authorization path.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-submission receipt migration"
+        )
+    additions = (
+        ("launch_submission_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_submission_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_submission_at", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_launch_submission_insert_guard",
+        "sandbox_launch_submission_write_once",
+        "sandbox_execution_launch_requires_submission",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_submission_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_submission_id != ''
+          OR NEW.launch_submission_digest != ''
+          OR NEW.launch_submission_at != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_submission_must_follow_reservation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_submission_write_once
+        BEFORE UPDATE OF launch_submission_id, launch_submission_digest,
+          launch_submission_at ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND OLD.launch_submission_id = ''
+          AND OLD.launch_submission_digest = ''
+          AND OLD.launch_submission_at = ''
+          AND length(NEW.launch_submission_id) = 32
+          AND NEW.launch_submission_id NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_submission_digest) = 64
+          AND NEW.launch_submission_digest NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_submission_at) BETWEEN 1 AND 64
+          AND acp_sandbox_launch_submission_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            NEW.launch_submission_id, NEW.launch_submission_digest
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_submission_must_be_authorized_once');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_submission
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            NEW.launch_submission_id = ''
+            OR length(NEW.launch_submission_digest) != 64
+            OR NEW.launch_submission_at = ''
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_launch_submission_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1819,6 +1904,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (25, _add_sandbox_bundle_digest_semantics),
     (26, _add_sandbox_attempt_slice_identity),
     (27, _require_verified_cleanup_before_candidate_capture),
+    (28, _add_sandbox_launch_submission_receipt),
 )
 
 

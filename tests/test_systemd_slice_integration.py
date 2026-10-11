@@ -1,14 +1,15 @@
-"""Opt-in proof for systemd-owned service receipt recovery and attempt-slice teardown.
+"""Opt-in proofs for systemd-owned monitor identity, IPC, and slice teardown.
 
 Run with ``ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`` on a disposable Linux host
-with an active user systemd manager and cgroup v2. It verifies receipt-based
-service identity reconciliation after controller-process exit and unit/cgroup
-teardown only; it does not integrate or attest the supervised OCI worker
-lifecycle.
+with an active user systemd manager and cgroup v2. The control-channel case
+uses a test-only monitor service and ``/usr/bin/sleep`` scope to exercise the
+production receipt and authenticated IPC code after controller-process exit.
+It does not launch or attest the supervised OCI worker or its runc handle.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import selectors
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -31,8 +33,16 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     validate_running_runtime_attestation,
     verify_running_runtime_systemd_units,
 )
+from agent_control_plane.supervisor.sandbox_monitor_ipc import (
+    SandboxMonitorControlClient,
+    SandboxMonitorControlServer,
+)
+from agent_control_plane.supervisor.sandbox_monitor_lifecycle import (
+    reconnect_sandbox_monitor,
+)
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
+    load_or_create_sandbox_monitor_control_key,
     read_sandbox_monitor_receipt,
     sandbox_attempt_slice_unit,
     sandbox_container_id,
@@ -43,6 +53,38 @@ from agent_control_plane.supervisor.sandbox_monitor_receipt import (
 
 _ENABLED = os.environ.get("ACP_RUN_SYSTEMD_SLICE_INTEGRATION") == "1"
 _WAIT_SECONDS = 8.0
+_SYSTEMD_ACTIVATION_PROPERTIES = ("Id", "InvocationID", "ControlGroup", "Slice")
+
+
+def _same_systemd_activation(expected: dict[str, str], observed: dict[str, str]) -> bool:
+    return all(
+        bool(expected.get(name)) and observed.get(name) == expected[name]
+        for name in _SYSTEMD_ACTIVATION_PROPERTIES
+    )
+
+
+def _monitor_scope_phase(
+    expected: dict[str, str],
+    observed: dict[str, str],
+    *,
+    worker_identity_matches: bool,
+    worker_process_absent: bool,
+    worker_in_scope: bool,
+) -> str:
+    if (
+        _same_systemd_activation(expected, observed)
+        and observed.get("ActiveState") == "active"
+        and worker_identity_matches
+        and worker_in_scope
+    ):
+        return "running"
+    if (
+        _same_systemd_activation(expected, observed)
+        and observed.get("ActiveState") == "inactive"
+        and worker_process_absent
+    ):
+        return "exited"
+    return "unknown"
 
 
 def _environment() -> dict[str, str]:
@@ -174,6 +216,245 @@ def _start_monitor_controller(
     _write_monitor_receipt(receipt_path, receipt)
     # The parent kills this controller after the durable receipt is visible.
     # The transient service must remain owned by systemd, not this process.
+    print("receipt-durable", flush=True)
+    time.sleep(60)
+
+
+def _serve_control_monitor(
+    systemctl: str,
+    scope_unit: str,
+    control_directory: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+) -> None:
+    """Test-only monitor: own a systemd scope and expose the production IPC."""
+
+    (control_directory / "scope-launching").touch(mode=0o600)
+    scope_client = subprocess.Popen(
+        [
+            shutil.which("systemd-run", path=_environment()["PATH"]) or "systemd-run",
+            "--user",
+            "--scope",
+            f"--unit={scope_unit}",
+            f"--slice={sandbox_attempt_slice_unit(attempt_id, claim_token, execution_id)}",
+            "/usr/bin/sleep",
+            "90",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env=_environment(),
+    )
+    scope = _wait_active(systemctl, scope_unit, scope_client)
+    # systemd scopes do not promise a MainPID property. The retained
+    # systemd-run client PID is the command PID for this exact scope.
+    worker_pid = scope_client.pid
+    worker_identity = ProcessMixin._process_identity(worker_pid)
+
+    def worker_in_exact_scope() -> bool:
+        try:
+            worker_cgroup = Path(f"/proc/{worker_pid}/cgroup").read_text(encoding="ascii")
+        except OSError:
+            return False
+        return any(
+            line.endswith(f":{scope['ControlGroup']}") for line in worker_cgroup.splitlines()
+        )
+
+    scope_identity = {name: scope.get(name, "") for name in _SYSTEMD_ACTIVATION_PROPERTIES}
+    if (
+        worker_pid <= 0
+        or worker_identity is None
+        or not all(scope_identity.values())
+        or not worker_in_exact_scope()
+    ):
+        scope_client.terminate()
+        scope_client.wait(timeout=_WAIT_SECONDS)
+        raise RuntimeError("monitor-owned scope lacks its exact live command identity")
+    (control_directory / "scope-ready").touch(mode=0o600)
+
+    def status() -> dict[str, Any]:
+        current = _unit_properties(systemctl, scope_unit)
+        current_worker_identity = ProcessMixin._process_identity(worker_pid)
+        phase = _monitor_scope_phase(
+            scope_identity,
+            current,
+            worker_identity_matches=current_worker_identity == worker_identity,
+            worker_process_absent=current_worker_identity is None,
+            worker_in_scope=worker_in_exact_scope(),
+        )
+        if phase == "running":
+            return {"phase": "running", "worker_pid": worker_pid}
+        if phase == "exited":
+            return {"phase": "exited", "worker_pid": worker_pid, "worker_exit_code": 0}
+        return {"phase": "unknown"}
+
+    def cancel() -> dict[str, Any]:
+        current = _unit_properties(systemctl, scope_unit)
+        if (
+            not _same_systemd_activation(scope_identity, current)
+            or current.get("ActiveState") != "active"
+            or ProcessMixin._process_identity(worker_pid) != worker_identity
+            or not worker_in_exact_scope()
+        ):
+            raise RuntimeError("monitor refuses to cancel a changed worker-scope identity")
+        _run([systemctl, "--user", "stop", scope_unit])
+        scope_client.wait(timeout=_WAIT_SECONDS)
+        current = _wait_inactive(systemctl, scope_unit)
+        if current.get("ActiveState") in {"active", "activating", "deactivating"}:
+            raise RuntimeError("monitor did not stop its exact worker scope")
+        if not _cgroup_is_empty(scope_identity["ControlGroup"]):
+            raise RuntimeError("monitor worker scope cgroup remained populated")
+        if ProcessMixin._process_identity(worker_pid) is not None:
+            raise RuntimeError("monitor worker PID survived its exact scope stop")
+        return {
+            "phase": "exited",
+            "worker_pid": worker_pid,
+            "worker_exit_code": scope_client.returncode,
+        }
+
+    identity = (attempt_id, claim_token, execution_id)
+    key = load_or_create_sandbox_monitor_control_key(
+        control_directory,
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+    )
+    server = SandboxMonitorControlServer(
+        socket_path=control_directory / "monitor.sock",
+        request_directory=control_directory,
+        key=key,
+        expected_identity=identity,
+        expected_uid=os.geteuid(),
+        status_provider=status,
+        cancel_action=cancel,
+    )
+    (control_directory / "server-bound").touch(mode=0o600)
+    signal.signal(signal.SIGTERM, lambda *_args: server.close())
+    server.serve_forever()
+    if scope_client.poll() is None:
+        scope_client.terminate()
+        try:
+            scope_client.wait(timeout=_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            scope_client.kill()
+            scope_client.wait(timeout=_WAIT_SECONDS)
+
+
+def _start_control_monitor_controller(
+    systemd_run: str,
+    systemctl: str,
+    service_unit: str,
+    monitor_slice_unit: str,
+    attempt_slice_unit: str,
+    scope_unit: str,
+    control_directory: Path,
+    receipt_path: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+) -> None:
+    """Launch the test monitor service, attest it, and acknowledge durable receipt."""
+
+    (control_directory / "attempt-slice-launching").touch(mode=0o600)
+    _run([systemctl, "--user", "start", attempt_slice_unit])
+    environment = _environment()
+    command = [
+        systemd_run,
+        "--user",
+        f"--unit={service_unit}",
+        f"--slice={monitor_slice_unit}",
+        "--property=Type=exec",
+        "--property=KillMode=control-group",
+        "--property=RuntimeMaxSec=90s",
+    ]
+    for name in ("PYTHONPATH", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        value = environment.get(name)
+        if value:
+            command.append(f"--setenv={name}={value}")
+    command.extend(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--control-monitor-service",
+            systemctl,
+            scope_unit,
+            str(control_directory),
+            attempt_id,
+            str(claim_token),
+            execution_id,
+        ]
+    )
+    (control_directory / "monitor-service-launching").touch(mode=0o600)
+    _run(command)
+    service = _wait_active(systemctl, service_unit)
+    monitor_slice = _wait_active(systemctl, monitor_slice_unit)
+    attempt_slice = _wait_active(systemctl, attempt_slice_unit)
+    if (
+        service.get("Id") != service_unit
+        or service.get("Slice") != monitor_slice_unit
+        or not service.get("InvocationID")
+        or not service.get("ControlGroup")
+        or PurePosixPath(service["ControlGroup"]).parent.as_posix() != monitor_slice["ControlGroup"]
+        or PurePosixPath(service["ControlGroup"]).is_relative_to(
+            PurePosixPath(attempt_slice["ControlGroup"])
+        )
+    ):
+        raise RuntimeError(f"monitor service identity or placement is incomplete: {service}")
+    main_pid = int(service.get("MainPID", "0"))
+    main_identity = ProcessMixin._process_identity(main_pid)
+    if main_pid <= 0 or main_pid == os.getpid() or main_identity is None:
+        raise RuntimeError("monitor service lacks a distinct live PID-start identity")
+
+    socket_path = control_directory / "monitor.sock"
+    deadline = time.monotonic() + _WAIT_SECONDS
+    while not socket_path.is_socket():
+        if time.monotonic() >= deadline:
+            properties = _unit_properties(systemctl, service_unit)
+            progress = sorted(path.name for path in control_directory.iterdir())
+            diagnostic_path = control_directory / "monitor-error.txt"
+            diagnostic = (
+                diagnostic_path.read_text(encoding="utf-8") if diagnostic_path.is_file() else ""
+            )
+            raise RuntimeError(
+                "monitor service did not bind its control socket: "
+                f"properties={properties}; progress={progress}; diagnostic={diagnostic}"
+            )
+        time.sleep(0.02)
+    receipt = SandboxMonitorReceipt(
+        version=1,
+        controller_pid=os.getpid(),
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+        unit=service_unit,
+        invocation_id=service["InvocationID"],
+        control_group=service["ControlGroup"],
+        main_pid=main_pid,
+        main_identity=main_identity,
+        monitor_slice_unit=monitor_slice_unit,
+        monitor_slice_control_group=monitor_slice["ControlGroup"],
+        attempt_slice_unit=attempt_slice_unit,
+        attempt_slice_control_group=attempt_slice["ControlGroup"],
+    )
+    _write_monitor_receipt(receipt_path, receipt.as_dict())
+    key = load_or_create_sandbox_monitor_control_key(
+        control_directory,
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+    )
+    client = SandboxMonitorControlClient(
+        receipt=receipt,
+        socket_path=socket_path,
+        key=key,
+        expected_uid=os.geteuid(),
+    )
+    response = client.status()
+    if response.outcome != "ok" or response.payload.get("phase") != "running":
+        raise RuntimeError("monitor did not return authenticated running status")
     print("receipt-durable", flush=True)
     time.sleep(60)
 
@@ -625,6 +906,48 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
             raise RuntimeError(message)
 
 
+def test_monitor_scope_phase_requires_exact_activation_even_after_exit() -> None:
+    expected = {
+        "Id": "acp-worker.scope",
+        "InvocationID": "original-invocation",
+        "ControlGroup": "/user.slice/user-acp.slice/acp-worker.scope",
+        "Slice": "user-acp.slice",
+    }
+    exited = {**expected, "ActiveState": "inactive"}
+    assert (
+        _monitor_scope_phase(
+            expected,
+            exited,
+            worker_identity_matches=False,
+            worker_process_absent=True,
+            worker_in_scope=False,
+        )
+        == "exited"
+    )
+    for name in _SYSTEMD_ACTIVATION_PROPERTIES:
+        replacement = {**exited, name: f"replacement-{name}"}
+        assert (
+            _monitor_scope_phase(
+                expected,
+                replacement,
+                worker_identity_matches=False,
+                worker_process_absent=True,
+                worker_in_scope=False,
+            )
+            == "unknown"
+        )
+    assert (
+        _monitor_scope_phase(
+            expected,
+            exited,
+            worker_identity_matches=False,
+            worker_process_absent=False,
+            worker_in_scope=False,
+        )
+        == "unknown"
+    )
+
+
 def test_systemd_monitor_reconciles_after_controller_crash_and_slice_stops_units(
     tmp_path: Path,
 ) -> None:
@@ -637,6 +960,107 @@ def test_systemd_monitor_reconciles_after_controller_crash_and_slice_stops_units
     assert evidence["monitor_survived_worker_slice_stop"] is True
     assert evidence["cgroups_empty"] is True
     assert set(evidence["post_stop_states"].values()) <= {"inactive", "failed", "not-found"}
+
+
+def test_exec_stop_post_is_not_final_unit_absence_evidence() -> None:
+    """A post-stop hook can persist action evidence, but cannot certify its own absence."""
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("the opt-in systemd teardown test requires Linux")
+
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+
+    token = uuid.uuid4().hex
+    unit = f"acp-stop-post-{token}.service"
+    hook_cgroup = ""
+    service_cgroup = ""
+    output_lines: list[str] = []
+    try:
+        completed = _run(
+            [
+                systemd_run,
+                "--user",
+                "--wait",
+                "--pipe",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "--property=Delegate=yes",
+                '--property=ExecStopPost=/bin/sh -c "cat /proc/self/cgroup"',
+                "/usr/bin/true",
+            ]
+        )
+        output_lines = (completed.stdout + "\n" + completed.stderr).splitlines()
+        invocation_line = next(
+            (line for line in output_lines if line.startswith("Running as unit: ")), ""
+        )
+        expected_prefix = f"Running as unit: {unit}; invocation ID: "
+        if not invocation_line.startswith(expected_prefix):
+            raise RuntimeError("systemd-run did not return the exact transient unit invocation")
+        invocation_id = invocation_line.removeprefix(expected_prefix)
+        if len(invocation_id) != 32 or any(
+            character not in "0123456789abcdef" for character in invocation_id
+        ):
+            raise RuntimeError("systemd-run returned a malformed invocation ID")
+
+        cgroup_line = next((line for line in output_lines if line.startswith("0::/")), "")
+        if not cgroup_line:
+            raise RuntimeError("ExecStopPost did not report its live cgroup")
+        hook_cgroup = cgroup_line.removeprefix("0::")
+        hook_path = PurePosixPath(hook_cgroup)
+        if unit in hook_path.parts:
+            unit_index = hook_path.parts.index(unit)
+            service_cgroup = PurePosixPath(*hook_path.parts[: unit_index + 1]).as_posix()
+        if hook_path.name != ".control" or hook_path.parent.name != unit:
+            raise RuntimeError(
+                f"ExecStopPost did not run in the expected service control subgroup: {hook_cgroup}"
+            )
+
+        after_stop = _unit_properties(systemctl, unit)
+        if (
+            after_stop.get("LoadState") != "not-found"
+            or after_stop.get("ActiveState") != "inactive"
+            or after_stop.get("MainPID") != "0"
+            or after_stop.get("ControlGroup") != ""
+            or after_stop.get("InvocationID") != ""
+        ):
+            raise RuntimeError(
+                f"post-stop unit properties were inconsistent for {unit}: {after_stop}"
+            )
+        if not _cgroup_is_empty(hook_path.parent.as_posix()):
+            raise RuntimeError(f"the service cgroup remained populated after stop: {hook_cgroup}")
+        assert invocation_id != after_stop.get("InvocationID")
+    finally:
+        if not service_cgroup:
+            cgroup_line = next((line for line in output_lines if line.startswith("0::/")), "")
+            if cgroup_line:
+                hook_path = PurePosixPath(cgroup_line.removeprefix("0::"))
+                if unit in hook_path.parts:
+                    unit_index = hook_path.parts.index(unit)
+                    service_cgroup = PurePosixPath(*hook_path.parts[: unit_index + 1]).as_posix()
+            if not service_cgroup:
+                service_cgroup = _unit_properties(systemctl, unit).get("ControlGroup", "")
+        subprocess.run(
+            [systemctl, "--user", "stop", unit],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_WAIT_SECONDS,
+            env=_environment(),
+        )
+        inactive = _wait_inactive(systemctl, unit)
+        if inactive.get("ActiveState") in {"active", "activating", "deactivating"}:
+            raise RuntimeError(f"transient post-stop probe remained active: {inactive}")
+        if service_cgroup and not _cgroup_is_empty(service_cgroup):
+            raise RuntimeError(
+                f"transient post-stop probe cgroup was not cleaned: {service_cgroup}"
+            )
 
 
 def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
@@ -765,6 +1189,914 @@ def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
             raise RuntimeError(message)
 
 
+def test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_scope() -> None:
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the opt-in systemd monitor IPC test requires Linux cgroup v2")
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+
+    token = uuid.uuid4().hex
+    attempt_id = f"ipc-{token[:16]}"
+    claim_token = 1
+    execution_id = token
+    service_unit = sandbox_monitor_service_unit(attempt_id, claim_token, execution_id)
+    attempt_slice_unit = sandbox_attempt_slice_unit(attempt_id, claim_token, execution_id)
+    monitor_slice_unit = "user-acp.slice"
+    scope_unit = f"acp-ipc-scope-{token}.scope"
+    runtime_directory_value = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_directory_value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for the user-systemd probe")
+    runtime_directory = Path(runtime_directory_value)
+    control_directory = Path(tempfile.mkdtemp(prefix="acp-mipc-", dir=runtime_directory))
+    os.chmod(control_directory, 0o700)
+    directory_identity = control_directory.stat()
+    receipt_path = control_directory / "monitor-receipt.json"
+    socket_path = control_directory / "monitor.sock"
+    controller: subprocess.Popen[str] | None = None
+    cleanup_errors: list[str] = []
+    active: dict[str, dict[str, str]] = {}
+    try:
+        controller = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--start-control-monitor",
+                systemd_run,
+                systemctl,
+                service_unit,
+                monitor_slice_unit,
+                attempt_slice_unit,
+                scope_unit,
+                str(control_directory),
+                str(receipt_path),
+                attempt_id,
+                str(claim_token),
+                execution_id,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_environment(),
+        )
+        deadline = time.monotonic() + _WAIT_SECONDS * 2
+        while not receipt_path.exists():
+            if controller.poll() is not None:
+                _, stderr = controller.communicate()
+                raise RuntimeError(
+                    f"monitor controller exited {controller.returncode} before receipt: "
+                    f"{stderr.strip()}"
+                )
+            if time.monotonic() >= deadline:
+                raise RuntimeError("monitor controller did not persist its receipt in time")
+            time.sleep(0.05)
+        if controller.stdout is None:
+            raise RuntimeError("monitor controller has no durability acknowledgment pipe")
+        with selectors.DefaultSelector() as selector:
+            selector.register(controller.stdout, selectors.EVENT_READ)
+            if not selector.select(timeout=_WAIT_SECONDS):
+                raise RuntimeError("monitor controller did not acknowledge authenticated status")
+            if controller.stdout.readline().strip() != "receipt-durable":
+                raise RuntimeError("monitor controller exited before its durability acknowledgment")
+        controller.send_signal(signal.SIGKILL)
+        stdout, stderr = controller.communicate(timeout=_WAIT_SECONDS)
+        if controller.returncode != -signal.SIGKILL:
+            raise RuntimeError(
+                f"monitor controller did not die abruptly: rc={controller.returncode}; "
+                f"stdout={stdout.strip()}; stderr={stderr.strip()}"
+            )
+        controller = None
+
+        reconciliation = _reconcile_monitor_after_restart(systemctl, receipt_path)
+        receipt = SandboxMonitorReceipt.from_dict(reconciliation["receipt"])
+        service = _wait_active(systemctl, service_unit)
+        active[service_unit] = service
+        attempt_slice = _wait_active(systemctl, attempt_slice_unit)
+        active[attempt_slice_unit] = attempt_slice
+        scope = _wait_active(systemctl, scope_unit)
+        active[scope_unit] = scope
+        if (
+            service.get("Slice") != monitor_slice_unit
+            or PurePosixPath(service["ControlGroup"]).parent.as_posix()
+            != reconciliation["monitor_slice"]["ControlGroup"]
+            or scope.get("Slice") != attempt_slice_unit
+            or PurePosixPath(scope["ControlGroup"]).parent.as_posix()
+            != attempt_slice["ControlGroup"]
+            or PurePosixPath(service["ControlGroup"]).is_relative_to(
+                PurePosixPath(attempt_slice["ControlGroup"])
+            )
+        ):
+            raise AssertionError("monitor service and worker scope are not isolated siblings")
+        client = reconnect_sandbox_monitor(
+            receipt_path=receipt_path,
+            control_directory=control_directory,
+            socket_path=socket_path,
+            expected_identity=(attempt_id, claim_token, execution_id),
+        )
+        status = client.status()
+        if status.outcome != "ok" or status.payload.get("phase") != "running":
+            raise AssertionError(f"reconnected monitor status was not authenticated: {status}")
+        worker_pid = status.payload.get("worker_pid")
+        if type(worker_pid) is not int or ProcessMixin._process_identity(worker_pid) is None:
+            raise AssertionError("monitor status did not identify a live worker process")
+        worker_cgroup = Path(f"/proc/{worker_pid}/cgroup").read_text(encoding="ascii")
+        if not any(
+            line.endswith(f":{scope['ControlGroup']}") for line in worker_cgroup.splitlines()
+        ):
+            raise AssertionError("monitor-reported worker PID is outside the exact scope cgroup")
+
+        request_id = uuid.uuid4().hex
+        cancelled = client.cancel(request_id)
+        replayed = client.cancel(request_id)
+        if (
+            cancelled.outcome != "ok"
+            or cancelled.payload.get("phase") != "exited"
+            or cancelled.payload.get("worker_pid") != worker_pid
+            or replayed != cancelled
+        ):
+            raise AssertionError(
+                "monitor cancellation was not exact, durable, and idempotent: "
+                f"cancelled={cancelled!r}; replayed={replayed!r}"
+            )
+        scope = _wait_inactive(systemctl, scope_unit)
+        if scope.get("ActiveState") in {"active", "activating", "deactivating"}:
+            raise AssertionError("monitor cancellation left the exact worker scope active")
+        if not _cgroup_is_empty(scope.get("ControlGroup", "")):
+            raise AssertionError("monitor cancellation left the worker scope cgroup populated")
+        if ProcessMixin._process_identity(worker_pid) is not None:
+            raise AssertionError("monitor cancellation left its worker process alive")
+        service = _wait_active(systemctl, service_unit)
+        if service.get("InvocationID") != receipt.invocation_id:
+            raise AssertionError("monitor service changed while its worker scope was stopped")
+        if ProcessMixin._process_identity(receipt.main_pid) != receipt.main_identity:
+            raise AssertionError("monitor process identity changed during cancellation")
+    finally:
+        if controller is not None and controller.poll() is None:
+            controller.kill()
+            controller.communicate(timeout=_WAIT_SECONDS)
+        launch_markers = {
+            scope_unit: "scope-launching",
+            service_unit: "monitor-service-launching",
+            attempt_slice_unit: "attempt-slice-launching",
+        }
+        for unit in (scope_unit, service_unit, attempt_slice_unit):
+            try:
+                original = active.get(unit)
+                before_stop = _unit_properties(systemctl, unit)
+                if original is None and before_stop.get("ControlGroup"):
+                    original = before_stop
+                    active[unit] = before_stop
+                if (control_directory / launch_markers[unit]).exists() and not (
+                    original and original.get("ControlGroup")
+                ):
+                    cleanup_errors.append(
+                        f"{unit} was launched but its original cgroup was not captured"
+                    )
+                subprocess.run(
+                    [systemctl, "--user", "stop", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_WAIT_SECONDS,
+                    env=_environment(),
+                )
+                inactive = _wait_inactive(systemctl, unit)
+                if inactive.get("ActiveState") in {"active", "activating", "deactivating"}:
+                    cleanup_errors.append(f"{unit} remained active: {inactive}")
+                for control_group in {
+                    inactive.get("ControlGroup", ""),
+                    active.get(unit, {}).get("ControlGroup", ""),
+                } - {""}:
+                    if not _cgroup_is_empty(control_group):
+                        cleanup_errors.append(f"{unit} retained populated cgroup {control_group}")
+                if inactive.get("ActiveState") == "failed":
+                    _run([systemctl, "--user", "reset-failed", unit])
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify {unit} cleanup: {error}")
+        try:
+            after = control_directory.lstat()
+            if (
+                (after.st_dev, after.st_ino)
+                != (directory_identity.st_dev, directory_identity.st_ino)
+                or after.st_uid != os.geteuid()
+                or control_directory.is_symlink()
+                or (after.st_mode & 0o777) != 0o700
+            ):
+                cleanup_errors.append("monitor IPC fixture directory identity changed")
+        except OSError as error:
+            cleanup_errors.append(f"monitor IPC fixture directory could not be verified: {error}")
+        if cleanup_errors:
+            raise RuntimeError(
+                "monitor IPC integration cleanup was not verified; fixture retained: "
+                + "; ".join(cleanup_errors)
+            )
+        shutil.rmtree(control_directory)
+
+
+def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
+    """Prove the systemd credential handoff primitive with a fake secret only."""
+
+    import stat
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the opt-in systemd credential test requires Linux cgroup v2")
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    version_line = _run([systemctl, "--version"]).stdout.splitlines()[0]
+    try:
+        systemd_version = int(version_line.split()[1].split(".", 1)[0])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError("systemd version could not be read") from error
+    if systemd_version < 252:
+        raise RuntimeError("the supported systemd credential probe requires version 252 or newer")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+    runtime_directory_value = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_directory_value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for the user-systemd credential probe")
+
+    token = uuid.uuid4().hex
+    unit = f"acp-credential-probe-{token}.service"
+    runtime_directory = Path(runtime_directory_value)
+    existing = _unit_properties(systemctl, unit)
+    if existing.get("LoadState") != "not-found":
+        raise RuntimeError(f"random credential probe unit already exists: {existing!r}")
+
+    private_directory = Path(tempfile.mkdtemp(prefix="acp-credential-", dir=runtime_directory))
+    directory_identity = private_directory.lstat()
+    credential_source = private_directory / "credential-source"
+    result_path = private_directory / "probe-result.json"
+    secret = (uuid.uuid4().hex + uuid.uuid4().hex).encode("ascii")
+    launch_attempted = False
+    observed_unit: dict[str, str] = {}
+    captured_main_pid = 0
+    captured_main_identity: str | None = None
+    cleanup_errors: list[str] = []
+    try:
+        if (
+            directory_identity.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_identity.st_mode) != 0o700
+            or not stat.S_ISDIR(directory_identity.st_mode)
+        ):
+            raise AssertionError("credential fixture directory is not private to the current user")
+        descriptor = os.open(
+            credential_source,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            if os.write(descriptor, secret) != len(secret):
+                raise RuntimeError("fake credential source write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        source_info = credential_source.lstat()
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_uid != os.geteuid()
+            or stat.S_IMODE(source_info.st_mode) != 0o600
+        ):
+            raise AssertionError("fake credential source is not private to the current user")
+        expected_digest = hashlib.sha256(secret).hexdigest()
+        probe = (
+            "import hashlib,json,os,stat,sys; from pathlib import Path; "
+            "credential_path=Path(os.environ['CREDENTIALS_DIRECTORY'])/'launch'; "
+            "credential=credential_path.read_bytes(); "
+            "report={'sha256':hashlib.sha256(credential).hexdigest(), "
+            "'secret_in_environment':any(credential.decode('ascii') in value "
+            "for value in os.environ.values()), "
+            "'credential_read_only':(stat.S_IMODE(credential_path.stat().st_mode)&0o222)==0, "
+            "'credential_owner_uid':credential_path.stat().st_uid}; "
+            "Path(sys.argv[1]).write_text(json.dumps(report),encoding='ascii'); "
+            "import time; time.sleep(60)"
+        )
+        launch_attempted = True
+        launch_result = _run(
+            [
+                systemd_run,
+                "--user",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "--property=RuntimeMaxSec=90s",
+                f"--property=LoadCredential=launch:{credential_source}",
+                "--no-block",
+                sys.executable,
+                "-c",
+                probe,
+                str(result_path),
+            ],
+            timeout=10.0,
+        )
+        if secret.decode("ascii") in launch_result.stdout + launch_result.stderr:
+            raise AssertionError("systemd-run output exposed the fake credential")
+        observed_unit = _wait_active(systemctl, unit)
+        if (
+            observed_unit.get("LoadState") != "loaded"
+            or observed_unit.get("Id") != unit
+            or not observed_unit.get("InvocationID")
+            or not observed_unit.get("ControlGroup")
+            or observed_unit.get("ActiveState") != "active"
+        ):
+            raise AssertionError(
+                "systemd did not expose the exact active credential-probe identity"
+            )
+        main_pid = int(observed_unit.get("MainPID", "0"))
+        main_identity = ProcessMixin._process_identity(main_pid) if main_pid > 0 else None
+        if main_identity is None:
+            raise AssertionError("credential-probe service process identity was not observable")
+        captured_main_pid = main_pid
+        captured_main_identity = main_identity
+        result_deadline = time.monotonic() + _WAIT_SECONDS
+        while not result_path.is_file() and time.monotonic() < result_deadline:
+            time.sleep(0.05)
+        if not result_path.is_file():
+            raise AssertionError("monitor service did not read the supplied fake credential")
+        observed = json.loads(result_path.read_text(encoding="ascii"))
+        expected = {
+            "sha256": expected_digest,
+            "secret_in_environment": False,
+            "credential_read_only": True,
+            "credential_owner_uid": os.geteuid(),
+        }
+        if observed != expected:
+            raise AssertionError(f"systemd credential handoff differed: {observed!r}")
+    finally:
+        # Preserve the private fixture unless the exact transient unit is terminal,
+        # its captured cgroups are empty, and its main process is gone.
+        deadline = time.monotonic() + _WAIT_SECONDS
+        control_groups: set[str] = set()
+        process_identities: set[tuple[int, str]] = set()
+        invocation_id = observed_unit.get("InvocationID", "")
+        if launch_attempted and (
+            observed_unit.get("Id") != unit
+            or not invocation_id
+            or not observed_unit.get("ControlGroup")
+        ):
+            cleanup_errors.append("the exact launched service identity was not captured")
+        if observed_unit.get("ControlGroup"):
+            control_groups.add(observed_unit["ControlGroup"])
+        if captured_main_pid > 0 and captured_main_identity is not None:
+            process_identities.add((captured_main_pid, captured_main_identity))
+        elif launch_attempted:
+            cleanup_errors.append("the pre-stop credential-probe process identity was not captured")
+        try:
+            observed_pid = int(observed_unit.get("MainPID", "0"))
+            observed_identity = (
+                ProcessMixin._process_identity(observed_pid) if observed_pid > 0 else None
+            )
+            if observed_identity is not None:
+                process_identities.add((observed_pid, observed_identity))
+        except (OSError, ValueError):
+            cleanup_errors.append("the captured credential-probe MainPID could not be verified")
+        if launch_attempted:
+            try:
+                subprocess.run(
+                    [systemctl, "--user", "stop", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(2.0, _WAIT_SECONDS),
+                    env=_environment(),
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not stop exact credential-probe unit: {error}")
+        terminal = False
+        last: dict[str, str] = {}
+        while time.monotonic() < deadline:
+            try:
+                last = _unit_properties(systemctl, unit)
+                load_state = last.get("LoadState")
+                if load_state == "loaded":
+                    if last.get("Id") != unit:
+                        cleanup_errors.append("systemd credential probe unit ID changed")
+                        break
+                    current_invocation = last.get("InvocationID", "")
+                    if invocation_id and current_invocation and current_invocation != invocation_id:
+                        cleanup_errors.append("systemd credential probe invocation changed")
+                        break
+                    invocation_id = invocation_id or current_invocation
+                    if last.get("ControlGroup"):
+                        control_groups.add(last["ControlGroup"])
+                    try:
+                        main_pid = int(last.get("MainPID", "0"))
+                    except ValueError:
+                        cleanup_errors.append("systemd credential probe MainPID was invalid")
+                        break
+                    if main_pid > 0:
+                        identity = ProcessMixin._process_identity(main_pid)
+                        if identity is not None:
+                            process_identities.add((main_pid, identity))
+                    active_state = last.get("ActiveState")
+                    if active_state == "failed":
+                        subprocess.run(
+                            [systemctl, "--user", "reset-failed", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                    elif active_state in {"active", "activating", "deactivating"}:
+                        subprocess.run(
+                            [systemctl, "--user", "stop", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                    elif active_state != "inactive" or main_pid != 0:
+                        cleanup_errors.append(
+                            f"systemd credential probe has unknown active state: {last!r}"
+                        )
+                        break
+                    terminal = False
+                elif load_state == "not-found":
+                    terminal = True
+                else:
+                    cleanup_errors.append(
+                        f"systemd credential probe has unknown load state: {last!r}"
+                    )
+                    break
+                cgroups_empty = all(_cgroup_is_empty(group) for group in control_groups)
+                processes_gone = all(
+                    ProcessMixin._process_identity(pid) != identity
+                    for pid, identity in process_identities
+                )
+                if terminal and cgroups_empty and processes_gone:
+                    break
+                terminal = False
+            except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify systemd credential probe cleanup: {error}")
+                break
+            time.sleep(0.05)
+        else:
+            cleanup_errors.append(
+                f"systemd credential probe did not reach a verified terminal state: {last!r}"
+            )
+        if not terminal:
+            if not cleanup_errors:
+                cleanup_errors.append(f"systemd credential probe remained non-terminal: {last!r}")
+        for control_group in control_groups:
+            try:
+                if not _cgroup_is_empty(control_group):
+                    cleanup_errors.append(
+                        f"systemd credential probe retained populated cgroup {control_group}"
+                    )
+            except (OSError, RuntimeError, AssertionError) as error:
+                cleanup_errors.append(f"could not verify credential-probe cgroup: {error}")
+        if any(
+            ProcessMixin._process_identity(pid) == identity for pid, identity in process_identities
+        ):
+            cleanup_errors.append("systemd credential probe process identity remained alive")
+        try:
+            after = private_directory.lstat()
+            if (
+                (after.st_dev, after.st_ino)
+                != (directory_identity.st_dev, directory_identity.st_ino)
+                or after.st_uid != os.geteuid()
+                or not stat.S_ISDIR(after.st_mode)
+                or stat.S_IMODE(after.st_mode) != 0o700
+                or private_directory.is_symlink()
+            ):
+                cleanup_errors.append("credential fixture directory identity changed")
+            else:
+                for entry in private_directory.iterdir():
+                    info = entry.lstat()
+                    if (
+                        entry.name not in {"credential-source", "probe-result.json"}
+                        or not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or entry.is_symlink()
+                    ):
+                        cleanup_errors.append(
+                            f"credential fixture entry was not expected: {entry.name}"
+                        )
+        except OSError as error:
+            cleanup_errors.append(f"credential fixture directory could not be verified: {error}")
+        if cleanup_errors:
+            raise RuntimeError(
+                "systemd credential probe cleanup was not verified; "
+                f"private fixture retained at {private_directory}: " + "; ".join(cleanup_errors)
+            ) from sys.exc_info()[1]
+        shutil.rmtree(private_directory)
+
+
+def test_live_systemd_loadcredential_restart_requires_source_again() -> None:
+    """Prove a restart re-resolves LoadCredential sources using only a fake value."""
+
+    import stat
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the opt-in credential restart test requires Linux cgroup v2")
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    version_line = _run([systemctl, "--version"]).stdout.splitlines()[0]
+    try:
+        systemd_version = int(version_line.split()[1].split(".", 1)[0])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError("systemd version could not be read") from error
+    if systemd_version < 252:
+        raise RuntimeError("the supported credential restart probe requires systemd 252 or newer")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+    runtime_directory_value = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_directory_value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for the credential restart probe")
+
+    token = uuid.uuid4().hex
+    unit = f"acp-credential-restart-{token}.service"
+    runtime_directory = Path(runtime_directory_value)
+    if _unit_properties(systemctl, unit).get("LoadState") != "not-found":
+        raise RuntimeError(f"random credential restart unit already exists: {unit}")
+    private_directory = Path(
+        tempfile.mkdtemp(prefix="acp-credential-restart-", dir=runtime_directory)
+    )
+    directory_identity = private_directory.lstat()
+    source_path = private_directory / "credential-source"
+    starts_path = private_directory / "starts"
+    report_path = private_directory / "credential-report.json"
+    release_path = private_directory / "release"
+    fake_secret = (uuid.uuid4().hex + uuid.uuid4().hex).encode("ascii")
+    fake_digest = hashlib.sha256(fake_secret).hexdigest()
+    launch_attempted = False
+    first_unit: dict[str, str] = {}
+    control_groups: set[str] = set()
+    process_identities: set[tuple[int, str]] = set()
+    cleanup_errors: list[str] = []
+    try:
+        if (
+            directory_identity.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_identity.st_mode) != 0o700
+            or not stat.S_ISDIR(directory_identity.st_mode)
+        ):
+            raise AssertionError("credential restart fixture directory is not private")
+        descriptor = os.open(
+            source_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            if os.write(descriptor, fake_secret) != len(fake_secret):
+                raise RuntimeError("fake credential source write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        source_info = source_path.lstat()
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_uid != os.geteuid()
+            or stat.S_IMODE(source_info.st_mode) != 0o600
+        ):
+            raise AssertionError("fake credential source is not private")
+
+        # The first activation proves its copied credential survives source
+        # removal. It then exits unsuccessfully so systemd must perform a real
+        # automatic restart; a second process marker would mean the restart
+        # improperly reused the old credential copy.
+        worker = (
+            "import hashlib,json,os,sys,time; from pathlib import Path; "
+            "root=Path(sys.argv[1]); starts=root/'starts'; "
+            "fd=os.open(starts,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600); "
+            "os.write(fd,b'worker-started\\n'); os.close(fd); "
+            "credential=Path(os.environ['CREDENTIALS_DIRECTORY'])/'launch'; "
+            "before=credential.read_bytes(); "
+            "deadline=time.monotonic()+10; "
+            "exec(\"while not (root/'release').exists() and time.monotonic()<deadline: time.sleep(0.01)\"); "
+            "after=credential.read_bytes(); "
+            "report={'before_sha256':hashlib.sha256(before).hexdigest(), "
+            "'after_sha256':hashlib.sha256(after).hexdigest(), "
+            "'secret_in_environment':any(before.decode('ascii') in value for value in os.environ.values()), "
+            "'credential_read_only':(credential.stat().st_mode&0o222)==0}; "
+            "(root/'credential-report.json').write_text(json.dumps(report),encoding='ascii'); "
+            "sys.exit(75)"
+        )
+        launch_attempted = True
+        launch_output = _run(
+            [
+                systemd_run,
+                "--user",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "--property=RuntimeMaxSec=30s",
+                "--property=Restart=on-failure",
+                "--property=RestartSec=500ms",
+                "--property=StartLimitIntervalSec=15s",
+                "--property=StartLimitBurst=2",
+                f"--property=LoadCredential=launch:{source_path}",
+                "--no-block",
+                sys.executable,
+                "-c",
+                worker,
+                str(private_directory),
+            ],
+            timeout=10.0,
+        )
+        if fake_secret.decode("ascii") in launch_output.stdout + launch_output.stderr:
+            raise AssertionError("systemd-run output exposed the fake credential")
+        first_unit = _wait_active(systemctl, unit)
+        if (
+            first_unit.get("Id") != unit
+            or first_unit.get("LoadState") != "loaded"
+            or not first_unit.get("InvocationID")
+            or not first_unit.get("ControlGroup")
+        ):
+            raise AssertionError("credential restart probe lacks an exact active unit identity")
+        control_groups.add(first_unit["ControlGroup"])
+        first_pid = int(first_unit.get("MainPID", "0"))
+        first_identity = ProcessMixin._process_identity(first_pid) if first_pid > 0 else None
+        if first_identity is None:
+            raise AssertionError("first credential activation process identity was not observable")
+        process_identities.add((first_pid, first_identity))
+
+        deadline = time.monotonic() + _WAIT_SECONDS
+        while not starts_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not starts_path.is_file() or starts_path.read_bytes() != b"worker-started\n":
+            raise AssertionError("first fake worker activation did not reach its read gate")
+
+        # Unlink only the private, identity-checked source entry. systemd's
+        # already-created credential copy must remain readable by this first
+        # activation, while a later activation must resolve the now-missing
+        # source anew.
+        current_source = source_path.lstat()
+        if (
+            not stat.S_ISREG(current_source.st_mode)
+            or (current_source.st_dev, current_source.st_ino)
+            != (source_info.st_dev, source_info.st_ino)
+            or current_source.st_uid != os.geteuid()
+            or stat.S_IMODE(current_source.st_mode) != 0o600
+        ):
+            raise AssertionError("credential source identity changed before unlink")
+        source_path.unlink()
+        descriptor = os.open(
+            release_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            if os.write(descriptor, b"release\n") != 8:
+                raise RuntimeError("credential restart release marker write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        deadline = time.monotonic() + _WAIT_SECONDS
+        terminal: dict[str, str] = {}
+        unit_status = ""
+        restart_count = 0
+        while time.monotonic() < deadline:
+            observed = _run(
+                [
+                    systemctl,
+                    "--user",
+                    "show",
+                    unit,
+                    "--no-pager",
+                    "--property=Id",
+                    "--property=LoadState",
+                    "--property=ActiveState",
+                    "--property=InvocationID",
+                    "--property=ControlGroup",
+                    "--property=MainPID",
+                    "--property=NRestarts",
+                    "--property=Result",
+                ]
+            )
+            terminal = dict(
+                line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line
+            )
+            if terminal.get("LoadState") == "not-found":
+                status = _run(
+                    [systemctl, "--user", "status", unit, "--no-pager", "--full"],
+                    accepted_returncodes=(0, 3),
+                )
+                unit_status = status.stdout + status.stderr
+                break
+            if terminal.get("Id") != unit:
+                raise AssertionError("credential restart unit identity changed")
+            if terminal.get("ControlGroup"):
+                control_groups.add(terminal["ControlGroup"])
+            try:
+                restart_count = int(terminal.get("NRestarts", "0"))
+                main_pid = int(terminal.get("MainPID", "0"))
+            except ValueError as error:
+                raise AssertionError(
+                    "systemd credential restart properties were invalid"
+                ) from error
+            if main_pid > 0:
+                identity = ProcessMixin._process_identity(main_pid)
+                if identity is not None:
+                    process_identities.add((main_pid, identity))
+            if terminal.get("ActiveState") == "failed" and restart_count >= 1:
+                status = _run(
+                    [systemctl, "--user", "status", unit, "--no-pager", "--full"],
+                    accepted_returncodes=(0, 3),
+                )
+                unit_status = status.stdout + status.stderr
+                break
+            time.sleep(0.05)
+        if restart_count < 1:
+            raise AssertionError(
+                f"systemd did not record the expected automatic restart: {terminal!r}"
+            )
+        if terminal.get("LoadState") != "loaded" or terminal.get("ActiveState") != "failed":
+            raise AssertionError(
+                f"restart did not fail closed on the missing credential: {terminal!r}"
+            )
+        if int(terminal.get("MainPID", "-1")) != 0:
+            raise AssertionError("failed credential restart left a live main process")
+        if not report_path.is_file():
+            raise AssertionError("first activation did not re-read its copied credential")
+        report = json.loads(report_path.read_text(encoding="ascii"))
+        expected_report = {
+            "before_sha256": fake_digest,
+            "after_sha256": fake_digest,
+            "secret_in_environment": False,
+            "credential_read_only": True,
+        }
+        if report != expected_report:
+            raise AssertionError(
+                f"systemd credential copy changed after source removal: {report!r}"
+            )
+        if starts_path.read_bytes() != b"worker-started\n":
+            raise AssertionError("restart executed a second worker without the removed source")
+        if "243/CREDENTIALS" not in unit_status:
+            raise AssertionError(
+                "systemd did not report the credential-load failure for the restart; "
+                f"unit={terminal!r}; status={unit_status!r}"
+            )
+        if fake_secret.decode("ascii") in unit_status:
+            raise AssertionError("systemd status exposed the fake credential")
+    finally:
+        deadline = time.monotonic() + _WAIT_SECONDS
+        terminal_unit = False
+        last: dict[str, str] = {}
+        if launch_attempted:
+            try:
+                subprocess.run(
+                    [systemctl, "--user", "stop", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(2.0, _WAIT_SECONDS),
+                    env=_environment(),
+                )
+                subprocess.run(
+                    [systemctl, "--user", "reset-failed", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(2.0, _WAIT_SECONDS),
+                    env=_environment(),
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not stop exact credential restart unit: {error}")
+        while time.monotonic() < deadline:
+            try:
+                last = _unit_properties(systemctl, unit)
+                if last.get("LoadState") == "not-found":
+                    terminal_unit = True
+                elif last.get("LoadState") == "loaded" and last.get("Id") == unit:
+                    if last.get("ControlGroup"):
+                        control_groups.add(last["ControlGroup"])
+                    try:
+                        main_pid = int(last.get("MainPID", "0"))
+                    except ValueError:
+                        cleanup_errors.append("credential restart MainPID was invalid")
+                        break
+                    if main_pid > 0:
+                        identity = ProcessMixin._process_identity(main_pid)
+                        if identity is not None:
+                            process_identities.add((main_pid, identity))
+                    if last.get("ActiveState") not in {"inactive", "failed"} or main_pid != 0:
+                        subprocess.run(
+                            [systemctl, "--user", "stop", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                    else:
+                        subprocess.run(
+                            [systemctl, "--user", "reset-failed", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                else:
+                    cleanup_errors.append(f"credential restart unit identity is unknown: {last!r}")
+                    break
+                if (
+                    terminal_unit
+                    and all(_cgroup_is_empty(group) for group in control_groups)
+                    and all(
+                        ProcessMixin._process_identity(pid) != identity
+                        for pid, identity in process_identities
+                    )
+                ):
+                    break
+            except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify credential restart cleanup: {error}")
+                break
+            time.sleep(0.05)
+        else:
+            cleanup_errors.append(f"credential restart unit did not unload: {last!r}")
+        if not terminal_unit:
+            if not cleanup_errors:
+                cleanup_errors.append(f"credential restart unit remained loaded: {last!r}")
+        for control_group in control_groups:
+            try:
+                if not _cgroup_is_empty(control_group):
+                    cleanup_errors.append(
+                        f"credential restart cgroup remained populated: {control_group}"
+                    )
+            except (OSError, RuntimeError, AssertionError) as error:
+                cleanup_errors.append(f"could not verify credential restart cgroup: {error}")
+        if any(
+            ProcessMixin._process_identity(pid) == identity for pid, identity in process_identities
+        ):
+            cleanup_errors.append("credential restart process identity remained alive")
+        try:
+            after = private_directory.lstat()
+            if (
+                (after.st_dev, after.st_ino)
+                != (directory_identity.st_dev, directory_identity.st_ino)
+                or after.st_uid != os.geteuid()
+                or not stat.S_ISDIR(after.st_mode)
+                or stat.S_IMODE(after.st_mode) != 0o700
+                or private_directory.is_symlink()
+            ):
+                cleanup_errors.append("credential restart fixture directory identity changed")
+            else:
+                expected_entries = {"starts", "credential-report.json", "release"}
+                if source_path.exists():
+                    expected_entries.add(source_path.name)
+                for entry in private_directory.iterdir():
+                    info = entry.lstat()
+                    if (
+                        entry.name not in expected_entries
+                        or not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or entry.is_symlink()
+                    ):
+                        cleanup_errors.append(
+                            f"unexpected credential restart fixture entry: {entry.name}"
+                        )
+        except OSError as error:
+            cleanup_errors.append(
+                f"credential restart fixture directory could not be verified: {error}"
+            )
+        if cleanup_errors:
+            raise RuntimeError(
+                "credential restart cleanup was not verified; private fixture retained at "
+                f"{private_directory}: " + "; ".join(cleanup_errors)
+            ) from sys.exc_info()[1]
+        shutil.rmtree(private_directory)
+
+
 if __name__ == "__main__":
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--monitor-controller":
@@ -777,6 +2109,42 @@ if __name__ == "__main__":
             int(arguments[8]),
             arguments[9],
         )
+    elif arguments and arguments[0] == "--start-control-monitor":
+        if len(arguments) != 12:
+            raise SystemExit("start-control-monitor mode requires eleven arguments")
+        _start_control_monitor_controller(
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+            arguments[6],
+            Path(arguments[7]),
+            Path(arguments[8]),
+            arguments[9],
+            int(arguments[10]),
+            arguments[11],
+        )
+    elif arguments and arguments[0] == "--control-monitor-service":
+        if len(arguments) != 7:
+            raise SystemExit("control-monitor-service mode requires six arguments")
+        try:
+            _serve_control_monitor(
+                arguments[1],
+                arguments[2],
+                Path(arguments[3]),
+                arguments[4],
+                int(arguments[5]),
+                arguments[6],
+            )
+        except BaseException:
+            diagnostic_path = Path(arguments[3]) / "monitor-error.txt"
+            try:
+                with diagnostic_path.open("x", encoding="utf-8") as stream:
+                    stream.write(traceback.format_exc())
+            except OSError:
+                pass
+            raise
     elif arguments and arguments[0] == "--reconcile-monitor":
         if len(arguments) != 3:
             raise SystemExit("reconcile-monitor mode requires two arguments")

@@ -26,6 +26,9 @@ _SANDBOX_EXIT_RECEIPT_AUTHORIZATION: ContextVar[
 _SANDBOX_LAUNCH_PLAN_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str, str, str]] | None
 ] = ContextVar("acp_sandbox_launch_plan_authorization", default=None)
+_SANDBOX_LAUNCH_SUBMISSION_AUTHORIZATION: ContextVar[
+    tuple[int, tuple[str, int, str, str, str]] | None
+] = ContextVar("acp_sandbox_launch_submission_authorization", default=None)
 _SANDBOX_RESERVATION_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str]] | None
 ] = ContextVar("acp_sandbox_reservation_authorization", default=None)
@@ -185,6 +188,46 @@ def _sandbox_launch_plan_authorized_for(connection: sqlite3.Connection):
 
 
 @contextmanager
+def _authorize_sandbox_launch_submission_write(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    submission_id: str,
+    submission_digest: str,
+) -> Iterator[None]:
+    """Scope the irreversible launch marker to one validated runc target."""
+
+    fields = (attempt_id, claim_token, execution_id, submission_id, submission_digest)
+    token = _SANDBOX_LAUNCH_SUBMISSION_AUTHORIZATION.set((id(connection), fields))
+    try:
+        yield
+    finally:
+        _SANDBOX_LAUNCH_SUBMISSION_AUTHORIZATION.reset(token)
+
+
+def _sandbox_launch_submission_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        submission_id: str,
+        submission_digest: str,
+    ) -> int:
+        authorization = _SANDBOX_LAUNCH_SUBMISSION_AUTHORIZATION.get()
+        expected = (attempt_id, claim_token, execution_id, submission_id, submission_digest)
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
+
+
+@contextmanager
 def _authorize_sandbox_reservation_write(
     connection: sqlite3.Connection,
     attempt_id: str,
@@ -259,6 +302,11 @@ class StoreMixin:
                 _sandbox_launch_plan_authorized_for(connection),
             )
             connection.create_function(
+                "acp_sandbox_launch_submission_authorized",
+                5,
+                _sandbox_launch_submission_authorized_for(connection),
+            )
+            connection.create_function(
                 "acp_sandbox_reservation_authorized",
                 5,
                 _sandbox_reservation_authorized_for(connection),
@@ -279,6 +327,11 @@ class StoreMixin:
             "acp_sandbox_launch_plan_authorized",
             7,
             _sandbox_launch_plan_authorized_for(connection),
+        )
+        connection.create_function(
+            "acp_sandbox_launch_submission_authorized",
+            5,
+            _sandbox_launch_submission_authorized_for(connection),
         )
         connection.create_function(
             "acp_sandbox_reservation_authorized",

@@ -787,7 +787,7 @@ def test_private_bundle_launcher_script_is_valid_python() -> None:
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux namespaces")
-def test_private_bundle_launcher_reaps_client_on_setup_failure(
+def test_private_bundle_launcher_reaps_client_on_submission_authorization_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if os.environ.get("ACP_RUN_OCI_INTEGRATION") != "1":
@@ -822,12 +822,16 @@ def test_private_bundle_launcher_reaps_client_on_setup_failure(
     monkeypatch.setattr(oci_worker.subprocess, "Popen", capture_popen)
     callback_reached = False
 
-    def fail_before_runc_exec(_pid: int, _private_bundle: Path, _bundle_fd: int) -> None:
+    def fail_submission_authorization(target: oci_worker._RuncLaunchTarget) -> None:
         nonlocal callback_reached
         callback_reached = True
-        raise RuntimeError("injected private-bundle setup failure")
+        assert target.launch_mode == "private_bundle"
+        assert target.container_id == "acp-worker-123"
+        raise RuntimeError("injected launch-submission authorization failure")
 
-    with pytest.raises(SupervisorError, match="injected private-bundle setup failure") as error:
+    with pytest.raises(
+        SupervisorError, match="injected launch-submission authorization failure"
+    ) as error:
         oci_worker._spawn_pinned_runc_with_private_bundle(
             pin,
             argv,
@@ -835,7 +839,7 @@ def test_private_bundle_launcher_reaps_client_on_setup_failure(
             binding.config_json,
             rootfs_sha256=binding.rootfs_sha256,
             rootfs_closure_sha256=binding.rootfs_closure_sha256,
-            _before_runc_exec=fail_before_runc_exec,
+            _authorize_runc_submission=fail_submission_authorization,
         )
 
     assert error.value.code == "sandbox_bundle_setup_failed"
@@ -872,6 +876,9 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
         spawned.append((executable, tuple(argv), bundle_root, config_json, kwargs))
         return object()
 
+    def authorize_submission(_target: oci_worker._RuncLaunchTarget) -> object:
+        return object()
+
     monkeypatch.setattr(oci_worker, "_spawn_pinned_runc_with_private_bundle", private_spawn)
 
     result = oci_worker.spawn_pinned_runc(
@@ -881,6 +888,7 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
         workspace.root,
         state_root / "worker.pid",
         "acp-worker-123",
+        _authorize_runc_submission=authorize_submission,
     )
 
     assert result is not None
@@ -893,6 +901,7 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
     assert config_json == binding.config_json
     assert launch_options["rootfs_sha256"] == binding.rootfs_sha256
     assert launch_options["rootfs_closure_sha256"] == binding.rootfs_closure_sha256
+    assert launch_options["_authorize_runc_submission"] is authorize_submission
 
 
 def test_pinned_spawn_rejects_rootfs_changed_after_config_compilation_before_launch(

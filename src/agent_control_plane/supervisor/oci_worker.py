@@ -3546,6 +3546,69 @@ class _RuncLaunchTarget:
     pids_limit: int | None = None
 
 
+_RUNC_LAUNCH_SUBMISSION_TARGETS: dict[
+    int, tuple[weakref.ReferenceType[Any], _RuncLaunchTarget]
+] = {}
+_RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK = threading.Lock()
+
+
+def _register_runc_launch_submission_target(submission: Any, target: _RuncLaunchTarget) -> None:
+    """Bind a committed journal capability to the exact target object."""
+
+    if submission is None or type(target) is not _RuncLaunchTarget:
+        raise SupervisorError(
+            "sandbox_execution_launch_submission_required",
+            "pre-runc authorization did not return a target-bound capability",
+        )
+    key = id(submission)
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        with _RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK:
+            current = _RUNC_LAUNCH_SUBMISSION_TARGETS.get(key)
+            if current is not None and current[0] is reference:
+                _RUNC_LAUNCH_SUBMISSION_TARGETS.pop(key, None)
+
+    try:
+        reference = weakref.ref(submission, discard)
+    except TypeError as error:
+        raise SupervisorError(
+            "sandbox_execution_launch_submission_required",
+            "pre-runc authorization returned a non-process-local capability",
+        ) from error
+    with _RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK:
+        current = _RUNC_LAUNCH_SUBMISSION_TARGETS.get(key)
+        if current is not None and current[0]() is submission:
+            raise SupervisorError(
+                "sandbox_execution_launch_submission_conflict",
+                "pre-runc capability was already bound to a launch target",
+            )
+        _RUNC_LAUNCH_SUBMISSION_TARGETS[key] = (reference, target)
+
+
+def _runc_launch_submission_is_authorized_for_target(
+    submission: Any, target: _RuncLaunchTarget
+) -> bool:
+    if submission is None or type(target) is not _RuncLaunchTarget:
+        return False
+    with _RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK:
+        registered = _RUNC_LAUNCH_SUBMISSION_TARGETS.get(id(submission))
+        return registered is not None and registered[0]() is submission and registered[1] is target
+
+
+def _authorize_runc_submission_before_exec(
+    authorize: Callable[[_RuncLaunchTarget], Any], target: _RuncLaunchTarget
+) -> Any:
+    """Fail closed unless the callback returns a committed capability for target."""
+
+    submission = authorize(target)
+    if not _runc_launch_submission_is_authorized_for_target(submission, target):
+        raise SupervisorError(
+            "sandbox_execution_launch_submission_required",
+            "pre-runc callback did not return the committed capability for this exact target",
+        )
+    return submission
+
+
 @dataclass(frozen=True)
 class _RuncLaunchRecord:
     """Private immutable provenance retained independently of mutable handles."""
@@ -3554,6 +3617,7 @@ class _RuncLaunchRecord:
     pid: int
     process_identity: str
     target: _RuncLaunchTarget
+    launch_submission: Any | None = None
     execution_binding: tuple[str, int, str] | None = None
     gate_release_authorized: bool = False
     wait_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
@@ -3640,6 +3704,7 @@ def _register_runc_launch_handle(
     process: Any,
     process_identity: str,
     target: _RuncLaunchTarget,
+    launch_submission: Any | None = None,
     _test_waitpid: Callable[[int, int], tuple[int, int]] | None = None,
     _test_identity_reader: Callable[[int], str | None] | None = None,
 ) -> None:
@@ -3672,6 +3737,7 @@ def _register_runc_launch_handle(
         pid=pid,
         process_identity=process_identity,
         target=target,
+        launch_submission=launch_submission,
         _test_waitpid=_test_waitpid,
         _test_identity_reader=_test_identity_reader,
     )
@@ -3776,6 +3842,7 @@ def _record_runc_kernel_wait_status(
             pid=current.pid,
             process_identity=current.process_identity,
             target=current.target,
+            launch_submission=current.launch_submission,
             execution_binding=current.execution_binding,
             gate_release_authorized=current.gate_release_authorized,
             wait_lock=current.wait_lock,
@@ -3800,6 +3867,17 @@ def _runc_launch_handle_is_self_consistent(handle: Any) -> bool:
     """Recognize only a live handle present in the private launch registry."""
 
     return _runc_launch_record(handle) is not None
+
+
+def _runc_launch_submission_is_bound_to_handle(handle: Any, launch_submission: Any) -> bool:
+    """Require the pre-exec capability captured by this exact launcher record."""
+
+    record = _runc_launch_record(handle)
+    return (
+        record is not None
+        and record.launch_submission is launch_submission
+        and _runc_launch_submission_is_authorized_for_target(launch_submission, record.target)
+    )
 
 
 def _runc_launch_handle_is_bound_to_execution(
@@ -3867,6 +3945,7 @@ def _authorize_runc_launch_gate_release_locked(
             pid=record.pid,
             process_identity=record.process_identity,
             target=record.target,
+            launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
             gate_release_authorized=True,
             wait_lock=record.wait_lock,
@@ -3900,6 +3979,7 @@ def _revoke_runc_launch_gate_release_locked(
             pid=record.pid,
             process_identity=record.process_identity,
             target=record.target,
+            launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
             gate_release_authorized=False,
             wait_lock=record.wait_lock,
@@ -3931,6 +4011,7 @@ def _consume_runc_launch_gate_authorization(handle: RuncLaunchHandle) -> None:
             pid=record.pid,
             process_identity=record.process_identity,
             target=record.target,
+            launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
             gate_release_authorized=False,
             wait_lock=record.wait_lock,
@@ -3980,6 +4061,7 @@ def _runc_launch_handle_bind_execution(
             pid=record.pid,
             process_identity=record.process_identity,
             target=record.target,
+            launch_submission=record.launch_submission,
             execution_binding=binding,
             gate_release_authorized=record.gate_release_authorized,
             wait_lock=record.wait_lock,
@@ -4771,6 +4853,7 @@ def _spawn_pinned_runc_with_private_bundle(
     stderr: Any = subprocess.DEVNULL,
     _before_workspace_open: Callable[[int, Path, int, int], None] | None = None,
     _before_runc_exec: Callable[[int, Path, int], None] | None = None,
+    _authorize_runc_submission: Callable[[_RuncLaunchTarget], Any] | None = None,
 ) -> RuncLaunchHandle:
     """Exec pinned runc only after sealing its bundle in a private mount namespace.
 
@@ -4782,8 +4865,12 @@ def _spawn_pinned_runc_with_private_bundle(
     device nodes without making the rootfs writable. The helper is made
     non-dumpable before creating the snapshot, blocking same-UID procfs access.
     Runc consumes the bundle through its inherited mount FD, never through the
-    mutable host pathname. The optional pre-exec callback is
-    private test instrumentation; the supported public API never supplies it.
+    mutable host pathname. The optional pre-exec callback is private test
+    instrumentation. A supervised monitor supplies ``_authorize_runc_submission``
+    to durably consume the attempt's one launch opportunity immediately before
+    the private launcher is allowed to exec runc. If that callback commits but
+    the monitor crashes before recording the returned handle, the attempt stays
+    fenced and must be reconciled rather than relaunched.
     """
 
     if os.geteuid() == 0:
@@ -5154,6 +5241,11 @@ def _spawn_pinned_runc_with_private_bundle(
         )
         if _before_runc_exec is not None:
             _before_runc_exec(process.pid, bundle, private_bundle_fd)
+        launch_submission = None
+        if _authorize_runc_submission is not None:
+            launch_submission = _authorize_runc_submission_before_exec(
+                _authorize_runc_submission, launch_target
+            )
         # This byte is the runc-submission boundary: after it is attempted the
         # caller must reconcile exact runtime state if no handle is returned.
         launch_payload_may_have_been_delivered = True
@@ -5171,7 +5263,11 @@ def _spawn_pinned_runc_with_private_bundle(
             _bundle_path=bundle_fd_path,
         )
         _register_runc_launch_handle(
-            handle, process=process, process_identity=process_identity, target=launch_target
+            handle,
+            process=process,
+            process_identity=process_identity,
+            target=launch_target,
+            launch_submission=launch_submission,
         )
         gate_write = -1
         return handle
@@ -5268,6 +5364,7 @@ def spawn_pinned_runc(
     *,
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
+    _authorize_runc_submission: Callable[[_RuncLaunchTarget], Any] | None = None,
 ) -> RuncLaunchHandle:
     """Launch sealed runc policy from a private, descriptor-anchored bundle.
 
@@ -5281,7 +5378,9 @@ def spawn_pinned_runc(
     replacement cannot redirect the config handoff.
     This low-level API still does not reserve a supervisor attempt, attest
     runtime state, supervise cancellation/recovery, prove cleanup, or authorize
-    result import; ``run_worker`` remains fail-closed for configured OCI.
+    result import; ``run_worker`` remains fail-closed for configured OCI. A
+    supervised monitor may supply the private submission callback, which must
+    return the process-local capability committed for this exact launch target.
     """
 
     if type(binding) is not _PinnedRuncWorkerConfig:
@@ -5307,6 +5406,7 @@ def spawn_pinned_runc(
         rootfs_closure_sha256=binding.rootfs_closure_sha256,
         stdout=stdout,
         stderr=stderr,
+        _authorize_runc_submission=_authorize_runc_submission,
     )
 
 

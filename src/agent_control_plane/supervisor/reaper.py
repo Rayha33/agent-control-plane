@@ -52,9 +52,10 @@ class ReaperMixin:
     #     away would forge exactly the proof the mismatch is reporting.
     #   * recover NEVER releases an allocation on an assertion. A port returns
     #     to the pool only against a POSITIVE ABSENCE PROOF — the driver's own
-    #     verify phase reporting present=False, or the port failing to accept a
-    #     bind. An operator receipt is authenticated and recorded, but it is
-    #     testimony, not proof, and it cannot release anything on its own.
+    #     verify phase succeeding under its cleanup-proof policy, or the port
+    #     successfully accepting a bind. An operator receipt is authenticated
+    #     and recorded, but it is testimony, not proof, and it cannot release
+    #     anything on its own.
     # ------------------------------------------------------------------ #
 
     _QUARANTINE_ACTIONS: tuple[str, ...] = (

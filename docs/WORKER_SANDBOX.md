@@ -437,20 +437,95 @@ not a monitor launcher or worker executor: the integration probe still uses a
 placeholder service, does not transfer a live runc handle, and does not attest
 cleanup or result import. `run_worker()` remains fail-closed.
 
-**Monitor control-request codec (2026-10-11; authentication primitive only).**
-The same module now encodes a bounded canonical-JSON request authenticated by a
-fixed 32-byte HMAC-SHA-256 capability. The MAC covers the full fenced execution
-tuple, a request ID, the operation, and (for `start`) the exact launch-plan
-digest. The schema permits only `start`, `status`, and `cancel`; it has no field
-for arbitrary argv, environment, path, UID, or systemd property. The request ID
-is only a deduplication key: this codec does not persist replay state, provide
-Unix-socket peer credentials, store/deliver the secret, or execute any action.
-An eventual monitor server must authenticate the peer, load the expected tuple
-and launch plan from private durable state, reject replays transactionally, and
-authorize each operation before acting. The capability must remain host-private
-and outside all worker mounts. This is not an authenticated reconnect service or
-an executor; no systemd unit, runc handle, gate, cancellation, or cleanup is
-controlled by these functions. `run_worker()` remains fail-closed.
+**Monitor control IPC slice (2026-10-11; not wired to the worker executor).**
+`supervisor/sandbox_monitor_ipc.py` adds a Linux Unix-domain server/client around
+the request codec. The server checks `SO_PEERCRED` UID and HMAC-fences the full
+execution tuple; the client checks peer UID against the configured service
+owner and pins PID plus fresh `/proc` start-time identity to the durable monitor
+receipt. Status/cancel responses are bounded, allow-listed,
+HMAC-authenticated values. The durable request ledger
+applies to cancellation only: it creates a mode-0600 acceptance record and
+fsyncs it before invoking the monitor-owned handler, then creates a signed
+response record. The controller can reuse the same cancellation request ID to
+retry; exact retries return the original response. An accepted cancellation
+without a durable response returns `unknown` and is never re-applied. Read-only
+status polling does not consume ledger capacity. Cancellation requires the
+caller to provide and retain a stable 32-hex request ID before sending, so an
+ambiguous timeout can be retried with the exact same ID; the client does not
+hide a generated ID that the caller could not recover. The ledger is bounded
+to 256 cancellation IDs per attempt. The socket and ledger require owner-private
+mode-0700 directories; a pre-existing socket path is not removed or replaced.
+The server rejects a second concurrent `serve_forever()` loop and cannot be
+restarted after its serving loop exits, including unexpected exits.
+
+The IPC permits only `status` and `cancel`: systemd starts the monitor service,
+so a controller request cannot ask an already-running service to launch a
+worker. Callers must first reconcile exact systemd service/slice properties
+against the receipt. The monitor-side cancel callback must act only on its
+retained execution handle and exact worker slice, and must be idempotent. The
+32-byte capability remains host-private and outside all worker mounts.
+
+This is now a concrete transport/replay primitive, not the production monitor
+service: it is not yet launched by systemd, connected to the runc handle or
+execution journal, provisioned with a durable capability, or used by
+`run_worker()`. It proves neither cancellation nor cleanup nor result import.
+`run_worker()` remains fail-closed, and the lifecycle acceptance criteria below
+remain open.
+
+**Systemd-owned monitor IPC live slice (2026-10-11; test-only monitor).** The
+opt-in `test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_scope`
+now composes the production receipt codec, control-key store, and authenticated
+Unix-socket IPC with a real transient user-systemd service. That test-only
+monitor places a `/usr/bin/sleep` scope in the exact per-attempt worker slice,
+while its own service remains in the separate `user-acp.slice`. A separate
+controller writes and validates the durable service receipt, performs an
+authenticated status call, then is killed with `SIGKILL`. The fresh controller
+uses `reconnect_sandbox_monitor()` to reconcile the exact unit InvocationID,
+ControlGroup, MainPID/start identity, and sibling-slice placement before it
+reads the existing capability and obtains authenticated status; it then cancels
+the exact scope. Repeating the same cancellation request ID returns the
+original response; the worker PID and scope cgroup are absent while the monitor
+remains active. Status reports `unknown` for activation drift even when a
+same-name scope is inactive. Teardown snapshots each unit cgroup before
+placement assertions, verifies the original cgroups are empty, and retains the
+private fixture if a launched unit lacks a captured cgroup.
+
+The exact replay passed all five tests in
+`tests/test_systemd_slice_integration.py` (one identity-drift unit test and four
+opt-in live tests) and all twelve
+`tests/test_sandbox_monitor_ipc.py` tests on the dedicated no-host-share Lima
+guest `acp-sandbox-monitor-20261010`: Ubuntu 24.04.5 LTS ARM64, Linux
+`6.8.0-142-generic`, systemd `255.4`, Python `3.12.3`, cgroup v2, and an active
+user manager. The controller/monitor IPC test source SHA-256 is
+`5445863306b6c0eb04ea7ca6f45e1cc2e27722f5dc6df4409cbda71d7bc3809c`; the
+production IPC module is `72f7eea3f9cde1ffacd264465a2ac960f683f78d0279384fc5d797a18bc39a89`,
+and the receipt/key module is
+`9bb50e5c52fcfeffd494a7f0b7e1489e43b598c24a8542e0d0fa8131020dbe29`. Guest
+and checkout hashes matched. Postflight found zero failed units, zero probe
+units, zero runc processes, and zero temporary control directories.
+
+This is an IPC/service-lifecycle integration proof only. The monitor is still a
+test helper, and its owned process is not an OCI container. It does not prove a
+production monitor owning `RuncLaunchHandle`, journal-authorized gate release,
+OCI scope enforcement, `cleanup_verified`, result import, provider auth/egress,
+or the registered `run_worker()` path. `run_worker()` remains fail-closed.
+
+**Controller restart adoption helper (2026-10-11; production recovery primitive).**
+`supervisor/sandbox_monitor_lifecycle.py` now provides a controller-side
+reconnect path for an already-running monitor. The caller must supply the
+attempt/claim/execution tuple read from its durable execution journal; the
+helper requires it to match the immutable service receipt, then re-queries the
+trusted user-systemd manager for the exact active service and both sibling
+slice identities, including InvocationID, ControlGroup, MainPID, and fresh
+PID-start identity. Only after that proof does it read the existing per-execution
+control key and validate the monitor socket. Recovery never calls the key
+creator: a missing/corrupt key fails closed and leaves the execution fenced.
+The helper only reconnects for authenticated status/cancel; it cannot start a
+worker or reconstruct `RuncLaunchHandle`. Focused tests cover wrong-fence and
+same-name activation drift, exact unit queries, successful reconnect, and
+missing-key refusal. The live test above now exercises this production recovery
+helper against a placeholder monitor; this remains an adoption primitive, not
+an integrated OCI worker path, and `run_worker()` remains fail-closed.
 
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the
@@ -540,13 +615,36 @@ their process-local provenance. This naming guard narrows one adoption/replay
 ambiguity but does not implement monitor startup, authenticated reconnect, or
 worker execution.
 
+**Write-ahead runc submission latch (schema v28; fail-closed primitive).** A
+supervised monitor must now commit a one-time receipt for the exact pinned
+private-bundle target immediately before the launcher's exec acknowledgement.
+The `reserved -> launched` journal transition requires that receipt, and the
+SQLite write guard prevents a second authorization for the same fenced
+execution. If the monitor dies after the latch but before it records the
+returned process handle, a restarted process cannot resubmit; it must reconcile
+the exact runtime state or retain the attempt fence. This deliberately favors
+duplicate-launch safety over automatic retry when the crash point is ambiguous.
+The callback returns a process-local capability that the private launcher
+stores in the registry record for the exact returned handle; journal recording
+checks object identity against that handle. Before sending the exec
+acknowledgement, the launcher rejects missing, unrelated, or differently
+targeted callback results. A capability minted after an unjournaled handle
+already exists cannot be paired with it. Unit coverage exercises
+commit-before-marker ordering, post-launch pairing rejection, invalid callback
+results, and cross-process at-most-once authorization. It does not substitute
+for a live Linux launcher test.
+The callback and journal primitive are not wired to `run_worker`, and no
+production monitor owns the callback yet. They do not prove restart recovery,
+cleanup, cancellation, or worker isolation; OCI worker execution remains
+fail-closed.
+
 ### Cleanup proof boundary (2026-10-11; architecture/QC decision)
 
-Do not add a standalone observer that writes `cleanup_verified`. The current
-`cleanup_reported` receipt is an identity-bound template: its observations are
-null, and it contains no trusted receipt for the exact pinned `runc delete`
-invocation or its exit. `runc --root` selects the runtime state store, while
-`runc state` and `runc list` are read commands; absence from a later query does
+Do not add an observer that writes `cleanup_verified` from absence checks alone.
+The current `cleanup_reported` receipt is an identity-bound template: its
+observations are null, and it contains no trusted receipt for the exact pinned
+`runc delete` invocation or its exit. `runc --root` selects the runtime state
+store, while `runc state` and `runc list` are read commands; absence from a later query does
 not prove which actor performed deletion or that no actor can recreate state
 before the journal commit. The command semantics are documented by upstream
 [runc](https://github.com/opencontainers/runc/blob/main/man/runc.8.md) and
@@ -581,6 +679,30 @@ observation, and commit. Until this owner/serialization path exists, keep
 `cleanup_verified` transitions guarded and OCI `run_worker` fail-closed. This
 decision deliberately does not add a cleanup collector: a typed snapshot would
 not solve the missing action provenance or close the probe-to-commit race.
+
+**Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
+systemd documents that `ExecStopPost=` also runs after unexpected service exit.
+In the task's disposable Ubuntu guest (kernel `6.8.0-142-generic`,
+systemd `255.4-1ubuntu8.17`), an exact `systemd-run --user --wait` probe observed
+the hook under `<unit-cgroup>/.control`; systemd may place delegated hooks there.
+Only after the hook and wait returned
+did `systemctl show` report `LoadState=not-found`, `ActiveState=inactive`,
+`MainPID=0`, and empty `ControlGroup` and `InvocationID`. Thus `ExecStopPost=`
+cannot certify that its own unit or cgroup is absent. The monitor main process
+must durably persist an immutable receipt for its pinned `runc delete` action
+and wait result before exiting. A finalizer must run after the complete stop
+job (including any `ExecStopPost=`) returns, verify the pre-bound unit/process
+identities and empty cgroup/private paths, and require that action receipt as
+well as those fresh observations before committing `cleanup_verified`. The
+captured InvocationID must remain bound to the unique fencing-epoch unit name;
+a missing or contradictory live unit state is not, by itself, evidence of a
+matching stop. A crash before the action receipt is durable remains ambiguous;
+later `runc state` absence must not trigger a retry or release the fence. The
+opt-in regression is
+`test_exec_stop_post_is_not_final_unit_absence_evidence`; this is systemd
+lifecycle evidence only, not a cleanup verifier or integrated-worker proof.
+See upstream [systemd service lifecycle documentation](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml)
+and [cgroup delegation documentation](https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md).
 
 ## Threat model
 
@@ -2186,6 +2308,24 @@ split cgroup placement and monitor survival at the systemd primitive level.
 There is still no integrated service launcher or production monitor, and the
 public `run_worker` OCI route remains fail-closed.
 
+**Per-execution monitor control-key storage (2026-10-11; code-only).** The
+receipt/control-codec module now provides an atomic, durable 32-byte key store
+whose filename is derived from the full attempt, claim-token and execution
+identity. It rejects non-private directories, symlinks, unsafe metadata and
+malformed keys. A per-key advisory lock serializes cooperating callers, while
+the published secret remains bound to the exact attempt, claim token and
+execution identity. This is only a prerequisite: no monitor service or
+controller calls it yet, the worker-mount exclusion is a caller obligation, a
+same-host-UID process remains in the trust boundary, and lifecycle key cleanup
+is not integrated. It does not establish monitor-owned runc execution,
+reconnect, authentication delivery, or cleanup.
+An abrupt exit after the temporary key is fsynced but before publication can
+leave a private temporary key file. A subsequent helper call acquires the
+per-key lock, removes only a safe private single-link temp for that identity,
+and then loads an already-published key or creates one. A published two-link
+orphan is preserved for the existing same-inode recovery path. The empty
+mode-0600 lock file remains until lifecycle cleanup is wired.
+
 **Historical same-slice stop propagation probe (2026-10-09; opt-in regression).**
 The systemd v252 resource-control contract says units assigned with `Slice=`
 automatically acquire `Requires=` and `After=` dependencies on that slice;
@@ -2574,3 +2714,108 @@ for explicit no-model host-path diagnostics and is not a safe worker launch
 path. Do not connect either low-level launcher to `run_worker`: lifecycle,
 runtime attestation, cleanup, result-import, credential, and provider-egress
 safety remain separate open gates.
+
+### Exact-source rootless OCI boundary recheck (2026-10-11; pass)
+
+On the dedicated Lima VM `acp-oci-qc-20261009` (Ubuntu 24.04.5 LTS ARM64,
+Linux 6.8.0-142-generic, systemd 255.4, Python 3.12.3, cgroup v2), the
+current opt-in `test_live_rootless_runc_enforces_minimal_worker_boundary`
+passed (`1 passed`) against the copied ACP Python-source manifest at test time
+`ebbd1b29e845c1b5fbd5556624d02d846a2caf09f1f9a4c3d7b11ed3468ab5e8` and
+test-source hash `4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`.
+The test used BusyBox 1.36.1 and rootless runc 1.5.2. The upstream ARM64
+release binary matched SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`
+([runc v1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)).
+An initial 1.3.5 run was rejected by ACP's version guard before worker launch;
+the existing runc binary was left untouched, and the test used a separate
+versioned executable. The VM denies unprivileged user namespaces when
+unconfined, but its already-loaded `lxc-unshare` AppArmor profile permits the
+namespace preflight; the opt-in test ran under that profile. The test's
+assertions covered the bounded no-model payload, mutable workspace, host/base
+and credential sentinels, symlink/path attacks, mount policy, process
+visibility, network isolation, cgroup controls, and cleanup. A separate exact
+`NamespaceRuntimeDriver` fake-agent integration also passed (`1 passed`): the
+payload ran in the private root, could not write its read-only workspace, and
+could still read host `/etc/os-release`, confirming that this resource driver
+is not itself the worker-read-isolation boundary; its test-source hash was
+`c6efabd7ecafde1691ad35e53f938c2bb176d436218c3bb6c7dac92c3d36622c`.
+The extra versioned runc executable and scratch checkout/venv were removed
+afterward; the VM's original runc 1.3.5 remained unchanged. The monitor-key
+hardening added after this run is outside the OCI fixture's exercised code.
+
+These are low-level OCI and resource-driver proofs, not registered-worker
+integration. The OCI test does not exercise `run_worker`, monitor ownership,
+durable journal transitions, provider authentication, Git/result transfer, or
+supervisor-restart cancellation/recovery. The configured-OCI `run_worker`
+route remains fail-closed, and the broader proof gates above remain open.
+
+### systemd credential handoff primitive (2026-10-11; opt-in proof only)
+
+The supported systemd 252 contract provides `LoadCredential=`: a service reads
+the credential from a read-only file under `$CREDENTIALS_DIRECTORY`, with
+access limited to that unit's UID and root. The same version's documentation
+explicitly warns that unit environment variables are not a secret channel
+because they are exposed through D-Bus and propagated down the process tree.
+This makes `LoadCredential=` a viable *monitor-service handoff primitive*; it
+does not isolate secrets from other trusted processes running as the same host
+UID, and it does not permit the worker to inherit the credential directory or
+descriptor. See the pinned [systemd v252 execution
+contract](https://github.com/systemd/systemd/blob/v252/man/systemd.exec.xml#L2259-L2266)
+and [credential contract](https://github.com/systemd/systemd/blob/v252/man/systemd.exec.xml#L2717-L2735).
+
+`test_live_systemd_loadcredential_is_read_only_and_not_environment` now
+performs an opt-in no-model test with a randomly generated fake value in the
+dedicated disposable VM. On Ubuntu 26.04.1 ARM64, Linux 7.0.0-34, Python 3.14.4,
+systemd 259.5, cgroup v2, and a running user manager, the exact copied test
+source (SHA-256
+`d086b4de4ad7b6916b0c5d657c829fe4808993d9d94d8bf87a599bffcf62740f`) passed
+(`1 passed in 0.10s`). The child read the credential, verified the per-unit
+file was read-only and user-owned, and returned only its digest and boolean
+checks; the test also checked that the value was absent from the child
+environment and `systemd-run` output. It captures the exact live unit,
+invocation, process identity, and cgroup before stopping the service; cleanup
+requires the exact transient unit to become `not-found`, the captured process
+identity to be absent, and captured cgroups to be empty. The private fixture is
+retained if any of those checks fail. Post-run inspection found no transient
+unit, process, cgroup, or fixture directory. This proves systemd's
+credential-file transport only—not provider authentication, worker access
+separation, secret rotation, or the production monitor path, which does not
+yet use `LoadCredential=`.
+
+Do not equate `Restart=on-failure` with ACP recovery. systemd documents restart
+as a stop followed by a start and subjects it to start-rate limits; the monitor
+must re-read the exact journaled fencing epoch and reconcile the exact units
+before it can observe or cancel a worker. A service restart must never blindly
+repeat the launch request. The service's credential-source lifetime and
+restart behavior is now tested on exact systemd 252.39 below. Monitor-owned
+`RuncLaunchHandle` lifecycle and registered-worker integration remain open.
+See the pinned [systemd v252 service restart
+semantics](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L493-L495)
+and [restart rate-limit behavior](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L818-L823).
+
+**Credential source lifetime and restart fail-closed proof (2026-10-11; systemd
+252.39).** The opt-in
+`test_live_systemd_loadcredential_restart_requires_source_again` ran twice in a
+new no-host-share Lima 2.2.1 VZ Debian 12 ARM64 guest: kernel
+`6.1.0-53-cloud-arm64`, systemd `252.39-1~deb12u2`, Python 3.11.2, pytest 9.1.1,
+and cgroup v2. The exact test-file SHA-256 was
+`de735a8d37a8b6c5a8cd3e636285474c03bfd58b5d5a17022d48da435c447930`; both
+opt-in runs passed. It used only a random fake value and a private mode-0700
+fixture. After the first service process was active, the test unlinked the
+identity-checked source, let that process read the same credential copy again,
+and then forced an exit to exercise systemd's automatic restart. The child
+reported only the digest and boolean checks: its credential stayed unchanged
+and read-only and the fake value was absent from its environment. systemd
+recorded an automatic restart and failed at `CREDENTIALS` (`243/CREDENTIALS`)
+before a second worker process ran; the fixture's process-start marker contained
+exactly one activation. This matches systemd's contract that credentials are
+acquired at activation, immutable while the service runs, and released on
+deactivation ([systemd v252 service credentials](https://github.com/systemd/systemd/blob/v252/docs/CREDENTIALS.md#system-and-service-credentials)).
+
+Post-run checks found no transient unit, populated cgroup, original process
+identity, or fixture directory. This closes only the systemd credential
+transport/lifecycle primitive: ACP's production monitor still does not use
+`LoadCredential=`, and this does not isolate credentials from other trusted
+processes under the same host UID, prove provider authentication, or wire the
+monitor into `run_worker()`. Keep configured OCI worker execution fail-closed.
