@@ -513,6 +513,35 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     assert not worker_log.exists()
 
 
+def test_unsupported_worker_platform_fails_before_attempt_mutation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def side_effect_must_not_run(*_args, **_kwargs):
+        pytest.fail("unsupported worker platform must fail before heartbeat or launch")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "darwin")
+    monkeypatch.setattr(supervisor, "heartbeat", side_effect_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", side_effect_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", side_effect_must_not_run)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], [sys.executable, "-c", "pass"])
+
+    assert error.value.code == "process_containment_unavailable"
+    assert "require Linux child-subreaper containment" in str(error.value)
+    attempt_after = supervisor.attempt(attempt["id"])
+    assert attempt_after["pid"] is None
+    assert attempt_after["updated_at"] == attempt_before["updated_at"]
+    assert not worker_log.exists()
+
+
 @pytest.mark.parametrize(
     ("entry", "message"),
     [
