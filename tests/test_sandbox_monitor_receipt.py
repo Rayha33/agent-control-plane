@@ -4,6 +4,9 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,8 +19,10 @@ from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceiptError,
     decode_sandbox_monitor_control_request,
     encode_sandbox_monitor_control_request,
+    load_or_create_sandbox_monitor_control_key,
     read_sandbox_monitor_receipt,
     sandbox_attempt_slice_unit,
+    sandbox_container_id,
     sandbox_monitor_service_unit,
     validate_monitor_service_reconciliation,
     write_sandbox_monitor_receipt,
@@ -269,6 +274,212 @@ def test_monitor_receipt_rejects_symlinks_and_nonprivate_directories(tmp_path: P
     public_dir.chmod(0o755)
     with pytest.raises(SandboxMonitorReceiptError, match="directory is not private"):
         write_sandbox_monitor_receipt(public_dir / "receipt.json", receipt)
+
+
+def test_monitor_control_key_is_durable_and_bound_to_the_fenced_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    key = load_or_create_sandbox_monitor_control_key(
+        directory,
+        attempt_id="attempt-1",
+        claim_token=7,
+        execution_id="execution-1",
+    )
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            receipt_module.secrets,
+            "token_bytes",
+            lambda *_args: pytest.fail("existing monitor key must be loaded without reminting"),
+        )
+        replayed = load_or_create_sandbox_monitor_control_key(
+            directory,
+            attempt_id="attempt-1",
+            claim_token=7,
+            execution_id="execution-1",
+        )
+    next_fence = load_or_create_sandbox_monitor_control_key(
+        directory,
+        attempt_id="attempt-1",
+        claim_token=8,
+        execution_id="execution-2",
+    )
+
+    key_path = directory / f"{sandbox_container_id('attempt-1', 7, 'execution-1')}.control-key"
+    assert len(key) == 32
+    assert replayed == key
+    assert next_fence != key
+    assert key_path.read_bytes() == key
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert key_path.stat().st_nlink == 1
+    assert len(list(directory.iterdir())) == 2
+    encoded = encode_sandbox_monitor_control_request(
+        attempt_id="attempt-1",
+        claim_token=7,
+        execution_id="execution-1",
+        request_id="a" * 32,
+        operation="cancel",
+        key=key,
+    )
+    decoded = decode_sandbox_monitor_control_request(
+        encoded,
+        key=replayed,
+        expected_identity=("attempt-1", 7, "execution-1"),
+    )
+    assert decoded.operation == "cancel"
+    with pytest.raises(SandboxMonitorReceiptError, match="authentication failed"):
+        decode_sandbox_monitor_control_request(
+            encoded,
+            key=next_fence,
+            expected_identity=("attempt-1", 7, "execution-1"),
+        )
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import hashlib, sys; from agent_control_plane.supervisor.sandbox_monitor_receipt "
+            "import load_or_create_sandbox_monitor_control_key; key = "
+            "load_or_create_sandbox_monitor_control_key(sys.argv[1], attempt_id=sys.argv[2], "
+            "claim_token=int(sys.argv[3]), execution_id=sys.argv[4]); "
+            "print(hashlib.sha256(key).hexdigest())",
+            str(directory),
+            "attempt-1",
+            "7",
+            "execution-1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert child.stdout.strip() == hashlib.sha256(key).hexdigest()
+
+
+def test_monitor_control_key_concurrent_creation_returns_one_durable_secret(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+
+    def load() -> bytes:
+        return load_or_create_sandbox_monitor_control_key(
+            directory,
+            attempt_id="attempt-race",
+            claim_token=3,
+            execution_id="execution-race",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        keys = list(pool.map(lambda _index: load(), range(32)))
+
+    assert len(set(keys)) == 1
+    assert len(list(directory.iterdir())) == 1
+
+
+def test_monitor_control_key_recovers_a_published_orphan_link(tmp_path: Path) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    key_name = f"{sandbox_container_id('attempt-orphan', 9, 'execution-orphan')}.control-key"
+    key_path = directory / key_name
+    expected = b"k" * 32
+    key_path.write_bytes(expected)
+    key_path.chmod(0o600)
+    orphan = directory / f".{key_name}.{'a' * 32}.tmp"
+    os.link(key_path, orphan)
+
+    actual = load_or_create_sandbox_monitor_control_key(
+        directory,
+        attempt_id="attempt-orphan",
+        claim_token=9,
+        execution_id="execution-orphan",
+    )
+
+    assert actual == expected
+    assert not orphan.exists()
+    assert key_path.stat().st_nlink == 1
+
+
+@pytest.mark.parametrize("unsafe_entry", ["symlink", "wrong_mode", "unrelated_hardlink"])
+def test_monitor_control_key_rejects_unsafe_persisted_entries(
+    tmp_path: Path, unsafe_entry: str
+) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    key_name = f"{sandbox_container_id('attempt-unsafe', 1, 'execution-unsafe')}.control-key"
+    key_path = directory / key_name
+    source = directory / "source"
+    source.write_bytes(b"s" * 32)
+    source.chmod(0o600)
+    if unsafe_entry == "symlink":
+        key_path.symlink_to(source)
+    else:
+        key_path.write_bytes(b"k" * 32)
+        key_path.chmod(0o600)
+        if unsafe_entry == "wrong_mode":
+            key_path.chmod(0o644)
+        else:
+            os.link(key_path, directory / "unrelated-link")
+
+    with pytest.raises(SandboxMonitorReceiptError):
+        load_or_create_sandbox_monitor_control_key(
+            directory,
+            attempt_id="attempt-unsafe",
+            claim_token=1,
+            execution_id="execution-unsafe",
+        )
+
+
+def test_monitor_control_key_requires_canonical_private_directory(tmp_path: Path) -> None:
+    public = tmp_path / "public-control-keys"
+    public.mkdir(mode=0o700)
+    public.chmod(0o755)
+
+    with pytest.raises(SandboxMonitorReceiptError, match="directory must be owned and mode 0700"):
+        load_or_create_sandbox_monitor_control_key(
+            public,
+            attempt_id="attempt-public",
+            claim_token=1,
+            execution_id="execution-public",
+        )
+
+    link = tmp_path / "control-key-link"
+    private = tmp_path / "private-control-keys"
+    private.mkdir(mode=0o700)
+    link.symlink_to(private, target_is_directory=True)
+    with pytest.raises(OSError):
+        load_or_create_sandbox_monitor_control_key(
+            link,
+            attempt_id="attempt-link",
+            claim_token=1,
+            execution_id="execution-link",
+        )
+
+
+def test_monitor_control_key_fsyncs_key_and_directory_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    original_fsync = os.fsync
+    directory_syncs: list[int] = []
+
+    def record_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_syncs.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(receipt_module.os, "fsync", record_fsync)
+    key = load_or_create_sandbox_monitor_control_key(
+        directory,
+        attempt_id="attempt-fsync",
+        claim_token=1,
+        execution_id="execution-fsync",
+    )
+
+    assert len(key) == 32
+    assert len(directory_syncs) >= 2
 
 
 @pytest.mark.parametrize(

@@ -2253,6 +2253,20 @@ split cgroup placement and monitor survival at the systemd primitive level.
 There is still no integrated service launcher or production monitor, and the
 public `run_worker` OCI route remains fail-closed.
 
+**Per-execution monitor control-key storage (2026-10-11; code-only).** The
+receipt/control-codec module now provides an atomic, durable 32-byte key store
+whose filename is derived from the full attempt, claim-token and execution
+identity. It rejects non-private directories, symlinks, unsafe metadata and
+malformed keys, and converges concurrent creators on the published key. This
+is only a prerequisite: no monitor service or controller calls it yet, the
+worker-mount exclusion is a caller obligation, a same-host-UID process remains
+in the trust boundary, and key cleanup is not integrated. It does not establish
+monitor-owned runc execution, reconnect, authentication delivery, or cleanup.
+An abrupt exit after the temporary key is fsynced but before publication can
+leave a private single-link temporary key file. A subsequent helper call ignores
+that residue and either loads an already-published key or creates one; stale
+temporary-key cleanup is not implemented.
+
 **Historical same-slice stop propagation probe (2026-10-09; opt-in regression).**
 The systemd v252 resource-control contract says units assigned with `Slice=`
 automatically acquire `Requires=` and `After=` dependencies on that slice;
@@ -2641,3 +2655,38 @@ for explicit no-model host-path diagnostics and is not a safe worker launch
 path. Do not connect either low-level launcher to `run_worker`: lifecycle,
 runtime attestation, cleanup, result-import, credential, and provider-egress
 safety remain separate open gates.
+
+### Exact-source rootless OCI boundary recheck (2026-10-11; pass)
+
+On the dedicated Lima VM `acp-oci-qc-20261009` (Ubuntu 24.04.5 LTS ARM64,
+Linux 6.8.0-142-generic, systemd 255.4, Python 3.12.3, cgroup v2), the
+current opt-in `test_live_rootless_runc_enforces_minimal_worker_boundary`
+passed (`1 passed`) against the copied ACP Python-source manifest at test time
+`ebbd1b29e845c1b5fbd5556624d02d846a2caf09f1f9a4c3d7b11ed3468ab5e8` and
+test-source hash `4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`.
+The test used BusyBox 1.36.1 and rootless runc 1.5.2. The upstream ARM64
+release binary matched SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`
+([runc v1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)).
+An initial 1.3.5 run was rejected by ACP's version guard before worker launch;
+the existing runc binary was left untouched, and the test used a separate
+versioned executable. The VM denies unprivileged user namespaces when
+unconfined, but its already-loaded `lxc-unshare` AppArmor profile permits the
+namespace preflight; the opt-in test ran under that profile. The test's
+assertions covered the bounded no-model payload, mutable workspace, host/base
+and credential sentinels, symlink/path attacks, mount policy, process
+visibility, network isolation, cgroup controls, and cleanup. A separate exact
+`NamespaceRuntimeDriver` fake-agent integration also passed (`1 passed`): the
+payload ran in the private root, could not write its read-only workspace, and
+could still read host `/etc/os-release`, confirming that this resource driver
+is not itself the worker-read-isolation boundary; its test-source hash was
+`c6efabd7ecafde1691ad35e53f938c2bb176d436218c3bb6c7dac92c3d36622c`.
+The extra versioned runc executable and scratch checkout/venv were removed
+afterward; the VM's original runc 1.3.5 remained unchanged. The monitor-key
+hardening added after this run is outside the OCI fixture's exercised code.
+
+These are low-level OCI and resource-driver proofs, not registered-worker
+integration. The OCI test does not exercise `run_worker`, monitor ownership,
+durable journal transitions, provider authentication, Git/result transfer, or
+supervisor-restart cancellation/recovery. The configured-OCI `run_worker`
+route remains fail-closed, and the broader proof gates above remain open.

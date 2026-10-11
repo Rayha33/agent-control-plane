@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import stat
 import uuid
 from collections.abc import Mapping
@@ -66,6 +67,186 @@ def sandbox_attempt_slice_unit(attempt_id: str, claim_token: int, execution_id: 
     container_id = sandbox_container_id(attempt_id, claim_token, execution_id)
     digest = hashlib.sha256(container_id.encode("ascii")).hexdigest()
     return f"user-acp-{digest}.slice"
+
+
+def _open_control_key_directory(path: Path) -> int:
+    """Open a private key directory without following any path component."""
+
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or path == Path("/")
+        or ".." in path.parts
+        or str(path) != os.path.normpath(str(path))
+    ):
+        raise SandboxMonitorReceiptError("monitor control-key directory path is not canonical")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise SandboxMonitorReceiptError(
+                "monitor control-key directory must be owned and mode 0700"
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_control_key_at(directory_fd: int, name: str) -> bytes:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise SandboxMonitorReceiptError(
+            "monitor control key could not be opened safely"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink not in {1, 2}
+            or before.st_size != _CONTROL_KEY_BYTES
+        ):
+            raise SandboxMonitorReceiptError("monitor control key has unsafe metadata")
+        if before.st_nlink == 2:
+            _recover_orphan_temporary_link(directory_fd, name, descriptor, before)
+            before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = _CONTROL_KEY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        key = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(key) != _CONTROL_KEY_BYTES
+            or before.st_nlink != 1
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise SandboxMonitorReceiptError("monitor control key changed while being read")
+        os.fsync(directory_fd)
+        return key
+    finally:
+        os.close(descriptor)
+
+
+def load_or_create_sandbox_monitor_control_key(
+    directory: str | Path,
+    *,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+) -> bytes:
+    """Load or atomically mint the private 32-byte key for one fenced execution.
+
+    The directory must be private, persistent supervisor state outside every
+    worker-visible mount. Exact execution identity determines the immutable
+    key filename, so a later fencing epoch cannot reuse an earlier key. A
+    temporary file is fsynced before its hard link publishes the key; a
+    concurrent caller therefore either reads the winner or fails closed on
+    malformed state. The returned bytes are for in-memory IPC use only and
+    must never be logged, placed in argv/environment, or copied into receipts.
+    This does not protect against another process with the same host UID.
+    """
+
+    if not isinstance(directory, (str, Path)):
+        raise SandboxMonitorReceiptError("monitor control-key directory is invalid")
+    identity = sandbox_container_id(attempt_id, claim_token, execution_id)
+    key_name = f"{identity}.control-key"
+    directory_fd = _open_control_key_directory(Path(directory))
+    temporary_name = f".{key_name}.{uuid.uuid4().hex}.tmp"
+    descriptor = -1
+    try:
+        try:
+            os.stat(key_name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            return _read_control_key_at(directory_fd, key_name)
+
+        key = secrets.token_bytes(_CONTROL_KEY_BYTES)
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise SandboxMonitorReceiptError("monitor control key was created unsafely")
+        view = memoryview(key)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while persisting monitor control key")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(
+                temporary_name,
+                key_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            return _read_control_key_at(directory_fd, key_name)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            # A racing reader can recover this exact published hard link after
+            # the target appears; that reader has already synced the directory.
+            pass
+        os.fsync(directory_fd)
+        return _read_control_key_at(directory_fd, key_name)
+    except SandboxMonitorReceiptError:
+        raise
+    except OSError as error:
+        raise SandboxMonitorReceiptError(
+            "monitor control key could not be persisted safely"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
 
 
 def _validate_component(value: Any, field: str) -> str:
