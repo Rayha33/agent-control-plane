@@ -1,8 +1,12 @@
-"""Linux Unix-socket control channel for a durable per-attempt monitor.
+"""Linux Unix-socket status/cancel protocol for a per-attempt monitor.
 
-The systemd-owned monitor starts the worker and retains its live runc handle.
-This channel deliberately exposes only status and cancellation; a controller
-cannot ask it to reconstruct or start an execution from caller-supplied data.
+This module implements authenticated control messages and durable replay
+protection. It does not start workers, create or accept a runc launch handle, or
+connect the protocol to ``run_worker``. A server stores injected status/cancel
+callbacks, which may retain caller-owned state. No production worker-execution
+path invokes this protocol today. It exposes only status and cancellation, so a
+controller cannot ask it to reconstruct or start an execution from
+caller-supplied data.
 """
 
 from __future__ import annotations
