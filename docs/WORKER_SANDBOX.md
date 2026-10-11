@@ -2257,15 +2257,19 @@ public `run_worker` OCI route remains fail-closed.
 receipt/control-codec module now provides an atomic, durable 32-byte key store
 whose filename is derived from the full attempt, claim-token and execution
 identity. It rejects non-private directories, symlinks, unsafe metadata and
-malformed keys, and converges concurrent creators on the published key. This
-is only a prerequisite: no monitor service or controller calls it yet, the
-worker-mount exclusion is a caller obligation, a same-host-UID process remains
-in the trust boundary, and key cleanup is not integrated. It does not establish
-monitor-owned runc execution, reconnect, authentication delivery, or cleanup.
+malformed keys. A per-key advisory lock serializes cooperating callers, while
+the published secret remains bound to the exact attempt, claim token and
+execution identity. This is only a prerequisite: no monitor service or
+controller calls it yet, the worker-mount exclusion is a caller obligation, a
+same-host-UID process remains in the trust boundary, and lifecycle key cleanup
+is not integrated. It does not establish monitor-owned runc execution,
+reconnect, authentication delivery, or cleanup.
 An abrupt exit after the temporary key is fsynced but before publication can
-leave a private single-link temporary key file. A subsequent helper call ignores
-that residue and either loads an already-published key or creates one; stale
-temporary-key cleanup is not implemented.
+leave a private temporary key file. A subsequent helper call acquires the
+per-key lock, removes only a safe private single-link temp for that identity,
+and then loads an already-published key or creates one. A published two-link
+orphan is preserved for the existing same-inode recovery path. The empty
+mode-0600 lock file remains until lifecycle cleanup is wired.
 
 **Historical same-slice stop propagation probe (2026-10-09; opt-in regression).**
 The systemd v252 resource-control contract says units assigned with `Slice=`

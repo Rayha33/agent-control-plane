@@ -6,6 +6,8 @@ import os
 import stat
 import subprocess
 import sys
+import textwrap
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -313,7 +315,8 @@ def test_monitor_control_key_is_durable_and_bound_to_the_fenced_execution(
     assert key_path.read_bytes() == key
     assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
     assert key_path.stat().st_nlink == 1
-    assert len(list(directory.iterdir())) == 2
+    assert len(list(directory.glob("*.control-key"))) == 2
+    assert len(list(directory.glob(".*.control-key.lock"))) == 2
     encoded = encode_sandbox_monitor_control_request(
         attempt_id="attempt-1",
         claim_token=7,
@@ -375,7 +378,149 @@ def test_monitor_control_key_concurrent_creation_returns_one_durable_secret(
         keys = list(pool.map(lambda _index: load(), range(32)))
 
     assert len(set(keys)) == 1
-    assert len(list(directory.iterdir())) == 1
+    assert len(list(directory.glob("*.control-key"))) == 1
+    assert len(list(directory.glob(".*.control-key.lock"))) == 1
+
+
+def test_monitor_control_key_reclaims_private_prepublication_crash_residue(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    key_name = f"{sandbox_container_id('attempt-crash', 4, 'execution-crash')}.control-key"
+    project = Path(__file__).resolve().parents[1]
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys; import agent_control_plane.supervisor.sandbox_monitor_receipt as r; "
+            "r.os.link = lambda *args, **kwargs: os._exit(77); "
+            "r.load_or_create_sandbox_monitor_control_key(sys.argv[1], attempt_id='attempt-crash', "
+            "claim_token=4, execution_id='execution-crash'); raise SystemExit(1)",
+            str(directory),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        cwd=project,
+    )
+    assert child.returncode == 77, child.stderr
+    stale_files = list(directory.glob(f".{key_name}.*.tmp"))
+    assert len(stale_files) == 1
+    stale = stale_files[0]
+    assert stale.stat().st_nlink == 1
+    assert stale.stat().st_size == 32
+
+    key = load_or_create_sandbox_monitor_control_key(
+        directory,
+        attempt_id="attempt-crash",
+        claim_token=4,
+        execution_id="execution-crash",
+    )
+
+    assert len(key) == 32
+    assert not stale.exists()
+    assert (directory / key_name).read_bytes() == key
+
+
+def test_monitor_control_key_cross_process_creation_is_serialized(tmp_path: Path) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    project = Path(__file__).resolve().parents[1]
+    ready_directory = directory / "ready"
+    ready_directory.mkdir(mode=0o700)
+    gate = directory / "start"
+    mint_log = directory / "mint.log"
+    child_program = textwrap.dedent(
+        r"""
+        import hashlib
+        import os
+        import pathlib
+        import sys
+        import time
+
+        import agent_control_plane.supervisor.sandbox_monitor_receipt as receipt
+
+        directory = pathlib.Path(sys.argv[1])
+        worker_id = sys.argv[2]
+        ready_directory = pathlib.Path(sys.argv[3])
+        gate = pathlib.Path(sys.argv[4])
+        mint_log = pathlib.Path(sys.argv[5])
+        (ready_directory / worker_id).write_text("ready", encoding="utf-8")
+        while not gate.exists():
+            time.sleep(0.005)
+
+        original_token_bytes = receipt.secrets.token_bytes
+
+        def counted_token_bytes(length):
+            descriptor = os.open(
+                mint_log,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                0o600,
+            )
+            try:
+                os.write(descriptor, b"mint\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            time.sleep(0.05)
+            return original_token_bytes(length)
+
+        receipt.secrets.token_bytes = counted_token_bytes
+        key = receipt.load_or_create_sandbox_monitor_control_key(
+            directory,
+            attempt_id="attempt-process-race",
+            claim_token=5,
+            execution_id="execution-process-race",
+        )
+        print(hashlib.sha256(key).hexdigest())
+        """
+    )
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        for index in range(4):
+            processes.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        child_program,
+                        str(directory),
+                        str(index),
+                        str(ready_directory),
+                        str(gate),
+                        str(mint_log),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=project,
+                )
+            )
+
+        deadline = time.monotonic() + 10
+        while len(list(ready_directory.iterdir())) != len(processes):
+            assert all(process.poll() is None for process in processes), (
+                "child exited before reaching the start barrier"
+            )
+            assert time.monotonic() < deadline, "children did not reach the start barrier"
+            time.sleep(0.01)
+        gate.touch()
+        results = [process.communicate(timeout=20) for process in processes]
+        for process, (_stdout, stderr) in zip(processes, results, strict=True):
+            assert process.returncode == 0, stderr
+        digests = [stdout.strip() for stdout, _stderr in results]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+    assert len(set(digests)) == 1
+    assert mint_log.read_text(encoding="utf-8").splitlines() == ["mint"]
+    assert len(list(directory.glob("*.control-key"))) == 1
+    assert len(list(directory.glob(".*.control-key.lock"))) == 1
 
 
 def test_monitor_control_key_recovers_a_published_orphan_link(tmp_path: Path) -> None:
@@ -455,6 +600,36 @@ def test_monitor_control_key_requires_canonical_private_directory(tmp_path: Path
             claim_token=1,
             execution_id="execution-link",
         )
+
+
+@pytest.mark.parametrize("unsafe_lock", ["symlink", "wrong_mode", "unrelated_hardlink"])
+def test_monitor_control_key_rejects_unsafe_lock_entries(tmp_path: Path, unsafe_lock: str) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    key_name = f"{sandbox_container_id('attempt-lock', 2, 'execution-lock')}.control-key"
+    lock_path = directory / f".{key_name}.lock"
+    source = directory / "lock-source"
+    source.write_bytes(b"")
+    source.chmod(0o600)
+    if unsafe_lock == "symlink":
+        lock_path.symlink_to(source)
+    else:
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+        if unsafe_lock == "wrong_mode":
+            lock_path.chmod(0o644)
+        else:
+            os.link(lock_path, directory / "unrelated-lock-link")
+
+    with pytest.raises(SandboxMonitorReceiptError):
+        load_or_create_sandbox_monitor_control_key(
+            directory,
+            attempt_id="attempt-lock",
+            claim_token=2,
+            execution_id="execution-lock",
+        )
+
+    assert not (directory / key_name).exists()
 
 
 def test_monitor_control_key_fsyncs_key_and_directory_before_return(

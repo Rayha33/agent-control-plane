@@ -8,6 +8,7 @@ actions remain owned by the monitor process.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ import os
 import re
 import secrets
 import stat
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -102,6 +104,123 @@ def _open_control_key_directory(path: Path) -> int:
         raise
 
 
+def _acquire_control_key_lock(directory_fd: int, key_name: str) -> int:
+    lock_name = f".{key_name}.lock"
+    descriptor = -1
+    for attempt in range(8):
+        try:
+            descriptor = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            break
+        except FileNotFoundError as error:
+            if attempt == 7:
+                raise SandboxMonitorReceiptError(
+                    "monitor control-key lock could not be opened safely"
+                ) from error
+            # A competing O_CREAT in the same private directory can briefly
+            # return ENOENT on macOS before the newly linked entry is visible.
+            time.sleep(0.001 * (attempt + 1))
+        except OSError as error:
+            raise SandboxMonitorReceiptError(
+                "monitor control-key lock could not be opened safely"
+            ) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size != 0
+        ):
+            raise SandboxMonitorReceiptError("monitor control-key lock has unsafe metadata")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        after = os.fstat(descriptor)
+        named = os.stat(lock_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)
+            or after.st_nlink != 1
+            or after.st_size != 0
+        ):
+            raise SandboxMonitorReceiptError("monitor control-key lock changed while acquiring")
+        os.fsync(directory_fd)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _cleanup_unpublished_control_key_temps(directory_fd: int, key_name: str) -> None:
+    expected_name = re.compile(rf"\.{re.escape(key_name)}\.[0-9a-f]{{32}}\.tmp\Z")
+    try:
+        published = os.stat(key_name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        published = None
+    removed = False
+    for entry in os.listdir(directory_fd):
+        if expected_name.fullmatch(entry) is None:
+            continue
+        try:
+            info = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if info.st_nlink == 2:
+            if (
+                published is None
+                or not stat.S_ISREG(published.st_mode)
+                or (info.st_dev, info.st_ino) != (published.st_dev, published.st_ino)
+            ):
+                raise SandboxMonitorReceiptError(
+                    "monitor control-key temporary link has no matching published key"
+                )
+            # A writer may have crashed after publishing the target. Preserve
+            # this link for _read_control_key_at to reconcile and fsync.
+            continue
+        if (
+            info.st_nlink != 1
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > _CONTROL_KEY_BYTES
+        ):
+            raise SandboxMonitorReceiptError(
+                "monitor control-key temporary file has unsafe metadata"
+            )
+        try:
+            descriptor = os.open(
+                entry,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            opened = os.fstat(descriptor)
+            named = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+                or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise SandboxMonitorReceiptError(
+                    "monitor control-key temporary file changed during cleanup"
+                )
+            os.unlink(entry, dir_fd=directory_fd)
+            removed = True
+        finally:
+            os.close(descriptor)
+    if removed:
+        os.fsync(directory_fd)
+
+
 def _read_control_key_at(directory_fd: int, name: str) -> bytes:
     try:
         descriptor = os.open(
@@ -167,11 +286,12 @@ def load_or_create_sandbox_monitor_control_key(
     The directory must be private, persistent supervisor state outside every
     worker-visible mount. Exact execution identity determines the immutable
     key filename, so a later fencing epoch cannot reuse an earlier key. A
-    temporary file is fsynced before its hard link publishes the key; a
-    concurrent caller therefore either reads the winner or fails closed on
-    malformed state. The returned bytes are for in-memory IPC use only and
-    must never be logged, placed in argv/environment, or copied into receipts.
-    This does not protect against another process with the same host UID.
+    per-key advisory lock serializes cooperating callers; stale single-link
+    temporary files are reclaimed only while holding that lock. A temporary
+    file is fsynced before its hard link publishes the key. The returned bytes
+    are for in-memory IPC use only and must never be logged, placed in
+    argv/environment, or copied into receipts. This does not protect against
+    another process with the same host UID or non-cooperating older code.
     """
 
     if not isinstance(directory, (str, Path)):
@@ -181,7 +301,10 @@ def load_or_create_sandbox_monitor_control_key(
     directory_fd = _open_control_key_directory(Path(directory))
     temporary_name = f".{key_name}.{uuid.uuid4().hex}.tmp"
     descriptor = -1
+    lock_fd = -1
     try:
+        lock_fd = _acquire_control_key_lock(directory_fd, key_name)
+        _cleanup_unpublished_control_key_temps(directory_fd, key_name)
         try:
             os.stat(key_name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -242,6 +365,8 @@ def load_or_create_sandbox_monitor_control_key(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if lock_fd >= 0:
+            os.close(lock_fd)
         try:
             os.unlink(temporary_name, dir_fd=directory_fd)
         except FileNotFoundError:
