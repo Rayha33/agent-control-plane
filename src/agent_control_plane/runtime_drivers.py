@@ -1508,6 +1508,12 @@ class NamespaceRuntimeDriver(ResourceDriver):
         # this wrapper CAP_SYS_ADMIN only long enough to build its private mount,
         # PID and optional network namespaces. The payload is exec'd after every
         # capability is removed, so it cannot undo those mounts.
+        apparmor_profile = self._apparmor_profile()
+        if apparmor_profile:
+            # AppArmorProfile= is not supported by all per-user systemd
+            # managers. Apply the administrator-installed profile to the
+            # actual runtime command instead of relying on a unit property.
+            argv.extend([self._apparmor_exec(), "-p", apparmor_profile, "--"])
         argv.extend(
             [
                 self._unshare(),
@@ -1810,6 +1816,14 @@ class NamespaceRuntimeDriver(ResourceDriver):
     def _unshare(self) -> str:
         return self.definition.option("unshare_path", "/usr/bin/unshare") or "/usr/bin/unshare"
 
+    def _apparmor_profile(self) -> str:
+        return self.definition.option("apparmor_profile", "") or ""
+
+    def _apparmor_exec(self) -> str:
+        return (
+            self.definition.option("apparmor_exec_path", "/usr/bin/aa-exec") or "/usr/bin/aa-exec"
+        )
+
     def _namespace_preflight_argv(self) -> list[str]:
         argv = [
             self._unshare(),
@@ -1821,7 +1835,11 @@ class NamespaceRuntimeDriver(ResourceDriver):
         ]
         if self._egress_denied():
             argv.append("--net")
-        return [*argv, "--", self._shell(), "-c", "exit 0"]
+        command = [*argv, "--", self._shell(), "-c", "exit 0"]
+        apparmor_profile = self._apparmor_profile()
+        if apparmor_profile:
+            return [self._apparmor_exec(), "-p", apparmor_profile, "--", *command]
+        return command
 
     def _shell(self) -> str:
         # Only used to run the read-only bind prelude before exec'ing the
@@ -1990,6 +2008,15 @@ def parse_driver_definitions(
                     f"namespace runtime driver {name!r} disk_max must be a positive K/M/G size",
                 )
             options["disk_max"] = disk_max.upper()
+            apparmor_profile = str(options.get("apparmor_profile", "")).strip()
+            if apparmor_profile and not re.fullmatch(
+                r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", apparmor_profile
+            ):
+                raise DriverError(
+                    "invalid_config",
+                    f"namespace runtime driver {name!r} apparmor_profile must be a plain profile name",
+                )
+            options["apparmor_profile"] = apparmor_profile
             read_only = options.get("read_only_paths", "")
             for raw_path in (part.strip() for part in read_only.split(",")):
                 if raw_path and not Path(raw_path).is_absolute():
@@ -2014,6 +2041,10 @@ def parse_driver_definitions(
                 candidate = options.get(option_name, "").strip() or default
                 resolve_trusted_executable(candidate, repo_root, expected_owners)
                 options[option_name] = candidate
+            if apparmor_profile:
+                candidate = str(options.get("apparmor_exec_path", "")).strip() or "/usr/bin/aa-exec"
+                resolve_trusted_executable(candidate, repo_root, expected_owners)
+                options["apparmor_exec_path"] = candidate
 
         if kind == PostgresSchemaDriver.kind:
             if options.get("dsn") or options.get("dsn_env"):

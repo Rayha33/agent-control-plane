@@ -46,6 +46,7 @@ from .sandbox_attestation import (
     running_attestation_is_self_consistent,
     verify_running_runtime_process_membership,
     verify_running_runtime_resource_controls,
+    verify_running_runtime_systemd_units,
 )
 from .sandbox_workspace import (
     _MAX_DURABLE_MANIFEST_BYTES,
@@ -108,6 +109,24 @@ _TRANSITION_FIELDS = {
     ("running", "stopping"): frozenset({"stop_reason"}),
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
 }
+
+
+def _sandbox_container_id(attempt_id: str, claim_token: int, execution_id: str) -> str:
+    """Derive a runtime ID from the full fenced execution identity.
+
+    The digest suffix avoids using a short execution-ID prefix as the only
+    discriminator between different attempts in a shared runc state root.
+    """
+
+    identity = canonical_json(
+        {
+            "attempt_id": attempt_id,
+            "claim_token": claim_token,
+            "execution_id": execution_id,
+        }
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"acp-{digest[:60]}"
 
 
 def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]:
@@ -647,7 +666,7 @@ class SandboxExecutionJournalMixin:
             )
 
         execution_id = str(uuid.uuid4())
-        container_id = f"acp-{attempt_id[:24]}-{claim_token}-{execution_id[:8]}"
+        container_id = _sandbox_container_id(attempt_id, claim_token, execution_id)
         execution_root = (
             self.state_dir.resolve() / "sandbox-executions" / f"{attempt_id}-{claim_token}"
         )
@@ -2108,6 +2127,7 @@ class SandboxExecutionJournalMixin:
             # the release lock before the durable transition and one-shot permit.
             verify_running_runtime_resource_controls(attestation)
             verify_running_runtime_process_membership(attestation)
+            verify_running_runtime_systemd_units(attestation)
             updated = self._sandbox_execution_transition(
                 attempt_id,
                 claim_token,
@@ -2158,6 +2178,11 @@ class SandboxExecutionJournalMixin:
                 raise SupervisorError(
                     "sandbox_execution_transition_conflict",
                     "durable execution identity changed while requesting stop",
+                )
+            if row["phase"] in {"running", "stopping"} and locked_handle is None:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_unavailable",
+                    "the monitor-owned launch handle is unavailable in this process; stop state is unchanged",
                 )
             if row["phase"] == "stopping":
                 if row["stop_reason"] != reason:

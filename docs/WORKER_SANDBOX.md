@@ -391,6 +391,51 @@ first OS-boundary proof should use a registered no-model fake worker; each
 provider adapter must then prove its own auth and egress contract before launch
 is enabled. No provider adapter or `externalSandbox` opt-in is selected yet.
 
+### Lifecycle ownership decision (2026-10-10)
+
+The durable owner must be a systemd-managed transient **service** for each
+attempt/fencing epoch, not the API process, its `systemd-run` client, or a
+transient scope around a client-launched monitor. Put that service in a
+dedicated monitor slice outside the worker attempt slice. It owns the pinned
+runc launch handle and its one-shot init gate, observes the exact worker scope,
+and is the only component allowed to advance launch/running/exit journal
+receipts. Give each execution a non-reusable unit identity bound to the
+attempt, claim token, and execution ID. The manager's unit name alone is not
+enough: durable adoption must also match the exact invocation ID, control-group
+path, main-process start identity, and journaled fencing epoch. If any evidence
+is absent or conflicts, classify the execution as unknown and retain the
+attempt fence.
+
+The worker scope is a separate systemd object: launch rootless runc with the
+qualified systemd cgroup driver into the exact attempt slice, then independently
+reconcile/stop that scope and container. `KillMode=control-group` governs the
+processes in its own service unit; it is not evidence that a sibling runc scope
+was killed. A controller restart may reconnect to the still-active exact
+monitor service, but a new controller must never reconstruct the monitor's
+in-process runc handle or gate from a PID, path, or self-reported receipt. This
+only covers a controller-process restart while the system manager remains
+alive: a `systemd --user` manager normally terminates its services after the
+last login session ends unless lingering is enabled. The deployment preflight
+must therefore prove the chosen manager's lifetime (for example, require
+lingering for a user manager); this is not a reboot-survival claim. If the
+monitor is gone, recovery must use a separate trusted cleanup/reconciliation
+path to prove the exact init identity absent, the stopped container deleted,
+the state entry absent, and the worker cgroup empty before recording
+`cleanup_verified` or importing results. Ambiguous cleanup stays fenced.
+
+This choice is consistent with systemd's distinct transient service/scope
+lifecycles and unit-level cgroup controls ([`systemd-run(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
+[`systemd.kill(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html),
+[`systemd.resource-control(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)).
+The opt-in [`test_systemd_slice_integration.py`](../tests/test_systemd_slice_integration.py)
+does prove that a systemd-owned monitor service can be reconciled after its
+controller is SIGKILLed and can survive a separate worker-slice stop. Its own
+module documentation correctly limits that evidence: it does not launch or
+attest the ACP OCI worker, recover its runc handle, exercise authenticated
+cancellation, or verify cleanup/result import. The service-owner pattern is
+therefore the integration direction, not a completed executor; `run_worker`
+remains fail-closed.
+
 ## Threat model
 
 Assume the worker command, model-generated scripts, project files, symlinks,
@@ -631,6 +676,9 @@ execution remains unavailable and fail-closed.
 Schema 14 introduced a private, per-attempt `sandbox_executions` journal. Reservation
 binds the current claim token, an ACP-generated container ID, attempt-specific
 bundle/state paths, the bundle and rootfs digests, and exact runc/OCI versions.
+New container IDs are `acp-` plus a 240-bit SHA-256 prefix over the canonical
+full `(attempt_id, claim_token, execution_id)` tuple; they do not use a short
+execution-ID prefix as a cross-attempt discriminator.
 The transition contract keeps the ACP monitor, attached runc client, and
 container-init PID/start identities separate, and also records the wrapper and
 scope unit names plus InvocationIDs and exact cgroup path. SQLite prevents edits
@@ -862,10 +910,10 @@ re-reads the cgroup-v2 memory, CPU, and PID limits. Synthetic regressions cover
 PID reuse, process exit, cgroup movement, gate-lock ordering, and a shut gate on
 drift. These sequential reads narrow a stale-receipt window; they are not an
 atomic procfs/cgroup snapshot, and process exit or movement after the reads
-remains a race. Runc state and systemd invocation properties are still supplied
-by the future caller and are not re-queried here. No production worker calls
-this path: OCI `run_worker` remains fail-closed and end-to-end worker isolation
-is unproven.
+remains a race. At the time of this 2026-10-09 change, systemd invocation
+properties were not re-queried at release; the 2026-10-10 release-time identity
+gate below adds that check. No production worker calls this path: OCI
+`run_worker` remains fail-closed and end-to-end worker isolation is unproven.
 
    **Repeat fixture and exact cleanup (2026-10-03).** A separate no-model
    rootless OCI composition run on the NAS added runtime-only evidence. The
@@ -1400,6 +1448,128 @@ It is not evidence of `run_worker` isolation, provider authentication or
 egress, result transfer, crash/cancellation recovery, or full task #2370
 acceptance.
 
+### AppArmor-gated OCI boundary replay on runc 1.5.2 (2026-10-10; pass)
+
+The exact `d22483ce6c566df514936c83f7bd500a7f1fb594` source and test were
+copied into the no-host-share Lima guest `acp-oci-qc-20261009` (Ubuntu 24.04.5
+ARM64, Linux `6.8.0-142-generic`, cgroup v2, active user manager, Python
+3.12.3, pytest 7.4.4). The 48-file package-source tree digest was
+`6f0c9f40249f42ffc22ad61274f8a0837c3d76b21a66da8be12f875bf83aaa1a`; the
+tested `oci_worker.py` SHA-256 was
+`d3891165e4ec1b11c4997188cfdea3108e3fb8edff17a0ec7f92f5d541d1991d`, and
+`test_oci_worker_runtime.py` was
+`697b39229d436cf65bf0984921ed4513e1d47d3fa324938d4af34317f177e824`. A
+separate root-owned `/usr/local/bin/runc-1.5.2` was installed from the
+[official runc v1.5.2 ARM64 release asset](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+only after its SHA-256 matched the GitHub release API digest
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`;
+the pre-existing runc binary was not replaced. BusyBox was 1.36.1.
+
+With the guest's default `kernel.apparmor_restrict_unprivileged_userns=1`,
+the live integration attempt from an unconfined shell stopped before runc exec:
+the private bundle helper received `EPERM` at mount-namespace setup (phase 4).
+A direct `unshare` check also failed under that policy. The guest already had
+AppArmor 4.0.1's packaged `/etc/apparmor.d/runc` profile (SHA-256
+`e97400404d8b8e85ce3e458558105ec218276efab10b355c7a6086a90ad0b4c6`): it is
+`flags=(unconfined)` with an explicit `userns,` rule. The upstream AppArmor
+[user-namespace policy notes](https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction)
+describe this per-profile permission path. `aa-exec -p runc -- unshare
+--user --map-root-user --mount --fork -- /bin/true` passed while the sysctl
+remained `1`.
+
+The first profile replay exposed an unclosed `Popen` pipe when private-bundle
+setup failed before a launch handle could be returned. `_reap_failed_runc_launch`
+now closes the caller-unreachable stdin/stdout/stderr handles in `finally`, with
+a regression test. Only `oci_worker.py` and `test_oci_worker_runtime.py` were
+then overlaid into the same guest; their tested SHA-256 values were
+`60e5b1ef264de00be2c486a55f3db4eccd211a7b94fbe8207486e1688428778c` and
+`d15ff55c5f4202655f51158bf9a907588708df5b10457f8d5db54fe2da5a7d44`.
+With the sysctl still `1`, the exact live test
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1 under
+`aa-exec -p runc`, with resource warnings visible and none emitted. Postflight
+found no attempt tree, matching user slice, or runc process; the user manager
+remained active and the sysctl remained `1`. No host settings were changed.
+
+After that guest replay, the source received a compatibility-only adjustment:
+cleanup now uses `getattr(..., None)` for optional Popen stream attributes so
+structural process doubles without those attributes do not mask the bounded
+reap error. The final local source SHA-256 is
+`020f35c85285740fa0df6c78e05b12eae1c1860df01240a0bd99141ebe7faa7e`; it was
+not overlaid or replayed in the guest. The final source passed both focused
+cleanup tests locally, including
+`test_failed_runc_launch_cleanup_reports_bounded_unreaped_child`.
+
+This proves the low-level test can run with the default sysctl when its caller
+is assigned a profile granting user-namespace creation; it does not establish
+a production-ready profile. The packaged `runc` profile is unconfined apart
+from naming and its userns rule, and this replay placed the entire pytest
+controller and descendants under that label. It therefore does not prove the
+permission is restricted to the trusted setup helper or absent from the worker.
+The profile-separated prototype below addresses that low-level boundary, but
+does not provide a production profile or policy lifecycle. The executor is
+still not wired to registered `run_worker`; lifecycle ownership, cleanup
+verification, credential/provider egress, result import, and full task #2370
+acceptance remain open. Keep OCI `run_worker` fail-closed.
+
+### OCI helper/worker AppArmor profile separation (2026-10-10; bounded pass)
+
+The OCI compiler now optionally emits the standard `process.apparmorProfile`
+field. The [OCI Runtime Specification v1.2.1](https://github.com/opencontainers/runtime-spec/blob/v1.2.1/config.md)
+defines this as a Linux process profile name, and pinned [runc v1.5.2 applies
+the profile during init, before exec](https://github.com/opencontainers/runc/blob/v1.5.2/libcontainer/standard_init_linux.go#L1016).
+The compiler validates a single plain profile name; it does not load, verify,
+attest to, or audit the named policy. The name must refer to a profile already
+loaded by the host, and the actual runtime must still be independently checked.
+
+In the disposable no-host-share guest above, a temporary **confined** enforce
+profile named `acp-worker-qc` (flags `attach_disconnected,mediate_deleted`, no
+`userns` rule) was loaded from stdin. A direct probe without the worker's
+seccomp filter distinguished the profiles: `unshare --user --map-root-user`
+under the packaged `runc` profile succeeded, while the same command under
+`acp-worker-qc` failed with `Operation not permitted`. This is consistent with
+the [AppArmor user-namespace policy](https://apparmor.net/man/4.0/apparmor.d/).
+An earlier scratch profile using `flags=(unconfined)` but omitting `userns`
+unexpectedly still allowed the operation with the global restriction enabled;
+absence of a rule in an unconfined profile is not a worker denial. Do not use
+that profile shape for this separation.
+
+The exact `oci_worker.py` and `test_oci_worker_runtime.py` overlay passed the
+opt-in rootless live test using pinned `runc-1.5.2` and
+`ACP_OCI_TEST_APPARMOR_PROFILE=acp-worker-qc`. The host read
+`/proc/<init-pid>/attr/current` and asserted `acp-worker-qc (enforce)` before
+releasing the candidate-code gate; the payload independently read its own
+label. The guest test environment was Python 3.12.3 / pytest 9.1.1. Its
+user-namespace attempt was denied, though the worker seccomp policy
+also denies namespace syscalls, so that payload result alone cannot attribute
+the denial to AppArmor. The preceding direct no-seccomp contrast isolates the
+AppArmor result. Tested file SHA-256 values:
+
+- `src/agent_control_plane/supervisor/oci_worker.py`:
+  `1a5559be722334c5797e2d908621a289adea11e55e46c69b16c43cbfbcdeedfd`
+- `tests/test_oci_worker.py`:
+  `b53e107889dd984c5f279ead9f542a20d9aaa929c5571833f6ad9b006b3f15ec`
+- `tests/test_oci_worker_runtime.py`:
+  `40ed1181d28ca585907a52c555b353a8a768a95373f4f8728a6a1972011eeb17`
+
+`tests/test_oci_worker.py` was also overlaid (hash above), but its compiler
+unit tests were exercised by the local suite rather than this live runtime
+test. After the guest replay, the source docstring alone was clarified to state
+that the compiler does not provision or attest to the named profile. The final
+local source SHA-256 is
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`; these
+comment-only bytes were not recopied to the guest. The full local suite passed
+on the final source tree.
+
+Postflight confirmed `kernel.apparmor_restrict_unprivileged_userns=1`, removed
+the temporary profile, and found no matching runc/unshare processes, ACP systemd
+units, or live-attempt tree. This establishes optional OCI-field compilation
+and profile application for this pinned low-level replay—not production policy
+provisioning/discovery, integration with registered `run_worker`, complete
+cleanup/recovery, or result handling. The temporary profile was intentionally
+minimal for the experiment and is not production policy. Keep OCI `run_worker`
+fail-closed until those remaining boundaries are independently implemented
+and verified.
+
 ### NamespaceRuntimeDriver live payload boundary (2026-10-09; pass)
 
 Added opt-in regression `test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps`
@@ -1465,7 +1635,52 @@ Linux with live opt-in unset (the two live tests were explicitly skipped).
 Postflight found no matching systemd unit or fixture worktree, and the guest
 policy still read back as `1`.
 
-The exact tested source and test SHA-256 values are
+The driver now also accepts an optional `apparmor_profile` name. When set,
+preflight and the service's actual namespace command are both wrapped with the
+trusted `/usr/bin/aa-exec` (or configured trusted `apparmor_exec_path`) and the
+same named profile. This intentionally does not use systemd's
+`AppArmorProfile=` unit property: systemd documents mandatory-access-control
+properties as unavailable to per-user service managers
+([systemd.exec(5)](https://manpages.ubuntu.com/manpages/noble/man5/systemd.exec.5.html)),
+while ACP launches transient user services. The profile is not invented or installed by ACP; it
+must already exist and be administrator-reviewed. Names are restricted to a
+single plain token. This lets a host grant the namespace helper an explicit
+user-namespace policy without turning off Ubuntu's global AppArmor restriction.
+Do not copy the disposable test profile into production without independent
+review: the Ubuntu `lxc-unshare` profile used for local validation is an
+`unconfined` profile with a `userns` rule, not a complete ACP confinement
+policy. A missing or insufficient profile fails closed: a missing profile
+fails preflight before unit launch; a profile that permits preflight but not
+the full mount sequence can still make unit setup fail, after which normal
+teardown and positive-absence verification remain required.
+
+**AppArmor-profile live recheck (2026-10-10; pass).** Exact source SHA-256
+`e4a0cd58f8f6f5bf4491febe88926ac31586b21ee88c9f1c5643a79e18bf8aeb` and test
+SHA-256 `398950fd966a202e06a21de1b888b970969e2259fde89c0762fbb03445b9b588`
+were copied into the no-host-share Lima 2.2.1 VZ Ubuntu 24.04.5 ARM64 guest.
+With `ACP_RUN_NAMESPACE_INTEGRATION=1`,
+`ACP_NAMESPACE_TEST_APPARMOR_PROFILE=lxc-unshare`, and
+`ACP_NAMESPACE_TEST_APPARMOR_EXEC=/usr/bin/aa-exec`, the exact live test passed
+(`1 passed, 107 deselected in 0.12s`) and the full Linux `tests/test_runtime_drivers.py` module
+passed (`106 passed, 2 opt-in integration tests skipped`). The guest remained
+rootless (uid 501), on kernel `6.8.0-142-generic` / systemd 255.4, with unified
+cgroup v2 and `kernel.apparmor_restrict_unprivileged_userns=1` before and after;
+no global AppArmor setting was changed. The live test reads
+`/proc/<host-pid>/attr/current` for the process holding the payload marker and
+asserts that its effective label matches the configured profile name; the guest
+reported `lxc-unshare (unconfined)`. Postflight found no matching ACP unit,
+fixture worktree, or worker service. The payload again confirmed
+`workspace_write=denied` while host `/etc/os-release` remained readable.
+
+This proves the named profile transition reaches the payload process under this
+Ubuntu policy; it does not establish that the selected profile is restrictive
+or suitable for production. It also does not make the workspace mutable or hide
+the host's enumerated `/etc`, and it does not exercise registered `run_worker`,
+cancellation/recovery, Git transfer, or result import. The feature therefore
+improves platform compatibility only; #2370 remains open and OCI worker
+execution remains fail-closed.
+
+For the earlier sysctl-based live run, the tested source and test SHA-256 values are
 `66e937ec6cc2a4b11bd6c8f526695a7c94dc45d642865391355418f72e4e5ba3` and
 `2a6afa465ece4426b8f599dac8be59426454228d82c6b9358b98ecadfd8b2e38`.
 Environment: Lima 2.2.1 VZ, Ubuntu 24.04.5 ARM64, kernel `6.8.0-142-generic`,
@@ -1474,6 +1689,90 @@ guest had no host-shared folders. The test venv used the project's declared
 development extras, not the exact `uv.lock` environment; hosted CI remains the
 locked-dependency matrix. Never relax this AppArmor setting on a shared host
 to make a test pass.
+
+**Ubuntu 26.04 rootless OCI boundary recheck (2026-10-11; pass).** To avoid
+the active NAS I/O alert and leave the two existing ACP VMs untouched, the
+source was copied into a new Lima 2.2.1 VZ `--plain` guest with no host mounts
+or port forwards. The tested snapshot was based on PR-42 commit
+`cedfecdaa59affb19edd68a2d8173be2b1f17b5d`, with only
+`tests/test_oci_worker_runtime.py` overlaid; `oci_worker.py` SHA-256 was
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`, and the
+tested file SHA-256 was
+`4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`. The
+guest was Ubuntu 26.04 ARM64, kernel `7.0.0-34-generic`, systemd 259.5, uid
+501, Python 3.14.4, pytest 9.1.1, and unified cgroup v2. The installed
+`runc.arm64` came from the [official runc v1.5.2 release](https://github.com/opencontainers/runc/releases/tag/v1.5.2)
+after its SHA-256 matched the release-asset digest
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+Dynamic BusyBox 1.37.0-7ubuntu1 was separately extracted from the signed
+Ubuntu package so the test could audit and copy its loader/library closure.
+
+With `ACP_RUN_OCI_INTEGRATION=1`, runc 1.5.2 explicitly pinned, and the test's
+normal bounded fake payload (no model or provider credentials),
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1. The
+Ubuntu image labels device-node bind mounts' devtmpfs source as `devtmpfs`
+and omits `relatime`; the validator now accepts only the source labels
+`udev`/`devtmpfs` and only the exact `rw,nosuid` option set with optional
+`relatime`. It rejects unapproved source labels and every other per-mount
+option set. This exact allowlist applies to mountinfo's per-mount options; for
+these device binds the validator separately requires `rw` and rejects `ro` in
+`super_options`, but does not exact-allowlist other superblock options. It also
+checks the root/filesystem, filesystem device identity, shared devtmpfs
+identity, device numbers, read-only proc masks, cgroup limits, PID namespace,
+and bundle/path replacement attacks. The default guest AppArmor userns
+restriction was `1`; a 10-minute systemd restore timer was armed before a
+temporary guest-only change to `0`, and a shell exit trap restored and read
+back `1`. At the end of this focused run, independent postflight confirmed the
+setting was `1`, the live attempt tree absent, no runc process, and the user
+manager active; its fallback timer remained armed to repeat the same safe
+restore. Neither the Mac host nor NAS policy was changed.
+
+As a follow-up on the same guest snapshot and exact source hashes above, the
+entire `tests/test_oci_worker_runtime.py` module was run with
+`ACP_RUN_OCI_INTEGRATION=1`: **47 passed in 5.67 seconds**, including the live
+rootless-runc test (not skipped). For this run, two 10-minute fallback restore
+timers were armed before the guest-only sysctl change; the shell exit path
+restored and read back `1`, and both timers were stopped only after that
+readback. Postflight found the user manager active and no runc process. The
+live test's exact pytest directory
+`/tmp/pytest-of-rayha/pytest-7/test_live_rootless_runc_enforc0` had no
+`live-oci-attempt` child. A read-only scan of `/tmp/pytest-of-rayha/pytest-7`
+found four adversarial pytest fixtures that intentionally retained their
+markers: `test_checkout_write_probe_clea1/checkout-write-probe`,
+`test_private_attempt_tree_clea1/live-oci-attempt`,
+`test_private_attempt_tree_clea2/live-oci-attempt`, and
+`test_private_attempt_tree_fina0/live-oci-attempt`. Their unexpected or
+replacement marker entries remain by design; these fixture directories are
+distinct from the live test's attempt tree and were preserved, not deleted.
+
+**Ubuntu 26.04 systemd 259 monitor/attestation primitive recheck (2026-10-11; pass).**
+In the same no-host-mount Lima guest (Ubuntu 26.04 ARM64, Linux
+`7.0.0-34-generic`, systemd 259.5, Python 3.14.4, pytest 9.1.1, cgroup v2),
+the exact `tests/test_systemd_slice_integration.py` SHA-256
+`94eb48cc486c1e174d697ec01767701576a257f52a7a52bb74359773fbbba7e9` was run
+with `ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`; the two selected live tests passed
+(2 passed, 3 deselected, 0.48 seconds). The first test killed its creating
+controller, reconciled the exact service receipt from a fresh controller, and
+verified the monitor service survived stopping the worker slice while the scope
+cgroup emptied. The second verified that the live systemd attestation rejects
+a restarted wrapper. The imported `sandbox_attestation.py` and `oci_worker.py`
+SHA-256 values were `c64ef56def1dc4cd9fc58c2db62560b6f1da33076483c2b460dee78ad3044b22`
+and `7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236`.
+Postflight found the user manager running, no matching `acp-live-*` or
+`user-acp-*.slice` units, and no `/usr/bin/sleep 90` or `runc` process.
+
+These systemd tests use placeholder sleep processes, and their scope is started
+by an external controller; they do not test a monitor that owns the runc client
+and its wait/reconciliation. This extends primitive-level coverage to systemd
+259.5 only; it is not durable monitor integration, supervisor-restart recovery,
+or registered `run_worker()` acceptance.
+
+This is a successful low-level OCI-boundary probe on a second Linux/kernel
+profile, not end-to-end supervised-worker acceptance. It does not connect the
+container launch to registered `run_worker`, provide least-privilege provider
+authentication/egress, or demonstrate supervisor-crash recovery, cancellation,
+and result import. `run_worker()` therefore remains fail-closed with
+`sandbox_executor_unavailable`; task #2370 remains open.
 
 **Target NAS capability spot check (2026-10-10; no unit or worker started).**
 From the regular uid-1000 account on `DXP4800PLUS-RING` (`Linux 6.18.15
@@ -1683,6 +1982,16 @@ transient-unit creation, not a separate lifecycle owner. Sources:
 [systemd control-group API](https://systemd.io/CONTROL_GROUP_INTERFACE/), and
 [systemd v252 cgroup delegation guide](https://github.com/systemd/systemd/blob/v252/docs/CGROUP_DELEGATION.md).
 
+The v252 D-Bus XML declares `GetUnitByInvocationID` and
+`GetUnitByControlGroup`, but comments that both methods are not documented; it
+also marks the `InvocationID` property undocumented. Do not treat these
+declarations as compatibility guarantees. The monitor should query the
+durable exact unit name and compare the returned `Id`, `InvocationID`,
+`ControlGroup`, `Slice`, and state with its receipt; any unavailable or
+mismatched identity keeps the attempt fenced. Required property readback must
+be tested for each supported systemd version, and reverse-lookup methods need
+an explicit version/behavior test before use.
+
 The recovery design must not use `systemd-run --scope` as the durable monitor:
 in v252 the command remains a child of the `systemd-run` client and the client
 waits synchronously for it. Instead, the candidate architecture is one
@@ -1840,6 +2149,86 @@ systemd manager restart/logout/reboot, a concurrent cleanup race, runc-created
 scope behavior, or `run_worker` integration. The opt-in test is not default CI
 and does not authorize setting `cleanup_verified`; OCI remains fail-closed.
 
+**PID-start-identity receipt revalidation (2026-10-10; exact-source replay).**
+Receipt schema v3 records the Linux process identity
+`linux:<MainPID>:<starttime>` using ACP's PID-reuse-resistant process helper.
+Receipt parsing rejects malformed or PID-mismatched identities, and a fresh
+reconciler compares the current process start identity after checking the
+systemd-reported unit identity. A deterministic regression keeps all mocked
+systemd properties, including `MainPID`, unchanged while changing the start
+identity; reconciliation rejects it. This simulates PID reuse at the identity
+boundary, not actual kernel PID reuse.
+
+The exact updated test file and package wheel were replayed in the disposable
+no-host-mount Lima guest above (Ubuntu 24.04.5 ARM64, Linux 6.8.0-142,
+systemd 255.4, Python 3.12.3, active user manager, cgroup v2). The test file
+SHA-256 was
+`282427fbbe67345ee3d8c404c35a110ce3cc55c7cbe7344e2469fe76e1f966f0` and the
+package wheel SHA-256 was
+`b285d3c387b36acb05652d63b331f2e27f40d5ac57e679607cf336fb68a82134`; both
+matched between host and guest. The opt-in pytest passed (1 passed), and a
+direct script replay returned `monitor_reconciled_after_controller_sigkill`,
+`monitor_survived_worker_slice_stop`, and `cgroups_empty` as true. The unique
+service and scope became `not-found`/`inactive`, the attempt slice became
+`inactive`, their three recorded cgroup paths were absent, the recorded monitor
+PID was absent, and the scope client exited `-15` (`SIGTERM`). The host's exact
+commit `ad63e2d` also passed all four Ubuntu/macOS × Python 3.11/3.12 CI jobs
+(run `38085103683`). This is still a `/usr/bin/sleep 45` placeholder and
+controller-process recovery only: it does not prove kernel PID reuse,
+fencing-epoch binding, an ACP monitor owning runc, cleanup/result-import
+integration, manager restart/logout/reboot recovery, or `run_worker`; OCI
+remains fail-closed.
+
+**Systemd monitor MainPID binding (2026-10-10; source-level gate).** The
+trusted runtime collector now requests `MainPID` for the wrapper service and
+requires it to equal the expected monitor PID. Existing procfs observations
+then bind that PID to its kernel start identity and the service cgroup; absent
+or mismatched `MainPID` fails attestation. Slice and scope queries do not ask
+for the service-only property. Unit regressions cover missing and mismatched
+values and verify the collector requests it only for the wrapper. This closes
+the attestation ambiguity where another process in the same wrapper cgroup
+could be passed as the monitor. The collector re-queries all three exact units
+after process and cgroup sampling, requires systemd properties to be byte-identical,
+then rechecks process membership and resource controls before issuing collector
+provenance. At the journal's gate-release boundary, the same launch-gate lock
+now protects another exact wrapper/slice/scope property read, including wrapper
+`MainPID`; drift leaves the row at `launched` and the one-shot gate closed.
+Systemd, procfs, and cgroup reads remain sequential, not an atomic snapshot; an
+ABA transition or change after the final read is not ruled out. This narrows the
+observation window, not a kernel-level race. It does not establish that a
+production ACP monitor owns or waits for runc, is crash-recoverable, or is
+connected to `run_worker`; OCI remains fail-closed.
+
+**Gate-release systemd identity recheck (2026-10-10; exact-source live replay).**
+The journal now re-reads the exact wrapper service, attempt slice, and runc
+scope while holding the launch-gate lock, immediately before the durable
+`launched` to `running` transition and one-shot gate authorization. A new
+opt-in regression starts unique transient units under the disposable user
+manager, builds a self-consistent test receipt from their live unit properties
+and process snapshots, accepts the original identities, restarts the wrapper,
+and requires the old receipt to fail with `sandbox_runtime_attestation_stale`.
+Its runc-state and resource-limit bytes are fixtures: this proves the trusted
+`systemctl` observation path and replacement rejection, not a live runc launch
+or resource enforcement. The test's `finally` gate stops the exact scope,
+attempt slice, and wrapper and verifies their cgroups empty or absent.
+
+The exact test and source copy ran in the no-host-share Lima 2.2.1 VZ guest
+`acp-sandbox-monitor-20261010` (Ubuntu 24.04.5 LTS ARM64, Linux 6.8.0-142,
+systemd 255.4, Python 3.12.3, active user manager, cgroup v2). The live test
+alone passed (`1 passed, 4 deselected`) in 0.18 seconds; the complete opt-in
+systemd test file passed (`5 passed`) in 0.50 seconds. The test file SHA-256 was
+`94eb48cc486c1e174d697ec01767701576a257f52a7a52bb74359773fbbba7e9`; the
+48-file `src/agent_control_plane` Python-source manifest SHA-256 was
+`d59e1d78a9150a5c2a962831b4d35aef9d82bfb5f34e88f0b2c5d6cdf24ab710` on both
+host and guest. The test cleanup asserts that each exact unit is no longer
+active/activating/deactivating and each recorded cgroup is empty or absent. A
+separate postflight `systemctl --user list-units --all` query found no loaded
+probe service or scope; that loaded-state observation is not an assertion in
+the test. This remains a test of the systemd verifier in isolation: it does
+not establish durable monitor recovery, production cleanup verification, real
+runc scope behavior, result import, or `run_worker` integration. OCI remains
+fail-closed.
+
 **OCI policy compiler slice (2026-10-04; not integrated).** The new
 `supervisor/oci_worker.py` compiles an OCI 1.2 config and an attached `runc`
 argv for a future executor. It encodes a readonly root, a single non-recursive
@@ -1980,9 +2369,12 @@ integrated, and `externalSandbox` remains disabled.
   for the same fencing epoch and refused for a later one. Only a valid bounded
   diff may reach the existing QC path.
 - **Lifecycle:** test cancellation, abrupt supervisor restart, timeout,
-  failed systemd setup, stale unit, and concurrent attempts. A missing or
-  ambiguous unit identity is `unknown` and retains the fence; it is not cleanup
-  proof. After a stopped container, explicitly run `runc delete` and verify
+  failed systemd setup, stale unit, and concurrent attempts. Separately test
+  controller death while the system manager stays live and the selected
+  `systemd --user` manager's logout/linger lifecycle on a disposable host; a
+  manager shutdown or vanished unit is not proof of worker cleanup. A missing
+  or ambiguous unit identity is `unknown` and retains the fence; it is not
+  cleanup proof. After a stopped container, explicitly run `runc delete` and verify
   that its exact ID is absent from the configured runc state root and its
   cgroup/unit is absent before releasing the fence. Preflight every required
   cgroup controller and verify configured resource limits by reading them back

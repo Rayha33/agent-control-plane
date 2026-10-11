@@ -2199,6 +2199,42 @@ def test_namespace_runtime_never_uses_a_scope(tmp_path: Path) -> None:
     argv = namespace_unit_argv(calls)
     assert "--scope" not in argv
     assert "--property=KillMode=control-group" in argv
+    assert not any(arg.startswith("--property=AppArmorProfile=") for arg in argv)
+    assert "/usr/bin/aa-exec" not in argv
+
+
+def test_namespace_runtime_uses_explicit_apparmor_profile_for_preflight_and_unit(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver(apparmor_profile="lxc-unshare", apparmor_exec_path="/usr/bin/aa-exec")
+    runner, calls = recording_runner()
+
+    driver.setup(context(tmp_path), runner)
+
+    assert calls[0][:4] == [
+        "/usr/bin/aa-exec",
+        "-p",
+        "lxc-unshare",
+        "--",
+    ]
+    assert calls[0][4:10] == [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--pid",
+        "--fork",
+    ]
+    assert "--net" in calls[0]
+    unit_argv = namespace_unit_argv(calls)
+    unshare_index = unit_argv.index("/usr/bin/unshare")
+    assert unit_argv[unshare_index - 4 : unshare_index] == [
+        "/usr/bin/aa-exec",
+        "-p",
+        "lxc-unshare",
+        "--",
+    ]
+    assert not any(arg.startswith("--property=AppArmorProfile=") for arg in unit_argv)
 
 
 def test_namespace_runtime_applies_every_quota_as_a_unit_property(tmp_path: Path) -> None:
@@ -2821,6 +2857,59 @@ def test_namespace_runtime_rejects_an_unknown_egress_mode(tmp_path: Path) -> Non
     assert "egress" in str(error.value)
 
 
+@pytest.mark.parametrize("profile", ["lxc-unshare --debug", "-lxc-unshare"])
+def test_namespace_runtime_rejects_non_plain_apparmor_profile_names(
+    tmp_path: Path, profile: str
+) -> None:
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions(
+            [
+                {
+                    "name": "rt",
+                    "kind": "namespace_runtime",
+                    "executable": TRUSTED_BIN,
+                    "payload": "/bin/true",
+                    "apparmor_profile": profile,
+                    "apparmor_exec_path": str(TRUSTED_BIN),
+                }
+            ],
+            tmp_path,
+        )
+    assert error.value.code == "invalid_config"
+    assert "plain profile name" in str(error.value)
+
+
+def test_namespace_runtime_trusts_configured_apparmor_helper(tmp_path: Path) -> None:
+    definition = {
+        "name": "rt",
+        "kind": "namespace_runtime",
+        "executable": TRUSTED_BIN,
+        "payload": "/bin/true",
+        "apparmor_profile": "acp-test-profile",
+        "apparmor_exec_path": str(TRUSTED_BIN),
+    }
+    # These defaults are Linux-only. Point them at the trusted cross-platform
+    # test binary so the parser test can focus on the opt-in helper contract.
+    for helper in (
+        "systemctl_path",
+        "unshare_path",
+        "shell_path",
+        "setpriv_path",
+        "mount_path",
+        "chroot_path",
+    ):
+        definition[helper] = str(TRUSTED_BIN)
+    definitions = parse_driver_definitions([definition], tmp_path)
+    assert definitions[0].option("apparmor_profile") == "acp-test-profile"
+    assert definitions[0].option("apparmor_exec_path") == str(TRUSTED_BIN)
+
+    attacker = make_executable(tmp_path / "aa-exec")
+    definition["apparmor_exec_path"] = str(attacker)
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions([definition], tmp_path)
+    assert error.value.code == "untrusted_driver"
+
+
 def test_namespace_runtime_validates_every_helper_binary(tmp_path: Path) -> None:
     """Every helper in the privileged namespace prelude is part of the trust root."""
     attacker = make_executable(tmp_path / "systemctl")
@@ -3074,10 +3163,19 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             "ACP_REPO_ROOT": str(worktree),
         },
     )
+    driver_options = {
+        "payload": "/bin/sh /workspace/fake-agent.sh",
+        "unit_prefix": "acp-ns-it",
+        "wall_clock_seconds": "60",
+    }
+    apparmor_profile = os.environ.get("ACP_NAMESPACE_TEST_APPARMOR_PROFILE", "").strip()
+    if apparmor_profile:
+        driver_options["apparmor_profile"] = apparmor_profile
+        driver_options["apparmor_exec_path"] = os.environ.get(
+            "ACP_NAMESPACE_TEST_APPARMOR_EXEC", "/usr/bin/aa-exec"
+        )
     driver = namespace_driver(
-        payload="/bin/sh /workspace/fake-agent.sh",
-        unit_prefix="acp-ns-it",
-        wall_clock_seconds="60",
+        **driver_options,
     )
     unit = driver._unit(driver_context)
     marker = None
@@ -3167,6 +3265,11 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
         assert observed["workspace_write"] == "denied"
         assert int(observed["inner_pid"]) > 0
         assert os.readlink(f"/proc/{marker_host_pid}/ns/pid") != os.readlink("/proc/self/ns/pid")
+        if apparmor_profile:
+            effective_label = (
+                Path(f"/proc/{marker_host_pid}/attr/current").read_text(encoding="utf-8").strip()
+            )
+            assert effective_label.split(" (", 1)[0] == apparmor_profile
         assert not (worktree / "should-not-write").exists()
     finally:
         cleanup_proven = False

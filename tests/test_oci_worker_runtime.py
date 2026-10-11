@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 import select
@@ -585,16 +586,27 @@ def _validate_worker_mount_policy(
         device_mount_ids: set[tuple[int, int]] = set()
         for target, (root, filesystem, source, options) in verified_runc_152_mounts.items():
             observed = mounts[target]
-            if (observed.root, observed.filesystem, observed.source) != (
-                root,
-                filesystem,
-                source,
+            expected_sources = {source}
+            if filesystem == "devtmpfs":
+                # Ubuntu/systemd hosts label the same device filesystem either
+                # "udev" or "devtmpfs". Filesystem device and device-node
+                # identity checks below remain authoritative; reject other labels.
+                expected_sources.add("devtmpfs")
+            if (
+                observed.root != root
+                or observed.filesystem != filesystem
+                or observed.source not in expected_sources
             ):
                 raise AssertionError(
                     f"worker default mount {target} has unexpected root/filesystem/source: "
                     f"{observed.root!r}/{observed.filesystem!r}/{observed.source!r}"
                 )
-            if observed.mount_options != frozenset(options):
+            allowed_mount_options = {frozenset(options)}
+            if filesystem == "devtmpfs":
+                # Device-node bind mounts may omit relatime when the host's
+                # devtmpfs does. Keep rw/nosuid and reject all other variants.
+                allowed_mount_options.add(frozenset(options - {"relatime"}))
+            if observed.mount_options not in allowed_mount_options:
                 raise AssertionError(
                     f"worker default mount {target} has unexpected mount options "
                     f"{sorted(observed.mount_options)}"
@@ -1566,6 +1578,44 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
     )
     assert {mount["target"] for mount in accepted_defaults} == set(runc_152_mounts)
 
+    devtmpfs_source_mounts = {
+        target: mount(
+            "devtmpfs",
+            set(observed.mount_options),
+            root=observed.root,
+            source="devtmpfs",
+            device_id=observed.device_id,
+            super_options=set(observed.super_options),
+            optional_fields=observed.optional_fields,
+        )
+        for target, observed in runc_152_mounts.items()
+        if observed.filesystem == "devtmpfs"
+    }
+    accepted_devtmpfs_source = _validate_worker_mount_policy(
+        {**runc_152_mounts, **devtmpfs_source_mounts},
+        expected_runc_version="1.5.2",
+    )
+    assert {mount["target"] for mount in accepted_devtmpfs_source} == set(runc_152_mounts)
+
+    devtmpfs_without_relatime = {
+        target: mount(
+            "devtmpfs",
+            set(observed.mount_options) - {"relatime"},
+            root=observed.root,
+            source=observed.source,
+            device_id=observed.device_id,
+            super_options=set(observed.super_options),
+            optional_fields=observed.optional_fields,
+        )
+        for target, observed in runc_152_mounts.items()
+        if observed.filesystem == "devtmpfs"
+    }
+    accepted_without_relatime = _validate_worker_mount_policy(
+        {**runc_152_mounts, **devtmpfs_without_relatime},
+        expected_runc_version="1.5.2",
+    )
+    assert {mount["target"] for mount in accepted_without_relatime} == set(runc_152_mounts)
+
     latency_stats_mask = mount(
         "devtmpfs",
         {"rw", "nosuid", "relatime"},
@@ -1594,6 +1644,36 @@ def test_worker_mount_policy_requires_isolated_expected_mounts() -> None:
                     {"rw", "nosuid", "relatime"},
                     root="/latency_stats",
                     source="udev",
+                    device_id=dev_id,
+                    super_options={"rw", "size=1024"},
+                ),
+            },
+            expected_runc_version="1.5.2",
+        )
+    with pytest.raises(AssertionError, match="mount options"):
+        _validate_worker_mount_policy(
+            {
+                **runc_152_mounts,
+                "/dev/null": mount(
+                    "devtmpfs",
+                    {"rw", "nosuid", "relatime", "noexec"},
+                    root="/null",
+                    source="udev",
+                    device_id=dev_id,
+                    super_options={"rw", "size=1024"},
+                ),
+            },
+            expected_runc_version="1.5.2",
+        )
+    with pytest.raises(AssertionError, match="root/filesystem/source"):
+        _validate_worker_mount_policy(
+            {
+                **runc_152_mounts,
+                "/dev/null": mount(
+                    "devtmpfs",
+                    {"rw", "nosuid", "relatime"},
+                    root="/null",
+                    source="unexpected-source",
                     device_id=dev_id,
                     super_options={"rw", "size=1024"},
                 ),
@@ -2130,6 +2210,25 @@ def test_partial_launch_without_runtime_identity_fails_closed() -> None:
     assert "systemd scope cgroup" in gaps[2]
 
 
+def test_failed_runc_launch_closes_unreturned_pipe_handles(monkeypatch: pytest.MonkeyPatch) -> None:
+    class PopenWithPipes:
+        pid = 123
+
+        def __init__(self) -> None:
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+
+    process = PopenWithPipes()
+    monkeypatch.setattr(oci_worker, "_kill_process_group", lambda _process: None)
+
+    oci_worker._reap_failed_runc_launch(process)  # type: ignore[arg-type]
+
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+
+
 def test_systemd_parent_slice_cleanup_requires_empty_cgroup_subtree(tmp_path: Path) -> None:
     cgroup_root = tmp_path / "cgroup"
     slice_cgroup = cgroup_root / "user-acp-test.slice"
@@ -2296,11 +2395,27 @@ def _probe_script(
     host_tmp_relative: str,
     host_network_ip: str,
     host_network_port: int,
+    worker_apparmor_profile: str | None = None,
 ) -> str:
     q = {name: shell_quote(str(path)) for name, path in host_paths.items()}
     host_tmp_rel = shell_quote(host_tmp_relative)
     net_ip = shell_quote(host_network_ip)
     net_port = shell_quote(str(host_network_port))
+    apparmor_probe = "worker_apparmor=not-configured"
+    if worker_apparmor_profile is not None:
+        expected_profile = shell_quote(f"{worker_apparmor_profile} (enforce)")
+        apparmor_probe = f"""worker_apparmor=$(/bin/busybox cat /proc/self/attr/current)
+test "$worker_apparmor" = {expected_profile}
+if /bin/busybox unshare -U -r /bin/busybox true > /workspace/userns-denial.txt 2>&1; then
+  exit 50
+else
+  worker_userns_error=$(/bin/busybox cat /workspace/userns-denial.txt)
+fi
+case "$worker_userns_error" in
+  *"Operation not permitted"*|*"Permission denied"*) ;;
+  *) exit 51 ;;
+esac
+"""
     return f"""set -eu
 # Stop at a second host-controlled file gate. The host performs the FD audit.
 /bin/busybox touch /workspace/fd-audit-ready
@@ -2349,7 +2464,8 @@ else
   network_rc=$?
 fi
 
-printf 'network_probe_rc=%s\\ninterfaces=%s\\n' "$network_rc" "$interfaces" > /workspace/isolation-result.txt
+{apparmor_probe}
+printf 'network_probe_rc=%s\\ninterfaces=%s\\nworker_apparmor=%s\\n' "$network_rc" "$interfaces" "$worker_apparmor" > /workspace/isolation-result.txt
 """
 
 
@@ -2390,6 +2506,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     expected_version = os.environ.get("ACP_OCI_TEST_RUNC_VERSION")
     if not expected_version:
         pytest.fail("set ACP_OCI_TEST_RUNC_VERSION to the exact approved runc release")
+    apparmor_profile = os.environ.get("ACP_OCI_TEST_APPARMOR_PROFILE") or None
 
     repo_root = Path(__file__).resolve().parents[1]
     if not repo_root.is_relative_to(Path("/tmp")):
@@ -2674,6 +2791,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             host_tmp_relative=host_tmp_relative,
             host_network_ip=host_network_ip,
             host_network_port=host_network_port,
+            worker_apparmor_profile=apparmor_profile,
         )
         config = oci_worker.build_oci_worker_config(
             bundle_root,
@@ -2687,6 +2805,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             cpu_period_us=_CONTAINER_CPU_PERIOD_US,
             tmpfs_bytes=8 * 1024 * 1024,
             home_bytes=2 * 1024 * 1024,
+            apparmor_profile=apparmor_profile,
         )
         worker_config = oci_worker._apply_pinned_runc_recursive_private_policy(
             config, pin, expected_version=observed_version
@@ -3061,6 +3180,17 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             )
 
         init_pid = int(read_private_runc_pid_file(pid_file, state_root))
+        if apparmor_profile is not None:
+            apparmor_label_path = Path(f"/proc/{init_pid}/attr/current")
+            try:
+                apparmor_label = apparmor_label_path.read_text(encoding="utf-8").strip()
+            except OSError as error:
+                pytest.fail(f"could not read worker AppArmor label before gate release: {error}")
+            if apparmor_label != f"{apparmor_profile} (enforce)":
+                pytest.fail(
+                    f"runc worker AppArmor label mismatch: {apparmor_label!r} "
+                    f"!= {apparmor_profile!r} (enforce)"
+                )
         init_snapshot = read_linux_process_snapshot(init_pid)
         init_start = _snapshot_start_time(init_snapshot, init_pid, require_live=True)
         cgroup_path = _snapshot_cgroup_path(init_snapshot)
@@ -3197,6 +3327,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         result_fields = dict(line.split("=", 1) for line in result.splitlines())
         assert int(result_fields["network_probe_rc"]) != 0
         assert result_fields["interfaces"] == "lo"
+        if apparmor_profile is not None:
+            assert result_fields["worker_apparmor"] == f"{apparmor_profile} (enforce)"
+            assert (workspace / "userns-denial.txt").is_file()
         assert (workspace / "result.txt").read_text(encoding="ascii") == "candidate result\n"
         assert (workspace / "absolute-host-tmp").is_symlink()
         assert (workspace / "relative-host-tmp").is_symlink()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import selectors
 import shutil
 import signal
@@ -23,7 +24,15 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.oci_worker import _oci_worker_systemd_slice
+from agent_control_plane.supervisor.process import ProcessMixin
+from agent_control_plane.supervisor.sandbox_attestation import (
+    _parse_proc_stat,
+    read_linux_process_snapshot,
+    validate_running_runtime_attestation,
+    verify_running_runtime_systemd_units,
+)
 
 _ENABLED = os.environ.get("ACP_RUN_SYSTEMD_SLICE_INTEGRATION") == "1"
 _WAIT_SECONDS = 8.0
@@ -140,6 +149,7 @@ def _read_monitor_receipt(path: Path) -> dict[str, Any]:
         "invocation_id",
         "control_group",
         "main_pid",
+        "main_identity",
         "monitor_slice_unit",
         "monitor_slice_control_group",
         "slice_unit",
@@ -149,7 +159,7 @@ def _read_monitor_receipt(path: Path) -> dict[str, Any]:
         not isinstance(receipt, dict)
         or set(receipt) != expected
         or type(receipt["version"]) is not int
-        or receipt["version"] != 2
+        or receipt["version"] != 3
     ):
         raise RuntimeError("monitor receipt has an unsupported shape")
     if (
@@ -157,6 +167,9 @@ def _read_monitor_receipt(path: Path) -> dict[str, Any]:
         or receipt["controller_pid"] <= 0
         or type(receipt["main_pid"]) is not int
         or receipt["main_pid"] <= 0
+        or not isinstance(receipt["main_identity"], str)
+        or re.fullmatch(rf"linux:{receipt['main_pid']}:[1-9][0-9]*", receipt["main_identity"])
+        is None
         or not isinstance(receipt["invocation_id"], str)
         or len(receipt["invocation_id"]) != 32
         or any(char not in "0123456789abcdef" for char in receipt["invocation_id"])
@@ -218,20 +231,24 @@ def _start_monitor_controller(
     ):
         raise RuntimeError(f"systemd monitor identity is incomplete: {service}")
     main_pid = int(service.get("MainPID", "0"))
+    main_identity = ProcessMixin._process_identity(main_pid)
     receipt = {
-        "version": 2,
+        "version": 3,
         "controller_pid": os.getpid(),
         "unit": service_unit,
         "invocation_id": service["InvocationID"],
         "control_group": service["ControlGroup"],
         "main_pid": main_pid,
+        "main_identity": main_identity,
         "monitor_slice_unit": monitor_slice_unit,
         "monitor_slice_control_group": monitor_slice["ControlGroup"],
         "slice_unit": slice_unit,
         "slice_control_group": attempt_slice["ControlGroup"],
     }
-    if main_pid <= 0 or main_pid == os.getpid():
-        raise RuntimeError("systemd monitor MainPID is not owned by a distinct service process")
+    if main_pid <= 0 or main_pid == os.getpid() or main_identity is None:
+        raise RuntimeError(
+            "systemd monitor MainPID lacks a distinct, readable process start identity"
+        )
     _write_monitor_receipt(receipt_path, receipt)
     # The parent kills this controller after the durable receipt is visible.
     # The transient service must remain owned by systemd, not this process.
@@ -280,8 +297,8 @@ def _reconcile_monitor_after_restart(systemctl: str, receipt_path: Path) -> dict
         or attempt_cgroup.is_relative_to(monitor_cgroup)
     ):
         raise RuntimeError("trusted monitor and worker attempt slice are not separated")
-    if not Path(f"/proc/{receipt['main_pid']}").is_dir():
-        raise RuntimeError("recorded systemd monitor MainPID is no longer present")
+    if ProcessMixin._process_identity(receipt["main_pid"]) != receipt["main_identity"]:
+        raise RuntimeError("recorded systemd monitor PID start identity changed or is absent")
     if os.getpid() == receipt["controller_pid"]:
         raise RuntimeError("reconciliation unexpectedly ran in the original controller process")
     return {
@@ -380,12 +397,13 @@ def _crash_controller_and_reconcile(
 
 def test_monitor_receipt_round_trips_as_private_durable_identity(tmp_path: Path) -> None:
     receipt = {
-        "version": 2,
+        "version": 3,
         "controller_pid": 101,
         "unit": "acp-monitor-test.service",
         "invocation_id": "a" * 32,
         "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
         "main_pid": 102,
+        "main_identity": "linux:102:12345",
         "monitor_slice_unit": "app.slice",
         "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
         "slice_unit": "user-acp-test.slice",
@@ -403,12 +421,13 @@ def test_monitor_receipt_rejects_symlinks_and_boolean_versions(tmp_path: Path) -
     import pytest
 
     receipt = {
-        "version": 2,
+        "version": 3,
         "controller_pid": 101,
         "unit": "acp-monitor-test.service",
         "invocation_id": "a" * 32,
         "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
         "main_pid": 102,
+        "main_identity": "linux:102:12345",
         "monitor_slice_unit": "app.slice",
         "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
         "slice_unit": "user-acp-test.slice",
@@ -427,6 +446,64 @@ def test_monitor_receipt_rejects_symlinks_and_boolean_versions(tmp_path: Path) -
     invalid_path.chmod(0o600)
     with pytest.raises(RuntimeError, match="unsupported shape"):
         _read_monitor_receipt(invalid_path)
+
+    invalid_identity = dict(receipt, main_identity="linux:103:12345")
+    invalid_identity_path = tmp_path / "mismatched-main-identity.json"
+    invalid_identity_path.write_text(json.dumps(invalid_identity), encoding="ascii")
+    invalid_identity_path.chmod(0o600)
+    with pytest.raises(RuntimeError, match="invalid identity"):
+        _read_monitor_receipt(invalid_identity_path)
+
+
+def test_monitor_reconciliation_rejects_reused_main_pid(tmp_path: Path, monkeypatch: Any) -> None:
+    import pytest
+
+    receipt = {
+        "version": 3,
+        "controller_pid": os.getpid() + 1,
+        "unit": "acp-monitor-test.service",
+        "invocation_id": "a" * 32,
+        "control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/acp-monitor-test.service",
+        "main_pid": 102,
+        "main_identity": "linux:102:12345",
+        "monitor_slice_unit": "app.slice",
+        "monitor_slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice",
+        "slice_unit": "user-acp-test.slice",
+        "slice_control_group": "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp-test.slice",
+    }
+    properties = {
+        receipt["unit"]: {
+            "Id": receipt["unit"],
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "InvocationID": receipt["invocation_id"],
+            "ControlGroup": receipt["control_group"],
+            "Slice": receipt["monitor_slice_unit"],
+            "MainPID": str(receipt["main_pid"]),
+        },
+        receipt["monitor_slice_unit"]: {
+            "Id": receipt["monitor_slice_unit"],
+            "LoadState": "loaded",
+            "ControlGroup": receipt["monitor_slice_control_group"],
+        },
+        receipt["slice_unit"]: {
+            "Id": receipt["slice_unit"],
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "ControlGroup": receipt["slice_control_group"],
+        },
+    }
+    receipt_path = tmp_path / "monitor-receipt.json"
+    _write_monitor_receipt(receipt_path, receipt)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_unit_properties",
+        lambda systemctl, unit: properties[unit],
+    )
+    monkeypatch.setattr(ProcessMixin, "_process_identity", lambda pid: "linux:102:12346")
+
+    with pytest.raises(RuntimeError, match="PID start identity changed"):
+        _reconcile_monitor_after_restart("systemctl", receipt_path)
 
 
 def _wait_active(systemctl: str, unit: str, client: subprocess.Popen[str] | None = None):
@@ -454,6 +531,98 @@ def _wait_inactive(systemctl: str, unit: str) -> dict[str, str]:
             return last
         time.sleep(0.05)
     raise RuntimeError(f"unit remained active after its slice was stopped: {unit}: {last}")
+
+
+def _wait_cgroup_pids(control_group: str, *, count: int) -> set[int]:
+    path = Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+    deadline = time.monotonic() + _WAIT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            pids = {int(value) for value in path.read_text(encoding="ascii").split()}
+        except (OSError, ValueError):
+            pids = set()
+        if len(pids) >= count:
+            return pids
+        time.sleep(0.05)
+    raise RuntimeError(f"cgroup did not contain {count} process(es): {control_group}")
+
+
+def _attestation_unit_bytes(properties: dict[str, str], *, include_main_pid: bool) -> bytes:
+    names = ("ActiveState", "ControlGroup", "Id", "InvocationID")
+    if include_main_pid:
+        names += ("MainPID",)
+    try:
+        return "".join(f"{name}={properties[name]}\n" for name in names).encode("ascii")
+    except (KeyError, UnicodeEncodeError) as error:
+        raise RuntimeError("live systemd unit properties are incomplete or non-ASCII") from error
+
+
+def _attestation_for_live_units(
+    *,
+    container_id: str,
+    wrapper_unit: str,
+    wrapper: dict[str, str],
+    attempt_slice_unit: str,
+    attempt_slice: dict[str, str],
+    scope_unit: str,
+    scope: dict[str, str],
+    bundle_path: str,
+):
+    """Build a self-consistent test receipt from live unit/process identities.
+
+    Resource-control bytes and runc state below are fixture values: this probe
+    tests the systemctl identity recheck, not a real runc launch or cgroup limit.
+    """
+
+    monitor_pid = int(wrapper["MainPID"])
+    wrapper_cgroup = wrapper["ControlGroup"]
+    worker_pids = _wait_cgroup_pids(wrapper_cgroup, count=2)
+    runc_client_pid = next(pid for pid in worker_pids if pid != monitor_pid)
+    init_pids = _wait_cgroup_pids(scope["ControlGroup"], count=1)
+    init_pid = next(iter(init_pids))
+    pids = (monitor_pid, runc_client_pid, init_pid)
+    snapshots = {pid: read_linux_process_snapshot(pid) for pid in pids}
+    identities = {
+        pid: f"linux:{pid}:{_parse_proc_stat(snapshot.stat_before)[2]}"
+        for pid, snapshot in snapshots.items()
+    }
+    memory_max_bytes = 1_073_741_824
+    cpu_quota = 100_000
+    cpu_period = 100_000
+    pids_max = 256
+    return validate_running_runtime_attestation(
+        runc_state=json.dumps(
+            {"id": container_id, "status": "running", "pid": init_pid, "bundle": bundle_path},
+            separators=(",", ":"),
+        ).encode("ascii"),
+        pid_file=f"{init_pid}\n".encode("ascii"),
+        process_snapshots=snapshots,
+        wrapper_properties=_attestation_unit_bytes(wrapper, include_main_pid=True),
+        attempt_slice_properties=_attestation_unit_bytes(attempt_slice, include_main_pid=False),
+        scope_properties=_attestation_unit_bytes(scope, include_main_pid=False),
+        expected_container_id=container_id,
+        expected_bundle_path=bundle_path,
+        expected_monitor_pid=monitor_pid,
+        expected_monitor_identity=identities[monitor_pid],
+        expected_runc_client_pid=runc_client_pid,
+        expected_runc_client_identity=identities[runc_client_pid],
+        expected_wrapper_unit=wrapper_unit,
+        expected_wrapper_invocation_id=wrapper["InvocationID"],
+        expected_attempt_slice_unit=attempt_slice_unit,
+        expected_attempt_slice_invocation_id=attempt_slice["InvocationID"],
+        expected_scope_unit=scope_unit,
+        expected_scope_invocation_id=scope["InvocationID"],
+        expected_cgroup_path=scope["ControlGroup"],
+        resource_control_files={
+            "memory.max": f"{memory_max_bytes}\n".encode("ascii"),
+            "cpu.max": f"{cpu_quota} {cpu_period}\n".encode("ascii"),
+            "pids.max": f"{pids_max}\n".encode("ascii"),
+        },
+        expected_memory_max_bytes=memory_max_bytes,
+        expected_cpu_quota=cpu_quota,
+        expected_cpu_period=cpu_period,
+        expected_pids_max=pids_max,
+    )
 
 
 def _cgroup_is_empty(control_group: str) -> bool:
@@ -669,6 +838,132 @@ def test_systemd_monitor_reconciles_after_controller_crash_and_slice_stops_units
     assert evidence["monitor_survived_worker_slice_stop"] is True
     assert evidence["cgroups_empty"] is True
     assert set(evidence["post_stop_states"].values()) <= {"inactive", "failed", "not-found"}
+
+
+def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("the opt-in systemd attestation test requires Linux")
+    if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+        raise RuntimeError("the opt-in systemd attestation test requires cgroup v2")
+
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+
+    token = uuid.uuid4().hex
+    container_id = f"acp-live-systemd-{token}"
+    attempt_slice_unit = _oci_worker_systemd_slice(container_id)
+    wrapper_unit = f"acp-live-wrapper-{token}.service"
+    scope_unit = f"acp-live-scope-{token}.scope"
+    bundle_path = f"/tmp/{container_id}/bundle"
+    active: dict[str, dict[str, str]] = {}
+    scope_client: subprocess.Popen[str] | None = None
+    try:
+        _run([systemctl, "--user", "start", attempt_slice_unit])
+        _run(
+            [
+                systemd_run,
+                "--user",
+                f"--unit={wrapper_unit}",
+                "--slice=app.slice",
+                "--property=Type=exec",
+                "--property=KillMode=control-group",
+                "--property=RuntimeMaxSec=90s",
+                "/usr/bin/python3",
+                "-c",
+                "import subprocess; p = subprocess.Popen(['/usr/bin/sleep', '90']); p.wait()",
+            ]
+        )
+        active[wrapper_unit] = _wait_active(systemctl, wrapper_unit)
+        active[attempt_slice_unit] = _wait_active(systemctl, attempt_slice_unit)
+        scope_client = subprocess.Popen(
+            [
+                systemd_run,
+                "--user",
+                "--scope",
+                f"--unit={scope_unit}",
+                f"--slice={attempt_slice_unit}",
+                "/usr/bin/sleep",
+                "90",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_environment(),
+        )
+        active[scope_unit] = _wait_active(systemctl, scope_unit, scope_client)
+        receipt = _attestation_for_live_units(
+            container_id=container_id,
+            wrapper_unit=wrapper_unit,
+            wrapper=active[wrapper_unit],
+            attempt_slice_unit=attempt_slice_unit,
+            attempt_slice=active[attempt_slice_unit],
+            scope_unit=scope_unit,
+            scope=active[scope_unit],
+            bundle_path=bundle_path,
+        )
+        verify_running_runtime_systemd_units(receipt)
+
+        original_invocation = active[wrapper_unit]["InvocationID"]
+        _run([systemctl, "--user", "restart", wrapper_unit])
+        restarted = _wait_active(systemctl, wrapper_unit)
+        active[wrapper_unit] = restarted
+        if restarted.get("InvocationID") == original_invocation:
+            raise AssertionError("systemd restart reused the wrapper InvocationID")
+        with pytest.raises(SupervisorError) as stale:
+            verify_running_runtime_systemd_units(receipt)
+        assert stale.value.code == "sandbox_runtime_attestation_stale"
+    finally:
+        cleanup_errors: list[str] = []
+        for unit in (scope_unit, attempt_slice_unit, wrapper_unit):
+            try:
+                subprocess.run(
+                    [systemctl, "--user", "stop", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_WAIT_SECONDS,
+                    env=_environment(),
+                )
+                inactive = _wait_inactive(systemctl, unit)
+                if inactive.get("ActiveState") in {"active", "activating", "deactivating"}:
+                    cleanup_errors.append(f"{unit} remained active: {inactive}")
+                control_groups = {
+                    inactive.get("ControlGroup", ""),
+                    active.get(unit, {}).get("ControlGroup", ""),
+                }
+                for control_group in control_groups - {""}:
+                    if not _cgroup_is_empty(control_group):
+                        cleanup_errors.append(f"{unit} retained populated cgroup {control_group}")
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify {unit} cleanup: {error}")
+        if scope_client is not None and scope_client.poll() is None:
+            scope_client.terminate()
+            try:
+                scope_client.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                scope_client.kill()
+                scope_client.wait(timeout=2)
+        if cleanup_errors:
+            active_error = sys.exc_info()[1]
+            message = "systemd attestation probe cleanup was not verified: " + "; ".join(
+                cleanup_errors
+            )
+            if active_error is not None:
+                raise RuntimeError(message) from active_error
+            raise RuntimeError(message)
 
 
 if __name__ == "__main__":

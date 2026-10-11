@@ -4898,6 +4898,7 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
     ready_entered = Event()
     release_ready = Event()
     original_record = supervisor._record_worker_command_ready
+    secret_argument = "worker-argument-secret-sentinel"
 
     def block_before_receipt(*arguments, **keywords):
         ready_entered.set()
@@ -4915,6 +4916,7 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
             "subprocess.run(['git','add','alpha.txt'],check=True); "
             "subprocess.run(['git','commit','-m','gated worker'],check=True)"
         ),
+        secret_argument,
     ]
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
@@ -4951,6 +4953,23 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
             json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
         ).hexdigest()
     )
+    with supervisor.connect() as connection:
+        telemetry = connection.execute(
+            "SELECT event_type, payload_json FROM events "
+            "WHERE json_extract(payload_json, '$.attempt_id') = ?",
+            (attempt["id"],),
+        ).fetchall()
+    assert telemetry
+    assert all(secret_argument not in row["payload_json"] for row in telemetry)
+    started = next(row for row in telemetry if row["event_type"] == "worker.started")
+    started_payload = json.loads(started["payload_json"])
+    assert started_payload["command_digest"] == ready["command_digest"]
+    assert started_payload["command_argument_count"] == len(command)
+    assert "command" not in started_payload
+    checkpoint = supervisor.attempt(attempt["id"])["checkpoint"]
+    assert secret_argument not in canonical_json(checkpoint)
+    assert checkpoint["command_digest"] == ready["command_digest"]
+    assert checkpoint["command_argument_count"] == len(command)
 
 
 @requires_linux_worker

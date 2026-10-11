@@ -47,6 +47,14 @@ def _read_worker_output_chunk(
     return written, written < len(chunk), False
 
 
+def _worker_command_digest(command: Sequence[str]) -> str:
+    """Fingerprint argv for receipts; the digest is correlation, not confidentiality."""
+
+    return hashlib.sha256(
+        json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+
+
 class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
 
@@ -65,6 +73,7 @@ class WorkersMixin:
         command = tuple(command)
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
+        command_digest = _worker_command_digest(command)
         if self.config.oci_runc_executable is not None:
             raise SupervisorError(
                 "sandbox_executor_unavailable",
@@ -79,7 +88,11 @@ class WorkersMixin:
         attempt = self.heartbeat(
             attempt_id,
             claim_token,
-            {"phase": "launching", "command": list(command)},
+            {
+                "phase": "launching",
+                "command_digest": command_digest,
+                "command_argument_count": len(command),
+            },
             credential=credential,
         )
         if not sys.platform.startswith("linux"):
@@ -226,7 +239,8 @@ class WorkersMixin:
                             {
                                 "attempt_id": attempt_id,
                                 "pid": process.pid,
-                                "command": list(command),
+                                "command_digest": command_digest,
+                                "command_argument_count": len(command),
                             },
                         )
                 if launch_fenced:
@@ -678,9 +692,7 @@ class WorkersMixin:
     ) -> str:
         """Persist the blocked command identity before releasing its exec gate."""
 
-        command_digest = hashlib.sha256(
-            json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
-        ).hexdigest()
+        command_digest = _worker_command_digest(command)
         if (
             command_pid < 1
             or command_pid == monitor_pid

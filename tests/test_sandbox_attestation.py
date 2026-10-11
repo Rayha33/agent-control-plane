@@ -36,10 +36,20 @@ def _proc_stat(pid: int, state: str, start: int, comm: str = "worker (gate)") ->
     return f"{pid} ({comm}) ".encode("ascii") + b" ".join(fields) + b"\n"
 
 
-def _properties(*, unit: str, invocation: str, cgroup: str, active: str = "active") -> bytes:
-    return f"ActiveState={active}\nControlGroup={cgroup}\nId={unit}\nInvocationID={invocation}\n".encode(
-        "ascii"
+def _properties(
+    *,
+    unit: str,
+    invocation: str,
+    cgroup: str,
+    active: str = "active",
+    main_pid: int | None = None,
+) -> bytes:
+    properties = (
+        f"ActiveState={active}\nControlGroup={cgroup}\nId={unit}\nInvocationID={invocation}\n"
     )
+    if main_pid is not None:
+        properties += f"MainPID={main_pid}\n"
+    return properties.encode("ascii")
 
 
 def _valid_observations() -> dict:
@@ -66,7 +76,10 @@ def _valid_observations() -> dict:
             for pid in pids
         },
         "wrapper_properties": _properties(
-            unit="acp-worker.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP
+            unit="acp-worker.service",
+            invocation="1" * 32,
+            cgroup=_WRAPPER_CGROUP,
+            main_pid=101,
         ),
         "attempt_slice_properties": _properties(
             unit=_ATTEMPT_SLICE_UNIT,
@@ -356,7 +369,13 @@ def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, mo
     assert not running_attestation_has_collector_provenance(receipt)
 
 
-def test_trusted_collector_reads_pinned_runc_and_exact_systemd_units(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "drift_unit",
+    [None, "acp-worker.service", _ATTEMPT_SLICE_UNIT, "acp-container.scope"],
+)
+def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
+    tmp_path, monkeypatch, drift_unit: str | None
+) -> None:
     observations = _valid_observations()
     state_root, pid_file = _private_pid_file(tmp_path)
     proc_observations = {
@@ -365,6 +384,7 @@ def test_trusted_collector_reads_pinned_runc_and_exact_systemd_units(tmp_path, m
         303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
     }
     commands: list[tuple[list[str], dict]] = []
+    unit_read_counts: dict[str, int] = {}
     executable_fd = os.open(os.devnull, os.O_RDONLY)
     monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
     monkeypatch.setattr(
@@ -399,20 +419,35 @@ def test_trusted_collector_reads_pinned_runc_and_exact_systemd_units(tmp_path, m
             assert kwargs["pass_fds"] == (executable_fd,)
             assert kwargs["exec_fd"] == executable_fd
             return 0, observations["runc_state"].decode("utf-8")
-        assert command[:5] == [
+        assert command[:4] == [
             "/usr/bin/systemctl",
             "--user",
             "show",
             "--no-pager",
-            "--property=ActiveState,ControlGroup,Id,InvocationID",
         ]
+        expected_properties = "ActiveState,ControlGroup,Id,InvocationID"
+        if command[-1] == "acp-worker.service":
+            expected_properties += ",MainPID"
+        assert command[4] == f"--property={expected_properties}"
         assert command[5] == "--"
         assert kwargs.get("exec_fd") is None
-        return 0, {
+        result = {
             "acp-worker.service": observations["wrapper_properties"],
             _ATTEMPT_SLICE_UNIT: observations["attempt_slice_properties"],
             "acp-container.scope": observations["scope_properties"],
-        }[command[-1]].decode("ascii")
+        }[command[-1]]
+        unit_read_counts[command[-1]] = unit_read_counts.get(command[-1], 0) + 1
+        if command[-1] == drift_unit and unit_read_counts[command[-1]] == 2:
+            lines = result.decode("ascii").splitlines()
+            replacement = "f" * 32
+            if f"InvocationID={replacement}" in lines:
+                replacement = "e" * 32
+            lines = [
+                f"InvocationID={replacement}" if line.startswith("InvocationID=") else line
+                for line in lines
+            ]
+            result = ("\n".join(lines) + "\n").encode("ascii")
+        return 0, result.decode("ascii")
 
     monkeypatch.setattr(oci_worker, "_run_bounded_command", run_bounded)
 
@@ -443,6 +478,19 @@ def test_trusted_collector_reads_pinned_runc_and_exact_systemd_units(tmp_path, m
         }
     }
     runc_pin = SimpleNamespace(sha256="a" * 64)
+    if drift_unit is not None:
+        provenance_ids_before = set(sandbox_attestation._COLLECTED_ATTESTATIONS)
+        with pytest.raises(SupervisorError, match="systemd unit identity changed"):
+            collect_running_runtime_attestation(
+                runc_executable_pin=runc_pin,
+                state_root=state_root,
+                pid_file_path=pid_file,
+                **expected,
+            )
+        assert unit_read_counts[drift_unit] == 2
+        assert set(sandbox_attestation._COLLECTED_ATTESTATIONS).issubset(provenance_ids_before)
+        return
+
     receipt = collect_running_runtime_attestation(
         runc_executable_pin=runc_pin,
         state_root=state_root,
@@ -453,11 +501,16 @@ def test_trusted_collector_reads_pinned_runc_and_exact_systemd_units(tmp_path, m
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
     assert running_attestation_has_collector_provenance(receipt)
-    assert len(commands) == 4
+    assert len(commands) == 7
     assert {command[-1] for command, _kwargs in commands[1:]} == {
         "acp-worker.service",
         _ATTEMPT_SLICE_UNIT,
         "acp-container.scope",
+    }
+    assert unit_read_counts == {
+        "acp-worker.service": 2,
+        _ATTEMPT_SLICE_UNIT: 2,
+        "acp-container.scope": 2,
     }
 
 
@@ -629,6 +682,19 @@ def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:
             _properties(unit="different.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP),
         ),
         (
+            "wrapper_properties",
+            _properties(
+                unit="acp-worker.service",
+                invocation="1" * 32,
+                cgroup=_WRAPPER_CGROUP,
+                main_pid=202,
+            ),
+        ),
+        (
+            "wrapper_properties",
+            _properties(unit="acp-worker.service", invocation="1" * 32, cgroup=_WRAPPER_CGROUP),
+        ),
+        (
             "scope_properties",
             _properties(unit="acp-container.scope", invocation="2" * 32, cgroup="/other/scope"),
         ),
@@ -717,7 +783,10 @@ def test_attestation_rejects_units_outside_the_exact_attempt_slice() -> None:
 def test_attestation_rejects_monitor_inside_or_owning_worker_slice(monitor_cgroup: str) -> None:
     observations = _valid_observations()
     observations["wrapper_properties"] = _properties(
-        unit="acp-worker.service", invocation="1" * 32, cgroup=monitor_cgroup
+        unit="acp-worker.service",
+        invocation="1" * 32,
+        cgroup=monitor_cgroup,
+        main_pid=101,
     )
     for pid in (101, 202):
         observations["process_snapshots"][pid] = replace(
