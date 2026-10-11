@@ -763,6 +763,13 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             )
             assert qc_receipt["blocking_reason"] == ("runtime_target_command_binding_unavailable")
             assert qc_receipt["targets"][0]["status"] == "unknown"
+            assert not any(
+                "runtime_target_preflight_link" in item for item in json.loads(qc["results_json"])
+            )
+            assert not any(
+                item.get("command") in {qc_command, second_gate_command}
+                for item in json.loads(qc["results_json"])
+            )
             assert not command_entered.exists(), "strict QC command was launched"
             return
         if stale_qc_worktree:
@@ -809,6 +816,16 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         ]
         if strict_binding_phase == "integration":
             assert qc_target_receipts == []
+            qc_gate_results = [
+                item
+                for item in qc_results
+                if item.get("command") in {qc_command, second_gate_command}
+            ]
+            assert [item["command"] for item in qc_gate_results] == [
+                qc_command,
+                second_gate_command,
+            ]
+            assert not any("runtime_target_preflight_link" in item for item in qc_gate_results)
         else:
             qc_receipt = qc_target_receipts[0]
             assert qc_receipt["phase"] == "qc"
@@ -849,10 +866,15 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 for item in json.loads(integration["results_json"])
                 if item.get("kind") == "runtime_target_preflight"
             )
+            integration_results = json.loads(integration["results_json"])
             assert integration_receipt["blocking_reason"] == (
                 "runtime_target_command_binding_unavailable"
             )
             assert integration_receipt["targets"][0]["status"] == "unknown"
+            assert not any("runtime_target_preflight_link" in item for item in integration_results)
+            assert not any(
+                item.get("command") in {gate, second_gate_command} for item in integration_results
+            )
             assert not command_entered.exists(), "strict integration command was launched"
             return
         assert integrated["verdict"] == "pass", integrated["error"]
