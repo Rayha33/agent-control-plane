@@ -205,13 +205,19 @@ def runtime_target_phase(
     source_revision: str,
     runtime_dir: Path,
     receipt_id: str,
+    baseline_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     """Probe configured loopback targets and write a read-only manifest.
 
     Returns ``(durable_receipt, command_environment, blocked)``. Missing fields
     remain unknown. Required targets block unless every declared identity field
     matches; even a full match is only corroboration because the app controls its
-    own report.
+    own report. When baseline resource hashes are supplied, a required target
+    also blocks if its latest persisted trusted-driver evidence differs from the
+    phase preflight. This rereads stored rows; it does not rerun the host probe,
+    so it detects drift only when reflected in persisted evidence. The live
+    endpoint identity probe is separate, and neither sample closes the race
+    between checking and command execution.
     """
 
     if phase not in {"qc", "integration"}:
@@ -227,10 +233,65 @@ def runtime_target_phase(
             "runtime_target_fence_invalid", "target claim fence digest is invalid"
         )
     command_set_sha256 = _command_set_sha256(commands)
+    baseline_resource_snapshot_sha256: dict[str, str] | None = None
+    baseline_evidence_id: str | None = None
+    baseline_evidence_sha256: str | None = None
+    if baseline_receipt is not None:
+        expected_target_names = {
+            definition.name for definition in definitions if phase in definition.phases
+        }
+        baseline_payload = dict(baseline_receipt) if isinstance(baseline_receipt, Mapping) else {}
+        baseline_evidence_sha256 = baseline_payload.pop("evidence_sha256", None)
+        baseline_evidence_id = baseline_payload.get("evidence_id")
+        baseline_targets = (
+            baseline_receipt.get("targets") if isinstance(baseline_receipt, Mapping) else None
+        )
+        baseline_hashes = (
+            {
+                str(target.get("name")): target.get("resource_snapshot_sha256")
+                for target in baseline_targets
+                if isinstance(target, Mapping)
+            }
+            if isinstance(baseline_targets, list)
+            else {}
+        )
+        if (
+            not isinstance(baseline_receipt, Mapping)
+            or baseline_payload.get("contract") != TARGET_CONTRACT
+            or baseline_payload.get("status") != "complete"
+            or baseline_payload.get("phase") != phase
+            or baseline_payload.get("attempt_id") != attempt_id
+            or baseline_payload.get("task_id") != task_id
+            or baseline_payload.get("claim_token") != claim_token
+            or baseline_payload.get("reservation_fence_sha256") != reservation_fence_sha256
+            or baseline_payload.get("source_revision") != source_revision
+            or baseline_payload.get("command_set_sha256") != command_set_sha256
+            or baseline_payload.get("command_count") != len(commands)
+            or not isinstance(baseline_evidence_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}:runtime-target:[a-z]+", baseline_evidence_id)
+            or not isinstance(baseline_evidence_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", baseline_evidence_sha256)
+            or baseline_evidence_sha256 != sha256(canonical_json(baseline_payload).encode("utf-8"))
+            or set(baseline_hashes) != expected_target_names
+            or not isinstance(baseline_targets, list)
+            or len(baseline_targets) != len(expected_target_names)
+            or any(
+                not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in baseline_hashes.values()
+            )
+        ):
+            raise SupervisorError(
+                "runtime_target_baseline_invalid",
+                "phase target preflight receipt is invalid or belongs to another execution",
+            )
+        baseline_resource_snapshot_sha256 = {
+            str(name): str(value) for name, value in baseline_hashes.items()
+        }
     resources = {str(item.get("driver", "")): item for item in driver_resources}
     manifest_targets: list[dict[str, Any]] = []
     receipt_targets: list[dict[str, Any]] = []
     blocked = False
+    resource_replacement_blocked = False
     for definition in definitions:
         if phase not in definition.phases:
             continue
@@ -288,6 +349,11 @@ def runtime_target_phase(
                 _resource_binding_snapshot("queue", definition.queue_driver, resources)
             )
         resource_snapshot_sha256 = sha256(canonical_json(resource_snapshots).encode("utf-8"))
+        resource_snapshot_matches_preflight = (
+            None
+            if baseline_resource_snapshot_sha256 is None
+            else baseline_resource_snapshot_sha256[definition.name] == resource_snapshot_sha256
+        )
 
         endpoint = f"http://127.0.0.1:{port}" if port else None
         observed, probe_status = (
@@ -300,6 +366,8 @@ def runtime_target_phase(
         mismatches = [
             key for key in expected_fields if key in observed and observed[key] != expected[key]
         ]
+        if resource_snapshot_matches_preflight is False:
+            mismatches.append("resource_snapshot_sha256")
         if (
             host_identity["container_ids"]
             and "container_id" in observed
@@ -340,6 +408,9 @@ def runtime_target_phase(
             definition.require_command_binding
         )
         blocked = blocked or target_blocked
+        resource_replacement_blocked = resource_replacement_blocked or (
+            definition.required and resource_snapshot_matches_preflight is False
+        )
         entry = {
             "name": definition.name,
             "required": definition.required,
@@ -352,6 +423,7 @@ def runtime_target_phase(
             "host_identity": host_identity,
             "resource_snapshots": resource_snapshots,
             "resource_snapshot_sha256": resource_snapshot_sha256,
+            "resource_snapshot_matches_preflight": resource_snapshot_matches_preflight,
             "probe_status": probe_status,
             "missing_evidence": sorted(set(missing_expected + missing_observed)),
             "mismatches": mismatches,
@@ -370,6 +442,7 @@ def runtime_target_phase(
                 "host_identity": host_identity,
                 "resource_snapshots": resource_snapshots,
                 "resource_snapshot_sha256": resource_snapshot_sha256,
+                "resource_snapshot_matches_preflight": resource_snapshot_matches_preflight,
                 "identity_path": definition.identity_path,
                 "required": definition.required,
                 "require_command_binding": definition.require_command_binding,
@@ -403,6 +476,8 @@ def runtime_target_phase(
         "command_set_scope": COMMAND_SET_SCOPE,
         "command_set_sha256": command_set_sha256,
         "command_count": len(commands),
+        "baseline_evidence_id": baseline_evidence_id,
+        "baseline_evidence_sha256": baseline_evidence_sha256,
         "targets": manifest_targets,
         "limitations": limitations,
     }
@@ -418,7 +493,11 @@ def runtime_target_phase(
         if target["endpoint"]:
             target_env[env_name] = str(target["endpoint"])
     receipt = {
-        "kind": "runtime_target_preflight",
+        "kind": (
+            "runtime_target_revalidation"
+            if baseline_receipt is not None
+            else "runtime_target_preflight"
+        ),
         "exit_code": 1 if blocked else 0,
         "duration_ms": 0,
         "contract": TARGET_CONTRACT,
@@ -432,6 +511,8 @@ def runtime_target_phase(
         "command_set_scope": COMMAND_SET_SCOPE,
         "command_set_sha256": command_set_sha256,
         "command_count": len(commands),
+        "baseline_evidence_id": baseline_evidence_id,
+        "baseline_evidence_sha256": baseline_evidence_sha256,
         "status": "blocked" if blocked else "complete",
         "blocking_reason": (
             "runtime_target_command_binding_unavailable"
@@ -439,9 +520,14 @@ def runtime_target_phase(
                 definition.require_command_binding and phase in definition.phases
                 for definition in definitions
             )
+            else "runtime_target_resource_replaced"
+            if resource_replacement_blocked
             else "runtime_target_identity_mismatch"
             if blocked
             else None
+        ),
+        "resource_replacement_detected": any(
+            target["resource_snapshot_matches_preflight"] is False for target in receipt_targets
         ),
         "verified": False,
         "manifest_path": str(manifest_path),
@@ -599,8 +685,9 @@ def _resource_binding_snapshot(
     Resource IDs alone can stay stable across a driver-observed container or
     systemd service replacement. Preserve any host-captured identities supplied
     by the driver separately; never copy raw driver output or credential
-    evidence. These snapshots improve provenance, but do not prove command
-    routing or independently re-probe the resource.
+    evidence. Repeated phase checks compare these snapshots to the preflight to
+    detect sampled replacement, but do not prove command routing or close the
+    race between the check and command execution.
     """
 
     resource = resources.get(driver_name)

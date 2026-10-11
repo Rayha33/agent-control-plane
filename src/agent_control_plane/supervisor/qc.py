@@ -599,6 +599,7 @@ class QcMixin:
         critic_verdict = "pass"
         packet: dict[str, Any] | None = None
         target_preflight_link: dict[str, Any] | None = None
+        target_preflight_receipt: dict[str, Any] | None = None
         packet_hash = sha256(b"")
         try:
             self._assert_safe_git_execution_config()
@@ -674,6 +675,7 @@ class QcMixin:
                             runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
                             receipt_id=qc_id,
                         )
+                        target_preflight_receipt = receipt
                         results.append(receipt)
                         target_preflight_link = {
                             "evidence_id": receipt["evidence_id"],
@@ -709,10 +711,57 @@ class QcMixin:
                         runtime_env.update(target_env)
             for index, command in enumerate(self.config.qc_commands, start=1):
                 self._restore_candidate(qc_dir, submission["commit_sha"])
+                target_freshness_link: dict[str, Any] | None = None
+                if target_preflight_receipt is not None:
+                    freshness_receipt, freshness_env, freshness_blocked = runtime_target_phase(
+                        definitions=phase_targets,
+                        commands=self.config.qc_commands,
+                        runtime_environment=runtime_env,
+                        driver_resources=self.driver_resources(submission["attempt_id"]),
+                        attempt_id=str(submission["attempt_id"]),
+                        task_id=str(submission["task_id"]),
+                        claim_token=int(attempt["claim_token"]),
+                        reservation_fence_sha256=fence_sha,
+                        phase="qc",
+                        source_revision=str(submission["commit_sha"]),
+                        runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
+                        receipt_id=f"{qc_id}-cmd-{index:03d}",
+                        baseline_receipt=target_preflight_receipt,
+                    )
+                    results.append(freshness_receipt)
+                    packet["evidence_catalog"].append(
+                        {
+                            "id": freshness_receipt["evidence_id"],
+                            "kind": "runtime_target_revalidation",
+                            "run_id": qc_id,
+                            "commit_sha": submission["commit_sha"],
+                            "sha256": freshness_receipt["evidence_sha256"],
+                            "exit_code": freshness_receipt["exit_code"],
+                            "command_index": index,
+                        }
+                    )
+                    packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+                    packet_hash = sha256(packet_path.read_bytes())
+                    if freshness_blocked:
+                        raise SupervisorError(
+                            str(
+                                freshness_receipt.get("blocking_reason")
+                                or "runtime_target_identity_mismatch"
+                            ),
+                            "QC target identity or resource snapshot changed after preflight",
+                        )
+                    runtime_env.update(freshness_env)
+                    target_freshness_link = {
+                        "evidence_id": freshness_receipt["evidence_id"],
+                        "evidence_sha256": freshness_receipt["evidence_sha256"],
+                        "preflight_evidence_id": target_preflight_receipt["evidence_id"],
+                        "command_index": index,
+                    }
+                command_environment = self._phase_runtime_env(runtime_env, "qc", qc_dir)
                 result = self._run_command(
                     command,
                     qc_dir,
-                    self._phase_runtime_env(runtime_env, "qc", qc_dir),
+                    command_environment,
                     pass_fds=(operation_guard_fd,),
                 )
                 if target_preflight_link is not None:
@@ -720,6 +769,8 @@ class QcMixin:
                         **target_preflight_link,
                         "command_index": index,
                     }
+                if target_freshness_link is not None:
+                    result["runtime_target_freshness_link"] = target_freshness_link
                 evidence_id = f"{qc_id}:command:{index:03d}"
                 result["evidence_id"] = evidence_id
                 result["evidence_sha256"] = sha256(

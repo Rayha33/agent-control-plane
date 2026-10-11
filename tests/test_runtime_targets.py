@@ -17,6 +17,8 @@ import pytest
 from support import init_repo, python_command, write_config
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.supervisor import integration as integration_module
+from agent_control_plane.supervisor import qc as qc_module
 from agent_control_plane.supervisor import runtime_targets
 from agent_control_plane.supervisor.common import canonical_json, sha256
 
@@ -209,6 +211,82 @@ def test_required_command_network_binding_is_unknown_and_blocks_matching_target(
     assert target["command_binding_status"] == "unknown"
     assert "command_network_binding" in target["missing_evidence"]
     assert receipt["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
+
+
+def test_required_target_revalidation_blocks_replaced_host_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight, _environment, preflight_blocked = evaluate_target(
+        tmp_path / "preflight", monkeypatch
+    )
+    assert preflight_blocked is False
+
+    replacement = driver_resources()
+    replacement[0]["evidence"]["proof"]["observation"]["stdout"] = "abcdef123456\n"
+    report = expected_report()
+    report["container_id"] = "abcdef123456"
+    monkeypatch.setattr(
+        runtime_targets, "probe_target_identity", lambda _port, _path: (report, "ok")
+    )
+    revalidation_dir = tmp_path / "revalidation"
+    revalidation_dir.mkdir()
+    receipt, _environment, blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+        driver_resources=replacement,
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=revalidation_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is True
+    assert receipt["kind"] == "runtime_target_revalidation"
+    assert receipt["blocking_reason"] == "runtime_target_resource_replaced"
+    assert receipt["baseline_evidence_id"] == preflight["evidence_id"]
+    assert receipt["baseline_evidence_sha256"] == preflight["evidence_sha256"]
+    assert target["resource_snapshot_matches_preflight"] is False
+    assert target["status"] == "mismatch"
+    assert "resource_snapshot_sha256" in target["mismatches"]
+    assert receipt["verified"] is False
+
+
+def test_target_revalidation_rejects_receipt_from_another_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight, _environment, _blocked = evaluate_target(tmp_path / "preflight", monkeypatch)
+    foreign = dict(preflight)
+    foreign["task_id"] = "other-task"
+    foreign.pop("evidence_sha256")
+    foreign["evidence_sha256"] = sha256(canonical_json(foreign).encode("utf-8"))
+    revalidation_dir = tmp_path / "revalidation"
+    revalidation_dir.mkdir()
+
+    with pytest.raises(SupervisorError) as rejected:
+        runtime_targets.runtime_target_phase(
+            definitions=(target_definition(),),
+            commands=("pytest -q",),
+            runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+            driver_resources=driver_resources(),
+            attempt_id="attempt-17",
+            task_id="task-17",
+            claim_token=9,
+            reservation_fence_sha256="a" * 64,
+            phase="qc",
+            source_revision=SOURCE_REVISION,
+            runtime_dir=revalidation_dir,
+            receipt_id="qc-run-19",
+            baseline_receipt=foreign,
+        )
+
+    assert rejected.value.code == "runtime_target_baseline_invalid"
 
 
 def test_command_set_digest_binds_order_and_exact_shell_text(
@@ -580,14 +658,21 @@ def test_target_names_must_not_alias_environment_variables() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stale_qc_worktree", "pause_phase", "strict_binding_phase"),
+    (
+        "stale_qc_worktree",
+        "pause_phase",
+        "strict_binding_phase",
+        "resource_replacement_phase",
+    ),
     [
-        (False, None, None),
-        (True, None, None),
-        (False, "qc", None),
-        (False, "integration", None),
-        (False, None, "qc"),
-        (False, None, "integration"),
+        (False, None, None, None),
+        (True, None, None, None),
+        (False, "qc", None, None),
+        (False, "integration", None, None),
+        (False, None, "qc", None),
+        (False, None, "integration", None),
+        (False, None, None, "qc"),
+        (False, None, None, "integration"),
     ],
 )
 def test_qc_and_integration_receive_claim_fenced_target_receipts(
@@ -596,6 +681,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
     stale_qc_worktree: bool,
     pause_phase: str | None,
     strict_binding_phase: str | None,
+    resource_replacement_phase: str | None,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -657,8 +743,56 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         ["alpha.txt"],
     )
     attempt = supervisor.claim(created["id"], "worker")
-    server = _TargetIdentityServer(200, "application/json", b"{}", port=port)
     context: dict[str, Any] = {}
+    replacement_state = {"armed": False}
+    original_driver_resources = supervisor.driver_resources
+
+    def replaced_driver_resources(attempt_id: str, *, fresh: bool = False):
+        rows = original_driver_resources(attempt_id, fresh=fresh)
+        if (
+            replacement_state["armed"]
+            and attempt_id == attempt["id"]
+            and not fresh
+            and isinstance(rows, list)
+        ):
+            replacement_state["armed"] = False
+            replaced_rows = []
+            for item in rows:
+                if item.get("driver") == "api":
+                    replacement_id = f"{item['resource_id']}-replaced"
+                    context["driver_resource_id"] = replacement_id
+                    replaced_rows.append({**item, "resource_id": replacement_id})
+                else:
+                    replaced_rows.append(item)
+            return replaced_rows
+        return rows
+
+    monkeypatch.setattr(supervisor, "driver_resources", replaced_driver_resources)
+
+    def arm_replacement_after_preflight(original):
+        def wrapped_runtime_target_phase(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if (
+                resource_replacement_phase is not None
+                and kwargs.get("baseline_receipt") is None
+                and kwargs.get("phase") == resource_replacement_phase
+            ):
+                replacement_state["armed"] = True
+            return result
+
+        return wrapped_runtime_target_phase
+
+    monkeypatch.setattr(
+        qc_module,
+        "runtime_target_phase",
+        arm_replacement_after_preflight(qc_module.runtime_target_phase),
+    )
+    monkeypatch.setattr(
+        integration_module,
+        "runtime_target_phase",
+        arm_replacement_after_preflight(integration_module.runtime_target_phase),
+    )
+    server = _TargetIdentityServer(200, "application/json", b"{}", port=port)
     original_restart = supervisor._runtime_restart_in_operation
 
     def capture_phase(
@@ -803,6 +937,38 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             )
             assert not command_entered.exists(), "stale QC command was launched"
             return
+        if resource_replacement_phase == "qc":
+            assert qc_result["verdict"] == "block"
+            with supervisor.connect() as connection:
+                qc = connection.execute(
+                    "SELECT id, packet_sha256, results_json FROM qc_runs "
+                    "WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
+                    (submission["id"],),
+                ).fetchone()
+            qc_results = json.loads(qc["results_json"])
+            replacement_receipt = next(
+                item for item in qc_results if item.get("kind") == "runtime_target_revalidation"
+            )
+            assert replacement_receipt["status"] == "blocked"
+            assert replacement_receipt["blocking_reason"] == "runtime_target_resource_replaced"
+            assert replacement_receipt["resource_replacement_detected"] is True
+            assert replacement_receipt["targets"][0]["resource_snapshot_matches_preflight"] is False
+            assert replacement_receipt["targets"][0]["mismatches"] == ["resource_snapshot_sha256"]
+            packet_path = (
+                supervisor.state_dir / "logs" / f"review-{submission['id']}-{qc['id']}.json"
+            )
+            packet_bytes = packet_path.read_bytes()
+            packet = json.loads(packet_bytes)
+            assert hashlib.sha256(packet_bytes).hexdigest() == qc["packet_sha256"]
+            assert any(
+                item.get("sha256") == replacement_receipt["evidence_sha256"]
+                for item in packet["evidence_catalog"]
+            )
+            assert not any(
+                item.get("command") in {qc_command, second_gate_command} for item in qc_results
+            )
+            assert not command_entered.exists(), "replaced-target QC command was launched"
+            return
         assert qc_result["verdict"] == "pass", qc_result.get("findings")
         with supervisor.connect() as connection:
             qc = connection.execute(
@@ -833,6 +999,14 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             assert qc_receipt["claim_token"] == attempt["claim_token"]
             assert qc_receipt["targets"][0]["status"] == "corroborated"
             assert qc_receipt["verified"] is False
+            qc_revalidations = [
+                item for item in qc_results if item.get("kind") == "runtime_target_revalidation"
+            ]
+            assert len(qc_revalidations) == 2
+            for _index, receipt in enumerate(qc_revalidations, start=1):
+                assert receipt["baseline_evidence_id"] == qc_receipt["evidence_id"]
+                assert receipt["baseline_evidence_sha256"] == qc_receipt["evidence_sha256"]
+                assert receipt["targets"][0]["resource_snapshot_matches_preflight"] is True
             qc_gate_results = [
                 item for item in qc_results if item.get("runtime_target_preflight_link")
             ]
@@ -849,7 +1023,15 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                     "command_count": 2,
                     "command_index": index,
                 }
+                assert result["runtime_target_freshness_link"] == {
+                    "evidence_id": qc_revalidations[index - 1]["evidence_id"],
+                    "evidence_sha256": qc_revalidations[index - 1]["evidence_sha256"],
+                    "preflight_evidence_id": qc_receipt["evidence_id"],
+                    "command_index": index,
+                }
 
+        if resource_replacement_phase == "integration":
+            command_entered.unlink(missing_ok=True)
         integrated = run_with_restart_race(
             "integration", lambda: supervisor.integrate(attempt["task_id"])
         )
@@ -877,6 +1059,30 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             )
             assert not command_entered.exists(), "strict integration command was launched"
             return
+        if resource_replacement_phase == "integration":
+            assert integrated["verdict"] == "failed", integrated
+            with supervisor.connect() as connection:
+                integration = connection.execute(
+                    "SELECT results_json FROM integrations "
+                    "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (attempt["task_id"],),
+                ).fetchone()
+            integration_results = json.loads(integration["results_json"])
+            replacement_receipt = next(
+                item
+                for item in integration_results
+                if item.get("kind") == "runtime_target_revalidation"
+            )
+            assert replacement_receipt["status"] == "blocked"
+            assert replacement_receipt["blocking_reason"] == "runtime_target_resource_replaced"
+            assert replacement_receipt["resource_replacement_detected"] is True
+            assert replacement_receipt["targets"][0]["resource_snapshot_matches_preflight"] is False
+            assert replacement_receipt["targets"][0]["mismatches"] == ["resource_snapshot_sha256"]
+            assert not any(
+                item.get("command") in {gate, second_gate_command} for item in integration_results
+            )
+            assert not command_entered.exists(), "replaced-target integration command was launched"
+            return
         assert integrated["verdict"] == "pass", integrated["error"]
         with supervisor.connect() as connection:
             integration = connection.execute(
@@ -893,6 +1099,16 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         assert integration_receipt["claim_token"] == attempt["claim_token"]
         assert integration_receipt["targets"][0]["status"] == "corroborated"
         assert integration_receipt["verified"] is False
+        integration_revalidations = [
+            item
+            for item in integration_results
+            if item.get("kind") == "runtime_target_revalidation"
+        ]
+        assert len(integration_revalidations) == 2
+        for receipt in integration_revalidations:
+            assert receipt["baseline_evidence_id"] == integration_receipt["evidence_id"]
+            assert receipt["baseline_evidence_sha256"] == integration_receipt["evidence_sha256"]
+            assert receipt["targets"][0]["resource_snapshot_matches_preflight"] is True
         integration_gate_results = [
             item for item in integration_results if item.get("runtime_target_preflight_link")
         ]
@@ -907,6 +1123,12 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 "evidence_sha256": integration_receipt["evidence_sha256"],
                 "command_set_sha256": integration_receipt["command_set_sha256"],
                 "command_count": 2,
+                "command_index": index,
+            }
+            assert result["runtime_target_freshness_link"] == {
+                "evidence_id": integration_revalidations[index - 1]["evidence_id"],
+                "evidence_sha256": integration_revalidations[index - 1]["evidence_sha256"],
+                "preflight_evidence_id": integration_receipt["evidence_id"],
                 "command_index": index,
             }
     finally:

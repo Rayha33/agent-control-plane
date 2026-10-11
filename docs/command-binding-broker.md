@@ -97,6 +97,20 @@ environment, workspace immutability, or the process's live network namespace.
 `require_command_binding=true` therefore remains `unknown` and blocks command
 execution until a trusted executor supplies those proofs.
 
+**Sampled freshness guard (2026-10-11):** when a non-strict phase has a successful
+runtime-target preflight, ACP repeats the live app identity probe and rereads the
+latest persisted trusted runtime-driver resource evidence before each configured
+QC/integration command. The resource reread does not rerun the host probe: a
+replacement is detected only if the changed state is reflected in those stored
+rows. Each `runtime_target_revalidation` receipt references
+the exact preflight receipt and command-plan digest. A changed required-target
+resource snapshot or failed/mismatched identity check blocks that command before
+launch. This detects sampled replacement after preflight; it is not atomic with
+command launch, does not constrain which endpoint the command can reach, and
+does not make a target verified. A command can race the sample or ignore the
+provided manifest. `require_command_binding=true` remains fail-closed until the
+broker-owned executor enforces and attests command networking.
+
 ## Claims that must not be conflated
 
 1. **Allocation:** ACP assigned a port, database/schema, queue, or unit name.

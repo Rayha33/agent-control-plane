@@ -169,6 +169,7 @@ class IntegrationMixin:
         commit: str | None = None
         error_message = ""
         target_preflight_link: dict[str, Any] | None = None
+        target_preflight_receipt: dict[str, Any] | None = None
         try:
             if (
                 self._git_text("cat-file", "-t", submission["commit_sha"]) != "commit"
@@ -261,6 +262,7 @@ class IntegrationMixin:
                         runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
                         receipt_id=integration_id,
                     )
+                    target_preflight_receipt = receipt
                     results.append(receipt)
                     target_preflight_link = {
                         "evidence_id": receipt["evidence_id"],
@@ -286,12 +288,48 @@ class IntegrationMixin:
                         operation_guard_fd,
                         git_boundary,
                     )
+                    target_freshness_link: dict[str, Any] | None = None
+                    if target_preflight_receipt is not None:
+                        freshness_receipt, freshness_env, freshness_blocked = runtime_target_phase(
+                            definitions=phase_targets,
+                            commands=self.config.integration_commands,
+                            runtime_environment=runtime_env,
+                            driver_resources=self.driver_resources(submission["attempt_id"]),
+                            attempt_id=str(submission["attempt_id"]),
+                            task_id=str(task_id),
+                            claim_token=int(attempt["claim_token"]),
+                            reservation_fence_sha256=sha256(
+                                str(submission["resource_tokens_json"]).encode("utf-8")
+                            ),
+                            phase="integration",
+                            source_revision=integration_commit,
+                            runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
+                            receipt_id=f"{integration_id}-cmd-{command_index:03d}",
+                            baseline_receipt=target_preflight_receipt,
+                        )
+                        results.append(freshness_receipt)
+                        if freshness_blocked:
+                            raise SupervisorError(
+                                str(
+                                    freshness_receipt.get("blocking_reason")
+                                    or "runtime_target_identity_mismatch"
+                                ),
+                                "integration target identity or resource snapshot changed after preflight",
+                            )
+                        target_freshness_link = {
+                            "evidence_id": freshness_receipt["evidence_id"],
+                            "evidence_sha256": freshness_receipt["evidence_sha256"],
+                            "preflight_evidence_id": target_preflight_receipt["evidence_id"],
+                            "command_index": command_index,
+                        }
                     command_environment = self._phase_runtime_env(
                         runtime_env, "integration", worktree
                     )
                     if phase_context:
                         command_environment.update(phase_context)
                         command_environment.update(target_env)
+                        if target_preflight_receipt is not None:
+                            command_environment.update(freshness_env)
                     result = self._run_command(
                         command,
                         worktree,
@@ -303,6 +341,8 @@ class IntegrationMixin:
                             **target_preflight_link,
                             "command_index": command_index,
                         }
+                    if target_freshness_link is not None:
+                        result["runtime_target_freshness_link"] = target_freshness_link
                     results.append(result)
                     if result["exit_code"]:
                         raise SupervisorError(
