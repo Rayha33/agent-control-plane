@@ -211,6 +211,7 @@ def runtime_target_phase(
     receipt_id: str,
     live_runtime_sample: Mapping[str, Any] | None = None,
     baseline_receipt: Mapping[str, Any] | None = None,
+    probe_identity_endpoint: bool = True,
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     """Probe configured loopback targets and write a read-only manifest.
 
@@ -415,9 +416,14 @@ def runtime_target_phase(
         )
 
         endpoint = f"http://127.0.0.1:{port}" if port else None
-        observed, probe_status = (
-            probe_target_identity(port, definition.identity_path) if port else ({}, "invalid_port")
-        )
+        if not probe_identity_endpoint:
+            observed, probe_status = {}, "skipped_command_binding_unavailable"
+        else:
+            observed, probe_status = (
+                probe_target_identity(port, definition.identity_path)
+                if port
+                else ({}, "invalid_port")
+            )
         observed = _safe_identity(observed)
         expected_fields = [key for key, value in expected.items() if value is not None]
         missing_expected = [key for key in expected if expected[key] is None]
@@ -538,6 +544,10 @@ def runtime_target_phase(
     ):
         limitations.append(
             "required command network binding is unavailable; the phase is blocked as unknown"
+        )
+    if not probe_identity_endpoint:
+        limitations.append(
+            "app identity endpoint was not probed because command network binding is unavailable"
         )
     manifest = {
         "contract": "acp-runtime-target-manifest-v1",

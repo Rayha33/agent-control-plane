@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import sqlite3
 import stat
 import subprocess
 import threading
@@ -678,6 +679,230 @@ def test_target_identity_probe_is_loopback_bounded_and_does_not_follow_redirects
     assert status == expected_status
 
 
+def test_stale_before_publication_preserves_same_commit_unowned_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo(repo)
+    gate_started = tmp_path / "integration-gate-started"
+    gate = python_command(
+        f"import pathlib,time; pathlib.Path({str(gate_started)!r}).write_text('started'); "
+        "time.sleep(0.8)"
+    )
+    write_config(repo, integration_commands=[gate])
+    supervisor = GitSupervisor(repo)
+    created = supervisor.create_task(
+        "already integrated candidate",
+        "Reproduce stale reservation cleanup before publication.",
+        ["The unowned integration ref remains untouched"],
+        ["alpha.txt"],
+    )
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "alpha.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "alpha.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-m", "candidate"],
+        check=True,
+        capture_output=True,
+    )
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--detach", "HEAD"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", "-f", "main", submission["commit_sha"]],
+        check=True,
+        capture_output=True,
+    )
+    current_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    unowned_ref: dict[str, str] = {}
+    original_event = supervisor._event
+
+    def plant_unowned_ref(connection, event_type, actor, payload):
+        if event_type == "integration.started":
+            reference = (
+                f"refs/heads/acp/integrate-{created['id'][:8]}-{payload['integration_id'][:8]}"
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "update-ref", reference, current_base],
+                check=True,
+                capture_output=True,
+            )
+            unowned_ref["reference"] = reference
+        return original_event(connection, event_type, actor, payload)
+
+    monkeypatch.setattr(supervisor, "_event", plant_unowned_ref)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(supervisor.integrate, created["id"])
+        deadline = time.monotonic() + 5
+        while not gate_started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert gate_started.exists(), "integration gate did not start"
+        with supervisor.connect() as connection:
+            connection.execute(
+                "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
+                (created["id"],),
+            )
+        supervisor.reap_expired()
+        result = future.result(timeout=15)
+
+    assert result["verdict"] == "stale"
+    assert result["commit_sha"] == current_base
+    assert unowned_ref.get("reference")
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", unowned_ref["reference"]],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == current_base
+    )
+
+
+def test_restart_recovery_preserves_same_commit_ref_without_ownership_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo(repo)
+    supervisor = GitSupervisor(repo)
+    created = supervisor.create_task(
+        "recover an ambiguous publication",
+        "Do not delete a same-commit ref unless this integration created it.",
+        ["An unowned same-commit ref survives recovery"],
+        ["alpha.txt"],
+    )
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "alpha.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "alpha.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-m", "candidate"],
+        check=True,
+        capture_output=True,
+    )
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    planted_ref: dict[str, str] = {}
+
+    def plant_unowned_ref_and_crash(branch: str, commit_sha: str, _operation_guard_fd: int) -> bool:
+        reference = f"refs/heads/{branch}"
+        subprocess.run(
+            ["git", "-C", str(repo), "update-ref", reference, commit_sha],
+            check=True,
+            capture_output=True,
+        )
+        planted_ref.update(reference=reference, commit=commit_sha)
+        raise KeyboardInterrupt("simulated crash after an external ref appeared")
+
+    monkeypatch.setattr(supervisor, "_publish_integration_ref", plant_unowned_ref_and_crash)
+    with pytest.raises(KeyboardInterrupt, match="external ref appeared"):
+        supervisor.integrate(created["id"])
+
+    with supervisor.connect() as connection:
+        pending = connection.execute(
+            "SELECT id, branch, commit_sha, verdict FROM integrations WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+        assert not connection.execute(
+            "SELECT 1 FROM events WHERE event_type = 'integration.ref_published'"
+        ).fetchone()
+        forged_payload = canonical_json(
+            {
+                "integration_id": pending["id"],
+                "branch": pending["branch"],
+                "commit_sha": pending["commit_sha"],
+            }
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="integration_ref_publication_capability_required",
+        ):
+            connection.execute(
+                """
+                INSERT INTO events
+                  (id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+                VALUES (?, 'integration.ref_published', 'untrusted-test', ?, ?, ?, ?)
+                """,
+                (
+                    f"forged-{pending['id']}",
+                    forged_payload,
+                    "0" * 64,
+                    "0" * 64,
+                    datetime.now(UTC).isoformat(timespec="microseconds"),
+                ),
+            )
+        assert supervisor._verify_event_chain(connection)["ok"]
+        assert not supervisor._integration_ref_publication_recorded(
+            connection,
+            pending["id"],
+            pending["branch"],
+            pending["commit_sha"],
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
+            (created["id"],),
+        )
+    with sqlite3.connect(supervisor.db_path) as untrusted_connection:
+        untrusted_connection.create_function(
+            "acp_integration_ref_publication_authorized", 1, lambda _payload: None
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="integration_ref_publication_capability_required",
+        ):
+            untrusted_connection.execute(
+                """
+                INSERT INTO events
+                  (id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+                VALUES (?, 'integration.ref_published', 'untrusted-test', ?, ?, ?, ?)
+                """,
+                (
+                    f"null-forged-{pending['id']}",
+                    forged_payload,
+                    "0" * 64,
+                    "0" * 64,
+                    datetime.now(UTC).isoformat(timespec="microseconds"),
+                ),
+            )
+    assert pending["verdict"] == "publish_pending"
+    assert pending["branch"] == planted_ref["reference"].removeprefix("refs/heads/")
+    supervisor.reap_expired()
+
+    recovered = GitSupervisor(repo)
+
+    with recovered.connect() as connection:
+        terminal = connection.execute(
+            "SELECT branch, commit_sha, verdict, error FROM integrations WHERE id = ?",
+            (pending["id"],),
+        ).fetchone()
+    assert terminal["verdict"] == "failed"
+    assert terminal["branch"] is None
+    assert "ownership unproven, preserving ref" in terminal["error"]
+    assert terminal["commit_sha"] == planted_ref["commit"]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", planted_ref["reference"]],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == planted_ref["commit"]
+    )
+
+
 def test_host_captured_container_identity_is_exposed_but_not_overstated() -> None:
     resource = {
         "driver": "api",
@@ -1011,8 +1236,17 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         "runtime_target_phase",
         arm_replacement_after_preflight(integration_module.runtime_target_phase),
     )
+    identity_probes: list[tuple[int, str]] = []
+    original_identity_probe = runtime_targets.probe_target_identity
+
+    def capture_identity_probe(port: int, identity_path: str):
+        identity_probes.append((port, identity_path))
+        return original_identity_probe(port, identity_path)
+
+    monkeypatch.setattr(runtime_targets, "probe_target_identity", capture_identity_probe)
     server = _TargetIdentityServer(200, "application/json", b"{}", port=port)
     original_restart = supervisor._runtime_restart_in_operation
+    restart_phases: list[str] = []
 
     def capture_phase(
         attempt_id: str,
@@ -1021,6 +1255,8 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         *,
         phase_context=None,
     ):
+        if phase_context:
+            restart_phases.append(phase_context.get("ACP_PHASE", ""))
         restarted = original_restart(
             attempt_id,
             operation_guard_fd,
@@ -1249,6 +1485,34 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                     "command_index": index,
                 }
 
+        unowned_integration_ref: dict[str, str] = {}
+        if strict_binding_phase == "integration":
+            original_event = supervisor._event
+
+            def expose_integration_ref_name(
+                connection, event_type: str, actor: str, payload: dict[str, Any]
+            ) -> None:
+                original_event(connection, event_type, actor, payload)
+                if event_type == "integration.started":
+                    reference = (
+                        f"refs/heads/acp/integrate-{attempt['task_id'][:8]}-"
+                        f"{payload['integration_id'][:8]}"
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            reference,
+                            submission["commit_sha"],
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    unowned_integration_ref["reference"] = reference
+
+            monkeypatch.setattr(supervisor, "_event", expose_integration_ref_name)
         if resource_replacement_phase == "integration":
             command_entered.unlink(missing_ok=True)
         integrated = run_with_restart_race(
@@ -1272,9 +1536,40 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 "runtime_target_command_binding_unavailable"
             )
             assert integration_receipt["targets"][0]["status"] == "unknown"
+            assert integration_receipt["phase"] == "integration"
+            assert integration_receipt["source_revision"] == submission["commit_sha"]
+            assert integration_receipt["claim_token"] == attempt["claim_token"]
+            assert integration_receipt["targets"][0]["probe_status"] == (
+                "skipped_command_binding_unavailable"
+            )
+            assert "app identity endpoint was not probed" in " ".join(
+                integration_receipt["limitations"]
+            )
             assert not any("runtime_target_preflight_link" in item for item in integration_results)
             assert not any(
                 item.get("command") in {gate, second_gate_command} for item in integration_results
+            )
+            assert len(integration_results) == 1, "integration merge ran before strict block"
+            assert integrated["commit_sha"] is None
+            assert integrated["branch"] is None
+            assert "integration" not in restart_phases
+            assert identity_probes == [], "strict integration block probed the app endpoint"
+            assert unowned_integration_ref.get("reference")
+            assert (
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "rev-parse",
+                        "--verify",
+                        unowned_integration_ref["reference"],
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                == submission["commit_sha"]
             )
             assert not command_entered.exists(), "strict integration command was launched"
             return
