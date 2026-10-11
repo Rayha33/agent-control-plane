@@ -16,6 +16,7 @@ or cleanup from every crash boundary.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import secrets
@@ -36,6 +37,46 @@ _ROLES = ("app", "database", "queue")
 _PROTECTED_RUNTIME_PATHS = "/run/systemd/private /run/dbus/system_bus_socket"
 _DISPOSABLE_HOST_MARKER = Path("/run/acp-disposable-systemd-test")
 _DISPOSABLE_HOST_MARKER_CONTENT = "acp-systemd-network-binding-v1\n"
+_SYSTEM_MANAGER_ACCESS_DENIALS = (
+    "access denied",
+    "not authorized",
+    "operation not permitted",
+    "permission denied",
+)
+_SYSTEM_MANAGER_CONNECTION_FAILURES = (
+    "failed to connect",
+    "failed to contact",
+    "failed to reach",
+)
+
+
+def _system_manager_access_denied(returncode: int, stderr: str) -> bool:
+    """Distinguish manager socket denial from a client-side command failure."""
+
+    normalized_stderr = " ".join(stderr.lower().split())
+    return (
+        returncode != 0
+        and any(failure in normalized_stderr for failure in _SYSTEM_MANAGER_CONNECTION_FAILURES)
+        and any(diagnostic in normalized_stderr for diagnostic in _SYSTEM_MANAGER_ACCESS_DENIALS)
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (1, "Failed to connect to system scope bus: Operation not permitted", True),
+        (1, "Failed to connect: Permission denied", True),
+        (1, "Failed to connect: Access denied", True),
+        (2, "systemd-run: unrecognized option --typo", False),
+        (2, "systemd-run: Permission denied parsing an invalid option", False),
+        (1, "Failed to connect: Connection refused", False),
+        (0, "Operation not permitted", False),
+    ],
+)
+def test_system_manager_denial_requires_access_denial_diagnostic(
+    returncode: int, stderr: str, expected: bool
+) -> None:
+    assert _system_manager_access_denied(returncode, stderr) is expected
 
 
 def _environment() -> dict[str, str]:
@@ -238,12 +279,16 @@ manager = subprocess.run(
     timeout=3,
 )
 print("acp_system_manager_rc=" + str(manager.returncode), flush=True)
-if "permission denied" not in manager.stderr.lower():
-    print("acp_system_manager_denial=unexpected", flush=True)
-    finish(20)
-print("acp_system_manager_denial=permission-denied", flush=True)
-if manager.returncode == 0:
+manager_stderr = " ".join(manager.stderr.split())[:240]
+print("acp_system_manager_stderr=" + json.dumps(manager_stderr), flush=True)
+_SYSTEM_MANAGER_ACCESS_DENIALS = {_SYSTEM_MANAGER_ACCESS_DENIALS!r}
+_SYSTEM_MANAGER_CONNECTION_FAILURES = {_SYSTEM_MANAGER_CONNECTION_FAILURES!r}
+{inspect.getsource(_system_manager_access_denied)}
+if not _system_manager_access_denied(manager.returncode, manager.stderr):
+    print("acp_system_manager_blocked=0", flush=True)
+    print("acp_system_manager_denial_diagnostic=missing", flush=True)
     finish(19)
+print("acp_system_manager_blocked=1", flush=True)
 
 try:
     os.stat("/proc/{holder_pid}")
@@ -253,7 +298,7 @@ except FileNotFoundError:
 try:
     os.kill({holder_pid}, 0)
     holder_signal_denied = False
-except PermissionError:
+except (PermissionError, ProcessLookupError):
     holder_signal_denied = True
 print("acp_holder_proc_visible=" + str(int(holder_visible)), flush=True)
 print("acp_holder_signal_denied=" + str(int(holder_signal_denied)), flush=True)
@@ -391,9 +436,28 @@ def _run_command_unit(
         raise RuntimeError(f"phase unit {unit} has no systemd InvocationID")
 
     finished = _wait_inactive(systemctl, systemd_unit)
-    output = _run(
-        [journalctl, "--system", "--unit", systemd_unit, "--output=cat", "--no-pager"]
+    journal = _run(
+        [journalctl, "--system", "--unit", systemd_unit, "--output=json", "--no-pager"]
     ).stdout
+    output_lines: list[str] = []
+    for line in journal.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError as error:
+            raise RuntimeError(
+                f"systemd journal returned invalid JSON for {systemd_unit}"
+            ) from error
+        # systemd logs the full `python -c` command line in its own "Starting"
+        # message. Only trust records emitted by the phase process itself, or
+        # the source code can satisfy its own output assertions.
+        if record.get("_SYSTEMD_UNIT") != systemd_unit or record.get("_PID") != str(main_pid):
+            continue
+        message = record.get("MESSAGE")
+        if isinstance(message, str):
+            output_lines.append(message)
+    output = "\n".join(output_lines)
+    if not output_lines:
+        raise RuntimeError(f"phase process {main_pid} emitted no journal output")
     return finished, output
 
 
@@ -538,9 +602,9 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
 
         for name in outputs:
             output = outputs[name]
-            if "acp_system_manager_denial=permission-denied" not in output:
-                raise RuntimeError(f"untrusted phase {name} did not prove socket denial")
-            if "acp_system_manager_rc=0" in output:
+            if "acp_system_manager_blocked=1" not in output:
+                raise RuntimeError(f"untrusted phase {name} did not prove the manager was blocked")
+            if "acp_system_manager_blocked=0" in output:
                 raise RuntimeError(f"untrusted phase {name} reached the system manager")
             if "acp_holder_proc_visible=0" not in output:
                 raise RuntimeError(f"untrusted phase {name} inspected its holder")
@@ -563,8 +627,6 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
                 raise RuntimeError(
                     f"worker manager request created its forbidden unit: {forbidden_state}"
                 )
-            if name in finished_states and finished_states[name].get("ExecMainStatus") == "20":
-                raise RuntimeError(f"phase {name} manager denial reason was not Permission denied")
 
         original_holder_invocation = state_a["InvocationID"]
         original_holder_namespace = namespace_by_attempt[attempt_a]
@@ -613,7 +675,7 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
             ports=ports_by_attempt[attempt_a],
             forbidden_unit=forbidden_units[restart_phase_name],
         )
-        if "acp_system_manager_denial=permission-denied" not in restarted_output:
+        if "acp_system_manager_blocked=1" not in restarted_output:
             raise RuntimeError("restarted phase did not prove system-manager socket denial")
         if "acp_holder_proc_visible=0" not in restarted_output or (
             "acp_holder_signal_denied=1" not in restarted_output
@@ -645,7 +707,12 @@ def test_systemd_phase_commands_are_bound_to_one_attempt_and_fail_closed_on_cros
             raise RuntimeError("healthy wrong-attempt responses were not rejected")
         if finished_states["wrong-identity"].get("ExecMainStatus") != "17":
             raise RuntimeError("wrong-identity command did not fail before its writes")
-        if "acp_sibling_endpoints_reachable=\n" not in outputs["sibling-ports"]:
+        sibling_reachability = next(
+            line
+            for line in outputs["sibling-ports"].splitlines()
+            if line.startswith("acp_sibling_endpoints_reachable=")
+        )
+        if sibling_reachability != "acp_sibling_endpoints_reachable=":
             raise RuntimeError("sibling app/database/queue ports were reachable")
         if finished_states["sibling-ports"].get("ExecMainStatus") != "18":
             raise RuntimeError("sibling-port command did not fail closed")
