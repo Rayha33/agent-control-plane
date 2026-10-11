@@ -480,12 +480,13 @@ monitor places a `/usr/bin/sleep` scope in the exact per-attempt worker slice,
 while its own service remains in the separate `user-acp.slice`. A separate
 controller writes and validates the durable service receipt, performs an
 authenticated status call, then is killed with `SIGKILL`. The fresh controller
-reconciles the exact unit InvocationID, ControlGroup, MainPID/start identity,
-and slice placement, reads the durable capability, obtains authenticated
-status, and cancels the exact scope. Repeating the same cancellation request ID
-returns the original response; the worker PID and scope cgroup are absent while
-the monitor remains active. Status reports `unknown` for activation drift even
-when a same-name scope is inactive. Teardown snapshots each unit cgroup before
+uses `reconnect_sandbox_monitor()` to reconcile the exact unit InvocationID,
+ControlGroup, MainPID/start identity, and sibling-slice placement before it
+reads the existing capability and obtains authenticated status; it then cancels
+the exact scope. Repeating the same cancellation request ID returns the
+original response; the worker PID and scope cgroup are absent while the monitor
+remains active. Status reports `unknown` for activation drift even when a
+same-name scope is inactive. Teardown snapshots each unit cgroup before
 placement assertions, verifies the original cgroups are empty, and retains the
 private fixture if a launched unit lacks a captured cgroup.
 
@@ -522,9 +523,9 @@ creator: a missing/corrupt key fails closed and leaves the execution fenced.
 The helper only reconnects for authenticated status/cancel; it cannot start a
 worker or reconstruct `RuncLaunchHandle`. Focused tests cover wrong-fence and
 same-name activation drift, exact unit queries, successful reconnect, and
-missing-key refusal. This remains an adoption primitive, not an integrated
-monitor service or OCI worker path; the live test above still uses a placeholder
-monitor, and `run_worker()` remains fail-closed.
+missing-key refusal. The live test above now exercises this production recovery
+helper against a placeholder monitor; this remains an adoption primitive, not
+an integrated OCI worker path, and `run_worker()` remains fail-closed.
 
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the

@@ -36,6 +36,9 @@ from agent_control_plane.supervisor.sandbox_monitor_ipc import (
     SandboxMonitorControlClient,
     SandboxMonitorControlServer,
 )
+from agent_control_plane.supervisor.sandbox_monitor_lifecycle import (
+    reconnect_sandbox_monitor,
+)
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
     load_or_create_sandbox_monitor_control_key,
@@ -1298,17 +1301,11 @@ def test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_sc
             )
         ):
             raise AssertionError("monitor service and worker scope are not isolated siblings")
-        key = load_or_create_sandbox_monitor_control_key(
-            control_directory,
-            attempt_id=attempt_id,
-            claim_token=claim_token,
-            execution_id=execution_id,
-        )
-        client = SandboxMonitorControlClient(
-            receipt=receipt,
+        client = reconnect_sandbox_monitor(
+            receipt_path=receipt_path,
+            control_directory=control_directory,
             socket_path=socket_path,
-            key=key,
-            expected_uid=os.geteuid(),
+            expected_identity=(attempt_id, claim_token, execution_id),
         )
         status = client.status()
         if status.outcome != "ok" or status.payload.get("phase") != "running":
