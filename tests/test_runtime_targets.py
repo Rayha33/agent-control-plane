@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,6 @@ from agent_control_plane.supervisor import runtime_targets
 from agent_control_plane.supervisor.common import canonical_json, sha256
 
 SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
-LIVE_SAMPLED_AT = "2026-10-11T14:00:00+00:00"
 
 
 def target_definition(**overrides: Any) -> runtime_targets.RuntimeTargetDefinition:
@@ -95,10 +95,12 @@ def namespace_driver_resources(invocation_id: str) -> list[dict[str, Any]]:
     return resources
 
 
-def live_namespace_sample(invocation_id: str | None) -> dict[str, Any]:
+def live_namespace_sample(
+    invocation_id: str | None, *, sampled_at: str | None = None
+) -> dict[str, Any]:
     available = invocation_id is not None
     return {
-        "sampled_at": LIVE_SAMPLED_AT,
+        "sampled_at": sampled_at or datetime.now(UTC).isoformat(timespec="seconds"),
         "source": "systemd user unit / cgroup",
         "available": available,
         "drivers": [
@@ -303,6 +305,7 @@ def test_namespace_runtime_revalidation_binds_live_invocation_id_and_blocks_repl
 ) -> None:
     original_id = "0123456789abcdef0123456789abcdef"
     replacement_id = "fedcba9876543210fedcba9876543210"
+    preflight_sample = live_namespace_sample(original_id)
     report = expected_report()
     report.pop("container_id")
     report["process_identity"] = original_id
@@ -311,23 +314,24 @@ def test_namespace_runtime_revalidation_binds_live_invocation_id_and_blocks_repl
         monkeypatch,
         report,
         resources=namespace_driver_resources(original_id),
-        live_runtime_sample=live_namespace_sample(original_id),
+        live_runtime_sample=preflight_sample,
     )
 
     assert blocked is False
     assert preflight["verified"] is False
-    assert preflight["live_runtime_sampled_at"] == LIVE_SAMPLED_AT
+    assert preflight["live_runtime_sampled_at"] == preflight_sample["sampled_at"]
     assert preflight["targets"][0]["expected"]["process_identity"] == original_id
     assert (
         preflight["targets"][0]["resource_snapshots"][0]["live_systemd_invocation_id"]
         == original_id
     )
     manifest = json.loads(Path(environment["ACP_RUNTIME_TARGETS_FILE"]).read_text())
-    assert manifest["live_runtime_sampled_at"] == LIVE_SAMPLED_AT
+    assert manifest["live_runtime_sampled_at"] == preflight_sample["sampled_at"]
 
     replacement_report = expected_report()
     replacement_report.pop("container_id")
     replacement_report["process_identity"] = replacement_id
+    replacement_sample = live_namespace_sample(replacement_id)
     monkeypatch.setattr(
         runtime_targets,
         "probe_target_identity",
@@ -340,7 +344,7 @@ def test_namespace_runtime_revalidation_binds_live_invocation_id_and_blocks_repl
         commands=("pytest -q",),
         runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(replacement_dir)},
         driver_resources=namespace_driver_resources(replacement_id),
-        live_runtime_sample=live_namespace_sample(replacement_id),
+        live_runtime_sample=replacement_sample,
         attempt_id="attempt-17",
         task_id="task-17",
         claim_token=9,
@@ -386,6 +390,61 @@ def test_namespace_runtime_target_fails_closed_without_live_invocation_id(
     assert "api.live_systemd_invocation_id" in receipt["targets"][0]["missing_evidence"]
     assert receipt["targets"][0]["expected"].get("process_identity") is None
     assert receipt["verified"] is False
+
+
+def test_namespace_runtime_target_fails_closed_on_stale_live_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = invocation_id
+    stale_sampled_at = (datetime.now(UTC) - timedelta(minutes=2)).isoformat(timespec="seconds")
+
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path,
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(invocation_id),
+        live_runtime_sample=live_namespace_sample(invocation_id, sampled_at=stale_sampled_at),
+    )
+
+    assert blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_live_identity_unavailable"
+    assert receipt["live_runtime_sampled_at"] == stale_sampled_at
+    assert receipt["targets"][0]["live_runtime_identity_unavailable"] is True
+
+
+@pytest.mark.parametrize(
+    ("offset_seconds", "identity_expected"),
+    [(-20, True), (-40, False), (1, True), (10, False)],
+)
+def test_live_namespace_sample_age_and_clock_skew_limits(
+    offset_seconds: int, identity_expected: bool
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    sampled_at = (datetime.now(UTC) + timedelta(seconds=offset_seconds)).isoformat(
+        timespec="microseconds"
+    )
+    sample = live_namespace_sample(invocation_id, sampled_at=sampled_at)
+
+    identities, returned_sampled_at = runtime_targets._live_systemd_invocation_ids(sample)
+
+    assert bool(identities) is identity_expected
+    assert returned_sampled_at == sampled_at
+    assert identities == ({"api": invocation_id} if identity_expected else {})
+
+
+def test_live_namespace_sample_rejects_impossible_utc_timestamp() -> None:
+    sample = live_namespace_sample(
+        "0123456789abcdef0123456789abcdef",
+        sampled_at="2026-99-99T00:00:00+00:00",
+    )
+
+    identities, returned_sampled_at = runtime_targets._live_systemd_invocation_ids(sample)
+
+    assert identities == {}
+    assert returned_sampled_at is None
 
 
 def test_optional_namespace_target_keeps_identity_failure_diagnostic_without_blocking(

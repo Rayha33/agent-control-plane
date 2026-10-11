@@ -74,8 +74,9 @@ also run the existing read-only systemd probe and include its validated active
 `InvocationID` in the target resource snapshot and its hash. The sample time is
 recorded separately on the overall manifest and receipt and covered by their
 full evidence hashes; it is not part of `resource_snapshot_sha256`. A missing, malformed, inactive,
-or inconsistent live ID blocks a required target; a changed ID changes the
-snapshot even if the unit name is stable. Other driver kinds, including Docker,
+or inconsistent live ID blocks a required target. Samples older than 30 seconds
+or more than 5 seconds in the future are treated as unavailable. A changed ID
+changes the snapshot even if the unit name is stable. Other driver kinds, including Docker,
 still use their latest persisted trusted-driver identity evidence. ACP omits raw
 driver stdout/stderr and credential data. This is sampled lifecycle evidence,
 not socket attribution: it does not prove that QC/integration reached those

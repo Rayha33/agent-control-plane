@@ -105,8 +105,9 @@ probe and requires a valid active `InvocationID`; the ID is bound into the targe
 resource snapshot and its hash. The sample time is recorded separately on the
 overall manifest and receipt and covered by their full evidence hashes; it is
 not part of `resource_snapshot_sha256`. Missing or inconsistent live identity
-blocks a required target, while a changed invocation ID invalidates the
-preflight snapshot. Other driver kinds, including Docker, still use their
+blocks a required target; samples older than 30 seconds or more than 5 seconds
+in the future are treated as unavailable. A changed invocation ID invalidates
+the preflight snapshot. Other driver kinds, including Docker, still use their
 latest persisted trusted-driver evidence. Each `runtime_target_revalidation`
 receipt references the exact preflight receipt and command-plan digest. This
 detects sampled unit replacement after preflight; it is not atomic with command

@@ -15,6 +15,7 @@ import re
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ COMMAND_SET_SCOPE = (
 )
 MAX_COMMAND_SET_COUNT = 128
 MAX_COMMAND_LENGTH = 65536
+MAX_LIVE_RUNTIME_SAMPLE_AGE_SECONDS = 30
+MAX_LIVE_RUNTIME_SAMPLE_FUTURE_SKEW_SECONDS = 5
 IDENTITY_FIELDS = (
     "attempt_id",
     "task_id",
@@ -730,6 +733,16 @@ def _live_systemd_invocation_ids(
     sampled_at = sample.get("sampled_at")
     if not isinstance(sampled_at, str) or not _UTC_TIMESTAMP.fullmatch(sampled_at):
         return {}, None
+    try:
+        sampled_time = datetime.fromisoformat(sampled_at)
+    except ValueError:
+        return {}, None
+    age_seconds = (datetime.now(UTC) - sampled_time).total_seconds()
+    if (
+        age_seconds > MAX_LIVE_RUNTIME_SAMPLE_AGE_SECONDS
+        or age_seconds < -MAX_LIVE_RUNTIME_SAMPLE_FUTURE_SKEW_SECONDS
+    ):
+        return {}, sampled_at
     drivers = sample.get("drivers")
     if not isinstance(drivers, list):
         return {}, sampled_at
