@@ -454,7 +454,11 @@ def _probe(receipt_directory: Path) -> dict[str, Any]:
     slice_unit = sandbox_attempt_slice_unit(attempt_id, claim_token, execution_id)
     if slice_unit != _oci_worker_systemd_slice(container_id):
         raise AssertionError("monitor receipt and runc derive different attempt slices")
-    monitor_slice_unit = "app.slice"
+    # Per-attempt slice names are `user-acp-<digest>.slice`, which systemd
+    # nests beneath this shared parent. Keep the durable monitor service in
+    # that same parent but outside the attempt slice so worker-slice teardown
+    # cannot stop its owner.
+    monitor_slice_unit = "user-acp.slice"
     service_unit = sandbox_monitor_service_unit(attempt_id, claim_token, execution_id)
     scope_unit = f"acp-scope-probe-{token}.scope"
     scope_client: subprocess.Popen[str] | None = None
