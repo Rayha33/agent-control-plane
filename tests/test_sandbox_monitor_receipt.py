@@ -22,6 +22,7 @@ from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     decode_sandbox_monitor_control_request,
     encode_sandbox_monitor_control_request,
     load_or_create_sandbox_monitor_control_key,
+    read_sandbox_monitor_control_key,
     read_sandbox_monitor_receipt,
     sandbox_attempt_slice_unit,
     sandbox_container_id,
@@ -358,6 +359,46 @@ def test_monitor_control_key_is_durable_and_bound_to_the_fenced_execution(
         cwd=Path(__file__).resolve().parents[1],
     )
     assert child.stdout.strip() == hashlib.sha256(key).hexdigest()
+
+
+def test_monitor_control_key_recovery_read_never_mints_a_missing_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "control-keys"
+    directory.mkdir(mode=0o700)
+    key_path = directory / f"{sandbox_container_id('attempt-1', 7, 'execution-1')}.control-key"
+
+    with pytest.raises(SandboxMonitorReceiptError, match="refusing to mint a replacement"):
+        read_sandbox_monitor_control_key(
+            directory,
+            attempt_id="attempt-1",
+            claim_token=7,
+            execution_id="execution-1",
+        )
+    assert not key_path.exists()
+    assert not list(directory.glob("*.lock"))
+
+    key = load_or_create_sandbox_monitor_control_key(
+        directory,
+        attempt_id="attempt-1",
+        claim_token=7,
+        execution_id="execution-1",
+    )
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            receipt_module.secrets,
+            "token_bytes",
+            lambda *_args: pytest.fail("recovery reads must never mint a replacement"),
+        )
+        assert (
+            read_sandbox_monitor_control_key(
+                directory,
+                attempt_id="attempt-1",
+                claim_token=7,
+                execution_id="execution-1",
+            )
+            == key
+        )
 
 
 def test_monitor_control_key_concurrent_creation_returns_one_durable_secret(

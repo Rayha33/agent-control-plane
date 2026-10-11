@@ -374,6 +374,42 @@ def load_or_create_sandbox_monitor_control_key(
         os.close(directory_fd)
 
 
+def read_sandbox_monitor_control_key(
+    directory: str | Path,
+    *,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+) -> bytes:
+    """Read an existing key without minting one during controller recovery.
+
+    A reconnecting controller must not turn a missing or corrupt capability
+    into a fresh key: the live monitor would still hold the original bytes and
+    the replacement would make its identity ambiguous. The underlying reader
+    may finish recovery of an exact, already-published temporary hard link.
+    """
+
+    if not isinstance(directory, (str, Path)):
+        raise SandboxMonitorReceiptError("monitor control-key directory is invalid")
+    identity = sandbox_container_id(attempt_id, claim_token, execution_id)
+    key_name = f"{identity}.control-key"
+    directory_fd = _open_control_key_directory(Path(directory))
+    try:
+        try:
+            os.stat(key_name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise SandboxMonitorReceiptError(
+                "monitor control key is missing; refusing to mint a replacement during recovery"
+            ) from None
+        return _read_control_key_at(directory_fd, key_name)
+    except SandboxMonitorReceiptError:
+        raise
+    except OSError as error:
+        raise SandboxMonitorReceiptError("monitor control key could not be read safely") from error
+    finally:
+        os.close(directory_fd)
+
+
 def _validate_component(value: Any, field: str) -> str:
     if not isinstance(value, str) or _COMPONENT.fullmatch(value) is None:
         raise SandboxMonitorReceiptError(f"{field} is not a safe component")

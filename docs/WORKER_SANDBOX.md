@@ -509,6 +509,23 @@ production monitor owning `RuncLaunchHandle`, journal-authorized gate release,
 OCI scope enforcement, `cleanup_verified`, result import, provider auth/egress,
 or the registered `run_worker()` path. `run_worker()` remains fail-closed.
 
+**Controller restart adoption helper (2026-10-11; production recovery primitive).**
+`supervisor/sandbox_monitor_lifecycle.py` now provides a controller-side
+reconnect path for an already-running monitor. The caller must supply the
+attempt/claim/execution tuple read from its durable execution journal; the
+helper requires it to match the immutable service receipt, then re-queries the
+trusted user-systemd manager for the exact active service and both sibling
+slice identities, including InvocationID, ControlGroup, MainPID, and fresh
+PID-start identity. Only after that proof does it read the existing per-execution
+control key and validate the monitor socket. Recovery never calls the key
+creator: a missing/corrupt key fails closed and leaves the execution fenced.
+The helper only reconnects for authenticated status/cancel; it cannot start a
+worker or reconstruct `RuncLaunchHandle`. Focused tests cover wrong-fence and
+same-name activation drift, exact unit queries, successful reconnect, and
+missing-key refusal. This remains an adoption primitive, not an integrated
+monitor service or OCI worker path; the live test above still uses a placeholder
+monitor, and `run_worker()` remains fail-closed.
+
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the
 supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)
