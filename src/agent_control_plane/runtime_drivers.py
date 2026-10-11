@@ -614,7 +614,9 @@ class ResourceDriver:
 
         if phase == "verify":
             present, observation = self.probe(context, runner)
-            verified = present is not None and observation.get("exit_code", 0) == 0
+            verified = (present is True and observation.get("exit_code", 0) == 0) or (
+                present is False and self.cleanup_is_proven(present, observation)
+            )
             return PhaseEvidence(
                 driver=self.definition.name,
                 kind=self.kind,
@@ -1681,6 +1683,8 @@ class NamespaceRuntimeDriver(ResourceDriver):
             self._unit(context),
             "--property=LoadState",
             "--property=ActiveState",
+            "--property=MainPID",
+            "--property=ControlGroup",
             "--property=InvocationID",
             "--property=Result",
             "--property=ExecMainStatus",
@@ -1699,24 +1703,50 @@ class NamespaceRuntimeDriver(ResourceDriver):
             self._timeout(),
             None,
         )
-        load_state = self._show_value(result.get("stdout", ""), "LoadState")
+        stdout = str(result.get("stdout", ""))
+        systemd_properties = {
+            line.partition("=")[0].strip(): line.partition("=")[2].strip()
+            for line in stdout.splitlines()
+            if "=" in line
+        }
+        load_state = systemd_properties.get("LoadState", "")
         stderr = str(result.get("stderr", ""))
-        missing = load_state == "not-found" or (
+        not_found_error = (
             result.get("exit_code", 0) != 0
             and self._unit(context).casefold() in stderr.casefold()
             and ("not found" in stderr.casefold() or "could not be found" in stderr.casefold())
         )
-        if missing:
-            # A transient unit is normally garbage-collected after stop and
-            # reset-failed. systemctl versions differ: some report
-            # LoadState=not-found, while others return non-zero with a
-            # unit-specific not-found diagnostic. Both are positive absence
-            # proof because the trusted query names only this owned unit.
+        terminal_not_found_snapshot = (
+            result.get("exit_code") == 0
+            and systemd_properties.get("LoadState") == "not-found"
+            and systemd_properties.get("ActiveState") == "inactive"
+            and systemd_properties.get("MainPID") == "0"
+            and systemd_properties.get("ControlGroup") == ""
+            and systemd_properties.get("InvocationID") == ""
+        )
+        no_properties_on_not_found_error = not_found_error and not any(
+            key in systemd_properties
+            for key in ("LoadState", "ActiveState", "MainPID", "ControlGroup", "InvocationID")
+        )
+        not_found_signal = load_state == "not-found" or not_found_error
+        if not_found_signal and (terminal_not_found_snapshot or no_properties_on_not_found_error):
+            # A unit's name being reported as not found is not enough: systemd
+            # has returned contradictory ActiveState values in the wild. Accept
+            # structured output only when it is the complete terminal snapshot;
+            # older systemd error output remains usable only when it contains no
+            # contradictory unit properties at all.
             result = {
                 **result,
                 "original_exit_code": result.get("exit_code", 0),
                 "exit_code": 0,
                 "absence_proved_by": "systemd-unit-not-found",
+            }
+        elif not_found_signal:
+            result = {
+                **result,
+                "original_exit_code": result.get("exit_code", 0),
+                "exit_code": 1,
+                "absence_conflict": "systemd unit properties are not a terminal not-found snapshot",
             }
         state = self._show_value(result.get("stdout", ""), "ActiveState")
         present = state in {"active", "activating", "deactivating", "reloading"}

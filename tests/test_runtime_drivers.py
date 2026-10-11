@@ -2179,7 +2179,9 @@ ACTIVE_SHOW = (
     "CPUUsageNSec=123456789\nCPUQuotaPerSecUSec=500000\n"
 )
 GONE_SHOW = "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
-NOT_FOUND_SHOW = "LoadState=not-found\nActiveState=inactive\n"
+NOT_FOUND_SHOW = (
+    "LoadState=not-found\nActiveState=inactive\nMainPID=0\nControlGroup=\nInvocationID=\n"
+)
 OOM_SHOW = "ActiveState=failed\nResult=oom-kill\nExecMainStatus=137\n"
 
 
@@ -2297,6 +2299,42 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     assert "--property=TasksCurrent" in calls[0]
     assert "--property=CPUUsageNSec" in calls[0]
     assert "--property=InvocationID" in calls[0]
+    assert "--property=MainPID" in calls[0]
+    assert "--property=ControlGroup" in calls[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ActiveState", "active"),
+        ("MainPID", "71"),
+        ("ControlGroup", "/user.slice/acp-attempt.service"),
+        ("InvocationID", "0123456789abcdef0123456789abcdef"),
+    ],
+)
+def test_namespace_runtime_not_found_rejects_contradictory_unit_properties(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    driver = namespace_driver()
+    properties = dict(
+        line.split("=", maxsplit=1) for line in NOT_FOUND_SHOW.splitlines() if "=" in line
+    )
+    properties[field] = value
+    output = "\n".join(f"{name}={item}" for name, item in properties.items()) + "\n"
+    runner, _calls = recording_runner({"show": output})
+
+    evidence = driver.run_phase("verify", context(tmp_path), runner)
+
+    assert evidence.present is (field == "ActiveState")
+    assert evidence.exit_code == 1
+    assert not evidence.ok
+    observation = evidence.proof["observation"]
+    assert "absence_proved_by" not in observation
+    assert observation["exit_code"] == 1
+    assert observation["absence_conflict"] == (
+        "systemd unit properties are not a terminal not-found snapshot"
+    )
+    assert not driver.cleanup_is_proven(evidence.present, observation)
 
     runner, _ = recording_runner(
         {
@@ -2336,6 +2374,28 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     present, observation = driver.probe(context(tmp_path), runner)
     assert present is False
     assert observation["absence_proved_by"] == "systemd-unit-not-found"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        GONE_SHOW,
+        "LoadState=loaded\nActiveState=failed\nMainPID=0\n"
+        "ControlGroup=/user.slice/acp-runtime.service\nInvocationID=\n",
+    ],
+)
+def test_namespace_runtime_verify_requires_positive_absence_proof(
+    tmp_path: Path, output: str
+) -> None:
+    driver = namespace_driver()
+    runner, _calls = recording_runner({"show": output})
+
+    evidence = driver.run_phase("verify", context(tmp_path), runner)
+
+    assert evidence.present is False
+    assert evidence.exit_code == 1
+    assert not evidence.ok
+    assert not evidence.proof["observation"].get("absence_proved_by")
 
 
 def test_supervisor_persists_namespace_runtime_unit_invocation_id(
@@ -2404,6 +2464,74 @@ def test_supervisor_persists_namespace_runtime_unit_invocation_id(
     )
     assert setup_payload["systemd_unit_invocation_id"] == "0123456789abcdef0123456789abcdef"
     assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_namespace_runtime_conflicting_not_found_snapshot_cannot_release_quarantine(
+    driver_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    config = (driver_repo / "acp.toml").read_text(encoding="utf-8")
+    config = config.replace(
+        'name = "browser"\nkind = "browser_profile"',
+        'name = "runtime"\nkind = "namespace_runtime"\n'
+        'executable = "/usr/bin/systemd-run"\n'
+        'systemctl_path = "/usr/bin/systemctl"\n'
+        'payload = "/bin/sleep 30"\n'
+        'tasks_max = "16"\n'
+        'memory_max = "64M"\n'
+        'cpu_quota = "50%"\n'
+        'wall_clock_seconds = "120"',
+    )
+    (driver_repo / "acp.toml").write_text(config, encoding="utf-8")
+    snapshots = {
+        "active": (
+            "LoadState=loaded\nActiveState=active\nMainPID=71\n"
+            "ControlGroup=/user.slice/acp-runtime.service\n"
+            "InvocationID=0123456789abcdef0123456789abcdef\n"
+        ),
+        "conflict": (
+            "LoadState=not-found\nActiveState=inactive\nMainPID=71\n"
+            "ControlGroup=/user.slice/acp-runtime.service\n"
+            "InvocationID=0123456789abcdef0123456789abcdef\n"
+        ),
+    }
+    state = {"snapshot": "active"}
+
+    def fake_run_trusted(argv, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        output = ""
+        if len(argv) > 2 and Path(argv[0]).name == "systemctl" and argv[2] == "show":
+            output = snapshots[state["snapshot"]]
+        return {"argv": list(argv), "exit_code": 0, "stdout": output, "stderr": ""}
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+    resources = supervisor.driver_resources(attempt["id"])
+    assert resources[0]["state"] == "active"
+
+    supervisor._quarantine_driver_attempt(attempt["id"], "test_induced")
+    enrolled = supervisor.enroll_runner("operator-a", "integrator")
+    state["snapshot"] = "conflict"
+    recovered = supervisor.quarantine_recover(
+        attempt["id"],
+        "manual-receipt",
+        operator="operator-a",
+        credential=enrolled["credential"],
+        reason="systemd returned a contradictory not-found snapshot",
+    )
+
+    assert recovered["released"] == []
+    assert recovered["still_quarantined"] == 1
+    assert recovered["receipts"][0]["absence_proved"] is False
+    resource = supervisor.driver_resources(attempt["id"])[0]
+    assert resource["state"] == "quarantined"
+    observation = resource["evidence"]["proof"]["observation"]
+    assert observation["exit_code"] == 1
+    assert "absence_proved_by" not in observation
 
 
 def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
@@ -2530,6 +2658,8 @@ def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
     assert exit_code == 0
     assert inactive["available"] is False
     assert inactive["drivers"][0]["present"] is False
+    assert inactive["drivers"][0]["active_state"] == "inactive"
+    assert inactive["drivers"][0]["error_code"] is None
     assert inactive["drivers"][0]["usage"]["tasks_current"] is None
     assert acp_snapshot() == before_inactive
 
@@ -2553,6 +2683,27 @@ def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
     assert inactive_counters["drivers"][0]["usage"]["memory_current_bytes"] is None
     assert inactive_counters["drivers"][0]["usage"]["cpu_usage_ns"] is None
     assert acp_snapshot() == before_inactive_counters
+
+    show_payload.update(
+        value=(
+            "LoadState=not-found\nActiveState=inactive\nMainPID=71\n"
+            "ControlGroup=/user.slice/acp-runtime.service\n"
+            "InvocationID=0123456789abcdef0123456789abcdef\n"
+        ),
+        exit_code=0,
+    )
+    before_conflict = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    conflict = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert conflict["available"] is False
+    assert conflict["drivers"][0]["active_state"] is None
+    assert conflict["drivers"][0]["present"] is None
+    assert conflict["drivers"][0]["error_code"] == "systemd_absence_conflict"
+    assert conflict["drivers"][0]["usage"]["tasks_current"] is None
+    assert acp_snapshot() == before_conflict
 
     show_payload.update(value="LoadState=loaded\nActiveState=not-a-state\n", exit_code=0)
     calls.clear()
