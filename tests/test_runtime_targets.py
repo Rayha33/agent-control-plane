@@ -1339,9 +1339,11 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         )
         if strict_binding_phase == "qc":
             assert qc_result["verdict"] == "block"
+            assert restart_phases == [], "strict QC restarted a runtime before its guaranteed block"
+            assert identity_probes == [], "strict QC probed app self-report without command binding"
             with supervisor.connect() as connection:
                 qc = connection.execute(
-                    "SELECT id, results_json FROM qc_runs "
+                    "SELECT id, packet_sha256, results_json FROM qc_runs "
                     "WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
                     (submission["id"],),
                 ).fetchone()
@@ -1352,6 +1354,21 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
             )
             assert qc_receipt["blocking_reason"] == ("runtime_target_command_binding_unavailable")
             assert qc_receipt["targets"][0]["status"] == "unknown"
+            assert qc_receipt["targets"][0]["probe_status"] == "skipped_command_binding_unavailable"
+            packet_path = (
+                supervisor.state_dir / "logs" / f"review-{submission['id']}-{qc['id']}.json"
+            )
+            packet_bytes = packet_path.read_bytes()
+            assert hashlib.sha256(packet_bytes).hexdigest() == qc["packet_sha256"]
+            packet = json.loads(packet_bytes)
+            assert (
+                packet["runtime_target_preflight"]["evidence_sha256"]
+                == qc_receipt["evidence_sha256"]
+            )
+            assert any(
+                item.get("sha256") == qc_receipt["evidence_sha256"]
+                for item in packet["evidence_catalog"]
+            )
             assert not any(
                 "runtime_target_preflight_link" in item for item in json.loads(qc["results_json"])
             )

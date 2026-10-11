@@ -138,13 +138,16 @@ and network policy when those stronger guarantees are required. At present,
 there is no trusted phase-command network executor. Therefore a target with
 `require_command_binding = true` records `command_binding_status: "unknown"` and
 blocks before the configured deterministic QC/integration gate commands run,
-even if the app's identity report matches. QC still restarts the runtime before
-its preflight. Strict integration instead records the unavailable-binding
-receipt against the submitted candidate revision before integration merge or
-runtime restart; it does not probe the app identity endpoint because that
-self-report cannot establish command routing. The receipt is an explicit
-`unknown`, not a verified target. This strict mode is a fail-closed guard, not
-proof that cross-attempt isolation has been implemented. The positive
+even if the app's identity report matches. Strict QC records the
+unavailable-binding receipt against the submitted candidate without probing the
+app or restarting services for a review that is guaranteed to block. The normal
+post-review cleanup policy still applies to a blocked QC result. Non-strict QC
+continues to restart services before its identity preflight. Strict integration
+records the unavailable-binding receipt against the submitted candidate revision
+before integration merge or runtime restart; it does not probe the app identity
+endpoint because that self-report cannot establish command routing. The receipt
+is an explicit `unknown`, not a verified target. This strict mode is a fail-closed
+guard, not proof that cross-attempt isolation has been implemented. The positive
 enforcement backend remains tracked by the open ACP coordination task #2523.
 Projects that do not configure `runtime.targets` keep their existing QC and
 integration behavior and make no target-identity claim.
