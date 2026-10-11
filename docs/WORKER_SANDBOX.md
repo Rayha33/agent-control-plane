@@ -437,6 +437,69 @@ not a monitor launcher or worker executor: the integration probe still uses a
 placeholder service, does not transfer a live runc handle, and does not attest
 cleanup or result import. `run_worker()` remains fail-closed.
 
+**Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
+unchanged).** Do not treat the existing namespace resource driver as the
+supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)
+launches the candidate through the process trampoline with the attempt worktree
+as `cwd` but does not enter the namespace resource-driver path or an outer
+filesystem/network namespace. When OCI is configured it refuses the launch
+rather than falling back to host execution. [`NamespaceRuntimeDriver`](../src/agent_control_plane/runtime_drivers.py)
+is a separate systemd resource-payload path: it requires rootless user/mount/PID
+namespaces (plus a network namespace for deny-egress), mounts `ACP_WORKTREE`
+read-only at `/workspace`, provides a separate writable `/work`, and currently
+bind-mounts host `/usr`, `/bin`, `/sbin`, `/lib*`, and `/etc` read-only. Those
+properties do not meet the coding-agent contract: writable attempt files,
+private Git metadata, an audited runtime closure, and no broad host `/usr` or
+`/etc` exposure. Reuse is rejected until those gaps are closed and measured.
+
+Codex's `externalSandbox` is not an enforcement mechanism: App Server
+documentation says to use it only when the server process is already
+sandboxed, because it skips Codex's own sandbox for the command. The supported
+boundary must therefore be independently enforced around each attempt before
+that policy is considered. In particular, if Codex App Server remains the
+trusted host-side harness, do not use `externalSandbox` on the assumption that
+it isolates only a child command; it disables Codex's own command sandbox and
+does not create the attempt boundary ([Codex App Server](https://learn.chatgpt.com/docs/app-server),
+[Agent approvals and security](https://learn.chatgpt.com/docs/agent-approvals-security)).
+The first architecture candidate is a provider-independent ACP executor
+contract running in a per-attempt Linux namespace, with the trusted harness,
+credential broker, and result importer outside that namespace. The worker gets
+only an attempt-private writable file tree, a minimal generated `/etc`, an
+audited read-only executable/library closure, and no host home, temp, socket,
+credential, or shared Git-object paths. Attempt egress is denied by default;
+trusted harness/model traffic remains outside the attempt namespace, and any
+worker-side provider access must go through an independently authenticated,
+narrowly scoped broker. This namespace candidate trusts the target host kernel:
+Linux namespaces isolate selected resources, not the kernel itself. If host
+kernel compromise is in scope, require a disposable VM/microVM (or another
+separate-kernel boundary) before accepting the design; namespace-only tests do
+not prove kernel-escape resistance. A snapshot/patch is validated and staged by the host-side
+supervisor; candidate processes never receive the shared checkout's `.git`
+pointer or object database. This is a hypothesis to prove, not implemented
+behavior. OpenAI's self-hosted executor is a provider-specific alternative:
+the harness remains outside the environment and the inside environment key is
+limited to environment-connection actions (not other API actions), but the key
+itself is readable by agent-generated code; the cited documentation does not
+establish that a key is restricted to exactly one environment ([Self-hosted
+sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)).
+
+Current source-level constraints and deployment evidence:
+
+| Item | Current evidence | Required before launch |
+| --- | --- | --- |
+| OS/runtime | Linux user, mount, PID, and optionally network namespaces; systemd user service and delegated cgroup v2 are required by the current resource driver. | Disposable target-host probe of namespace, cgroup, systemd-manager lifetime, and mount policy. |
+| Kernel/distribution | **MISSING** for the target NAS; no live-host version or capability result is claimed. Namespace isolation also trusts the host kernel. | Record exact kernel/distribution and required namespace/cgroup settings from an approved disposable Linux lane; use a VM/microVM if the host kernel is not in the trust boundary. |
+| Codex adapter | The repository has no pinned Codex CLI/App Server in this execution path. The current App Server docs describe stdio/Unix socket transports; WebSocket transport is marked experimental/unsupported. | Pin an exact binary/version and protocol schema, then test it inside the proven boundary without a model call. |
+| Authentication | No host Codex config, OAuth file, API key, or Git credential may be mounted into the candidate tree. | Prove a brokered/least-privilege auth path or reject the adapter; no credential material has been tested here. |
+
+Until those versions and isolation tests are available, the architecture decision
+is **NO-GO for production worker integration**. Do not set `externalSandbox`,
+do not mount host credential/config paths, and do not change the fail-closed
+`run_worker()` behavior. Remaining proof includes base/sibling/home/tmp/credential
+denials (including symlink escapes), process-visibility and socket/network
+checks, isolated Git result transfer, crash/cancel cleanup, and exact-head
+Linux CI. The current receipt codec proves none of those controls.
+
 This choice is consistent with systemd's distinct transient service/scope
 lifecycles and unit-level cgroup controls ([`systemd-run(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
 [`systemd.kill(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html),
