@@ -448,6 +448,48 @@ their process-local provenance. This naming guard narrows one adoption/replay
 ambiguity but does not implement monitor startup, authenticated reconnect, or
 worker execution.
 
+### Cleanup proof boundary (2026-10-11; architecture/QC decision)
+
+Do not add a standalone observer that writes `cleanup_verified`. The current
+`cleanup_reported` receipt is an identity-bound template: its observations are
+null, and it contains no trusted receipt for the exact pinned `runc delete`
+invocation or its exit. `runc --root` selects the runtime state store, while
+`runc state` and `runc list` are read commands; absence from a later query does
+not prove which actor performed deletion or that no actor can recreate state
+before the journal commit. The command semantics are documented by upstream
+[runc](https://github.com/opencontainers/runc/blob/main/man/runc.8.md) and
+[runc-delete](https://github.com/opencontainers/runc/blob/main/man/runc-delete.8.md).
+Bind the delete action, kernel wait result, and post-delete observations to the
+same fenced monitor execution; no observation-only receipt may release the
+attempt fence.
+
+Systemd absence checks must also be conjunctive. `systemctl show` can succeed
+for an unknown unit and report `LoadState=not-found`
+([systemd issue #1105](https://github.com/systemd/systemd/issues/1105)); an
+upstream edge report also demonstrates `LoadState=not-found` alongside
+`ActiveState=active`
+([systemd issue #43442](https://github.com/systemd/systemd/issues/43442)).
+Therefore `not-found` alone is not cleanup evidence. First bind the expected
+unit name, invocation ID, control group, and (for the monitor) main-process
+start identity to the durable launch receipt. Then query that exact unit name:
+if it is `not-found`, require the response to be internally consistent
+(`ActiveState=inactive`, empty `ControlGroup` and `InvocationID`; for the
+monitor service, `MainPID=0`) and independently verify the original PID-start
+identities are absent. Also verify the exact attempt cgroup subtree and private
+paths are empty/absent under their recorded root identities. Any command error,
+timeout, permission gap, reused/mismatched identity, or contradictory property
+retains the fence.
+
+Those checks are still point-in-time observations. The verifier may commit only
+after the monitor has durably recorded its exact delete/wait outcome and can no
+longer launch, stop, or recreate execution resources for that fencing epoch.
+Serialize final verification and the immutable proof-digest journal transition
+against that owner; inject crashes and state/unit ABA changes between delete,
+observation, and commit. Until this owner/serialization path exists, keep
+`cleanup_verified` transitions guarded and OCI `run_worker` fail-closed. This
+decision deliberately does not add a cleanup collector: a typed snapshot would
+not solve the missing action provenance or close the probe-to-commit race.
+
 ## Threat model
 
 Assume the worker command, model-generated scripts, project files, symlinks,
