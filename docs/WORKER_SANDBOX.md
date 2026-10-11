@@ -537,10 +537,13 @@ rather than falling back to host execution. [`NamespaceRuntimeDriver`](../src/ag
 is a separate systemd resource-payload path: it requires rootless user/mount/PID
 namespaces (plus a network namespace for deny-egress), mounts `ACP_WORKTREE`
 read-only at `/workspace`, provides a separate writable `/work`, and currently
-bind-mounts host `/usr`, `/bin`, `/sbin`, `/lib*`, and `/etc` read-only. Those
-properties do not meet the coding-agent contract: writable attempt files,
-private Git metadata, an audited runtime closure, and no broad host `/usr` or
-`/etc` exposure. Reuse is rejected until those gaps are closed and measured.
+bind-mounts host `/usr`, `/bin`, `/sbin`, and `/lib*` read-only. It now creates
+a minimal fixed `/etc/os-release` instead of mounting host `/etc` (2026-10-11;
+structural tests added and a disposable Ubuntu 26.04 guest probe passed;
+exact-head hosted CI and target-host qualification remain pending). The
+remaining broad host `/usr` and toolchain exposure, read-only workspace, and
+lack of private Git metadata still fail the coding-agent contract. Reuse is
+rejected until those gaps are closed and measured.
 
 Codex's `externalSandbox` is not an enforcement mechanism: App Server
 documentation says to use it only when the server process is already
@@ -1870,10 +1873,39 @@ driver's private-tmpfs mount sequence. Cgroup paths from the unit are checked
 for traversal and resolved
 beneath the cgroup-v2 root before their process list is read.
 
-**Interpretation:** this proves that the resource driver can host and clean up
-a generic no-model payload in the measured guest. It simultaneously confirms
-why the driver is not the coding-worker boundary as currently configured:
-the coding workspace is read-only, and broad host `/etc` is still readable.
+**Follow-up hardening (2026-10-11; live probe passed, hosted CI pending).**
+`NamespaceRuntimeDriver` no longer bind-mounts host `/etc`; it generates a
+fixed, read-only `/etc/os-release` inside the private root. The structural test
+rejects reintroduction of `/etc` into the host bind loop. The opt-in Linux test
+now checks the generated identity, requires representative host `/etc/passwd`
+to be unreadable, and compares generated `/etc/os-release` bytes with the
+host's current file. These checks do not create a unique sentinel or inspect
+the mount table, so they are narrower than full host-`/etc` isolation proof.
+The helper default now prefers `/usr/sbin/chroot` and falls back to
+`/usr/bin/chroot`, with either path still subject to trusted-binary validation.
+The exact source/test pair passed the opt-in probe rootlessly in Lima 2.2.1
+Ubuntu 26.04.1 ARM64 (kernel `7.0.0-34-generic`, systemd `259.5`, Python
+`3.14.4`, unified cgroup v2, uid 501): 1 passed. The test temporarily changed
+`kernel.apparmor_restrict_unprivileged_userns` from 1 to 0; the live-run wrapper
+restored it to 1 with an exit trap (the pytest test itself made no sysctl
+changes). Postflight found zero `acp-ns-it` units and zero test
+worktree fixtures. The first attempt surfaced the guest's `/usr/bin/chroot`
+layout; the final pass exercised the driver's adaptive default without a
+test-only path override. Local full pytest passed (1,377 passed, 78 expected
+platform/opt-in skips); Ruff format/check and package build passed. Exact-head
+hosted CI remains pending. The generated `/etc` also omits resolver and CA
+configuration: `egress=allow` does not guarantee DNS name resolution or HTTPS
+certificate validation. Broad `/usr` exposure and all registered-worker/Git,
+credential, egress, monitor, and cleanup integration gaps remain open.
+
+**Interpretation (historical source under test, 2026-10-09):** the recorded
+live run proves that the resource driver could host and clean up a generic
+no-model payload in that measured guest. At that tested revision, host
+`/etc/os-release` was readable. The 2026-10-11 source follow-up above removes
+that broad bind, and its opt-in probe passed the generated-identity and
+representative-file checks described above. Exact-head hosted CI remains
+pending. The read-only coding workspace and other gaps still disqualify this
+driver as the worker boundary.
 It does not exercise ACP's registered `run_worker` reservation, worker PID,
 cancel/recovery, Git transfer, or validated result import; it is not acceptance
 criterion #3 or end-to-end sandbox proof. The driver must remain disconnected

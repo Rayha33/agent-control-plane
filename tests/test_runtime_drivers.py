@@ -3276,12 +3276,75 @@ def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
 
     assert "/tmp/acp-root" in script
     assert 'remount,bind,ro "/tmp/acp-root$acp_path"' in script
-    assert "exec /usr/sbin/chroot /tmp/acp-root" in script
+    assert "for acp_path in /usr /bin /sbin /lib /lib64; do" in script
+    assert "for acp_path in /usr /bin /sbin /lib /lib64 /etc; do" not in script
+    assert "ID=acp-isolated-runtime" in script
+    assert "/tmp/acp-root/etc/os-release" in script
+    assert "chmod 0755 /tmp/acp-root/etc &&" not in script
+    assert "os-release && chmod" not in script
+    assert f"exec {driver._chroot()} /tmp/acp-root" in script
     assert "--pid" in argv and "-t proc" in script
     assert "--no-new-privs" in script
     assert "--bounding-set=-all" in script
     assert script.index("remount,bind,ro") < script.index("chroot")
     assert script.index("chroot") < script.index("--bounding-set=-all")
+
+
+def test_namespace_runtime_fails_closed_if_generated_etc_file_creation_fails(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver(egress="allow")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    script = namespace_unit_argv(calls)[-1]
+    setup_lines = [
+        line
+        for line in script.splitlines()
+        if line == "chmod 0755 /tmp/acp-root/etc"
+        or line.startswith("printf '%s\\n' 'NAME=")
+        or line == "chmod 0444 /tmp/acp-root/etc/os-release"
+    ]
+    assert len(setup_lines) == 3
+    assert not any("&&" in line for line in setup_lines)
+
+    sandbox_root = tmp_path / "sandbox-root"
+    sandbox_root.mkdir()
+    (sandbox_root / "etc").write_text("not-a-directory", encoding="utf-8")
+    payload_marker = tmp_path / "payload-ran"
+    setup_script = "\n".join(
+        line.replace("/tmp/acp-root", str(sandbox_root)) for line in setup_lines
+    )
+    result = subprocess.run(
+        ["/bin/sh", "-c", f"set -eu\n{setup_script}\n: > {payload_marker}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result
+    assert not payload_marker.exists()
+
+
+def test_namespace_runtime_default_chroot_supports_usr_merged_layout(monkeypatch) -> None:
+    monkeypatch.setattr(Path, "is_file", lambda path: str(path) == "/usr/bin/chroot")
+
+    assert runtime_driver_module._default_chroot_path() == "/usr/bin/chroot"
+
+
+def test_namespace_runtime_parser_uses_adaptive_chroot_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runtime_driver_module, "_default_chroot_path", lambda: TRUSTED_BIN)
+    definition = {
+        "name": "runtime",
+        "kind": "namespace_runtime",
+        "executable": TRUSTED_BIN,
+        "payload": "/bin/true",
+    }
+    for helper in ("systemctl_path", "unshare_path", "shell_path", "setpriv_path", "mount_path"):
+        definition[helper] = TRUSTED_BIN
+
+    parsed = parse_driver_definitions([definition], tmp_path)
+
+    assert parsed[0].option("chroot_path") == TRUSTED_BIN
 
 
 def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
@@ -3314,6 +3377,9 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             "ACP_REPO_ROOT": str(worktree),
         },
     )
+    chroot_path = runtime_driver_module._default_chroot_path()
+    if not Path(chroot_path).is_file():
+        pytest.skip("NamespaceRuntimeDriver integration requires a trusted chroot executable")
     driver_options = {
         "payload": "/bin/sh /workspace/fake-agent.sh",
         "unit_prefix": "acp-ns-it",
@@ -3328,6 +3394,7 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
     driver = namespace_driver(
         **driver_options,
     )
+    assert driver._chroot() == chroot_path
     unit = driver._unit(driver_context)
     marker = None
     marker_host_pid = None
@@ -3348,8 +3415,10 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             "  printf 'inner_pid=%s\\n' \"$$\"\n"
             "  printf 'home=%s\\n' \"$HOME\"\n"
             "  printf 'cwd=%s\\n' \"$PWD\"\n"
-            "  if [ -r /etc/os-release ]; then echo host_etc_os_release=readable; "
-            "else echo host_etc_os_release=absent; fi\n"
+            "  printf 'etc_os_release_id=%s\\n' "
+            "\"$(sed -n 's/^ID=//p' /etc/os-release)\"\n"
+            "  if [ -r /etc/passwd ]; then echo host_etc_passwd=readable; "
+            "else echo host_etc_passwd=absent; fi\n"
             "  if touch /workspace/should-not-write 2>/dev/null; then "
             "echo workspace_write=allowed; else echo workspace_write=denied; fi\n"
             "} > /work/acp-agent-marker\n"
@@ -3412,7 +3481,16 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
         observed = dict(line.split("=", 1) for line in marker.splitlines() if "=" in line)
         assert observed["home"] == "/work"
         assert observed["cwd"] == "/work"
-        assert observed["host_etc_os_release"] == "readable"
+        assert observed["etc_os_release_id"] == "acp-isolated-runtime"
+        assert Path("/etc/passwd").is_file()
+        assert observed["host_etc_passwd"] == "absent"
+        sandbox_os_release = Path(f"/proc/{marker_host_pid}/root/etc/os-release").read_text(
+            encoding="utf-8"
+        )
+        assert sandbox_os_release == (
+            'NAME="ACP"\nID=acp-isolated-runtime\nPRETTY_NAME="ACP isolated resource runtime"\n'
+        )
+        assert sandbox_os_release != Path("/etc/os-release").read_text(encoding="utf-8")
         assert observed["workspace_write"] == "denied"
         assert int(observed["inner_pid"]) > 0
         assert os.readlink(f"/proc/{marker_host_pid}/ns/pid") != os.readlink("/proc/self/ns/pid")

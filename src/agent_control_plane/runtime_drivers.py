@@ -75,6 +75,12 @@ SENSITIVE_ENV_NAMES = {
 }
 
 
+def _default_chroot_path() -> str:
+    """Prefer the traditional path, with the usr-merged coreutils location as fallback."""
+    candidates = ("/usr/sbin/chroot", "/usr/bin/chroot")
+    return next((candidate for candidate in candidates if Path(candidate).is_file()), candidates[0])
+
+
 def _validated_private_runtime_directory(path: Path, owner_uid: int) -> str | None:
     """Return a private, owner-controlled systemd runtime directory, if safe."""
     try:
@@ -1615,12 +1621,19 @@ class NamespaceRuntimeDriver(ResourceDriver):
             ),
             f"chmod 0700 {root}/work && chmod 1777 {root}/tmp",
             (
-                "for acp_path in /usr /bin /sbin /lib /lib64 /etc; do "
+                "for acp_path in /usr /bin /sbin /lib /lib64; do "
                 'if [ -e "$acp_path" ]; then '
                 f'{mount} --bind "$acp_path" "{root}$acp_path"; '
                 f'{mount} -o remount,bind,ro "{root}$acp_path"; '
                 "fi; done"
             ),
+            # Keep each operation standalone: `set -e` does not stop on every
+            # failed command inside an `&&` list.
+            f"chmod 0755 {root}/etc",
+            "printf '%s\\n' 'NAME=\"ACP\"' 'ID=acp-isolated-runtime' "
+            "'PRETTY_NAME=\"ACP isolated resource runtime\"' "
+            f"> {root}/etc/os-release",
+            f"chmod 0444 {root}/etc/os-release",
             f"mkdir -p {root}/dev/shm {root}/dev/pts",
             (
                 "for acp_dev in null zero random urandom tty; do "
@@ -1883,7 +1896,9 @@ class NamespaceRuntimeDriver(ResourceDriver):
         return self.definition.option("mount_path", "/usr/bin/mount") or "/usr/bin/mount"
 
     def _chroot(self) -> str:
-        return self.definition.option("chroot_path", "/usr/sbin/chroot") or "/usr/sbin/chroot"
+        return (
+            self.definition.option("chroot_path", _default_chroot_path()) or _default_chroot_path()
+        )
 
     @staticmethod
     def _show_value(stdout: str, key: str) -> str:
@@ -2066,7 +2081,7 @@ def parse_driver_definitions(
                 ("shell_path", "/bin/sh"),
                 ("setpriv_path", "/usr/bin/setpriv"),
                 ("mount_path", "/usr/bin/mount"),
-                ("chroot_path", "/usr/sbin/chroot"),
+                ("chroot_path", _default_chroot_path()),
             ):
                 candidate = options.get(option_name, "").strip() or default
                 resolve_trusted_executable(candidate, repo_root, expected_owners)

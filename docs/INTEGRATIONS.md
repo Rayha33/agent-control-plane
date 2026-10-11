@@ -304,6 +304,12 @@ The driver's `egress = "deny"` option creates a private network namespace, while
 Neither mode currently provides a provider-connected worker with both model access and
 independently enforced, destination-restricted egress.
 
+The private root now generates only a minimal `/etc/os-release`; it does not
+inherit host resolver or CA files. Consequently, `egress = "allow"` means the
+payload keeps the host network namespace, not that DNS lookup or HTTPS trust is
+configured. Payloads requiring those services need explicit, reviewed runtime
+configuration; broad host `/etc` must not be restored as a shortcut.
+
 Codex App Server's `sandboxPolicy.type = "externalSandbox"` tells Codex to skip its
 own command sandbox because an outer sandbox is already in force. It does not create
 or select an ACP namespace. Do not use this mode for an ACP worker until every
