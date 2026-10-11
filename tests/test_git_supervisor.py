@@ -3747,6 +3747,111 @@ def test_command_cannot_escape_by_terminating_its_monitor(repo: Path, close_stdi
     assert not marker.exists()
 
 
+def test_contained_process_enforces_combined_output_limit_while_draining(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        "import os,time\n"
+        "chunk = b'x' * 4096\n"
+        "while True:\n"
+        "    os.write(1, chunk)\n"
+        "    os.write(2, chunk)\n"
+        "    time.sleep(0.001)\n",
+    ]
+
+    result = supervisor._run_process(
+        command,
+        "bounded process output test",
+        repo,
+        supervisor._child_env(),
+        timeout_seconds=5,
+        max_output_bytes=1024,
+    )
+
+    captured_bytes = len(result["stdout"].encode()) + len(result["stderr"].encode())
+    assert result["output_limited"] is True
+    assert result["timed_out"] is False
+    assert result["exit_code"] == 125
+    assert captured_bytes <= 1024
+
+
+def test_bounded_output_selector_error_stops_command_and_releases_lifecycle_fd(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    command_pid_file = repo / "bounded-selector-command-pid"
+    started = repo / "bounded-selector-command-started"
+    late_marker = repo / "bounded-selector-command-survived"
+    read_fd, write_fd = os.pipe()
+    real_selector = process_module.selectors.DefaultSelector
+
+    class FailingSelector:
+        def __init__(self) -> None:
+            self.delegate = real_selector()
+
+        def register(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return self.delegate.register(*args, **kwargs)
+
+        def unregister(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return self.delegate.unregister(*args, **kwargs)
+
+        def get_map(self):  # type: ignore[no-untyped-def]
+            return self.delegate.get_map()
+
+        def select(self, _timeout=None):  # type: ignore[no-untyped-def]
+            deadline = time.monotonic() + 3
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not started.exists():
+                raise AssertionError("contained command did not start before selector failure")
+            raise OSError("forced bounded selector failure")
+
+        def close(self) -> None:
+            self.delegate.close()
+
+    monkeypatch.setattr(process_module.selectors, "DefaultSelector", FailingSelector)
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            "import os,pathlib,time; "
+            f"pathlib.Path({str(command_pid_file)!r}).write_text(str(os.getpid())); "
+            f"pathlib.Path({str(started)!r}).write_text('ready'); "
+            "time.sleep(0.3); "
+            f"pathlib.Path({str(late_marker)!r}).write_text('alive'); "
+            "time.sleep(30)"
+        ),
+    ]
+    try:
+        with pytest.raises(OSError, match="forced bounded selector failure"):
+            supervisor._run_process(
+                command,
+                "bounded selector cleanup test",
+                repo,
+                supervisor._child_env(),
+                timeout_seconds=5,
+                lifecycle_fds=(write_fd,),
+                max_output_bytes=1024,
+            )
+        assert started.exists()
+        command_pid = int(command_pid_file.read_text(encoding="ascii"))
+        os.close(write_fd)
+        write_fd = -1
+        ready, _, _ = process_module.select.select([read_fd], [], [], 2)
+        assert ready, "the monitor retained its lifecycle descriptor after the error"
+        assert os.read(read_fd, 1) == b"", "a contained command retained the lifecycle descriptor"
+        time.sleep(0.4)
+        assert not late_marker.exists()
+        assert supervisor._process_identity(command_pid) is None
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
 def test_process_maps_fd3_only_into_command_and_closes_monitor_copy(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     marker = repo / "fd3-mapping-source-state"

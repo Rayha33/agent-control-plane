@@ -76,11 +76,28 @@ recorded separately on the overall manifest and receipt and covered by their
 full evidence hashes; it is not part of `resource_snapshot_sha256`. A missing, malformed, inactive,
 or inconsistent live ID blocks a required target. Samples older than 30 seconds
 or more than 5 seconds in the future are treated as unavailable. A changed ID
-changes the snapshot even if the unit name is stable. Other driver kinds, including Docker,
-still use their latest persisted trusted-driver identity evidence. ACP omits raw
-driver stdout/stderr and credential data. This is sampled lifecycle evidence,
-not socket attribution: it does not prove that QC/integration reached those
-resources or close the race between sampling and command launch.
+changes the snapshot even if the unit name is stable. For target-referenced
+`docker_compose` drivers, the same fresh sample runs the trusted driver's
+fixed `compose -p <attempt-project> ps --all --quiet` inventory probe and adds
+only presence, count, and a SHA-256 of the sorted container IDs to the snapshot.
+This detects a changed inventory across preflight/revalidation even when the
+Compose project ID stays the same. Malformed, duplicate, failed, stale, or
+ambiguous Docker observations are marked unavailable; unlike a missing
+systemd invocation ID, that fact alone does not block a required target. If
+either preflight or revalidation lacks a valid Docker fingerprint while the
+other snapshot evidence is unchanged, the cross-phase comparison is `null`
+(unknown), not a match or a replacement finding. A changed resource ID or
+host-captured identity remains an independent replacement finding even when a
+Docker sample is unavailable. The sample's top-level `available` field continues to
+describe systemd/cgroup usage; `resource_identity_available` separately reports
+whether any Docker resource identity was sampled successfully. The shared
+sample timestamp is taken before the sequential probes, conservatively dating
+the earliest observation. ACP
+omits raw driver stdout/stderr and credential data. These are sampled
+lifecycle fingerprints, not socket attribution: they do not prove that
+QC/integration reached those resources or close the race between sampling and
+command launch. `require_command_binding = true` therefore remains unknown and
+blocks until a trusted command/network enforcement backend exists.
 
 During a target-aware restart ACP supplies the attempt/task/claim identity,
 phase, phase checkout, and exact source revision to the trusted runtime drivers

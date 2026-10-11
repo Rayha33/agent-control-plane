@@ -221,9 +221,10 @@ def runtime_target_phase(
     own report. When baseline resource hashes are supplied, a required target
     also blocks if its latest trusted-driver evidence differs from the phase
     preflight. Namespace-runtime resources additionally require a current,
-    successful systemd invocation-ID sample; a missing or stale identity blocks
-    a required target. These samples detect unit replacement but do not prove
-    command routing or close the race between checking and command execution.
+    successful systemd invocation-ID sample; Docker Compose resources include a
+    current bounded container-inventory fingerprint when available. These
+    samples detect observed replacement but do not prove traffic/command routing
+    or close the race between checking and command execution.
     """
 
     if phase not in {"qc", "integration"}:
@@ -240,6 +241,7 @@ def runtime_target_phase(
         )
     command_set_sha256 = _command_set_sha256(commands)
     baseline_resource_snapshot_sha256: dict[str, str] | None = None
+    baseline_targets_by_name: dict[str, Mapping[str, Any]] = {}
     baseline_evidence_id: str | None = None
     baseline_evidence_sha256: str | None = None
     if baseline_receipt is not None:
@@ -293,10 +295,16 @@ def runtime_target_phase(
         baseline_resource_snapshot_sha256 = {
             str(name): str(value) for name, value in baseline_hashes.items()
         }
+        baseline_targets_by_name = {
+            str(target.get("name")): target
+            for target in baseline_targets
+            if isinstance(target, Mapping)
+        }
     resources = {str(item.get("driver", "")): item for item in driver_resources}
     live_systemd_invocation_ids, live_runtime_sampled_at = _live_systemd_invocation_ids(
         live_runtime_sample
     )
+    live_docker_container_identities = _live_docker_container_identities(live_runtime_sample)
     manifest_targets: list[dict[str, Any]] = []
     receipt_targets: list[dict[str, Any]] = []
     blocked = False
@@ -393,26 +401,49 @@ def runtime_target_phase(
 
         resource_snapshots = [
             _resource_binding_snapshot(
-                "service", definition.driver, resources, live_systemd_invocation_ids
+                "service",
+                definition.driver,
+                resources,
+                live_systemd_invocation_ids,
+                live_docker_container_identities,
             )
         ]
         if definition.database_driver:
             resource_snapshots.append(
                 _resource_binding_snapshot(
-                    "database", definition.database_driver, resources, live_systemd_invocation_ids
+                    "database",
+                    definition.database_driver,
+                    resources,
+                    live_systemd_invocation_ids,
+                    live_docker_container_identities,
                 )
             )
         if definition.queue_driver:
             resource_snapshots.append(
                 _resource_binding_snapshot(
-                    "queue", definition.queue_driver, resources, live_systemd_invocation_ids
+                    "queue",
+                    definition.queue_driver,
+                    resources,
+                    live_systemd_invocation_ids,
+                    live_docker_container_identities,
                 )
             )
         resource_snapshot_sha256 = sha256(canonical_json(resource_snapshots).encode("utf-8"))
+        baseline_target = baseline_targets_by_name.get(definition.name)
+        baseline_resource_snapshots = (
+            baseline_target.get("resource_snapshots")
+            if isinstance(baseline_target, Mapping)
+            else None
+        )
         resource_snapshot_matches_preflight = (
             None
             if baseline_resource_snapshot_sha256 is None
-            else baseline_resource_snapshot_sha256[definition.name] == resource_snapshot_sha256
+            else _resource_snapshot_comparison(
+                resource_snapshots,
+                baseline_resource_snapshots,
+                baseline_resource_snapshot_sha256[definition.name],
+                resource_snapshot_sha256,
+            )
         )
 
         endpoint = f"http://127.0.0.1:{port}" if port else None
@@ -782,6 +813,138 @@ def _live_systemd_invocation_ids(
     return identities, sampled_at
 
 
+def _live_docker_container_identities(
+    sample: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Keep fresh allowlisted Docker container fingerprints by target driver."""
+
+    if not isinstance(sample, Mapping):
+        return {}
+    sampled_at = sample.get("sampled_at")
+    if not isinstance(sampled_at, str) or not _UTC_TIMESTAMP.fullmatch(sampled_at):
+        return {}
+    try:
+        sampled_time = datetime.fromisoformat(sampled_at)
+    except ValueError:
+        return {}
+    age_seconds = (datetime.now(UTC) - sampled_time).total_seconds()
+    if (
+        age_seconds > MAX_LIVE_RUNTIME_SAMPLE_AGE_SECONDS
+        or age_seconds < -MAX_LIVE_RUNTIME_SAMPLE_FUTURE_SKEW_SECONDS
+    ):
+        return {}
+    raw_resources = sample.get("resource_identities")
+    if not isinstance(raw_resources, list):
+        return {}
+
+    identities: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
+    for resource in raw_resources:
+        if not isinstance(resource, Mapping) or resource.get("kind") != "docker_compose":
+            continue
+        name = resource.get("driver")
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
+            continue
+        identity_available = resource.get("identity_available") is True
+        present = resource.get("present")
+        count = resource.get("container_count")
+        digest = resource.get("container_ids_sha256")
+        valid_identity = (
+            identity_available
+            and type(present) is bool
+            and type(count) is int
+            and 0 <= count <= 64
+            and present == (count > 0)
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest)
+        )
+        current = {
+            "identity_available": bool(valid_identity),
+            "present": present if valid_identity else None,
+            "container_count": count if valid_identity else None,
+            "container_ids_sha256": digest if valid_identity else None,
+        }
+        if name in identities:
+            identities[name] = {
+                "identity_available": False,
+                "present": None,
+                "container_count": None,
+                "container_ids_sha256": None,
+            }
+            ambiguous.add(name)
+        elif name not in ambiguous:
+            identities[name] = current
+    return identities
+
+
+def _resource_snapshot_comparison(
+    current_snapshots: Sequence[Mapping[str, Any]],
+    baseline_snapshots: Any,
+    baseline_sha256: str,
+    current_sha256: str,
+) -> bool | None:
+    """Compare independent resource evidence even when Docker sampling is unknown."""
+
+    current = {
+        (snapshot.get("role"), snapshot.get("driver")): snapshot
+        for snapshot in current_snapshots
+        if snapshot.get("kind") == "docker_compose"
+    }
+    baseline_values = baseline_snapshots if isinstance(baseline_snapshots, list) else []
+    baseline = {
+        (snapshot.get("role"), snapshot.get("driver")): snapshot
+        for snapshot in baseline_values
+        if isinstance(snapshot, Mapping) and snapshot.get("kind") == "docker_compose"
+    }
+    if not current and not baseline:
+        return baseline_sha256 == current_sha256
+
+    # Resource IDs and host-captured evidence are independent of the live
+    # Docker probe. A difference there remains a concrete replacement even if
+    # one Docker sample is unavailable.
+    if not isinstance(baseline_snapshots, list):
+        return None
+    current_without_live = [
+        {key: value for key, value in snapshot.items() if key != "live_container_identity"}
+        for snapshot in current_snapshots
+    ]
+    baseline_without_live = [
+        {key: value for key, value in snapshot.items() if key != "live_container_identity"}
+        for snapshot in baseline_values
+        if isinstance(snapshot, Mapping)
+    ]
+    base_sha256 = sha256(canonical_json(current_without_live).encode("utf-8"))
+    baseline_base_sha256 = sha256(canonical_json(baseline_without_live).encode("utf-8"))
+    if base_sha256 != baseline_base_sha256:
+        return False
+    if set(current) != set(baseline):
+        return None
+    for key, current_snapshot in current.items():
+        baseline_snapshot = baseline[key]
+        if not _valid_docker_identity(current_snapshot.get("live_container_identity")):
+            return None
+        if not _valid_docker_identity(baseline_snapshot.get("live_container_identity")):
+            return None
+    return baseline_sha256 == current_sha256
+
+
+def _valid_docker_identity(identity: Any) -> bool:
+    if not isinstance(identity, Mapping):
+        return False
+    present = identity.get("present")
+    count = identity.get("container_count")
+    digest = identity.get("container_ids_sha256")
+    return (
+        identity.get("identity_available") is True
+        and type(present) is bool
+        and type(count) is int
+        and 0 <= count <= 64
+        and present == (count > 0)
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+    )
+
+
 def _host_resource_identity(resource: Mapping[str, Any] | None) -> dict[str, Any]:
     """Extract narrowly typed identity captured by a trusted runtime-driver probe."""
 
@@ -824,15 +987,16 @@ def _resource_binding_snapshot(
     driver_name: str,
     resources: Mapping[str, Mapping[str, Any]],
     live_systemd_invocation_ids: Mapping[str, str],
+    live_docker_container_identities: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Return an allowlisted snapshot of one target's configured resource.
 
     Resource IDs alone can stay stable across a driver-observed container or
-    systemd service replacement. Preserve host-captured evidence and the current
-    validated systemd invocation ID separately; never copy raw driver output or
-    credential evidence. Repeated phase checks compare these snapshots to the
-    preflight to detect sampled replacement, but do not prove command routing or
-    close the race between the check and command execution.
+    systemd service replacement. Preserve host-captured evidence and current
+    validated systemd/Docker identities separately; never copy raw driver output
+    or credential evidence. Repeated phase checks compare these snapshots to the
+    preflight to detect sampled replacement, but do not prove traffic/command
+    routing or close the race between the check and command execution.
     """
 
     resource = resources.get(driver_name)
@@ -868,6 +1032,8 @@ def _resource_binding_snapshot(
     }
     if kind == "namespace_runtime":
         snapshot["live_systemd_invocation_id"] = live_systemd_invocation_ids.get(driver_name)
+    elif kind == "docker_compose":
+        snapshot["live_container_identity"] = live_docker_container_identities.get(driver_name)
     return snapshot
 
 

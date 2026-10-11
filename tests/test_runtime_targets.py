@@ -117,6 +117,31 @@ def live_namespace_sample(
     }
 
 
+def live_docker_sample(
+    api_ids: list[str], queue_ids: list[str], *, sampled_at: str | None = None
+) -> dict[str, Any]:
+    resources = []
+    for driver, container_ids in (("api", api_ids), ("queue", queue_ids)):
+        canonical_ids = sorted(container_ids)
+        resources.append(
+            {
+                "driver": driver,
+                "kind": "docker_compose",
+                "identity_available": True,
+                "present": bool(container_ids),
+                "container_count": len(container_ids),
+                "container_ids_sha256": sha256(canonical_json(canonical_ids).encode("utf-8")),
+            }
+        )
+    return {
+        "sampled_at": sampled_at or datetime.now(UTC).isoformat(timespec="seconds"),
+        "source": "read-only Docker Compose probe",
+        "available": False,
+        "drivers": [],
+        "resource_identities": resources,
+    }
+
+
 def expected_report(
     *,
     phase: str = "qc",
@@ -241,7 +266,10 @@ def test_required_command_network_binding_is_unknown_and_blocks_matching_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     receipt, _environment, blocked = evaluate_target(
-        tmp_path, monkeypatch, require_command_binding=True
+        tmp_path,
+        monkeypatch,
+        require_command_binding=True,
+        live_runtime_sample=live_docker_sample(["0123456789ab"], ["fedcba987654"]),
     )
 
     target = receipt["targets"][0]
@@ -253,21 +281,137 @@ def test_required_command_network_binding_is_unknown_and_blocks_matching_target(
     assert target["status"] == "unknown"
     assert target["command_binding_status"] == "unknown"
     assert "command_network_binding" in target["missing_evidence"]
+    assert target["resource_snapshots"][0]["live_container_identity"]["identity_available"]
     assert receipt["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
 
 
-def test_required_target_revalidation_blocks_replaced_host_resource(
+def test_docker_compose_target_revalidation_detects_live_inventory_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    preflight_sample = live_docker_sample(["0123456789ab"], ["fedcba987654"])
     preflight, _environment, preflight_blocked = evaluate_target(
-        tmp_path / "preflight", monkeypatch
+        tmp_path / "preflight", monkeypatch, live_runtime_sample=preflight_sample
+    )
+    assert preflight_blocked is False
+
+    revalidation_dir = tmp_path / "revalidation"
+    revalidation_dir.mkdir()
+    receipt, _environment, blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+        driver_resources=driver_resources(),
+        live_runtime_sample=live_docker_sample(["abcdef123456"], ["fedcba987654"]),
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=revalidation_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_resource_replaced"
+    assert target["resource_snapshot_matches_preflight"] is False
+    assert target["mismatches"] == ["resource_snapshot_sha256"]
+    assert target["resource_snapshots"][0]["resource_id"] == "api-project-attempt-17"
+    assert target["resource_snapshots"][0]["live_container_identity"]["container_ids_sha256"] == (
+        sha256(canonical_json(["abcdef123456"]).encode("utf-8"))
+    )
+    assert receipt["verified"] is False
+
+
+@pytest.mark.parametrize(
+    ("preflight_available", "revalidation_available"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+    ],
+    ids=("both-unavailable", "revalidation-unavailable", "preflight-unavailable"),
+)
+def test_docker_resource_comparison_is_unknown_without_two_valid_samples(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preflight_available: bool,
+    revalidation_available: bool,
+) -> None:
+    preflight, _environment, preflight_blocked = evaluate_target(
+        tmp_path / "preflight",
+        monkeypatch,
+        live_runtime_sample=(
+            live_docker_sample(["0123456789ab"], ["fedcba987654"]) if preflight_available else None
+        ),
+    )
+    assert preflight_blocked is False
+
+    revalidation_dir = tmp_path / "revalidation"
+    receipt, _environment, blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+        driver_resources=driver_resources(),
+        live_runtime_sample=(
+            live_docker_sample(["0123456789ab"], ["fedcba987654"])
+            if revalidation_available
+            else None
+        ),
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=revalidation_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is False
+    assert target["resource_snapshot_matches_preflight"] is None
+    assert target["mismatches"] == []
+    assert receipt["resource_replacement_detected"] is False
+
+
+def test_live_docker_identity_rejects_stale_or_ambiguous_samples() -> None:
+    stale = live_docker_sample(
+        ["0123456789ab"],
+        ["fedcba987654"],
+        sampled_at=(datetime.now(UTC) - timedelta(minutes=2)).isoformat(timespec="seconds"),
+    )
+    assert runtime_targets._live_docker_container_identities(stale) == {}
+
+    duplicate = live_docker_sample(["0123456789ab"], ["fedcba987654"])
+    duplicate["resource_identities"].append(dict(duplicate["resource_identities"][0]))
+    identities = runtime_targets._live_docker_container_identities(duplicate)
+    assert identities["api"]["identity_available"] is False
+    assert identities["queue"]["identity_available"] is True
+
+
+@pytest.mark.parametrize("replacement_kind", ["host_identity", "resource_id"])
+def test_required_target_revalidation_blocks_replaced_host_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    preflight, _environment, preflight_blocked = evaluate_target(
+        tmp_path / "preflight",
+        monkeypatch,
+        live_runtime_sample=live_docker_sample(["0123456789ab"], ["fedcba987654"]),
     )
     assert preflight_blocked is False
 
     replacement = driver_resources()
-    replacement[0]["evidence"]["proof"]["observation"]["stdout"] = "abcdef123456\n"
     report = expected_report()
-    report["container_id"] = "abcdef123456"
+    if replacement_kind == "host_identity":
+        replacement[0]["evidence"]["proof"]["observation"]["stdout"] = "abcdef123456\n"
+        report["container_id"] = "abcdef123456"
+    else:
+        replacement[0]["resource_id"] = "api-project-attempt-17-replaced"
+        report["driver_resource_id"] = "api-project-attempt-17-replaced"
     monkeypatch.setattr(
         runtime_targets, "probe_target_identity", lambda _port, _path: (report, "ok")
     )
@@ -296,6 +440,7 @@ def test_required_target_revalidation_blocks_replaced_host_resource(
     assert receipt["baseline_evidence_id"] == preflight["evidence_id"]
     assert receipt["baseline_evidence_sha256"] == preflight["evidence_sha256"]
     assert target["resource_snapshot_matches_preflight"] is False
+    assert target["resource_snapshots"][0]["live_container_identity"] is None
     assert target["status"] == "mismatch"
     assert "resource_snapshot_sha256" in target["mismatches"]
     assert receipt["verified"] is False

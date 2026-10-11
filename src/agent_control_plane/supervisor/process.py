@@ -15,6 +15,7 @@ import fcntl
 import os
 import re
 import select
+import selectors
 import signal
 import stat
 import subprocess
@@ -62,8 +63,17 @@ class ProcessMixin:
         lifecycle_fds: Sequence[int] = (),
         fd3_source: int | None = None,
         exec_fd: int | None = None,
+        max_output_bytes: int | None = None,
     ) -> dict[str, Any]:
         from ..worker_trampoline import _monitor_argv_prefix
+
+        if max_output_bytes is not None and (
+            type(max_output_bytes) is not int or not 1 <= max_output_bytes <= 1_048_576
+        ):
+            raise SupervisorError(
+                "process_output_limit_invalid",
+                "captured process output limit must be between 1 byte and 1 MiB",
+            )
 
         if fd3_source is not None:
             if type(fd3_source) is not int or fd3_source < 3 or fd3_source in set(lifecycle_fds):
@@ -212,34 +222,137 @@ class ProcessMixin:
         finally:
             os.close(target_read)
         os.close(start_write)
-        timed_out = False
         deadline = time.monotonic() + (timeout_seconds or self.config.timeout_seconds)
-        while True:
-            remaining = deadline - time.monotonic()
-            try:
-                stdout, stderr = process.communicate(timeout=max(0.01, min(0.1, remaining)))
-                break
-            except subprocess.TimeoutExpired:
-                if process.poll() is not None:
-                    if process.returncode is not None and process.returncode < 0:
-                        self._terminate_unexpected_monitor_target(target_pid, target_identity)
-                    stdout, stderr = process.communicate(timeout=3)
+        output_limited = False
+        if max_output_bytes is None:
+            timed_out = False
+            while True:
+                remaining = deadline - time.monotonic()
+                try:
+                    stdout, stderr = process.communicate(timeout=max(0.01, min(0.1, remaining)))
                     break
-                if remaining <= 0:
-                    timed_out = True
-                    self._stop_kernel_monitor(process)
-                    stdout, stderr = process.communicate(timeout=3)
-                    break
+                except subprocess.TimeoutExpired:
+                    if process.poll() is not None:
+                        if process.returncode is not None and process.returncode < 0:
+                            self._terminate_unexpected_monitor_target(target_pid, target_identity)
+                        stdout, stderr = process.communicate(timeout=3)
+                        break
+                    if remaining <= 0:
+                        timed_out = True
+                        self._stop_kernel_monitor(process)
+                        stdout, stderr = process.communicate(timeout=3)
+                        break
+        else:
+            stdout, stderr, timed_out, output_limited = self._communicate_bounded(
+                process,
+                target_pid,
+                target_identity,
+                deadline,
+                max_output_bytes,
+            )
         if process.returncode is not None and process.returncode < 0:
             self._terminate_unexpected_monitor_target(target_pid, target_identity)
         return {
             "command": label,
-            "exit_code": 124 if timed_out else process.returncode,
+            "exit_code": 125 if output_limited else 124 if timed_out else process.returncode,
             "stdout": stdout[-12000:],
             "stderr": stderr[-12000:],
             "duration_ms": int((time.monotonic() - started) * 1000),
             "timed_out": timed_out,
+            "output_limited": output_limited,
         }
+
+    def _communicate_bounded(
+        self,
+        process: subprocess.Popen[Any],
+        target_pid: int,
+        target_identity: str,
+        deadline: float,
+        max_output_bytes: int,
+    ) -> tuple[str, str, bool, bool]:
+        """Drain both pipes while retaining at most a fixed combined byte budget."""
+
+        streams: dict[int, tuple[str, Any]] = {}
+        captured = {"stdout": bytearray(), "stderr": bytearray()}
+        captured_bytes = 0
+        timed_out = False
+        output_limited = False
+        cleanup_deadline: float | None = None
+        selector: selectors.BaseSelector | None = None
+
+        try:
+            selector = selectors.DefaultSelector()
+            for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+                if stream is not None:
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, name)
+                    streams[stream.fileno()] = (name, stream)
+            while selector.get_map() or process.poll() is None:
+                now = time.monotonic()
+                if not timed_out and not output_limited and now >= deadline:
+                    timed_out = True
+                    self._stop_kernel_monitor(process)
+                    cleanup_deadline = time.monotonic() + 3
+                if cleanup_deadline is not None and now >= cleanup_deadline and streams:
+                    self._terminate_unexpected_monitor_target(target_pid, target_identity)
+                    break
+                try:
+                    readable = selector.select(0.1)
+                except InterruptedError:
+                    continue
+                for key, _events in readable:
+                    stream = key.fileobj
+                    descriptor = stream.fileno()
+                    try:
+                        chunk = os.read(descriptor, 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        streams.pop(descriptor, None)
+                        stream.close()
+                        continue
+                    if output_limited:
+                        continue
+                    remaining = max_output_bytes - captured_bytes
+                    accepted = chunk[:remaining]
+                    name = key.data
+                    captured[name].extend(accepted)
+                    captured_bytes += len(accepted)
+                    if len(chunk) > remaining:
+                        output_limited = True
+                        cleanup_deadline = time.monotonic() + 3
+                        if process.poll() is None:
+                            self._stop_kernel_monitor(process)
+        except BaseException as communication_error:
+            cleanup_error: BaseException | None = None
+            try:
+                if process.poll() is None:
+                    self._stop_kernel_monitor(process)
+            except BaseException as error:
+                cleanup_error = error
+            try:
+                self._terminate_unexpected_monitor_target(target_pid, target_identity)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            if cleanup_error is not None:
+                raise cleanup_error from communication_error
+            raise
+        finally:
+            if selector is not None:
+                selector.close()
+            for _name, stream in streams.values():
+                stream.close()
+
+        if process.returncode is not None and process.returncode < 0:
+            self._terminate_unexpected_monitor_target(target_pid, target_identity)
+        return (
+            captured["stdout"].decode(errors="replace"),
+            captured["stderr"].decode(errors="replace"),
+            timed_out,
+            output_limited,
+        )
 
     def _run_trusted_contained(
         self,
@@ -249,6 +362,7 @@ class ProcessMixin:
         timeout_seconds: int,
         pass_fds: Sequence[int],
         lifecycle_fds: Sequence[int],
+        max_output_bytes: int | None = None,
     ) -> dict[str, Any]:
         return self._run_process(
             arguments,
@@ -258,6 +372,7 @@ class ProcessMixin:
             timeout_seconds=timeout_seconds,
             pass_fds=pass_fds,
             lifecycle_fds=lifecycle_fds,
+            max_output_bytes=max_output_bytes,
         )
 
     @staticmethod

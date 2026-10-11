@@ -41,6 +41,8 @@ from agent_control_plane.runtime_drivers import (
     resolve_trusted_executable,
     run_trusted,
 )
+from agent_control_plane.supervisor import runtime as runtime_module
+from agent_control_plane.supervisor.common import canonical_json, sha256
 
 BASE_SIMULATOR_UDID = "11111111-1111-4111-8111-111111111111"
 CLONE_SIMULATOR_UDID = "22222222-2222-4222-8222-222222222222"
@@ -2807,6 +2809,95 @@ def test_fresh_runtime_sample_marks_non_systemd_driver_unavailable(driver_repo: 
     assert result["live_sample"]["available"] is False
     assert result["live_sample"]["reason"] == "no_namespace_runtime_driver"
     assert result["live_sample"]["drivers"] == []
+
+
+def test_fresh_runtime_sample_fingerprints_docker_target_without_persisting_raw_ids(
+    driver_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    config = (driver_repo / "acp.toml").read_text(encoding="utf-8")
+    config = config.replace(
+        '[[runtime.drivers]]\nname = "browser"\nkind = "browser_profile"',
+        '[[runtime.drivers]]\nname = "api"\nkind = "docker_compose"\n'
+        'executable = "/usr/bin/docker"\n',
+    )
+    config += (
+        "\n[runtime.ports]\nAPP_PORT = [43000, 43010]\n"
+        '\n[[runtime.targets]]\nname = "api"\nport_env = "APP_PORT"\n'
+        'driver = "api"\n'
+    )
+    (driver_repo / "acp.toml").write_text(config, encoding="utf-8")
+    container_ids = ["0123456789ab", "fedcba987654"]
+    calls: list[list[str]] = []
+    runner_options: list[dict[str, object]] = []
+    probe_started = False
+    batch_started_at = "2026-10-11T17:00:00+00:00"
+    batch_finished_at = "2026-10-11T17:00:10+00:00"
+
+    def fake_utc_now() -> str:
+        return batch_finished_at if probe_started else batch_started_at
+
+    monkeypatch.setattr(runtime_module, "utc_now", fake_utc_now)
+
+    def fake_run_trusted(argv, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal probe_started
+        probe_started = True
+        calls.append(list(argv))
+        runner_options.append(dict(_kwargs))
+        stdout = "\n".join(container_ids) + "\n" if argv[-3:] == ["ps", "--all", "--quiet"] else ""
+        return {
+            "argv": list(argv),
+            "exit_code": 0,
+            "stdout": stdout,
+            "stderr": "private diagnostic",
+        }
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+    calls.clear()
+    runner_options.clear()
+    probe_started = False
+    with sqlite3.connect(supervisor.db_path) as connection:
+        before_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        before_evidence = connection.execute(
+            "SELECT evidence_json FROM runtime_driver_resources WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()[0]
+
+    sample = supervisor._fresh_runtime_usage_sample(attempt["id"])
+
+    identity = sample["resource_identities"][0]
+    assert identity["driver"] == "api"
+    assert identity["kind"] == "docker_compose"
+    assert identity["identity_available"] is True
+    assert identity["present"] is True
+    assert identity["container_count"] == 2
+    assert identity["container_ids_sha256"] == sha256(
+        canonical_json(sorted(container_ids)).encode("utf-8")
+    )
+    assert sample["sampled_at"] == batch_started_at
+    assert sample["available"] is False
+    assert sample["resource_identity_available"] is True
+    assert all(argv[-3:] == ["ps", "--all", "--quiet"] for argv in calls)
+    assert all(options["max_output_bytes"] == 8192 for options in runner_options)
+    assert all("-f" not in argv for argv in calls)
+    serialized = json.dumps(sample)
+    assert all(container_id not in serialized for container_id in container_ids)
+    assert "private diagnostic" not in serialized
+    with sqlite3.connect(supervisor.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before_events
+        assert (
+            connection.execute(
+                "SELECT evidence_json FROM runtime_driver_resources WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()[0]
+            == before_evidence
+        )
 
 
 def test_fresh_runtime_sample_refuses_corrupt_trust_pin_without_quarantine(
