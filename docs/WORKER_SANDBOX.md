@@ -437,6 +437,21 @@ not a monitor launcher or worker executor: the integration probe still uses a
 placeholder service, does not transfer a live runc handle, and does not attest
 cleanup or result import. `run_worker()` remains fail-closed.
 
+**Monitor control-request codec (2026-10-11; authentication primitive only).**
+The same module now encodes a bounded canonical-JSON request authenticated by a
+fixed 32-byte HMAC-SHA-256 capability. The MAC covers the full fenced execution
+tuple, a request ID, the operation, and (for `start`) the exact launch-plan
+digest. The schema permits only `start`, `status`, and `cancel`; it has no field
+for arbitrary argv, environment, path, UID, or systemd property. The request ID
+is only a deduplication key: this codec does not persist replay state, provide
+Unix-socket peer credentials, store/deliver the secret, or execute any action.
+An eventual monitor server must authenticate the peer, load the expected tuple
+and launch plan from private durable state, reject replays transactionally, and
+authorize each operation before acting. The capability must remain host-private
+and outside all worker mounts. This is not an authenticated reconnect service or
+an executor; no systemd unit, runc handle, gate, cancellation, or cleanup is
+controlled by these functions. `run_worker()` remains fail-closed.
+
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the
 supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)

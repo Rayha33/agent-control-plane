@@ -1,13 +1,15 @@
-"""Durable identity receipts for per-execution systemd monitor services.
+"""Identity receipts and authenticated control requests for monitor services.
 
-This module records and revalidates the manager-owned service identity only.
-It does not transfer a live runc handle, authorize its gate, or prove worker
-cleanup; those actions remain owned by the monitor process.
+This module records and revalidates manager-owned service identity and encodes
+bounded control requests. It does not authenticate peers, prevent replay,
+transfer a live runc handle, authorize its gate, or prove worker cleanup; those
+actions remain owned by the monitor process.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -23,10 +25,15 @@ _UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.(?:service|slice)\Z")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _LINUX_IDENTITY = re.compile(r"linux:([1-9][0-9]*):([1-9][0-9]*)\Z")
 _MAX_RECEIPT_BYTES = 8192
+_MAX_CONTROL_REQUEST_BYTES = 4096
+_CONTROL_KEY_BYTES = 32
+_REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_CONTROL_OPERATIONS = frozenset({"start", "status", "cancel"})
 
 
 class SandboxMonitorReceiptError(ValueError):
-    """A persisted monitor identity is malformed, stale, or contradictory."""
+    """A monitor identity receipt or control request is invalid or contradictory."""
 
 
 def sandbox_container_id(attempt_id: str, claim_token: int, execution_id: str) -> str:
@@ -86,6 +93,197 @@ def _cgroup_path(value: Any, field: str) -> PurePosixPath:
     ):
         raise SandboxMonitorReceiptError(f"{field} is not a canonical absolute cgroup path")
     return path
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "ascii"
+    )
+
+
+def _validate_control_key(key: Any) -> bytes:
+    if type(key) is not bytes or len(key) != _CONTROL_KEY_BYTES:
+        raise SandboxMonitorReceiptError("monitor control key must contain exactly 32 bytes")
+    return key
+
+
+def _validate_control_request_fields(value: Any) -> None:
+    expected = {
+        "version",
+        "attempt_id",
+        "claim_token",
+        "execution_id",
+        "request_id",
+        "operation",
+        "launch_plan_sha256",
+        "mac",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise SandboxMonitorReceiptError("monitor control request has an unsupported shape")
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise SandboxMonitorReceiptError("monitor control request has an unsupported version")
+    _validate_execution_identity(value["attempt_id"], value["claim_token"], value["execution_id"])
+    request_id = value["request_id"]
+    if not isinstance(request_id, str) or _REQUEST_ID.fullmatch(request_id) is None:
+        raise SandboxMonitorReceiptError("monitor control request ID is invalid")
+    operation = value["operation"]
+    if not isinstance(operation, str) or operation not in _CONTROL_OPERATIONS:
+        raise SandboxMonitorReceiptError("monitor control operation is not allowed")
+    plan_digest = value["launch_plan_sha256"]
+    if operation == "start":
+        if not isinstance(plan_digest, str) or _DIGEST.fullmatch(plan_digest) is None:
+            raise SandboxMonitorReceiptError(
+                "monitor start request requires an exact launch-plan digest"
+            )
+    elif plan_digest is not None:
+        raise SandboxMonitorReceiptError(
+            "non-start monitor control request must not carry a launch-plan digest"
+        )
+    mac = value["mac"]
+    if not isinstance(mac, str) or _DIGEST.fullmatch(mac) is None:
+        raise SandboxMonitorReceiptError("monitor control authentication tag is invalid")
+
+
+@dataclass(frozen=True)
+class SandboxMonitorControlRequest:
+    """Command-free request value returned by the authenticated decoder.
+
+    This codec deliberately carries no argv, environment, path, UID, or unit
+    property. The monitor resolves the exact launch plan from its private,
+    durable execution record; ``request_id`` is for server-side deduplication.
+    Direct construction validates shape only and must not be treated as proof
+    that the HMAC was verified; use the decoder at the IPC trust boundary.
+    """
+
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    request_id: str
+    operation: str
+    launch_plan_sha256: str | None
+    mac: str
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        _validate_control_request_fields(self.as_dict())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "attempt_id": self.attempt_id,
+            "claim_token": self.claim_token,
+            "execution_id": self.execution_id,
+            "request_id": self.request_id,
+            "operation": self.operation,
+            "launch_plan_sha256": self.launch_plan_sha256,
+            "mac": self.mac,
+        }
+
+
+def encode_sandbox_monitor_control_request(
+    *,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    request_id: str,
+    operation: str,
+    key: bytes,
+    launch_plan_sha256: str | None = None,
+) -> bytes:
+    """Encode an HMAC-authenticated monitor request with a strict fixed schema.
+
+    The capability key must be stored and delivered out-of-band in a private
+    host-only location. This function does not create sockets, authenticate the
+    peer UID, persist replay state, or execute any monitor operation.
+    """
+
+    key = _validate_control_key(key)
+    material = {
+        "version": 1,
+        "attempt_id": attempt_id,
+        "claim_token": claim_token,
+        "execution_id": execution_id,
+        "request_id": request_id,
+        "operation": operation,
+        "launch_plan_sha256": launch_plan_sha256,
+    }
+    candidate = {**material, "mac": "0" * 64}
+    _validate_control_request_fields(candidate)
+    tag = hmac.new(key, _canonical_json_bytes(material), hashlib.sha256).hexdigest()
+    encoded = _canonical_json_bytes({**material, "mac": tag})
+    if len(encoded) > _MAX_CONTROL_REQUEST_BYTES:
+        raise SandboxMonitorReceiptError("monitor control request exceeds its size bound")
+    return encoded
+
+
+def decode_sandbox_monitor_control_request(
+    encoded: bytes,
+    *,
+    key: bytes,
+    expected_identity: tuple[str, int, str],
+    expected_launch_plan_sha256: str | None = None,
+) -> SandboxMonitorControlRequest:
+    """Verify a canonical request and fence it to the durable execution identity.
+
+    Callers must additionally authenticate the IPC peer and durably deduplicate
+    ``request_id`` before applying side effects. The codec alone is not an IPC
+    server or replay defense.
+    """
+
+    key = _validate_control_key(key)
+    if type(encoded) is not bytes or not encoded or len(encoded) > _MAX_CONTROL_REQUEST_BYTES:
+        raise SandboxMonitorReceiptError("monitor control request is empty or oversized")
+    try:
+        decoded = json.loads(encoded.decode("ascii"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SandboxMonitorReceiptError(
+            "monitor control request is not valid ASCII JSON"
+        ) from error
+    _validate_control_request_fields(decoded)
+    if _canonical_json_bytes(decoded) != encoded:
+        raise SandboxMonitorReceiptError("monitor control request is not canonical JSON")
+
+    material = {name: value for name, value in decoded.items() if name != "mac"}
+    expected_mac = hmac.new(key, _canonical_json_bytes(material), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(decoded["mac"], expected_mac):
+        raise SandboxMonitorReceiptError("monitor control request authentication failed")
+
+    if (
+        not isinstance(expected_identity, tuple)
+        or len(expected_identity) != 3
+        or type(expected_identity[1]) is not int
+    ):
+        raise SandboxMonitorReceiptError("expected monitor execution identity is invalid")
+    _validate_execution_identity(*expected_identity)
+    observed_identity = (decoded["attempt_id"], decoded["claim_token"], decoded["execution_id"])
+    if observed_identity != expected_identity:
+        raise SandboxMonitorReceiptError("monitor control request is fenced to another execution")
+    if decoded["operation"] == "start":
+        if (
+            not isinstance(expected_launch_plan_sha256, str)
+            or _DIGEST.fullmatch(expected_launch_plan_sha256) is None
+        ):
+            raise SandboxMonitorReceiptError(
+                "monitor start authorization requires a trusted launch-plan digest"
+            )
+        if not hmac.compare_digest(decoded["launch_plan_sha256"], expected_launch_plan_sha256):
+            raise SandboxMonitorReceiptError(
+                "monitor start request does not match the durable launch plan"
+            )
+    elif expected_launch_plan_sha256 is not None:
+        raise SandboxMonitorReceiptError(
+            "expected launch-plan digest is only valid for a monitor start request"
+        )
+    return SandboxMonitorControlRequest(
+        attempt_id=decoded["attempt_id"],
+        claim_token=decoded["claim_token"],
+        execution_id=decoded["execution_id"],
+        request_id=decoded["request_id"],
+        operation=decoded["operation"],
+        launch_plan_sha256=decoded["launch_plan_sha256"],
+        mac=decoded["mac"],
+        version=decoded["version"],
+    )
 
 
 @dataclass(frozen=True)

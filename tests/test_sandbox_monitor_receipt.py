@@ -11,8 +11,11 @@ import pytest
 
 import agent_control_plane.supervisor.sandbox_monitor_receipt as receipt_module
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
+    SandboxMonitorControlRequest,
     SandboxMonitorReceipt,
     SandboxMonitorReceiptError,
+    decode_sandbox_monitor_control_request,
+    encode_sandbox_monitor_control_request,
     read_sandbox_monitor_receipt,
     sandbox_attempt_slice_unit,
     sandbox_monitor_service_unit,
@@ -392,3 +395,153 @@ def test_receipt_fields_match_journal_unit_derivation() -> None:
     )
     expected_container_id = f"acp-{hashlib.sha256(identity.encode()).hexdigest()[:60]}"
     assert receipt.unit == f"acp-monitor-{expected_container_id.removeprefix('acp-')}.service"
+
+
+_CONTROL_KEY = b"monitor-control-test-key-0000000"
+
+
+def _control_request(operation: str = "status", **overrides: object) -> bytes:
+    receipt = _receipt()
+    values: dict[str, object] = {
+        "attempt_id": receipt.attempt_id,
+        "claim_token": receipt.claim_token,
+        "execution_id": receipt.execution_id,
+        "request_id": "c" * 32,
+        "operation": operation,
+        "key": _CONTROL_KEY,
+    }
+    if operation == "start":
+        values["launch_plan_sha256"] = "d" * 64
+    values.update(overrides)
+    return encode_sandbox_monitor_control_request(**values)  # type: ignore[arg-type]
+
+
+def test_monitor_control_request_round_trips_only_fenced_control_intent() -> None:
+    receipt = _receipt()
+    encoded = _control_request("start")
+    request = decode_sandbox_monitor_control_request(
+        encoded,
+        key=_CONTROL_KEY,
+        expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+        expected_launch_plan_sha256="d" * 64,
+    )
+
+    assert type(request) is SandboxMonitorControlRequest
+    assert request.operation == "start"
+    assert request.launch_plan_sha256 == "d" * 64
+    assert request.request_id == "c" * 32
+    assert request.attempt_id == receipt.attempt_id
+    assert request.claim_token == receipt.claim_token
+    assert request.execution_id == receipt.execution_id
+
+
+@pytest.mark.parametrize("operation", ["status", "cancel"])
+def test_monitor_control_read_and_cancel_requests_carry_no_launch_plan(
+    operation: str,
+) -> None:
+    receipt = _receipt()
+    request = decode_sandbox_monitor_control_request(
+        _control_request(operation),
+        key=_CONTROL_KEY,
+        expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+    )
+    assert request.operation == operation
+    assert request.launch_plan_sha256 is None
+
+
+@pytest.mark.parametrize("operation", ["exec", "launch", "release_gate", "delete"])
+def test_monitor_control_codec_rejects_arbitrary_execution_operations(operation: str) -> None:
+    with pytest.raises(SandboxMonitorReceiptError, match="operation is not allowed"):
+        _control_request(operation)
+
+
+def test_monitor_control_request_rejects_mac_or_key_tampering() -> None:
+    receipt = _receipt()
+    encoded = _control_request("status")
+    changed = json.loads(encoded)
+    changed["operation"] = "cancel"
+    changed_bytes = json.dumps(changed, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+    with pytest.raises(SandboxMonitorReceiptError, match="authentication failed"):
+        decode_sandbox_monitor_control_request(
+            changed_bytes,
+            key=_CONTROL_KEY,
+            expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+        )
+    with pytest.raises(SandboxMonitorReceiptError, match="authentication failed"):
+        decode_sandbox_monitor_control_request(
+            encoded,
+            key=b"x" * 32,
+            expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+        )
+
+
+def test_monitor_control_request_rejects_stale_execution_fence() -> None:
+    receipt = _receipt()
+    with pytest.raises(SandboxMonitorReceiptError, match="another execution"):
+        decode_sandbox_monitor_control_request(
+            _control_request("cancel"),
+            key=_CONTROL_KEY,
+            expected_identity=(receipt.attempt_id, receipt.claim_token + 1, receipt.execution_id),
+        )
+
+
+def test_monitor_start_request_must_match_the_durable_launch_plan() -> None:
+    receipt = _receipt()
+    arguments = {
+        "key": _CONTROL_KEY,
+        "expected_identity": (receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+    }
+    with pytest.raises(SandboxMonitorReceiptError, match="trusted launch-plan digest"):
+        decode_sandbox_monitor_control_request(_control_request("start"), **arguments)
+    with pytest.raises(SandboxMonitorReceiptError, match="does not match the durable launch plan"):
+        decode_sandbox_monitor_control_request(
+            _control_request("start"),
+            **arguments,
+            expected_launch_plan_sha256="e" * 64,
+        )
+
+
+def test_monitor_control_request_rejects_duplicate_and_noncanonical_json() -> None:
+    receipt = _receipt()
+    encoded = _control_request("status")
+    duplicate = encoded[:-1] + b',"version":1}'
+    with pytest.raises(SandboxMonitorReceiptError, match="duplicate JSON keys"):
+        decode_sandbox_monitor_control_request(
+            duplicate,
+            key=_CONTROL_KEY,
+            expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+        )
+
+    noncanonical = json.dumps(json.loads(encoded), indent=2).encode("ascii")
+    with pytest.raises(SandboxMonitorReceiptError, match="not canonical JSON"):
+        decode_sandbox_monitor_control_request(
+            noncanonical,
+            key=_CONTROL_KEY,
+            expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "digest"),
+    [("start", None), ("start", "not-a-digest"), ("status", "d" * 64)],
+)
+def test_monitor_control_request_requires_operation_specific_plan_binding(
+    operation: str, digest: str | None
+) -> None:
+    with pytest.raises(SandboxMonitorReceiptError, match="launch-plan digest"):
+        _control_request(operation, launch_plan_sha256=digest)
+
+
+@pytest.mark.parametrize("key", [b"short", b"x" * 33, bytearray(b"x" * 32)])
+def test_monitor_control_codec_requires_a_fixed_length_byte_key(key: object) -> None:
+    receipt = _receipt()
+    with pytest.raises(SandboxMonitorReceiptError, match="exactly 32 bytes"):
+        encode_sandbox_monitor_control_request(
+            attempt_id=receipt.attempt_id,
+            claim_token=receipt.claim_token,
+            execution_id=receipt.execution_id,
+            request_id="c" * 32,
+            operation="status",
+            key=key,  # type: ignore[arg-type]
+        )
