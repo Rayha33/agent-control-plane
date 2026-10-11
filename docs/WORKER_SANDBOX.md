@@ -436,6 +436,18 @@ cancellation, or verify cleanup/result import. The service-owner pattern is
 therefore the integration direction, not a completed executor; `run_worker`
 remains fail-closed.
 
+New v6 launch plans derive the monitor unit name from the complete
+`(attempt_id, claim_token, execution_id)` identity; the journal rejects launch
+receipts that reuse a generic service name. Existing v5 plans retain their previous
+read/validation semantics. The unit name is only a collision-resistant
+lookup key: adoption still requires its exact systemd invocation ID, cgroup,
+and live monitor identity, plus the durable launch-plan binding. The monitor
+must load and revalidate operator configuration in its own process; serializing
+the caller's `_PinnedRuncWorkerConfig` or `RuncLaunchHandle` would not transfer
+their process-local provenance. This naming guard narrows one adoption/replay
+ambiguity but does not implement monitor startup, authenticated reconnect, or
+worker execution.
+
 ## Threat model
 
 Assume the worker command, model-generated scripts, project files, symlinks,
