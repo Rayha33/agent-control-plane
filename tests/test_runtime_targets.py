@@ -1339,6 +1339,27 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         )
         if strict_binding_phase == "qc":
             assert qc_result["verdict"] == "block"
+            assert qc_result["runtime_cleanup"]["state"] == "teardown_failed"
+            with supervisor.connect() as connection:
+                task_status = connection.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (submission["task_id"],)
+                ).fetchone()["status"]
+                teardown_events = connection.execute(
+                    "SELECT payload_json FROM events WHERE event_type = ? ORDER BY sequence DESC",
+                    ("runtime.teardown_failed",),
+                ).fetchall()
+            assert task_status == "cleanup_pending"
+            teardown_payloads = [json.loads(row["payload_json"]) for row in teardown_events]
+            teardown_payload = next(
+                payload
+                for payload in teardown_payloads
+                if payload.get("attempt_id") == attempt["id"]
+            )
+            assert teardown_payload["occupied"] == [f"APP_PORT={port}"]
+            assert any(
+                allocation["pool_name"] == "APP_PORT" and allocation["value"] == port
+                for allocation in qc_result["runtime_cleanup"]["allocations"]
+            )
             assert restart_phases == [], "strict QC restarted a runtime before its guaranteed block"
             assert identity_probes == [], "strict QC probed app self-report without command binding"
             with supervisor.connect() as connection:
