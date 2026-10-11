@@ -1709,6 +1709,394 @@ def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
         shutil.rmtree(private_directory)
 
 
+def test_live_systemd_loadcredential_restart_requires_source_again() -> None:
+    """Prove a restart re-resolves LoadCredential sources using only a fake value."""
+
+    import stat
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the opt-in credential restart test requires Linux cgroup v2")
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    version_line = _run([systemctl, "--version"]).stdout.splitlines()[0]
+    try:
+        systemd_version = int(version_line.split()[1].split(".", 1)[0])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError("systemd version could not be read") from error
+    if systemd_version < 252:
+        raise RuntimeError("the supported credential restart probe requires systemd 252 or newer")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+    runtime_directory_value = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_directory_value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for the credential restart probe")
+
+    token = uuid.uuid4().hex
+    unit = f"acp-credential-restart-{token}.service"
+    runtime_directory = Path(runtime_directory_value)
+    if _unit_properties(systemctl, unit).get("LoadState") != "not-found":
+        raise RuntimeError(f"random credential restart unit already exists: {unit}")
+    private_directory = Path(
+        tempfile.mkdtemp(prefix="acp-credential-restart-", dir=runtime_directory)
+    )
+    directory_identity = private_directory.lstat()
+    source_path = private_directory / "credential-source"
+    starts_path = private_directory / "starts"
+    report_path = private_directory / "credential-report.json"
+    release_path = private_directory / "release"
+    fake_secret = (uuid.uuid4().hex + uuid.uuid4().hex).encode("ascii")
+    fake_digest = hashlib.sha256(fake_secret).hexdigest()
+    launch_attempted = False
+    first_unit: dict[str, str] = {}
+    control_groups: set[str] = set()
+    process_identities: set[tuple[int, str]] = set()
+    cleanup_errors: list[str] = []
+    try:
+        if (
+            directory_identity.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_identity.st_mode) != 0o700
+            or not stat.S_ISDIR(directory_identity.st_mode)
+        ):
+            raise AssertionError("credential restart fixture directory is not private")
+        descriptor = os.open(
+            source_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            if os.write(descriptor, fake_secret) != len(fake_secret):
+                raise RuntimeError("fake credential source write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        source_info = source_path.lstat()
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_uid != os.geteuid()
+            or stat.S_IMODE(source_info.st_mode) != 0o600
+        ):
+            raise AssertionError("fake credential source is not private")
+
+        # The first activation proves its copied credential survives source
+        # removal. It then exits unsuccessfully so systemd must perform a real
+        # automatic restart; a second process marker would mean the restart
+        # improperly reused the old credential copy.
+        worker = (
+            "import hashlib,json,os,sys,time; from pathlib import Path; "
+            "root=Path(sys.argv[1]); starts=root/'starts'; "
+            "fd=os.open(starts,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600); "
+            "os.write(fd,b'worker-started\\n'); os.close(fd); "
+            "credential=Path(os.environ['CREDENTIALS_DIRECTORY'])/'launch'; "
+            "before=credential.read_bytes(); "
+            "deadline=time.monotonic()+10; "
+            "exec(\"while not (root/'release').exists() and time.monotonic()<deadline: time.sleep(0.01)\"); "
+            "after=credential.read_bytes(); "
+            "report={'before_sha256':hashlib.sha256(before).hexdigest(), "
+            "'after_sha256':hashlib.sha256(after).hexdigest(), "
+            "'secret_in_environment':any(before.decode('ascii') in value for value in os.environ.values()), "
+            "'credential_read_only':(credential.stat().st_mode&0o222)==0}; "
+            "(root/'credential-report.json').write_text(json.dumps(report),encoding='ascii'); "
+            "sys.exit(75)"
+        )
+        launch_attempted = True
+        launch_output = _run(
+            [
+                systemd_run,
+                "--user",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "--property=RuntimeMaxSec=30s",
+                "--property=Restart=on-failure",
+                "--property=RestartSec=500ms",
+                "--property=StartLimitIntervalSec=15s",
+                "--property=StartLimitBurst=2",
+                f"--property=LoadCredential=launch:{source_path}",
+                "--no-block",
+                sys.executable,
+                "-c",
+                worker,
+                str(private_directory),
+            ],
+            timeout=10.0,
+        )
+        if fake_secret.decode("ascii") in launch_output.stdout + launch_output.stderr:
+            raise AssertionError("systemd-run output exposed the fake credential")
+        first_unit = _wait_active(systemctl, unit)
+        if (
+            first_unit.get("Id") != unit
+            or first_unit.get("LoadState") != "loaded"
+            or not first_unit.get("InvocationID")
+            or not first_unit.get("ControlGroup")
+        ):
+            raise AssertionError("credential restart probe lacks an exact active unit identity")
+        control_groups.add(first_unit["ControlGroup"])
+        first_pid = int(first_unit.get("MainPID", "0"))
+        first_identity = ProcessMixin._process_identity(first_pid) if first_pid > 0 else None
+        if first_identity is None:
+            raise AssertionError("first credential activation process identity was not observable")
+        process_identities.add((first_pid, first_identity))
+
+        deadline = time.monotonic() + _WAIT_SECONDS
+        while not starts_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not starts_path.is_file() or starts_path.read_bytes() != b"worker-started\n":
+            raise AssertionError("first fake worker activation did not reach its read gate")
+
+        # Unlink only the private, identity-checked source entry. systemd's
+        # already-created credential copy must remain readable by this first
+        # activation, while a later activation must resolve the now-missing
+        # source anew.
+        current_source = source_path.lstat()
+        if (
+            not stat.S_ISREG(current_source.st_mode)
+            or (current_source.st_dev, current_source.st_ino)
+            != (source_info.st_dev, source_info.st_ino)
+            or current_source.st_uid != os.geteuid()
+            or stat.S_IMODE(current_source.st_mode) != 0o600
+        ):
+            raise AssertionError("credential source identity changed before unlink")
+        source_path.unlink()
+        descriptor = os.open(
+            release_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            if os.write(descriptor, b"release\n") != 8:
+                raise RuntimeError("credential restart release marker write was incomplete")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        deadline = time.monotonic() + _WAIT_SECONDS
+        terminal: dict[str, str] = {}
+        unit_status = ""
+        restart_count = 0
+        while time.monotonic() < deadline:
+            observed = _run(
+                [
+                    systemctl,
+                    "--user",
+                    "show",
+                    unit,
+                    "--no-pager",
+                    "--property=Id",
+                    "--property=LoadState",
+                    "--property=ActiveState",
+                    "--property=InvocationID",
+                    "--property=ControlGroup",
+                    "--property=MainPID",
+                    "--property=NRestarts",
+                    "--property=Result",
+                ]
+            )
+            terminal = dict(
+                line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line
+            )
+            if terminal.get("LoadState") == "not-found":
+                status = _run(
+                    [systemctl, "--user", "status", unit, "--no-pager", "--full"],
+                    accepted_returncodes=(0, 3),
+                )
+                unit_status = status.stdout + status.stderr
+                break
+            if terminal.get("Id") != unit:
+                raise AssertionError("credential restart unit identity changed")
+            if terminal.get("ControlGroup"):
+                control_groups.add(terminal["ControlGroup"])
+            try:
+                restart_count = int(terminal.get("NRestarts", "0"))
+                main_pid = int(terminal.get("MainPID", "0"))
+            except ValueError as error:
+                raise AssertionError(
+                    "systemd credential restart properties were invalid"
+                ) from error
+            if main_pid > 0:
+                identity = ProcessMixin._process_identity(main_pid)
+                if identity is not None:
+                    process_identities.add((main_pid, identity))
+            if terminal.get("ActiveState") == "failed" and restart_count >= 1:
+                status = _run(
+                    [systemctl, "--user", "status", unit, "--no-pager", "--full"],
+                    accepted_returncodes=(0, 3),
+                )
+                unit_status = status.stdout + status.stderr
+                break
+            time.sleep(0.05)
+        if restart_count < 1:
+            raise AssertionError(
+                f"systemd did not record the expected automatic restart: {terminal!r}"
+            )
+        if terminal.get("LoadState") != "loaded" or terminal.get("ActiveState") != "failed":
+            raise AssertionError(
+                f"restart did not fail closed on the missing credential: {terminal!r}"
+            )
+        if int(terminal.get("MainPID", "-1")) != 0:
+            raise AssertionError("failed credential restart left a live main process")
+        if not report_path.is_file():
+            raise AssertionError("first activation did not re-read its copied credential")
+        report = json.loads(report_path.read_text(encoding="ascii"))
+        expected_report = {
+            "before_sha256": fake_digest,
+            "after_sha256": fake_digest,
+            "secret_in_environment": False,
+            "credential_read_only": True,
+        }
+        if report != expected_report:
+            raise AssertionError(
+                f"systemd credential copy changed after source removal: {report!r}"
+            )
+        if starts_path.read_bytes() != b"worker-started\n":
+            raise AssertionError("restart executed a second worker without the removed source")
+        if "243/CREDENTIALS" not in unit_status:
+            raise AssertionError(
+                "systemd did not report the credential-load failure for the restart; "
+                f"unit={terminal!r}; status={unit_status!r}"
+            )
+        if fake_secret.decode("ascii") in unit_status:
+            raise AssertionError("systemd status exposed the fake credential")
+    finally:
+        deadline = time.monotonic() + _WAIT_SECONDS
+        terminal_unit = False
+        last: dict[str, str] = {}
+        if launch_attempted:
+            try:
+                subprocess.run(
+                    [systemctl, "--user", "stop", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(2.0, _WAIT_SECONDS),
+                    env=_environment(),
+                )
+                subprocess.run(
+                    [systemctl, "--user", "reset-failed", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(2.0, _WAIT_SECONDS),
+                    env=_environment(),
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not stop exact credential restart unit: {error}")
+        while time.monotonic() < deadline:
+            try:
+                last = _unit_properties(systemctl, unit)
+                if last.get("LoadState") == "not-found":
+                    terminal_unit = True
+                elif last.get("LoadState") == "loaded" and last.get("Id") == unit:
+                    if last.get("ControlGroup"):
+                        control_groups.add(last["ControlGroup"])
+                    try:
+                        main_pid = int(last.get("MainPID", "0"))
+                    except ValueError:
+                        cleanup_errors.append("credential restart MainPID was invalid")
+                        break
+                    if main_pid > 0:
+                        identity = ProcessMixin._process_identity(main_pid)
+                        if identity is not None:
+                            process_identities.add((main_pid, identity))
+                    if last.get("ActiveState") not in {"inactive", "failed"} or main_pid != 0:
+                        subprocess.run(
+                            [systemctl, "--user", "stop", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                    else:
+                        subprocess.run(
+                            [systemctl, "--user", "reset-failed", unit],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=min(2.0, _WAIT_SECONDS),
+                            env=_environment(),
+                        )
+                else:
+                    cleanup_errors.append(f"credential restart unit identity is unknown: {last!r}")
+                    break
+                if (
+                    terminal_unit
+                    and all(_cgroup_is_empty(group) for group in control_groups)
+                    and all(
+                        ProcessMixin._process_identity(pid) != identity
+                        for pid, identity in process_identities
+                    )
+                ):
+                    break
+            except (OSError, RuntimeError, AssertionError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify credential restart cleanup: {error}")
+                break
+            time.sleep(0.05)
+        else:
+            cleanup_errors.append(f"credential restart unit did not unload: {last!r}")
+        if not terminal_unit:
+            if not cleanup_errors:
+                cleanup_errors.append(f"credential restart unit remained loaded: {last!r}")
+        for control_group in control_groups:
+            try:
+                if not _cgroup_is_empty(control_group):
+                    cleanup_errors.append(
+                        f"credential restart cgroup remained populated: {control_group}"
+                    )
+            except (OSError, RuntimeError, AssertionError) as error:
+                cleanup_errors.append(f"could not verify credential restart cgroup: {error}")
+        if any(
+            ProcessMixin._process_identity(pid) == identity for pid, identity in process_identities
+        ):
+            cleanup_errors.append("credential restart process identity remained alive")
+        try:
+            after = private_directory.lstat()
+            if (
+                (after.st_dev, after.st_ino)
+                != (directory_identity.st_dev, directory_identity.st_ino)
+                or after.st_uid != os.geteuid()
+                or not stat.S_ISDIR(after.st_mode)
+                or stat.S_IMODE(after.st_mode) != 0o700
+                or private_directory.is_symlink()
+            ):
+                cleanup_errors.append("credential restart fixture directory identity changed")
+            else:
+                expected_entries = {"starts", "credential-report.json", "release"}
+                if source_path.exists():
+                    expected_entries.add(source_path.name)
+                for entry in private_directory.iterdir():
+                    info = entry.lstat()
+                    if (
+                        entry.name not in expected_entries
+                        or not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or entry.is_symlink()
+                    ):
+                        cleanup_errors.append(
+                            f"unexpected credential restart fixture entry: {entry.name}"
+                        )
+        except OSError as error:
+            cleanup_errors.append(
+                f"credential restart fixture directory could not be verified: {error}"
+            )
+        if cleanup_errors:
+            raise RuntimeError(
+                "credential restart cleanup was not verified; private fixture retained at "
+                f"{private_directory}: " + "; ".join(cleanup_errors)
+            ) from sys.exc_info()[1]
+        shutil.rmtree(private_directory)
+
+
 if __name__ == "__main__":
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--monitor-controller":

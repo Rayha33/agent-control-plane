@@ -2788,8 +2788,34 @@ as a stop followed by a start and subjects it to start-rate limits; the monitor
 must re-read the exact journaled fencing epoch and reconcile the exact units
 before it can observe or cancel a worker. A service restart must never blindly
 repeat the launch request. The service's credential-source lifetime and
-restart behavior still need an exact systemd-252 live test, followed by
-monitor-owned `RuncLaunchHandle` lifecycle and registered-worker integration.
+restart behavior is now tested on exact systemd 252.39 below. Monitor-owned
+`RuncLaunchHandle` lifecycle and registered-worker integration remain open.
 See the pinned [systemd v252 service restart
 semantics](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L493-L495)
 and [restart rate-limit behavior](https://github.com/systemd/systemd/blob/v252/man/systemd.service.xml#L818-L823).
+
+**Credential source lifetime and restart fail-closed proof (2026-10-11; systemd
+252.39).** The opt-in
+`test_live_systemd_loadcredential_restart_requires_source_again` ran twice in a
+new no-host-share Lima 2.2.1 VZ Debian 12 ARM64 guest: kernel
+`6.1.0-53-cloud-arm64`, systemd `252.39-1~deb12u2`, Python 3.11.2, pytest 9.1.1,
+and cgroup v2. The exact test-file SHA-256 was
+`de735a8d37a8b6c5a8cd3e636285474c03bfd58b5d5a17022d48da435c447930`; both
+opt-in runs passed. It used only a random fake value and a private mode-0700
+fixture. After the first service process was active, the test unlinked the
+identity-checked source, let that process read the same credential copy again,
+and then forced an exit to exercise systemd's automatic restart. The child
+reported only the digest and boolean checks: its credential stayed unchanged
+and read-only and the fake value was absent from its environment. systemd
+recorded an automatic restart and failed at `CREDENTIALS` (`243/CREDENTIALS`)
+before a second worker process ran; the fixture's process-start marker contained
+exactly one activation. This matches systemd's contract that credentials are
+acquired at activation, immutable while the service runs, and released on
+deactivation ([systemd v252 service credentials](https://github.com/systemd/systemd/blob/v252/docs/CREDENTIALS.md#system-and-service-credentials)).
+
+Post-run checks found no transient unit, populated cgroup, original process
+identity, or fixture directory. This closes only the systemd credential
+transport/lifecycle primitive: ACP's production monitor still does not use
+`LoadCredential=`, and this does not isolate credentials from other trusted
+processes under the same host UID, prove provider authentication, or wire the
+monitor into `run_worker()`. Keep configured OCI worker execution fail-closed.
