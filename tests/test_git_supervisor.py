@@ -9,6 +9,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -20,10 +21,12 @@ from types import SimpleNamespace
 
 import pytest
 from support import (
+    event_count,
     install_passing_critic,
     passing_critic_script,
     python_command,
     requires_linux_worker,
+    state_fingerprint,
 )
 
 from agent_control_plane import worker_trampoline
@@ -36,6 +39,7 @@ from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker as oci_worker_module
 from agent_control_plane.supervisor import process as process_module
 from agent_control_plane.supervisor import result_import as result_import_module
+from agent_control_plane.supervisor import views as views_module
 from agent_control_plane.supervisor import workers as workers_module
 from agent_control_plane.supervisor.common import canonical_json, sha256
 from agent_control_plane.supervisor.result_import import result_ref_name
@@ -3279,6 +3283,26 @@ def test_qc_uses_real_commit_and_failure_cannot_pass(repo: Path) -> None:
     assert supervisor.task(created["id"])["status"] == "blocked"
 
 
+def test_qc_packet_setup_failure_preserves_original_error_and_pending_state(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    commit_change(attempt, "alpha.txt", "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    def fail_packet(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise SupervisorError("packet_creation_failed", "original packet setup failure")
+
+    monkeypatch.setattr(supervisor, "_review_packet", fail_packet)
+    with pytest.raises(SupervisorError, match="original packet setup failure") as captured:
+        supervisor.run_qc(submission["id"], "independent-qc")
+
+    assert captured.value.code == "packet_creation_failed"
+    assert supervisor.submission(submission["id"])["status"] == "pending_qc"
+
+
 def test_qc_command_that_mutates_candidate_cannot_pass(repo: Path) -> None:
     write_config(
         repo,
@@ -3292,6 +3316,748 @@ def test_qc_command_that_mutates_candidate_cannot_pass(repo: Path) -> None:
     review = supervisor.run_qc(submission["id"], "independent-qc")
     assert review["verdict"] == "revise"
     assert "mutated the candidate" in review["findings"][0]["finding"]
+
+
+def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) -> None:
+    write_config(
+        repo,
+        [
+            python_command(
+                'from pathlib import Path; print("".join(["PRIVATE", "_QC", "_OUTPUT"])); '
+                'Path("alpha.txt").write_text("QC touched")'
+            )
+        ],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index, content in enumerate(("candidate one\n", "candidate two\n")):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", content)
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        review = supervisor.run_qc(submission["id"], "independent-qc")
+        assert review["verdict"] == "revise"
+        submissions.append(submission)
+
+    readonly = GitSupervisor(repo, read_only=True)
+    before = state_fingerprint(readonly)
+    event_total = event_count(readonly)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    after = state_fingerprint(readonly)
+
+    assert compared["schema"] == "acp-submission-comparison-v1"
+    assert compared["order"] == "caller_supplied_no_ranking"
+    assert compared["read_only"] is True
+    assert compared["task_brief"]["state"] == "current_brief_available"
+    assert compared["task_brief"]["sha256"]
+    assert [item["submission_id"] for item in compared["candidates"]] == [
+        item["id"] for item in submissions
+    ]
+    expected_base_states = ["same_as_current_task_base", "different_from_current_task_base"]
+    for candidate, submission, expected_base_state in zip(
+        compared["candidates"], submissions, expected_base_states, strict=True
+    ):
+        assert candidate["commit_sha"] == submission["commit_sha"]
+        assert candidate["tree_sha"] == submission["tree_sha"]
+        assert candidate["patch_sha256"] == submission["patch_sha256"]
+        assert candidate["diff_summary"]["state"] == "available"
+        assert candidate["diff_summary"]["basis"] == "attempt_start_to_commit"
+        assert candidate["diff_summary"]["files_changed"] >= 1
+        assert candidate["task_brief"]["binding_state"] == "exact"
+        assert candidate["task_brief"]["attempt_sha256"] == compared["task_brief"]["sha256"]
+        assert candidate["base_relation"]["state"] == expected_base_state
+        assert candidate["latest_qc"]["candidate_binding"] == "exact"
+        assert candidate["latest_qc"]["policy_fingerprint"]
+        assert candidate["latest_qc"]["record_state"] == "recorded_only_not_revalidated"
+        assert candidate["latest_qc"]["recorded_verdict"] == "revise"
+        assert candidate["latest_qc"]["reviewer_provider"]
+        assert candidate["latest_qc"]["policy_state"] == "current_and_ratified"
+        assert candidate["latest_qc"]["bundle_integrity_state"] == "verified"
+        assert candidate["latest_qc"]["coverage_contract_state"] == "current"
+        assert candidate["latest_qc"]["evidence_complete"] is True
+        assert candidate["latest_qc"]["handoff_eligibility"] == "eligible"
+        assert candidate["latest_qc"]["acceptance_coverage"]["integrity_state"] == "verified"
+        assert candidate["latest_qc"]["findings"]["integrity_state"] == "verified"
+        assert candidate["latest_qc"]["command_results"]["integrity_state"] == "verified"
+        assert candidate["latest_qc"]["review_packet_sha256"]
+        assert candidate["latest_qc"]["findings"]["state"] == "available"
+        assert candidate["review_handoff"]["state"] == "prepared_not_dispatched"
+        assert candidate["review_handoff"]["task_brief_binding_state"] == "exact"
+        assert candidate["review_handoff"]["handoff_eligibility"] == "eligible"
+        assert candidate["review_handoff"]["qc_evidence_state"] == "eligible"
+        assert candidate["review_handoff"]["qc_run_id"] == candidate["latest_qc"]["qc_run_id"]
+        assert (
+            candidate["review_handoff"]["review_packet_sha256"]
+            == candidate["latest_qc"]["review_packet_sha256"]
+        )
+        assert candidate["review_handoff"]["critic_write_authority"] is False
+        assert candidate["review_handoff"]["automatic_selection_or_dispatch"] is False
+        assert candidate["review_handoff"]["feedback_route"]["mode"] == ("authenticated_owner_pull")
+        assert (
+            candidate["review_handoff"]["feedback_route"]["attempt_id"] == (candidate["attempt_id"])
+        )
+        assert candidate["review_handoff"]["feedback_route"]["credential_role"] == "worker"
+        assert candidate["completion_receipt"]["state"] == "not_provided"
+    serialized = json.dumps(compared)
+    assert "PRIVATE_QC_OUTPUT" not in serialized
+    assert "candidate one" not in serialized
+    assert before == after
+    assert event_count(readonly) == event_total
+    assert len(serialized.encode("utf-8")) < 100_000
+
+
+def test_compare_submissions_pins_brief_and_withholds_stale_or_legacy_handoff(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(3):
+        if index == 1:
+            with supervisor.connect() as connection:
+                connection.execute(
+                    "UPDATE tasks SET title = ?, description = ?, acceptance_json = ? WHERE id = ?",
+                    (
+                        "Updated task title",
+                        "PRIVATE_TASK_OBJECTIVE_v2",
+                        json.dumps(["updated acceptance criterion"]),
+                        created["id"],
+                    ),
+                )
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        assert len(attempt["task_brief_sha256"]) == 64
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    # Model an attempt created before v29: its historical brief cannot be
+    # reconstructed, so it must remain explicitly unpinned.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER attempts_task_brief_pin_immutable")
+        connection.execute(
+            "UPDATE attempts SET task_brief_sha256 = '' WHERE id = ?",
+            (submissions[2]["attempt_id"],),
+        )
+
+    readonly = GitSupervisor(repo, read_only=True)
+    before = state_fingerprint(readonly)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    after = state_fingerprint(readonly)
+    stale, exact, legacy = [item for item in compared["candidates"]]
+
+    assert compared["task_brief"]["state"] == "current_brief_available"
+    assert stale["task_brief"]["binding_state"] == "stale"
+    assert stale["review_handoff"]["handoff_eligibility"] == "incomplete_task_brief"
+    assert stale["review_handoff"]["qc_evidence_state"] == "task_brief_stale"
+    assert stale["review_handoff"]["qc_run_id"] is None
+    assert stale["review_handoff"]["review_packet_sha256"] is None
+    assert exact["task_brief"]["binding_state"] == "exact"
+    assert exact["review_handoff"]["task_brief_sha256"] == compared["task_brief"]["sha256"]
+    assert exact["review_handoff"]["handoff_eligibility"] == "eligible"
+    assert legacy["task_brief"]["binding_state"] == "legacy_unpinned"
+    assert legacy["review_handoff"]["handoff_eligibility"] == "incomplete_task_brief"
+    assert legacy["review_handoff"]["qc_run_id"] is None
+    assert before == after
+    assert "PRIVATE_TASK_OBJECTIVE_v2" not in json.dumps(compared)
+
+
+def test_compare_submissions_rejects_database_only_qc_record_mutations(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    reviews = []
+    for index in range(4):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        review = supervisor.run_qc(submission["id"], "independent-qc")
+        assert review["verdict"] == "revise"
+        submissions.append(submission)
+        reviews.append(review)
+
+    database = repo / ".acp" / "control.db"
+    with sqlite3.connect(database) as connection:
+        changed_results = json.loads(
+            connection.execute(
+                "SELECT results_json FROM qc_runs WHERE submission_id = ?",
+                (submissions[0]["id"],),
+            ).fetchone()[0]
+        )
+        changed_results[0]["exit_code"] = 0 if changed_results[0]["exit_code"] else 1
+        connection.execute(
+            "UPDATE qc_runs SET results_json = ? WHERE submission_id = ?",
+            (json.dumps(changed_results), submissions[0]["id"]),
+        )
+
+        changed_findings = json.loads(
+            connection.execute(
+                "SELECT findings_json FROM qc_runs WHERE submission_id = ?",
+                (submissions[1]["id"],),
+            ).fetchone()[0]
+        )
+        assert changed_findings
+        changed_findings[0]["finding"] += " database-only mutation"
+        connection.execute(
+            "UPDATE qc_runs SET findings_json = ? WHERE submission_id = ?",
+            (json.dumps(changed_findings), submissions[1]["id"]),
+        )
+
+        # Model an older, validly signed QC policy record whose mutable DB row
+        # is later rewritten to the currently ratified policy fingerprint.
+        old_policy = "older-signed-policy"
+        policy_record = supervisor.reproduction_bundle(reviews[2]["id"])["bundle"]
+        policy_payload = {key: value for key, value in policy_record.items() if key != "signature"}
+        policy_payload["policy_fingerprint"] = old_policy
+        policy_signature = supervisor.assurance.sign(policy_payload)
+        signed_policy_record = {**policy_payload, "signature": policy_signature}
+        policy_bundle_hash = sha256(canonical_json(signed_policy_record).encode("utf-8"))
+        (supervisor.state_dir / "bundles" / f"{reviews[2]['id']}.json").write_text(
+            json.dumps(signed_policy_record, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        connection.execute(
+            "UPDATE qc_runs SET policy_fingerprint = ?, reviewer_signature = ?, bundle_sha256 = ? "
+            "WHERE submission_id = ?",
+            (old_policy, policy_signature, policy_bundle_hash, submissions[2]["id"]),
+        )
+        current_policy = supervisor.assurance_policy.fingerprint
+        connection.execute(
+            "UPDATE qc_runs SET policy_fingerprint = ? WHERE submission_id = ?",
+            (current_policy, submissions[2]["id"]),
+        )
+
+        connection.execute(
+            "UPDATE qc_runs SET verdict = 'pass' WHERE submission_id = ?",
+            (submissions[3]["id"],),
+        )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    results_tampered, findings_tampered, policy_tampered, verdict_tampered = [
+        item["latest_qc"] for item in compared["candidates"]
+    ]
+    assert results_tampered["command_results"]["state"] == "unavailable"
+    assert results_tampered["command_results"]["integrity_state"] == "unavailable"
+    assert results_tampered["command_results"]["items"] == []
+    assert findings_tampered["findings"]["state"] == "unavailable"
+    assert findings_tampered["findings"]["integrity_state"] == "unavailable"
+    assert findings_tampered["findings"]["items"] == []
+    assert policy_tampered["policy_state"] == "current_and_ratified"
+    assert policy_tampered["bundle_integrity_state"] == "unavailable"
+    assert verdict_tampered["recorded_verdict"] == "pass"
+    assert verdict_tampered["bundle_integrity_state"] == "unavailable"
+    for candidate in compared["candidates"]:
+        assert candidate["latest_qc"]["evidence_complete"] is False
+        assert candidate["latest_qc"]["handoff_eligibility"] == "incomplete_evidence"
+        assert candidate["review_handoff"]["qc_run_id"] is None
+
+
+def test_compare_submissions_fails_closed_on_non_utf8_reviewer_provenance(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        supervisor.run_qc(submission["id"], "independent-qc")
+        submissions.append(submission)
+
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE qc_runs SET reviewer_provenance_json = ? WHERE submission_id = ?",
+            (
+                json.dumps(
+                    {
+                        "identity": "\ud800",
+                        "provider": "builtin",
+                        "model": "test",
+                        "prompt_policy": "test",
+                        "command_sha256": "a" * 64,
+                    }
+                ),
+                submissions[0]["id"],
+            ),
+        )
+
+    readonly = GitSupervisor(repo, read_only=True)
+    before = state_fingerprint(readonly)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    after = state_fingerprint(readonly)
+    malformed, valid = [item["latest_qc"] for item in compared["candidates"]]
+    assert malformed["reviewer_provenance_state"] == "unavailable"
+    assert malformed["reviewer_provenance_sha256"] is None
+    assert malformed["reviewer_identity"] is None
+    assert malformed["evidence_complete"] is False
+    assert malformed["handoff_eligibility"] == "incomplete_evidence"
+    assert malformed["findings"]["items"] == []
+    assert valid["handoff_eligibility"] == "eligible"
+    assert before == after
+    assert "\\ud800" not in json.dumps(compared)
+
+
+def test_compare_submissions_marks_changed_base_and_mismatched_qc(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute("UPDATE tasks SET base_sha = ? WHERE id = ?", ("f" * 40, created["id"]))
+        connection.execute(
+            "UPDATE qc_runs SET commit_sha = ? WHERE submission_id = ?",
+            ("e" * 40, submissions[1]["id"]),
+        )
+        connection.execute(
+            "UPDATE qc_runs SET policy_fingerprint = ? WHERE submission_id = ?",
+            ("stale-policy", submissions[0]["id"]),
+        )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    assert all(
+        candidate["base_relation"]["state"] == "different_from_current_task_base"
+        for candidate in compared["candidates"]
+    )
+    assert compared["candidates"][0]["latest_qc"]["candidate_binding"] == "exact"
+    assert compared["candidates"][0]["latest_qc"]["policy_state"] == "stale"
+    assert compared["candidates"][0]["review_handoff"]["qc_evidence_state"] == "stale_policy"
+    assert compared["candidates"][1]["latest_qc"]["candidate_binding"] == "mismatch"
+    assert compared["candidates"][1]["review_handoff"]["qc_evidence_state"] == "candidate_mismatch"
+    for candidate in compared["candidates"]:
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute("DELETE FROM qc_runs WHERE submission_id = ?", (submissions[0]["id"],))
+    without_qc = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    assert without_qc["candidates"][0]["latest_qc"] == {"state": "missing"}
+
+
+def test_compare_submissions_withholds_handoff_for_truncated_or_malformed_qc(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    finding = {
+        "severity": "low",
+        "requirement": "criterion",
+        "finding": "noted",
+        "evidence": "receipt",
+        "required_fix": "none",
+    }
+    result = {
+        "evidence_id": "qc:command:000",
+        "evidence_sha256": "a" * 64,
+        "exit_code": 0,
+    }
+    coverage = {
+        "criterion_id": "AC-001-example",
+        "status": "pass",
+        "rationale": "checked",
+        "evidence_refs": ["qc:command:000"],
+    }
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            """
+            UPDATE qc_runs
+            SET findings_json = ?, results_json = ?, acceptance_coverage_json = ?,
+                acceptance_coverage_contract_version = ?
+            WHERE submission_id = ?
+            """,
+            (
+                json.dumps([finding] * 9),
+                json.dumps(
+                    [{**result, "evidence_id": f"qc:command:{index:03d}"} for index in range(17)]
+                ),
+                json.dumps(
+                    [{**coverage, "criterion_id": f"AC-{index:03d}-example"} for index in range(17)]
+                ),
+                1,
+                submissions[0]["id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE qc_runs
+            SET findings_json = ?, results_json = ?, acceptance_coverage_json = ?,
+                acceptance_coverage_contract_version = ?
+            WHERE submission_id = ?
+            """,
+            (
+                json.dumps([finding, "malformed"]),
+                json.dumps([result, "malformed"]),
+                json.dumps([coverage, "malformed"]),
+                2,
+                submissions[1]["id"],
+            ),
+        )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    truncated, malformed = [item["latest_qc"] for item in compared["candidates"]]
+    assert truncated["coverage_contract_state"] == "not_current"
+    assert truncated["findings"]["truncated"] is True
+    assert truncated["command_results"]["truncated"] is True
+    assert truncated["acceptance_coverage"]["truncated"] is True
+    assert truncated["evidence_complete"] is False
+    assert truncated["handoff_eligibility"] == "coverage_contract_not_current"
+    assert malformed["coverage_contract_state"] == "current"
+    assert malformed["findings"]["state"] == "unavailable"
+    assert malformed["command_results"]["state"] == "unavailable"
+    assert malformed["acceptance_coverage"]["state"] == "unavailable"
+    assert malformed["evidence_complete"] is False
+    assert malformed["handoff_eligibility"] == "incomplete_evidence"
+    for candidate in compared["candidates"]:
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
+
+
+def test_compare_submissions_revalidates_signed_acceptance_coverage(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    reviews = []
+    for index in range(5):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        review = supervisor.run_qc(submission["id"], "independent-qc")
+        submissions.append(submission)
+        reviews.append(review)
+
+    def with_coverage(items: list[dict], mode: str) -> list[dict]:
+        if mode == "empty":
+            return []
+        changed = json.loads(json.dumps(items))
+        if mode == "duplicate":
+            changed[1]["criterion_id"] = changed[0]["criterion_id"]
+        elif mode == "unknown":
+            changed[0]["criterion_id"] = "AC-999-unknown"
+        elif mode == "unresolved_reference":
+            changed[0]["evidence_refs"] = ["qc-run:not-in-packet"]
+        return changed
+
+    for submission, review, mode in zip(
+        submissions[1:],
+        reviews[1:],
+        ("empty", "duplicate", "unknown", "unresolved_reference"),
+        strict=True,
+    ):
+        stored = supervisor.reproduction_bundle(review["id"])
+        record = stored["bundle"]
+        coverage = with_coverage(record["acceptance_coverage"], mode)
+        payload = {key: value for key, value in record.items() if key != "signature"}
+        payload["acceptance_coverage"] = coverage
+        signature = supervisor.assurance.sign(payload)
+        signed_record = {**payload, "signature": signature}
+        bundle_sha256 = hashlib.sha256(canonical_json(signed_record).encode("utf-8")).hexdigest()
+        (supervisor.state_dir / "bundles" / f"{review['id']}.json").write_text(
+            json.dumps(signed_record, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+            connection.execute(
+                """
+                UPDATE qc_runs
+                SET acceptance_coverage_json = ?, reviewer_signature = ?, bundle_sha256 = ?
+                WHERE submission_id = ?
+                """,
+                (json.dumps(coverage), signature, bundle_sha256, submission["id"]),
+            )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [submission["id"] for submission in submissions]
+    )
+    valid, *invalid = [candidate["latest_qc"] for candidate in compared["candidates"]]
+    assert valid["acceptance_coverage"]["integrity_state"] == "verified"
+    assert valid["handoff_eligibility"] == "eligible"
+    for candidate in invalid:
+        assert candidate["acceptance_coverage"]["integrity_state"] == "unavailable"
+        assert candidate["acceptance_coverage"]["state"] == "unavailable"
+        assert candidate["acceptance_coverage"]["items"] == []
+        assert candidate["evidence_complete"] is False
+        assert candidate["handoff_eligibility"] == "incomplete_evidence"
+    for candidate in compared["candidates"][1:]:
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
+
+
+def test_compare_submissions_does_not_create_a_missing_reviewer_key(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        supervisor.run_qc(submission["id"], "independent-qc")
+        submissions.append(submission)
+
+    key_path = supervisor.state_dir / "reviewer-key"
+    key_path.unlink()
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [submission["id"] for submission in submissions]
+    )
+
+    assert key_path.exists() is False
+    assert all(
+        candidate["latest_qc"]["acceptance_coverage"]["integrity_state"] == "unavailable"
+        for candidate in compared["candidates"]
+    )
+    assert all(
+        candidate["latest_qc"]["handoff_eligibility"] == "incomplete_evidence"
+        for candidate in compared["candidates"]
+    )
+
+
+def test_readonly_diff_does_not_fetch_missing_promisor_objects(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_sha = git(repo, "rev-parse", "HEAD")
+    (repo / "alpha.txt").write_text("partial clone target\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    git(repo, "commit", "-m", "partial clone diff target")
+    commit_sha = git(repo, "rev-parse", "HEAD")
+    blob_oid = git(repo, "rev-parse", f"{commit_sha}:alpha.txt")
+
+    bare_remote = tmp_path / "promisor.git"
+    subprocess.run(["git", "clone", "--bare", str(repo), str(bare_remote)], check=True)
+    subprocess.run(
+        ["git", "--git-dir", str(bare_remote), "config", "uploadpack.allowFilter", "true"],
+        check=True,
+    )
+    partial_clone = tmp_path / "partial-clone"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            bare_remote.as_uri(),
+            str(partial_clone),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pack_indexes = list((partial_clone / ".git" / "objects" / "pack").glob("*.idx"))
+    blob_in_pack = False
+    for pack_index in pack_indexes:
+        verification = subprocess.run(
+            ["git", "verify-pack", "-v", str(pack_index)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        blob_in_pack |= any(
+            len(columns := line.split()) >= 2 and columns[0] == blob_oid and columns[1] == "blob"
+            for line in verification.stdout.splitlines()
+        )
+    loose_blob = partial_clone / ".git" / "objects" / blob_oid[:2] / blob_oid[2:]
+    assert not blob_in_pack and not loose_blob.exists()
+    network_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    network_probe.bind(("127.0.0.1", 0))
+    network_probe.listen()
+    git(
+        partial_clone,
+        "remote",
+        "set-url",
+        "origin",
+        f"git://127.0.0.1:{network_probe.getsockname()[1]}/unused-promisor.git",
+    )
+
+    object_store = partial_clone / ".git" / "objects"
+
+    def object_snapshot() -> list[tuple[str, str]]:
+        return sorted(
+            (
+                path.relative_to(object_store).as_posix(),
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in object_store.rglob("*")
+            if path.is_file()
+        )
+
+    before = object_snapshot()
+    readonly = GitSupervisor.__new__(GitSupervisor)
+    readonly.root = partial_clone
+    observed_no_lazy_fetch: list[str | None] = []
+    real_run = subprocess.run
+
+    def observe_git_environment(*args, **kwargs):
+        command = args[0]
+        if (
+            isinstance(command, (list, tuple))
+            and "diff" in command
+            and str(partial_clone) in command
+        ):
+            observed_no_lazy_fetch.append(kwargs["env"].get("GIT_NO_LAZY_FETCH"))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(process_module.subprocess, "run", observe_git_environment)
+    with pytest.raises(SupervisorError) as captured:
+        readonly._git_readonly_bytes(
+            "diff",
+            "--shortstat",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            base_sha,
+            commit_sha,
+            "--",
+            no_lazy_fetch=True,
+            timeout=2,
+        )
+    assert captured.value.code == "git_error"
+    assert observed_no_lazy_fetch == ["1"]
+    assert object_snapshot() == before
+    network_probe.setblocking(False)
+    try:
+        accepted_connection, _ = network_probe.accept()
+    except BlockingIOError:
+        pass
+    else:
+        accepted_connection.close()
+        pytest.fail("read-only diff attempted a promisor-network connection")
+    finally:
+        network_probe.close()
+
+
+def test_compare_submissions_shares_one_diff_time_budget(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr(views_module, "time", clock)
+    readonly = GitSupervisor(repo, read_only=True)
+    calls: list[float] = []
+
+    def delayed_diff(*args, **kwargs) -> bytes:
+        calls.append(kwargs["timeout"])
+        clock.now += 6.0
+        return b"1 file changed, 1 insertion(+)"
+
+    monkeypatch.setattr(readonly, "_git_readonly_bytes", delayed_diff)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    assert calls == [2.0]
+    assert compared["candidates"][0]["diff_summary"]["state"] == "available"
+    assert compared["candidates"][1]["diff_summary"]["state"] == "unavailable"
+
+
+def test_compare_submissions_withholds_handoff_for_unratified_policy(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE meta SET value = ? WHERE key = 'reviewer_policy_fingerprint'",
+            ("no-longer-ratified",),
+        )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    for candidate in compared["candidates"]:
+        assert candidate["latest_qc"]["candidate_binding"] == "exact"
+        assert candidate["latest_qc"]["policy_state"] == "current_unratified"
+        assert candidate["latest_qc"]["handoff_eligibility"] == "policy_unratified"
+        assert candidate["review_handoff"]["qc_evidence_state"] == "policy_unratified"
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
+
+
+def test_compare_submissions_rejects_invalid_scope(repo: Path) -> None:
+    supervisor = GitSupervisor(repo, read_only=True)
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions(["only-one"])
+    assert captured.value.code == "invalid_submission_ids"
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions(["duplicate", "duplicate"])
+    assert captured.value.code == "invalid_submission_ids"
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions([f"candidate-{index}" for index in range(9)])
+    assert captured.value.code == "invalid_submission_ids"
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions(["valid", "\ud800"])
+    assert captured.value.code == "invalid_submission_ids"
 
 
 def test_builtin_independent_critic_runs_as_separate_process(repo: Path) -> None:

@@ -68,6 +68,88 @@ def test_quarantine_recovery_accepts_only_non_argv_credential_sources() -> None:
         )
 
 
+def test_cli_compare_submissions_opens_read_only_and_preserves_argument_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed: dict[str, object] = {}
+
+    class ReadOnlySupervisor:
+        def compare_submissions(self, submission_ids: list[str]) -> dict[str, object]:
+            observed["submission_ids"] = submission_ids
+            return {"candidates": submission_ids}
+
+    def build_supervisor(*_args: object, **kwargs: object) -> ReadOnlySupervisor:
+        observed["read_only"] = kwargs.get("read_only")
+        return ReadOnlySupervisor()
+
+    monkeypatch.setattr(cli, "GitSupervisor", build_supervisor)
+
+    assert (
+        cli.main(
+            [
+                "--repo",
+                str(tmp_path),
+                "compare-submissions",
+                "submission-b",
+                "submission-a",
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "read_only": True,
+        "submission_ids": ["submission-b", "submission-a"],
+    }
+    assert json.loads(capsys.readouterr().out) == {"candidates": ["submission-b", "submission-a"]}
+
+
+def test_cli_owner_feedback_uses_read_only_authenticated_worker_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed: dict[str, object] = {}
+
+    class ReadOnlySupervisor:
+        def owner_feedback(
+            self, attempt_id: str, agent_id: str, credential: str | None
+        ) -> dict[str, object]:
+            observed.update(
+                attempt_id=attempt_id,
+                agent_id=agent_id,
+                credential=credential,
+            )
+            return {"state": "available", "read_only": True}
+
+    def build_supervisor(*_args: object, **kwargs: object) -> ReadOnlySupervisor:
+        observed["read_only"] = kwargs.get("read_only")
+        return ReadOnlySupervisor()
+
+    monkeypatch.setattr(cli, "GitSupervisor", build_supervisor)
+    monkeypatch.setattr(cli, "_read_credential", lambda _args: "credential-from-protected-fd")
+
+    assert (
+        cli.main(
+            [
+                "--repo",
+                str(tmp_path),
+                "owner-feedback",
+                "attempt-1",
+                "--agent",
+                "worker-1",
+                "--credential-fd",
+                "9",
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "read_only": True,
+        "attempt_id": "attempt-1",
+        "agent_id": "worker-1",
+        "credential": "credential-from-protected-fd",
+    }
+    assert json.loads(capsys.readouterr().out) == {"state": "available", "read_only": True}
+
+
 def test_cli_submit_and_run_accept_a_result_manifest_path() -> None:
     submit = cli.parser().parse_args(
         [

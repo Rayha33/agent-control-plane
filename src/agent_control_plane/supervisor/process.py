@@ -832,7 +832,13 @@ class ProcessMixin:
             )
         return result.stdout
 
-    def _git_readonly_bytes(self, *arguments: str, check: bool = True) -> bytes:
+    def _git_readonly_bytes(
+        self,
+        *arguments: str,
+        check: bool = True,
+        timeout: float = 10,
+        no_lazy_fetch: bool = False,
+    ) -> bytes:
         """Run a sanitized read-only Git query without creating ACP lock/hook state."""
         git = str(self._system_git_executable(self.root))
         argv = [
@@ -841,13 +847,18 @@ class ProcessMixin:
             str(self.root),
             *arguments,
         ]
+        environment = self._supervisor_git_env()
+        if no_lazy_fetch:
+            # Partial clones otherwise let even a read-only query download missing
+            # promisor objects into .git/objects. Missing objects must stay missing.
+            environment["GIT_NO_LAZY_FETCH"] = "1"
         try:
             result = subprocess.run(
                 argv,
-                env=self._supervisor_git_env(),
+                env=environment,
                 capture_output=True,
                 check=False,
-                timeout=10,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as error:
             raise SupervisorError("git_timeout", "read-only Git query timed out") from error

@@ -221,6 +221,10 @@ def test_undeclared_arguments_are_refused(repo: Path) -> None:
 
     assert body(call(repo, "acp_status", {"limit": 1}))["error"] == "invalid_arguments"
     assert body(call(repo, "acp_show", {}))["error"] == "invalid_arguments"
+    assert (
+        body(call(repo, "acp_compare_submissions", {"submission_ids": ["only-one"]}))["error"]
+        == "invalid_submission_ids"
+    )
 
 
 def test_a_malformed_line_does_not_kill_the_session(repo: Path) -> None:

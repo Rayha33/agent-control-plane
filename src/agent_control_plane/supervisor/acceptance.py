@@ -5,8 +5,39 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from .common import canonical_json, sha256
+
 ACCEPTANCE_COVERAGE_CONTRACT_VERSION = 2
 ACCEPTANCE_COVERAGE_STATUSES = frozenset({"pass", "revise", "unknown", "human_required"})
+TASK_BRIEF_FINGERPRINT_SCHEMA = "acp-task-brief-v1"
+
+
+def task_brief_fingerprint(title: Any, description: Any, acceptance: Any) -> str:
+    """Fingerprint the bounded task brief without retaining its prompt text."""
+    if (
+        not isinstance(title, str)
+        or len(title) > 1024
+        or not isinstance(description, str)
+        or not isinstance(acceptance, list)
+        or any(not isinstance(item, str) for item in acceptance)
+    ):
+        raise ValueError("task brief fields are malformed")
+    try:
+        if len(description.encode("utf-8")) > 64 * 1024:
+            raise ValueError("task description exceeds the fingerprint bound")
+    except UnicodeEncodeError as error:
+        raise ValueError("task description is not valid UTF-8") from error
+    encoded = canonical_json(
+        {
+            "schema": TASK_BRIEF_FINGERPRINT_SCHEMA,
+            "title": title,
+            "description": description,
+            "acceptance": acceptance,
+        }
+    ).encode("utf-8")
+    if len(encoded) > 128 * 1024:
+        raise ValueError("task brief exceeds the fingerprint bound")
+    return sha256(encoded)
 
 
 def acceptance_criteria(items: list[str]) -> list[dict[str, str]]:

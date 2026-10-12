@@ -153,7 +153,7 @@ pinned CI runner and a newer operator install, say:
   contract could approve work the newer contract rejects. It now stops with
   `schema_newer_than_binary` and tells you to upgrade acp.
 - **Only commands that admit they mutate will upgrade one.** `plan`, `queue`,
-  `merge-plan`, `status`, `wait`, `show`, `intents`, `intent-history`, `reviewers`, `bundle` and `verify-events` open
+  `merge-plan`, `compare-submissions`, `status`, `wait`, `show`, `intents`, `intent-history`, `reviewers`, `bundle` and `verify-events` open
   `mode=ro`. Against a database that is behind, they report
   `schema_upgrade_required` and leave the file byte for byte as they found it.
 
@@ -366,6 +366,7 @@ answers it from state it already holds, without launching anything:
 uv run --extra dev acp plan TASK_ID     # would this claim succeed, and if not, who is in the way?
 uv run --extra dev acp queue            # ordered set of tasks that can run concurrently
 uv run --extra dev acp merge-plan       # integration order for approved work
+uv run --extra dev acp compare-submissions SUBMISSION_ID_A SUBMISSION_ID_B
 ~~~
 
 `plan` classifies every collision as <code>exact</code> (identical normalized
@@ -406,6 +407,42 @@ prove that a change is semantically incompatible. Missing/untracked scopes and
 unavailable snapshots are reported as `unknown`, never as unchanged. Tasks with
 no declared read resources retain the existing behavior.
 
+`compare-submissions` accepts 2–8 submission IDs for one task, in the supplied order.
+It presents each exact attempt/base, commit/tree, patch digest, changed paths,
+bounded QC evidence and completion receipt. The structured reviewer handoff is
+prepared but never dispatched; it contains no raw prompt or command transcript and
+grants no critic write authority. Each claim stores a write-once, versioned digest of
+the task title, description and acceptance criteria without duplicating that text.
+Comparison marks each candidate's brief binding `exact`, `stale`, `legacy_unpinned`
+or `unavailable`; QC references are withheld unless the claim-time digest matches
+the current brief. The view also includes a bounded file/insert/delete count from
+attempt start to commit, while changed bases or missing evidence stay visible. Git
+diff inspection disables partial-clone lazy fetch and has a shared five-second budget
+across all candidates; missing promisor objects produce an unavailable summary without
+fetching or writing them.
+Recorded QC is labeled as not revalidated and includes the reviewer and recorded
+policy identity. QC references enter the handoff only when the QC row binds to that
+candidate's commit, its policy is current and ratified, its acceptance-coverage
+contract matches the current version, and all bounded evidence arrays are valid and
+untruncated and match their signed content digests. The signed bundle is also bound
+to the database verdict, policy fingerprint, reviewer provenance and identity, and
+candidate packet; a database-only rewrite makes the affected evidence unavailable.
+The comparison revalidates exact criterion coverage and cited evidence IDs against
+the current task criteria and QC run/commit; otherwise coverage is unavailable and
+its references are withheld. The recorded verdict remains labeled not revalidated
+and is not a current assurance result. Comparison does not rank, select, approve or
+integrate candidates. The comparison response names an authenticated owner-pull route;
+the owning worker can read its candidate's signed QC findings and bounded check evidence
+with `acp owner-feedback ATTEMPT_ID --agent AGENT_ID --credential-file PRIVATE_FILE`
+(or `--credential-fd`). ACP verifies that the enrolled worker credential is bound to
+that exact attempt before returning feedback. A stale task-brief pin is explicit, and
+missing or mismatched signed evidence is withheld. The response labels QC as
+`recorded_only_not_revalidated`, preserves its recorded verdict and eligibility as
+historical fields, and reports current `handoff_eligibility` as
+`incomplete_task_brief` unless the attempt's pinned brief exactly matches the current
+brief. This is a read-only pull channel:
+critics cannot write the candidate, and comparison does not dispatch prompts or feedback.
+
 Each `merge-plan` entry also includes a read-only
 `cross_submission_read_write_advisory`. It compares that task's declared read
 scopes with the changed paths of every other approved, assurance-ready
@@ -420,7 +457,7 @@ submission paths or write-set admission. This does not infer actual reads or
 semantic incompatibility, and does not block, reorder, or mutate submissions; it
 also cannot account for work that has not reached an approved submission.
 
-All four planning commands are read-only. Unlike <code>claim</code> and
+These planning and comparison commands are read-only. Unlike <code>claim</code> and
 <code>list</code>, they never reap: looking at the board does not orphan an
 agent's attempt.
 
@@ -856,7 +893,9 @@ golden_dir = "acp-golden"
 
 Every QC record then carries signed provenance — identity, provider, model,
 prompt policy, and the hash of the resolved command — plus a deterministic
-reproduction bundle written to ignored <code>.acp/bundles/</code>:
+reproduction bundle written to ignored <code>.acp/bundles/</code>. The signed bundle
+binds the verdict, reviewer, ratified-policy fingerprint, acceptance coverage, and
+SHA-256 digests of the complete findings and command-result arrays:
 
 ~~~bash
 uv run --extra dev acp reviewers          # who reviews, and is the policy ratified?
@@ -1060,7 +1099,7 @@ service.
   is deliberately not guarded: what a shell command writes cannot be read off the
   command string, and a pattern that can be walked around by rephrasing would read as
   coverage without being any. `acp mcp-serve` additionally
-  exposes ten read-only tools over stdio MCP — no writes, no credential — so a session
+  exposes eleven read-only tools over stdio MCP — no writes, no credential — so a session
   can read the board without shelling out. See docs/INTEGRATIONS.md.
 - Tests and critic commands execute candidate code. Linux uses a child subreaper
   to adopt and kill double-fork/`setsid` descendants on both success and timeout;

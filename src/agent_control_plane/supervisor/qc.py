@@ -968,8 +968,13 @@ class QcMixin:
                 )
                 critic_verdict = "human_required"
         except (OSError, subprocess.SubprocessError, SupervisorError, ValueError) as error:
+            if packet is None:
+                # There is no packet from which to construct bounded evidence.
+                # Preserve the original setup failure so run_qc can restore the
+                # pending state instead of masking it with a packet dereference.
+                raise
             critic_verdict = "block"
-            if packet is not None and not acceptance_coverage:
+            if not acceptance_coverage:
                 acceptance_coverage = self._unassessed_coverage(
                     packet, "QC did not produce a valid per-criterion reviewer result."
                 )
@@ -1007,17 +1012,18 @@ class QcMixin:
                 }
             )
         finished = utc_now()
-        bundle = self.assurance.bundle(
-            qc_id,
-            dict(submission),
-            task["base_sha"],
-            [*self.config.qc_commands, *([reviewer.command] if reviewer.command else [])],
-            reviewer,
-            verdict,
-            packet_hash,
-            acceptance_coverage,
-            ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
-        )
+        referenced_evidence = {
+            reference
+            for coverage_item in acceptance_coverage
+            for reference in coverage_item["evidence_refs"]
+        }
+        acceptance_evidence_catalog = [
+            item for item in packet["evidence_catalog"] if item.get("id") in referenced_evidence
+        ]
+        if {item["id"] for item in acceptance_evidence_catalog} != referenced_evidence:
+            raise SupervisorError(
+                "invalid_critic_output", "acceptance evidence is missing from the QC packet"
+            )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._reauthenticate_bound(
@@ -1048,6 +1054,58 @@ class QcMixin:
             ):
                 raise SupervisorError("submission_not_reviewable", "submission changed during QC")
             self._assert_reservations(connection, current_task, current)
+            passing = self._current_policy_passes(connection, current)
+            if verdict == "pass" and reviewer_id not in {item["reviewer_id"] for item in passing}:
+                # Include this authenticated, ratified review in the same
+                # requirement calculation that the prior insert-then-query
+                # sequence used, without persisting unsigned findings first.
+                passing.append({"reviewer_id": reviewer_id, "provider": reviewer.provider})
+            requirement = self.assurance.review_requirement(
+                json.loads(current["changed_paths_json"]), passing
+            )
+            submission_status = {
+                "pass": "approved",
+                "revise": "changes_requested",
+                "block": "blocked",
+                "human_required": "human_required",
+            }[verdict]
+            task_status = (
+                "approved"
+                if verdict == "pass"
+                else "changes_requested"
+                if verdict == "revise"
+                else "blocked"
+            )
+            if verdict == "pass" and requirement["high_risk"] and not requirement["satisfied"]:
+                # Finalize all persisted verdict content before signing it.
+                findings = [
+                    *findings,
+                    {
+                        "severity": "low",
+                        "requirement": "high-risk paths satisfy the reviewer policy",
+                        "finding": requirement["reason"],
+                        "evidence": ", ".join(requirement["paths"][:20]),
+                        "required_fix": "obtain the additional review the policy requires",
+                    },
+                ]
+                if self.assurance_policy.high_risk_mode == "human":
+                    submission_status, task_status = "human_required", "blocked"
+                else:
+                    submission_status, task_status = "pending_second_review", "qc_review"
+            bundle = self.assurance.bundle(
+                qc_id,
+                dict(submission),
+                task["base_sha"],
+                [*self.config.qc_commands, *([reviewer.command] if reviewer.command else [])],
+                reviewer,
+                verdict,
+                packet_hash,
+                acceptance_coverage,
+                acceptance_evidence_catalog,
+                ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
+                sha256(canonical_json(findings).encode("utf-8")),
+                sha256(canonical_json(results).encode("utf-8")),
+            )
             connection.execute(
                 """
                 INSERT INTO qc_runs
@@ -1078,44 +1136,6 @@ class QcMixin:
                     finished,
                 ),
             )
-            passing = self._current_policy_passes(connection, current)
-            requirement = self.assurance.review_requirement(
-                json.loads(current["changed_paths_json"]), passing
-            )
-            submission_status = {
-                "pass": "approved",
-                "revise": "changes_requested",
-                "block": "blocked",
-                "human_required": "human_required",
-            }[verdict]
-            task_status = (
-                "approved"
-                if verdict == "pass"
-                else "changes_requested"
-                if verdict == "revise"
-                else "blocked"
-            )
-            if verdict == "pass" and requirement["high_risk"] and not requirement["satisfied"]:
-                # A passing verdict is not an approval while policy still owes a
-                # second reviewer, a second provider, or a human.
-                findings = [
-                    *findings,
-                    {
-                        "severity": "low",
-                        "requirement": "high-risk paths satisfy the reviewer policy",
-                        "finding": requirement["reason"],
-                        "evidence": ", ".join(requirement["paths"][:20]),
-                        "required_fix": "obtain the additional review the policy requires",
-                    },
-                ]
-                if self.assurance_policy.high_risk_mode == "human":
-                    submission_status, task_status = "human_required", "blocked"
-                else:
-                    submission_status, task_status = "pending_second_review", "qc_review"
-                connection.execute(
-                    "UPDATE qc_runs SET findings_json = ? WHERE id = ?",
-                    (canonical_json(findings), qc_id),
-                )
             connection.execute(
                 "UPDATE submissions SET status = ?, qc_resume_status = '' WHERE id = ?",
                 (submission_status, submission_id),

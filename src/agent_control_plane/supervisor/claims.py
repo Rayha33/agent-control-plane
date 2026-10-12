@@ -413,6 +413,8 @@ class ClaimsMixin:
         lease_seconds: int | None = None,
         credential: str | None = None,
     ) -> dict[str, Any]:
+        from .acceptance import task_brief_fingerprint
+
         if not agent_id.strip():
             raise SupervisorError("invalid_agent", "agent_id is required")
         self._authenticate(agent_id, "worker", credential)
@@ -435,6 +437,16 @@ class ClaimsMixin:
             connection.execute("BEGIN IMMEDIATE")
             identity = self._authenticate(agent_id, "worker", credential, connection)
             task = self._task_row(connection, task_id)
+            try:
+                task_brief_sha256 = task_brief_fingerprint(
+                    task["title"],
+                    task["description"],
+                    json.loads(task["acceptance_json"]),
+                )
+            except (RecursionError, TypeError, UnicodeError, ValueError) as error:
+                raise SupervisorError(
+                    "task_brief_unavailable", "task brief cannot be pinned for this claim"
+                ) from error
             if task["status"] not in {"open", "orphaned", "changes_requested"}:
                 raise SupervisorError("task_unavailable", f"task status is {task['status']}")
             for dependency in json.loads(task["dependencies_json"]):
@@ -572,9 +584,9 @@ class ClaimsMixin:
                    read_resources_snapshot_json, trust_bundle_json,
                    pid, log_path, status,
                    lease_expires_at, created_at, updated_at, base_checkout_snapshot_json,
-                   base_checkout_snapshot_required)
+                   base_checkout_snapshot_required, task_brief_sha256)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, NULL, NULL,
-                        'provisioning', ?, ?, ?, ?, 1)
+                        'provisioning', ?, ?, ?, ?, 1, ?)
                 """,
                 (
                     attempt_id,
@@ -596,6 +608,7 @@ class ClaimsMixin:
                     now,
                     now,
                     canonical_json(base_checkout_snapshot),
+                    task_brief_sha256,
                 ),
             )
             self._allocate_runtime(

@@ -49,6 +49,24 @@ TOOLS: dict[str, tuple[str, str, dict[str, Any]]] = {
         "Integration ordering preview for approved work.",
         {"type": "object", "additionalProperties": False, "properties": {}},
     ),
+    "acp_compare_submissions": (
+        "compare_submissions",
+        "Read-only, non-ranking comparison of 2-8 submissions for one task, with bounded QC and manual handoff provenance.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["submission_ids"],
+            "properties": {
+                "submission_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "minItems": 2,
+                    "maxItems": 8,
+                    "uniqueItems": True,
+                }
+            },
+        },
+    ),
     "acp_reviewers": (
         "reviewers",
         "Declared reviewers and the evaluation policy state.",
