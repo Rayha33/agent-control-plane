@@ -421,12 +421,14 @@ Recorded QC is labeled as not revalidated and includes the reviewer and recorded
 policy identity. QC references enter the handoff only when the QC row binds to that
 candidate's commit, its policy is current and ratified, its acceptance-coverage
 contract matches the current version, and all bounded evidence arrays are valid and
-untruncated. The comparison also verifies the signed QC bundle against the database
-record and revalidates exact criterion coverage and cited evidence IDs against the
-current task criteria and QC run/commit; otherwise coverage is unavailable and its
-references are withheld. The recorded verdict remains labeled not revalidated and is
-not a current assurance result. Comparison does not rank, select, approve or integrate
-candidates.
+untruncated and match their signed content digests. The signed bundle is also bound
+to the database verdict, policy fingerprint, reviewer provenance and identity, and
+candidate packet; a database-only rewrite makes the affected evidence unavailable.
+The comparison revalidates exact criterion coverage and cited evidence IDs against
+the current task criteria and QC run/commit; otherwise coverage is unavailable and
+its references are withheld. The recorded verdict remains labeled not revalidated
+and is not a current assurance result. Comparison does not rank, select, approve or
+integrate candidates.
 
 Each `merge-plan` entry also includes a read-only
 `cross_submission_read_write_advisory`. It compares that task's declared read
@@ -878,7 +880,9 @@ golden_dir = "acp-golden"
 
 Every QC record then carries signed provenance — identity, provider, model,
 prompt policy, and the hash of the resolved command — plus a deterministic
-reproduction bundle written to ignored <code>.acp/bundles/</code>:
+reproduction bundle written to ignored <code>.acp/bundles/</code>. The signed bundle
+binds the verdict, reviewer, ratified-policy fingerprint, acceptance coverage, and
+SHA-256 digests of the complete findings and command-result arrays:
 
 ~~~bash
 uv run --extra dev acp reviewers          # who reviews, and is the policy ratified?

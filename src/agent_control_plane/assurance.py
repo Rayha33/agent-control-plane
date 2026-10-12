@@ -402,6 +402,8 @@ class Assurance:
         acceptance_coverage: list[dict[str, Any]],
         acceptance_evidence_catalog: list[dict[str, Any]],
         acceptance_coverage_contract_version: int,
+        findings_sha256: str,
+        results_sha256: str,
     ) -> dict[str, Any]:
         """Everything needed to re-run this verdict, and its signature."""
         payload = {
@@ -413,6 +415,8 @@ class Assurance:
             "base_sha": task_base_sha,
             "packet_sha256": packet_sha256,
             "verdict": verdict,
+            "findings_sha256": findings_sha256,
+            "results_sha256": results_sha256,
             "acceptance_coverage": acceptance_coverage,
             "acceptance_evidence_catalog": acceptance_evidence_catalog,
             "acceptance_coverage_contract_version": acceptance_coverage_contract_version,

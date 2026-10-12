@@ -554,27 +554,106 @@ class ViewsMixin:
         else:
             coverage_state = "unavailable"
 
+        provenance_state, provenance = self._bounded_comparison_json(
+            row["reviewer_provenance_json"], 16 * 1024
+        )
+        provenance_fingerprint = (
+            sha256(canonical_json(provenance).encode("utf-8"))
+            if provenance_state == "available" and isinstance(provenance, dict)
+            else None
+        )
+        reviewer_identity = (
+            self._comparison_text(provenance.get("identity"), 160)
+            if isinstance(provenance, dict)
+            else None
+        )
+        reviewer_provider = (
+            self._comparison_text(provenance.get("provider"), 160)
+            if isinstance(provenance, dict)
+            else None
+        )
+        reviewer_model = (
+            self._comparison_text(provenance.get("model"), 160)
+            if isinstance(provenance, dict)
+            else None
+        )
+
+        bundle_record_valid = False
+        bundle_core_binding_matches = False
+        coverage_bundle_binding_matches = False
+        findings_integrity_state = "unavailable"
+        results_integrity_state = "unavailable"
+        bundle: dict[str, Any] = {}
+        try:
+            stored_bundle = self.assurance.read_bundle(row["id"], max_bytes=1024 * 1024)
+            bundle = stored_bundle["bundle"]
+            bundle_record_valid = (
+                stored_bundle["signature_valid"] is True
+                and sha256(canonical_json(bundle).encode("utf-8")) == row["bundle_sha256"]
+                and bundle.get("signature") == row["reviewer_signature"]
+            )
+            bundle_core_binding_matches = (
+                bundle_record_valid
+                and bundle.get("qc_id") == row["id"]
+                and bundle.get("submission_id") == submission["id"]
+                and bundle.get("commit_sha") == row["commit_sha"]
+                and bundle.get("tree_sha") == submission["tree_sha"]
+                and bundle.get("patch_sha256") == submission["patch_sha256"]
+                and bundle.get("packet_sha256") == row["packet_sha256"]
+                and bundle.get("verdict") == row["verdict"]
+                and bundle.get("policy_fingerprint") == row["policy_fingerprint"]
+                and isinstance(provenance, dict)
+                and bundle.get("reviewer") == provenance
+                and provenance.get("identity") == row["reviewer_id"]
+            )
+            if (
+                bundle_core_binding_matches
+                and findings_state == "available"
+                and not findings_truncated
+                and bundle.get("findings_sha256")
+                == sha256(canonical_json(findings_value).encode("utf-8"))
+            ):
+                findings_integrity_state = "verified"
+            else:
+                findings_state = "unavailable"
+                findings = []
+            if (
+                bundle_core_binding_matches
+                and results_state == "available"
+                and not results_truncated
+                and bundle.get("results_sha256")
+                == sha256(canonical_json(results_value).encode("utf-8"))
+            ):
+                results_integrity_state = "verified"
+            else:
+                results_state = "unavailable"
+                command_results = []
+            coverage_bundle_binding_matches = (
+                bundle_core_binding_matches
+                and bundle.get("acceptance_coverage") == coverage_value
+                and type(bundle.get("acceptance_coverage_contract_version")) is int
+                and bundle.get("acceptance_coverage_contract_version")
+                == row["acceptance_coverage_contract_version"]
+            )
+        except (
+            AttributeError,
+            KeyError,
+            OSError,
+            RecursionError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            SupervisorError,
+        ):
+            findings_state = "unavailable"
+            findings = []
+            results_state = "unavailable"
+            command_results = []
+
         coverage_integrity_state = "unavailable"
         if coverage_state == "available" and not coverage_truncated:
             try:
                 expected = acceptance_criteria(task_acceptance)
-                stored_bundle = self.assurance.read_bundle(row["id"], max_bytes=1024 * 1024)
-                bundle = stored_bundle["bundle"]
-                coverage_binding_matches = (
-                    stored_bundle["signature_valid"] is True
-                    and sha256(canonical_json(bundle).encode("utf-8")) == row["bundle_sha256"]
-                    and bundle.get("signature") == row["reviewer_signature"]
-                    and bundle.get("qc_id") == row["id"]
-                    and bundle.get("submission_id") == submission["id"]
-                    and bundle.get("commit_sha") == row["commit_sha"]
-                    and bundle.get("tree_sha") == submission["tree_sha"]
-                    and bundle.get("patch_sha256") == submission["patch_sha256"]
-                    and bundle.get("packet_sha256") == row["packet_sha256"]
-                    and bundle.get("acceptance_coverage") == coverage_value
-                    and type(bundle.get("acceptance_coverage_contract_version")) is int
-                    and bundle.get("acceptance_coverage_contract_version")
-                    == row["acceptance_coverage_contract_version"]
-                )
                 bundled_coverage = bundle.get("acceptance_coverage")
                 raw_coverage = (
                     [
@@ -603,7 +682,7 @@ class ViewsMixin:
                     run_id=row["id"],
                     commit_sha=row["commit_sha"],
                 )
-                if coverage_binding_matches and validated_coverage == bundled_coverage:
+                if coverage_bundle_binding_matches and validated_coverage == bundled_coverage:
                     coverage_integrity_state = "verified"
                 else:
                     coverage_state = "unavailable"
@@ -620,29 +699,13 @@ class ViewsMixin:
             ):
                 coverage_state = "unavailable"
                 acceptance_coverage = []
-
-        provenance_state, provenance = self._bounded_comparison_json(
-            row["reviewer_provenance_json"], 16 * 1024
-        )
-        provenance_fingerprint = (
-            sha256(canonical_json(provenance).encode("utf-8"))
-            if provenance_state == "available" and isinstance(provenance, dict)
-            else None
-        )
-        reviewer_identity = (
-            self._comparison_text(provenance.get("identity"), 160)
-            if isinstance(provenance, dict)
-            else None
-        )
-        reviewer_provider = (
-            self._comparison_text(provenance.get("provider"), 160)
-            if isinstance(provenance, dict)
-            else None
-        )
-        reviewer_model = (
-            self._comparison_text(provenance.get("model"), 160)
-            if isinstance(provenance, dict)
-            else None
+        bundle_integrity_state = (
+            "verified"
+            if bundle_core_binding_matches
+            and findings_integrity_state == "verified"
+            and results_integrity_state == "verified"
+            and coverage_bundle_binding_matches
+            else "unavailable"
         )
         exact_binding = (
             row["submission_id"] == submission["id"]
@@ -677,12 +740,15 @@ class ViewsMixin:
             and bool(row["reviewer_signature"])
             and provenance_fingerprint is not None
             and findings_state == "available"
+            and findings_integrity_state == "verified"
             and not findings_truncated
             and results_state == "available"
+            and results_integrity_state == "verified"
             and not results_truncated
             and coverage_state == "available"
             and not coverage_truncated
             and coverage_integrity_state == "verified"
+            and bundle_integrity_state == "verified"
             and coverage_contract_state == "current"
         )
         handoff_eligibility = (
@@ -719,6 +785,7 @@ class ViewsMixin:
             "reviewer_signature_present": bool(row["reviewer_signature"]),
             "policy_fingerprint": recorded_policy_fingerprint,
             "policy_state": policy_state,
+            "bundle_integrity_state": bundle_integrity_state,
             "coverage_contract_state": coverage_contract_state,
             "evidence_complete": evidence_complete,
             "handoff_eligibility": handoff_eligibility,
@@ -726,12 +793,14 @@ class ViewsMixin:
             "bundle_sha256": row["bundle_sha256"],
             "command_results": {
                 "state": results_state,
+                "integrity_state": results_integrity_state,
                 "count": result_count,
                 "truncated": results_truncated,
                 "items": command_results,
             },
             "findings": {
                 "state": findings_state,
+                "integrity_state": findings_integrity_state,
                 "count": findings_count,
                 "truncated": findings_truncated,
                 "items": findings,
