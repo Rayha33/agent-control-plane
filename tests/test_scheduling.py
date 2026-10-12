@@ -7,6 +7,7 @@ import pytest
 from support import approve, commit_change, git, init_repo, make_task, state_fingerprint
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.scheduling import Scheduler
 
 
 @pytest.fixture
@@ -289,6 +290,30 @@ def test_ready_queue_is_deterministic_and_read_only(repo: Path) -> None:
     assert first == json.dumps(second_snapshot, sort_keys=True)
     assert state_fingerprint(supervisor) == before
     assert [entry["title"] for entry in json.loads(first)["ready"]] == ["c", "a", "b"]
+
+
+def test_plan_and_queue_read_from_one_explicit_database_snapshot(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(supervisor, "alpha.txt")
+    original = Scheduler._active_leases
+    observed_transactions: list[bool] = []
+
+    def assert_snapshot(connection, now: int) -> list[dict]:
+        observed_transactions.append(connection.in_transaction)
+        assert connection.in_transaction
+        return original(connection, now)
+
+    monkeypatch.setattr(Scheduler, "_active_leases", staticmethod(assert_snapshot))
+
+    preview = supervisor.plan_claim(task["id"])
+    queue = supervisor.ready_queue()
+
+    assert observed_transactions == [True, True]
+    assert type(preview["generated_at"]) is int
+    assert preview["attempt_budget"]["observation_time_ref"] == "generated_at"
+    assert type(queue["generated_at"]) is int
 
 
 def test_dependency_cycle_is_reported_not_hung(repo: Path) -> None:

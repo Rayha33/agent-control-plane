@@ -21,6 +21,7 @@ from support import (
 )
 
 from agent_control_plane.git_supervisor import GitSupervisor
+from agent_control_plane.scheduling import Scheduler
 from agent_control_plane.status import StatusView, _format_bytes
 
 
@@ -137,6 +138,27 @@ def test_status_reports_phase_paths_and_runtime_for_a_working_attempt(repo: Path
     assert entry["checkpoint_stale_advisory"] is False
     assert entry["read_dependency_advisory"] is None
     assert entry["worker"]["status"] == "working"
+
+
+def test_status_reads_task_and_lease_views_from_one_database_snapshot(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    make_task(supervisor, "alpha.txt")
+    original = Scheduler._active_leases
+    observed_transactions: list[bool] = []
+
+    def assert_snapshot(connection, now: int) -> list[dict]:
+        observed_transactions.append(connection.in_transaction)
+        assert connection.in_transaction
+        return original(connection, now)
+
+    monkeypatch.setattr(Scheduler, "_active_leases", staticmethod(assert_snapshot))
+
+    snapshot = supervisor.status()
+
+    assert observed_transactions == [True]
+    assert type(snapshot["generated_at"]) is int
 
 
 def test_status_tracks_only_declared_glob_read_inputs_and_is_read_only(repo: Path) -> None:

@@ -226,11 +226,14 @@ class StatusView:
     ) -> dict[str, Any]:
         if checkpoint_stale_seconds is not None and checkpoint_stale_seconds < 1:
             raise ValueError("checkpoint_stale_seconds must be at least 1")
-        now = time.time()
-        epoch = int(now)
         scheduler = Scheduler(self.supervisor)
         with self.supervisor.connect() as connection:
+            connection.execute("BEGIN")
             tasks = scheduler._task_records(connection)
+            # The first read establishes the SQLite snapshot. Timestamp that view
+            # here and use the same instant for lease and age advisories.
+            now = time.time()
+            epoch = int(now)
             holders = scheduler._active_leases(connection, epoch)
             attempts = self._latest_attempts(connection)
             attempts_for_inventory = [

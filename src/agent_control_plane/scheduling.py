@@ -378,9 +378,12 @@ class Scheduler:
 
     def plan_claim(self, task_id: str) -> dict[str, Any]:
         """Dry-run a claim: what would block it, and who owns the conflicting scope."""
-        now = int(time.time())
         with self.supervisor.connect() as connection:
+            connection.execute("BEGIN")
             self.supervisor._task_row(connection, task_id)
+            # The task-row read opens the SQLite snapshot. Bind all later reads and
+            # the evidence timestamp to that same snapshot.
+            now = int(time.time())
             tasks = self._task_records(connection)
             holders = self._active_leases(connection, now)
         return {"generated_at": now, **self._preview(task_id, tasks, holders)}
@@ -440,9 +443,11 @@ class Scheduler:
         `ready` list is a set of tasks that can run *at the same time* rather
         than a list of tasks that could each run alone.
         """
-        now = int(time.time())
         with self.supervisor.connect() as connection:
+            connection.execute("BEGIN")
             tasks = self._task_records(connection)
+            # _task_records is the first read and establishes the DB snapshot.
+            now = int(time.time())
             holders = self._active_leases(connection, now)
         plan = self.plan_pass(tasks, holders)
         return {"generated_at": now, **plan}
