@@ -83,6 +83,16 @@ class TaskCreate(BaseModel):
     resources: list[str] = Field(default_factory=list, max_length=500)
     dependencies: list[str] = Field(default_factory=list, max_length=200)
     priority: int = Field(default=50, ge=0, le=100)
+    provider_cost_limit_usd_micros: int | None = Field(
+        default=None,
+        strict=True,
+        gt=0,
+        le=2**63 - 1,
+        description=(
+            "Requested hard provider-cost limit in USD micros. This deployment has no "
+            "authenticated provider meter or request gate, so a non-null value is refused."
+        ),
+    )
 
     @field_validator("acceptance_criteria", "resources", "dependencies")
     @classmethod

@@ -26,6 +26,13 @@ class CoordinationService:
         self.control_plane = control_plane
 
     def create_task(self, request: TaskCreate) -> dict[str, Any]:
+        if request.provider_cost_limit_usd_micros is not None:
+            raise ControlPlaneError(
+                422,
+                "budget_capability_unsupported",
+                "provider cost hard limit requested but unsupported: no authenticated provider "
+                "meter or request gate is configured",
+            )
         task_id = str(uuid.uuid4())
         created_at = utc_now()
         with self.database.connect() as connection:

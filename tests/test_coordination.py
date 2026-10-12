@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
+import pytest
+
 from agent_control_plane.service import ControlPlaneError
 
 
@@ -50,6 +52,61 @@ def create_task(client, admin_headers, resources=None, dependencies=None, title=
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def test_public_task_api_refuses_unsupported_provider_limit_before_persistence(
+    client, app, admin_headers
+):
+    before_tasks = app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"]
+    before_audit = app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+
+    response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Provider-limited task",
+            "description": "Do not create work without the requested hard limit.",
+            "acceptance_criteria": ["No provider request starts"],
+            "resources": ["repo:file:budgeted.py"],
+            "provider_cost_limit_usd_micros": 2_500_000,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": "budget_capability_unsupported",
+        "message": (
+            "provider cost hard limit requested but unsupported: no authenticated provider "
+            "meter or request gate is configured"
+        ),
+    }
+    assert app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"] == before_tasks
+    assert (
+        app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+        == before_audit
+    )
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1, 2**63, True, "2500000", 1.5])
+def test_public_task_api_rejects_invalid_provider_limit_values(
+    client, app, admin_headers, invalid_limit
+):
+    before_tasks = app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"]
+
+    response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Invalid provider limit",
+            "description": "Invalid limit types and bounds fail validation.",
+            "acceptance_criteria": ["No task is created"],
+            "resources": ["repo:file:invalid-budget.py"],
+            "provider_cost_limit_usd_micros": invalid_limit,
+        },
+    )
+
+    assert response.status_code == 422
+    assert app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"] == before_tasks
 
 
 def claim_task(client, task_id, token):

@@ -192,6 +192,7 @@
       "_capture_base_checkout_snapshot",
       "_capture_read_resource_snapshot",
       "_case_sensitive_paths",
+      "_check_attempt_budget",
       "_cleanup_completed_result_stages_locked",
       "_cleanup_result_import_staging_locked",
       "_clear_result_import_staging_paths",
@@ -321,6 +322,7 @@
       "_capture_base_checkout_snapshot",
       "_capture_read_resource_snapshot",
       "_case_sensitive_paths",
+      "_check_attempt_budget",
       "_child_env",
       "_cleanup_calibration_artifact",
       "_cleanup_completed_result_stages_locked",
@@ -933,6 +935,7 @@
       "WorkersMixin",
       "_add_agent_intent_attempt_latest_index",
       "_add_agent_intent_revisions",
+      "_add_attempt_budget_exhaustion_marker",
       "_add_attempt_progress_timestamps",
       "_add_attempt_task_brief_pin",
       "_add_attempt_worktree_root",
@@ -956,6 +959,7 @@
       "_add_sandbox_runtime_content_pins",
       "_add_sandbox_workspace_binding",
       "_add_submission_result_manifest",
+      "_add_task_attempt_budget",
       "_age_seconds",
       "_apply_ledger",
       "_assert_not_newer",
@@ -1211,6 +1215,7 @@
     ]
   },
   "agent_control_plane.scheduling": {
+    "class:AttemptBudgetEvidence": [],
     "class:Scheduler": [
       "_active_leases",
       "_advisory_changed_paths",
@@ -1232,14 +1237,23 @@
       "ready_queue"
     ],
     "class:SupervisorError": [],
+    "class:TaskBudgetScope": [],
+    "class:UnsupportedProviderUsage": [],
     "module": [
       "Any",
+      "AttemptBudgetEvidence",
       "CLAIMABLE_STATUSES",
+      "Literal",
       "Scheduler",
       "SupervisorError",
       "TYPE_CHECKING",
+      "TaskBudgetScope",
+      "TypedDict",
+      "UnsupportedProviderUsage",
       "_MERGE_PLAN_CHANGED_PATHS_MAX_BYTES",
+      "_attempt_budget_fields",
       "annotations",
+      "attempt_budget_evidence",
       "declared_read_resources",
       "declared_resources",
       "json",
@@ -1509,6 +1523,7 @@
       "_path_key",
       "_process_liveness",
       "annotations",
+      "attempt_budget_evidence",
       "datetime",
       "json",
       "os",
@@ -1532,6 +1547,7 @@
       "_capture_base_checkout_snapshot",
       "_capture_read_resource_snapshot",
       "_case_sensitive_paths",
+      "_check_attempt_budget",
       "_cleanup_completed_result_stages_locked",
       "_cleanup_result_import_staging_locked",
       "_clear_result_import_staging_paths",
@@ -2265,6 +2281,7 @@
       "SupervisorError",
       "ViewsMixin",
       "annotations",
+      "attempt_budget_evidence",
       "canonical_json",
       "declared_read_resources",
       "json",
@@ -2272,7 +2289,8 @@
       "sha256",
       "shutil",
       "sqlite3",
-      "time"
+      "time",
+      "utc_now"
     ]
   },
   "agent_control_plane.supervisor.workers": {
