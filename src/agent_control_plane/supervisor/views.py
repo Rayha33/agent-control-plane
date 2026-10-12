@@ -11,12 +11,13 @@ import re
 import shutil
 import sqlite3
 import time
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..scheduling import Scheduler, declared_read_resources
 from ..status import DEFAULT_LEASE_RISK_SECONDS, StatusView
-from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError
+from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError, canonical_json, sha256
 
 
 class ViewsMixin:
@@ -337,6 +338,389 @@ class ViewsMixin:
         """Integration ordering preview for approved submissions. Read-only."""
         self._assert_no_git_grafts()
         return Scheduler(self).merge_plan()
+
+    @staticmethod
+    def _bounded_comparison_json(raw: Any, maximum_bytes: int) -> tuple[str, Any]:
+        if not isinstance(raw, str):
+            return "unavailable", None
+        try:
+            if len(raw.encode("utf-8")) > maximum_bytes:
+                return "unavailable", None
+            return "available", json.loads(raw)
+        except (UnicodeEncodeError, ValueError, RecursionError):
+            return "unavailable", None
+
+    @staticmethod
+    def _comparison_text(value: Any, maximum: int = 512) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = "".join(
+            character
+            for character in value
+            if ord(character) >= 32 and not 127 <= ord(character) <= 159
+        )
+        return normalized[:maximum]
+
+    @staticmethod
+    def _valid_comparison_submission_id(value: Any) -> bool:
+        if not isinstance(value, str) or not value or not value.isprintable():
+            return False
+        try:
+            return len(value.encode("utf-8")) <= 128
+        except UnicodeEncodeError:
+            return False
+
+    def _comparison_qc_view(
+        self, connection: sqlite3.Connection, submission: sqlite3.Row
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT id, submission_id, reviewer_id, commit_sha, verdict,
+                   substr(findings_json, 1, 32769) AS findings_json,
+                   substr(results_json, 1, 65537) AS results_json,
+                   packet_sha256,
+                   substr(reviewer_provenance_json, 1, 16385) AS reviewer_provenance_json,
+                   reviewer_signature, bundle_sha256, policy_fingerprint,
+                   substr(acceptance_coverage_json, 1, 32769) AS acceptance_coverage_json,
+                   acceptance_coverage_contract_version, started_at, finished_at
+            FROM qc_runs WHERE submission_id = ?
+            ORDER BY finished_at DESC, id DESC LIMIT 1
+            """,
+            (submission["id"],),
+        ).fetchone()
+        if row is None:
+            return {"state": "missing"}
+
+        findings_state, findings_value = self._bounded_comparison_json(
+            row["findings_json"], 32 * 1024
+        )
+        findings: list[dict[str, Any]] = []
+        findings_count: int | None = None
+        findings_truncated = False
+        if findings_state == "available" and isinstance(findings_value, list):
+            findings_count = len(findings_value)
+            findings_truncated = findings_count > 8
+            for item in findings_value[:8]:
+                if not isinstance(item, dict):
+                    continue
+                finding: dict[str, Any] = {}
+                for key in (
+                    "severity",
+                    "requirement",
+                    "finding",
+                    "evidence",
+                    "required_fix",
+                    "path",
+                ):
+                    value = self._comparison_text(item.get(key))
+                    if value is not None:
+                        finding[key] = value
+                line = item.get("line")
+                if type(line) is int and line >= 0:
+                    finding["line"] = line
+                findings.append(finding)
+        else:
+            findings_state = "unavailable"
+
+        results_state, results_value = self._bounded_comparison_json(row["results_json"], 64 * 1024)
+        command_results: list[dict[str, Any]] = []
+        result_count: int | None = None
+        results_truncated = False
+        if results_state == "available" and isinstance(results_value, list):
+            result_count = len(results_value)
+            results_truncated = result_count > 16
+            for item in results_value[:16]:
+                if not isinstance(item, dict):
+                    continue
+                result: dict[str, Any] = {}
+                for key in (
+                    "evidence_id",
+                    "evidence_sha256",
+                    "command_set_sha256",
+                    "kind",
+                    "phase",
+                    "status",
+                ):
+                    value = self._comparison_text(item.get(key), 160)
+                    if value is not None:
+                        result[key] = value
+                for key in ("exit_code", "command_count"):
+                    value = item.get(key)
+                    if type(value) is int:
+                        result[key] = value
+                duration = item.get("duration_seconds")
+                if type(duration) in {int, float}:
+                    result["duration_seconds"] = duration
+                command_results.append(result)
+        else:
+            results_state = "unavailable"
+
+        coverage_state, coverage_value = self._bounded_comparison_json(
+            row["acceptance_coverage_json"], 32 * 1024
+        )
+        acceptance_coverage: list[dict[str, Any]] = []
+        coverage_count: int | None = None
+        coverage_truncated = False
+        if coverage_state == "available" and isinstance(coverage_value, list):
+            coverage_count = len(coverage_value)
+            coverage_truncated = coverage_count > 16
+            for item in coverage_value[:16]:
+                if not isinstance(item, dict):
+                    continue
+                entry: dict[str, Any] = {}
+                # Free-form acceptance text belongs to the task brief, not this view.
+                coverage_status = self._comparison_text(item.get("status"), 80)
+                if coverage_status is not None:
+                    entry["status"] = coverage_status
+                criterion_id = self._comparison_text(item.get("criterion_id"), 160)
+                if criterion_id is not None:
+                    entry["criterion_id"] = criterion_id
+                evidence_refs = item.get("evidence_refs")
+                if isinstance(evidence_refs, list):
+                    entry["evidence_refs"] = [
+                        value[:160] for value in evidence_refs[:16] if isinstance(value, str)
+                    ]
+                acceptance_coverage.append(entry)
+        else:
+            coverage_state = "unavailable"
+
+        provenance_state, provenance = self._bounded_comparison_json(
+            row["reviewer_provenance_json"], 16 * 1024
+        )
+        provenance_fingerprint = (
+            sha256(canonical_json(provenance).encode("utf-8"))
+            if provenance_state == "available" and isinstance(provenance, dict)
+            else None
+        )
+        exact_binding = (
+            row["submission_id"] == submission["id"]
+            and row["commit_sha"] == submission["commit_sha"]
+        )
+        return {
+            "state": "available",
+            "qc_run_id": row["id"],
+            "submission_id": row["submission_id"],
+            "commit_sha": row["commit_sha"],
+            "candidate_binding": "exact" if exact_binding else "mismatch",
+            "verdict": row["verdict"],
+            "reviewer_id": row["reviewer_id"],
+            "reviewer_provenance_sha256": provenance_fingerprint,
+            "reviewer_provenance_state": provenance_state,
+            "reviewer_signature_present": bool(row["reviewer_signature"]),
+            "policy_fingerprint": row["policy_fingerprint"],
+            "review_packet_sha256": row["packet_sha256"],
+            "bundle_sha256": row["bundle_sha256"],
+            "command_results": {
+                "state": results_state,
+                "count": result_count,
+                "truncated": results_truncated,
+                "items": command_results,
+            },
+            "findings": {
+                "state": findings_state,
+                "count": findings_count,
+                "truncated": findings_truncated,
+                "items": findings,
+            },
+            "acceptance_coverage": {
+                "state": coverage_state,
+                "contract_version": row["acceptance_coverage_contract_version"],
+                "count": coverage_count,
+                "truncated": coverage_truncated,
+                "items": acceptance_coverage,
+            },
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
+
+    def compare_submissions(self, submission_ids: Sequence[str]) -> dict[str, Any]:
+        """Compare 2-8 submissions for one task without ranking or mutating them."""
+        if (
+            isinstance(submission_ids, (str, bytes))
+            or not isinstance(submission_ids, Sequence)
+            or not 2 <= len(submission_ids) <= 8
+            or any(not self._valid_comparison_submission_id(value) for value in submission_ids)
+            or len(set(submission_ids)) != len(submission_ids)
+        ):
+            raise SupervisorError(
+                "invalid_submission_ids", "pass 2 to 8 unique submission IDs (maximum 128 bytes)"
+            )
+
+        with self.connect() as connection:
+            connection.execute("BEGIN")
+            submissions: list[sqlite3.Row] = []
+            for submission_id in submission_ids:
+                row = connection.execute(
+                    """
+                    SELECT id, task_id, attempt_id, worker_agent_id, commit_sha, tree_sha,
+                           object_contract, patch_sha256,
+                           substr(changed_paths_json, 1, 65537) AS changed_paths_json,
+                           status, substr(result_manifest_json, 1, 65537) AS result_manifest_json,
+                           created_at
+                    FROM submissions WHERE id = ?
+                    """,
+                    (submission_id,),
+                ).fetchone()
+                if row is None:
+                    raise SupervisorError(
+                        "submission_not_found", f"submission {submission_id} not found"
+                    )
+                submissions.append(row)
+
+            task_id = submissions[0]["task_id"]
+            if any(row["task_id"] != task_id for row in submissions[1:]):
+                raise SupervisorError(
+                    "submission_task_mismatch", "all compared submissions must belong to one task"
+                )
+            task = connection.execute(
+                """
+                SELECT id, substr(title, 1, 1025) AS title, base_branch, base_sha,
+                       substr(description, 1, 65537) AS description,
+                       substr(acceptance_json, 1, 65537) AS acceptance_json
+                FROM tasks WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise SupervisorError("task_not_found", f"task {task_id} not found")
+
+            raw_title = task["title"]
+            title = self._comparison_text(raw_title, 1024)
+            description = task["description"]
+            brief_state, acceptance = self._bounded_comparison_json(
+                task["acceptance_json"], 64 * 1024
+            )
+            if (
+                brief_state == "available"
+                and isinstance(raw_title, str)
+                and len(raw_title) <= 1024
+                and isinstance(description, str)
+                and len(description.encode("utf-8")) <= 64 * 1024
+            ):
+                brief_fingerprint = sha256(
+                    canonical_json(
+                        {
+                            "title": raw_title,
+                            "description": description,
+                            "acceptance": acceptance,
+                        }
+                    ).encode("utf-8")
+                )
+            else:
+                brief_state = "unavailable"
+                brief_fingerprint = None
+
+            candidates: list[dict[str, Any]] = []
+            for submission in submissions:
+                attempt = connection.execute(
+                    """
+                    SELECT id, task_id, number, agent_id, branch, start_sha, status
+                    FROM attempts WHERE id = ? AND task_id = ?
+                    """,
+                    (submission["attempt_id"], task_id),
+                ).fetchone()
+                attempt_state = "available" if attempt is not None else "unavailable"
+                attempt_start_sha = attempt["start_sha"] if attempt is not None else None
+                paths_state, paths = self._bounded_comparison_json(
+                    submission["changed_paths_json"], 64 * 1024
+                )
+                if paths_state == "available" and isinstance(paths, list):
+                    paths_truncated = len(paths) > 100
+                    normalized_paths = [
+                        value[:1024] for value in paths[:100] if isinstance(value, str)
+                    ]
+                    if len(normalized_paths) != min(len(paths), 100):
+                        paths_state = "unavailable"
+                        normalized_paths = []
+                else:
+                    paths_state = "unavailable"
+                    paths_truncated = False
+                    normalized_paths = []
+
+                candidate = {
+                    "submission_id": submission["id"],
+                    "attempt_id": submission["attempt_id"],
+                    "worker_agent_id": submission["worker_agent_id"],
+                    "attempt": (
+                        {
+                            "state": attempt_state,
+                            "number": attempt["number"],
+                            "agent_id": attempt["agent_id"],
+                            "branch": attempt["branch"],
+                            "start_sha": attempt_start_sha,
+                            "status": attempt["status"],
+                        }
+                        if attempt is not None
+                        else {"state": "unavailable"}
+                    ),
+                    "base_relation": {
+                        "attempt_start_sha": attempt_start_sha,
+                        "task_base_sha_at_comparison": task["base_sha"],
+                        "state": (
+                            "same_as_current_task_base"
+                            if attempt_start_sha == task["base_sha"]
+                            else "different_from_current_task_base"
+                            if attempt_start_sha is not None
+                            else "unavailable"
+                        ),
+                    },
+                    "commit_sha": submission["commit_sha"],
+                    "tree_sha": submission["tree_sha"],
+                    "object_contract": submission["object_contract"],
+                    "patch_sha256": submission["patch_sha256"],
+                    "changed_paths": {
+                        "state": paths_state,
+                        "truncated": paths_truncated,
+                        "items": normalized_paths,
+                    },
+                    "status": submission["status"],
+                    "completion_receipt": self._completion_receipt_view(submission),
+                    "latest_qc": self._comparison_qc_view(connection, submission),
+                    "created_at": submission["created_at"],
+                }
+                qc = candidate["latest_qc"]
+                candidate["review_handoff"] = {
+                    "state": "prepared_not_dispatched",
+                    "task_id": task_id,
+                    "task_brief_sha256": brief_fingerprint,
+                    "task_brief_binding_state": "current_only_not_pinned_at_attempt_start",
+                    "candidate_submission_id": submission["id"],
+                    "candidate_commit_sha": submission["commit_sha"],
+                    "candidate_tree_sha": submission["tree_sha"],
+                    "candidate_patch_sha256": submission["patch_sha256"],
+                    "attempt_id": submission["attempt_id"],
+                    "writer_agent_id": submission["worker_agent_id"],
+                    "feedback_route": {
+                        "agent_id": submission["worker_agent_id"],
+                        "mode": "manual_operator_routing",
+                    },
+                    "qc_run_id": qc.get("qc_run_id") if qc.get("state") == "available" else None,
+                    "review_packet_sha256": (
+                        qc.get("review_packet_sha256") if qc.get("state") == "available" else None
+                    ),
+                    "policy_fingerprint": (
+                        qc.get("policy_fingerprint") if qc.get("state") == "available" else None
+                    ),
+                    "critic_write_authority": False,
+                    "automatic_selection_or_dispatch": False,
+                }
+                candidates.append(candidate)
+
+            return {
+                "schema": "acp-submission-comparison-v1",
+                "task_id": task_id,
+                "task_title": title,
+                "task_base": {"branch": task["base_branch"], "sha": task["base_sha"]},
+                "task_brief": {
+                    "state": "current_only_not_pinned_at_attempt_start",
+                    "fingerprint_state": brief_state,
+                    "sha256": brief_fingerprint,
+                },
+                "candidate_count": len(candidates),
+                "order": "caller_supplied_no_ranking",
+                "read_only": True,
+                "candidates": candidates,
+            }
 
     def status(
         self,

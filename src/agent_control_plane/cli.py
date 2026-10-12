@@ -26,6 +26,7 @@ READ_ONLY_ACTIONS = frozenset(
         "plan",
         "queue",
         "merge-plan",
+        "compare-submissions",
         "reviewers",
         "bundle",
         "verify-events",
@@ -281,6 +282,11 @@ def parser() -> argparse.ArgumentParser:
     intent_history.add_argument("--after-revision", type=int, default=0)
     commands.add_parser("queue", help="ordered ready queue with overlap and dependency blockers")
     commands.add_parser("merge-plan", help="integration ordering preview for approved work")
+    compare_submissions = commands.add_parser(
+        "compare-submissions",
+        help="read-only, non-ranking comparison of submissions for one task",
+    )
+    compare_submissions.add_argument("submission_ids", nargs="+", help="2 to 8 submission IDs")
     commands.add_parser("reviewers", help="declared reviewers and the evaluation policy state")
     ratify = commands.add_parser(
         "ratify-reviewers", help="accept a changed reviewer policy so QC may run again"
@@ -947,6 +953,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.ready_queue()
         elif args.action == "merge-plan":
             result = supervisor.merge_plan()
+        elif args.action == "compare-submissions":
+            result = supervisor.compare_submissions(args.submission_ids)
         elif args.action == "reviewers":
             result = supervisor.reviewers()
         elif args.action == "ratify-reviewers":

@@ -153,7 +153,7 @@ pinned CI runner and a newer operator install, say:
   contract could approve work the newer contract rejects. It now stops with
   `schema_newer_than_binary` and tells you to upgrade acp.
 - **Only commands that admit they mutate will upgrade one.** `plan`, `queue`,
-  `merge-plan`, `status`, `wait`, `show`, `intents`, `intent-history`, `reviewers`, `bundle` and `verify-events` open
+  `merge-plan`, `compare-submissions`, `status`, `wait`, `show`, `intents`, `intent-history`, `reviewers`, `bundle` and `verify-events` open
   `mode=ro`. Against a database that is behind, they report
   `schema_upgrade_required` and leave the file byte for byte as they found it.
 
@@ -366,6 +366,7 @@ answers it from state it already holds, without launching anything:
 uv run --extra dev acp plan TASK_ID     # would this claim succeed, and if not, who is in the way?
 uv run --extra dev acp queue            # ordered set of tasks that can run concurrently
 uv run --extra dev acp merge-plan       # integration order for approved work
+uv run --extra dev acp compare-submissions SUBMISSION_ID_A SUBMISSION_ID_B
 ~~~
 
 `plan` classifies every collision as <code>exact</code> (identical normalized
@@ -406,6 +407,14 @@ prove that a change is semantically incompatible. Missing/untracked scopes and
 unavailable snapshots are reported as `unknown`, never as unchanged. Tasks with
 no declared read resources retain the existing behavior.
 
+`compare-submissions` accepts 2–8 submission IDs for one task, in the supplied order.
+It presents each exact attempt/base, commit/tree, patch digest, changed paths,
+bounded QC evidence and completion receipt. The structured reviewer handoff is
+prepared but never dispatched; it contains no raw prompt or command transcript and
+grants no critic write authority. A current brief fingerprint is explicitly marked
+as not pinned to attempt start, and changed bases or missing evidence stay visible.
+It does not rank, select, approve or integrate candidates.
+
 Each `merge-plan` entry also includes a read-only
 `cross_submission_read_write_advisory`. It compares that task's declared read
 scopes with the changed paths of every other approved, assurance-ready
@@ -420,7 +429,7 @@ submission paths or write-set admission. This does not infer actual reads or
 semantic incompatibility, and does not block, reorder, or mutate submissions; it
 also cannot account for work that has not reached an approved submission.
 
-All four planning commands are read-only. Unlike <code>claim</code> and
+These planning and comparison commands are read-only. Unlike <code>claim</code> and
 <code>list</code>, they never reap: looking at the board does not orphan an
 agent's attempt.
 
@@ -1060,7 +1069,7 @@ service.
   is deliberately not guarded: what a shell command writes cannot be read off the
   command string, and a pattern that can be walked around by rephrasing would read as
   coverage without being any. `acp mcp-serve` additionally
-  exposes ten read-only tools over stdio MCP — no writes, no credential — so a session
+  exposes eleven read-only tools over stdio MCP — no writes, no credential — so a session
   can read the board without shelling out. See docs/INTEGRATIONS.md.
 - Tests and critic commands execute candidate code. Linux uses a child subreaper
   to adopt and kill double-fork/`setsid` descendants on both success and timeout;

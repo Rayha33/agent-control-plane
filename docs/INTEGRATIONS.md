@@ -187,9 +187,10 @@ without shelling out:
 {"mcpServers": {"acp": {"command": "acp", "args": ["--repo", "/path/to/repo", "mcp-serve"]}}}
 ```
 
-Ten tools, each a one-line delegation to a supervisor method: `acp_status`,
-`acp_queue`, `acp_merge_plan`, `acp_reviewers`, `acp_verify_events`, `acp_show`,
-`acp_plan`, `acp_bundle`, `acp_guard_context`, `acp_guard`.
+Eleven tools, each a one-line delegation to a supervisor method: `acp_status`,
+`acp_queue`, `acp_merge_plan`, `acp_compare_submissions`, `acp_reviewers`,
+`acp_verify_events`, `acp_show`, `acp_plan`, `acp_bundle`, `acp_guard_context`,
+`acp_guard`.
 
 **No writes and no credential, on purpose.** `claim`, `heartbeat`, `submit`, `qc` and
 `integrate` are authenticated, and `runner_identity.py` keeps worker, critic and

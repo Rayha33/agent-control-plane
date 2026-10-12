@@ -9,6 +9,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -20,10 +21,12 @@ from types import SimpleNamespace
 
 import pytest
 from support import (
+    event_count,
     install_passing_critic,
     passing_critic_script,
     python_command,
     requires_linux_worker,
+    state_fingerprint,
 )
 
 from agent_control_plane import worker_trampoline
@@ -3292,6 +3295,123 @@ def test_qc_command_that_mutates_candidate_cannot_pass(repo: Path) -> None:
     review = supervisor.run_qc(submission["id"], "independent-qc")
     assert review["verdict"] == "revise"
     assert "mutated the candidate" in review["findings"][0]["finding"]
+
+
+def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) -> None:
+    write_config(
+        repo,
+        [
+            python_command(
+                'from pathlib import Path; print("".join(["PRIVATE", "_QC", "_OUTPUT"])); '
+                'Path("alpha.txt").write_text("QC touched")'
+            )
+        ],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index, content in enumerate(("candidate one\n", "candidate two\n")):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", content)
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        review = supervisor.run_qc(submission["id"], "independent-qc")
+        assert review["verdict"] == "revise"
+        submissions.append(submission)
+
+    readonly = GitSupervisor(repo, read_only=True)
+    before = state_fingerprint(readonly)
+    event_total = event_count(readonly)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    after = state_fingerprint(readonly)
+
+    assert compared["schema"] == "acp-submission-comparison-v1"
+    assert compared["order"] == "caller_supplied_no_ranking"
+    assert compared["read_only"] is True
+    assert compared["task_brief"]["state"] == "current_only_not_pinned_at_attempt_start"
+    assert compared["task_brief"]["sha256"]
+    assert [item["submission_id"] for item in compared["candidates"]] == [
+        item["id"] for item in submissions
+    ]
+    expected_base_states = ["same_as_current_task_base", "different_from_current_task_base"]
+    for candidate, submission, expected_base_state in zip(
+        compared["candidates"], submissions, expected_base_states, strict=True
+    ):
+        assert candidate["commit_sha"] == submission["commit_sha"]
+        assert candidate["tree_sha"] == submission["tree_sha"]
+        assert candidate["patch_sha256"] == submission["patch_sha256"]
+        assert candidate["base_relation"]["state"] == expected_base_state
+        assert candidate["latest_qc"]["candidate_binding"] == "exact"
+        assert candidate["latest_qc"]["policy_fingerprint"]
+        assert candidate["latest_qc"]["review_packet_sha256"]
+        assert candidate["latest_qc"]["findings"]["state"] == "available"
+        assert candidate["review_handoff"]["state"] == "prepared_not_dispatched"
+        assert candidate["review_handoff"]["critic_write_authority"] is False
+        assert candidate["review_handoff"]["automatic_selection_or_dispatch"] is False
+        assert candidate["completion_receipt"]["state"] == "not_provided"
+    serialized = json.dumps(compared)
+    assert "PRIVATE_QC_OUTPUT" not in serialized
+    assert "candidate one" not in serialized
+    assert before == after
+    assert event_count(readonly) == event_total
+    assert len(serialized.encode("utf-8")) < 100_000
+
+
+def test_compare_submissions_marks_changed_base_and_mismatched_qc(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute("UPDATE tasks SET base_sha = ? WHERE id = ?", ("f" * 40, created["id"]))
+        connection.execute(
+            "UPDATE qc_runs SET commit_sha = ? WHERE submission_id = ?",
+            ("e" * 40, submissions[1]["id"]),
+        )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    assert all(
+        candidate["base_relation"]["state"] == "different_from_current_task_base"
+        for candidate in compared["candidates"]
+    )
+    assert compared["candidates"][0]["latest_qc"]["candidate_binding"] == "exact"
+    assert compared["candidates"][1]["latest_qc"]["candidate_binding"] == "mismatch"
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute("DELETE FROM qc_runs WHERE submission_id = ?", (submissions[0]["id"],))
+    without_qc = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    assert without_qc["candidates"][0]["latest_qc"] == {"state": "missing"}
+
+
+def test_compare_submissions_rejects_invalid_scope(repo: Path) -> None:
+    supervisor = GitSupervisor(repo, read_only=True)
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions(["only-one"])
+    assert captured.value.code == "invalid_submission_ids"
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions(["duplicate", "duplicate"])
+    assert captured.value.code == "invalid_submission_ids"
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions([f"candidate-{index}" for index in range(9)])
+    assert captured.value.code == "invalid_submission_ids"
+
+    with pytest.raises(SupervisorError) as captured:
+        supervisor.compare_submissions(["valid", "\ud800"])
+    assert captured.value.code == "invalid_submission_ids"
 
 
 def test_builtin_independent_critic_runs_as_separate_process(repo: Path) -> None:
