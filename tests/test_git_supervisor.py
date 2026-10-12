@@ -39,6 +39,7 @@ from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker as oci_worker_module
 from agent_control_plane.supervisor import process as process_module
 from agent_control_plane.supervisor import result_import as result_import_module
+from agent_control_plane.supervisor import views as views_module
 from agent_control_plane.supervisor import workers as workers_module
 from agent_control_plane.supervisor.common import canonical_json, sha256
 from agent_control_plane.supervisor.result_import import result_ref_name
@@ -3349,6 +3350,8 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
         assert candidate["latest_qc"]["recorded_verdict"] == "revise"
         assert candidate["latest_qc"]["reviewer_provider"]
         assert candidate["latest_qc"]["policy_state"] == "current_and_ratified"
+        assert candidate["latest_qc"]["coverage_contract_state"] == "current"
+        assert candidate["latest_qc"]["evidence_complete"] is True
         assert candidate["latest_qc"]["handoff_eligibility"] == "eligible"
         assert candidate["latest_qc"]["review_packet_sha256"]
         assert candidate["latest_qc"]["findings"]["state"] == "available"
@@ -3418,6 +3421,250 @@ def test_compare_submissions_marks_changed_base_and_mismatched_qc(repo: Path) ->
         [item["id"] for item in submissions]
     )
     assert without_qc["candidates"][0]["latest_qc"] == {"state": "missing"}
+
+
+def test_compare_submissions_withholds_handoff_for_truncated_or_malformed_qc(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    finding = {
+        "severity": "low",
+        "requirement": "criterion",
+        "finding": "noted",
+        "evidence": "receipt",
+        "required_fix": "none",
+    }
+    result = {
+        "evidence_id": "qc:command:000",
+        "evidence_sha256": "a" * 64,
+        "exit_code": 0,
+    }
+    coverage = {
+        "criterion_id": "AC-001-example",
+        "status": "pass",
+        "rationale": "checked",
+        "evidence_refs": ["qc:command:000"],
+    }
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            """
+            UPDATE qc_runs
+            SET findings_json = ?, results_json = ?, acceptance_coverage_json = ?,
+                acceptance_coverage_contract_version = ?
+            WHERE submission_id = ?
+            """,
+            (
+                json.dumps([finding] * 9),
+                json.dumps(
+                    [{**result, "evidence_id": f"qc:command:{index:03d}"} for index in range(17)]
+                ),
+                json.dumps(
+                    [{**coverage, "criterion_id": f"AC-{index:03d}-example"} for index in range(17)]
+                ),
+                1,
+                submissions[0]["id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE qc_runs
+            SET findings_json = ?, results_json = ?, acceptance_coverage_json = ?,
+                acceptance_coverage_contract_version = ?
+            WHERE submission_id = ?
+            """,
+            (
+                json.dumps([finding, "malformed"]),
+                json.dumps([result, "malformed"]),
+                json.dumps([coverage, "malformed"]),
+                2,
+                submissions[1]["id"],
+            ),
+        )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    truncated, malformed = [item["latest_qc"] for item in compared["candidates"]]
+    assert truncated["coverage_contract_state"] == "not_current"
+    assert truncated["findings"]["truncated"] is True
+    assert truncated["command_results"]["truncated"] is True
+    assert truncated["acceptance_coverage"]["truncated"] is True
+    assert truncated["evidence_complete"] is False
+    assert truncated["handoff_eligibility"] == "coverage_contract_not_current"
+    assert malformed["coverage_contract_state"] == "current"
+    assert malformed["findings"]["state"] == "unavailable"
+    assert malformed["command_results"]["state"] == "unavailable"
+    assert malformed["acceptance_coverage"]["state"] == "unavailable"
+    assert malformed["evidence_complete"] is False
+    assert malformed["handoff_eligibility"] == "incomplete_evidence"
+    for candidate in compared["candidates"]:
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
+
+
+def test_readonly_diff_does_not_fetch_missing_promisor_objects(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_sha = git(repo, "rev-parse", "HEAD")
+    (repo / "alpha.txt").write_text("partial clone target\n", encoding="utf-8")
+    git(repo, "add", "alpha.txt")
+    git(repo, "commit", "-m", "partial clone diff target")
+    commit_sha = git(repo, "rev-parse", "HEAD")
+    blob_oid = git(repo, "rev-parse", f"{commit_sha}:alpha.txt")
+
+    bare_remote = tmp_path / "promisor.git"
+    subprocess.run(["git", "clone", "--bare", str(repo), str(bare_remote)], check=True)
+    subprocess.run(
+        ["git", "--git-dir", str(bare_remote), "config", "uploadpack.allowFilter", "true"],
+        check=True,
+    )
+    partial_clone = tmp_path / "partial-clone"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            bare_remote.as_uri(),
+            str(partial_clone),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    pack_indexes = list((partial_clone / ".git" / "objects" / "pack").glob("*.idx"))
+    blob_in_pack = False
+    for pack_index in pack_indexes:
+        verification = subprocess.run(
+            ["git", "verify-pack", "-v", str(pack_index)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        blob_in_pack |= any(
+            len(columns := line.split()) >= 2 and columns[0] == blob_oid and columns[1] == "blob"
+            for line in verification.stdout.splitlines()
+        )
+    loose_blob = partial_clone / ".git" / "objects" / blob_oid[:2] / blob_oid[2:]
+    assert not blob_in_pack and not loose_blob.exists()
+    network_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    network_probe.bind(("127.0.0.1", 0))
+    network_probe.listen()
+    git(
+        partial_clone,
+        "remote",
+        "set-url",
+        "origin",
+        f"git://127.0.0.1:{network_probe.getsockname()[1]}/unused-promisor.git",
+    )
+
+    object_store = partial_clone / ".git" / "objects"
+
+    def object_snapshot() -> list[tuple[str, str]]:
+        return sorted(
+            (
+                path.relative_to(object_store).as_posix(),
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in object_store.rglob("*")
+            if path.is_file()
+        )
+
+    before = object_snapshot()
+    readonly = GitSupervisor.__new__(GitSupervisor)
+    readonly.root = partial_clone
+    observed_no_lazy_fetch: list[str | None] = []
+    real_run = subprocess.run
+
+    def observe_git_environment(*args, **kwargs):
+        command = args[0]
+        if (
+            isinstance(command, (list, tuple))
+            and "diff" in command
+            and str(partial_clone) in command
+        ):
+            observed_no_lazy_fetch.append(kwargs["env"].get("GIT_NO_LAZY_FETCH"))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(process_module.subprocess, "run", observe_git_environment)
+    with pytest.raises(SupervisorError) as captured:
+        readonly._git_readonly_bytes(
+            "diff",
+            "--shortstat",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            base_sha,
+            commit_sha,
+            "--",
+            no_lazy_fetch=True,
+            timeout=2,
+        )
+    assert captured.value.code == "git_error"
+    assert observed_no_lazy_fetch == ["1"]
+    assert object_snapshot() == before
+    network_probe.setblocking(False)
+    try:
+        accepted_connection, _ = network_probe.accept()
+    except BlockingIOError:
+        pass
+    else:
+        accepted_connection.close()
+        pytest.fail("read-only diff attempted a promisor-network connection")
+    finally:
+        network_probe.close()
+
+
+def test_compare_submissions_shares_one_diff_time_budget(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr(views_module, "time", clock)
+    readonly = GitSupervisor(repo, read_only=True)
+    calls: list[float] = []
+
+    def delayed_diff(*args, **kwargs) -> bytes:
+        calls.append(kwargs["timeout"])
+        clock.now += 6.0
+        return b"1 file changed, 1 insertion(+)"
+
+    monkeypatch.setattr(readonly, "_git_readonly_bytes", delayed_diff)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    assert calls == [2.0]
+    assert compared["candidates"][0]["diff_summary"]["state"] == "available"
+    assert compared["candidates"][1]["diff_summary"]["state"] == "unavailable"
 
 
 def test_compare_submissions_withholds_handoff_for_unratified_policy(repo: Path) -> None:

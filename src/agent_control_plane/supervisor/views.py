@@ -373,6 +373,9 @@ class ViewsMixin:
     def _comparison_qc_view(
         self, connection: sqlite3.Connection, submission: sqlite3.Row
     ) -> dict[str, Any]:
+        # Keep the private comparison module's pinned public surface unchanged.
+        from .acceptance import ACCEPTANCE_COVERAGE_CONTRACT_VERSION
+
         row = connection.execute(
             """
             SELECT id, submission_id, reviewer_id, commit_sha, verdict,
@@ -400,8 +403,23 @@ class ViewsMixin:
         if findings_state == "available" and isinstance(findings_value, list):
             findings_count = len(findings_value)
             findings_truncated = findings_count > 8
+            required_finding_fields = {
+                "severity",
+                "requirement",
+                "finding",
+                "evidence",
+                "required_fix",
+            }
+            finding_severities = {"critical", "high", "medium", "low", "info"}
             for item in findings_value[:8]:
-                if not isinstance(item, dict):
+                if (
+                    not isinstance(item, dict)
+                    or not required_finding_fields.issubset(item)
+                    or not isinstance(item.get("severity"), str)
+                    or item["severity"] not in finding_severities
+                    or any(not isinstance(item.get(key), str) for key in required_finding_fields)
+                ):
+                    findings_state = "unavailable"
                     continue
                 finding: dict[str, Any] = {}
                 for key in (
@@ -430,7 +448,37 @@ class ViewsMixin:
             result_count = len(results_value)
             results_truncated = result_count > 16
             for item in results_value[:16]:
-                if not isinstance(item, dict):
+                has_evidence_identity = isinstance(item, dict) and (
+                    "evidence_id" in item or "evidence_sha256" in item
+                )
+                evidence_record_valid = (
+                    isinstance(item.get("evidence_id"), str)
+                    and bool(item["evidence_id"])
+                    and isinstance(item.get("evidence_sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", item["evidence_sha256"]) is not None
+                    if isinstance(item, dict)
+                    else False
+                )
+                command_record_valid = (
+                    isinstance(item.get("command"), str)
+                    and bool(item["command"])
+                    and isinstance(item.get("argv"), list)
+                    and all(isinstance(value, str) for value in item["argv"])
+                    and type(item.get("duration_ms")) is int
+                    and item["duration_ms"] >= 0
+                    and type(item.get("timed_out")) is bool
+                    and type(item.get("output_limited")) is bool
+                    if isinstance(item, dict)
+                    else False
+                )
+                if (
+                    not isinstance(item, dict)
+                    or type(item.get("exit_code")) is not int
+                    or not (
+                        evidence_record_valid if has_evidence_identity else command_record_valid
+                    )
+                ):
+                    results_state = "unavailable"
                     continue
                 result: dict[str, Any] = {}
                 for key in (
@@ -464,9 +512,27 @@ class ViewsMixin:
         if coverage_state == "available" and isinstance(coverage_value, list):
             coverage_count = len(coverage_value)
             coverage_truncated = coverage_count > 16
+            coverage_statuses = {"pass", "revise", "unknown", "human_required"}
             for item in coverage_value[:16]:
-                if not isinstance(item, dict):
+                evidence_refs = item.get("evidence_refs") if isinstance(item, dict) else None
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("criterion_id"), str)
+                    or not item["criterion_id"]
+                    or not isinstance(item.get("status"), str)
+                    or item["status"] not in coverage_statuses
+                    or not isinstance(item.get("rationale"), str)
+                    or not item["rationale"].strip()
+                    or not isinstance(evidence_refs, list)
+                    or not evidence_refs
+                    or len(evidence_refs) > 20
+                    or any(not isinstance(value, str) or not value for value in evidence_refs)
+                    or len(set(evidence_refs)) != len(evidence_refs)
+                ):
+                    coverage_state = "unavailable"
                     continue
+                if len(evidence_refs) > 16:
+                    coverage_truncated = True
                 entry: dict[str, Any] = {}
                 # Free-form acceptance text belongs to the task brief, not this view.
                 coverage_status = self._comparison_text(item.get("status"), 80)
@@ -475,11 +541,8 @@ class ViewsMixin:
                 criterion_id = self._comparison_text(item.get("criterion_id"), 160)
                 if criterion_id is not None:
                     entry["criterion_id"] = criterion_id
-                evidence_refs = item.get("evidence_refs")
-                if isinstance(evidence_refs, list):
-                    entry["evidence_refs"] = [
-                        value[:160] for value in evidence_refs[:16] if isinstance(value, str)
-                    ]
+                entry["evidence_refs"] = [value[:160] for value in evidence_refs[:16]]
+                entry["evidence_refs_truncated"] = len(evidence_refs) > 16
                 acceptance_coverage.append(entry)
         else:
             coverage_state = "unavailable"
@@ -527,15 +590,25 @@ class ViewsMixin:
             isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
             for value in (row["packet_sha256"], row["bundle_sha256"])
         )
+        coverage_contract_version = row["acceptance_coverage_contract_version"]
+        coverage_contract_state = (
+            "unknown"
+            if type(coverage_contract_version) is not int
+            else "current"
+            if coverage_contract_version == ACCEPTANCE_COVERAGE_CONTRACT_VERSION
+            else "not_current"
+        )
         evidence_complete = (
             evidence_hashes_valid
             and bool(row["reviewer_signature"])
             and provenance_fingerprint is not None
             and findings_state == "available"
+            and not findings_truncated
             and results_state == "available"
+            and not results_truncated
             and coverage_state == "available"
-            and type(row["acceptance_coverage_contract_version"]) is int
-            and row["acceptance_coverage_contract_version"] > 0
+            and not coverage_truncated
+            and coverage_contract_state == "current"
         )
         handoff_eligibility = (
             "candidate_mismatch"
@@ -546,6 +619,10 @@ class ViewsMixin:
             if policy_state == "current_unratified"
             else "policy_unknown"
             if policy_state == "unknown"
+            else "coverage_contract_not_current"
+            if coverage_contract_state == "not_current"
+            else "coverage_contract_unknown"
+            if coverage_contract_state == "unknown"
             else "incomplete_evidence"
             if not evidence_complete
             else "eligible"
@@ -567,6 +644,8 @@ class ViewsMixin:
             "reviewer_signature_present": bool(row["reviewer_signature"]),
             "policy_fingerprint": recorded_policy_fingerprint,
             "policy_state": policy_state,
+            "coverage_contract_state": coverage_contract_state,
+            "evidence_complete": evidence_complete,
             "handoff_eligibility": handoff_eligibility,
             "review_packet_sha256": row["packet_sha256"],
             "bundle_sha256": row["bundle_sha256"],
@@ -606,12 +685,17 @@ class ViewsMixin:
                 "invalid_submission_ids", "pass 2 to 8 unique submission IDs (maximum 128 bytes)"
             )
 
+        diff_deadline = time.monotonic() + 5.0
+
         def diff_summary(start_sha: Any, commit_sha: Any) -> dict[str, Any]:
             if any(
                 not isinstance(value, str)
                 or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) is None
                 for value in (start_sha, commit_sha)
             ):
+                return {"state": "unavailable", "basis": "attempt_start_to_commit"}
+            remaining = diff_deadline - time.monotonic()
+            if remaining <= 0:
                 return {"state": "unavailable", "basis": "attempt_start_to_commit"}
             try:
                 raw = self._git_readonly_bytes(
@@ -623,6 +707,8 @@ class ViewsMixin:
                     start_sha,
                     commit_sha,
                     "--",
+                    timeout=min(2.0, remaining),
+                    no_lazy_fetch=True,
                 )
             except SupervisorError:
                 return {"state": "unavailable", "basis": "attempt_start_to_commit"}

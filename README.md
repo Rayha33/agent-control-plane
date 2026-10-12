@@ -413,11 +413,15 @@ bounded QC evidence and completion receipt. The structured reviewer handoff is
 prepared but never dispatched; it contains no raw prompt or command transcript and
 grants no critic write authority. A current brief fingerprint is explicitly marked
 as not pinned to attempt start; it includes a bounded file/insert/delete count from
-attempt start to commit, while changed bases or missing evidence stay visible.
+attempt start to commit, while changed bases or missing evidence stay visible. Git
+diff inspection disables partial-clone lazy fetch and has a shared five-second budget
+across all candidates; missing promisor objects produce an unavailable summary without
+fetching or writing them.
 Recorded QC is labeled as not revalidated and includes the reviewer and recorded
 policy identity. QC references enter the handoff only when the QC row binds to that
-candidate's commit, its policy is current and ratified, and bounded evidence fields
-are complete; otherwise the reason is explicit and the references are withheld. This
+candidate's commit, its policy is current and ratified, its acceptance-coverage
+contract matches the current version, and all bounded evidence arrays are valid and
+untruncated; otherwise the reason is explicit and the references are withheld. This
 does not independently verify the stored QC bundle or make the recorded verdict a
 current assurance result. Comparison does not rank, select, approve or integrate
 candidates.
