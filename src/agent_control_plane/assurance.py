@@ -241,7 +241,15 @@ class Assurance:
         ).hexdigest()
 
     def verify(self, payload: dict[str, Any], signature: str) -> bool:
-        return hmac.compare_digest(self.sign(payload), signature)
+        key_path = self.supervisor.state_dir / "reviewer-key"
+        try:
+            key = key_path.read_text(encoding="utf-8").strip().encode("utf-8")
+        except (OSError, UnicodeError):
+            return False
+        if not key:
+            return False
+        expected = hmac.new(key, canonical(payload).encode("utf-8"), "sha256").hexdigest()
+        return hmac.compare_digest(expected, signature)
 
     # ------------------------------------------------------------------- policy
 
@@ -392,6 +400,7 @@ class Assurance:
         verdict: str,
         packet_sha256: str,
         acceptance_coverage: list[dict[str, Any]],
+        acceptance_evidence_catalog: list[dict[str, Any]],
         acceptance_coverage_contract_version: int,
     ) -> dict[str, Any]:
         """Everything needed to re-run this verdict, and its signature."""
@@ -405,6 +414,7 @@ class Assurance:
             "packet_sha256": packet_sha256,
             "verdict": verdict,
             "acceptance_coverage": acceptance_coverage,
+            "acceptance_evidence_catalog": acceptance_evidence_catalog,
             "acceptance_coverage_contract_version": acceptance_coverage_contract_version,
             "commands": commands,
             "reviewer": reviewer.provenance(),
@@ -427,7 +437,7 @@ class Assurance:
         path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
         return {"record": record, "sha256": digest(canonical(record)), "path": str(path)}
 
-    def read_bundle(self, qc_id: str) -> dict[str, Any]:
+    def read_bundle(self, qc_id: str, *, max_bytes: int | None = None) -> dict[str, Any]:
         from .git_supervisor import SupervisorError
 
         # The caller's string used to be interpolated straight into the path, so
@@ -445,7 +455,15 @@ class Assurance:
             raise SupervisorError("invalid_qc_id", f"{qc_id!r} is not a QC identifier")
         if not path.is_file():
             raise SupervisorError("bundle_not_found", f"no reproduction bundle for {qc_id}")
-        record = json.loads(path.read_text(encoding="utf-8"))
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 1):
+            raise ValueError("max_bytes must be a positive integer")
+        with path.open("rb") as handle:
+            raw = handle.read(max_bytes + 1 if max_bytes is not None else -1)
+        if max_bytes is not None and len(raw) > max_bytes:
+            raise SupervisorError(
+                "bundle_too_large", f"QC bundle for {qc_id} exceeds its read limit"
+            )
+        record = json.loads(raw)
         signature = record.pop("signature", "")
         return {
             "bundle": {**record, "signature": signature},

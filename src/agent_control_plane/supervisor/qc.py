@@ -1007,6 +1007,18 @@ class QcMixin:
                 }
             )
         finished = utc_now()
+        referenced_evidence = {
+            reference
+            for coverage_item in acceptance_coverage
+            for reference in coverage_item["evidence_refs"]
+        }
+        acceptance_evidence_catalog = [
+            item for item in packet["evidence_catalog"] if item.get("id") in referenced_evidence
+        ]
+        if {item["id"] for item in acceptance_evidence_catalog} != referenced_evidence:
+            raise SupervisorError(
+                "invalid_critic_output", "acceptance evidence is missing from the QC packet"
+            )
         bundle = self.assurance.bundle(
             qc_id,
             dict(submission),
@@ -1016,6 +1028,7 @@ class QcMixin:
             verdict,
             packet_hash,
             acceptance_coverage,
+            acceptance_evidence_catalog,
             ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
         )
         with self.connect() as connection:

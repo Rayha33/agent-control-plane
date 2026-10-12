@@ -3353,6 +3353,7 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
         assert candidate["latest_qc"]["coverage_contract_state"] == "current"
         assert candidate["latest_qc"]["evidence_complete"] is True
         assert candidate["latest_qc"]["handoff_eligibility"] == "eligible"
+        assert candidate["latest_qc"]["acceptance_coverage"]["integrity_state"] == "verified"
         assert candidate["latest_qc"]["review_packet_sha256"]
         assert candidate["latest_qc"]["findings"]["state"] == "available"
         assert candidate["review_handoff"]["state"] == "prepared_not_dispatched"
@@ -3512,6 +3513,112 @@ def test_compare_submissions_withholds_handoff_for_truncated_or_malformed_qc(rep
         assert candidate["review_handoff"]["qc_run_id"] is None
         assert candidate["review_handoff"]["review_packet_sha256"] is None
         assert candidate["review_handoff"]["policy_fingerprint"] is None
+
+
+def test_compare_submissions_revalidates_signed_acceptance_coverage(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    reviews = []
+    for index in range(5):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        review = supervisor.run_qc(submission["id"], "independent-qc")
+        submissions.append(submission)
+        reviews.append(review)
+
+    def with_coverage(items: list[dict], mode: str) -> list[dict]:
+        if mode == "empty":
+            return []
+        changed = json.loads(json.dumps(items))
+        if mode == "duplicate":
+            changed[1]["criterion_id"] = changed[0]["criterion_id"]
+        elif mode == "unknown":
+            changed[0]["criterion_id"] = "AC-999-unknown"
+        elif mode == "unresolved_reference":
+            changed[0]["evidence_refs"] = ["qc-run:not-in-packet"]
+        return changed
+
+    for submission, review, mode in zip(
+        submissions[1:],
+        reviews[1:],
+        ("empty", "duplicate", "unknown", "unresolved_reference"),
+        strict=True,
+    ):
+        stored = supervisor.reproduction_bundle(review["id"])
+        record = stored["bundle"]
+        coverage = with_coverage(record["acceptance_coverage"], mode)
+        payload = {key: value for key, value in record.items() if key != "signature"}
+        payload["acceptance_coverage"] = coverage
+        signature = supervisor.assurance.sign(payload)
+        signed_record = {**payload, "signature": signature}
+        bundle_sha256 = hashlib.sha256(canonical_json(signed_record).encode("utf-8")).hexdigest()
+        (supervisor.state_dir / "bundles" / f"{review['id']}.json").write_text(
+            json.dumps(signed_record, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+            connection.execute(
+                """
+                UPDATE qc_runs
+                SET acceptance_coverage_json = ?, reviewer_signature = ?, bundle_sha256 = ?
+                WHERE submission_id = ?
+                """,
+                (json.dumps(coverage), signature, bundle_sha256, submission["id"]),
+            )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [submission["id"] for submission in submissions]
+    )
+    valid, *invalid = [candidate["latest_qc"] for candidate in compared["candidates"]]
+    assert valid["acceptance_coverage"]["integrity_state"] == "verified"
+    assert valid["handoff_eligibility"] == "eligible"
+    for candidate in invalid:
+        assert candidate["acceptance_coverage"]["integrity_state"] == "unavailable"
+        assert candidate["acceptance_coverage"]["state"] == "unavailable"
+        assert candidate["acceptance_coverage"]["items"] == []
+        assert candidate["evidence_complete"] is False
+        assert candidate["handoff_eligibility"] == "incomplete_evidence"
+    for candidate in compared["candidates"][1:]:
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
+
+
+def test_compare_submissions_does_not_create_a_missing_reviewer_key(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        supervisor.run_qc(submission["id"], "independent-qc")
+        submissions.append(submission)
+
+    key_path = supervisor.state_dir / "reviewer-key"
+    key_path.unlink()
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [submission["id"] for submission in submissions]
+    )
+
+    assert key_path.exists() is False
+    assert all(
+        candidate["latest_qc"]["acceptance_coverage"]["integrity_state"] == "unavailable"
+        for candidate in compared["candidates"]
+    )
+    assert all(
+        candidate["latest_qc"]["handoff_eligibility"] == "incomplete_evidence"
+        for candidate in compared["candidates"]
+    )
 
 
 def test_readonly_diff_does_not_fetch_missing_promisor_objects(

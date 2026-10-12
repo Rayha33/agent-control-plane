@@ -421,9 +421,11 @@ Recorded QC is labeled as not revalidated and includes the reviewer and recorded
 policy identity. QC references enter the handoff only when the QC row binds to that
 candidate's commit, its policy is current and ratified, its acceptance-coverage
 contract matches the current version, and all bounded evidence arrays are valid and
-untruncated; otherwise the reason is explicit and the references are withheld. This
-does not independently verify the stored QC bundle or make the recorded verdict a
-current assurance result. Comparison does not rank, select, approve or integrate
+untruncated. The comparison also verifies the signed QC bundle against the database
+record and revalidates exact criterion coverage and cited evidence IDs against the
+current task criteria and QC run/commit; otherwise coverage is unavailable and its
+references are withheld. The recorded verdict remains labeled not revalidated and is
+not a current assurance result. Comparison does not rank, select, approve or integrate
 candidates.
 
 Each `merge-plan` entry also includes a read-only

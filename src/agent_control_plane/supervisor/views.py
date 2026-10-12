@@ -371,10 +371,17 @@ class ViewsMixin:
             return False
 
     def _comparison_qc_view(
-        self, connection: sqlite3.Connection, submission: sqlite3.Row
+        self,
+        connection: sqlite3.Connection,
+        submission: sqlite3.Row,
+        task_acceptance: Any,
     ) -> dict[str, Any]:
         # Keep the private comparison module's pinned public surface unchanged.
-        from .acceptance import ACCEPTANCE_COVERAGE_CONTRACT_VERSION
+        from .acceptance import (
+            ACCEPTANCE_COVERAGE_CONTRACT_VERSION,
+            acceptance_criteria,
+            validate_acceptance_coverage,
+        )
 
         row = connection.execute(
             """
@@ -547,6 +554,73 @@ class ViewsMixin:
         else:
             coverage_state = "unavailable"
 
+        coverage_integrity_state = "unavailable"
+        if coverage_state == "available" and not coverage_truncated:
+            try:
+                expected = acceptance_criteria(task_acceptance)
+                stored_bundle = self.assurance.read_bundle(row["id"], max_bytes=1024 * 1024)
+                bundle = stored_bundle["bundle"]
+                coverage_binding_matches = (
+                    stored_bundle["signature_valid"] is True
+                    and sha256(canonical_json(bundle).encode("utf-8")) == row["bundle_sha256"]
+                    and bundle.get("signature") == row["reviewer_signature"]
+                    and bundle.get("qc_id") == row["id"]
+                    and bundle.get("submission_id") == submission["id"]
+                    and bundle.get("commit_sha") == row["commit_sha"]
+                    and bundle.get("tree_sha") == submission["tree_sha"]
+                    and bundle.get("patch_sha256") == submission["patch_sha256"]
+                    and bundle.get("packet_sha256") == row["packet_sha256"]
+                    and bundle.get("acceptance_coverage") == coverage_value
+                    and type(bundle.get("acceptance_coverage_contract_version")) is int
+                    and bundle.get("acceptance_coverage_contract_version")
+                    == row["acceptance_coverage_contract_version"]
+                )
+                bundled_coverage = bundle.get("acceptance_coverage")
+                raw_coverage = (
+                    [
+                        {
+                            key: item[key]
+                            for key in ("criterion_id", "status", "rationale", "evidence_refs")
+                        }
+                        for item in bundled_coverage
+                        if isinstance(item, dict)
+                        and set(item)
+                        == {
+                            "criterion_id",
+                            "criterion",
+                            "status",
+                            "rationale",
+                            "evidence_refs",
+                        }
+                    ]
+                    if isinstance(bundled_coverage, list)
+                    else None
+                )
+                validated_coverage = validate_acceptance_coverage(
+                    raw_coverage,
+                    expected,
+                    bundle.get("acceptance_evidence_catalog"),
+                    run_id=row["id"],
+                    commit_sha=row["commit_sha"],
+                )
+                if coverage_binding_matches and validated_coverage == bundled_coverage:
+                    coverage_integrity_state = "verified"
+                else:
+                    coverage_state = "unavailable"
+                    acceptance_coverage = []
+            except (
+                AttributeError,
+                KeyError,
+                OSError,
+                RecursionError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+                SupervisorError,
+            ):
+                coverage_state = "unavailable"
+                acceptance_coverage = []
+
         provenance_state, provenance = self._bounded_comparison_json(
             row["reviewer_provenance_json"], 16 * 1024
         )
@@ -608,6 +682,7 @@ class ViewsMixin:
             and not results_truncated
             and coverage_state == "available"
             and not coverage_truncated
+            and coverage_integrity_state == "verified"
             and coverage_contract_state == "current"
         )
         handoff_eligibility = (
@@ -666,6 +741,7 @@ class ViewsMixin:
                 "contract_version": row["acceptance_coverage_contract_version"],
                 "count": coverage_count,
                 "truncated": coverage_truncated,
+                "integrity_state": coverage_integrity_state,
                 "items": acceptance_coverage,
             },
             "started_at": row["started_at"],
@@ -867,7 +943,7 @@ class ViewsMixin:
                     "diff_summary": diff_summary(attempt_start_sha, submission["commit_sha"]),
                     "status": submission["status"],
                     "completion_receipt": self._completion_receipt_view(submission),
-                    "latest_qc": self._comparison_qc_view(connection, submission),
+                    "latest_qc": self._comparison_qc_view(connection, submission, acceptance),
                     "created_at": submission["created_at"],
                 }
                 qc = candidate["latest_qc"]
