@@ -22,7 +22,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from .scheduling import Scheduler
+from .scheduling import Scheduler, attempt_budget_evidence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .git_supervisor import GitSupervisor
@@ -659,6 +659,11 @@ class StatusView:
             "repeated_qc_findings": repeated_qc_findings,
             "ready": preview["ready"] if preview else None,
             "blockers": preview["blockers"] if preview else [],
+            "attempt_budget": attempt_budget_evidence(
+                task["id"],
+                task.get("max_attempts"),
+                task.get("attempts_used", 0),
+            ),
         }
         entry["category"], entry["reason"] = self._categorize(entry, lease_risk_seconds)
         return entry

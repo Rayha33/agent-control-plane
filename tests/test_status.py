@@ -161,6 +161,35 @@ def test_status_reads_task_and_lease_views_from_one_database_snapshot(
     assert type(snapshot["generated_at"]) is int
 
 
+def test_status_reports_typed_local_attempt_budget_provenance(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Bounded status view",
+        "Expose only local attempt-count evidence.",
+        ["The budget evidence matches the task attempt history"],
+        ["alpha.txt"],
+        max_attempts=1,
+    )
+    supervisor.claim(task["id"], "budget-worker")
+
+    snapshot = supervisor.status()
+    evidence = entry_for(snapshot, task["id"])["attempt_budget"]
+
+    assert evidence["dimension"] == "task_attempt_launches"
+    assert evidence["unit"] == "attempts"
+    assert evidence["scope"] == {"kind": "task", "id": task["id"]}
+    assert evidence["status"] == "exhausted"
+    assert evidence["configured_limit"] == 1
+    assert evidence["consumed"] == 1
+    assert evidence["reserved"] == 0
+    assert evidence["released"] == 0
+    assert evidence["remaining"] == 0
+    assert evidence["observed_at"] is None
+    assert evidence["observation_time_ref"] == "generated_at"
+    assert evidence["freshness"] == "current"
+    assert evidence["provider_usage"]["status"] == "unsupported"
+
+
 def test_status_tracks_only_declared_glob_read_inputs_and_is_read_only(repo: Path) -> None:
     (repo / "src" / "api").mkdir(parents=True)
     (repo / "src" / "ui").mkdir(parents=True)

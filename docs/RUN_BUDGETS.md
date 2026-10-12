@@ -81,11 +81,12 @@ implement shared ancestor budgets, provider usage, or quota-exhaustion recovery.
 The first refused claim records one durable exhaustion event; repeat refusals
 do not append unbounded duplicate events.
 
-Task, plan, queue, and attempt views expose this slice as `attempt_budget`: unit
-`attempts`, task scope, the configured cap, consumed/remaining counts, observation
-time and freshness, source, and the serialized claim transaction that enforces it.
-Task details carry the current observation time; plan and queue entries refer to
-their parent `generated_at`, while an attempt receipt records its creation time.
+Task, plan, queue, status, and attempt views expose this slice as `attempt_budget`:
+unit `attempts`, task scope, the configured cap, consumed/remaining counts,
+observation time and freshness, source, and the serialized claim transaction that
+enforces it. Task details carry the current observation time; plan, queue, and
+status entries refer to their parent `generated_at`, while an attempt receipt
+records its creation time.
 The attempt row is inserted and its slot consumed atomically, so this slice has
 zero held reservations and zero releases; failed provisioning still consumes the
 slot. The same view explicitly reports provider usage as unsupported with unknown
