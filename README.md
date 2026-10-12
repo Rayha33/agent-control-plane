@@ -436,7 +436,11 @@ the owning worker can read its candidate's signed QC findings and bounded check 
 with `acp owner-feedback ATTEMPT_ID --agent AGENT_ID --credential-file PRIVATE_FILE`
 (or `--credential-fd`). ACP verifies that the enrolled worker credential is bound to
 that exact attempt before returning feedback. A stale task-brief pin is explicit, and
-missing or mismatched signed evidence is withheld. This is a read-only pull channel:
+missing or mismatched signed evidence is withheld. The response labels QC as
+`recorded_only_not_revalidated`, preserves its recorded verdict and eligibility as
+historical fields, and reports current `handoff_eligibility` as
+`incomplete_task_brief` unless the attempt's pinned brief exactly matches the current
+brief. This is a read-only pull channel:
 critics cannot write the candidate, and comparison does not dispatch prompts or feedback.
 
 Each `merge-plan` entry also includes a read-only

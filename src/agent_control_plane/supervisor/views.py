@@ -437,7 +437,8 @@ class ViewsMixin:
                 feedback = {
                     "qc_run_id": qc["qc_run_id"],
                     "candidate_commit_sha": qc["commit_sha"],
-                    "verdict": qc["recorded_verdict"],
+                    "record_state": qc["record_state"],
+                    "recorded_verdict": qc["recorded_verdict"],
                     "reviewer": {
                         "id": qc["reviewer_id"],
                         "identity": qc["reviewer_identity"],
@@ -446,7 +447,12 @@ class ViewsMixin:
                     },
                     "policy_fingerprint": qc["policy_fingerprint"],
                     "policy_state": qc["policy_state"],
-                    "handoff_eligibility": qc["handoff_eligibility"],
+                    "recorded_handoff_eligibility": qc["handoff_eligibility"],
+                    "handoff_eligibility": (
+                        qc["handoff_eligibility"]
+                        if brief_binding_state == "exact"
+                        else "incomplete_task_brief"
+                    ),
                     "findings": qc["findings"],
                     "acceptance_coverage": qc["acceptance_coverage"],
                     "command_results": qc["command_results"],

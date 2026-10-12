@@ -244,6 +244,7 @@ def test_qc_feedback_is_read_only_and_restricted_to_exact_attempt_owner(repo: Pa
     assert feedback["submission_id"] == submission["id"]
     assert feedback["candidate_commit_sha"] == submission["commit_sha"]
     assert feedback["feedback"]["qc_run_id"] == review["id"]
+    assert feedback["feedback"]["record_state"] == "recorded_only_not_revalidated"
     assert feedback["feedback"]["findings"]["integrity_state"] == "verified"
     assert feedback["feedback"]["findings"]["items"]
     assert feedback["critic_write_authority"] is False
@@ -264,6 +265,10 @@ def test_qc_feedback_is_read_only_and_restricted_to_exact_attempt_owner(repo: Pa
     stale_brief_feedback = readonly.owner_feedback(attempt["id"], "worker-1", worker["credential"])
     assert stale_brief_feedback["state"] == "available_with_task_brief_warning"
     assert stale_brief_feedback["task_brief"]["binding_state"] == "stale"
+    assert stale_brief_feedback["feedback"]["record_state"] == "recorded_only_not_revalidated"
+    assert stale_brief_feedback["feedback"]["recorded_verdict"] == "block"
+    assert stale_brief_feedback["feedback"]["recorded_handoff_eligibility"] == "eligible"
+    assert stale_brief_feedback["feedback"]["handoff_eligibility"] == "incomplete_task_brief"
     assert stale_brief_feedback["feedback"]["candidate_commit_sha"] == submission["commit_sha"]
 
 
