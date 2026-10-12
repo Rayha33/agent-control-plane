@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from threading import Barrier
 
@@ -50,6 +51,17 @@ def test_exhausted_cap_refuses_before_creating_attempt_and_is_audited(repo: Path
     assert after["status"] == before["status"] == "orphaned"
     assert after["attempts_used"] == 1
     assert after["attempts_remaining"] == 0
+    assert after["attempt_budget"]["status"] == "exhausted"
+    assert after["attempt_budget"]["consumed"] == 1
+    assert after["attempt_budget"]["configured_limit"] == 1
+    assert after["attempt_budget"]["provider_usage"]["status"] == "unsupported"
+    assert after["latest_attempt"]["attempt_budget"]["consumed"] == 1
+    assert after["latest_attempt"]["attempt_budget"]["freshness"] == "historical"
+    assert (
+        after["latest_attempt"]["attempt_budget"]["observed_at"]
+        == after["latest_attempt"]["created_at"]
+    )
+    assert datetime.fromisoformat(after["attempt_budget"]["observed_at"])
     assert after["latest_attempt"]["id"] == first["id"]
     assert after["attempt_budget_exhausted_at"]
     with supervisor.connect() as connection:
@@ -181,6 +193,9 @@ def test_legacy_unlimited_task_behavior_is_preserved(repo: Path) -> None:
     assert view["max_attempts"] is None
     assert view["attempts_used"] == 1
     assert view["attempts_remaining"] is None
+    assert view["attempt_budget"]["status"] == "unconfigured"
+    assert view["attempt_budget"]["provider_usage"]["status"] == "unsupported"
+    assert view["latest_attempt"]["attempt_budget"]["status"] == "unconfigured"
 
 
 def test_plan_and_queue_report_under_cap_usage(repo: Path) -> None:
@@ -193,6 +208,21 @@ def test_plan_and_queue_report_under_cap_usage(repo: Path) -> None:
         assert row["max_attempts"] == 3
         assert row["attempts_used"] == 0
         assert row["attempts_remaining"] == 3
+        evidence = row["attempt_budget"]
+        assert evidence["status"] == "enforced"
+        assert evidence["dimension"] == "task_attempt_launches"
+        assert evidence["unit"] == "attempts"
+        assert evidence["scope"] == {"kind": "task", "id": task["id"]}
+        assert evidence["configured_limit"] == 3
+        assert evidence["consumed"] == 0
+        assert evidence["reserved"] == 0
+        assert evidence["released"] == 0
+        assert evidence["source"] == "ACP supervisor attempts table"
+        assert evidence["freshness"] == "current"
+        assert evidence["observed_at"] is None
+        assert evidence["observation_time_ref"] == "generated_at"
+        assert evidence["provider_usage"]["status"] == "unsupported"
+        assert evidence["provider_usage"]["freshness"] == "unknown"
 
     supervisor.claim(task["id"], "worker-one")
     with supervisor.connect() as connection:
@@ -207,6 +237,8 @@ def test_plan_and_queue_report_under_cap_usage(repo: Path) -> None:
         assert row["max_attempts"] == 3
         assert row["attempts_used"] == 1
         assert row["attempts_remaining"] == 2
+        assert row["attempt_budget"]["consumed"] == 1
+        assert row["attempt_budget"]["remaining"] == 2
 
 
 def test_active_queue_rows_report_attempt_budget_usage(repo: Path) -> None:
@@ -219,3 +251,5 @@ def test_active_queue_rows_report_attempt_budget_usage(repo: Path) -> None:
     assert active[0]["max_attempts"] == 2
     assert active[0]["attempts_used"] == 1
     assert active[0]["attempts_remaining"] == 1
+    assert active[0]["attempt_budget"]["consumed"] == 1
+    assert active[0]["attempt_budget"]["observation_time_ref"] == "generated_at"

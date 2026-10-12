@@ -20,7 +20,7 @@ import sqlite3
 import subprocess
 import time
 import unicodedata
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from .supervisor.common import SupervisorError
 
@@ -29,6 +29,41 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 CLAIMABLE_STATUSES = frozenset({"open", "orphaned", "changes_requested"})
 _MERGE_PLAN_CHANGED_PATHS_MAX_BYTES = 16 * 1024 * 1024
+
+
+class TaskBudgetScope(TypedDict):
+    kind: Literal["task"]
+    id: str
+
+
+class UnsupportedProviderUsage(TypedDict):
+    status: Literal["unsupported"]
+    unit: None
+    source: None
+    scope: str
+    observed_at: None
+    freshness: Literal["unknown"]
+    enforcement_point: None
+    reason: str
+
+
+class AttemptBudgetEvidence(TypedDict):
+    dimension: Literal["task_attempt_launches"]
+    unit: Literal["attempts"]
+    scope: TaskBudgetScope
+    status: Literal["unconfigured", "invalid", "enforced", "exhausted"]
+    configured_limit: int | None
+    consumed: int
+    reserved: int
+    released: int
+    remaining: int | None
+    source: str
+    observed_at: str | None
+    observation_time_ref: Literal["generated_at"] | None
+    freshness: Literal["current", "historical"]
+    enforcement_point: str
+    release_policy: str
+    provider_usage: UnsupportedProviderUsage
 
 
 def declared_resources(row: Any) -> list[str]:
@@ -81,8 +116,60 @@ def normalize_artifact(raw: str) -> str:
     return value
 
 
-def _attempt_budget_fields(task: dict[str, Any]) -> dict[str, int | None]:
-    """Keep budget visibility consistent across plan, queue, and active rows."""
+def attempt_budget_evidence(
+    task_id: str,
+    limit: int | None,
+    consumed: int,
+    *,
+    observed_at: str | None = None,
+    freshness: Literal["current", "historical"] = "current",
+) -> AttemptBudgetEvidence:
+    """Describe only the local attempt counter and explicitly mark provider usage unknown."""
+    valid_cap = type(limit) is int and limit > 0
+    valid_consumed = type(consumed) is int and consumed >= 0
+    remaining = max(0, limit - consumed) if valid_cap and valid_consumed else None
+    status = (
+        "unconfigured"
+        if limit is None
+        else "invalid"
+        if not valid_cap or not valid_consumed
+        else "exhausted"
+        if remaining == 0
+        else "enforced"
+    )
+    return {
+        "dimension": "task_attempt_launches",
+        "unit": "attempts",
+        "scope": {"kind": "task", "id": task_id},
+        "status": status,
+        "configured_limit": limit,
+        "consumed": consumed,
+        # Claim inserts the durable attempt and consumes its slot in one serialized
+        # transaction; there is no separately held or refundable attempt reservation.
+        "reserved": 0,
+        "released": 0,
+        "remaining": remaining,
+        "source": "ACP supervisor attempts table",
+        "observed_at": observed_at or None,
+        "observation_time_ref": "generated_at" if observed_at is None else None,
+        "freshness": freshness,
+        "enforcement_point": "serialized task claim transaction",
+        "release_policy": "attempt slots are not refunded, including failed provisioning",
+        "provider_usage": {
+            "status": "unsupported",
+            "unit": None,
+            "source": None,
+            "scope": "provider calls and provider-internal fan-out",
+            "observed_at": None,
+            "freshness": "unknown",
+            "enforcement_point": None,
+            "reason": "no authenticated provider meter and request gate are wired to this supervisor",
+        },
+    }
+
+
+def _attempt_budget_fields(task: dict[str, Any]) -> dict[str, Any]:
+    """Keep legacy counters and typed evidence consistent across plan and queue rows."""
     limit = task.get("max_attempts")
     used = task.get("attempts_used", 0)
     remaining = max(0, limit - used) if type(limit) is int and type(used) is int else None
@@ -90,6 +177,7 @@ def _attempt_budget_fields(task: dict[str, Any]) -> dict[str, int | None]:
         "max_attempts": limit,
         "attempts_used": used,
         "attempts_remaining": remaining,
+        "attempt_budget": attempt_budget_evidence(task["id"], limit, used),
     }
 
 
@@ -295,7 +383,7 @@ class Scheduler:
             self.supervisor._task_row(connection, task_id)
             tasks = self._task_records(connection)
             holders = self._active_leases(connection, now)
-        return self._preview(task_id, tasks, holders)
+        return {"generated_at": now, **self._preview(task_id, tasks, holders)}
 
     def _preview(
         self,
