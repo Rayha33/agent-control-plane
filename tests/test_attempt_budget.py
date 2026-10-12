@@ -111,6 +111,24 @@ def test_failed_provisioning_consumes_the_attempt_cap(repo: Path, monkeypatch) -
     assert error.value.code == "attempt_budget_exhausted"
 
 
+def test_attempt_cap_usage_survives_supervisor_restart(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = _task(supervisor, 1)
+    first = supervisor.claim(task["id"], "worker-one")
+    _make_retryable(supervisor, task["id"])
+
+    restarted = GitSupervisor(repo)
+    recovered = restarted.task(task["id"])
+    assert recovered["attempts_used"] == 1
+    assert recovered["attempts_remaining"] == 0
+
+    with pytest.raises(SupervisorError) as error:
+        restarted.claim(task["id"], "worker-after-restart")
+
+    assert error.value.code == "attempt_budget_exhausted"
+    assert restarted.task(task["id"])["latest_attempt"]["id"] == first["id"]
+
+
 def test_concurrent_claims_cannot_oversubscribe_last_attempt(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     task = _task(supervisor, 2)
