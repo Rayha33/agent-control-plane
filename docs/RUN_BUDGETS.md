@@ -92,14 +92,17 @@ must consume a bounded retry allowance and cannot by itself create an
 unlimited retry loop. Do not automatically restart or expand work when a
 provider quota later resets.
 
-Before stopping, preserve only bounded, host-authored partial progress with its
-attempt, claim fence, exact tree/base, usage receipt, and checkpoint digest.
-Record the result as interrupted or budget-exhausted, never successful. It
-must not be promoted, integrated, or reported complete without the existing
-review and submission gates. Request cancellation only when the exact
-process/sandbox identity is independently verified. If identity or cleanup is
-ambiguous, stop granting new authority and surface the state for recovery; do
-not signal a guessed PID or recycle the runtime.
+Where a controlled graceful stop is supported, first persist bounded,
+host-authored partial progress with its attempt, claim fence, exact tree/base,
+usage receipt, and checkpoint digest. After a crash or forced termination,
+retain only the last durable checkpoint and state plainly that newer output
+may be missing; never synthesize a final result. Record the attempt as
+interrupted or budget-exhausted, never successful. It must not be promoted,
+integrated, or reported complete without the existing review and submission
+gates. Request cancellation only when the exact process/sandbox identity is
+independently verified. If identity or cleanup is ambiguous, stop granting new
+authority and surface the state for recovery; do not signal a guessed PID or
+recycle the runtime.
 
 ## Delivery gates
 
