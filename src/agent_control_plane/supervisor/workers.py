@@ -85,6 +85,11 @@ class WorkersMixin:
         # This is only a side-effect-free preflight: _reserve_worker_launch
         # retains the transactional check that arbitrates concurrent claims.
         self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
+        if not sys.platform.startswith("linux"):
+            raise SupervisorError(
+                "process_containment_unavailable",
+                "long-running workers require Linux child-subreaper containment",
+            )
         attempt = self.heartbeat(
             attempt_id,
             claim_token,
@@ -95,11 +100,6 @@ class WorkersMixin:
             },
             credential=credential,
         )
-        if not sys.platform.startswith("linux"):
-            raise SupervisorError(
-                "process_containment_unavailable",
-                "long-running workers require Linux child-subreaper containment",
-            )
         worker_env = self._child_env(
             self._phase_runtime_env(
                 self._runtime_env(attempt_id), "worker", Path(attempt["worktree"])
