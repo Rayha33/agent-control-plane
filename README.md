@@ -412,8 +412,15 @@ It presents each exact attempt/base, commit/tree, patch digest, changed paths,
 bounded QC evidence and completion receipt. The structured reviewer handoff is
 prepared but never dispatched; it contains no raw prompt or command transcript and
 grants no critic write authority. A current brief fingerprint is explicitly marked
-as not pinned to attempt start, and changed bases or missing evidence stay visible.
-It does not rank, select, approve or integrate candidates.
+as not pinned to attempt start; it includes a bounded file/insert/delete count from
+attempt start to commit, while changed bases or missing evidence stay visible.
+Recorded QC is labeled as not revalidated and includes the reviewer and recorded
+policy identity. QC references enter the handoff only when the QC row binds to that
+candidate's commit, its policy is current and ratified, and bounded evidence fields
+are complete; otherwise the reason is explicit and the references are withheld. This
+does not independently verify the stored QC bundle or make the recorded verdict a
+current assurance result. Comparison does not rank, select, approve or integrate
+candidates.
 
 Each `merge-plan` entry also includes a read-only
 `cross_submission_read_write_advisory`. It compares that task's declared read

@@ -492,22 +492,82 @@ class ViewsMixin:
             if provenance_state == "available" and isinstance(provenance, dict)
             else None
         )
+        reviewer_identity = (
+            self._comparison_text(provenance.get("identity"), 160)
+            if isinstance(provenance, dict)
+            else None
+        )
+        reviewer_provider = (
+            self._comparison_text(provenance.get("provider"), 160)
+            if isinstance(provenance, dict)
+            else None
+        )
+        reviewer_model = (
+            self._comparison_text(provenance.get("model"), 160)
+            if isinstance(provenance, dict)
+            else None
+        )
         exact_binding = (
             row["submission_id"] == submission["id"]
             and row["commit_sha"] == submission["commit_sha"]
         )
+        current_policy_fingerprint = self.assurance_policy.fingerprint
+        ratified_policy_fingerprint = self.assurance.ratified_fingerprint(connection)
+        recorded_policy_fingerprint = row["policy_fingerprint"]
+        policy_state = (
+            "unknown"
+            if not isinstance(recorded_policy_fingerprint, str) or not recorded_policy_fingerprint
+            else "stale"
+            if recorded_policy_fingerprint != current_policy_fingerprint
+            else "current_unratified"
+            if ratified_policy_fingerprint != current_policy_fingerprint
+            else "current_and_ratified"
+        )
+        evidence_hashes_valid = all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            for value in (row["packet_sha256"], row["bundle_sha256"])
+        )
+        evidence_complete = (
+            evidence_hashes_valid
+            and bool(row["reviewer_signature"])
+            and provenance_fingerprint is not None
+            and findings_state == "available"
+            and results_state == "available"
+            and coverage_state == "available"
+            and type(row["acceptance_coverage_contract_version"]) is int
+            and row["acceptance_coverage_contract_version"] > 0
+        )
+        handoff_eligibility = (
+            "candidate_mismatch"
+            if not exact_binding
+            else "stale_policy"
+            if policy_state == "stale"
+            else "policy_unratified"
+            if policy_state == "current_unratified"
+            else "policy_unknown"
+            if policy_state == "unknown"
+            else "incomplete_evidence"
+            if not evidence_complete
+            else "eligible"
+        )
         return {
             "state": "available",
+            "record_state": "recorded_only_not_revalidated",
             "qc_run_id": row["id"],
             "submission_id": row["submission_id"],
             "commit_sha": row["commit_sha"],
             "candidate_binding": "exact" if exact_binding else "mismatch",
-            "verdict": row["verdict"],
+            "recorded_verdict": row["verdict"],
             "reviewer_id": row["reviewer_id"],
+            "reviewer_identity": reviewer_identity,
+            "reviewer_provider": reviewer_provider,
+            "reviewer_model": reviewer_model,
             "reviewer_provenance_sha256": provenance_fingerprint,
             "reviewer_provenance_state": provenance_state,
             "reviewer_signature_present": bool(row["reviewer_signature"]),
-            "policy_fingerprint": row["policy_fingerprint"],
+            "policy_fingerprint": recorded_policy_fingerprint,
+            "policy_state": policy_state,
+            "handoff_eligibility": handoff_eligibility,
             "review_packet_sha256": row["packet_sha256"],
             "bundle_sha256": row["bundle_sha256"],
             "command_results": {
@@ -545,6 +605,51 @@ class ViewsMixin:
             raise SupervisorError(
                 "invalid_submission_ids", "pass 2 to 8 unique submission IDs (maximum 128 bytes)"
             )
+
+        def diff_summary(start_sha: Any, commit_sha: Any) -> dict[str, Any]:
+            if any(
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) is None
+                for value in (start_sha, commit_sha)
+            ):
+                return {"state": "unavailable", "basis": "attempt_start_to_commit"}
+            try:
+                raw = self._git_readonly_bytes(
+                    "diff",
+                    "--shortstat",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    start_sha,
+                    commit_sha,
+                    "--",
+                )
+            except SupervisorError:
+                return {"state": "unavailable", "basis": "attempt_start_to_commit"}
+            summary = raw.decode("ascii", errors="replace").strip()
+            if not summary:
+                return {
+                    "state": "available",
+                    "basis": "attempt_start_to_commit",
+                    "files_changed": 0,
+                    "insertions": 0,
+                    "deletions": 0,
+                }
+            match = re.fullmatch(
+                r"(\d+) files? changed"
+                r"(?:, (\d+) insertions?\(\+\))?"
+                r"(?:, (\d+) deletions?\(-\))?",
+                summary,
+            )
+            if match is None:
+                return {"state": "unavailable", "basis": "attempt_start_to_commit"}
+            return {
+                "state": "available",
+                "basis": "attempt_start_to_commit",
+                "files_changed": int(match.group(1)),
+                "insertions": int(match.group(2)) if match.group(2) is not None else None,
+                "deletions": int(match.group(3)) if match.group(3) is not None else None,
+            }
 
         with self.connect() as connection:
             connection.execute("BEGIN")
@@ -673,6 +778,7 @@ class ViewsMixin:
                         "truncated": paths_truncated,
                         "items": normalized_paths,
                     },
+                    "diff_summary": diff_summary(attempt_start_sha, submission["commit_sha"]),
                     "status": submission["status"],
                     "completion_receipt": self._completion_receipt_view(submission),
                     "latest_qc": self._comparison_qc_view(connection, submission),
@@ -694,12 +800,19 @@ class ViewsMixin:
                         "agent_id": submission["worker_agent_id"],
                         "mode": "manual_operator_routing",
                     },
-                    "qc_run_id": qc.get("qc_run_id") if qc.get("state") == "available" else None,
+                    "qc_evidence_state": qc.get("handoff_eligibility", "qc_missing"),
+                    "qc_run_id": (
+                        qc.get("qc_run_id") if qc.get("handoff_eligibility") == "eligible" else None
+                    ),
                     "review_packet_sha256": (
-                        qc.get("review_packet_sha256") if qc.get("state") == "available" else None
+                        qc.get("review_packet_sha256")
+                        if qc.get("handoff_eligibility") == "eligible"
+                        else None
                     ),
                     "policy_fingerprint": (
-                        qc.get("policy_fingerprint") if qc.get("state") == "available" else None
+                        qc.get("policy_fingerprint")
+                        if qc.get("handoff_eligibility") == "eligible"
+                        else None
                     ),
                     "critic_write_authority": False,
                     "automatic_selection_or_dispatch": False,

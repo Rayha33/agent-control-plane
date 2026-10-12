@@ -3339,12 +3339,26 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
         assert candidate["commit_sha"] == submission["commit_sha"]
         assert candidate["tree_sha"] == submission["tree_sha"]
         assert candidate["patch_sha256"] == submission["patch_sha256"]
+        assert candidate["diff_summary"]["state"] == "available"
+        assert candidate["diff_summary"]["basis"] == "attempt_start_to_commit"
+        assert candidate["diff_summary"]["files_changed"] >= 1
         assert candidate["base_relation"]["state"] == expected_base_state
         assert candidate["latest_qc"]["candidate_binding"] == "exact"
         assert candidate["latest_qc"]["policy_fingerprint"]
+        assert candidate["latest_qc"]["record_state"] == "recorded_only_not_revalidated"
+        assert candidate["latest_qc"]["recorded_verdict"] == "revise"
+        assert candidate["latest_qc"]["reviewer_provider"]
+        assert candidate["latest_qc"]["policy_state"] == "current_and_ratified"
+        assert candidate["latest_qc"]["handoff_eligibility"] == "eligible"
         assert candidate["latest_qc"]["review_packet_sha256"]
         assert candidate["latest_qc"]["findings"]["state"] == "available"
         assert candidate["review_handoff"]["state"] == "prepared_not_dispatched"
+        assert candidate["review_handoff"]["qc_evidence_state"] == "eligible"
+        assert candidate["review_handoff"]["qc_run_id"] == candidate["latest_qc"]["qc_run_id"]
+        assert (
+            candidate["review_handoff"]["review_packet_sha256"]
+            == candidate["latest_qc"]["review_packet_sha256"]
+        )
         assert candidate["review_handoff"]["critic_write_authority"] is False
         assert candidate["review_handoff"]["automatic_selection_or_dispatch"] is False
         assert candidate["completion_receipt"]["state"] == "not_provided"
@@ -3377,6 +3391,10 @@ def test_compare_submissions_marks_changed_base_and_mismatched_qc(repo: Path) ->
             "UPDATE qc_runs SET commit_sha = ? WHERE submission_id = ?",
             ("e" * 40, submissions[1]["id"]),
         )
+        connection.execute(
+            "UPDATE qc_runs SET policy_fingerprint = ? WHERE submission_id = ?",
+            ("stale-policy", submissions[0]["id"]),
+        )
 
     compared = GitSupervisor(repo, read_only=True).compare_submissions(
         [item["id"] for item in submissions]
@@ -3386,13 +3404,54 @@ def test_compare_submissions_marks_changed_base_and_mismatched_qc(repo: Path) ->
         for candidate in compared["candidates"]
     )
     assert compared["candidates"][0]["latest_qc"]["candidate_binding"] == "exact"
+    assert compared["candidates"][0]["latest_qc"]["policy_state"] == "stale"
+    assert compared["candidates"][0]["review_handoff"]["qc_evidence_state"] == "stale_policy"
     assert compared["candidates"][1]["latest_qc"]["candidate_binding"] == "mismatch"
+    assert compared["candidates"][1]["review_handoff"]["qc_evidence_state"] == "candidate_mismatch"
+    for candidate in compared["candidates"]:
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
     with sqlite3.connect(repo / ".acp" / "control.db") as connection:
         connection.execute("DELETE FROM qc_runs WHERE submission_id = ?", (submissions[0]["id"],))
     without_qc = GitSupervisor(repo, read_only=True).compare_submissions(
         [item["id"] for item in submissions]
     )
     assert without_qc["candidates"][0]["latest_qc"] == {"state": "missing"}
+
+
+def test_compare_submissions_withholds_handoff_for_unratified_policy(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE meta SET value = ? WHERE key = 'reviewer_policy_fingerprint'",
+            ("no-longer-ratified",),
+        )
+
+    compared = GitSupervisor(repo, read_only=True).compare_submissions(
+        [item["id"] for item in submissions]
+    )
+    for candidate in compared["candidates"]:
+        assert candidate["latest_qc"]["candidate_binding"] == "exact"
+        assert candidate["latest_qc"]["policy_state"] == "current_unratified"
+        assert candidate["latest_qc"]["handoff_eligibility"] == "policy_unratified"
+        assert candidate["review_handoff"]["qc_evidence_state"] == "policy_unratified"
+        assert candidate["review_handoff"]["qc_run_id"] is None
+        assert candidate["review_handoff"]["review_packet_sha256"] is None
+        assert candidate["review_handoff"]["policy_fingerprint"] is None
 
 
 def test_compare_submissions_rejects_invalid_scope(repo: Path) -> None:
