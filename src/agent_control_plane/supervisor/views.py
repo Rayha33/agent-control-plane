@@ -190,6 +190,7 @@ class ViewsMixin:
             or str((self.state_dir / "worktrees").resolve(strict=False)),
             "claim_token": row["claim_token"],
             "start_sha": row["start_sha"],
+            "task_brief_sha256": row["task_brief_sha256"],
             "latest_sha": row["latest_sha"],
             "checkpoint": json.loads(row["checkpoint_json"]),
             "heartbeat_at": row["heartbeat_at"],
@@ -313,6 +314,160 @@ class ViewsMixin:
     def task(self, task_id: str) -> dict[str, Any]:
         with self.connect() as connection:
             return self._task_view(connection, self._task_row(connection, task_id))
+
+    def owner_feedback(
+        self,
+        attempt_id: str,
+        agent_id: str,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Read signed QC feedback only as the worker identity bound to an attempt."""
+        if (
+            not self._valid_comparison_submission_id(attempt_id)
+            or not isinstance(agent_id, str)
+            or not agent_id.strip()
+            or self._comparison_text(agent_id, 128) != agent_id
+        ):
+            raise SupervisorError("invalid_feedback_target", "attempt and worker identity required")
+
+        from .acceptance import task_brief_fingerprint
+
+        with self.connect() as connection:
+            if not self._identity_enforced(connection):
+                raise SupervisorError(
+                    "feedback_requires_identity",
+                    "owner feedback requires an enrolled, credential-bound worker attempt",
+                )
+            self._authenticate(agent_id, "worker", credential, connection)
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt is None or attempt["agent_id"] != agent_id:
+                raise SupervisorError(
+                    "feedback_not_available", "attempt feedback is not available to this worker"
+                )
+            self._authenticate_attempt(connection, attempt, credential)
+
+            submission = connection.execute(
+                """
+                SELECT * FROM submissions
+                WHERE attempt_id = ? AND worker_agent_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (attempt_id, agent_id),
+            ).fetchone()
+            if submission is None:
+                return {
+                    "schema": "acp-owner-feedback-v1",
+                    "state": "awaiting_submission",
+                    "read_only": True,
+                    "recipient_agent_id": agent_id,
+                    "attempt_id": attempt_id,
+                    "task_brief_binding_state": "unknown",
+                    "feedback": None,
+                }
+
+            task = connection.execute(
+                """
+                SELECT title, substr(description, 1, 65537) AS description,
+                       substr(acceptance_json, 1, 65537) AS acceptance_json
+                FROM tasks WHERE id = ?
+                """,
+                (attempt["task_id"],),
+            ).fetchone()
+            if task is None:
+                raise SupervisorError("task_not_found", f"task {attempt['task_id']} not found")
+            acceptance_state, acceptance = self._bounded_comparison_json(
+                task["acceptance_json"], 64 * 1024
+            )
+            try:
+                current_brief_sha256 = (
+                    task_brief_fingerprint(task["title"], task["description"], acceptance)
+                    if acceptance_state == "available"
+                    else None
+                )
+            except (RecursionError, TypeError, UnicodeError, ValueError):
+                current_brief_sha256 = None
+            pinned_brief_sha256 = attempt["task_brief_sha256"]
+            brief_binding_state = (
+                "unavailable"
+                if current_brief_sha256 is None
+                else "legacy_unpinned"
+                if not pinned_brief_sha256
+                else "exact"
+                if pinned_brief_sha256 == current_brief_sha256
+                else "stale"
+            )
+
+            qc = self._comparison_qc_view(connection, submission, acceptance)
+            if qc.get("state") == "missing":
+                return {
+                    "schema": "acp-owner-feedback-v1",
+                    "state": "awaiting_qc",
+                    "read_only": True,
+                    "recipient_agent_id": agent_id,
+                    "attempt_id": attempt_id,
+                    "submission_id": submission["id"],
+                    "candidate_commit_sha": submission["commit_sha"],
+                    "task_brief_binding_state": brief_binding_state,
+                    "feedback": None,
+                }
+
+            candidate_exact = (
+                qc.get("candidate_binding") == "exact"
+                and qc.get("commit_sha") == submission["commit_sha"]
+                and qc.get("submission_id") == submission["id"]
+            )
+            findings_verified = (
+                candidate_exact
+                and qc.get("bundle_integrity_state") == "verified"
+                and isinstance(qc.get("findings"), dict)
+                and qc["findings"].get("state") == "available"
+                and qc["findings"].get("integrity_state") == "verified"
+            )
+            state = (
+                "evidence_unavailable"
+                if not findings_verified
+                else "available"
+                if brief_binding_state == "exact"
+                else "available_with_task_brief_warning"
+            )
+            feedback = None
+            if findings_verified:
+                feedback = {
+                    "qc_run_id": qc["qc_run_id"],
+                    "candidate_commit_sha": qc["commit_sha"],
+                    "verdict": qc["recorded_verdict"],
+                    "reviewer": {
+                        "id": qc["reviewer_id"],
+                        "identity": qc["reviewer_identity"],
+                        "provider": qc["reviewer_provider"],
+                        "model": qc["reviewer_model"],
+                    },
+                    "policy_fingerprint": qc["policy_fingerprint"],
+                    "policy_state": qc["policy_state"],
+                    "handoff_eligibility": qc["handoff_eligibility"],
+                    "findings": qc["findings"],
+                    "acceptance_coverage": qc["acceptance_coverage"],
+                    "command_results": qc["command_results"],
+                }
+            return {
+                "schema": "acp-owner-feedback-v1",
+                "state": state,
+                "read_only": True,
+                "recipient_agent_id": agent_id,
+                "attempt_id": attempt_id,
+                "submission_id": submission["id"],
+                "candidate_commit_sha": submission["commit_sha"],
+                "task_brief": {
+                    "attempt_sha256": pinned_brief_sha256,
+                    "current_sha256": current_brief_sha256,
+                    "binding_state": brief_binding_state,
+                },
+                "feedback": feedback,
+                "critic_write_authority": False,
+                "automatic_mutation_or_dispatch": False,
+            }
 
     def list_tasks(self) -> list[dict[str, Any]]:
         self.reap_expired()
@@ -557,11 +712,13 @@ class ViewsMixin:
         provenance_state, provenance = self._bounded_comparison_json(
             row["reviewer_provenance_json"], 16 * 1024
         )
-        provenance_fingerprint = (
-            sha256(canonical_json(provenance).encode("utf-8"))
-            if provenance_state == "available" and isinstance(provenance, dict)
-            else None
-        )
+        provenance_fingerprint = None
+        if provenance_state == "available" and isinstance(provenance, dict):
+            try:
+                provenance_fingerprint = sha256(canonical_json(provenance).encode("utf-8"))
+            except (RecursionError, TypeError, UnicodeError, ValueError):
+                provenance_state = "unavailable"
+                provenance = None
         reviewer_identity = (
             self._comparison_text(provenance.get("identity"), 160)
             if isinstance(provenance, dict)
@@ -819,6 +976,8 @@ class ViewsMixin:
 
     def compare_submissions(self, submission_ids: Sequence[str]) -> dict[str, Any]:
         """Compare 2-8 submissions for one task without ranking or mutating them."""
+        from .acceptance import task_brief_fingerprint
+
         if (
             isinstance(submission_ids, (str, bytes))
             or not isinstance(submission_ids, Sequence)
@@ -926,23 +1085,11 @@ class ViewsMixin:
             brief_state, acceptance = self._bounded_comparison_json(
                 task["acceptance_json"], 64 * 1024
             )
-            if (
-                brief_state == "available"
-                and isinstance(raw_title, str)
-                and len(raw_title) <= 1024
-                and isinstance(description, str)
-                and len(description.encode("utf-8")) <= 64 * 1024
-            ):
-                brief_fingerprint = sha256(
-                    canonical_json(
-                        {
-                            "title": raw_title,
-                            "description": description,
-                            "acceptance": acceptance,
-                        }
-                    ).encode("utf-8")
-                )
-            else:
+            try:
+                if brief_state != "available":
+                    raise ValueError("task acceptance is unavailable")
+                brief_fingerprint = task_brief_fingerprint(raw_title, description, acceptance)
+            except (RecursionError, TypeError, UnicodeError, ValueError):
                 brief_state = "unavailable"
                 brief_fingerprint = None
 
@@ -950,13 +1097,24 @@ class ViewsMixin:
             for submission in submissions:
                 attempt = connection.execute(
                     """
-                    SELECT id, task_id, number, agent_id, branch, start_sha, status
+                    SELECT id, task_id, number, agent_id, branch, start_sha,
+                           task_brief_sha256, status
                     FROM attempts WHERE id = ? AND task_id = ?
                     """,
                     (submission["attempt_id"], task_id),
                 ).fetchone()
                 attempt_state = "available" if attempt is not None else "unavailable"
                 attempt_start_sha = attempt["start_sha"] if attempt is not None else None
+                attempt_brief_sha256 = attempt["task_brief_sha256"] if attempt is not None else None
+                task_brief_binding_state = (
+                    "unavailable"
+                    if attempt is None or brief_fingerprint is None
+                    else "legacy_unpinned"
+                    if not attempt_brief_sha256
+                    else "exact"
+                    if attempt_brief_sha256 == brief_fingerprint
+                    else "stale"
+                )
                 paths_state, paths = self._bounded_comparison_json(
                     submission["changed_paths_json"], 64 * 1024
                 )
@@ -984,6 +1142,8 @@ class ViewsMixin:
                             "agent_id": attempt["agent_id"],
                             "branch": attempt["branch"],
                             "start_sha": attempt_start_sha,
+                            "task_brief_sha256": attempt_brief_sha256,
+                            "task_brief_binding_state": task_brief_binding_state,
                             "status": attempt["status"],
                         }
                         if attempt is not None
@@ -1010,17 +1170,27 @@ class ViewsMixin:
                         "items": normalized_paths,
                     },
                     "diff_summary": diff_summary(attempt_start_sha, submission["commit_sha"]),
+                    "task_brief": {
+                        "attempt_sha256": attempt_brief_sha256,
+                        "current_sha256": brief_fingerprint,
+                        "binding_state": task_brief_binding_state,
+                    },
                     "status": submission["status"],
                     "completion_receipt": self._completion_receipt_view(submission),
                     "latest_qc": self._comparison_qc_view(connection, submission, acceptance),
                     "created_at": submission["created_at"],
                 }
                 qc = candidate["latest_qc"]
+                handoff_brief_ready = task_brief_binding_state == "exact"
+                qc_handoff_ready = (
+                    handoff_brief_ready and qc.get("handoff_eligibility") == "eligible"
+                )
                 candidate["review_handoff"] = {
                     "state": "prepared_not_dispatched",
                     "task_id": task_id,
-                    "task_brief_sha256": brief_fingerprint,
-                    "task_brief_binding_state": "current_only_not_pinned_at_attempt_start",
+                    "task_brief_sha256": attempt_brief_sha256,
+                    "current_task_brief_sha256": brief_fingerprint,
+                    "task_brief_binding_state": task_brief_binding_state,
                     "candidate_submission_id": submission["id"],
                     "candidate_commit_sha": submission["commit_sha"],
                     "candidate_tree_sha": submission["tree_sha"],
@@ -1029,21 +1199,35 @@ class ViewsMixin:
                     "writer_agent_id": submission["worker_agent_id"],
                     "feedback_route": {
                         "agent_id": submission["worker_agent_id"],
-                        "mode": "manual_operator_routing",
+                        "attempt_id": submission["attempt_id"],
+                        "mode": "authenticated_owner_pull",
+                        "command": [
+                            "acp",
+                            "owner-feedback",
+                            submission["attempt_id"],
+                            "--agent",
+                            submission["worker_agent_id"],
+                        ],
+                        "credential_role": "worker",
                     },
-                    "qc_evidence_state": qc.get("handoff_eligibility", "qc_missing"),
-                    "qc_run_id": (
-                        qc.get("qc_run_id") if qc.get("handoff_eligibility") == "eligible" else None
+                    "qc_evidence_state": (
+                        qc.get("handoff_eligibility", "qc_missing")
+                        if handoff_brief_ready
+                        else "task_brief_" + task_brief_binding_state
                     ),
+                    "handoff_eligibility": (
+                        "eligible"
+                        if qc_handoff_ready
+                        else "incomplete_task_brief"
+                        if not handoff_brief_ready
+                        else qc.get("handoff_eligibility", "qc_missing")
+                    ),
+                    "qc_run_id": (qc.get("qc_run_id") if qc_handoff_ready else None),
                     "review_packet_sha256": (
-                        qc.get("review_packet_sha256")
-                        if qc.get("handoff_eligibility") == "eligible"
-                        else None
+                        qc.get("review_packet_sha256") if qc_handoff_ready else None
                     ),
                     "policy_fingerprint": (
-                        qc.get("policy_fingerprint")
-                        if qc.get("handoff_eligibility") == "eligible"
-                        else None
+                        qc.get("policy_fingerprint") if qc_handoff_ready else None
                     ),
                     "critic_write_authority": False,
                     "automatic_selection_or_dispatch": False,
@@ -1056,7 +1240,9 @@ class ViewsMixin:
                 "task_title": title,
                 "task_base": {"branch": task["base_branch"], "sha": task["base_sha"]},
                 "task_brief": {
-                    "state": "current_only_not_pinned_at_attempt_start",
+                    "state": "current_brief_available"
+                    if brief_fingerprint is not None
+                    else "current_brief_unavailable",
                     "fingerprint_state": brief_state,
                     "sha256": brief_fingerprint,
                 },

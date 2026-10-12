@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -302,6 +302,36 @@ def _add_attempt_worktree_root(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
     if "worktree_root" not in columns:
         connection.execute("ALTER TABLE attempts ADD COLUMN worktree_root TEXT NOT NULL DEFAULT ''")
+
+
+def _add_attempt_task_brief_pin(connection: sqlite3.Connection) -> None:
+    """Require a claim-time, write-once hash of the task brief for new attempts."""
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+    if "task_brief_sha256" not in columns:
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN task_brief_sha256 TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS attempts_require_task_brief_pin
+        BEFORE INSERT ON attempts
+        WHEN length(NEW.task_brief_sha256) != 64
+          OR NEW.task_brief_sha256 GLOB '*[^0-9a-f]*'
+        BEGIN
+          SELECT RAISE(ABORT, 'attempt_task_brief_pin_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS attempts_task_brief_pin_immutable
+        BEFORE UPDATE OF task_brief_sha256 ON attempts
+        BEGIN
+          SELECT RAISE(ABORT, 'attempt_task_brief_pin_immutable');
+        END
+        """
+    )
 
 
 def _add_qc_runs_latest_lookup_index(connection: sqlite3.Connection) -> None:
@@ -1905,6 +1935,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (26, _add_sandbox_attempt_slice_identity),
     (27, _require_verified_cleanup_before_candidate_capture),
     (28, _add_sandbox_launch_submission_receipt),
+    (29, _add_attempt_task_brief_pin),
 )
 
 

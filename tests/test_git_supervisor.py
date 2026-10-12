@@ -3348,7 +3348,7 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
     assert compared["schema"] == "acp-submission-comparison-v1"
     assert compared["order"] == "caller_supplied_no_ranking"
     assert compared["read_only"] is True
-    assert compared["task_brief"]["state"] == "current_only_not_pinned_at_attempt_start"
+    assert compared["task_brief"]["state"] == "current_brief_available"
     assert compared["task_brief"]["sha256"]
     assert [item["submission_id"] for item in compared["candidates"]] == [
         item["id"] for item in submissions
@@ -3363,6 +3363,8 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
         assert candidate["diff_summary"]["state"] == "available"
         assert candidate["diff_summary"]["basis"] == "attempt_start_to_commit"
         assert candidate["diff_summary"]["files_changed"] >= 1
+        assert candidate["task_brief"]["binding_state"] == "exact"
+        assert candidate["task_brief"]["attempt_sha256"] == compared["task_brief"]["sha256"]
         assert candidate["base_relation"]["state"] == expected_base_state
         assert candidate["latest_qc"]["candidate_binding"] == "exact"
         assert candidate["latest_qc"]["policy_fingerprint"]
@@ -3380,6 +3382,8 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
         assert candidate["latest_qc"]["review_packet_sha256"]
         assert candidate["latest_qc"]["findings"]["state"] == "available"
         assert candidate["review_handoff"]["state"] == "prepared_not_dispatched"
+        assert candidate["review_handoff"]["task_brief_binding_state"] == "exact"
+        assert candidate["review_handoff"]["handoff_eligibility"] == "eligible"
         assert candidate["review_handoff"]["qc_evidence_state"] == "eligible"
         assert candidate["review_handoff"]["qc_run_id"] == candidate["latest_qc"]["qc_run_id"]
         assert (
@@ -3388,6 +3392,11 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
         )
         assert candidate["review_handoff"]["critic_write_authority"] is False
         assert candidate["review_handoff"]["automatic_selection_or_dispatch"] is False
+        assert candidate["review_handoff"]["feedback_route"]["mode"] == ("authenticated_owner_pull")
+        assert (
+            candidate["review_handoff"]["feedback_route"]["attempt_id"] == (candidate["attempt_id"])
+        )
+        assert candidate["review_handoff"]["feedback_route"]["credential_role"] == "worker"
         assert candidate["completion_receipt"]["state"] == "not_provided"
     serialized = json.dumps(compared)
     assert "PRIVATE_QC_OUTPUT" not in serialized
@@ -3395,6 +3404,64 @@ def test_compare_submissions_is_bounded_read_only_and_does_not_rank(repo: Path) 
     assert before == after
     assert event_count(readonly) == event_total
     assert len(serialized.encode("utf-8")) < 100_000
+
+
+def test_compare_submissions_pins_brief_and_withholds_stale_or_legacy_handoff(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(3):
+        if index == 1:
+            with supervisor.connect() as connection:
+                connection.execute(
+                    "UPDATE tasks SET title = ?, description = ?, acceptance_json = ? WHERE id = ?",
+                    (
+                        "Updated task title",
+                        "PRIVATE_TASK_OBJECTIVE_v2",
+                        json.dumps(["updated acceptance criterion"]),
+                        created["id"],
+                    ),
+                )
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        assert len(attempt["task_brief_sha256"]) == 64
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "revise"
+        submissions.append(submission)
+
+    # Model an attempt created before v29: its historical brief cannot be
+    # reconstructed, so it must remain explicitly unpinned.
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER attempts_task_brief_pin_immutable")
+        connection.execute(
+            "UPDATE attempts SET task_brief_sha256 = '' WHERE id = ?",
+            (submissions[2]["attempt_id"],),
+        )
+
+    readonly = GitSupervisor(repo, read_only=True)
+    before = state_fingerprint(readonly)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    after = state_fingerprint(readonly)
+    stale, exact, legacy = [item for item in compared["candidates"]]
+
+    assert compared["task_brief"]["state"] == "current_brief_available"
+    assert stale["task_brief"]["binding_state"] == "stale"
+    assert stale["review_handoff"]["handoff_eligibility"] == "incomplete_task_brief"
+    assert stale["review_handoff"]["qc_evidence_state"] == "task_brief_stale"
+    assert stale["review_handoff"]["qc_run_id"] is None
+    assert stale["review_handoff"]["review_packet_sha256"] is None
+    assert exact["task_brief"]["binding_state"] == "exact"
+    assert exact["review_handoff"]["task_brief_sha256"] == compared["task_brief"]["sha256"]
+    assert exact["review_handoff"]["handoff_eligibility"] == "eligible"
+    assert legacy["task_brief"]["binding_state"] == "legacy_unpinned"
+    assert legacy["review_handoff"]["handoff_eligibility"] == "incomplete_task_brief"
+    assert legacy["review_handoff"]["qc_run_id"] is None
+    assert before == after
+    assert "PRIVATE_TASK_OBJECTIVE_v2" not in json.dumps(compared)
 
 
 def test_compare_submissions_rejects_database_only_qc_record_mutations(repo: Path) -> None:
@@ -3490,6 +3557,54 @@ def test_compare_submissions_rejects_database_only_qc_record_mutations(repo: Pat
         assert candidate["latest_qc"]["evidence_complete"] is False
         assert candidate["latest_qc"]["handoff_eligibility"] == "incomplete_evidence"
         assert candidate["review_handoff"]["qc_run_id"] is None
+
+
+def test_compare_submissions_fails_closed_on_non_utf8_reviewer_provenance(repo: Path) -> None:
+    write_config(
+        repo,
+        [python_command('from pathlib import Path; Path("alpha.txt").write_text("QC touched")')],
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    submissions = []
+    for index in range(2):
+        attempt = supervisor.claim(created["id"], f"writer-{index}")
+        commit_change(attempt, "alpha.txt", f"candidate {index}\n")
+        submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+        supervisor.run_qc(submission["id"], "independent-qc")
+        submissions.append(submission)
+
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE qc_runs SET reviewer_provenance_json = ? WHERE submission_id = ?",
+            (
+                json.dumps(
+                    {
+                        "identity": "\ud800",
+                        "provider": "builtin",
+                        "model": "test",
+                        "prompt_policy": "test",
+                        "command_sha256": "a" * 64,
+                    }
+                ),
+                submissions[0]["id"],
+            ),
+        )
+
+    readonly = GitSupervisor(repo, read_only=True)
+    before = state_fingerprint(readonly)
+    compared = readonly.compare_submissions([item["id"] for item in submissions])
+    after = state_fingerprint(readonly)
+    malformed, valid = [item["latest_qc"] for item in compared["candidates"]]
+    assert malformed["reviewer_provenance_state"] == "unavailable"
+    assert malformed["reviewer_provenance_sha256"] is None
+    assert malformed["reviewer_identity"] is None
+    assert malformed["evidence_complete"] is False
+    assert malformed["handoff_eligibility"] == "incomplete_evidence"
+    assert malformed["findings"]["items"] == []
+    assert valid["handoff_eligibility"] == "eligible"
+    assert before == after
+    assert "\\ud800" not in json.dumps(compared)
 
 
 def test_compare_submissions_marks_changed_base_and_mismatched_qc(repo: Path) -> None:

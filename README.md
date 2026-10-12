@@ -411,8 +411,11 @@ no declared read resources retain the existing behavior.
 It presents each exact attempt/base, commit/tree, patch digest, changed paths,
 bounded QC evidence and completion receipt. The structured reviewer handoff is
 prepared but never dispatched; it contains no raw prompt or command transcript and
-grants no critic write authority. A current brief fingerprint is explicitly marked
-as not pinned to attempt start; it includes a bounded file/insert/delete count from
+grants no critic write authority. Each claim stores a write-once, versioned digest of
+the task title, description and acceptance criteria without duplicating that text.
+Comparison marks each candidate's brief binding `exact`, `stale`, `legacy_unpinned`
+or `unavailable`; QC references are withheld unless the claim-time digest matches
+the current brief. The view also includes a bounded file/insert/delete count from
 attempt start to commit, while changed bases or missing evidence stay visible. Git
 diff inspection disables partial-clone lazy fetch and has a shared five-second budget
 across all candidates; missing promisor objects produce an unavailable summary without
@@ -428,7 +431,13 @@ The comparison revalidates exact criterion coverage and cited evidence IDs again
 the current task criteria and QC run/commit; otherwise coverage is unavailable and
 its references are withheld. The recorded verdict remains labeled not revalidated
 and is not a current assurance result. Comparison does not rank, select, approve or
-integrate candidates.
+integrate candidates. The comparison response names an authenticated owner-pull route;
+the owning worker can read its candidate's signed QC findings and bounded check evidence
+with `acp owner-feedback ATTEMPT_ID --agent AGENT_ID --credential-file PRIVATE_FILE`
+(or `--credential-fd`). ACP verifies that the enrolled worker credential is bound to
+that exact attempt before returning feedback. A stale task-brief pin is explicit, and
+missing or mismatched signed evidence is withheld. This is a read-only pull channel:
+critics cannot write the candidate, and comparison does not dispatch prompts or feedback.
 
 Each `merge-plan` entry also includes a read-only
 `cross_submission_read_write_advisory`. It compares that task's declared read

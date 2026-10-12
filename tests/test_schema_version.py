@@ -197,6 +197,40 @@ def test_attempt_worktree_root_migration_leaves_legacy_attempts_on_default_root(
     connection.close()
 
 
+def test_v29_attempt_task_brief_pin_migration_keeps_legacy_unknown_and_pins_new_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE attempts (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO attempts (id) VALUES ('legacy-attempt')")
+
+    migration = dict(MIGRATIONS)[29]
+    migration(connection)
+    legacy = connection.execute(
+        "SELECT task_brief_sha256 FROM attempts WHERE id = 'legacy-attempt'"
+    ).fetchone()
+    assert legacy["task_brief_sha256"] == ""
+    migration(connection)
+
+    fingerprint = "a" * 64
+    connection.execute(
+        "INSERT INTO attempts (id, task_brief_sha256) VALUES ('pinned-attempt', ?)",
+        (fingerprint,),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_task_brief_pin_required"):
+        connection.execute("INSERT INTO attempts (id) VALUES ('unpinned-new-attempt')")
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_task_brief_pin_immutable"):
+        connection.execute(
+            "UPDATE attempts SET task_brief_sha256 = ? WHERE id = 'pinned-attempt'",
+            ("b" * 64,),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_task_brief_pin_immutable"):
+        connection.execute(
+            "UPDATE attempts SET task_brief_sha256 = ? WHERE id = 'legacy-attempt'",
+            (fingerprint,),
+        )
+    connection.close()
+
+
 def test_qc_latest_lookup_index_migration_is_idempotent() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
@@ -692,7 +726,7 @@ def test_snapshot_migration_fences_inserts_from_pre_migration_supervisors(repo: 
     with migrated.connect() as connection:
         with pytest.raises(
             sqlite3.IntegrityError,
-            match="attempt_base_checkout_snapshot_required",
+            match="attempt_(base_checkout_snapshot_required|task_brief_pin_required)",
         ):
             # This uses the v4 column list: it can store the claim-time JSON but
             # cannot set the v5 required marker. The trigger must fail closed.

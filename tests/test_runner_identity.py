@@ -205,6 +205,68 @@ def test_enrolled_critic_can_review(repo: Path) -> None:
     assert review["verdict"] == "pass"
 
 
+def test_qc_feedback_is_read_only_and_restricted_to_exact_attempt_owner(repo: Path) -> None:
+    passing_command = json.dumps([python_command("pass")])
+    failing_command = json.dumps([python_command("raise SystemExit(7)")])
+    (repo / "acp.toml").write_text(
+        CONFIG.replace(f"commands = {passing_command}", f"commands = {failing_command}"),
+        encoding="utf-8",
+    )
+    supervisor = GitSupervisor(repo)
+    worker = supervisor.enroll_runner("worker-1", "worker")
+    other_worker = supervisor.enroll_runner("worker-2", "worker")
+    critic = supervisor.enroll_runner("independent-qc", "critic")
+    created = make_task(supervisor)
+    attempt = supervisor.claim(created["id"], "worker-1", credential=worker["credential"])
+    commit_change(attempt, "candidate\n")
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"], worker["credential"])
+    review = supervisor.run_qc(submission["id"], "independent-qc", credential=critic["credential"])
+    assert review["findings"]
+
+    readonly = GitSupervisor(repo, read_only=True)
+    with readonly.connect() as connection:
+        before = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("attempts", "submissions", "qc_runs", "events")
+        )
+    feedback = readonly.owner_feedback(attempt["id"], "worker-1", worker["credential"])
+    with readonly.connect() as connection:
+        after = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("attempts", "submissions", "qc_runs", "events")
+        )
+
+    assert feedback["schema"] == "acp-owner-feedback-v1"
+    assert feedback["state"] == "available"
+    assert feedback["read_only"] is True
+    assert feedback["recipient_agent_id"] == "worker-1"
+    assert feedback["attempt_id"] == attempt["id"]
+    assert feedback["submission_id"] == submission["id"]
+    assert feedback["candidate_commit_sha"] == submission["commit_sha"]
+    assert feedback["feedback"]["qc_run_id"] == review["id"]
+    assert feedback["feedback"]["findings"]["integrity_state"] == "verified"
+    assert feedback["feedback"]["findings"]["items"]
+    assert feedback["critic_write_authority"] is False
+    assert feedback["automatic_mutation_or_dispatch"] is False
+    assert before == after
+
+    with pytest.raises(SupervisorError) as wrong_owner:
+        readonly.owner_feedback(attempt["id"], "worker-2", other_worker["credential"])
+    assert wrong_owner.value.code == "feedback_not_available"
+    with pytest.raises(SupervisorError) as wrong_role:
+        readonly.owner_feedback(attempt["id"], "independent-qc", critic["credential"])
+    assert wrong_role.value.code == "runner_role_mismatch"
+
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET description = 'new task brief' WHERE id = ?", (created["id"],)
+        )
+    stale_brief_feedback = readonly.owner_feedback(attempt["id"], "worker-1", worker["credential"])
+    assert stale_brief_feedback["state"] == "available_with_task_brief_warning"
+    assert stale_brief_feedback["task_brief"]["binding_state"] == "stale"
+    assert stale_brief_feedback["feedback"]["candidate_commit_sha"] == submission["commit_sha"]
+
+
 def test_revoked_critic_cannot_review(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     worker = supervisor.enroll_runner("worker-1", "worker")

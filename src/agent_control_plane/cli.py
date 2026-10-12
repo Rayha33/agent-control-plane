@@ -27,6 +27,7 @@ READ_ONLY_ACTIONS = frozenset(
         "queue",
         "merge-plan",
         "compare-submissions",
+        "owner-feedback",
         "reviewers",
         "bundle",
         "verify-events",
@@ -287,6 +288,13 @@ def parser() -> argparse.ArgumentParser:
         help="read-only, non-ranking comparison of submissions for one task",
     )
     compare_submissions.add_argument("submission_ids", nargs="+", help="2 to 8 submission IDs")
+    owner_feedback = commands.add_parser(
+        "owner-feedback",
+        help="read exact-attempt QC feedback using its enrolled worker identity",
+    )
+    owner_feedback.add_argument("attempt_id")
+    owner_feedback.add_argument("--agent", required=True, dest="agent_id")
+    add_credential_source(owner_feedback)
     commands.add_parser("reviewers", help="declared reviewers and the evaluation policy state")
     ratify = commands.add_parser(
         "ratify-reviewers", help="accept a changed reviewer policy so QC may run again"
@@ -955,6 +963,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.merge_plan()
         elif args.action == "compare-submissions":
             result = supervisor.compare_submissions(args.submission_ids)
+        elif args.action == "owner-feedback":
+            result = supervisor.owner_feedback(
+                args.attempt_id,
+                args.agent_id,
+                _read_credential(args),
+            )
         elif args.action == "reviewers":
             result = supervisor.reviewers()
         elif args.action == "ratify-reviewers":
