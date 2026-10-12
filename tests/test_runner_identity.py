@@ -245,6 +245,8 @@ def test_qc_feedback_is_read_only_and_restricted_to_exact_attempt_owner(repo: Pa
     assert feedback["candidate_commit_sha"] == submission["commit_sha"]
     assert feedback["feedback"]["qc_run_id"] == review["id"]
     assert feedback["feedback"]["record_state"] == "recorded_only_not_revalidated"
+    assert feedback["feedback"]["recorded_handoff_eligibility"] == "eligible"
+    assert feedback["feedback"]["handoff_eligibility"] == "eligible"
     assert feedback["feedback"]["findings"]["integrity_state"] == "verified"
     assert feedback["feedback"]["findings"]["items"]
     assert feedback["critic_write_authority"] is False
