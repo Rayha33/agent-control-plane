@@ -629,6 +629,31 @@ def _add(repo: Path, title: str, resource: str, *extra: str) -> dict:
     return json.loads(created.stdout)
 
 
+def test_cli_attempt_limit_is_visible_and_blocks_a_retry(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "bounded retries", "owned.txt", "--max-attempts", "1")
+    assert task["max_attempts"] == 1
+    assert task["attempts_used"] == 0
+    assert task["attempts_remaining"] == 1
+
+    claimed = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
+    assert claimed.returncode == 0, claimed.stderr
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE tasks SET status = 'orphaned', current_attempt_id = NULL WHERE id = ?",
+            (task["id"],),
+        )
+
+    denied = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
+    assert denied.returncode == 1
+    result = json.loads(denied.stderr)
+    assert result["error"] == "attempt_budget_exhausted"
+    assert "1/1" in result["message"]
+    shown = json.loads(run_cli(repo, "show", task["id"]).stdout)
+    assert shown["attempts_used"] == 1
+    assert shown["attempts_remaining"] == 0
+
+
 def test_cli_heartbeat_without_checkpoint_only_renews_liveness(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     task = _add(repo, "heartbeat keeps progress", "owned.txt")

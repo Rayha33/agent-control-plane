@@ -231,6 +231,44 @@ def test_v29_attempt_task_brief_pin_migration_keeps_legacy_unknown_and_pins_new_
     connection.close()
 
 
+def test_v30_task_attempt_budget_migration_leaves_legacy_tasks_unlimited() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO tasks (id) VALUES ('legacy-task')")
+
+    migration = dict(MIGRATIONS)[30]
+    migration(connection)
+    legacy = connection.execute(
+        "SELECT max_attempts FROM tasks WHERE id = 'legacy-task'"
+    ).fetchone()
+    assert legacy["max_attempts"] is None
+    migration(connection)
+
+    connection.execute("INSERT INTO tasks (id, max_attempts) VALUES ('bounded-task', 2)")
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        connection.execute("INSERT INTO tasks (id, max_attempts) VALUES ('invalid-task', 0)")
+    connection.close()
+
+
+def test_v31_attempt_budget_refusal_marker_is_empty_for_legacy_tasks() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO tasks (id) VALUES ('legacy-task')")
+
+    migration = dict(MIGRATIONS)[31]
+    migration(connection)
+    assert (
+        connection.execute(
+            "SELECT attempt_budget_exhausted_at FROM tasks WHERE id = 'legacy-task'"
+        ).fetchone()["attempt_budget_exhausted_at"]
+        == ""
+    )
+    migration(connection)
+    connection.close()
+
+
 def test_qc_latest_lookup_index_migration_is_idempotent() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row

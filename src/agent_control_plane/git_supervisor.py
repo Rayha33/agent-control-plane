@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 31
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -220,6 +220,25 @@ def _add_declared_resources(connection: sqlite3.Connection) -> None:
     if "declared_resources_json" not in _columns(connection, "tasks"):
         connection.execute(
             "ALTER TABLE tasks ADD COLUMN declared_resources_json TEXT NOT NULL DEFAULT '{}'"
+        )
+
+
+def _add_task_attempt_budget(connection: sqlite3.Connection) -> None:
+    """Add an optional cap on task attempts created by the local supervisor."""
+
+    if "max_attempts" not in _columns(connection, "tasks"):
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_attempts INTEGER CHECK "
+            "(max_attempts IS NULL OR (typeof(max_attempts) = 'integer' AND max_attempts > 0))"
+        )
+
+
+def _add_attempt_budget_exhaustion_marker(connection: sqlite3.Connection) -> None:
+    """Record the first refused claim without growing the audit log on every retry."""
+
+    if "attempt_budget_exhausted_at" not in _columns(connection, "tasks"):
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN attempt_budget_exhausted_at TEXT NOT NULL DEFAULT ''"
         )
 
 
@@ -1936,6 +1955,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     (27, _require_verified_cleanup_before_candidate_capture),
     (28, _add_sandbox_launch_submission_receipt),
     (29, _add_attempt_task_brief_pin),
+    (30, _add_task_attempt_budget),
+    (31, _add_attempt_budget_exhaustion_marker),
 )
 
 

@@ -136,6 +136,10 @@ class ViewsMixin:
             """,
             (row["id"],),
         ).fetchone()
+        attempts_used = connection.execute(
+            "SELECT COUNT(*) AS value FROM attempts WHERE task_id = ?", (row["id"],)
+        ).fetchone()["value"]
+        max_attempts = row["max_attempts"]
         return {
             "id": row["id"],
             "title": row["title"],
@@ -155,6 +159,12 @@ class ViewsMixin:
             "base_branch": row["base_branch"],
             "base_sha": row["base_sha"],
             "priority": row["priority"],
+            "max_attempts": max_attempts,
+            "attempts_used": attempts_used,
+            "attempts_remaining": (
+                max(0, max_attempts - attempts_used) if max_attempts is not None else None
+            ),
+            "attempt_budget_exhausted_at": row["attempt_budget_exhausted_at"],
             "status": row["status"],
             "cleanup_target_status": row["cleanup_target_status"],
             "cleanup_error": row["cleanup_error"],

@@ -235,6 +235,12 @@ def parser() -> argparse.ArgumentParser:
     )
     add.add_argument("--priority", type=int, default=50)
     add.add_argument("--base", default="HEAD", dest="base_branch")
+    add.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help="optional maximum number of ACP-created attempts; does not meter provider usage",
+    )
 
     show = commands.add_parser("show", help="show a task")
     show.add_argument("task_id")
@@ -929,6 +935,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.produces,
                 args.consumes,
                 read_resources=args.read_resources,
+                max_attempts=args.max_attempts,
             )
         elif args.action == "show":
             result = supervisor.task(args.task_id)

@@ -423,6 +423,15 @@ class ClaimsMixin:
         ttl = lease_seconds or self.config.lease_seconds
         if ttl < 10:
             raise SupervisorError("invalid_lease", "lease must be at least 10 seconds")
+        # Fail an already-exhausted task before preparing a worktree. This is only
+        # an early refusal: the budget is rechecked under the authoritative claim
+        # transaction below, where concurrent callers cannot oversubscribe it.
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = self._task_row(connection, task_id)
+            if task["status"] not in {"open", "orphaned", "changes_requested"}:
+                raise SupervisorError("task_unavailable", f"task status is {task['status']}")
+            self._check_attempt_budget(connection, task, agent_id)
         # Pin the shared checkout before this claim provisions anything. ACP does
         # not require it to be clean; it records the exact pre-existing source state.
         base_checkout_snapshot = self._capture_base_checkout_snapshot()
@@ -449,6 +458,7 @@ class ClaimsMixin:
                 ) from error
             if task["status"] not in {"open", "orphaned", "changes_requested"}:
                 raise SupervisorError("task_unavailable", f"task status is {task['status']}")
+            self._check_attempt_budget(connection, task, agent_id)
             for dependency in json.loads(task["dependencies_json"]):
                 row = connection.execute(
                     "SELECT status FROM tasks WHERE id = ?", (dependency,)
@@ -550,10 +560,7 @@ class ClaimsMixin:
                 "UPDATE meta SET value = ? WHERE key = 'claim_counter'", (str(counter),)
             )
             number = connection.execute(
-                """
-                SELECT COALESCE(MAX(number), 0) + 1 AS value
-                FROM attempts WHERE task_id = ?
-                """,
+                "SELECT COALESCE(MAX(number), 0) + 1 AS value FROM attempts WHERE task_id = ?",
                 (task_id,),
             ).fetchone()["value"]
             resume = connection.execute(
@@ -725,6 +732,43 @@ class ClaimsMixin:
                 },
             )
         return self.attempt(attempt_id)
+
+    def _check_attempt_budget(
+        self, connection: sqlite3.Connection, task: sqlite3.Row, actor: str
+    ) -> None:
+        if task["status"] not in {"open", "orphaned", "changes_requested"}:
+            return
+        limit = task["max_attempts"]
+        if limit is None:
+            return
+        if type(limit) is not int or limit < 1:
+            raise SupervisorError("task_budget_invalid", "stored task attempt limit is invalid")
+        used = connection.execute(
+            "SELECT COUNT(*) AS value FROM attempts WHERE task_id = ?", (task["id"],)
+        ).fetchone()["value"]
+        if used < limit:
+            return
+        if not task["attempt_budget_exhausted_at"]:
+            observed_at = utc_now()
+            connection.execute(
+                "UPDATE tasks SET attempt_budget_exhausted_at = ?, updated_at = ? WHERE id = ?",
+                (observed_at, observed_at, task["id"]),
+            )
+            self._event(
+                connection,
+                "task.attempt_budget_exhausted",
+                actor,
+                {"task_id": task["id"], "max_attempts": limit, "attempts_used": used},
+            )
+            # Persist one exhaustion receipt. Repeated refusals roll back below,
+            # so a stuck caller cannot grow the audit log without bound.
+            connection.commit()
+        else:
+            connection.rollback()
+        raise SupervisorError(
+            "attempt_budget_exhausted",
+            f"task attempt limit reached ({used}/{limit}); no new attempt was created",
+        )
 
     def _rollback_provision(self, task_id: str, attempt_id: str) -> None:
         now = utc_now()
@@ -4062,9 +4106,16 @@ class ClaimsMixin:
         produces: Sequence[str] = (),
         consumes: Sequence[str] = (),
         read_resources: Sequence[str] = (),
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         if not title.strip() or not acceptance:
             raise SupervisorError("invalid_task", "title and acceptance criteria are required")
+        if max_attempts is not None and (
+            type(max_attempts) is not int or not 1 <= max_attempts <= 2**63 - 1
+        ):
+            raise SupervisorError(
+                "invalid_task", "max_attempts must be a positive 64-bit integer when set"
+            )
         declared: dict[str, str] = {}
         for item in resources:
             folded = self.normalize_resource(item, self.root)
@@ -4106,8 +4157,8 @@ class ClaimsMixin:
                    declared_resources_json,
                    read_resources_json, declared_read_resources_json,
                    dependencies_json, produces_json, consumes_json, base_branch,
-                   base_sha, priority, status, current_attempt_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
+                   base_sha, priority, max_attempts, status, current_attempt_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
                 """,
                 (
                     task_id,
@@ -4124,6 +4175,7 @@ class ClaimsMixin:
                     resolved_branch,
                     base_sha,
                     priority,
+                    max_attempts,
                     now,
                     now,
                 ),
@@ -4139,6 +4191,7 @@ class ClaimsMixin:
                     "produces": produced,
                     "consumes": consumed,
                     "base_sha": base_sha,
+                    "max_attempts": max_attempts,
                 },
             )
         return self.task(task_id)

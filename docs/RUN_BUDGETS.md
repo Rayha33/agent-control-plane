@@ -1,7 +1,9 @@
 # Run budgets and usage provenance
 
-**Status:** design decision for task #2998; not implemented. This document is
-not a provider billing cap or evidence that ACP currently meters model work.
+**Status:** design contract plus an initial local-attempt-cap implementation
+slice for task #2998. Hierarchical reservations, provider adapters, quota
+handling, and budget-exhaustion checkpoint recovery are not implemented. This
+document is not a provider billing cap or evidence that ACP meters model work.
 
 ## Problem
 
@@ -19,6 +21,12 @@ Current ACP controls cover only parts of that boundary:
   tokens, billing, or model work.
 - Completion receipts and worker checkpoints provide provenance, but there is
   not yet a budget-exhaustion path that safely preserves partial output.
+- The local Git supervisor can optionally cap durable attempts per task with
+  `--max-attempts`. Its serialized claim transaction prevents oversubscription
+  by concurrent claimers. This counts only ACP attempt records (including
+  attempts whose provisioning later fails); it is not a hierarchical child
+  reservation and does not see provider-internal fan-out, retries, tokens, or
+  billing.
 - The supervised OCI worker launch, independent cleanup verification, and
   sandbox-aware result import remain unproven end to end (#2370 and #2439).
 
@@ -67,6 +75,12 @@ after the operation's terminal state is independently established; ambiguous
 cleanup keeps the reservation held or quarantined rather than making capacity
 available twice.
 
+The current `--max-attempts` slice is narrower: one local task's durable attempt
+insert consumes one slot. It has no refund/reset operation and does not yet
+implement shared ancestor budgets, provider usage, or quota-exhaustion recovery.
+The first refused claim records one durable exhaustion event; repeat refusals
+do not append unbounded duplicate events.
+
 The counter must match the operation:
 
 - ACP can count mandate/attempt launches that pass through its own issuance
@@ -106,7 +120,8 @@ recycle the runtime.
 
 ## Delivery gates
 
-1. This design is documentation only; it does not complete #2998.
+1. The local attempt-cap slice is implemented separately from this broader
+   design; neither it nor this document completes #2998.
 2. Local launch/resource-budget enforcement must use existing ACP fencing and
    durable state, and must not duplicate or weaken #2316's descendant cap or
    #2366's truthful runtime-resource reporting.

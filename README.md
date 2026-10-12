@@ -167,12 +167,29 @@ Create and claim bounded work:
 ~~~bash
 uv run --extra dev acp task-add --title "Harden token refresh" --accept "refresh regression tests pass" --resource "src/auth/**" --resource "tests/auth/**"
 
+# Optional local limit: permit at most three ACP-created attempts for this task.
+uv run --extra dev acp task-add --title "Migrate cache keys" --accept "migration tests pass" \
+  --resource "src/cache/**" --resource "tests/cache/**" --max-attempts 3
+
 # Optional read inputs are tracked for freshness; they do not reserve write access.
 uv run --extra dev acp task-add --title "Update API client" --accept "client tests pass" \
   --resource "client/**" --read-resource "src/api/schema.py" --read-resource "openapi/**"
 
 uv run --extra dev acp claim TASK_ID --agent codex-session-17
 ~~~
+
+`--max-attempts` is an optional, positive per-task cap on durable attempt records
+created by this supervisor. It defaults to unlimited for compatibility and is
+checked again inside the atomic claim transaction, so concurrent retries cannot
+create more attempts than the cap. A durable attempt record counts even if the
+subsequent Git worktree or runtime provisioning fails. Once exhausted, `claim`
+returns `attempt_budget_exhausted`; existing branches, checkpoints, and attempt
+records remain available for inspection. The first refusal is durably recorded once;
+repeated refusals do not grow the event log. `show`, `plan`, and `queue` report
+the cap and usage. This is only a limit on ACP-created attempts: it does not
+measure or stop provider-internal fan-out, provider SDK retries, model tokens,
+elapsed time, or billing. Use an explicit follow-up task for additional work
+rather than treating a quota reset as permission to restart.
 
 Read-input globs use recursive `**` matching and are advisory only. A glob must
 have a literal directory prefix; repository-root-wide patterns report `unknown`

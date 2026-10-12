@@ -92,7 +92,12 @@ class Scheduler:
     @staticmethod
     def _task_records(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = connection.execute(
-            "SELECT * FROM tasks ORDER BY priority DESC, created_at, id"
+            """
+            SELECT tasks.*,
+                   (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id)
+                     AS attempts_used
+            FROM tasks ORDER BY priority DESC, created_at, id
+            """
         ).fetchall()
         records = []
         for row in rows:
@@ -291,6 +296,19 @@ class Scheduler:
         blockers: list[dict[str, Any]] = []
         if task["status"] not in CLAIMABLE_STATUSES:
             blockers.append({"kind": "task_unavailable", "status": task["status"]})
+        max_attempts = task.get("max_attempts")
+        attempts_used = task.get("attempts_used", 0)
+        if max_attempts is not None:
+            if type(max_attempts) is not int or max_attempts < 1:
+                blockers.append({"kind": "attempt_budget_invalid"})
+            elif attempts_used >= max_attempts:
+                blockers.append(
+                    {
+                        "kind": "attempt_budget_exhausted",
+                        "max_attempts": max_attempts,
+                        "attempts_used": attempts_used,
+                    }
+                )
         blockers.extend(
             self._dependency_blockers(
                 task, by_id, self._producers(tasks), self._dependency_edges(tasks)

@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   base_branch TEXT NOT NULL,
   base_sha TEXT NOT NULL,
   priority INTEGER NOT NULL,
+  max_attempts INTEGER CHECK (
+    max_attempts IS NULL OR (typeof(max_attempts) = 'integer' AND max_attempts > 0)
+  ),
+  attempt_budget_exhausted_at TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   cleanup_target_status TEXT NOT NULL DEFAULT '',
   cleanup_error TEXT NOT NULL DEFAULT '',
