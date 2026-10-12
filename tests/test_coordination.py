@@ -109,6 +109,34 @@ def test_public_task_api_rejects_invalid_provider_limit_values(
     assert app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"] == before_tasks
 
 
+@pytest.mark.parametrize("unsupported_field", ["max_attempts", "max_descendant_attempts"])
+def test_public_task_api_rejects_unimplemented_attempt_caps_before_persistence(
+    client, app, admin_headers, unsupported_field
+):
+    before_tasks = app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"]
+    before_audit = app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+
+    response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Unsupported attempt budget",
+            "description": "This request cannot silently lose its hard limit.",
+            "acceptance_criteria": ["No task is created"],
+            "resources": ["repo:file:unsupported-budget.py"],
+            unsupported_field: 1,
+        },
+    )
+
+    assert response.status_code == 422
+    assert unsupported_field in response.text
+    assert app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"] == before_tasks
+    assert (
+        app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+        == before_audit
+    )
+
+
 def claim_task(client, task_id, token):
     return client.post(
         f"/v1/tasks/{task_id}/claim",

@@ -242,6 +242,20 @@ def parser() -> argparse.ArgumentParser:
         help="optional maximum number of ACP-created attempts; does not meter provider usage",
     )
     add.add_argument(
+        "--parent-task-id",
+        default=None,
+        help="existing task that owns this child task; independent of dependency edges",
+    )
+    add.add_argument(
+        "--max-descendant-attempts",
+        type=int,
+        default=None,
+        help=(
+            "optional lifetime cap on durable attempts across all child tasks; "
+            "0 permits no descendant attempts"
+        ),
+    )
+    add.add_argument(
         "--provider-cost-limit-usd-micros",
         type=int,
         default=None,
@@ -946,6 +960,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 read_resources=args.read_resources,
                 max_attempts=args.max_attempts,
                 provider_cost_limit_usd_micros=args.provider_cost_limit_usd_micros,
+                parent_task_id=args.parent_task_id,
+                max_descendant_attempts=args.max_descendant_attempts,
             )
         elif args.action == "show":
             result = supervisor.task(args.task_id)

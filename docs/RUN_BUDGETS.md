@@ -1,7 +1,7 @@
 # Run budgets and usage provenance
 
-**Status:** design contract plus an initial local-attempt-cap implementation
-slice for task #2998. Hierarchical reservations, provider adapters, quota
+**Status:** design contract plus local per-task and hierarchical descendant-
+attempt enforcement slices for task #2998. Provider adapters, provider quota
 handling, and budget-exhaustion checkpoint recovery are not implemented. This
 document is not a provider billing cap or evidence that ACP meters model work.
 
@@ -24,9 +24,17 @@ Current ACP controls cover only parts of that boundary:
 - The local Git supervisor can optionally cap durable attempts per task with
   `--max-attempts`. Its serialized claim transaction prevents oversubscription
   by concurrent claimers. This counts only ACP attempt records (including
-  attempts whose provisioning later fails); it is not a hierarchical child
-  reservation and does not see provider-internal fan-out, retries, tokens, or
-  billing.
+  attempts whose provisioning later fails).
+- The local Git supervisor can also attach a task to an explicit parent with
+  `--parent-task-id` and set `--max-descendant-attempts`. Each capped ancestor
+  bounds durable attempt rows across all descendants at every depth, independent
+  of dependency edges. The ancestor's own attempts do not consume that cap.
+  Claim checks run inside the serialized write transaction; failed provisioning
+  and expired attempts still consume the slot. Plan/queue simulate slot use for
+  their proposed concurrent-ready set, but do not persist reservations.
+- The separate public Coordination `POST /v1/tasks` API does not implement the
+  local supervisor's attempt counters. It rejects unknown request fields, so an
+  unsupported attempt-cap field cannot be silently ignored there.
 - The supervised OCI worker launch, independent cleanup verification, and
   sandbox-aware result import remain unproven end to end (#2370 and #2439).
 
@@ -75,25 +83,38 @@ after the operation's terminal state is independently established; ambiguous
 cleanup keeps the reservation held or quarantined rather than making capacity
 available twice.
 
-The current `--max-attempts` slice is narrower: one local task's durable attempt
-insert consumes one slot. It has no refund/reset operation and does not yet
-implement shared ancestor budgets, provider usage, or quota-exhaustion recovery.
-The first refused claim records one durable exhaustion event; repeat refusals
-do not append unbounded duplicate events.
+The local supervisor now has two distinct attempt dimensions:
 
-Task, plan, queue, status, and attempt views expose this slice as `attempt_budget`:
-unit `attempts`, task scope, the configured cap, consumed/remaining counts,
-observation time and freshness, source, and the serialized claim transaction that
-enforces it. Task details carry the current observation time; plan, queue, and
-status entries refer to their parent `generated_at`, while an attempt receipt
-records its creation time.
-The attempt row is inserted and its slot consumed atomically, so this slice has
-zero held reservations and zero releases; failed provisioning still consumes the
-slot. The same view explicitly reports provider usage as unsupported with unknown
-freshness because this supervisor has no authenticated provider meter or request
-gate. That status is not a provider quota snapshot and cannot satisfy a requested
-hard provider-spend limit. The legacy top-level counter fields remain for
-compatibility.
+- `--max-attempts` limits attempts for the task itself.
+- `--parent-task-id` creates an immutable parent link, separate from
+  `--depends-on`; `--max-descendant-attempts` on a task limits durable attempts
+  for its full descendant subtree. Every capped ancestor is checked, so a
+  nested cap cannot expand an outer cap.
+
+For each dimension, inserting the durable attempt row consumes one slot in the
+same SQLite `BEGIN IMMEDIATE` transaction as the authoritative claim. There is
+no separate reservation to release and no refund/reset path; a failed
+provisioning attempt remains consumed. A first refusal writes one exhaustion
+marker/event on the exhausted task or ancestor. Repeated refusals roll back and
+do not grow the event log without bound. The `plan`/`queue` admission pass
+accounts for slots it proposes to launch concurrently, but those are advisory
+simulations, not durable reservations; the claim transaction remains the source
+of truth. These controls do not implement provider usage or quota-exhaustion
+recovery.
+
+Task, plan, queue, and status views expose per-task evidence as `attempt_budget`
+and subtree evidence as `descendant_attempt_budget`. Each names its unit, scope,
+configured cap, consumed/remaining amounts, source, observation time/freshness,
+and serialized claim enforcement point. Task details carry the current
+observation time; plan, queue, and status entries refer to their parent
+`generated_at`. An individual attempt receipt retains its per-task historical
+`attempt_budget`; it is not a historical snapshot of every ancestor cap. Both
+current dimensions report zero held reservations and zero releases because a
+durable attempt row consumes the slot atomically. Provider usage remains
+explicitly unsupported with unknown freshness: no authenticated provider meter
+or request gate is wired to this supervisor. This is not a provider quota
+snapshot and cannot satisfy a requested hard provider-spend limit. Legacy
+top-level per-task counter fields remain for compatibility.
 
 The CLI `task-add --provider-cost-limit-usd-micros` and public `POST /v1/tasks`
 API accept an explicit `provider_cost_limit_usd_micros` request so unsupported
@@ -103,6 +124,11 @@ inserting a task/event: there is no authenticated provider meter or request
 gate. No estimate, prompt instruction, stale quota snapshot, or provider-internal
 usage claim is read or accepted as enforcement evidence. This is a fail-closed
 request guard, not a functioning provider-spend cap.
+
+The public Coordination `TaskCreate` request rejects unrecognized fields. It has
+no durable attempt ledger or parent/child task hierarchy, so `max_attempts` and
+`max_descendant_attempts` are rejected as extra fields there rather than being
+accepted as local-supervisor guarantees.
 
 The counter must match the operation:
 
@@ -143,8 +169,9 @@ recycle the runtime.
 
 ## Delivery gates
 
-1. The local attempt-cap slice is implemented separately from this broader
-   design; neither it nor this document completes #2998.
+1. Local per-task and descendant-attempt caps are implemented separately from
+   provider meters, retry/quota lifecycle, and partial-result recovery; these
+   slices and this document do not complete #2998.
 2. Local launch/resource-budget enforcement must use existing ACP fencing and
    durable state, and must not duplicate or weaken #2316's descendant cap or
    #2366's truthful runtime-resource reporting.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 TaskStatus = Literal[
     "open",
@@ -77,6 +77,8 @@ class SubmissionView(BaseModel):
 
 
 class TaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=8000)
     acceptance_criteria: list[str] = Field(min_length=1, max_length=200)

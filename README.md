@@ -191,6 +191,19 @@ measure or stop provider-internal fan-out, provider SDK retries, model tokens,
 elapsed time, or billing. Use an explicit follow-up task for additional work
 rather than treating a quota reset as permission to restart.
 
+For fan-out within the local supervisor, `task-add --parent-task-id ID` records an explicit
+parent/child relationship; it is separate from `--depends-on`. A parent may set
+`--max-descendant-attempts N` to cap durable attempts across every descendant task, at any
+depth. A task's own attempts do not consume its descendant cap, while each configured
+ancestor's cap applies to every attempt below it. Claim admission checks those caps in the
+same serialized transaction that inserts the attempt row, so concurrent siblings cannot
+spend the same last slot. Attempts that expire or fail during provisioning still consume a
+slot; there is no reset/refund. `plan` and `queue` simulate descendant slots for their
+proposed concurrent-ready set, but only the claim transaction commits durable consumption.
+This counts ACP supervisor attempts only, not provider-internal fan-out, SDK retries, tokens,
+or cost. The public Coordination task API uses a separate store and rejects unknown task
+fields; it does not claim to enforce these local attempt limits.
+
 Read-input globs use recursive `**` matching and are advisory only. A glob must
 have a literal directory prefix; repository-root-wide patterns report `unknown`
 rather than scan the entire tree. Prefix scans over 10,000 tracked entries or

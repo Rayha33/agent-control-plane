@@ -654,6 +654,44 @@ def test_cli_attempt_limit_is_visible_and_blocks_a_retry(tmp_path: Path) -> None
     assert shown["attempts_remaining"] == 0
 
 
+def test_cli_hierarchical_attempt_cap_is_visible_and_blocks_sibling_launch(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    parent = _add(
+        repo,
+        "bounded descendant launches",
+        "parent.txt",
+        "--max-descendant-attempts",
+        "1",
+    )
+    child = _add(
+        repo,
+        "first child",
+        "child.txt",
+        "--parent-task-id",
+        parent["id"],
+    )
+    sibling = _add(
+        repo,
+        "second child",
+        "sibling.txt",
+        "--parent-task-id",
+        parent["id"],
+    )
+    assert child["parent_task_id"] == parent["id"]
+    assert parent["max_descendant_attempts"] == 1
+
+    claimed = run_cli(repo, "claim", child["id"], "--agent", "child-worker")
+    assert claimed.returncode == 0, claimed.stderr
+    denied = run_cli(repo, "claim", sibling["id"], "--agent", "sibling-worker")
+    assert denied.returncode == 1
+    assert json.loads(denied.stderr)["error"] == "descendant_attempt_budget_exhausted"
+    parent_view = json.loads(run_cli(repo, "show", parent["id"]).stdout)
+    assert parent_view["descendant_attempts_used"] == 1
+    assert parent_view["descendant_attempts_remaining"] == 0
+
+
 def test_cli_provider_cost_limit_fails_closed_before_task_creation(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
 

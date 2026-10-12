@@ -27,7 +27,12 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..scheduling import declared_read_resources, declared_resources, normalize_artifact
+from ..scheduling import (
+    declared_read_resources,
+    declared_resources,
+    descendant_attempt_count,
+    normalize_artifact,
+)
 from .common import SUBMISSION_OBJECT_CONTRACT, SupervisorError, canonical_json, sha256, utc_now
 from .result_import import (
     CandidateTree,
@@ -739,36 +744,97 @@ class ClaimsMixin:
         if task["status"] not in {"open", "orphaned", "changes_requested"}:
             return
         limit = task["max_attempts"]
-        if limit is None:
-            return
-        if type(limit) is not int or limit < 1:
-            raise SupervisorError("task_budget_invalid", "stored task attempt limit is invalid")
-        used = connection.execute(
-            "SELECT COUNT(*) AS value FROM attempts WHERE task_id = ?", (task["id"],)
-        ).fetchone()["value"]
-        if used < limit:
-            return
-        if not task["attempt_budget_exhausted_at"]:
-            observed_at = utc_now()
-            connection.execute(
-                "UPDATE tasks SET attempt_budget_exhausted_at = ?, updated_at = ? WHERE id = ?",
-                (observed_at, observed_at, task["id"]),
-            )
-            self._event(
-                connection,
-                "task.attempt_budget_exhausted",
-                actor,
-                {"task_id": task["id"], "max_attempts": limit, "attempts_used": used},
-            )
-            # Persist one exhaustion receipt. Repeated refusals roll back below,
-            # so a stuck caller cannot grow the audit log without bound.
-            connection.commit()
-        else:
-            connection.rollback()
-        raise SupervisorError(
-            "attempt_budget_exhausted",
-            f"task attempt limit reached ({used}/{limit}); no new attempt was created",
-        )
+        if limit is not None:
+            if type(limit) is not int or limit < 1:
+                raise SupervisorError("task_budget_invalid", "stored task attempt limit is invalid")
+            used = connection.execute(
+                "SELECT COUNT(*) AS value FROM attempts WHERE task_id = ?", (task["id"],)
+            ).fetchone()["value"]
+            if used >= limit:
+                if not task["attempt_budget_exhausted_at"]:
+                    observed_at = utc_now()
+                    connection.execute(
+                        "UPDATE tasks SET attempt_budget_exhausted_at = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (observed_at, observed_at, task["id"]),
+                    )
+                    self._event(
+                        connection,
+                        "task.attempt_budget_exhausted",
+                        actor,
+                        {
+                            "task_id": task["id"],
+                            "max_attempts": limit,
+                            "attempts_used": used,
+                        },
+                    )
+                    # Persist one refusal receipt; repeats must not grow the log.
+                    connection.commit()
+                else:
+                    connection.rollback()
+                raise SupervisorError(
+                    "attempt_budget_exhausted",
+                    f"task attempt limit reached ({used}/{limit}); no new attempt was created",
+                )
+
+        self._check_descendant_attempt_budget(connection, task, actor)
+
+    def _check_descendant_attempt_budget(
+        self, connection: sqlite3.Connection, task: sqlite3.Row, actor: str
+    ) -> None:
+        """Check every explicit ancestor cap in the same serialized claim transaction."""
+        seen: set[str] = {task["id"]}
+        ancestor_id = task["parent_task_id"]
+        while ancestor_id:
+            if ancestor_id in seen:
+                raise SupervisorError("task_hierarchy_invalid", "task parent cycle detected")
+            seen.add(ancestor_id)
+            ancestor = connection.execute(
+                """
+                SELECT id, parent_task_id, max_descendant_attempts,
+                       descendant_attempt_budget_exhausted_at
+                FROM tasks WHERE id = ?
+                """,
+                (ancestor_id,),
+            ).fetchone()
+            if ancestor is None:
+                raise SupervisorError("task_hierarchy_invalid", "task parent is missing")
+            limit = ancestor["max_descendant_attempts"]
+            if limit is not None:
+                if type(limit) is not int or not 0 <= limit <= 2**63 - 1:
+                    raise SupervisorError(
+                        "task_budget_invalid", "stored descendant attempt limit is invalid"
+                    )
+                used = descendant_attempt_count(connection, ancestor_id)
+                if used >= limit:
+                    if not ancestor["descendant_attempt_budget_exhausted_at"]:
+                        observed_at = utc_now()
+                        connection.execute(
+                            "UPDATE tasks SET descendant_attempt_budget_exhausted_at = ?, "
+                            "updated_at = ? WHERE id = ?",
+                            (observed_at, observed_at, ancestor_id),
+                        )
+                        self._event(
+                            connection,
+                            "task.descendant_attempt_budget_exhausted",
+                            actor,
+                            {
+                                "ancestor_task_id": ancestor_id,
+                                "descendant_task_id": task["id"],
+                                "max_descendant_attempts": limit,
+                                "descendant_attempts_used": used,
+                            },
+                        )
+                        # One durable exhaustion marker bounds retry-generated audit growth.
+                        connection.commit()
+                    else:
+                        connection.rollback()
+                    raise SupervisorError(
+                        "descendant_attempt_budget_exhausted",
+                        f"ancestor task {ancestor_id} attempt limit reached "
+                        f"({used}/{limit}); no new attempt was created",
+                    )
+            ancestor_id = ancestor["parent_task_id"]
 
     def _rollback_provision(self, task_id: str, attempt_id: str) -> None:
         now = utc_now()
@@ -4108,6 +4174,8 @@ class ClaimsMixin:
         read_resources: Sequence[str] = (),
         max_attempts: int | None = None,
         provider_cost_limit_usd_micros: int | None = None,
+        parent_task_id: str | None = None,
+        max_descendant_attempts: int | None = None,
     ) -> dict[str, Any]:
         if not title.strip() or not acceptance:
             raise SupervisorError("invalid_task", "title and acceptance criteria are required")
@@ -4130,6 +4198,18 @@ class ClaimsMixin:
                 "budget_capability_unsupported",
                 "provider cost hard limit requested but unsupported: no authenticated provider "
                 "meter or request gate is configured",
+            )
+        if parent_task_id is not None:
+            if not isinstance(parent_task_id, str) or not parent_task_id.strip():
+                raise SupervisorError("invalid_task", "parent_task_id must be a non-empty task id")
+            parent_task_id = parent_task_id.strip()
+        if max_descendant_attempts is not None and (
+            type(max_descendant_attempts) is not int
+            or not 0 <= max_descendant_attempts <= 2**63 - 1
+        ):
+            raise SupervisorError(
+                "invalid_task",
+                "max_descendant_attempts must be a non-negative 64-bit integer when set",
             )
         declared: dict[str, str] = {}
         for item in resources:
@@ -4158,6 +4238,13 @@ class ClaimsMixin:
         now = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if (
+                parent_task_id is not None
+                and not connection.execute(
+                    "SELECT 1 FROM tasks WHERE id = ?", (parent_task_id,)
+                ).fetchone()
+            ):
+                raise SupervisorError("parent_task_not_found", "parent task does not exist")
             for dependency in dependencies:
                 if not connection.execute(
                     "SELECT 1 FROM tasks WHERE id = ?", (dependency,)
@@ -4172,8 +4259,9 @@ class ClaimsMixin:
                    declared_resources_json,
                    read_resources_json, declared_read_resources_json,
                    dependencies_json, produces_json, consumes_json, base_branch,
-                   base_sha, priority, max_attempts, status, current_attempt_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
+                   base_sha, priority, max_attempts, parent_task_id,
+                   max_descendant_attempts, status, current_attempt_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
                 """,
                 (
                     task_id,
@@ -4191,6 +4279,8 @@ class ClaimsMixin:
                     base_sha,
                     priority,
                     max_attempts,
+                    parent_task_id,
+                    max_descendant_attempts,
                     now,
                     now,
                 ),
@@ -4207,6 +4297,8 @@ class ClaimsMixin:
                     "consumes": consumed,
                     "base_sha": base_sha,
                     "max_attempts": max_attempts,
+                    "parent_task_id": parent_task_id,
+                    "max_descendant_attempts": max_descendant_attempts,
                 },
             )
         return self.task(task_id)

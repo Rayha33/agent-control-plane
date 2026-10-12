@@ -32,7 +32,7 @@ _MERGE_PLAN_CHANGED_PATHS_MAX_BYTES = 16 * 1024 * 1024
 
 
 class TaskBudgetScope(TypedDict):
-    kind: Literal["task"]
+    kind: Literal["task", "task_descendants"]
     id: str
 
 
@@ -48,7 +48,7 @@ class UnsupportedProviderUsage(TypedDict):
 
 
 class AttemptBudgetEvidence(TypedDict):
-    dimension: Literal["task_attempt_launches"]
+    dimension: Literal["task_attempt_launches", "descendant_task_attempt_launches"]
     unit: Literal["attempts"]
     scope: TaskBudgetScope
     status: Literal["unconfigured", "invalid", "enforced", "exhausted"]
@@ -121,11 +121,12 @@ def attempt_budget_evidence(
     limit: int | None,
     consumed: int,
     *,
+    scope_kind: Literal["task", "task_descendants"] = "task",
     observed_at: str | None = None,
     freshness: Literal["current", "historical"] = "current",
 ) -> AttemptBudgetEvidence:
     """Describe only the local attempt counter and explicitly mark provider usage unknown."""
-    valid_cap = type(limit) is int and limit > 0
+    valid_cap = type(limit) is int and (limit > 0 if scope_kind == "task" else limit >= 0)
     valid_consumed = type(consumed) is int and consumed >= 0
     remaining = max(0, limit - consumed) if valid_cap and valid_consumed else None
     status = (
@@ -138,9 +139,11 @@ def attempt_budget_evidence(
         else "enforced"
     )
     return {
-        "dimension": "task_attempt_launches",
+        "dimension": (
+            "task_attempt_launches" if scope_kind == "task" else "descendant_task_attempt_launches"
+        ),
         "unit": "attempts",
-        "scope": {"kind": "task", "id": task_id},
+        "scope": {"kind": scope_kind, "id": task_id},
         "status": status,
         "configured_limit": limit,
         "consumed": consumed,
@@ -168,16 +171,53 @@ def attempt_budget_evidence(
     }
 
 
+def descendant_attempt_count(connection: sqlite3.Connection, task_id: str) -> int:
+    """Count durable attempt rows in the explicit child-task tree, excluding its root."""
+    row = connection.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT id FROM tasks WHERE parent_task_id = ?
+            UNION
+            SELECT child.id
+            FROM tasks AS child
+            JOIN descendants ON child.parent_task_id = descendants.id
+        )
+        SELECT COUNT(attempts.id) AS value
+        FROM descendants
+        LEFT JOIN attempts ON attempts.task_id = descendants.id
+        """,
+        (task_id,),
+    ).fetchone()
+    return int(row["value"])
+
+
 def _attempt_budget_fields(task: dict[str, Any]) -> dict[str, Any]:
     """Keep legacy counters and typed evidence consistent across plan and queue rows."""
     limit = task.get("max_attempts")
     used = task.get("attempts_used", 0)
     remaining = max(0, limit - used) if type(limit) is int and type(used) is int else None
+    descendant_limit = task.get("max_descendant_attempts")
+    descendant_used = task.get("descendant_attempts_used", 0)
+    descendant_remaining = (
+        max(0, descendant_limit - descendant_used)
+        if type(descendant_limit) is int and type(descendant_used) is int
+        else None
+    )
     return {
         "max_attempts": limit,
         "attempts_used": used,
         "attempts_remaining": remaining,
         "attempt_budget": attempt_budget_evidence(task["id"], limit, used),
+        "parent_task_id": task.get("parent_task_id"),
+        "max_descendant_attempts": descendant_limit,
+        "descendant_attempts_used": descendant_used,
+        "descendant_attempts_remaining": descendant_remaining,
+        "descendant_attempt_budget": attempt_budget_evidence(
+            task["id"],
+            descendant_limit,
+            descendant_used,
+            scope_kind="task_descendants",
+        ),
     }
 
 
@@ -193,10 +233,27 @@ class Scheduler:
     def _task_records(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = connection.execute(
             """
+            WITH RECURSIVE task_descendants(ancestor_id, descendant_id) AS (
+                SELECT parent_task_id, id FROM tasks WHERE parent_task_id IS NOT NULL
+                UNION
+                SELECT task_descendants.ancestor_id, child.id
+                FROM task_descendants
+                JOIN tasks AS child ON child.parent_task_id = task_descendants.descendant_id
+            ), descendant_usage AS (
+                SELECT task_descendants.ancestor_id,
+                       COUNT(attempts.id) AS descendant_attempts_used
+                FROM task_descendants
+                LEFT JOIN attempts ON attempts.task_id = task_descendants.descendant_id
+                GROUP BY task_descendants.ancestor_id
+            )
             SELECT tasks.*,
                    (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id)
-                     AS attempts_used
-            FROM tasks ORDER BY priority DESC, created_at, id
+                     AS attempts_used,
+                   COALESCE(descendant_usage.descendant_attempts_used, 0)
+                     AS descendant_attempts_used
+            FROM tasks
+            LEFT JOIN descendant_usage ON descendant_usage.ancestor_id = tasks.id
+            ORDER BY priority DESC, created_at, id
             """
         ).fetchall()
         records = []
@@ -393,6 +450,8 @@ class Scheduler:
         task_id: str,
         tasks: list[dict[str, Any]],
         holders: list[dict[str, Any]],
+        *,
+        planned_descendant_claims: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         by_id = {task["id"]: task for task in tasks}
         task = by_id[task_id]
@@ -412,6 +471,43 @@ class Scheduler:
                         "attempts_used": attempts_used,
                     }
                 )
+        ancestor_id = task.get("parent_task_id")
+        seen_ancestors: set[str] = set()
+        planned_descendant_claims = planned_descendant_claims or {}
+        while ancestor_id:
+            if ancestor_id in seen_ancestors:
+                blockers.append({"kind": "task_hierarchy_invalid"})
+                break
+            seen_ancestors.add(ancestor_id)
+            ancestor = by_id.get(ancestor_id)
+            if ancestor is None:
+                blockers.append({"kind": "task_hierarchy_invalid"})
+                break
+            descendant_limit = ancestor.get("max_descendant_attempts")
+            if descendant_limit is not None:
+                descendant_used = ancestor.get("descendant_attempts_used", 0)
+                planned = planned_descendant_claims.get(ancestor_id, 0)
+                if type(descendant_limit) is not int or descendant_limit < 0:
+                    blockers.append(
+                        {
+                            "kind": "descendant_attempt_budget_invalid",
+                            "ancestor_task_id": ancestor_id,
+                        }
+                    )
+                elif (
+                    type(descendant_used) is not int
+                    or descendant_used + planned >= descendant_limit
+                ):
+                    blockers.append(
+                        {
+                            "kind": "descendant_attempt_budget_exhausted",
+                            "ancestor_task_id": ancestor_id,
+                            "max_descendant_attempts": descendant_limit,
+                            "descendant_attempts_used": descendant_used,
+                            "planned_descendant_claims": planned,
+                        }
+                    )
+            ancestor_id = ancestor.get("parent_task_id")
         blockers.extend(
             self._dependency_blockers(
                 task, by_id, self._producers(tasks), self._dependency_edges(tasks)
@@ -458,6 +554,7 @@ class Scheduler:
         """One sequential admission pass. Shared with the status view so that
         `acp queue` and `acp status` can never disagree about what is launchable."""
         reserved = list(holders)
+        planned_descendant_claims: dict[str, int] = {}
         ready: list[dict[str, Any]] = []
         blocked: list[dict[str, Any]] = []
         active: list[dict[str, Any]] = []
@@ -472,10 +569,27 @@ class Scheduler:
                     }
                 )
                 continue
-            preview = self._preview(task["id"], tasks, reserved)
+            preview = self._preview(
+                task["id"],
+                tasks,
+                reserved,
+                planned_descendant_claims=planned_descendant_claims,
+            )
             if preview["ready"]:
                 preview["position"] = len(ready) + 1
                 ready.append(preview)
+                ancestor_id = task.get("parent_task_id")
+                seen_ancestors: set[str] = set()
+                while ancestor_id and ancestor_id not in seen_ancestors:
+                    seen_ancestors.add(ancestor_id)
+                    ancestor = next((item for item in tasks if item["id"] == ancestor_id), None)
+                    if ancestor is None:
+                        break
+                    if ancestor.get("max_descendant_attempts") is not None:
+                        planned_descendant_claims[ancestor_id] = (
+                            planned_descendant_claims.get(ancestor_id, 0) + 1
+                        )
+                    ancestor_id = ancestor.get("parent_task_id")
                 declared_by_key = dict(
                     zip(task["resources"], task["declared_resources"], strict=False)
                 )

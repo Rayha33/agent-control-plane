@@ -190,6 +190,43 @@ def test_status_reports_typed_local_attempt_budget_provenance(repo: Path) -> Non
     assert evidence["provider_usage"]["status"] == "unsupported"
 
 
+def test_status_reports_hierarchical_attempt_budget_provenance(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Parent budget",
+        "Status reports task-tree usage without equating it to provider spend.",
+        ["One child attempt is visible"],
+        ["parent.txt"],
+        max_descendant_attempts=1,
+    )
+    child = supervisor.create_task(
+        "Child budget consumer",
+        "Consume one durable attempt under the parent.",
+        ["Attempt counted"],
+        ["child.txt"],
+        parent_task_id=parent["id"],
+    )
+    supervisor.claim(parent["id"], "parent-worker")
+    supervisor.claim(child["id"], "child-worker")
+
+    snapshot = supervisor.status()
+    evidence = entry_for(snapshot, parent["id"])["descendant_attempt_budget"]
+
+    assert evidence["dimension"] == "descendant_task_attempt_launches"
+    assert evidence["unit"] == "attempts"
+    assert evidence["scope"] == {"kind": "task_descendants", "id": parent["id"]}
+    assert evidence["status"] == "exhausted"
+    assert evidence["configured_limit"] == 1
+    assert evidence["consumed"] == 1
+    assert evidence["reserved"] == 0
+    assert evidence["released"] == 0
+    assert evidence["remaining"] == 0
+    assert evidence["observed_at"] is None
+    assert evidence["observation_time_ref"] == "generated_at"
+    assert evidence["freshness"] == "current"
+    assert evidence["provider_usage"]["status"] == "unsupported"
+
+
 def test_status_tracks_only_declared_glob_read_inputs_and_is_read_only(repo: Path) -> None:
     (repo / "src" / "api").mkdir(parents=True)
     (repo / "src" / "ui").mkdir(parents=True)

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from support import commit_change, init_repo, make_task
@@ -266,6 +268,42 @@ def test_v31_attempt_budget_refusal_marker_is_empty_for_legacy_tasks() -> None:
         == ""
     )
     migration(connection)
+    connection.close()
+
+
+def test_v32_hierarchical_attempt_budget_migration_preserves_legacy_unlimited_tasks() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO tasks (id) VALUES ('legacy-task')")
+
+    migration = dict(MIGRATIONS)[32]
+    migration(connection)
+    legacy = connection.execute(
+        """
+        SELECT parent_task_id, max_descendant_attempts,
+               descendant_attempt_budget_exhausted_at
+        FROM tasks WHERE id = 'legacy-task'
+        """
+    ).fetchone()
+    assert tuple(legacy) == (None, None, "")
+    migration(connection)
+
+    connection.execute(
+        "INSERT INTO tasks (id, parent_task_id, max_descendant_attempts) "
+        "VALUES ('bounded-task', 'legacy-task', 0)"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        connection.execute(
+            "INSERT INTO tasks (id, max_descendant_attempts) VALUES ('invalid-task', -1)"
+        )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_tasks_parent_task'"
+        ).fetchone()[0]
+        == 1
+    )
     connection.close()
 
 
@@ -710,6 +748,21 @@ def test_result_import_source_migration_is_discriminated_and_pid_safe() -> None:
         connection.close()
 
 
+def downgrade_to_schema_31(repo: Path) -> None:
+    """Make a current test DB accurately represent the pre-hierarchy task table."""
+
+    connection = sqlite3.connect(db_path(repo))
+    try:
+        connection.execute("DROP INDEX IF EXISTS idx_tasks_parent_task")
+        connection.execute("ALTER TABLE tasks DROP COLUMN descendant_attempt_budget_exhausted_at")
+        connection.execute("ALTER TABLE tasks DROP COLUMN max_descendant_attempts")
+        connection.execute("ALTER TABLE tasks DROP COLUMN parent_task_id")
+        connection.execute("UPDATE meta SET value = '31' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_result_import_source_migration_refuses_legacy_mixed_source_rows() -> None:
     connection = _pre_v19_result_import_connection()
     try:
@@ -907,6 +960,40 @@ def test_read_write_open_upgrades_an_unstamped_database(repo: Path) -> None:
         "current": SCHEMA_VERSION,
         "version_changed": True,
     }
+
+
+def test_concurrent_read_write_opens_migrate_a_v31_database_once(repo: Path) -> None:
+    """An actual v31-shaped task table must survive concurrent first-open migration."""
+
+    supervisor = GitSupervisor(repo)
+    legacy = make_task(supervisor, "legacy-v31-task")
+    downgrade_to_schema_31(repo)
+
+    start = Barrier(2)
+
+    def open_control() -> int | None:
+        start.wait(timeout=10)
+        return GitSupervisor(repo).schema_version_on_open
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        versions = list(executor.map(lambda _: open_control(), range(2)))
+
+    assert sorted(versions) == [31, SCHEMA_VERSION]
+    with sqlite3.connect(db_path(repo)) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+        task = connection.execute(
+            "SELECT parent_task_id, max_descendant_attempts, "
+            "descendant_attempt_budget_exhausted_at FROM tasks WHERE id = ?",
+            (legacy["id"],),
+        ).fetchone()
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(tasks)")}
+        assert {
+            "parent_task_id",
+            "max_descendant_attempts",
+            "descendant_attempt_budget_exhausted_at",
+        } <= columns
+        assert tuple(task) == (None, None, "")
+        assert "idx_tasks_parent_task" in indexes
 
 
 def test_a_stamp_that_is_not_a_version_is_never_guessed(repo: Path) -> None:

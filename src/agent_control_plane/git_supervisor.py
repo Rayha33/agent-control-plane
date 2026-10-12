@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -240,6 +240,26 @@ def _add_attempt_budget_exhaustion_marker(connection: sqlite3.Connection) -> Non
         connection.execute(
             "ALTER TABLE tasks ADD COLUMN attempt_budget_exhausted_at TEXT NOT NULL DEFAULT ''"
         )
+
+
+def _add_hierarchical_attempt_budget(connection: sqlite3.Connection) -> None:
+    """Add an explicit task tree and an optional lifetime descendant-attempt cap."""
+
+    columns = _columns(connection, "tasks")
+    if "parent_task_id" not in columns:
+        connection.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT REFERENCES tasks(id)")
+    if "max_descendant_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_descendant_attempts INTEGER CHECK "
+            "(max_descendant_attempts IS NULL OR "
+            "(typeof(max_descendant_attempts) = 'integer' AND max_descendant_attempts >= 0))"
+        )
+    if "descendant_attempt_budget_exhausted_at" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN descendant_attempt_budget_exhausted_at "
+            "TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent_task ON tasks(parent_task_id)")
 
 
 def _add_attempt_progress_timestamps(connection: sqlite3.Connection) -> None:
@@ -1957,6 +1977,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (29, _add_attempt_task_brief_pin),
     (30, _add_task_attempt_budget),
     (31, _add_attempt_budget_exhaustion_marker),
+    (32, _add_hierarchical_attempt_budget),
 )
 
 
@@ -2063,11 +2084,18 @@ class GitSupervisor(
         (self.state_dir / "runtime").mkdir(exist_ok=True)
         (self.state_dir / "result-import-staging").mkdir(mode=0o700, exist_ok=True)
         with self.connect() as connection:
-            # Read the stamp before the first CREATE/ALTER. Checking afterwards would be
-            # checking a database this binary had already written to.
+            # Serialize schema validation and upgrade before the first CREATE/ALTER. A
+            # second opener must re-read the stamp only after it owns the write lock;
+            # otherwise two v31 openers can race the same ALTER, or an older binary can
+            # overwrite a version stamped by a newer one while it waited.
+            connection.execute("BEGIN IMMEDIATE")
             self.schema_version_on_open = stored_schema_version(connection)
             assert_schema_not_newer(self.schema_version_on_open)
-            connection.executescript(SCHEMA)
+            # The helper stays outside the pinned import surface, and resolving its
+            # dunder name through the module avoids class-scope name mangling.
+            from .supervisor import schema as supervisor_schema
+
+            getattr(supervisor_schema, "__execute_schema")(connection, SCHEMA)
             self._migrate(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('claim_counter', '0')"

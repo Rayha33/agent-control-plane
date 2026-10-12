@@ -15,7 +15,12 @@ from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..scheduling import Scheduler, attempt_budget_evidence, declared_read_resources
+from ..scheduling import (
+    Scheduler,
+    attempt_budget_evidence,
+    declared_read_resources,
+    descendant_attempt_count,
+)
 from ..status import DEFAULT_LEASE_RISK_SECONDS, StatusView
 from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError, canonical_json, sha256, utc_now
 
@@ -139,7 +144,9 @@ class ViewsMixin:
         attempts_used = connection.execute(
             "SELECT COUNT(*) AS value FROM attempts WHERE task_id = ?", (row["id"],)
         ).fetchone()["value"]
+        descendant_attempts_used = descendant_attempt_count(connection, row["id"])
         max_attempts = row["max_attempts"]
+        max_descendant_attempts = row["max_descendant_attempts"]
         observed_at = utc_now()
         return {
             "id": row["id"],
@@ -160,6 +167,7 @@ class ViewsMixin:
             "base_branch": row["base_branch"],
             "base_sha": row["base_sha"],
             "priority": row["priority"],
+            "parent_task_id": row["parent_task_id"],
             "max_attempts": max_attempts,
             "attempts_used": attempts_used,
             "attempts_remaining": (
@@ -169,6 +177,21 @@ class ViewsMixin:
                 row["id"], max_attempts, attempts_used, observed_at=observed_at
             ),
             "attempt_budget_exhausted_at": row["attempt_budget_exhausted_at"],
+            "max_descendant_attempts": max_descendant_attempts,
+            "descendant_attempts_used": descendant_attempts_used,
+            "descendant_attempts_remaining": (
+                max(0, max_descendant_attempts - descendant_attempts_used)
+                if max_descendant_attempts is not None
+                else None
+            ),
+            "descendant_attempt_budget": attempt_budget_evidence(
+                row["id"],
+                max_descendant_attempts,
+                descendant_attempts_used,
+                scope_kind="task_descendants",
+                observed_at=observed_at,
+            ),
+            "descendant_attempt_budget_exhausted_at": row["descendant_attempt_budget_exhausted_at"],
             "status": row["status"],
             "cleanup_target_status": row["cleanup_target_status"],
             "cleanup_error": row["cleanup_error"],

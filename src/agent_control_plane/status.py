@@ -664,6 +664,12 @@ class StatusView:
                 task.get("max_attempts"),
                 task.get("attempts_used", 0),
             ),
+            "descendant_attempt_budget": attempt_budget_evidence(
+                task["id"],
+                task.get("max_descendant_attempts"),
+                task.get("descendant_attempts_used", 0),
+                scope_kind="task_descendants",
+            ),
         }
         entry["category"], entry["reason"] = self._categorize(entry, lease_risk_seconds)
         return entry
