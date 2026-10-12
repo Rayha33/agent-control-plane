@@ -81,6 +81,18 @@ def normalize_artifact(raw: str) -> str:
     return value
 
 
+def _attempt_budget_fields(task: dict[str, Any]) -> dict[str, int | None]:
+    """Keep budget visibility consistent across plan, queue, and active rows."""
+    limit = task.get("max_attempts")
+    used = task.get("attempts_used", 0)
+    remaining = max(0, limit - used) if type(limit) is int and type(used) is int else None
+    return {
+        "max_attempts": limit,
+        "attempts_used": used,
+        "attempts_remaining": remaining,
+    }
+
+
 class Scheduler:
     """Read-only planning views over supervisor state."""
 
@@ -325,6 +337,7 @@ class Scheduler:
             "title": task["title"],
             "status": task["status"],
             "priority": task["priority"],
+            **_attempt_budget_fields(task),
             "resources": task["resources"],
             "produces": task["produces"],
             "consumes": task["consumes"],
@@ -358,7 +371,12 @@ class Scheduler:
         for task in tasks:
             if task["status"] not in CLAIMABLE_STATUSES:
                 active.append(
-                    {"task_id": task["id"], "title": task["title"], "status": task["status"]}
+                    {
+                        "task_id": task["id"],
+                        "title": task["title"],
+                        "status": task["status"],
+                        **_attempt_budget_fields(task),
+                    }
                 )
                 continue
             preview = self._preview(task["id"], tasks, reserved)

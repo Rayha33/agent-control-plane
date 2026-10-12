@@ -156,3 +156,41 @@ def test_legacy_unlimited_task_behavior_is_preserved(repo: Path) -> None:
     assert view["max_attempts"] is None
     assert view["attempts_used"] == 1
     assert view["attempts_remaining"] is None
+
+
+def test_plan_and_queue_report_under_cap_usage(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = _task(supervisor, 3)
+
+    plan = supervisor.plan_claim(task["id"])
+    queued = supervisor.ready_queue()["ready"][0]
+    for row in (plan, queued):
+        assert row["max_attempts"] == 3
+        assert row["attempts_used"] == 0
+        assert row["attempts_remaining"] == 3
+
+    supervisor.claim(task["id"], "worker-one")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET status = 'orphaned', current_attempt_id = NULL WHERE id = ?",
+            (task["id"],),
+        )
+
+    plan = supervisor.plan_claim(task["id"])
+    queued = supervisor.ready_queue()["ready"][0]
+    for row in (plan, queued):
+        assert row["max_attempts"] == 3
+        assert row["attempts_used"] == 1
+        assert row["attempts_remaining"] == 2
+
+
+def test_active_queue_rows_report_attempt_budget_usage(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = _task(supervisor, 2)
+    supervisor.claim(task["id"], "worker-one")
+
+    active = supervisor.ready_queue()["active"]
+    assert len(active) == 1
+    assert active[0]["max_attempts"] == 2
+    assert active[0]["attempts_used"] == 1
+    assert active[0]["attempts_remaining"] == 1
