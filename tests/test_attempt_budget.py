@@ -81,6 +81,13 @@ def test_exhausted_cap_refuses_before_creating_attempt_and_is_audited(repo: Path
     assert supervisor.verify_event_chain()["ok"] is True
     preview = supervisor.plan_claim(task["id"])
     assert any(item["kind"] == "attempt_budget_exhausted" for item in preview["blockers"])
+    blocked = supervisor.ready_queue()["blocked"]
+    assert len(blocked) == 1
+    assert blocked[0]["task_id"] == task["id"]
+    assert blocked[0]["max_attempts"] == 1
+    assert blocked[0]["attempts_used"] == 1
+    assert blocked[0]["attempts_remaining"] == 0
+    assert any(item["kind"] == "attempt_budget_exhausted" for item in blocked[0]["blockers"])
 
 
 def test_failed_provisioning_consumes_the_attempt_cap(repo: Path, monkeypatch) -> None:
