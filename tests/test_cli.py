@@ -654,6 +654,30 @@ def test_cli_attempt_limit_is_visible_and_blocks_a_retry(tmp_path: Path) -> None
     assert shown["attempts_remaining"] == 0
 
 
+def test_cli_provider_cost_limit_fails_closed_before_task_creation(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+
+    refused = run_cli(
+        repo,
+        "task-add",
+        "--title",
+        "provider limited",
+        "--accept",
+        "work stays within the hard provider cost limit",
+        "--resource",
+        "owned.txt",
+        "--provider-cost-limit-usd-micros",
+        "2500000",
+    )
+
+    assert refused.returncode == 1
+    response = json.loads(refused.stderr)
+    assert response["error"] == "budget_capability_unsupported"
+    assert "authenticated provider meter" in response["message"]
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
 def test_cli_heartbeat_without_checkpoint_only_renews_liveness(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     task = _add(repo, "heartbeat keeps progress", "owned.txt")

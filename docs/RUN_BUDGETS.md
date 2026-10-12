@@ -95,6 +95,15 @@ gate. That status is not a provider quota snapshot and cannot satisfy a requeste
 hard provider-spend limit. The legacy top-level counter fields remain for
 compatibility.
 
+The CLI/API also accepts an explicit `provider_cost_limit_usd_micros` request
+(`task-add --provider-cost-limit-usd-micros`) so unsupported hard limits are not
+silently ignored. In this build every such request fails with
+`budget_capability_unsupported` before resolving the task's base revision or
+inserting a task/event: there is no authenticated provider meter or request
+gate. No estimate, prompt instruction, stale quota snapshot, or provider-internal
+usage claim is read or accepted as enforcement evidence. This is a fail-closed
+request guard, not a functioning provider-spend cap.
+
 The counter must match the operation:
 
 - ACP can count mandate/attempt launches that pass through its own issuance

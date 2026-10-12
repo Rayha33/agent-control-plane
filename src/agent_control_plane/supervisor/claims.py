@@ -4107,6 +4107,7 @@ class ClaimsMixin:
         consumes: Sequence[str] = (),
         read_resources: Sequence[str] = (),
         max_attempts: int | None = None,
+        provider_cost_limit_usd_micros: int | None = None,
     ) -> dict[str, Any]:
         if not title.strip() or not acceptance:
             raise SupervisorError("invalid_task", "title and acceptance criteria are required")
@@ -4115,6 +4116,20 @@ class ClaimsMixin:
         ):
             raise SupervisorError(
                 "invalid_task", "max_attempts must be a positive 64-bit integer when set"
+            )
+        if provider_cost_limit_usd_micros is not None and (
+            type(provider_cost_limit_usd_micros) is not int
+            or not 1 <= provider_cost_limit_usd_micros <= 2**63 - 1
+        ):
+            raise SupervisorError(
+                "invalid_task",
+                "provider_cost_limit_usd_micros must be a positive 64-bit integer when set",
+            )
+        if provider_cost_limit_usd_micros is not None:
+            raise SupervisorError(
+                "budget_capability_unsupported",
+                "provider cost hard limit requested but unsupported: no authenticated provider "
+                "meter or request gate is configured",
             )
         declared: dict[str, str] = {}
         for item in resources:

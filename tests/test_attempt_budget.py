@@ -182,6 +182,27 @@ def test_invalid_attempt_caps_are_rejected(repo: Path, invalid: object) -> None:
     assert error.value.code == "invalid_task"
 
 
+def test_unsupported_provider_cost_limit_is_refused_before_task_persistence(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        before = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.create_task(
+            "Provider-budgeted task",
+            "This request must not start without a provider meter and request gate.",
+            ["No provider request occurs"],
+            ["alpha.txt"],
+            provider_cost_limit_usd_micros=5_000_000,
+        )
+
+    assert error.value.code == "budget_capability_unsupported"
+    assert "authenticated provider meter" in str(error.value)
+    assert "request gate" in str(error.value)
+    with supervisor.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+
+
 def test_legacy_unlimited_task_behavior_is_preserved(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     task = _task(supervisor, None)
