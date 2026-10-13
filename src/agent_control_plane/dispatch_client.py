@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -305,6 +306,121 @@ ResponseT = TypeVar("ResponseT", bound=DispatchHttpResponse)
 class DispatchResult(Generic[ResponseT]):
     dispatch_attempt_id: str
     response: ResponseT
+    retry_after_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchRetryPolicy:
+    """Explicit finite retry policy for selected server failures.
+
+    429 is deliberately never retried here: it can mean exhausted provider
+    quota, and Retry-After may point beyond a quota reset. A retry is permitted
+    only for 500/502/503/504 responses with a bounded Retry-After value.
+    """
+
+    max_attempts: int
+    max_retry_after_seconds: int = 30
+    max_total_wait_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 10:
+            raise ValueError("max_attempts must be an integer between 1 and 10")
+        if (
+            type(self.max_retry_after_seconds) is not int
+            or not 0 <= self.max_retry_after_seconds <= 86_400
+        ):
+            raise ValueError("max_retry_after_seconds must be an integer between 0 and 86400")
+        if (
+            type(self.max_total_wait_seconds) is not int
+            or not 0 <= self.max_total_wait_seconds <= 86_400
+        ):
+            raise ValueError("max_total_wait_seconds must be an integer between 0 and 86400")
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchRetryResult(Generic[ResponseT]):
+    """Receipted attempts from one bounded retry sequence."""
+
+    attempts: tuple[DispatchResult[ResponseT], ...]
+
+    @property
+    def response(self) -> ResponseT:
+        return self.attempts[-1].response
+
+
+_RETRYABLE_SERVER_STATUS_CODES = frozenset({500, 502, 503, 504})
+_RETRY_IDEMPOTENCY_KEY_MAX_LENGTH = 188
+
+
+def dispatch_with_retries(
+    *,
+    ledger: DispatchLedger,
+    task_id: str,
+    claim_fencing_token: int,
+    resource_fencing_tokens: Mapping[str, int],
+    idempotency_key: str,
+    provider_idempotency_key: str,
+    send_once: Callable[[str], ResponseT],
+    policy: DispatchRetryPolicy,
+    wait: Callable[[float], None] = time.sleep,
+) -> DispatchRetryResult[ResponseT]:
+    """Run an explicit bounded retry sequence through durable dispatch slots.
+
+    Each invocation gets a distinct ACP idempotency key and reservation; the
+    same provider idempotency key is passed to every callback. The callback
+    must submit that key to a provider that guarantees deduplication for this
+    operation. This function cannot verify either condition. Only selected
+    5xx responses with a Retry-After within both per-delay and total-wait caps
+    are retried. A 429, missing/invalid/too-long hint, ambiguous send, failed
+    receipt, or reservation denial ends the sequence. The caller's transport
+    must still have its own retries and redirects disabled.
+    """
+
+    if not isinstance(policy, DispatchRetryPolicy):
+        raise TypeError("policy must be a DispatchRetryPolicy")
+    if not callable(wait):
+        raise TypeError("wait must be callable")
+    if (
+        not isinstance(provider_idempotency_key, str)
+        or not 1 <= len(provider_idempotency_key) <= 255
+        or any(not 0x21 <= ord(char) <= 0x7E for char in provider_idempotency_key)
+    ):
+        raise ValueError("provider_idempotency_key must be 1..255 visible ASCII characters")
+    if (
+        not isinstance(idempotency_key, str)
+        or not 1 <= len(idempotency_key) <= _RETRY_IDEMPOTENCY_KEY_MAX_LENGTH
+        or any(
+            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+            for char in idempotency_key
+        )
+    ):
+        raise ValueError("idempotency_key must be 1..188 visible token characters")
+
+    attempts: list[DispatchResult[ResponseT]] = []
+    total_wait_seconds = 0
+    for attempt_number in range(1, policy.max_attempts + 1):
+        result = dispatch_once(
+            ledger=ledger,
+            task_id=task_id,
+            claim_fencing_token=claim_fencing_token,
+            resource_fencing_tokens=resource_fencing_tokens,
+            idempotency_key=f"{idempotency_key}:attempt:{attempt_number}",
+            send_once=lambda: send_once(provider_idempotency_key),
+        )
+        attempts.append(result)
+        delay = result.retry_after_seconds
+        if (
+            attempt_number >= policy.max_attempts
+            or result.response.status_code not in _RETRYABLE_SERVER_STATUS_CODES
+            or delay is None
+            or delay > policy.max_retry_after_seconds
+            or total_wait_seconds + delay > policy.max_total_wait_seconds
+        ):
+            break
+        wait(float(delay))
+        total_wait_seconds += delay
+
+    return DispatchRetryResult(attempts=tuple(attempts))
 
 
 def dispatch_once(
@@ -380,7 +496,11 @@ def dispatch_once(
     if error is not None:
         raise error
 
-    return DispatchResult(dispatch_attempt_id=reservation.dispatch_attempt_id, response=response)
+    return DispatchResult(
+        dispatch_attempt_id=reservation.dispatch_attempt_id,
+        response=response,
+        retry_after_seconds=retry_after_seconds,
+    )
 
 
 def _retry_after_seconds(response: DispatchHttpResponse) -> int | None:
@@ -473,5 +593,8 @@ __all__ = [
     "DispatchOutcomeUnknown",
     "DispatchReceiptUnrecorded",
     "DispatchResult",
+    "DispatchRetryPolicy",
+    "DispatchRetryResult",
+    "dispatch_with_retries",
     "dispatch_once",
 ]

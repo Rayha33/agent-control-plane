@@ -235,6 +235,16 @@
     "class:DispatchResponseInvalid": [],
     "class:DispatchResult": [
       "dispatch_attempt_id",
+      "response",
+      "retry_after_seconds"
+    ],
+    "class:DispatchRetryPolicy": [
+      "max_attempts",
+      "max_retry_after_seconds",
+      "max_total_wait_seconds"
+    ],
+    "class:DispatchRetryResult": [
+      "attempts",
       "response"
     ],
     "class:_JsonOpener": [
@@ -268,6 +278,8 @@
       "DispatchReservationReplay",
       "DispatchResponseInvalid",
       "DispatchResult",
+      "DispatchRetryPolicy",
+      "DispatchRetryResult",
       "Generic",
       "HTTPError",
       "HTTPRedirectHandler",
@@ -281,6 +293,8 @@
       "_JsonResponse",
       "_MAX_COORDINATION_RESPONSE_BYTES",
       "_NoRedirectHandler",
+      "_RETRYABLE_SERVER_STATUS_CODES",
+      "_RETRY_IDEMPOTENCY_KEY_MAX_LENGTH",
       "_bounded_retry_after",
       "_is_loopback_host",
       "_retry_after_seconds",
@@ -291,10 +305,12 @@
       "dataclass",
       "datetime",
       "dispatch_once",
+      "dispatch_with_retries",
       "ipaddress",
       "json",
       "parsedate_to_datetime",
       "quote",
+      "time",
       "urlsplit"
     ]
   },

@@ -18,7 +18,9 @@ from agent_control_plane.dispatch_client import (
     DispatchReservation,
     DispatchReservationReplay,
     DispatchResponseInvalid,
+    DispatchRetryPolicy,
     dispatch_once,
+    dispatch_with_retries,
 )
 
 
@@ -43,6 +45,7 @@ class FakeLedger:
         self.lose_next_reservation_response = False
         self.reserve_error: Exception | None = None
         self.receipt_error: Exception | None = None
+        self.reservation_limit: int | None = None
 
     def reserve_dispatch_attempt(
         self,
@@ -61,6 +64,8 @@ class FakeLedger:
         existing = self.reservations.get(idempotency_key)
         if existing is not None:
             return DispatchReservation(existing.dispatch_attempt_id, created=False)
+        if self.reservation_limit is not None and len(self.reservations) >= self.reservation_limit:
+            raise RuntimeError("task_dispatch_budget_exhausted")
         reservation = DispatchReservation(
             dispatch_attempt_id=f"attempt-{len(self.reservations) + 1}", created=True
         )
@@ -140,6 +145,20 @@ def _dispatch(ledger: FakeLedger, idempotency_key: str, send_once):
     )
 
 
+def _dispatch_retries(ledger: FakeLedger, idempotency_key: str, send_once, policy, wait):
+    return dispatch_with_retries(
+        ledger=ledger,
+        task_id="task-1",
+        claim_fencing_token=7,
+        resource_fencing_tokens={"repo:file:src/app.py": 11},
+        idempotency_key=idempotency_key,
+        provider_idempotency_key="provider-operation-key",
+        send_once=send_once,
+        policy=policy,
+        wait=wait,
+    )
+
+
 def test_reservation_denial_and_stale_fence_never_invoke_transport() -> None:
     for reason in ("task_dispatch_budget_exhausted", "claim_fencing_token_stale"):
         ledger = FakeLedger()
@@ -186,6 +205,230 @@ def test_429_is_recorded_once_without_automatic_retry() -> None:
     assert sends == [FakeResponse(429, retry_after_seconds=30)]
     assert ledger.reserve_calls == [("task-1", 7, {"repo:file:src/app.py": 11}, "429-key")]
     assert ledger.receipts == [("attempt-1", 429, 30)]
+
+
+def test_explicit_retry_policy_reserves_each_bounded_503_attempt() -> None:
+    ledger = FakeLedger()
+    responses = [FakeResponse(503, retry_after_seconds=2), FakeResponse(200)]
+    sends: list[int] = []
+    waits: list[float] = []
+
+    provider_keys: list[str] = []
+
+    def send_once(provider_idempotency_key: str) -> FakeResponse:
+        provider_keys.append(provider_idempotency_key)
+        sends.append(len(sends) + 1)
+        return responses.pop(0)
+
+    result = _dispatch_retries(
+        ledger,
+        "bounded-retry",
+        send_once,
+        DispatchRetryPolicy(max_attempts=3, max_retry_after_seconds=5),
+        waits.append,
+    )
+
+    assert result.response.status_code == 200
+    assert [item.response.status_code for item in result.attempts] == [503, 200]
+    assert [item.retry_after_seconds for item in result.attempts] == [2, None]
+    assert sends == [1, 2]
+    assert provider_keys == ["provider-operation-key", "provider-operation-key"]
+    assert waits == [2.0]
+    assert ledger.reservation_keys == [
+        "bounded-retry:attempt:1",
+        "bounded-retry:attempt:2",
+    ]
+    assert ledger.receipts == [("attempt-1", 503, 2), ("attempt-2", 200, None)]
+
+
+def test_explicit_retry_policy_never_retries_429_even_with_retry_after() -> None:
+    ledger = FakeLedger()
+    sends: list[int] = []
+    waits: list[float] = []
+
+    def send_once(_provider_idempotency_key: str) -> FakeResponse:
+        sends.append(1)
+        return FakeResponse(429, retry_after_seconds=1)
+
+    result = _dispatch_retries(
+        ledger,
+        "quota-response",
+        send_once,
+        DispatchRetryPolicy(max_attempts=4, max_retry_after_seconds=5),
+        waits.append,
+    )
+
+    assert result.response.status_code == 429
+    assert len(result.attempts) == 1
+    assert sends == [1]
+    assert waits == []
+    assert len(ledger.reservation_keys) == 1
+    assert ledger.receipts == [("attempt-1", 429, 1)]
+
+
+def test_explicit_retry_policy_does_not_retry_ambiguous_send() -> None:
+    ledger = FakeLedger()
+    sends: list[str] = []
+
+    def send_once(provider_idempotency_key: str) -> FakeResponse:
+        sends.append(provider_idempotency_key)
+        raise TimeoutError("upstream outcome unknown")
+
+    with pytest.raises(DispatchOutcomeUnknown):
+        _dispatch_retries(
+            ledger,
+            "ambiguous-send",
+            send_once,
+            DispatchRetryPolicy(max_attempts=3),
+            lambda _delay: None,
+        )
+
+    assert sends == ["provider-operation-key"]
+    assert ledger.reservation_keys == ["ambiguous-send:attempt:1"]
+    assert ledger.receipts == []
+
+
+@pytest.mark.parametrize(
+    "response, policy",
+    [
+        (FakeResponse(503), DispatchRetryPolicy(max_attempts=3)),
+        (
+            FakeResponse(503, retry_after_seconds=6),
+            DispatchRetryPolicy(max_attempts=3, max_retry_after_seconds=5),
+        ),
+        (FakeResponse(501, retry_after_seconds=1), DispatchRetryPolicy(max_attempts=3)),
+    ],
+)
+def test_explicit_retry_policy_stops_without_an_approved_retry_hint(response, policy) -> None:
+    ledger = FakeLedger()
+    sends: list[None] = []
+    waits: list[float] = []
+
+    result = _dispatch_retries(
+        ledger,
+        "retry-stops",
+        lambda _provider_idempotency_key: (sends.append(None), response)[1],
+        policy,
+        waits.append,
+    )
+
+    assert result.response is response
+    assert len(result.attempts) == 1
+    assert sends == [None]
+    assert waits == []
+    assert len(ledger.receipts) == 1
+
+
+def test_explicit_retry_policy_surfaces_dispatch_cap_before_second_send() -> None:
+    ledger = FakeLedger()
+    ledger.reservation_limit = 1
+    responses = [FakeResponse(503, retry_after_seconds=0)]
+    sends: list[None] = []
+
+    with pytest.raises(RuntimeError, match="task_dispatch_budget_exhausted"):
+        _dispatch_retries(
+            ledger,
+            "retry-cap",
+            lambda _provider_idempotency_key: (sends.append(None), responses.pop(0))[1],
+            DispatchRetryPolicy(max_attempts=3, max_retry_after_seconds=1),
+            lambda _delay: None,
+        )
+
+    assert sends == [None]
+    assert ledger.reservation_keys == ["retry-cap:attempt:1", "retry-cap:attempt:2"]
+    assert ledger.receipts == [("attempt-1", 503, 0)]
+
+
+def test_interrupted_retry_sequence_replays_first_key_and_does_not_resume() -> None:
+    ledger = FakeLedger()
+    responses = [FakeResponse(503, retry_after_seconds=1)]
+    sends: list[None] = []
+    policy = DispatchRetryPolicy(max_attempts=3, max_retry_after_seconds=2)
+
+    with pytest.raises(InterruptedError):
+        _dispatch_retries(
+            ledger,
+            "interrupted-sequence",
+            lambda _provider_idempotency_key: (sends.append(None), responses.pop(0))[1],
+            policy,
+            lambda _delay: (_ for _ in ()).throw(InterruptedError()),
+        )
+
+    with pytest.raises(DispatchReservationReplay):
+        _dispatch_retries(
+            ledger,
+            "interrupted-sequence",
+            lambda _provider_idempotency_key: sends.append(None),
+            policy,
+            lambda _delay: None,
+        )
+
+    assert sends == [None]
+    assert ledger.reservation_keys == [
+        "interrupted-sequence:attempt:1",
+        "interrupted-sequence:attempt:1",
+    ]
+    assert ledger.receipts == [("attempt-1", 503, 1)]
+
+
+def test_explicit_retry_policy_caps_total_wait_across_the_sequence() -> None:
+    ledger = FakeLedger()
+    responses = [
+        FakeResponse(503, retry_after_seconds=3),
+        FakeResponse(503, retry_after_seconds=3),
+        FakeResponse(200),
+    ]
+    sends: list[None] = []
+    waits: list[float] = []
+
+    result = _dispatch_retries(
+        ledger,
+        "total-wait-cap",
+        lambda _provider_idempotency_key: (sends.append(None), responses.pop(0))[1],
+        DispatchRetryPolicy(
+            max_attempts=4,
+            max_retry_after_seconds=10,
+            max_total_wait_seconds=5,
+        ),
+        waits.append,
+    )
+
+    assert result.response.status_code == 503
+    assert len(result.attempts) == 2
+    assert sends == [None, None]
+    assert waits == [3.0]
+    assert ledger.receipts == [("attempt-1", 503, 3), ("attempt-2", 503, 3)]
+
+
+@pytest.mark.parametrize("max_attempts", [True, 0, 11, 1.5])
+def test_dispatch_retry_policy_rejects_unbounded_or_non_integer_attempts(max_attempts) -> None:
+    with pytest.raises(ValueError, match="max_attempts"):
+        DispatchRetryPolicy(max_attempts=max_attempts)
+
+
+@pytest.mark.parametrize("max_total_wait_seconds", [True, -1, 86_401])
+def test_dispatch_retry_policy_rejects_invalid_total_wait_caps(max_total_wait_seconds) -> None:
+    with pytest.raises(ValueError, match="max_total_wait_seconds"):
+        DispatchRetryPolicy(max_attempts=2, max_total_wait_seconds=max_total_wait_seconds)
+
+
+def test_dispatch_with_retries_rejects_missing_provider_idempotency_before_reserving() -> None:
+    ledger = FakeLedger()
+
+    with pytest.raises(ValueError, match="provider_idempotency_key"):
+        dispatch_with_retries(
+            ledger=ledger,
+            task_id="task-1",
+            claim_fencing_token=7,
+            resource_fencing_tokens={"repo:file:src/app.py": 11},
+            idempotency_key="provider-key-required",
+            provider_idempotency_key="\n",
+            send_once=lambda _provider_key: FakeResponse(200),
+            policy=DispatchRetryPolicy(max_attempts=2),
+            wait=lambda _delay: None,
+        )
+
+    assert ledger.reserve_calls == []
 
 
 def test_standard_http_response_retry_after_header_is_normalized() -> None:
@@ -469,6 +712,95 @@ def test_http_adapter_and_dispatch_once_integrate_with_reference_api(client, adm
     receipt = opener.payloads[1]["receipt"]
     assert receipt["http_status_code"] == 429
     assert receipt["retry_after_seconds"] == 30
+
+
+def test_bounded_retry_sequence_integrates_with_reference_api(client, admin_headers) -> None:
+    agent_response = client.post(
+        "/v1/agents",
+        headers=admin_headers,
+        json={"name": "dispatch-retry-integration", "owner": "tests", "role": "worker"},
+    )
+    assert agent_response.status_code == 201
+    agent_id = agent_response.json()["id"]
+    mandate_response = client.post(
+        "/v1/mandates",
+        headers=admin_headers,
+        json={
+            "agent_id": agent_id,
+            "subject": f"agent:{agent_id}",
+            "scopes": [{"action": "coordination.*", "resource": "task:*"}],
+            "ttl_seconds": 3600,
+        },
+    )
+    assert mandate_response.status_code == 201
+    token = mandate_response.json()["token"]
+    task_response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Exercise bounded dispatch retries",
+            "description": "Each retry must reserve and receipt its own durable slot.",
+            "acceptance_criteria": ["two reservations and two receipts"],
+            "resources": ["repo:file:src/retry_integration.py"],
+            "priority": 80,
+            "max_dispatch_attempts": 2,
+        },
+    )
+    assert task_response.status_code == 201
+    task = task_response.json()
+    claim_response = client.post(
+        f"/v1/tasks/{task['id']}/claim",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"ttl_seconds": 300},
+    )
+    assert claim_response.status_code == 200
+    claim = claim_response.json()
+    resource_fencing_tokens = {
+        lease["resource"]: lease["fencing_token"] for lease in claim["resource_leases"]
+    }
+    opener = ClientTestOpener(client)
+    ledger = CoordinationHttpDispatchLedger(
+        base_url="http://127.0.0.1",
+        bearer_token=token,
+        opener=opener,
+    )
+    sends: list[tuple[str, StandardHttpResponse]] = []
+    waits: list[float] = []
+    responses = [
+        StandardHttpResponse(503, {"Retry-After": "0"}),
+        StandardHttpResponse(200, {}),
+    ]
+
+    def send_once(provider_idempotency_key: str) -> StandardHttpResponse:
+        response = responses.pop(0)
+        sends.append((provider_idempotency_key, response))
+        return response
+
+    result = dispatch_with_retries(
+        ledger=ledger,
+        task_id=task["id"],
+        claim_fencing_token=claim["task"]["claim_fencing_token"],
+        resource_fencing_tokens=resource_fencing_tokens,
+        idempotency_key="retry-integration-call",
+        provider_idempotency_key="provider-retry-integration-key",
+        send_once=send_once,
+        policy=DispatchRetryPolicy(max_attempts=2, max_retry_after_seconds=1),
+        wait=waits.append,
+    )
+
+    assert len(result.attempts) == 2
+    assert waits == [0.0]
+    assert result.response is sends[-1][1]
+    assert [key for key, _ in sends] == [
+        "provider-retry-integration-key",
+        "provider-retry-integration-key",
+    ]
+    receipts = [opener.payloads[index]["receipt"] for index in (1, 3)]
+    assert [receipt["http_status_code"] for receipt in receipts] == [503, 200]
+    assert receipts[0]["dispatch_attempt_id"] != receipts[1]["dispatch_attempt_id"]
+    task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert task_view["dispatch_attempt_budget"]["consumed"] == 2
+    assert task_view["dispatch_attempt_budget"]["provider_usage"]["status"] == "unsupported"
 
 
 def test_coordination_http_adapter_does_not_send_after_api_error_or_redirect() -> None:

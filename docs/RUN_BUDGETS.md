@@ -255,12 +255,36 @@ reservation error also propagates before the callback. It accepts standard
 24-hour retry hints are represented as `null`; the valid HTTP status receipt is
 still recorded. A 429 is never retried automatically. If sending or receipt
 recording is ambiguous, the helper raises a sanitized error without resending;
-the durable slot remains consumed. A deliberate retry must be a new call with
-a fresh idempotency key and another reservation. The supplied provider
-transport must itself disable retries and redirects: the helper invokes a
-callback once but cannot inspect or control behavior inside that transport.
-This is not a provider adapter, universal request gate, or protection against
-direct calls or provider-internal fan-out.
+the durable slot remains consumed. A deliberate retry through `dispatch_once`
+must be a new call with a fresh idempotency key and another reservation.
+
+Callers that need bounded transient-server retries may explicitly use
+`dispatch_with_retries` with a `DispatchRetryPolicy` and a provider-native
+idempotency key. Use a fresh provider key for each logical operation, then pass
+that same key to every callback for retries of that operation. The callback
+must submit it with the same semantic operation/payload to a provider that
+guarantees deduplication. ACP cannot verify provider support or that the
+callback uses the key; if those conditions are not met, use `dispatch_once`
+instead. The policy requires a finite maximum of 1–10 attempts, caps each
+delay, and also caps the sum of scheduled retry delays to at most 24 hours
+(60 seconds by default). It retries only HTTP 500, 502, 503, or 504 when the
+response contains a valid `Retry-After` within both caps; every attempt uses a distinct ACP
+reservation/idempotency key, and each response with a confirmed receipt write
+gets its own immutable client-reported receipt. An ambiguous send or receipt failure ends the sequence
+without a confirmed receipt; its durable slot remains consumed. HTTP 429 is
+always returned without an automatic retry, even when it includes
+`Retry-After`, because the response may represent exhausted quota and
+the reset boundary is not known here. Missing, invalid, or too-long retry hints
+also stop the sequence. A reservation denial prevents the next callback.
+Restarting the same sequence replays its first key and is refused before the
+transport is called; the helper does not resume or schedule work after a quota
+reset. A retry may still consume provider usage, which ACP cannot meter or cap.
+
+The supplied provider transport must itself disable retries and redirects: the
+helper invokes a callback once per reserved attempt but cannot inspect or
+control behavior inside that transport. This is not a provider adapter,
+universal request gate, or protection against direct calls or provider-internal
+fan-out.
 
 Task views expose local and descendant dispatch-attempt budgets with unit
 `dispatch_attempt_reservations`, consumed/remaining counts, status, source,
