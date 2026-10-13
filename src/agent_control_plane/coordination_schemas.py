@@ -85,6 +85,27 @@ class TaskCreate(BaseModel):
     resources: list[str] = Field(default_factory=list, max_length=500)
     dependencies: list[str] = Field(default_factory=list, max_length=200)
     priority: int = Field(default=50, ge=0, le=100)
+    parent_task_id: str | None = Field(default=None, min_length=1, max_length=200)
+    max_claims: int | None = Field(
+        default=None,
+        strict=True,
+        gt=0,
+        le=2**63 - 1,
+        description=(
+            "Maximum successful Coordination API claim reservations for this task. "
+            "This does not limit worker starts or provider usage."
+        ),
+    )
+    max_descendant_claims: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=2**63 - 1,
+        description=(
+            "Maximum successful Coordination API claim reservations across descendants "
+            "at any depth; the task's own claims are excluded."
+        ),
+    )
     provider_cost_limit_usd_micros: int | None = Field(
         default=None,
         strict=True,
@@ -106,6 +127,28 @@ class TaskCreate(BaseModel):
             raise ValueError("list values must be unique")
         return normalized
 
+    @field_validator("parent_task_id")
+    @classmethod
+    def require_nonempty_parent_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("parent_task_id cannot be empty")
+        return normalized
+
+
+class ClaimBudgetView(BaseModel):
+    scope: Literal["task", "descendant_tree"]
+    unit: Literal["successful_claim_reservations"]
+    limit: int | None
+    consumed: int | None
+    remaining: int | None
+    status: Literal["available", "exhausted", "unlimited", "invalid"]
+    source: Literal["tasks.claim_fencing_token"]
+    enforcement: Literal["BEGIN IMMEDIATE task claim and SQLite trigger"]
+    observed_at: str
+
 
 class TaskView(BaseModel):
     id: str
@@ -119,6 +162,12 @@ class TaskView(BaseModel):
     owner_agent_id: str | None
     claim_expires_at: int | None
     claim_fencing_token: int
+    parent_task_id: str | None
+    ancestor_lineage_integrity: Literal["valid", "invalid"]
+    max_claims: int | None
+    max_descendant_claims: int | None
+    claim_budget: ClaimBudgetView
+    descendant_claim_budget: ClaimBudgetView
     version: int
     created_at: str
     updated_at: str

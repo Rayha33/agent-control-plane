@@ -64,6 +64,10 @@
     ]
   },
   "agent_control_plane.coordination": {
+    "class:ClaimBudgetView": [
+      "_abc_impl",
+      "model_config"
+    ],
     "class:ControlPlaneError": [],
     "class:ControlPlaneService": [
       "_agent",
@@ -88,10 +92,16 @@
     "class:CoordinationService": [
       "_agent_for_action",
       "_assert_active_claim",
+      "_claim_budget_view",
+      "_claim_count",
+      "_claim_limit",
       "_clear_heartbeats",
+      "_descendant_claim_count",
+      "_raise_claim_guard_error",
       "_review_view",
       "_submission_row",
       "_submission_view",
+      "_task_ancestor_chain",
       "_task_row",
       "_task_view",
       "claim_task",
@@ -134,10 +144,12 @@
     "class:TaskCreate": [
       "_abc_impl",
       "model_config",
+      "require_nonempty_parent_id",
       "require_unique_nonempty_values"
     ],
     "module": [
       "Any",
+      "ClaimBudgetView",
       "ControlPlaneError",
       "ControlPlaneService",
       "CoordinationService",

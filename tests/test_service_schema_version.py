@@ -95,6 +95,39 @@ def create_v1_service_database(path: Path) -> None:
     connection.close()
 
 
+def create_v3_service_database(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES ('schema_version', '3');
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            acceptance_criteria_json TEXT NOT NULL,
+            resources_json TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 50,
+            status TEXT NOT NULL DEFAULT 'open',
+            owner_agent_id TEXT,
+            claim_expires_at INTEGER,
+            claim_fencing_token INTEGER NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO tasks(
+            id, title, description, acceptance_criteria_json, resources_json,
+            created_at, updated_at
+        ) VALUES (
+            'legacy-task', 'Legacy task', 'Existing v3 work', '[]', '[]', 'now', 'now'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
 def test_initialize_stamps_the_version_and_the_writer(database_path: Path) -> None:
     recorded = meta(database_path)
     assert recorded[SCHEMA_VERSION_KEY] == str(SERVICE_SCHEMA_VERSION)
@@ -179,6 +212,169 @@ def test_v2_service_database_installs_the_rolling_upgrade_guard(
             "('mandate_fanout_guard', 'service_schema_version_no_downgrade')"
         ).fetchone()[0]
     assert trigger_count == 2
+
+
+def test_v3_service_database_adds_nullable_task_claim_budgets_and_legacy_guard(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "service-v3.db"
+    create_v3_service_database(database_path)
+
+    Database(str(database_path)).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+        legacy = connection.execute(
+            "SELECT parent_task_id, max_claims, max_descendant_claims "
+            "FROM tasks WHERE id = 'legacy-task'"
+        ).fetchone()
+        triggers = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+
+    assert {"parent_task_id", "max_claims", "max_descendant_claims"} <= columns
+    assert legacy == (None, None, None)
+    assert {
+        "task_claim_budget_guard",
+        "task_claim_budget_config_immutable",
+        "task_claim_budget_insert_guard",
+    } <= triggers
+    assert "idx_tasks_parent_task" in indexes
+    assert meta(database_path)[SCHEMA_VERSION_KEY] == str(SERVICE_SCHEMA_VERSION)
+
+
+def test_stale_service_sql_writer_cannot_bypass_task_claim_cap(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        for task_id, parent_id, descendant_cap in (
+            ("root", None, 1),
+            ("child-a", "root", None),
+            ("child-b", "root", None),
+        ):
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, description, acceptance_criteria_json, resources_json,
+                    priority, status, claim_fencing_token, parent_task_id,
+                    max_descendant_claims, created_at, updated_at
+                ) VALUES (?, 'task', 'legacy writer test', '[]', '[]', 50, 'open',
+                          0, ?, ?, 'now', 'now')
+                """,
+                (task_id, parent_id, descendant_cap),
+            )
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, title, description, acceptance_criteria_json, resources_json,
+                status, max_claims, created_at, updated_at
+            ) VALUES ('local', 'task', 'local cap', '[]', '[]', 'open', 1, 'now', 'now')
+            """
+        )
+
+        # This is the old service's claim update: it knows only the fencing token.
+        connection.execute(
+            "UPDATE tasks SET claim_fencing_token = claim_fencing_token + 1 WHERE id = 'child-a'"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="descendant_claim_budget_exhausted"):
+            connection.execute(
+                "UPDATE tasks SET claim_fencing_token = claim_fencing_token + 1 "
+                "WHERE id = 'child-b'"
+            )
+        connection.execute(
+            "UPDATE tasks SET claim_fencing_token = claim_fencing_token + 1 WHERE id = 'local'"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="task_claim_budget_exhausted"):
+            connection.execute(
+                "UPDATE tasks SET claim_fencing_token = claim_fencing_token + 1 WHERE id = 'local'"
+            )
+        stored = connection.execute(
+            "SELECT id, claim_fencing_token FROM tasks "
+            "WHERE id IN ('child-a', 'child-b', 'local') ORDER BY id"
+        ).fetchall()
+
+    assert stored == [("child-a", 1), ("child-b", 0), ("local", 1)]
+
+
+def test_task_claim_budget_insert_guard_rejects_preconsumed_and_replaced_tasks(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="task_claim_fencing_invalid"):
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, description, acceptance_criteria_json, resources_json,
+                    claim_fencing_token, created_at, updated_at
+                ) VALUES ('preclaimed', 'task', 'invalid insert', '[]', '[]', 1, 'now', 'now')
+                """
+            )
+
+        connection.execute(
+            """
+                INSERT INTO tasks(
+                    id, title, description, acceptance_criteria_json, resources_json,
+                    status, max_claims, created_at, updated_at
+                ) VALUES (
+                    'immutable', 'task', 'immutable config', '[]', '[]', 'open', 1, 'now', 'now'
+                )
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="task_claim_budget_config_immutable"):
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO tasks(
+                    id, title, description, acceptance_criteria_json, resources_json,
+                    status, max_claims, created_at, updated_at
+                ) VALUES (
+                    'immutable', 'task', 'replace attempt', '[]', '[]', 'open', 10, 'now', 'now'
+                )
+                """
+            )
+        stored = connection.execute(
+            "SELECT max_claims FROM tasks WHERE id = 'immutable'"
+        ).fetchone()[0]
+
+    assert stored == 1
+
+
+def test_stale_service_sql_writer_fails_closed_on_corrupt_task_lineage(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, title, description, acceptance_criteria_json, resources_json,
+                status, max_descendant_claims, created_at, updated_at
+            ) VALUES ('root', 'task', 'cycle test', '[]', '[]', 'open', 2, 'now', 'now')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, title, description, acceptance_criteria_json, resources_json,
+                status, parent_task_id, created_at, updated_at
+            ) VALUES ('child', 'task', 'cycle test', '[]', '[]', 'open', 'root', 'now', 'now')
+            """
+        )
+        connection.execute("DROP TRIGGER task_claim_budget_config_immutable")
+        connection.execute("UPDATE tasks SET parent_task_id = 'child' WHERE id = 'root'")
+        with pytest.raises(sqlite3.IntegrityError, match="task_lineage_invalid"):
+            connection.execute(
+                "UPDATE tasks SET claim_fencing_token = claim_fencing_token + 1 WHERE id = 'child'"
+            )
+        token = connection.execute(
+            "SELECT claim_fencing_token FROM tasks WHERE id = 'child'"
+        ).fetchone()[0]
+
+    assert token == 0
 
 
 def test_a_stale_initializer_cannot_downgrade_the_service_schema_stamp(

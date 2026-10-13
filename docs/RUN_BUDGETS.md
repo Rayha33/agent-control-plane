@@ -1,9 +1,10 @@
 # Run budgets and usage provenance
 
-**Status:** design contract plus local per-task and hierarchical descendant-
-attempt enforcement slices for task #2998. Provider adapters, provider quota
-handling, and budget-exhaustion checkpoint recovery are not implemented. This
-document is not a provider billing cap or evidence that ACP meters model work.
+**Status:** design contract plus local supervisor attempt caps and public
+Coordination API claim-reservation caps for task #2998. Provider adapters,
+provider quota handling, and budget-exhaustion checkpoint recovery are not
+implemented. This document is not a provider billing cap or evidence that ACP
+meters model work.
 
 ## Problem
 
@@ -178,6 +179,32 @@ simulations, not durable reservations; the claim transaction remains the source
 of truth. These controls do not implement provider usage or quota-exhaustion
 recovery.
 
+The separate public Coordination API now supports `max_claims` and
+`max_descendant_claims`. These count successful claim reservations represented
+by `tasks.claim_fencing_token`; they do not count worker starts, provider
+requests, or provider-internal fan-out. `parent_task_id` is immutable and
+separate from dependency edges. A task's `max_descendant_claims` covers all
+descendants at every depth and excludes the task's own claims.
+
+Each public API reservation increments the fencing token in the same
+`BEGIN IMMEDIATE` transaction as the task status/owner, resource leases,
+heartbeat, and `task.claimed` audit event. A database trigger repeats the local
+and ancestor-cap checks, so an already-running service binary that only knows
+the old claim update cannot bypass the cap. Failed claims consume no slot;
+expired, reopened, or reworked tasks do not refund a successful reservation.
+Budget configuration and parentage cannot be changed after task creation.
+
+Coordination task views expose `claim_budget` and `descendant_claim_budget`
+with unit `successful_claim_reservations`, current consumed/remaining values,
+status, source, enforcement point, and observation time. The local supervisor's
+`attempt_budget` evidence remains a different unit and enforcement boundary.
+These Coordination counters are durable claim generations, not a worker
+attempt ledger or proof that any worker actually started.
+The task, ancestor chain, descendants, dependencies, and latest submission/review
+are read from one SQLite snapshot; `ancestor_lineage_integrity` is `invalid` if
+an ancestor link, cap, or fencing counter is corrupt. Invalid lineage is never
+evidence that inherited caps are available.
+
 Task, plan, queue, and status views expose per-task evidence as `attempt_budget`
 and subtree evidence as `descendant_attempt_budget`. Each names its unit, scope,
 configured cap, consumed/remaining amounts, source, observation time/freshness,
@@ -221,10 +248,12 @@ gate. No estimate, prompt instruction, stale quota snapshot, or provider-interna
 usage claim is read or accepted as enforcement evidence. This is a fail-closed
 request guard, not a functioning provider-spend cap.
 
-The public Coordination `TaskCreate` request rejects unrecognized fields. It has
-no durable attempt ledger or parent/child task hierarchy, so `max_attempts` and
-`max_descendant_attempts` are rejected as extra fields there rather than being
-accepted as local-supervisor guarantees.
+The public Coordination `TaskCreate` request rejects unrecognized fields.
+`max_attempts` and `max_descendant_attempts` remain rejected there: they are
+local-supervisor controls, not aliases for the API's `max_claims` and
+`max_descendant_claims`. The API's claim counters still do not cap worker starts
+or any provider usage; no authenticated provider meter or request gate is wired
+to the Coordination service.
 
 The counter must match the operation:
 

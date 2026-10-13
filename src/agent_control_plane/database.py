@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 3
+SERVICE_SCHEMA_VERSION = 4
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -162,6 +162,216 @@ def _install_service_upgrade_guards(connection: sqlite3.Connection) -> None:
     _install_schema_version_monotonicity_guard(connection)
 
 
+def _install_task_claim_budget_guards(connection: sqlite3.Connection) -> None:
+    """Keep successful-claim caps effective across already-running service writers."""
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS task_claim_budget_insert_guard
+        BEFORE INSERT ON tasks
+        BEGIN
+            SELECT CASE WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.id)
+              THEN RAISE(ABORT, 'task_claim_budget_config_immutable') END;
+            SELECT CASE WHEN typeof(NEW.claim_fencing_token) <> 'integer'
+              OR NEW.claim_fencing_token <> 0
+              THEN RAISE(ABORT, 'task_claim_fencing_invalid') END;
+            SELECT CASE WHEN NEW.parent_task_id IS NOT NULL
+              AND (typeof(NEW.parent_task_id) <> 'text'
+                OR length(trim(NEW.parent_task_id)) = 0
+                OR NOT EXISTS (SELECT 1 FROM tasks WHERE id = NEW.parent_task_id))
+              THEN RAISE(ABORT, 'task_lineage_invalid') END;
+            SELECT CASE WHEN NEW.parent_task_id IS NOT NULL AND EXISTS (
+                WITH RECURSIVE ancestors(id, parent_task_id, path, cycle) AS (
+                    SELECT id, parent_task_id, '|' || id || '|', 0
+                    FROM tasks WHERE id = NEW.parent_task_id
+                    UNION ALL
+                    SELECT parent.id, parent.parent_task_id,
+                           ancestors.path || parent.id || '|',
+                           instr(ancestors.path, '|' || parent.id || '|') > 0
+                    FROM tasks AS parent
+                    JOIN ancestors ON parent.id = ancestors.parent_task_id
+                    WHERE ancestors.cycle = 0
+                )
+                SELECT 1 FROM ancestors
+                WHERE cycle = 1 OR (parent_task_id IS NOT NULL AND (
+                    typeof(parent_task_id) <> 'text'
+                    OR length(trim(parent_task_id)) = 0
+                    OR NOT EXISTS (SELECT 1 FROM tasks WHERE id = ancestors.parent_task_id)
+                ))
+            ) THEN RAISE(ABORT, 'task_lineage_invalid') END;
+        END;
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS task_claim_budget_config_immutable
+        BEFORE UPDATE OF parent_task_id, max_claims, max_descendant_claims ON tasks
+        WHEN NEW.parent_task_id IS NOT OLD.parent_task_id
+          OR NEW.max_claims IS NOT OLD.max_claims
+          OR NEW.max_descendant_claims IS NOT OLD.max_descendant_claims
+        BEGIN
+            SELECT RAISE(ABORT, 'task_claim_budget_config_immutable');
+        END;
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS task_claim_budget_guard
+        BEFORE UPDATE OF claim_fencing_token ON tasks
+        WHEN NEW.claim_fencing_token IS NOT OLD.claim_fencing_token
+        BEGIN
+            SELECT CASE WHEN typeof(OLD.claim_fencing_token) <> 'integer'
+              OR OLD.claim_fencing_token < 0
+              OR typeof(NEW.claim_fencing_token) <> 'integer'
+              OR NEW.claim_fencing_token <> OLD.claim_fencing_token + 1
+              THEN RAISE(ABORT, 'task_claim_fencing_invalid') END;
+            SELECT CASE WHEN OLD.max_claims IS NOT NULL
+              AND (typeof(OLD.max_claims) <> 'integer' OR OLD.max_claims <= 0)
+              THEN RAISE(ABORT, 'task_claim_budget_invalid') END;
+            SELECT CASE WHEN OLD.max_claims IS NOT NULL
+              AND OLD.claim_fencing_token >= OLD.max_claims
+              THEN RAISE(ABORT, 'task_claim_budget_exhausted') END;
+            SELECT CASE WHEN OLD.parent_task_id IS NOT NULL
+              AND (typeof(OLD.parent_task_id) <> 'text'
+                OR length(trim(OLD.parent_task_id)) = 0
+                OR NOT EXISTS (SELECT 1 FROM tasks WHERE id = OLD.parent_task_id))
+              THEN RAISE(ABORT, 'task_lineage_invalid') END;
+            SELECT CASE WHEN OLD.parent_task_id IS NOT NULL AND EXISTS (
+                WITH RECURSIVE ancestors(id, parent_task_id, path, cycle) AS (
+                    SELECT id, parent_task_id, '|' || id || '|', 0
+                    FROM tasks WHERE id = OLD.parent_task_id
+                    UNION ALL
+                    SELECT parent.id, parent.parent_task_id,
+                           ancestors.path || parent.id || '|',
+                           instr(ancestors.path, '|' || parent.id || '|') > 0
+                    FROM tasks AS parent
+                    JOIN ancestors ON parent.id = ancestors.parent_task_id
+                    WHERE ancestors.cycle = 0
+                )
+                SELECT 1 FROM ancestors
+                WHERE cycle = 1 OR (parent_task_id IS NOT NULL AND (
+                    typeof(parent_task_id) <> 'text'
+                    OR length(trim(parent_task_id)) = 0
+                    OR NOT EXISTS (SELECT 1 FROM tasks WHERE id = ancestors.parent_task_id)
+                ))
+            ) THEN RAISE(ABORT, 'task_lineage_invalid') END;
+            SELECT CASE WHEN OLD.parent_task_id IS NOT NULL AND EXISTS (
+                WITH RECURSIVE ancestors(id, parent_task_id, cap) AS (
+                    SELECT id, parent_task_id, max_descendant_claims
+                    FROM tasks WHERE id = OLD.parent_task_id
+                    UNION
+                    SELECT parent.id, parent.parent_task_id,
+                           parent.max_descendant_claims
+                    FROM tasks AS parent
+                    JOIN ancestors AS child ON parent.id = child.parent_task_id
+                )
+                SELECT 1 FROM ancestors
+                WHERE cap IS NOT NULL AND (typeof(cap) <> 'integer' OR cap < 0)
+            ) THEN RAISE(ABORT, 'descendant_claim_budget_invalid') END;
+            SELECT CASE WHEN OLD.parent_task_id IS NOT NULL AND EXISTS (
+                WITH RECURSIVE ancestors(id, parent_task_id) AS (
+                    SELECT id, parent_task_id FROM tasks WHERE id = OLD.parent_task_id
+                    UNION
+                    SELECT parent.id, parent.parent_task_id
+                    FROM tasks AS parent
+                    JOIN ancestors AS child ON parent.id = child.parent_task_id
+                ), descendants(ancestor_id, descendant_id, path, cycle) AS (
+                    SELECT ancestor.id, child.id,
+                           '|' || ancestor.id || '|' || child.id || '|',
+                           child.id = ancestor.id
+                    FROM ancestors AS ancestor
+                    JOIN tasks AS child ON child.parent_task_id = ancestor.id
+                    UNION ALL
+                    SELECT descendants.ancestor_id, child.id,
+                           descendants.path || child.id || '|',
+                           instr(descendants.path, '|' || child.id || '|') > 0
+                    FROM descendants
+                    JOIN tasks AS child ON child.parent_task_id = descendants.descendant_id
+                    WHERE descendants.cycle = 0
+                )
+                SELECT 1 FROM descendants WHERE cycle = 1
+            ) THEN RAISE(ABORT, 'task_lineage_invalid') END;
+            SELECT CASE WHEN OLD.parent_task_id IS NOT NULL AND EXISTS (
+                WITH RECURSIVE ancestors(id, parent_task_id, cap) AS (
+                    SELECT id, parent_task_id, max_descendant_claims
+                    FROM tasks WHERE id = OLD.parent_task_id
+                    UNION
+                    SELECT parent.id, parent.parent_task_id,
+                           parent.max_descendant_claims
+                    FROM tasks AS parent
+                    JOIN ancestors AS child ON parent.id = child.parent_task_id
+                ), descendants(ancestor_id, descendant_id) AS (
+                    SELECT ancestor.id, child.id
+                    FROM ancestors AS ancestor
+                    JOIN tasks AS child ON child.parent_task_id = ancestor.id
+                    UNION
+                    SELECT descendants.ancestor_id, child.id
+                    FROM descendants
+                    JOIN tasks AS child ON child.parent_task_id = descendants.descendant_id
+                )
+                SELECT 1
+                FROM ancestors AS ancestor
+                JOIN descendants ON descendants.ancestor_id = ancestor.id
+                JOIN tasks AS descendant ON descendant.id = descendants.descendant_id
+                WHERE ancestor.cap IS NOT NULL
+                  AND (typeof(descendant.claim_fencing_token) <> 'integer'
+                    OR descendant.claim_fencing_token < 0)
+            ) THEN RAISE(ABORT, 'descendant_claim_budget_invalid') END;
+            SELECT CASE WHEN OLD.parent_task_id IS NOT NULL AND EXISTS (
+                WITH RECURSIVE ancestors(id, parent_task_id, cap) AS (
+                    SELECT id, parent_task_id, max_descendant_claims
+                    FROM tasks WHERE id = OLD.parent_task_id
+                    UNION
+                    SELECT parent.id, parent.parent_task_id,
+                           parent.max_descendant_claims
+                    FROM tasks AS parent
+                    JOIN ancestors AS child ON parent.id = child.parent_task_id
+                ), descendants(ancestor_id, descendant_id) AS (
+                    SELECT ancestor.id, child.id
+                    FROM ancestors AS ancestor
+                    JOIN tasks AS child ON child.parent_task_id = ancestor.id
+                    UNION
+                    SELECT descendants.ancestor_id, child.id
+                    FROM descendants
+                    JOIN tasks AS child ON child.parent_task_id = descendants.descendant_id
+                ), usage(ancestor_id, claims) AS (
+                    SELECT descendants.ancestor_id, SUM(task.claim_fencing_token)
+                    FROM descendants
+                    JOIN tasks AS task ON task.id = descendants.descendant_id
+                    GROUP BY descendants.ancestor_id
+                )
+                SELECT 1 FROM ancestors AS ancestor
+                LEFT JOIN usage ON usage.ancestor_id = ancestor.id
+                WHERE ancestor.cap IS NOT NULL
+                  AND COALESCE(usage.claims, 0) >= ancestor.cap
+            ) THEN RAISE(ABORT, 'descendant_claim_budget_exhausted') END;
+        END;
+        """
+    )
+
+
+def _add_task_claim_budgets(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+    if "parent_task_id" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT REFERENCES tasks(id) CHECK ("
+            "parent_task_id IS NULL OR "
+            "(typeof(parent_task_id) = 'text' AND length(trim(parent_task_id)) > 0))"
+        )
+    if "max_claims" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_claims INTEGER CHECK ("
+            "max_claims IS NULL OR (typeof(max_claims) = 'integer' AND max_claims > 0))"
+        )
+    if "max_descendant_claims" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_descendant_claims INTEGER CHECK ("
+            "max_descendant_claims IS NULL OR "
+            "(typeof(max_descendant_claims) = 'integer' AND max_descendant_claims >= 0))"
+        )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent_task ON tasks(parent_task_id)")
+    _install_task_claim_budget_guards(connection)
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -180,6 +390,7 @@ def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) 
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_mandate_descendant_cap),
     (3, _install_service_upgrade_guards),
+    (4, _add_task_claim_budgets),
 )
 
 SCHEMA = """
@@ -255,6 +466,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     owner_agent_id TEXT REFERENCES agents(id),
     claim_expires_at INTEGER,
     claim_fencing_token INTEGER NOT NULL DEFAULT 0,
+    parent_task_id TEXT REFERENCES tasks(id) CHECK (
+        parent_task_id IS NULL OR
+        (typeof(parent_task_id) = 'text' AND length(trim(parent_task_id)) > 0)
+    ),
+    max_claims INTEGER CHECK (
+        max_claims IS NULL OR (typeof(max_claims) = 'integer' AND max_claims > 0)
+    ),
+    max_descendant_claims INTEGER CHECK (
+        max_descendant_claims IS NULL OR
+        (typeof(max_descendant_claims) = 'integer' AND max_descendant_claims >= 0)
+    ),
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL

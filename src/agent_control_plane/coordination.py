@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 from .coordination_schemas import (
+    ClaimBudgetView,
     HeartbeatRequest,
     QCReviewCreate,
     SubmissionCreate,
@@ -47,14 +48,26 @@ class CoordinationService:
                         "dependency_not_found",
                         f"dependency task {dependency_id} does not exist",
                     )
+            if request.parent_task_id is not None:
+                parent = connection.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (request.parent_task_id,)
+                ).fetchone()
+                if not parent:
+                    raise ControlPlaneError(
+                        404,
+                        "parent_task_not_found",
+                        f"parent task {request.parent_task_id} does not exist",
+                    )
+                self._task_ancestor_chain(connection, parent)
             connection.execute(
                 """
                 INSERT INTO tasks
                     (id, title, description, acceptance_criteria_json,
                      resources_json, priority, status, owner_agent_id,
-                     claim_expires_at, claim_fencing_token, version,
+                     claim_expires_at, claim_fencing_token, parent_task_id,
+                     max_claims, max_descendant_claims, version,
                      created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, NULL, 0, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, NULL, 0, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     task_id,
@@ -63,6 +76,9 @@ class CoordinationService:
                     canonical_json(request.acceptance_criteria),
                     canonical_json(request.resources),
                     request.priority,
+                    request.parent_task_id,
+                    request.max_claims,
+                    request.max_descendant_claims,
                     created_at,
                     created_at,
                 ),
@@ -81,6 +97,9 @@ class CoordinationService:
                 "admin",
                 {
                     "dependencies": request.dependencies,
+                    "max_claims": request.max_claims,
+                    "max_descendant_claims": request.max_descendant_claims,
+                    "parent_task_id": request.parent_task_id,
                     "priority": request.priority,
                     "resources": request.resources,
                     "task_id": task_id,
@@ -126,6 +145,37 @@ class CoordinationService:
                     "task_unavailable",
                     f"task cannot be claimed while status is {task['status']}",
                 )
+            ancestors = self._task_ancestor_chain(connection, task)
+            claims_used = self._claim_count(task["claim_fencing_token"])
+            local_limit = self._claim_limit(task["max_claims"], "max_claims")
+            if local_limit is not None and claims_used >= local_limit:
+                raise ControlPlaneError(
+                    409,
+                    "task_claim_budget_exhausted",
+                    f"task {task_id} has used {claims_used} of {local_limit} successful claims",
+                )
+            for ancestor in ancestors:
+                descendant_limit = self._claim_limit(
+                    ancestor["max_descendant_claims"],
+                    "max_descendant_claims",
+                    allow_zero=True,
+                )
+                if descendant_limit is None:
+                    continue
+                descendant_claims = self._descendant_claim_count(connection, ancestor["id"])
+                if descendant_claims is None:
+                    raise ControlPlaneError(
+                        409,
+                        "task_lineage_invalid",
+                        f"task lineage below ancestor {ancestor['id']} is invalid",
+                    )
+                if descendant_claims >= descendant_limit:
+                    raise ControlPlaneError(
+                        409,
+                        "descendant_claim_budget_exhausted",
+                        f"descendants of task {ancestor['id']} have used "
+                        f"{descendant_claims} of {descendant_limit} successful claims",
+                    )
             incomplete = connection.execute(
                 """
                 SELECT dependency.id, dependency.status
@@ -157,21 +207,24 @@ class CoordinationService:
 
             claim_fencing_token = task["claim_fencing_token"] + 1
             updated_at = utc_now()
-            connection.execute(
-                """
-                UPDATE tasks
-                SET status = 'claimed', owner_agent_id = ?, claim_expires_at = ?,
-                    claim_fencing_token = ?, version = version + 1, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    agent["id"],
-                    expires_at,
-                    claim_fencing_token,
-                    updated_at,
-                    task_id,
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'claimed', owner_agent_id = ?, claim_expires_at = ?,
+                        claim_fencing_token = ?, version = version + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        agent["id"],
+                        expires_at,
+                        claim_fencing_token,
+                        updated_at,
+                        task_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                self._raise_claim_guard_error(error)
             for resource in resources:
                 prior = connection.execute(
                     "SELECT fencing_token FROM resource_leases WHERE resource = ?",
@@ -811,6 +864,127 @@ class CoordinationService:
             raise ControlPlaneError(404, "task_not_found", "task not found")
         return row
 
+    @staticmethod
+    def _claim_count(value: Any) -> int:
+        if type(value) is not int or value < 0:
+            raise ControlPlaneError(
+                409,
+                "task_claim_budget_invalid",
+                "stored successful-claim count is not a non-negative integer",
+            )
+        return value
+
+    @staticmethod
+    def _claim_limit(value: Any, field: str, *, allow_zero: bool = False) -> int | None:
+        if value is None:
+            return None
+        minimum = 0 if allow_zero else 1
+        if type(value) is not int or value < minimum:
+            raise ControlPlaneError(
+                409,
+                "task_claim_budget_invalid",
+                f"stored {field} is not a valid non-negative claim limit",
+            )
+        return value
+
+    @classmethod
+    def _task_ancestor_chain(
+        cls, connection: sqlite3.Connection, task: sqlite3.Row
+    ) -> list[sqlite3.Row]:
+        """Return nearest-first parents; malformed, missing, or cyclic links fail closed."""
+        ancestors: list[sqlite3.Row] = []
+        visited = {task["id"]}
+        parent_id = task["parent_task_id"]
+        while parent_id is not None:
+            if (
+                not isinstance(parent_id, str)
+                or not parent_id.strip()
+                or parent_id != parent_id.strip()
+                or parent_id in visited
+            ):
+                raise ControlPlaneError(
+                    409, "task_lineage_invalid", "task parent lineage is invalid"
+                )
+            parent = connection.execute("SELECT * FROM tasks WHERE id = ?", (parent_id,)).fetchone()
+            if not parent:
+                raise ControlPlaneError(
+                    409, "task_lineage_invalid", "task parent lineage is invalid"
+                )
+            cls._claim_count(parent["claim_fencing_token"])
+            cls._claim_limit(
+                parent["max_descendant_claims"], "max_descendant_claims", allow_zero=True
+            )
+            visited.add(parent_id)
+            ancestors.append(parent)
+            parent_id = parent["parent_task_id"]
+        return ancestors
+
+    @classmethod
+    def _descendant_claim_count(
+        cls, connection: sqlite3.Connection, ancestor_id: str
+    ) -> int | None:
+        """Count claim generations below one task; return None for corrupt descendants."""
+        rows = connection.execute(
+            """
+            WITH RECURSIVE descendants(id, claim_fencing_token, path, cycle) AS (
+                SELECT id, claim_fencing_token, ? || id || '|', id = ?
+                FROM tasks WHERE parent_task_id = ?
+                UNION ALL
+                SELECT child.id, child.claim_fencing_token,
+                       descendants.path || child.id || '|',
+                       instr(descendants.path, '|' || child.id || '|') > 0
+                FROM tasks AS child
+                JOIN descendants ON child.parent_task_id = descendants.id
+                WHERE descendants.cycle = 0
+            )
+            SELECT id, claim_fencing_token, cycle FROM descendants
+            """,
+            (f"|{ancestor_id}|", ancestor_id, ancestor_id),
+        ).fetchall()
+        consumed = 0
+        for row in rows:
+            if row["cycle"]:
+                return None
+            try:
+                consumed += cls._claim_count(row["claim_fencing_token"])
+            except ControlPlaneError:
+                return None
+        return consumed
+
+    @staticmethod
+    def _raise_claim_guard_error(error: sqlite3.IntegrityError) -> None:
+        message = str(error)
+        errors = {
+            "task_claim_budget_exhausted": (
+                "task_claim_budget_exhausted",
+                "task has exhausted its successful-claim limit",
+            ),
+            "descendant_claim_budget_exhausted": (
+                "descendant_claim_budget_exhausted",
+                "an ancestor task has exhausted its descendant successful-claim limit",
+            ),
+            "task_lineage_invalid": (
+                "task_lineage_invalid",
+                "task parent lineage is invalid",
+            ),
+            "task_claim_budget_invalid": (
+                "task_claim_budget_invalid",
+                "stored task claim budget is invalid",
+            ),
+            "descendant_claim_budget_invalid": (
+                "descendant_claim_budget_invalid",
+                "stored descendant claim budget is invalid",
+            ),
+            "task_claim_fencing_invalid": (
+                "task_claim_fencing_invalid",
+                "stored claim fencing generation is invalid",
+            ),
+        }
+        for marker, (code, detail) in errors.items():
+            if marker in message:
+                raise ControlPlaneError(409, code, detail) from error
+        raise error
+
     def _submission_row(self, submission_id: str) -> sqlite3.Row:
         row = self.database.one("SELECT * FROM submissions WHERE id = ?", (submission_id,))
         if not row:
@@ -858,51 +1032,127 @@ class CoordinationService:
                 raise ControlPlaneError(409, "stale_fencing_token", f"stale lease for {resource}")
 
     def _task_view(self, row: sqlite3.Row) -> dict[str, Any]:
-        dependencies = self.database.all(
-            """
-            SELECT depends_on_task_id FROM task_dependencies
-            WHERE task_id = ? ORDER BY depends_on_task_id
-            """,
-            (row["id"],),
-        )
-        latest_submission = self.database.one(
-            """
-            SELECT * FROM submissions
-            WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
-            """,
-            (row["id"],),
-        )
-        latest_review = self.database.one(
-            """
-            SELECT review.* FROM reviews AS review
-            JOIN submissions AS submission ON submission.id = review.submission_id
-            WHERE submission.task_id = ?
-            ORDER BY review.created_at DESC, review.id DESC LIMIT 1
-            """,
-            (row["id"],),
-        )
-        return {
-            "id": row["id"],
-            "title": row["title"],
-            "description": row["description"],
-            "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
-            "resources": json.loads(row["resources_json"]),
-            # #1764: folded above is the lease key; declared is the operator's capitalisation.
-            "declared_resources": declared_resources(row),
-            "dependencies": [dependency["depends_on_task_id"] for dependency in dependencies],
-            "priority": row["priority"],
-            "status": row["status"],
-            "owner_agent_id": row["owner_agent_id"],
-            "claim_expires_at": row["claim_expires_at"],
-            "claim_fencing_token": row["claim_fencing_token"],
-            "version": row["version"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "latest_submission": (
-                self._submission_view(latest_submission) if latest_submission else None
-            ),
-            "latest_review": self._review_view(latest_review) if latest_review else None,
-        }
+        with self.database.connect() as connection:
+            connection.execute("BEGIN")
+            row = self._task_row(connection, row["id"])
+            dependencies = connection.execute(
+                """
+                SELECT depends_on_task_id FROM task_dependencies
+                WHERE task_id = ? ORDER BY depends_on_task_id
+                """,
+                (row["id"],),
+            ).fetchall()
+            latest_submission = connection.execute(
+                """
+                SELECT * FROM submissions
+                WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            latest_review = connection.execute(
+                """
+                SELECT review.* FROM reviews AS review
+                JOIN submissions AS submission ON submission.id = review.submission_id
+                WHERE submission.task_id = ?
+                ORDER BY review.created_at DESC, review.id DESC LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            try:
+                self._task_ancestor_chain(connection, row)
+                ancestor_lineage_integrity = "valid"
+            except ControlPlaneError:
+                ancestor_lineage_integrity = "invalid"
+            descendant_claims = self._descendant_claim_count(connection, row["id"])
+            try:
+                claims_used: int | None = self._claim_count(row["claim_fencing_token"])
+            except ControlPlaneError:
+                claims_used = None
+            max_claims_valid = row["max_claims"] is None or (
+                type(row["max_claims"]) is int and row["max_claims"] > 0
+            )
+            max_claims = row["max_claims"] if max_claims_valid else None
+            max_descendant_claims_valid = row["max_descendant_claims"] is None or (
+                type(row["max_descendant_claims"]) is int and row["max_descendant_claims"] >= 0
+            )
+            max_descendant_claims = (
+                row["max_descendant_claims"] if max_descendant_claims_valid else None
+            )
+            observed_at = utc_now()
+            return {
+                "id": row["id"],
+                "title": row["title"],
+                "description": row["description"],
+                "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
+                "resources": json.loads(row["resources_json"]),
+                # #1764: folded above is the lease key; declared is the operator's capitalisation.
+                "declared_resources": declared_resources(row),
+                "dependencies": [dependency["depends_on_task_id"] for dependency in dependencies],
+                "priority": row["priority"],
+                "status": row["status"],
+                "owner_agent_id": row["owner_agent_id"],
+                "claim_expires_at": row["claim_expires_at"],
+                "claim_fencing_token": row["claim_fencing_token"],
+                "parent_task_id": (
+                    row["parent_task_id"] if isinstance(row["parent_task_id"], str) else None
+                ),
+                "ancestor_lineage_integrity": ancestor_lineage_integrity,
+                "max_claims": max_claims,
+                "max_descendant_claims": max_descendant_claims,
+                "claim_budget": self._claim_budget_view(
+                    "task", max_claims, claims_used, observed_at, invalid=not max_claims_valid
+                ),
+                "descendant_claim_budget": self._claim_budget_view(
+                    "descendant_tree",
+                    max_descendant_claims,
+                    descendant_claims,
+                    observed_at,
+                    invalid=not max_descendant_claims_valid,
+                ),
+                "version": row["version"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "latest_submission": (
+                    self._submission_view(latest_submission) if latest_submission else None
+                ),
+                "latest_review": self._review_view(latest_review) if latest_review else None,
+            }
+
+    @staticmethod
+    def _claim_budget_view(
+        scope: str,
+        limit: int | None,
+        consumed: int | None,
+        observed_at: str,
+        *,
+        invalid: bool = False,
+    ) -> dict[str, Any]:
+        if invalid or consumed is None or (limit is not None and type(limit) is not int):
+            status = "invalid"
+            safe_limit = None if type(limit) is not int else limit
+            safe_consumed = None
+            remaining = None
+        elif limit is None:
+            status = "unlimited"
+            safe_limit = None
+            safe_consumed = consumed
+            remaining = None
+        else:
+            safe_limit = limit
+            safe_consumed = consumed
+            remaining = max(0, limit - consumed)
+            status = "exhausted" if remaining == 0 else "available"
+        return ClaimBudgetView(
+            scope=scope,
+            unit="successful_claim_reservations",
+            limit=safe_limit,
+            consumed=safe_consumed,
+            remaining=remaining,
+            status=status,
+            source="tasks.claim_fencing_token",
+            enforcement="BEGIN IMMEDIATE task claim and SQLite trigger",
+            observed_at=observed_at,
+        ).model_dump()
 
     @staticmethod
     def _submission_view(row: sqlite3.Row) -> dict[str, Any]:

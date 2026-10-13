@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -37,7 +38,7 @@ def issue_coordination_mandate(client, admin_headers, agent_id):
     return response.json()["token"]
 
 
-def create_task(client, admin_headers, resources=None, dependencies=None, title="Task"):
+def create_task(client, admin_headers, resources=None, dependencies=None, title="Task", **extra):
     response = client.post(
         "/v1/tasks",
         headers=admin_headers,
@@ -48,6 +49,7 @@ def create_task(client, admin_headers, resources=None, dependencies=None, title=
             "resources": resources or [],
             "dependencies": dependencies or [],
             "priority": 80,
+            **extra,
         },
     )
     assert response.status_code == 201, response.text
@@ -137,6 +139,64 @@ def test_public_task_api_rejects_unimplemented_attempt_caps_before_persistence(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_claims", 0),
+        ("max_claims", -1),
+        ("max_claims", True),
+        ("max_claims", "2"),
+        ("max_descendant_claims", -1),
+        ("max_descendant_claims", True),
+        ("max_descendant_claims", "2"),
+        ("parent_task_id", "   "),
+    ],
+)
+def test_public_task_api_rejects_invalid_claim_budget_fields_before_persistence(
+    client, app, admin_headers, field, value
+):
+    before_tasks = app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"]
+    before_audit = app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+    response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Invalid claim budget",
+            "description": "Invalid claim caps cannot create a partial task.",
+            "acceptance_criteria": ["No task is created"],
+            field: value,
+        },
+    )
+    assert response.status_code == 422
+    assert app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"] == before_tasks
+    assert (
+        app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+        == before_audit
+    )
+
+
+def test_public_task_api_rejects_unknown_parent_before_persistence(client, app, admin_headers):
+    before_tasks = app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"]
+    before_audit = app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+    response = client.post(
+        "/v1/tasks",
+        headers=admin_headers,
+        json={
+            "title": "Missing parent",
+            "description": "A hierarchical claim cap requires a real parent task.",
+            "acceptance_criteria": ["No task is created"],
+            "parent_task_id": "missing-parent",
+        },
+    )
+    assert response.status_code == 404
+    assert response.json()["error"] == "parent_task_not_found"
+    assert app.state.database.one("SELECT COUNT(*) AS count FROM tasks")["count"] == before_tasks
+    assert (
+        app.state.database.one("SELECT COUNT(*) AS count FROM audit_events")["count"]
+        == before_audit
+    )
+
+
 def claim_task(client, task_id, token):
     return client.post(
         f"/v1/tasks/{task_id}/claim",
@@ -191,6 +251,246 @@ def test_simultaneous_claims_have_exactly_one_winner(client, app, admin_headers)
     losers = [outcome for outcome in outcomes if outcome[0] == "lost"]
     assert len(winners) == 1
     assert losers == [("lost", 409, "task_unavailable")]
+
+
+def test_sibling_claims_share_atomic_descendant_budget(client, app, admin_headers):
+    worker_a = create_agent(client, admin_headers, "budget-worker-a", "worker")
+    worker_b = create_agent(client, admin_headers, "budget-worker-b", "worker")
+    tokens = [
+        issue_coordination_mandate(client, admin_headers, worker_a["id"]),
+        issue_coordination_mandate(client, admin_headers, worker_b["id"]),
+    ]
+    parent = create_task(
+        client,
+        admin_headers,
+        title="Parent with one descendant claim",
+        max_descendant_claims=1,
+    )
+    children = [
+        create_task(
+            client,
+            admin_headers,
+            title=f"Budget child {index}",
+            parent_task_id=parent["id"],
+            resources=[f"repo:file:budget-child-{index}.py"],
+        )
+        for index in range(2)
+    ]
+    claimed_events_before = app.state.database.one(
+        "SELECT COUNT(*) AS count FROM audit_events WHERE event_type = 'task.claimed'"
+    )["count"]
+    start = Barrier(2)
+
+    def compete(args):
+        task_id, token = args
+        start.wait(timeout=5)
+        try:
+            return "won", app.state.coordination.claim_task(task_id, token, 300)
+        except ControlPlaneError as error:
+            return "lost", error.status_code, error.code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(
+            executor.map(
+                compete,
+                zip([child["id"] for child in children], tokens, strict=True),
+            )
+        )
+
+    winners = [outcome for outcome in outcomes if outcome[0] == "won"]
+    losers = [outcome for outcome in outcomes if outcome[0] == "lost"]
+    assert len(winners) == 1
+    assert losers == [("lost", 409, "descendant_claim_budget_exhausted")]
+    child_rows = app.state.database.all(
+        "SELECT id, claim_fencing_token FROM tasks WHERE parent_task_id = ?",
+        (parent["id"],),
+    )
+    assert sum(row["claim_fencing_token"] for row in child_rows) == 1
+    assert (
+        app.state.database.one(
+            "SELECT claim_fencing_token FROM tasks WHERE id = ?", (parent["id"],)
+        )["claim_fencing_token"]
+        == 0
+    )
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM audit_events WHERE event_type = 'task.claimed'"
+        )["count"]
+        == claimed_events_before + 1
+    )
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM resource_leases WHERE task_id IN (?, ?)",
+            tuple(child["id"] for child in children),
+        )["count"]
+        == 1
+    )
+    winner = winners[0][1]
+    assert winner["task"]["descendant_claim_budget"]["consumed"] == 0
+    assert winner["task"]["ancestor_lineage_integrity"] == "valid"
+    parent_after_claim = client.get(f"/v1/tasks/{parent['id']}", headers=admin_headers).json()
+    assert parent_after_claim["descendant_claim_budget"]["consumed"] == 1
+    assert parent_after_claim["descendant_claim_budget"]["remaining"] == 0
+    assert parent_after_claim["ancestor_lineage_integrity"] == "valid"
+
+
+def test_zero_descendant_cap_allows_parent_claim_but_denies_child(client, admin_headers):
+    parent_worker = create_agent(client, admin_headers, "zero-cap-parent-worker", "worker")
+    child_worker = create_agent(client, admin_headers, "zero-cap-child-worker", "worker")
+    parent_token = issue_coordination_mandate(client, admin_headers, parent_worker["id"])
+    child_token = issue_coordination_mandate(client, admin_headers, child_worker["id"])
+    parent = create_task(
+        client,
+        admin_headers,
+        title="No descendants permitted",
+        max_descendant_claims=0,
+    )
+    child = create_task(
+        client,
+        admin_headers,
+        title="First denied descendant",
+        parent_task_id=parent["id"],
+    )
+
+    parent_claim = claim_task(client, parent["id"], parent_token)
+    assert parent_claim.status_code == 200, parent_claim.text
+    assert parent_claim.json()["task"]["descendant_claim_budget"]["status"] == "exhausted"
+
+    child_claim = claim_task(client, child["id"], child_token)
+    assert child_claim.status_code == 409
+    assert child_claim.json()["error"] == "descendant_claim_budget_exhausted"
+    child_view = client.get(f"/v1/tasks/{child['id']}", headers=admin_headers).json()
+    assert child_view["ancestor_lineage_integrity"] == "valid"
+
+
+@pytest.mark.parametrize(
+    ("root_cap", "intermediate_cap", "blocking_ancestor"),
+    [(2, 1, "intermediate"), (1, 2, "root")],
+)
+def test_nested_descendant_cap_is_enforced_at_every_ancestor(
+    client, admin_headers, root_cap, intermediate_cap, blocking_ancestor
+):
+    worker_a = create_agent(client, admin_headers, "nested-cap-worker-a", "worker")
+    worker_b = create_agent(client, admin_headers, "nested-cap-worker-b", "worker")
+    token_a = issue_coordination_mandate(client, admin_headers, worker_a["id"])
+    token_b = issue_coordination_mandate(client, admin_headers, worker_b["id"])
+    root = create_task(
+        client,
+        admin_headers,
+        title="Outer budget",
+        max_descendant_claims=root_cap,
+    )
+    intermediate = create_task(
+        client,
+        admin_headers,
+        title="Nested budget",
+        parent_task_id=root["id"],
+        max_descendant_claims=intermediate_cap,
+    )
+    grandchildren = [
+        create_task(
+            client,
+            admin_headers,
+            title=f"Nested child {index}",
+            parent_task_id=intermediate["id"],
+            resources=[f"repo:file:nested-budget-{index}.py"],
+        )
+        for index in range(2)
+    ]
+
+    first = claim_task(client, grandchildren[0]["id"], token_a)
+    assert first.status_code == 200, first.text
+    second = claim_task(client, grandchildren[1]["id"], token_b)
+    assert second.status_code == 409
+    assert second.json()["error"] == "descendant_claim_budget_exhausted"
+    limiting_id = intermediate["id"] if blocking_ancestor == "intermediate" else root["id"]
+    assert limiting_id in second.json()["message"]
+    assert (
+        client.get(f"/v1/tasks/{intermediate['id']}", headers=admin_headers).json()[
+            "descendant_claim_budget"
+        ]["consumed"]
+        == 1
+    )
+    assert (
+        client.get(f"/v1/tasks/{root['id']}", headers=admin_headers).json()[
+            "descendant_claim_budget"
+        ]["consumed"]
+        == 1
+    )
+
+
+def test_task_view_marks_corrupt_ancestor_lineage_invalid(client, app, admin_headers):
+    parent = create_task(client, admin_headers, title="Corruption fixture parent")
+    child = create_task(
+        client,
+        admin_headers,
+        title="Corruption fixture child",
+        parent_task_id=parent["id"],
+    )
+    with sqlite3.connect(app.state.database.path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TRIGGER task_claim_budget_config_immutable")
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = 'missing-parent' WHERE id = ?",
+            (child["id"],),
+        )
+
+    response = client.get(f"/v1/tasks/{child['id']}", headers=admin_headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["ancestor_lineage_integrity"] == "invalid"
+
+
+def test_expired_claim_still_consumes_task_claim_budget(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "budget-expired-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(
+        client,
+        admin_headers,
+        title="One claim survives expiry",
+        max_claims=1,
+    )
+    first = claim_task(client, task["id"], token)
+    assert first.status_code == 200, first.text
+    first_task_view = first.json()["task"]
+    claim_budget = first_task_view["claim_budget"]
+    assert {key: claim_budget[key] for key in claim_budget if key != "observed_at"} == {
+        "scope": "task",
+        "unit": "successful_claim_reservations",
+        "limit": 1,
+        "consumed": 1,
+        "remaining": 0,
+        "status": "exhausted",
+        "source": "tasks.claim_fencing_token",
+        "enforcement": "BEGIN IMMEDIATE task claim and SQLite trigger",
+    }
+    assert claim_budget["observed_at"]
+
+    with app.state.database.connect() as connection:
+        connection.execute(
+            """
+            UPDATE tasks SET status = 'open', owner_agent_id = NULL, claim_expires_at = 1
+            WHERE id = ?
+            """,
+            (task["id"],),
+        )
+
+    claimed_events_before = app.state.database.one(
+        "SELECT COUNT(*) AS count FROM audit_events WHERE event_type = 'task.claimed'"
+    )["count"]
+    second = claim_task(client, task["id"], token)
+
+    assert second.status_code == 409
+    assert second.json()["error"] == "task_claim_budget_exhausted"
+    stored = app.state.database.one(
+        "SELECT claim_fencing_token FROM tasks WHERE id = ?", (task["id"],)
+    )
+    assert stored["claim_fencing_token"] == 1
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM audit_events WHERE event_type = 'task.claimed'"
+        )["count"]
+        == claimed_events_before
+    )
 
 
 def test_atomic_claim_resource_reservation_independent_qc_and_release_gate(client, admin_headers):
