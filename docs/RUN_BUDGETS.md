@@ -99,18 +99,29 @@ dispatch and reconcile all returned receipts. Token budgets and per-request
 output limits are not dollar limits, and raw token totals must not be converted
 to currency without the applicable versioned rate card.
 
-The optional non-streaming OpenAI Responses extractor stores one response's
-`input_tokens`, `output_tokens`, `total_tokens`, and known token-detail fields
-with its response ID, model, provider-created time (when supplied), and
-client-observed time. Its receipt status is `reported`, `missing`, or `invalid`;
-the API also timestamps receipt ingestion. This is client-reported evidence:
-ACP does not authenticate the response body, infer billing, aggregate a task's
-provider usage, or treat the report as fresh for admission. `provider_usage`
-therefore remains `unsupported` for hard-limit decisions even when a per-call
-`provider_usage_report` is present. Missing and malformed fields produce
-bounded reason codes without storing a raw response or credentials. Streaming,
-SDK retries, other providers, and provider-internal fan-out remain outside this
-extractor. `dispatch_openai_responses_once` is an opt-in concrete adapter for
+The optional response extractors now cover OpenAI Responses,
+Anthropic Messages, and the Google AI Gemini Developer API `generateContent`
+(not Vertex AI). Each normalizes one
+non-streaming response into `input_tokens`, `output_tokens`, `total_tokens`,
+and known token-detail fields with a provider response ID, model, and
+client-observed time; provider-created time is retained when the provider
+supplies it. Anthropic's documented total input is the sum of ordinary input,
+cache-read, and cache-creation tokens; ACP retains the cache components as
+details. Gemini thinking tokens are included in normalized output and retained
+as details. Gemini `toolUsePromptTokenCount` is retained as a detail but is
+excluded from this Developer API's documented total; Vertex AI documents a
+different total-token formula that includes tool-use prompt tokens and needs a
+separate parser. Each report is `reported`, `missing`, or `invalid`; the API
+also timestamps receipt ingestion.
+These are client-reported observations: ACP does not authenticate response
+bodies or infer billing. ACP can aggregate a bounded sample of these
+client-reported receipts by task, but does not treat reports as fresh for
+admission. `provider_usage` therefore remains `unsupported` for
+hard-limit decisions even when a per-call `provider_usage_report` is present.
+Missing and malformed fields produce bounded reason codes without storing raw
+responses or credentials. Streaming, SDK retries, and provider-internal fan-out
+remain outside these extractors. `dispatch_openai_responses_once` is an opt-in
+concrete transport adapter only for
 the fixed `https://api.openai.com/v1/responses` endpoint: it reserves through
 the dispatch ledger, makes one synchronous, non-streaming request with
 `background: false` using the standard-library HTTP client, and attaches the
@@ -129,10 +140,9 @@ The adapter does not authenticate response usage, calculate cost, gate every
 provider call, control provider-internal fan-out, or enforce quota/spend.
 Callers can bypass it, and an ambiguous network outcome consumes its ACP slot
 without an automatic resend. Direct `dispatch_once` users may still pass
-`parse_openai_responses_usage` as `usage_report_from_response` after decoding
-their own response. The parser accepts a decoded JSON mapping, not an HTTP/SDK
-response wrapper. The Responses API documents these usage fields in its
-[response object](https://developers.openai.com/api/reference/resources/responses/methods/create).
+the matching parser as `usage_report_from_response` after decoding their own
+response. These parsers accept decoded JSON mappings, not HTTP/SDK response
+wrappers. See the provider references for [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses/methods/create), [Anthropic Messages](https://platform.claude.com/docs/en/api/http/messages/create) and [rate-limit token accounting](https://platform.claude.com/docs/en/api/rate-limits), [Gemini Developer API GenerateContent](https://ai.google.dev/api/generate-content), and [Vertex AI GenerateContent usage](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/GenerateContentResponse).
 
 Task status includes a separate `reported_provider_usage` roll-up for the task
 and its descendant tree. It groups observed token sums by provider, adapter,

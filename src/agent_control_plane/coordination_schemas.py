@@ -188,14 +188,14 @@ class ProviderUsageReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["reported", "missing", "invalid"]
-    provider: Literal["openai", "unknown"]
-    adapter: Literal["responses", "unknown"]
+    provider: Literal["openai", "anthropic", "gemini", "unknown"]
+    adapter: Literal["responses", "messages", "generate_content", "unknown"]
     source: Literal["client_reported"]
     scope: Literal["single_response"]
     unit: Literal["tokens"] | None
     observed_at: str = Field(min_length=20, max_length=40)
     response_id: str | None = Field(
-        default=None, min_length=6, max_length=256, pattern=r"^resp_[A-Za-z0-9_-]+$"
+        default=None, min_length=6, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
     )
     model: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
@@ -240,6 +240,7 @@ class ProviderUsageReport(BaseModel):
             "total_tokens",
             "cached_input_tokens",
             "cache_write_input_tokens",
+            "tool_use_prompt_tokens",
             "reasoning_output_tokens",
         }
         if any(
@@ -256,8 +257,12 @@ class ProviderUsageReport(BaseModel):
         if self.status == "reported":
             required = {"input_tokens", "output_tokens", "total_tokens"}
             if (
-                self.provider != "openai"
-                or self.adapter != "responses"
+                (self.provider, self.adapter)
+                not in {
+                    ("openai", "responses"),
+                    ("anthropic", "messages"),
+                    ("gemini", "generate_content"),
+                }
                 or self.unit != "tokens"
                 or self.response_id is None
                 or self.model is None
@@ -304,6 +309,7 @@ class ProviderUsageSummaryGroup(BaseModel):
             "total_tokens",
             "cached_input_tokens",
             "cache_write_input_tokens",
+            "tool_use_prompt_tokens",
             "reasoning_output_tokens",
         }
         if (
