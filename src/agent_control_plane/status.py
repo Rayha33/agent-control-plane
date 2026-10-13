@@ -784,6 +784,15 @@ class StatusView:
             if entry["cleanup_error"]:
                 details.append(f"last error: {entry['cleanup_error']}")
             return "cleanup_failed", "; ".join(details)
+        attempt_budget = entry["attempt_budget"]
+        from .scheduling import CLAIMABLE_STATUSES
+
+        if entry["status"] in CLAIMABLE_STATUSES and attempt_budget["status"] == "exhausted":
+            return "human_required", (
+                "task attempt budget exhausted "
+                f"({attempt_budget['consumed']}/{attempt_budget['configured_limit']} attempts used); "
+                "retry is not claimable"
+            )
         if entry["status"] in HUMAN_REQUIRED_STATUSES:
             verdict = (entry["qc"] or {}).get("verdict")
             return "human_required", f"task is {entry['status']}" + (

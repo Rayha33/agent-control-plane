@@ -21,7 +21,7 @@ from support import (
     write_config,
 )
 
-from agent_control_plane.git_supervisor import GitSupervisor
+from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
 from agent_control_plane.scheduling import Scheduler
 from agent_control_plane.status import StatusView, _format_bytes
 
@@ -1402,6 +1402,62 @@ def test_attention_queue_ranks_human_required_above_active_work(repo: Path) -> N
     assert attention[-1]["task_id"] == busy["id"]
     assert attention[-1]["category"] == "active"
     assert attention[0]["reason"]
+
+
+def test_exhausted_claimable_attempt_budget_is_human_required(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Budget exhausted",
+        "Implement and verify one isolated change.",
+        ["Tests pass"],
+        ["alpha.txt"],
+        max_attempts=1,
+    )
+    supervisor.claim(task["id"], "agent-a")
+    assert entry_for(supervisor.status(), task["id"])["category"] == "active"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET status = 'orphaned', current_attempt_id = NULL WHERE id = ?",
+            (task["id"],),
+        )
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(task["id"], "agent-b")
+    assert error.value.code == "attempt_budget_exhausted"
+
+    snapshot = supervisor.status()
+    entry = entry_for(snapshot, task["id"])
+    attention = next(item for item in snapshot["attention"] if item["task_id"] == task["id"])
+
+    assert entry["status"] == "orphaned"
+    assert entry["attempt_budget"]["status"] == "exhausted"
+    assert attention["category"] == "human_required"
+    assert "1/1 attempts used" in attention["reason"]
+    assert "retry is not claimable" in attention["reason"]
+
+
+def test_completed_or_invalid_attempt_budget_is_not_reported_as_exhausted(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Completed with one launch",
+        "Implement and verify one isolated change.",
+        ["Tests pass"],
+        ["beta.txt"],
+        max_attempts=1,
+    )
+    approve(supervisor, task["id"], "beta.txt", "done\n")
+
+    completed = entry_for(supervisor.status(), task["id"])
+    assert completed["status"] == "approved"
+    assert completed["category"] != "human_required"
+
+    invalid_entry = {
+        "status": "orphaned",
+        "attempt_budget": {"status": "invalid", "consumed": 1, "configured_limit": 0},
+        "runtime": None,
+        "lease_seconds_remaining": None,
+        "checkpoint_stale_advisory": False,
+    }
+    assert StatusView._categorize(invalid_entry, lease_risk_seconds=30) == (None, "")
 
 
 def test_failed_cleanup_outranks_review_and_is_listed(repo: Path) -> None:
