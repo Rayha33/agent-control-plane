@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
+from fastapi.testclient import TestClient
 
+from agent_control_plane.app import create_app
 from agent_control_plane.service import ControlPlaneError
 
 
@@ -438,6 +440,46 @@ def test_task_view_marks_corrupt_ancestor_lineage_invalid(client, app, admin_hea
     response = client.get(f"/v1/tasks/{child['id']}", headers=admin_headers)
     assert response.status_code == 200, response.text
     assert response.json()["ancestor_lineage_integrity"] == "invalid"
+
+
+def test_claim_budget_usage_survives_service_database_restart(client, app, admin_headers):
+    worker_a = create_agent(client, admin_headers, "restart-budget-worker-a", "worker")
+    worker_b = create_agent(client, admin_headers, "restart-budget-worker-b", "worker")
+    token_a = issue_coordination_mandate(client, admin_headers, worker_a["id"])
+    token_b = issue_coordination_mandate(client, admin_headers, worker_b["id"])
+    parent = create_task(
+        client,
+        admin_headers,
+        title="Restart-persistent descendant budget",
+        max_descendant_claims=1,
+    )
+    child_a = create_task(
+        client,
+        admin_headers,
+        title="Claimed before restart",
+        parent_task_id=parent["id"],
+        max_claims=1,
+    )
+    child_b = create_task(
+        client,
+        admin_headers,
+        title="Claimed after restart",
+        parent_task_id=parent["id"],
+    )
+
+    first = claim_task(client, child_a["id"], token_a)
+    assert first.status_code == 200, first.text
+
+    restarted_app = create_app(app.state.settings)
+    with TestClient(restarted_app) as restarted_client:
+        restored_child = restarted_client.get(f"/v1/tasks/{child_a['id']}", headers=admin_headers)
+        assert restored_child.status_code == 200, restored_child.text
+        assert restored_child.json()["claim_budget"]["consumed"] == 1
+        assert restored_child.json()["claim_budget"]["status"] == "exhausted"
+
+        second = claim_task(restarted_client, child_b["id"], token_b)
+        assert second.status_code == 409
+        assert second.json()["error"] == "descendant_claim_budget_exhausted"
 
 
 def test_expired_claim_still_consumes_task_claim_budget(client, app, admin_headers):
