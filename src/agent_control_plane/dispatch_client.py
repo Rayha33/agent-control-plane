@@ -24,6 +24,8 @@ from .coordination_schemas import ProviderUsageReport
 from .provider_usage import (
     ClientReportedProviderUsage,
     _provider_usage_extraction_failed,
+    parse_anthropic_messages_usage,
+    parse_gemini_generate_content_usage,
     parse_openai_responses_usage,
 )
 
@@ -113,7 +115,11 @@ class _ProviderHttpOpener(Protocol):
 
 _MAX_COORDINATION_RESPONSE_BYTES = 1_048_576
 _MAX_OPENAI_RESPONSES_BYTES = 16_777_216
+_MAX_PROVIDER_RESPONSE_BYTES = 16_777_216
 _OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+_ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+_GEMINI_GENERATE_CONTENT_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
+_ANTHROPIC_API_VERSION = "2023-06-01"
 
 
 class CoordinationHttpDispatchLedger:
@@ -333,8 +339,8 @@ class DispatchResult(Generic[ResponseT]):
 
 
 @dataclass(frozen=True, slots=True)
-class OpenAIResponsesHttpResponse:
-    """Bounded decoded response from the opt-in OpenAI Responses adapter.
+class ProviderJsonHttpResponse:
+    """Bounded decoded JSON response from a fixed-endpoint provider adapter.
 
     Only Retry-After and Content-Type response headers are retained. A decoded
     payload is available when body_status is "available", but omitted from repr
@@ -350,6 +356,11 @@ class OpenAIResponsesHttpResponse:
         """Return the decoded JSON payload, or None when it was unavailable."""
 
         return self.payload
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIResponsesHttpResponse(ProviderJsonHttpResponse):
+    """OpenAI response type retained for source and introspection compatibility."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -593,30 +604,11 @@ def dispatch_openai_responses_once(
     no-redirect behavior. Usage is attached as client-reported metadata only.
     """
 
-    if not isinstance(request_payload, Mapping):
-        raise TypeError("request_payload must be a mapping")
-    payload = dict(request_payload)
-    for request_option in ("stream", "background"):
-        value = payload.get(request_option, False)
-        if type(value) is not bool or value:
-            raise ValueError(
-                f"{request_option} must be false for report-only single-response dispatch"
-            )
-    try:
-        encoded_payload = json.dumps(
-            payload, separators=(",", ":"), ensure_ascii=True, allow_nan=False
-        ).encode("utf-8")
-    except (TypeError, ValueError, RecursionError):
-        raise ValueError("request_payload must be JSON-serializable") from None
-
-    if (
-        not isinstance(api_key, str)
-        or not 1 <= len(api_key) <= 4096
-        or any(not 0x21 <= ord(char) <= 0x7E for char in api_key)
-    ):
-        raise ValueError("api_key must contain 1..4096 visible ASCII characters")
-    if type(timeout_seconds) not in {int, float} or not 0 < timeout_seconds <= 300:
-        raise ValueError("timeout_seconds must be greater than 0 and at most 300")
+    encoded_payload = _encode_provider_request_payload(
+        request_payload, false_options=("stream", "background")
+    )
+    _validate_provider_api_key(api_key)
+    _validate_provider_timeout(timeout_seconds)
 
     selected_opener = opener if opener is not None else build_opener(_NoRedirectHandler())
     if not callable(getattr(selected_opener, "open", None)):
@@ -633,11 +625,13 @@ def dispatch_openai_responses_once(
     )
 
     def send_once() -> OpenAIResponsesHttpResponse:
-        try:
-            response = selected_opener.open(request, timeout=float(timeout_seconds))
-        except HTTPError as exc:
-            return _read_openai_responses_response(exc.code, exc.headers, exc)
-        return _read_openai_responses_response(response.status, response.headers, response)
+        return _send_provider_json_request(
+            selected_opener,
+            request,
+            float(timeout_seconds),
+            maximum_bytes=_MAX_OPENAI_RESPONSES_BYTES,
+            response_type=OpenAIResponsesHttpResponse,
+        )
 
     return dispatch_once(
         ledger=ledger,
@@ -650,26 +644,242 @@ def dispatch_openai_responses_once(
     )
 
 
+def dispatch_anthropic_messages_once(
+    *,
+    ledger: DispatchLedger,
+    task_id: str,
+    claim_fencing_token: int,
+    resource_fencing_tokens: Mapping[str, int],
+    idempotency_key: str,
+    api_key: str,
+    request_payload: Mapping[str, Any],
+    anthropic_version: str = _ANTHROPIC_API_VERSION,
+    timeout_seconds: float = 60.0,
+    opener: _ProviderHttpOpener | None = None,
+) -> DispatchResult[ProviderJsonHttpResponse]:
+    """Make one non-streaming Anthropic Messages call under a durable reservation.
+
+    The fixed transport does not retry or follow redirects. Provider usage is
+    attached as client-reported metadata only; this does not enforce provider
+    quota/spend or intercept other Anthropic traffic.
+    """
+
+    encoded_payload = _encode_provider_request_payload(request_payload, false_options=("stream",))
+    _validate_provider_api_key(api_key)
+    _validate_provider_timeout(timeout_seconds)
+    if (
+        not isinstance(anthropic_version, str)
+        or not 1 <= len(anthropic_version) <= 64
+        or any(not 0x21 <= ord(char) <= 0x7E for char in anthropic_version)
+    ):
+        raise ValueError("anthropic_version must contain 1..64 visible ASCII characters")
+
+    selected_opener = opener if opener is not None else build_opener(_NoRedirectHandler())
+    if not callable(getattr(selected_opener, "open", None)):
+        raise TypeError("opener must provide an open method")
+    request = Request(
+        _ANTHROPIC_MESSAGES_URL,
+        data=encoded_payload,
+        headers={
+            "X-Api-Key": api_key,
+            "Anthropic-Version": anthropic_version,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    return dispatch_once(
+        ledger=ledger,
+        task_id=task_id,
+        claim_fencing_token=claim_fencing_token,
+        resource_fencing_tokens=resource_fencing_tokens,
+        idempotency_key=idempotency_key,
+        send_once=lambda: _send_provider_json_request(
+            selected_opener,
+            request,
+            float(timeout_seconds),
+            maximum_bytes=_MAX_PROVIDER_RESPONSE_BYTES,
+        ),
+        usage_report_from_response=lambda response: parse_anthropic_messages_usage(
+            response.payload
+        ),
+    )
+
+
+def dispatch_gemini_generate_content_once(
+    *,
+    ledger: DispatchLedger,
+    task_id: str,
+    claim_fencing_token: int,
+    resource_fencing_tokens: Mapping[str, int],
+    idempotency_key: str,
+    api_key: str,
+    model: str,
+    request_payload: Mapping[str, Any],
+    timeout_seconds: float = 60.0,
+    opener: _ProviderHttpOpener | None = None,
+) -> DispatchResult[ProviderJsonHttpResponse]:
+    """Make one Gemini Developer API GenerateContent call under a reservation.
+
+    This fixed transport is for the Google AI Developer API, not Vertex AI or
+    Gemini Interactions. It does not retry or follow redirects, and its parsed
+    usage remains client-reported rather than a quota/spend enforcement signal.
+    """
+
+    encoded_payload = _encode_provider_request_payload(
+        request_payload, forbidden_options=("model", "stream")
+    )
+    _validate_provider_api_key(api_key)
+    _validate_provider_timeout(timeout_seconds)
+    if not _valid_gemini_model_name(model):
+        raise ValueError("model must be a plain Gemini Developer API model name")
+
+    selected_opener = opener if opener is not None else build_opener(_NoRedirectHandler())
+    if not callable(getattr(selected_opener, "open", None)):
+        raise TypeError("opener must provide an open method")
+    request = Request(
+        f"{_GEMINI_GENERATE_CONTENT_URL}{quote(model, safe='-._~')}:generateContent",
+        data=encoded_payload,
+        headers={
+            "X-Goog-Api-Key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    return dispatch_once(
+        ledger=ledger,
+        task_id=task_id,
+        claim_fencing_token=claim_fencing_token,
+        resource_fencing_tokens=resource_fencing_tokens,
+        idempotency_key=idempotency_key,
+        send_once=lambda: _send_provider_json_request(
+            selected_opener,
+            request,
+            float(timeout_seconds),
+            maximum_bytes=_MAX_PROVIDER_RESPONSE_BYTES,
+        ),
+        usage_report_from_response=lambda response: parse_gemini_generate_content_usage(
+            response.payload
+        ),
+    )
+
+
 def _read_openai_responses_response(
     status_code: int, headers: Any, response: _JsonResponse
 ) -> OpenAIResponsesHttpResponse:
+    return _read_provider_json_response(
+        status_code,
+        headers,
+        response,
+        maximum_bytes=_MAX_OPENAI_RESPONSES_BYTES,
+        response_type=OpenAIResponsesHttpResponse,
+    )
+
+
+def _send_provider_json_request(
+    opener: _ProviderHttpOpener,
+    request: Request,
+    timeout_seconds: float,
+    *,
+    maximum_bytes: int,
+    response_type: type[ProviderJsonHttpResponse] = ProviderJsonHttpResponse,
+) -> ProviderJsonHttpResponse:
+    try:
+        response = opener.open(request, timeout=timeout_seconds)
+    except HTTPError as exc:
+        return _read_provider_json_response(
+            exc.code,
+            exc.headers,
+            exc,
+            maximum_bytes=maximum_bytes,
+            response_type=response_type,
+        )
+    return _read_provider_json_response(
+        response.status,
+        response.headers,
+        response,
+        maximum_bytes=maximum_bytes,
+        response_type=response_type,
+    )
+
+
+def _read_provider_json_response(
+    status_code: int,
+    headers: Any,
+    response: _JsonResponse,
+    *,
+    maximum_bytes: int = _MAX_PROVIDER_RESPONSE_BYTES,
+    response_type: type[ProviderJsonHttpResponse] = ProviderJsonHttpResponse,
+) -> ProviderJsonHttpResponse:
     selected_headers = _safe_openai_response_headers(headers)
     try:
-        body = response.read(_MAX_OPENAI_RESPONSES_BYTES + 1)
+        body = response.read(maximum_bytes + 1)
     except Exception:
-        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "unavailable")
+        return response_type(status_code, selected_headers, None, "unavailable")
     finally:
         _close_openai_response(response)
 
     if not isinstance(body, bytes):
-        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "unavailable")
-    if len(body) > _MAX_OPENAI_RESPONSES_BYTES:
-        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "too_large")
+        return response_type(status_code, selected_headers, None, "unavailable")
+    if len(body) > maximum_bytes:
+        return response_type(status_code, selected_headers, None, "too_large")
     try:
         payload = json.loads(body.decode("utf-8"))
     except (ValueError, RecursionError):
-        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "invalid_json")
-    return OpenAIResponsesHttpResponse(status_code, selected_headers, payload, "available")
+        return response_type(status_code, selected_headers, None, "invalid_json")
+    return response_type(status_code, selected_headers, payload, "available")
+
+
+def _encode_provider_request_payload(
+    request_payload: Mapping[str, Any],
+    *,
+    false_options: tuple[str, ...] = (),
+    forbidden_options: tuple[str, ...] = (),
+) -> bytes:
+    if not isinstance(request_payload, Mapping):
+        raise TypeError("request_payload must be a mapping")
+    payload = dict(request_payload)
+    for request_option in false_options:
+        value = payload.get(request_option, False)
+        if type(value) is not bool or value:
+            raise ValueError(
+                f"{request_option} must be false for report-only single-response dispatch"
+            )
+    if any(request_option in payload for request_option in forbidden_options):
+        raise ValueError("request_payload contains a field not accepted by this endpoint adapter")
+    try:
+        return json.dumps(
+            payload, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("request_payload must be JSON-serializable") from None
+
+
+def _validate_provider_api_key(api_key: str) -> None:
+    if (
+        not isinstance(api_key, str)
+        or not 1 <= len(api_key) <= 4096
+        or any(not 0x21 <= ord(char) <= 0x7E for char in api_key)
+    ):
+        raise ValueError("api_key must contain 1..4096 visible ASCII characters")
+
+
+def _validate_provider_timeout(timeout_seconds: float) -> None:
+    if type(timeout_seconds) not in {int, float} or not 0 < timeout_seconds <= 300:
+        raise ValueError("timeout_seconds must be greater than 0 and at most 300")
+
+
+def _valid_gemini_model_name(model: object) -> bool:
+    return (
+        isinstance(model, str)
+        and 1 <= len(model) <= 128
+        and model.isascii()
+        and model[0].isalnum()
+        and all(char.isalnum() or char in "._-" for char in model)
+    )
 
 
 def _safe_openai_response_headers(headers: Any) -> dict[str, str]:
@@ -792,11 +1002,14 @@ __all__ = [
     "DispatchResponseInvalid",
     "DispatchOutcomeUnknown",
     "OpenAIResponsesHttpResponse",
+    "ProviderJsonHttpResponse",
     "DispatchReceiptUnrecorded",
     "DispatchResult",
     "DispatchRetryPolicy",
     "DispatchRetryResult",
     "dispatch_with_retries",
+    "dispatch_anthropic_messages_once",
+    "dispatch_gemini_generate_content_once",
     "dispatch_openai_responses_once",
     "dispatch_once",
 ]

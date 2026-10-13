@@ -22,6 +22,8 @@ from agent_control_plane.dispatch_client import (
     DispatchReservationReplay,
     DispatchResponseInvalid,
     DispatchRetryPolicy,
+    dispatch_anthropic_messages_once,
+    dispatch_gemini_generate_content_once,
     dispatch_once,
     dispatch_openai_responses_once,
     dispatch_with_retries,
@@ -222,6 +224,38 @@ def _dispatch_openai(ledger: FakeLedger, opener=None, *, request_payload=None):
     )
 
 
+def _dispatch_anthropic(ledger: FakeLedger, opener=None, *, request_payload=None, api_key=None):
+    return dispatch_anthropic_messages_once(
+        ledger=ledger,
+        task_id="task-1",
+        claim_fencing_token=7,
+        resource_fencing_tokens={"repo:file:src/app.py": 11},
+        idempotency_key="anthropic-messages-once",
+        api_key=api_key or "sk-ant-test-not-a-real-key",
+        request_payload=request_payload
+        or {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        opener=opener,
+    )
+
+
+def _dispatch_gemini(ledger: FakeLedger, opener=None, *, request_payload=None, api_key=None):
+    return dispatch_gemini_generate_content_once(
+        ledger=ledger,
+        task_id="task-1",
+        claim_fencing_token=7,
+        resource_fencing_tokens={"repo:file:src/app.py": 11},
+        idempotency_key="gemini-generate-content-once",
+        api_key=api_key or "gemini-test-not-a-real-key",
+        model="gemini-2.5-pro",
+        request_payload=request_payload or {"contents": [{"parts": [{"text": "hello"}]}]},
+        opener=opener,
+    )
+
+
 def test_openai_responses_adapter_sends_once_and_records_report_only_usage() -> None:
     ledger = FakeLedger()
     body = {
@@ -263,6 +297,269 @@ def test_openai_responses_adapter_sends_once_and_records_report_only_usage() -> 
     assert "response-body-secret-marker" not in str(ledger.usage_reports)
     assert "sk-test-not-a-real-key" not in repr(result)
     assert "response-body-secret-marker" not in repr(result)
+
+
+def test_anthropic_messages_adapter_sends_once_and_records_report_only_usage() -> None:
+    ledger = FakeLedger()
+    body = {
+        "type": "message",
+        "id": "msg_01Abcdef",
+        "model": "claude-sonnet-4-6",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "response-body-secret-marker"}],
+        "usage": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2,
+            "cache_read_input_tokens": 3,
+            "output_tokens": 5,
+            "output_tokens_details": {"thinking_tokens": 2},
+        },
+    }
+    raw = FakeProviderResponse(200, {"content-type": "application/json"}, json.dumps(body).encode())
+    opener = FakeProviderOpener(raw)
+
+    result = _dispatch_anthropic(ledger, opener)
+
+    assert len(opener.requests) == 1
+    request, timeout = opener.requests[0]
+    assert request.full_url == "https://api.anthropic.com/v1/messages"
+    assert request.get_method() == "POST"
+    headers = {name.casefold(): value for name, value in request.header_items()}
+    assert headers["x-api-key"] == "sk-ant-test-not-a-real-key"
+    assert headers["anthropic-version"] == "2023-06-01"
+    assert headers["content-type"] == "application/json"
+    assert json.loads(request.data) == {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    assert timeout == 60.0
+    assert raw.closed is True
+    assert result.response.payload == body
+    assert result.response.body_status == "available"
+    assert result.provider_usage_report["status"] == "reported"
+    assert result.provider_usage_report["measurements"] == {
+        "cache_write_input_tokens": 2,
+        "cached_input_tokens": 3,
+        "input_tokens": 9,
+        "output_tokens": 5,
+        "reasoning_output_tokens": 2,
+        "total_tokens": 14,
+    }
+    assert ledger.receipts == [("attempt-1", 200, None)]
+    assert ledger.usage_reports == [("attempt-1", result.provider_usage_report)]
+    assert "sk-ant-test-not-a-real-key" not in str(ledger.usage_reports)
+    assert "response-body-secret-marker" not in str(ledger.usage_reports)
+    assert "sk-ant-test-not-a-real-key" not in repr(result)
+    assert "response-body-secret-marker" not in repr(result)
+
+
+def test_gemini_generate_content_adapter_sends_once_and_records_report_only_usage() -> None:
+    ledger = FakeLedger()
+    body = {
+        "responseId": "geminiResponse_123",
+        "modelVersion": "gemini-2.5-pro",
+        "candidates": [{"content": {"parts": [{"text": "response-body-secret-marker"}]}}],
+        "usageMetadata": {
+            "promptTokenCount": 5,
+            "cachedContentTokenCount": 1,
+            "candidatesTokenCount": 4,
+            "thoughtsTokenCount": 2,
+            "toolUsePromptTokenCount": 1,
+            "totalTokenCount": 11,
+        },
+    }
+    raw = FakeProviderResponse(200, {"content-type": "application/json"}, json.dumps(body).encode())
+    opener = FakeProviderOpener(raw)
+
+    result = _dispatch_gemini(ledger, opener)
+
+    assert len(opener.requests) == 1
+    request, timeout = opener.requests[0]
+    assert request.full_url == (
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    )
+    assert request.get_method() == "POST"
+    headers = {name.casefold(): value for name, value in request.header_items()}
+    assert headers["x-goog-api-key"] == "gemini-test-not-a-real-key"
+    assert headers["content-type"] == "application/json"
+    assert json.loads(request.data) == {"contents": [{"parts": [{"text": "hello"}]}]}
+    assert timeout == 60.0
+    assert raw.closed is True
+    assert result.response.payload == body
+    assert result.response.body_status == "available"
+    assert result.provider_usage_report["status"] == "reported"
+    assert result.provider_usage_report["measurements"] == {
+        "cached_input_tokens": 1,
+        "input_tokens": 5,
+        "output_tokens": 6,
+        "reasoning_output_tokens": 2,
+        "tool_use_prompt_tokens": 1,
+        "total_tokens": 11,
+    }
+    assert ledger.receipts == [("attempt-1", 200, None)]
+    assert ledger.usage_reports == [("attempt-1", result.provider_usage_report)]
+    assert "gemini-test-not-a-real-key" not in str(ledger.usage_reports)
+    assert "response-body-secret-marker" not in str(ledger.usage_reports)
+    assert "gemini-test-not-a-real-key" not in repr(result)
+    assert "response-body-secret-marker" not in repr(result)
+
+
+def test_anthropic_and_gemini_adapters_reject_unsupported_request_shapes_before_reservation() -> (
+    None
+):
+    anthropic_ledger = FakeLedger()
+    anthropic_opener = FakeProviderOpener()
+    with pytest.raises(ValueError, match="stream must be false"):
+        _dispatch_anthropic(
+            anthropic_ledger,
+            anthropic_opener,
+            request_payload={"model": "claude-sonnet-4-6", "stream": True},
+        )
+    assert anthropic_ledger.reserve_calls == []
+    assert anthropic_opener.requests == []
+
+    gemini_ledger = FakeLedger()
+    gemini_opener = FakeProviderOpener()
+    with pytest.raises(ValueError, match="not accepted"):
+        _dispatch_gemini(
+            gemini_ledger,
+            gemini_opener,
+            request_payload={"model": "gemini-2.5-pro", "contents": []},
+        )
+    assert gemini_ledger.reserve_calls == []
+    assert gemini_opener.requests == []
+
+    with pytest.raises(ValueError, match="plain Gemini"):
+        dispatch_gemini_generate_content_once(
+            ledger=gemini_ledger,
+            task_id="task-1",
+            claim_fencing_token=7,
+            resource_fencing_tokens={},
+            idempotency_key="gemini-invalid-model",
+            api_key="gemini-test-not-a-real-key",
+            model="../models/gemini-2.5-pro",
+            request_payload={"contents": []},
+            opener=gemini_opener,
+        )
+    assert gemini_ledger.reserve_calls == []
+    assert gemini_opener.requests == []
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "ledger", "opener"),
+    [
+        (_dispatch_anthropic, FakeLedger(), FakeProviderOpener()),
+        (_dispatch_gemini, FakeLedger(), FakeProviderOpener()),
+    ],
+)
+def test_anthropic_and_gemini_adapters_reject_api_key_header_injection_before_reservation(
+    dispatch, ledger, opener
+) -> None:
+    with pytest.raises(ValueError, match="visible ASCII"):
+        dispatch(ledger, opener, api_key="key\r\nX-Leak: yes")
+
+    assert ledger.reserve_calls == []
+    assert opener.requests == []
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "url"),
+    [
+        (_dispatch_anthropic, "https://api.anthropic.com/v1/messages"),
+        (
+            _dispatch_gemini,
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-pro:generateContent",
+        ),
+    ],
+)
+def test_anthropic_and_gemini_adapters_record_429_without_retry(dispatch, url) -> None:
+    ledger = FakeLedger()
+    quota_response = HTTPError(
+        url,
+        429,
+        "Too Many Requests",
+        {"Retry-After": "900"},
+        io.BytesIO(b'{"error":{"message":"provider error secret"}}'),
+    )
+    opener = FakeProviderOpener(quota_response)
+
+    result = dispatch(ledger, opener)
+
+    assert len(opener.requests) == 1
+    assert result.response.status_code == 429
+    assert result.retry_after_seconds == 900
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 429, 900)]
+    assert "provider error secret" not in str(ledger.usage_reports)
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "url"),
+    [
+        (_dispatch_anthropic, "https://api.anthropic.com/v1/messages"),
+        (
+            _dispatch_gemini,
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-pro:generateContent",
+        ),
+    ],
+)
+def test_anthropic_and_gemini_adapters_refuse_redirects(dispatch, url, monkeypatch) -> None:
+    ledger = FakeLedger()
+    redirect = HTTPError(
+        url,
+        302,
+        "Found",
+        {"Location": "https://attacker.invalid/capture"},
+        io.BytesIO(b'{"error":"redirect body secret"}'),
+    )
+    opener = FakeProviderOpener(redirect)
+    registered_handlers = []
+
+    def build_fake_opener(*handlers):
+        registered_handlers.extend(handlers)
+        return opener
+
+    monkeypatch.setattr(dispatch_client_module, "build_opener", build_fake_opener)
+
+    result = dispatch(ledger)
+
+    assert len(registered_handlers) == 1
+    handler = registered_handlers[0]
+    assert (
+        handler.redirect_request(
+            Request(url),
+            None,
+            302,
+            "Found",
+            {"Location": "https://attacker.invalid/capture"},
+            "https://attacker.invalid/capture",
+        )
+        is None
+    )
+    assert len(opener.requests) == 1
+    assert result.response.status_code == 302
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 302, None)]
+    assert "redirect body secret" not in str(ledger.usage_reports)
+
+
+@pytest.mark.parametrize("dispatch", [_dispatch_anthropic, _dispatch_gemini])
+def test_anthropic_and_gemini_adapters_bound_response_bodies(dispatch, monkeypatch) -> None:
+    monkeypatch.setattr(dispatch_client_module, "_MAX_PROVIDER_RESPONSE_BYTES", 4)
+    ledger = FakeLedger()
+    raw = FakeProviderResponse(200, {}, b"12345")
+    opener = FakeProviderOpener(raw)
+
+    result = dispatch(ledger, opener)
+
+    assert raw.read_limits == [5]
+    assert result.response.body_status == "too_large"
+    assert result.response.payload is None
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 200, None)]
 
 
 @pytest.mark.parametrize(

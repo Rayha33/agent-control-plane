@@ -2,9 +2,11 @@
 
 **Status:** design contract plus local supervisor attempt caps and public
 Coordination claim- and dispatch-attempt-reservation caps for task #2998.
-Provider adapters, provider quota handling, and budget-exhaustion checkpoint
-recovery are not implemented. This document is not a provider billing cap or
-evidence that ACP meters model work.
+Report-only response parsing and opt-in one-shot HTTP adapters cover OpenAI
+Responses, Anthropic Messages, and Gemini Developer API GenerateContent.
+Provider quota handling and budget-exhaustion checkpoint recovery are not
+implemented. This document is not a provider billing cap or evidence that ACP
+meters model work.
 
 ## Problem
 
@@ -120,29 +122,28 @@ admission. `provider_usage` therefore remains `unsupported` for
 hard-limit decisions even when a per-call `provider_usage_report` is present.
 Missing and malformed fields produce bounded reason codes without storing raw
 responses or credentials. Streaming, SDK retries, and provider-internal fan-out
-remain outside these extractors. `dispatch_openai_responses_once` is an opt-in
-concrete transport adapter only for
-the fixed `https://api.openai.com/v1/responses` endpoint: it reserves through
-the dispatch ledger, makes one synchronous, non-streaming request with
-`background: false` using the standard-library HTTP client, and attaches the
-parsed usage observation to the receipt. Its default transport refuses
-redirects and does not retry; 429 is recorded and returned, never retried. It
-rejects `stream: true` and `background: true`, bounds decoded response bodies
-at 16 MiB, and never copies
-the response body or API key into the receipt. The API key is supplied by the
-caller and sent only in the Authorization header. A caller-supplied opener is
-for testing and must preserve the no-retry/no-redirect behavior. The returned
-response marks its body `available`, `invalid_json`, `too_large`, or
-`unavailable`; unavailable or invalid usage still leaves a receipt when an HTTP
-status was observed.
+remain outside these extractors. The opt-in `dispatch_*_once` HTTP adapters
+reserve through the dispatch ledger, make one synchronous, non-streaming request
+through the provider's standard-library HTTP transport, and attach parsed usage to
+the receipt. They currently cover fixed OpenAI Responses and Anthropic Messages
+endpoints plus the Google AI Gemini Developer API `generateContent` endpoint;
+the Gemini adapter does not cover Vertex AI or the Gemini Interactions API.
+The default transports refuse redirects and do not retry; 429 is recorded and
+returned, never retried. They reject streaming (and OpenAI background mode),
+bound decoded response bodies at 16 MiB, and never copy response bodies or API
+keys into the receipt. Keys are sent only in provider-specific headers. A
+caller-supplied opener is a transport seam and must preserve no-retry/no-redirect
+behavior. The returned response marks its body `available`, `invalid_json`,
+`too_large`, or `unavailable`; unavailable or invalid usage still leaves a
+receipt when an HTTP status was observed.
 
-The adapter does not authenticate response usage, calculate cost, gate every
+These adapters do not authenticate response usage, calculate cost, gate every
 provider call, control provider-internal fan-out, or enforce quota/spend.
-Callers can bypass it, and an ambiguous network outcome consumes its ACP slot
-without an automatic resend. Direct `dispatch_once` users may still pass
-the matching parser as `usage_report_from_response` after decoding their own
+Callers can bypass them, and an ambiguous network outcome consumes its ACP slot
+without an automatic resend. Direct `dispatch_once` users may still pass the
+matching parser as `usage_report_from_response` after decoding their own
 response. These parsers accept decoded JSON mappings, not HTTP/SDK response
-wrappers. See the provider references for [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses/methods/create), [Anthropic Messages](https://platform.claude.com/docs/en/api/http/messages/create) and [rate-limit token accounting](https://platform.claude.com/docs/en/api/rate-limits), [Gemini Developer API GenerateContent](https://ai.google.dev/api/generate-content), and [Vertex AI GenerateContent usage](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/GenerateContentResponse).
+wrappers. See the provider references for [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses/methods/create), [Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create) and [rate-limit token accounting](https://platform.claude.com/docs/en/api/rate-limits), [Gemini Developer API GenerateContent](https://ai.google.dev/api/generate-content?hl=en) and [Gemini API authentication](https://ai.google.dev/api), and [Vertex AI GenerateContent usage](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/GenerateContentResponse).
 
 Task status includes a separate `reported_provider_usage` roll-up for the task
 and its descendant tree. It groups observed token sums by provider, adapter,
