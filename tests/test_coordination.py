@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -10,7 +11,10 @@ from fastapi.testclient import TestClient
 
 from agent_control_plane import coordination as coordination_module
 from agent_control_plane.app import create_app
-from agent_control_plane.coordination_schemas import DispatchAttemptReservationCreate
+from agent_control_plane.coordination_schemas import (
+    DispatchAttemptReservationCreate,
+    ProviderUsageReport,
+)
 from agent_control_plane.provider_usage import parse_openai_responses_usage
 from agent_control_plane.service import ControlPlaneError
 
@@ -466,6 +470,32 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     )
 
 
+def test_provider_usage_report_rejects_timestamp_that_cannot_normalize_to_utc():
+    with pytest.raises(ValueError, match="normalize to UTC"):
+        ProviderUsageReport.model_validate(
+            {
+                "status": "reported",
+                "provider": "openai",
+                "adapter": "responses",
+                "source": "client_reported",
+                "scope": "single_response",
+                "unit": "tokens",
+                "observed_at": "0001-01-01T00:00:00+14:00",
+                "response_id": "resp_overflow",
+                "model": "gpt-test",
+                "response_created_at": 0,
+                "measurements": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+                "freshness": "unknown",
+                "enforcement": "report_only",
+                "reason": None,
+            }
+        )
+
+
 def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
     client, app, admin_headers, monkeypatch
 ):
@@ -507,7 +537,8 @@ def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
             "model": "gpt-root",
             "status": "completed",
             "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
-        }
+        },
+        observed_at=datetime.fromisoformat("2026-10-13T10:00:00+02:00"),
     ).as_dict()
     child_report = parse_openai_responses_usage(
         {
@@ -534,7 +565,8 @@ def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
             "model": "gpt-root",
             "status": "completed",
             "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
-        }
+        },
+        observed_at=datetime.fromisoformat("2026-10-13T07:30:00+00:00"),
     ).as_dict()
     missing_report = parse_openai_responses_usage({"error": {"type": "rate_limit_error"}}).as_dict()
     invalid_report = parse_openai_responses_usage(
@@ -552,7 +584,7 @@ def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
     child_report_receipt = reserve_and_receipt(
         child, child_claim, "usage-child-reported", report_marker=child_report
     )
-    reserve_and_receipt(
+    child_other_model_receipt = reserve_and_receipt(
         child, child_claim, "usage-child-other-model", report_marker=child_other_model_report
     )
     reserve_and_receipt(child, child_claim, "usage-child-missing", report_marker=missing_report)
@@ -586,6 +618,7 @@ def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
             "adapter": "responses",
             "model": "gpt-child",
             "response_count": 1,
+            "latest_client_observed_at": child_report["observed_at"],
             "measurements": {
                 "input_tokens": 7,
                 "output_tokens": 3,
@@ -602,6 +635,7 @@ def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
             "adapter": "responses",
             "model": "gpt-child-alt",
             "response_count": 1,
+            "latest_client_observed_at": child_other_model_report["observed_at"],
             "measurements": {
                 "input_tokens": 2,
                 "output_tokens": 1,
@@ -629,6 +663,7 @@ def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
     assert root_task_usage["status"] == "observed"
     assert root_task_usage["groups"][0]["model"] == "gpt-root"
     assert root_task_usage["groups"][0]["response_count"] == 2
+    assert root_task_usage["groups"][0]["latest_client_observed_at"] == ("2026-10-13T08:00:00Z")
     assert root_task_usage["groups"][0]["measurements"] == {
         "input_tokens": 14,
         "output_tokens": 3,
@@ -677,12 +712,25 @@ def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
                 child_report_receipt["dispatch_attempt_id"],
             ),
         )
+        overflow_report = {
+            **child_other_model_report,
+            "observed_at": "0001-01-01T00:00:00+14:00",
+        }
+        connection.execute(
+            "UPDATE dispatch_attempt_receipts SET provider_usage_json = ? "
+            "WHERE dispatch_attempt_id = ?",
+            (
+                json.dumps(overflow_report),
+                child_other_model_receipt["dispatch_attempt_id"],
+            ),
+        )
     malformed_stored = client.get(f"/v1/tasks/{child['id']}", headers=admin_headers).json()
     malformed_usage = malformed_stored["dispatch_attempt_budget"]["reported_provider_usage"]
     assert malformed_usage["status"] == "partial"
-    assert malformed_usage["invalid_report_count"] == 2
+    assert malformed_usage["invalid_report_count"] == 3
     assert "stored_usage_report_invalid" in malformed_usage["reasons"]
     assert "secret-shaped" not in str(malformed_usage)
+    assert malformed_usage["groups"] == []
 
 
 def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
@@ -766,6 +814,10 @@ def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
         assert restored_usage["status"] == "observed"
         assert restored_usage["reported_response_count"] == 1
         assert restored_usage["groups"][0]["measurements"]["total_tokens"] == 25
+        assert (
+            restored_usage["groups"][0]["latest_client_observed_at"]
+            == (provider_usage_report["observed_at"])
+        )
 
         replay = reserve_dispatch_attempt(
             restarted_client, task["id"], token, claim, "restart-call-1"

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -226,6 +226,10 @@ class ProviderUsageReport(BaseModel):
             raise ValueError("observed_at must be an ISO-8601 timestamp") from None
         if parsed.tzinfo is None:
             raise ValueError("observed_at must include a timezone")
+        try:
+            parsed.astimezone(UTC)
+        except (OverflowError, ValueError):
+            raise ValueError("observed_at must normalize to UTC") from None
         return value
 
     @model_validator(mode="after")
@@ -277,8 +281,20 @@ class ProviderUsageSummaryGroup(BaseModel):
     adapter: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
     model: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
     response_count: StrictInt = Field(ge=1, le=1000)
+    latest_client_observed_at: str = Field(min_length=20, max_length=40)
     measurements: dict[str, StrictInt] = Field(min_length=1, max_length=16)
     measurement_response_counts: dict[str, StrictInt] = Field(min_length=1, max_length=16)
+
+    @field_validator("latest_client_observed_at")
+    @classmethod
+    def require_zoned_timestamp(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("latest client observation must be an ISO-8601 timestamp") from None
+        if parsed.tzinfo is None:
+            raise ValueError("latest client observation must include a timezone")
+        return value
 
     @model_validator(mode="after")
     def validate_measurement_counts(self) -> ProviderUsageSummaryGroup:

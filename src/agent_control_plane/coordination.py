@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from .coordination_schemas import (
@@ -1620,7 +1621,10 @@ class CoordinationService:
                     receipt_without_report_count += 1
                     continue
                 report = ProviderUsageReport.model_validate(report_payload)
-            except (TypeError, ValueError):
+                client_observed_at = datetime.fromisoformat(
+                    report.observed_at.replace("Z", "+00:00")
+                ).astimezone(UTC)
+            except (OverflowError, TypeError, ValueError):
                 invalid_report_count += 1
                 invalid_stored_report = True
                 continue
@@ -1637,9 +1641,19 @@ class CoordinationService:
             key = (report.provider, report.adapter, report.model)
             group = groups.setdefault(
                 key,
-                {"response_count": 0, "measurements": {}, "measurement_response_counts": {}},
+                {
+                    "response_count": 0,
+                    "measurements": {},
+                    "measurement_response_counts": {},
+                    "_latest_client_observed_at": None,
+                },
             )
             group["response_count"] += 1
+            if (
+                group["_latest_client_observed_at"] is None
+                or client_observed_at > group["_latest_client_observed_at"]
+            ):
+                group["_latest_client_observed_at"] = client_observed_at
             for name, value in report.measurements.items():
                 group["measurements"][name] = group["measurements"].get(name, 0) + value
                 group["measurement_response_counts"][name] = (
@@ -1670,15 +1684,24 @@ class CoordinationService:
         else:
             status = "partial"
 
-        group_views = [
-            {
-                "provider": provider,
-                "adapter": adapter,
-                "model": model,
-                **groups[(provider, adapter, model)],
-            }
-            for provider, adapter, model in sorted(groups)
-        ]
+        group_views = []
+        for provider, adapter, model in sorted(groups):
+            group = groups[(provider, adapter, model)]
+            latest_client_observed_at = group["_latest_client_observed_at"]
+            assert isinstance(latest_client_observed_at, datetime)
+            group_views.append(
+                {
+                    "provider": provider,
+                    "adapter": adapter,
+                    "model": model,
+                    "response_count": group["response_count"],
+                    "latest_client_observed_at": latest_client_observed_at.isoformat().replace(
+                        "+00:00", "Z"
+                    ),
+                    "measurements": group["measurements"],
+                    "measurement_response_counts": group["measurement_response_counts"],
+                }
+            )
         return ReportedProviderUsageView(
             scope=scope,
             status=status,

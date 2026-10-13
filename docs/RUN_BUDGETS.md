@@ -124,8 +124,10 @@ Task status includes a separate `reported_provider_usage` roll-up for the task
 and its descendant tree. It groups observed token sums by provider, adapter,
 and model, and reports counts for reported, missing, invalid, receipt-without-
 report, and reservation-without-receipt cases. Each scope returns and aggregates
-at most its latest 1,000 dispatch reservations; `truncated` and
-`sampled_reservation_count` make that sample limit explicit. This bounds sample
+at most its latest 1,000 dispatch reservations; each provider/adapter/model group carries
+the latest client-reported observation timestamp among its reported responses.
+That timestamp is not provider-authenticated. `truncated` and
+`sampled_reservation_count` make the sample limit explicit. This bounds sample
 size and application-side aggregation work, not database work: the descendant
 summary and exact reservation count may still scan or sort the full descendant
 history, so read cost can grow with task-tree history.
