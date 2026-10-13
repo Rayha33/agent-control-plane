@@ -281,6 +281,13 @@
       "attempts",
       "response"
     ],
+    "class:OpenAIResponsesHttpResponse": [
+      "body_status",
+      "headers",
+      "json",
+      "payload",
+      "status_code"
+    ],
     "class:ProviderUsageReport": [
       "_abc_impl",
       "model_config",
@@ -300,6 +307,17 @@
     ],
     "class:_NoRedirectHandler": [
       "redirect_request"
+    ],
+    "class:_ProviderHttpOpener": [
+      "_abc_impl",
+      "_is_protocol",
+      "open"
+    ],
+    "class:_ProviderHttpResponse": [
+      "_abc_impl",
+      "_is_protocol",
+      "close",
+      "read"
     ],
     "module": [
       "Any",
@@ -324,7 +342,9 @@
       "Generic",
       "HTTPError",
       "HTTPRedirectHandler",
+      "Literal",
       "Mapping",
+      "OpenAIResponsesHttpResponse",
       "Protocol",
       "ProviderUsageReport",
       "Request",
@@ -334,23 +354,33 @@
       "_JsonOpener",
       "_JsonResponse",
       "_MAX_COORDINATION_RESPONSE_BYTES",
+      "_MAX_OPENAI_RESPONSES_BYTES",
       "_NoRedirectHandler",
+      "_OPENAI_RESPONSES_URL",
+      "_ProviderHttpOpener",
+      "_ProviderHttpResponse",
       "_RETRYABLE_SERVER_STATUS_CODES",
       "_RETRY_IDEMPOTENCY_KEY_MAX_LENGTH",
       "_bounded_retry_after",
+      "_close_openai_response",
       "_is_loopback_host",
       "_provider_usage_extraction_failed",
+      "_read_openai_responses_response",
       "_retry_after_seconds",
       "_safe_failure_type",
+      "_safe_openai_response_headers",
       "annotations",
       "build_opener",
       "ceil",
       "dataclass",
       "datetime",
       "dispatch_once",
+      "dispatch_openai_responses_once",
       "dispatch_with_retries",
+      "field",
       "ipaddress",
       "json",
+      "parse_openai_responses_usage",
       "parsedate_to_datetime",
       "quote",
       "time",

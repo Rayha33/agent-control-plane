@@ -110,15 +110,29 @@ therefore remains `unsupported` for hard-limit decisions even when a per-call
 `provider_usage_report` is present. Missing and malformed fields produce
 bounded reason codes without storing a raw response or credentials. Streaming,
 SDK retries, other providers, and provider-internal fan-out remain outside this
-extractor. A caller may pass `parse_openai_responses_usage` as the dispatch
-client's `usage_report_from_response` callback after decoding the response
-body. For a synchronous HTTP response, for example, use
-`lambda response: parse_openai_responses_usage(response.json())`; for a typed
-SDK response, pass its JSON-mode model dump instead. The parser accepts the
-decoded JSON mapping, not an HTTP/SDK response wrapper. ACP does not
-automatically intercept SDK requests or prove every billable request crosses
-this path. The Responses API documents these usage fields in its [response
-object](https://developers.openai.com/api/reference/resources/responses/methods/create).
+extractor. `dispatch_openai_responses_once` is an opt-in concrete adapter for
+the fixed `https://api.openai.com/v1/responses` endpoint: it reserves through
+the dispatch ledger, makes one synchronous, non-streaming request with
+`background: false` using the standard-library HTTP client, and attaches the
+parsed usage observation to the receipt. Its default transport refuses
+redirects and does not retry; 429 is recorded and returned, never retried. It
+rejects `stream: true` and `background: true`, bounds decoded response bodies
+at 16 MiB, and never copies
+the response body or API key into the receipt. The API key is supplied by the
+caller and sent only in the Authorization header. A caller-supplied opener is
+for testing and must preserve the no-retry/no-redirect behavior. The returned
+response marks its body `available`, `invalid_json`, `too_large`, or
+`unavailable`; unavailable or invalid usage still leaves a receipt when an HTTP
+status was observed.
+
+The adapter does not authenticate response usage, calculate cost, gate every
+provider call, control provider-internal fan-out, or enforce quota/spend.
+Callers can bypass it, and an ambiguous network outcome consumes its ACP slot
+without an automatic resend. Direct `dispatch_once` users may still pass
+`parse_openai_responses_usage` as `usage_report_from_response` after decoding
+their own response. The parser accepts a decoded JSON mapping, not an HTTP/SDK
+response wrapper. The Responses API documents these usage fields in its
+[response object](https://developers.openai.com/api/reference/resources/responses/methods/create).
 
 Task status includes a separate `reported_provider_usage` roll-up for the task
 and its descendant tree. It groups observed token sums by provider, adapter,
@@ -268,23 +282,44 @@ service restart; task views recompute consumed slots from those persisted rows.
 The optional receipt endpoint records one immutable response observation and
 labels it `source: client_reported`. In particular, a client-reported 429 or
 Retry-After is evidence only: it does not authorize, schedule, or perform a
-retry, and it never restores a slot. ACP does not yet run a provider adapter,
-observe whether the client actually sent a request, or control provider/CLI
-internal retries and fan-out. A worker that calls a provider directly can
-bypass these cooperative reservations. Therefore these counters are not a
+retry, and it never restores a slot. The opt-in
+`dispatch_openai_responses_once` helper covers only calls explicitly routed
+through that fixed-endpoint adapter. ACP does not observe whether the client
+actually sent a request or control provider/CLI internal retries and fan-out.
+A worker that calls a provider directly can bypass these cooperative
+reservations. Therefore these counters are not a
 provider request limit, egress gate, quota control, token budget, or spend cap.
 
 Python clients may opt into `agent_control_plane.dispatch_client.dispatch_once`
-with `CoordinationHttpDispatchLedger` to use the reference API directly:
+with `CoordinationHttpDispatchLedger` to use the reference API directly, or use
+`dispatch_openai_responses_once` to send one fixed-endpoint OpenAI Responses
+request and persist its client-reported usage:
 
 ~~~python
-from agent_control_plane.dispatch_client import CoordinationHttpDispatchLedger
+from agent_control_plane.dispatch_client import (
+    CoordinationHttpDispatchLedger,
+    dispatch_openai_responses_once,
+)
 
 ledger = CoordinationHttpDispatchLedger(
     base_url="https://acp.example",
     bearer_token=coordination_mandate,
 )
+
+result = dispatch_openai_responses_once(
+    ledger=ledger,
+    task_id=task_id,
+    claim_fencing_token=claim_fencing_token,
+    resource_fencing_tokens=resource_fencing_tokens,
+    idempotency_key="task-attempt-1",
+    api_key=api_key_from_secret_store,
+    request_payload={"model": "gpt-5.6", "input": "Review this change."},
+)
 ~~~
+
+Do not hard-code either credential in source. The `idempotency_key` above is
+for the ACP reservation only; the adapter does not claim provider-side
+deduplication or make retries safe.
 
 The adapter calls the published reservation/receipt routes, keeps the bearer
 token in the Authorization header, URL-escapes path IDs, bounds JSON response

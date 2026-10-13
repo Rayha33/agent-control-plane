@@ -11,11 +11,11 @@ import ipaddress
 import json
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from math import ceil
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeVar
 from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -24,6 +24,7 @@ from .coordination_schemas import ProviderUsageReport
 from .provider_usage import (
     ClientReportedProviderUsage,
     _provider_usage_extraction_failed,
+    parse_openai_responses_usage,
 )
 
 
@@ -102,7 +103,17 @@ class _JsonOpener(Protocol):
     def open(self, request: Request, timeout: float) -> _JsonResponse: ...
 
 
+class _ProviderHttpResponse(_JsonResponse, Protocol):
+    headers: Any
+
+
+class _ProviderHttpOpener(Protocol):
+    def open(self, request: Request, timeout: float) -> _ProviderHttpResponse: ...
+
+
 _MAX_COORDINATION_RESPONSE_BYTES = 1_048_576
+_MAX_OPENAI_RESPONSES_BYTES = 16_777_216
+_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 
 class CoordinationHttpDispatchLedger:
@@ -319,6 +330,26 @@ class DispatchResult(Generic[ResponseT]):
     response: ResponseT
     retry_after_seconds: int | None = None
     provider_usage_report: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIResponsesHttpResponse:
+    """Bounded decoded response from the opt-in OpenAI Responses adapter.
+
+    Only Retry-After and Content-Type response headers are retained. A decoded
+    payload is available when body_status is "available", but omitted from repr
+    and never copied into the dispatch receipt.
+    """
+
+    status_code: int
+    headers: Mapping[str, str]
+    payload: Any | None = field(repr=False)
+    body_status: Literal["available", "invalid_json", "too_large", "unavailable"]
+
+    def json(self) -> Any | None:
+        """Return the decoded JSON payload, or None when it was unavailable."""
+
+        return self.payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,6 +572,137 @@ def dispatch_once(
     )
 
 
+def dispatch_openai_responses_once(
+    *,
+    ledger: DispatchLedger,
+    task_id: str,
+    claim_fencing_token: int,
+    resource_fencing_tokens: Mapping[str, int],
+    idempotency_key: str,
+    api_key: str,
+    request_payload: Mapping[str, Any],
+    timeout_seconds: float = 60.0,
+    opener: _ProviderHttpOpener | None = None,
+) -> DispatchResult[OpenAIResponsesHttpResponse]:
+    """Make one non-streaming OpenAI Responses HTTP call under a durable reservation.
+
+    The default urllib opener refuses redirects and performs no application-level
+    retries. This function does not attach a provider idempotency key, retry a
+    failed call, enforce provider quota/spend, or intercept other provider calls.
+    An injected opener is intended for tests and must preserve the no-retry,
+    no-redirect behavior. Usage is attached as client-reported metadata only.
+    """
+
+    if not isinstance(request_payload, Mapping):
+        raise TypeError("request_payload must be a mapping")
+    payload = dict(request_payload)
+    for request_option in ("stream", "background"):
+        value = payload.get(request_option, False)
+        if type(value) is not bool or value:
+            raise ValueError(
+                f"{request_option} must be false for report-only single-response dispatch"
+            )
+    try:
+        encoded_payload = json.dumps(
+            payload, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("request_payload must be JSON-serializable") from None
+
+    if (
+        not isinstance(api_key, str)
+        or not 1 <= len(api_key) <= 4096
+        or any(not 0x21 <= ord(char) <= 0x7E for char in api_key)
+    ):
+        raise ValueError("api_key must contain 1..4096 visible ASCII characters")
+    if type(timeout_seconds) not in {int, float} or not 0 < timeout_seconds <= 300:
+        raise ValueError("timeout_seconds must be greater than 0 and at most 300")
+
+    selected_opener = opener if opener is not None else build_opener(_NoRedirectHandler())
+    if not callable(getattr(selected_opener, "open", None)):
+        raise TypeError("opener must provide an open method")
+    request = Request(
+        _OPENAI_RESPONSES_URL,
+        data=encoded_payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    def send_once() -> OpenAIResponsesHttpResponse:
+        try:
+            response = selected_opener.open(request, timeout=float(timeout_seconds))
+        except HTTPError as exc:
+            return _read_openai_responses_response(exc.code, exc.headers, exc)
+        return _read_openai_responses_response(response.status, response.headers, response)
+
+    return dispatch_once(
+        ledger=ledger,
+        task_id=task_id,
+        claim_fencing_token=claim_fencing_token,
+        resource_fencing_tokens=resource_fencing_tokens,
+        idempotency_key=idempotency_key,
+        send_once=send_once,
+        usage_report_from_response=lambda response: parse_openai_responses_usage(response.payload),
+    )
+
+
+def _read_openai_responses_response(
+    status_code: int, headers: Any, response: _JsonResponse
+) -> OpenAIResponsesHttpResponse:
+    selected_headers = _safe_openai_response_headers(headers)
+    try:
+        body = response.read(_MAX_OPENAI_RESPONSES_BYTES + 1)
+    except Exception:
+        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "unavailable")
+    finally:
+        _close_openai_response(response)
+
+    if not isinstance(body, bytes):
+        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "unavailable")
+    if len(body) > _MAX_OPENAI_RESPONSES_BYTES:
+        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "too_large")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return OpenAIResponsesHttpResponse(status_code, selected_headers, None, "invalid_json")
+    return OpenAIResponsesHttpResponse(status_code, selected_headers, payload, "available")
+
+
+def _safe_openai_response_headers(headers: Any) -> dict[str, str]:
+    safe: dict[str, str] = {}
+    if headers is None:
+        return safe
+    try:
+        items = headers.items()
+        for name, value in items:
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            canonical = {"retry-after": "Retry-After", "content-type": "Content-Type"}.get(
+                name.casefold()
+            )
+            if (
+                canonical is not None
+                and len(value) <= 1024
+                and "\r" not in value
+                and "\n" not in value
+            ):
+                safe[canonical] = value
+    except Exception:
+        return {}
+    return safe
+
+
+def _close_openai_response(response: Any) -> None:
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
 def _retry_after_seconds(response: DispatchHttpResponse) -> int | None:
     """Normalize numeric Retry-After headers used by standard HTTP clients."""
 
@@ -629,10 +791,12 @@ __all__ = [
     "DispatchReservationReplay",
     "DispatchResponseInvalid",
     "DispatchOutcomeUnknown",
+    "OpenAIResponsesHttpResponse",
     "DispatchReceiptUnrecorded",
     "DispatchResult",
     "DispatchRetryPolicy",
     "DispatchRetryResult",
     "dispatch_with_retries",
+    "dispatch_openai_responses_once",
     "dispatch_once",
 ]

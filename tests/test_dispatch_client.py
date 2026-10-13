@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -10,6 +11,7 @@ from urllib.request import Request
 
 import pytest
 
+import agent_control_plane.dispatch_client as dispatch_client_module
 from agent_control_plane.dispatch_client import (
     CoordinationHttpDispatchLedger,
     DispatchLedgerHttpError,
@@ -21,6 +23,7 @@ from agent_control_plane.dispatch_client import (
     DispatchResponseInvalid,
     DispatchRetryPolicy,
     dispatch_once,
+    dispatch_openai_responses_once,
     dispatch_with_retries,
 )
 from agent_control_plane.provider_usage import parse_openai_responses_usage
@@ -125,6 +128,35 @@ class FakeApiOpener:
         return outcome
 
 
+class FakeProviderResponse:
+    def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        self.status = status
+        self.headers = headers
+        self.body = body
+        self.read_limits: list[int] = []
+        self.closed = False
+
+    def read(self, amount: int = -1) -> bytes:
+        self.read_limits.append(amount)
+        return self.body if amount < 0 else self.body[:amount]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeProviderOpener:
+    def __init__(self, *responses_or_errors: object) -> None:
+        self.responses_or_errors = list(responses_or_errors)
+        self.requests: list[tuple[Request, float]] = []
+
+    def open(self, request: Request, timeout: float) -> FakeProviderResponse:
+        self.requests.append((request, timeout))
+        outcome = self.responses_or_errors.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 class ClientTestOpener:
     def __init__(self, client) -> None:
         self.client = client
@@ -175,6 +207,236 @@ def _dispatch_retries(
         wait=wait,
         usage_report_from_response=usage_report_from_response,
     )
+
+
+def _dispatch_openai(ledger: FakeLedger, opener=None, *, request_payload=None):
+    return dispatch_openai_responses_once(
+        ledger=ledger,
+        task_id="task-1",
+        claim_fencing_token=7,
+        resource_fencing_tokens={"repo:file:src/app.py": 11},
+        idempotency_key="openai-responses-once",
+        api_key="sk-test-not-a-real-key",
+        request_payload=request_payload or {"model": "gpt-5.6", "input": "hello"},
+        opener=opener,
+    )
+
+
+def test_openai_responses_adapter_sends_once_and_records_report_only_usage() -> None:
+    ledger = FakeLedger()
+    body = {
+        "object": "response",
+        "id": "resp_123456",
+        "model": "gpt-5.6",
+        "status": "completed",
+        "created_at": 1_791_883_739,
+        "output": [{"type": "output_text", "text": "response-body-secret-marker"}],
+        "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+    }
+    raw = FakeProviderResponse(200, {"content-type": "application/json"}, json.dumps(body).encode())
+    opener = FakeProviderOpener(raw)
+
+    result = _dispatch_openai(ledger, opener)
+
+    assert len(opener.requests) == 1
+    request, timeout = opener.requests[0]
+    assert request.full_url == "https://api.openai.com/v1/responses"
+    assert request.get_method() == "POST"
+    headers = {name.casefold(): value for name, value in request.header_items()}
+    assert headers["authorization"] == "Bearer sk-test-not-a-real-key"
+    assert headers["content-type"] == "application/json"
+    assert "idempotency-key" not in headers
+    assert json.loads(request.data) == {"model": "gpt-5.6", "input": "hello"}
+    assert timeout == 60.0
+    assert raw.closed is True
+    assert result.response.payload == body
+    assert result.response.body_status == "available"
+    assert result.provider_usage_report["status"] == "reported"
+    assert result.provider_usage_report["measurements"] == {
+        "input_tokens": 4,
+        "output_tokens": 3,
+        "total_tokens": 7,
+    }
+    assert ledger.receipts == [("attempt-1", 200, None)]
+    assert ledger.usage_reports == [("attempt-1", result.provider_usage_report)]
+    assert "sk-test-not-a-real-key" not in str(ledger.usage_reports)
+    assert "response-body-secret-marker" not in str(ledger.usage_reports)
+    assert "sk-test-not-a-real-key" not in repr(result)
+    assert "response-body-secret-marker" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "request_payload",
+    [
+        {"model": "gpt-5.6", "input": "hello", "stream": True},
+        {"model": "gpt-5.6", "input": "hello", "background": True},
+        {"model": "gpt-5.6", "input": "hello", "stream": 1},
+    ],
+)
+def test_openai_responses_adapter_rejects_streaming_before_reservation(request_payload) -> None:
+    ledger = FakeLedger()
+    opener = FakeProviderOpener()
+
+    with pytest.raises(ValueError):
+        _dispatch_openai(ledger, opener, request_payload=request_payload)
+
+    assert ledger.reserve_calls == []
+    assert opener.requests == []
+
+
+def test_openai_responses_adapter_rejects_header_injection_before_reservation() -> None:
+    ledger = FakeLedger()
+    opener = FakeProviderOpener()
+
+    with pytest.raises(ValueError, match="visible ASCII"):
+        dispatch_openai_responses_once(
+            ledger=ledger,
+            task_id="task-1",
+            claim_fencing_token=7,
+            resource_fencing_tokens={},
+            idempotency_key="openai-header-injection",
+            api_key="key\r\nX-Leak: yes",
+            request_payload={"model": "gpt-5.6", "input": "hello"},
+            opener=opener,
+        )
+
+    assert ledger.reserve_calls == []
+    assert opener.requests == []
+
+
+def test_openai_responses_adapter_refuses_redirect_and_never_resends(monkeypatch) -> None:
+    ledger = FakeLedger()
+    redirect = HTTPError(
+        "https://api.openai.com/v1/responses",
+        302,
+        "Found",
+        {"Location": "https://attacker.invalid/capture"},
+        io.BytesIO(b'{"error":"redirect refused"}'),
+    )
+    opener = FakeProviderOpener(redirect)
+    registered_handlers = []
+
+    def build_fake_opener(*handlers):
+        registered_handlers.extend(handlers)
+        return opener
+
+    monkeypatch.setattr(dispatch_client_module, "build_opener", build_fake_opener)
+
+    result = _dispatch_openai(ledger)
+
+    assert len(registered_handlers) == 1
+    handler = registered_handlers[0]
+    assert (
+        handler.redirect_request(
+            Request("https://api.openai.com/v1/responses"),
+            None,
+            302,
+            "Found",
+            {"Location": "https://attacker.invalid/capture"},
+            "https://attacker.invalid/capture",
+        )
+        is None
+    )
+    assert len(opener.requests) == 1
+    assert result.response.status_code == 302
+    assert result.retry_after_seconds is None
+    assert ledger.receipts == [("attempt-1", 302, None)]
+    assert "redirect refused" not in str(ledger.usage_reports)
+
+
+def test_openai_responses_adapter_records_429_without_retry() -> None:
+    ledger = FakeLedger()
+    too_many_requests = HTTPError(
+        "https://api.openai.com/v1/responses",
+        429,
+        "Too Many Requests",
+        {"Retry-After": "900"},
+        io.BytesIO(b'{"error":{"type":"rate_limit"}}'),
+    )
+    opener = FakeProviderOpener(too_many_requests)
+
+    result = _dispatch_openai(ledger, opener)
+
+    assert len(opener.requests) == 1
+    assert result.response.status_code == 429
+    assert result.retry_after_seconds == 900
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 429, 900)]
+
+
+def test_openai_responses_adapter_does_not_resend_an_ambiguous_send() -> None:
+    ledger = FakeLedger()
+    opener = FakeProviderOpener(TimeoutError("provider outcome unavailable"))
+
+    with pytest.raises(DispatchOutcomeUnknown) as raised:
+        _dispatch_openai(ledger, opener)
+
+    assert len(opener.requests) == 1
+    assert len(ledger.reserve_calls) == 1
+    assert ledger.receipts == []
+    assert "sk-test-not-a-real-key" not in str(raised.value)
+    assert "provider outcome unavailable" not in str(raised.value)
+
+
+def test_openai_responses_adapter_records_receipt_when_body_is_not_json() -> None:
+    ledger = FakeLedger()
+    raw = FakeProviderResponse(200, {}, b"not-json")
+    opener = FakeProviderOpener(raw)
+
+    result = _dispatch_openai(ledger, opener)
+
+    assert result.response.status_code == 200
+    assert result.response.body_status == "invalid_json"
+    assert result.response.payload is None
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 200, None)]
+
+
+def test_openai_responses_adapter_records_receipt_for_deeply_nested_json() -> None:
+    ledger = FakeLedger()
+    raw = FakeProviderResponse(200, {}, b"[" * 10_000 + b"0" + b"]" * 10_000)
+    opener = FakeProviderOpener(raw)
+
+    result = _dispatch_openai(ledger, opener)
+
+    assert result.response.status_code == 200
+    assert result.response.body_status == "invalid_json"
+    assert result.response.payload is None
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 200, None)]
+
+
+def test_openai_responses_adapter_records_receipt_for_integer_digit_limit() -> None:
+    original_limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    ledger = FakeLedger()
+    raw = FakeProviderResponse(200, {}, b'{"n":' + b"9" * 700 + b"}")
+    opener = FakeProviderOpener(raw)
+    try:
+        result = _dispatch_openai(ledger, opener)
+    finally:
+        sys.set_int_max_str_digits(original_limit)
+
+    assert result.response.status_code == 200
+    assert result.response.body_status == "invalid_json"
+    assert result.response.payload is None
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 200, None)]
+
+
+def test_openai_responses_adapter_bounds_and_reports_unavailable_json(monkeypatch) -> None:
+    monkeypatch.setattr(dispatch_client_module, "_MAX_OPENAI_RESPONSES_BYTES", 4)
+    ledger = FakeLedger()
+    raw = FakeProviderResponse(200, {}, b"12345")
+    opener = FakeProviderOpener(raw)
+
+    result = _dispatch_openai(ledger, opener)
+
+    assert raw.read_limits == [5]
+    assert result.response.body_status == "too_large"
+    assert result.response.payload is None
+    assert result.provider_usage_report["status"] == "missing"
+    assert ledger.receipts == [("attempt-1", 200, None)]
 
 
 def test_reservation_denial_and_stale_fence_never_invoke_transport() -> None:
