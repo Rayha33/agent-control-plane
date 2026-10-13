@@ -116,6 +116,18 @@ or request gate is wired to this supervisor. This is not a provider quota
 snapshot and cannot satisfy a requested hard provider-spend limit. Legacy
 top-level per-task counter fields remain for compatibility.
 
+Status also reports `parent_task_id`, nearest-first `ancestor_attempt_budgets`,
+and `ancestor_lineage_integrity`. A missing, blank (empty or whitespace-only),
+non-text, or cyclic parent link marks
+the lineage invalid, suppresses inherited budget rows, and marks the task's
+descendant-budget evidence `invalid` with no remaining value. In that invalid
+state, `consumed` is retained only as a raw diagnostic and may be inaccurate;
+consumers must not use it as authoritative cap evidence. Status renders a
+corrupt non-text parent ID as a type-only placeholder so the JSON view remains
+serializable. Plan and claim validate the full ancestor chain before recording
+any budget refusal; for a valid chain, the task-local cap keeps precedence over
+ancestor caps.
+
 The CLI `task-add --provider-cost-limit-usd-micros` and public `POST /v1/tasks`
 API accept an explicit `provider_cost_limit_usd_micros` request so unsupported
 hard limits are not silently ignored. In this build every such request fails with

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -175,12 +176,14 @@ def _child_task(
     resource: str,
     *,
     max_descendant_attempts: int | None = None,
+    max_attempts: int | None = None,
 ) -> dict:
     return supervisor.create_task(
         title,
         "A child task in the explicit task tree.",
         ["Tests pass"],
         [resource],
+        max_attempts=max_attempts,
         parent_task_id=parent_task_id,
         max_descendant_attempts=max_descendant_attempts,
     )
@@ -411,6 +414,113 @@ def test_parent_task_must_exist(repo: Path) -> None:
             parent_task_id="missing-parent",
         )
     assert error.value.code == "parent_task_not_found"
+
+
+@pytest.mark.parametrize("invalid_parent_id", ["", " "])
+def test_blank_corrupt_parent_link_blocks_plan_and_claim(
+    repo: Path, invalid_parent_id: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Parent",
+        "The child link is corrupted after a valid task is created.",
+        ["Admission fails closed"],
+        ["parent.txt"],
+        max_descendant_attempts=2,
+    )
+    child = _child_task(supervisor, parent["id"], "Child", "child.txt")
+    with sqlite3.connect(supervisor.db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET id = ? WHERE id = ?", (invalid_parent_id, parent["id"])
+        )
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+            (invalid_parent_id, child["id"]),
+        )
+
+    preview = supervisor.plan_claim(child["id"])
+    assert preview["ready"] is False
+    assert any(item["kind"] == "task_hierarchy_invalid" for item in preview["blockers"])
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(child["id"], "child-worker")
+    assert error.value.code == "task_hierarchy_invalid"
+    assert supervisor.task(child["id"])["attempts_used"] == 0
+
+
+def test_invalid_ancestry_precedes_local_attempt_exhaustion_marker(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Parent",
+        "A malformed cycle must be detected before recording a local retry-cap refusal.",
+        ["Hierarchy validation runs first"],
+        ["parent.txt"],
+    )
+    child = _child_task(supervisor, parent["id"], "One-attempt child", "child.txt", max_attempts=1)
+    supervisor.claim(child["id"], "first-worker")
+    _make_retryable(supervisor, child["id"])
+    with sqlite3.connect(supervisor.db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+            (child["id"], parent["id"]),
+        )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(child["id"], "second-worker")
+
+    assert error.value.code == "task_hierarchy_invalid"
+    view = supervisor.task(child["id"])
+    assert view["attempts_used"] == 1
+    assert not view["attempt_budget_exhausted_at"]
+
+
+def test_local_attempt_cap_precedes_ancestor_cap_after_valid_lineage(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "One-descendant budget",
+        "A valid hierarchy retains local-cap refusal precedence.",
+        ["The local refusal is audited first"],
+        ["parent.txt"],
+        max_descendant_attempts=1,
+    )
+    child = _child_task(supervisor, parent["id"], "One-attempt child", "child.txt", max_attempts=1)
+    supervisor.claim(child["id"], "first-worker")
+    _make_retryable(supervisor, child["id"])
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(child["id"], "second-worker")
+
+    assert error.value.code == "attempt_budget_exhausted"
+    assert supervisor.task(child["id"])["attempt_budget_exhausted_at"]
+    assert not supervisor.task(parent["id"])["descendant_attempt_budget_exhausted_at"]
+
+
+def test_cyclic_parent_link_blocks_before_budget_arithmetic(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Zero-descendant budget",
+        "Invalid ancestry takes precedence over any cap arithmetic or exhaustion marker.",
+        ["The hierarchy error is reported"],
+        ["parent.txt"],
+        max_descendant_attempts=0,
+    )
+    child = _child_task(supervisor, parent["id"], "Child", "child.txt")
+    with sqlite3.connect(supervisor.db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+            (child["id"], parent["id"]),
+        )
+
+    preview = supervisor.plan_claim(child["id"])
+    assert preview["ready"] is False
+    assert any(item["kind"] == "task_hierarchy_invalid" for item in preview["blockers"])
+    assert not any(
+        item["kind"] == "descendant_attempt_budget_exhausted" for item in preview["blockers"]
+    )
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(child["id"], "child-worker")
+    assert error.value.code == "task_hierarchy_invalid"
+    assert supervisor.task(child["id"])["attempts_used"] == 0
+    assert not supervisor.task(parent["id"])["descendant_attempt_budget_exhausted_at"]
 
 
 @pytest.mark.parametrize("invalid", [0, -1, True, 1.5, "2", 2**63])

@@ -203,12 +203,15 @@ def _attempt_budget_fields(task: dict[str, Any]) -> dict[str, Any]:
         if type(descendant_limit) is int and type(descendant_used) is int
         else None
     )
+    parent_task_id = task.get("parent_task_id")
+    if parent_task_id is not None and not isinstance(parent_task_id, str):
+        parent_task_id = f"<invalid-parent-id:{type(parent_task_id).__name__}>"
     return {
         "max_attempts": limit,
         "attempts_used": used,
         "attempts_remaining": remaining,
         "attempt_budget": attempt_budget_evidence(task["id"], limit, used),
-        "parent_task_id": task.get("parent_task_id"),
+        "parent_task_id": parent_task_id,
         "max_descendant_attempts": descendant_limit,
         "descendant_attempts_used": descendant_used,
         "descendant_attempts_remaining": descendant_remaining,
@@ -472,42 +475,52 @@ class Scheduler:
                     }
                 )
         ancestor_id = task.get("parent_task_id")
-        seen_ancestors: set[str] = set()
+        seen_ancestors = {task_id}
         planned_descendant_claims = planned_descendant_claims or {}
-        while ancestor_id:
-            if ancestor_id in seen_ancestors:
-                blockers.append({"kind": "task_hierarchy_invalid"})
+        ancestors: list[dict[str, Any]] = []
+        while ancestor_id is not None:
+            if (
+                not isinstance(ancestor_id, str)
+                or not ancestor_id.strip()
+                or ancestor_id in seen_ancestors
+            ):
                 break
             seen_ancestors.add(ancestor_id)
             ancestor = by_id.get(ancestor_id)
             if ancestor is None:
-                blockers.append({"kind": "task_hierarchy_invalid"})
                 break
-            descendant_limit = ancestor.get("max_descendant_attempts")
-            if descendant_limit is not None:
-                descendant_used = ancestor.get("descendant_attempts_used", 0)
-                planned = planned_descendant_claims.get(ancestor_id, 0)
-                if type(descendant_limit) is not int or descendant_limit < 0:
-                    blockers.append(
-                        {
-                            "kind": "descendant_attempt_budget_invalid",
-                            "ancestor_task_id": ancestor_id,
-                        }
-                    )
-                elif (
-                    type(descendant_used) is not int
-                    or descendant_used + planned >= descendant_limit
-                ):
-                    blockers.append(
-                        {
-                            "kind": "descendant_attempt_budget_exhausted",
-                            "ancestor_task_id": ancestor_id,
-                            "max_descendant_attempts": descendant_limit,
-                            "descendant_attempts_used": descendant_used,
-                            "planned_descendant_claims": planned,
-                        }
-                    )
+            ancestors.append(ancestor)
             ancestor_id = ancestor.get("parent_task_id")
+
+        if ancestor_id is not None:
+            blockers.append({"kind": "task_hierarchy_invalid"})
+        else:
+            for ancestor in ancestors:
+                ancestor_id = ancestor["id"]
+                descendant_limit = ancestor.get("max_descendant_attempts")
+                if descendant_limit is not None:
+                    descendant_used = ancestor.get("descendant_attempts_used", 0)
+                    planned = planned_descendant_claims.get(ancestor_id, 0)
+                    if type(descendant_limit) is not int or descendant_limit < 0:
+                        blockers.append(
+                            {
+                                "kind": "descendant_attempt_budget_invalid",
+                                "ancestor_task_id": ancestor_id,
+                            }
+                        )
+                    elif (
+                        type(descendant_used) is not int
+                        or descendant_used + planned >= descendant_limit
+                    ):
+                        blockers.append(
+                            {
+                                "kind": "descendant_attempt_budget_exhausted",
+                                "ancestor_task_id": ancestor_id,
+                                "max_descendant_attempts": descendant_limit,
+                                "descendant_attempts_used": descendant_used,
+                                "planned_descendant_claims": planned,
+                            }
+                        )
         blockers.extend(
             self._dependency_blockers(
                 task, by_id, self._producers(tasks), self._dependency_edges(tasks)

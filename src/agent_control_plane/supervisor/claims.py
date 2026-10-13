@@ -743,6 +743,32 @@ class ClaimsMixin:
     ) -> None:
         if task["status"] not in {"open", "orphaned", "changes_requested"}:
             return
+        # Validate lineage before any durable refusal marker, while preserving
+        # local-cap precedence when both local and ancestor caps are exhausted.
+        seen: set[str] = {task["id"]}
+        ancestor_id = task["parent_task_id"]
+        ancestors: list[sqlite3.Row] = []
+        while ancestor_id is not None:
+            if not isinstance(ancestor_id, str):
+                raise SupervisorError("task_hierarchy_invalid", "task parent id is not text")
+            if not ancestor_id.strip():
+                raise SupervisorError("task_hierarchy_invalid", "task parent id is blank")
+            if ancestor_id in seen:
+                raise SupervisorError("task_hierarchy_invalid", "task parent cycle detected")
+            seen.add(ancestor_id)
+            ancestor = connection.execute(
+                """
+                SELECT id, parent_task_id, max_descendant_attempts,
+                       descendant_attempt_budget_exhausted_at
+                FROM tasks WHERE id = ?
+                """,
+                (ancestor_id,),
+            ).fetchone()
+            if ancestor is None:
+                raise SupervisorError("task_hierarchy_invalid", "task parent is missing")
+            ancestors.append(ancestor)
+            ancestor_id = ancestor["parent_task_id"]
+
         limit = task["max_attempts"]
         if limit is not None:
             if type(limit) is not int or limit < 1:
@@ -777,28 +803,18 @@ class ClaimsMixin:
                     f"task attempt limit reached ({used}/{limit}); no new attempt was created",
                 )
 
-        self._check_descendant_attempt_budget(connection, task, actor)
+        self._check_descendant_attempt_budget(connection, task, actor, ancestors)
 
     def _check_descendant_attempt_budget(
-        self, connection: sqlite3.Connection, task: sqlite3.Row, actor: str
+        self,
+        connection: sqlite3.Connection,
+        task: sqlite3.Row,
+        actor: str,
+        ancestors: list[sqlite3.Row],
     ) -> None:
-        """Check every explicit ancestor cap in the same serialized claim transaction."""
-        seen: set[str] = {task["id"]}
-        ancestor_id = task["parent_task_id"]
-        while ancestor_id:
-            if ancestor_id in seen:
-                raise SupervisorError("task_hierarchy_invalid", "task parent cycle detected")
-            seen.add(ancestor_id)
-            ancestor = connection.execute(
-                """
-                SELECT id, parent_task_id, max_descendant_attempts,
-                       descendant_attempt_budget_exhausted_at
-                FROM tasks WHERE id = ?
-                """,
-                (ancestor_id,),
-            ).fetchone()
-            if ancestor is None:
-                raise SupervisorError("task_hierarchy_invalid", "task parent is missing")
+        """Enforce ancestor caps after the full lineage has passed validation."""
+        for ancestor in ancestors:
+            ancestor_id = ancestor["id"]
             limit = ancestor["max_descendant_attempts"]
             if limit is not None:
                 if type(limit) is not int or not 0 <= limit <= 2**63 - 1:
@@ -834,7 +850,6 @@ class ClaimsMixin:
                         f"ancestor task {ancestor_id} attempt limit reached "
                         f"({used}/{limit}); no new attempt was created",
                     )
-            ancestor_id = ancestor["parent_task_id"]
 
     def _rollback_provision(self, task_id: str, attempt_id: str) -> None:
         now = utc_now()

@@ -798,6 +798,28 @@ def test_cli_plan_queue_and_status_are_read_only_previews(tmp_path: Path) -> Non
     assert "cli-worker" in text.stdout
 
 
+def test_cli_plan_and_queue_json_sanitize_corrupt_blob_parent_id(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "malformed hierarchy", "owned.txt")
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+            (sqlite3.Binary(b"\x00\xff"), task["id"]),
+        )
+
+    plan = run_cli(repo, "plan", task["id"])
+    assert plan.returncode == 0, plan.stderr
+    preview = json.loads(plan.stdout)
+    assert preview["parent_task_id"] == "<invalid-parent-id:bytes>"
+    assert any(item["kind"] == "task_hierarchy_invalid" for item in preview["blockers"])
+
+    queue = run_cli(repo, "queue")
+    assert queue.returncode == 0, queue.stderr
+    queue_view = json.loads(queue.stdout)
+    blocked = next(item for item in queue_view["blocked"] if item["task_id"] == task["id"])
+    assert blocked["parent_task_id"] == "<invalid-parent-id:bytes>"
+
+
 def test_cli_publishes_intent_and_read_only_views_share_the_structured_snapshot(
     tmp_path: Path,
 ) -> None:

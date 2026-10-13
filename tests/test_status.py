@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import time
 import uuid
@@ -192,11 +193,19 @@ def test_status_reports_typed_local_attempt_budget_provenance(repo: Path) -> Non
 
 def test_status_reports_hierarchical_attempt_budget_provenance(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
+    grandparent = supervisor.create_task(
+        "Top-level budget",
+        "Status identifies inherited task-tree limits at every ancestor.",
+        ["Ancestor lineage is visible"],
+        ["top.txt"],
+        max_descendant_attempts=3,
+    )
     parent = supervisor.create_task(
         "Parent budget",
         "Status reports task-tree usage without equating it to provider spend.",
         ["One child attempt is visible"],
         ["parent.txt"],
+        parent_task_id=grandparent["id"],
         max_descendant_attempts=1,
     )
     child = supervisor.create_task(
@@ -225,6 +234,144 @@ def test_status_reports_hierarchical_attempt_budget_provenance(repo: Path) -> No
     assert evidence["observation_time_ref"] == "generated_at"
     assert evidence["freshness"] == "current"
     assert evidence["provider_usage"]["status"] == "unsupported"
+
+    child_entry = entry_for(snapshot, child["id"])
+    assert child_entry["parent_task_id"] == parent["id"]
+    ancestor_budgets = child_entry["ancestor_attempt_budgets"]
+    assert [budget["ancestor_task_id"] for budget in ancestor_budgets] == [
+        parent["id"],
+        grandparent["id"],
+    ]
+    assert ancestor_budgets[0]["configured_limit"] == 1
+    assert ancestor_budgets[0]["consumed"] == 1
+    assert ancestor_budgets[0]["remaining"] == 0
+    assert ancestor_budgets[0]["status"] == "exhausted"
+    assert ancestor_budgets[1]["configured_limit"] == 3
+    assert ancestor_budgets[1]["consumed"] == 2
+    assert ancestor_budgets[1]["remaining"] == 1
+    assert ancestor_budgets[1]["status"] == "enforced"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_parent", "empty_parent", "whitespace_parent", "cycle_detected"],
+)
+def test_status_flags_invalid_ancestor_lineage(repo: Path, corruption: str) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Parent budget",
+        "Status flags corrupted task ancestry instead of implying a complete budget chain.",
+        ["Lineage integrity is explicit"],
+        ["parent.txt"],
+        max_descendant_attempts=2,
+    )
+    child = supervisor.create_task(
+        "Child",
+        "The child has a normally valid parent before direct database corruption.",
+        ["Corruption is reported"],
+        ["child.txt"],
+        parent_task_id=parent["id"],
+        max_descendant_attempts=2,
+    )
+
+    if corruption == "cycle_detected":
+        supervisor.claim(parent["id"], "parent-worker")
+        supervisor.claim(child["id"], "child-worker")
+
+    with sqlite3.connect(supervisor.db_path) as connection:
+        if corruption == "missing_parent":
+            connection.execute(
+                "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+                ("missing-parent", child["id"]),
+            )
+        elif corruption in {"empty_parent", "whitespace_parent"}:
+            invalid_parent_id = "" if corruption == "empty_parent" else " "
+            connection.execute(
+                "UPDATE tasks SET id = ? WHERE id = ?", (invalid_parent_id, parent["id"])
+            )
+            connection.execute(
+                "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+                (invalid_parent_id, child["id"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+                (child["id"], parent["id"]),
+            )
+
+    snapshot = supervisor.status()
+    entry = entry_for(snapshot, child["id"])
+    assert entry["ancestor_lineage_integrity"] == {
+        "status": "invalid",
+        "issue": {
+            "kind": (
+                "missing_parent"
+                if corruption == "missing_parent"
+                else "empty_parent_id"
+                if corruption in {"empty_parent", "whitespace_parent"}
+                else corruption
+            ),
+            "task_id": (
+                "missing-parent"
+                if corruption == "missing_parent"
+                else ""
+                if corruption == "empty_parent"
+                else " "
+                if corruption == "whitespace_parent"
+                else child["id"]
+            ),
+        },
+    }
+    assert entry["ancestor_attempt_budgets"] == []
+    assert entry["descendant_attempt_budget"]["status"] == "invalid"
+    assert entry["descendant_attempt_budget"]["remaining"] is None
+    if corruption == "cycle_detected":
+        preview = supervisor.plan_claim(child["id"])
+        assert any(item["kind"] == "task_hierarchy_invalid" for item in preview["blockers"])
+        assert not any(
+            item["kind"] == "descendant_attempt_budget_exhausted" for item in preview["blockers"]
+        )
+        parent_entry = entry_for(snapshot, parent["id"])
+        assert parent_entry["ancestor_lineage_integrity"]["status"] == "invalid"
+        assert parent_entry["ancestor_attempt_budgets"] == []
+        assert parent_entry["descendant_attempt_budget"]["status"] == "invalid"
+        assert parent_entry["descendant_attempt_budget"]["remaining"] is None
+
+
+def test_status_json_sanitizes_blob_parent_id(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Parent",
+        "A malformed BLOB parent id must not break the JSON status endpoint.",
+        ["Status stays serializable"],
+        ["parent.txt"],
+    )
+    child = supervisor.create_task(
+        "Child",
+        "The parent link is corrupted after valid task creation.",
+        ["The invalid type is disclosed safely"],
+        ["child.txt"],
+        parent_task_id=parent["id"],
+    )
+    with sqlite3.connect(supervisor.db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+            (sqlite3.Binary(b"\x00\xff"), child["id"]),
+        )
+
+    snapshot = supervisor.status()
+    child_entry = entry_for(snapshot, child["id"])
+
+    assert child_entry["parent_task_id"] == "<invalid-parent-id:bytes>"
+    assert child_entry["ancestor_lineage_integrity"] == {
+        "status": "invalid",
+        "issue": {
+            "kind": "invalid_parent_id_type",
+            "task_id": "<invalid-parent-id:bytes>",
+            "value_type": "bytes",
+        },
+    }
+    assert json.loads(json.dumps(snapshot)) == snapshot
 
 
 def test_status_tracks_only_declared_glob_read_inputs_and_is_read_only(repo: Path) -> None:
