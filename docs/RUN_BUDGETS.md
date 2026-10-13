@@ -231,6 +231,37 @@ internal retries and fan-out. A worker that calls a provider directly can
 bypass these cooperative reservations. Therefore these counters are not a
 provider request limit, egress gate, quota control, token budget, or spend cap.
 
+Python clients may opt into `agent_control_plane.dispatch_client.dispatch_once`
+with `CoordinationHttpDispatchLedger` to use the reference API directly:
+
+~~~python
+from agent_control_plane.dispatch_client import CoordinationHttpDispatchLedger
+
+ledger = CoordinationHttpDispatchLedger(
+    base_url="https://acp.example",
+    bearer_token=coordination_mandate,
+)
+~~~
+
+The adapter calls the published reservation/receipt routes, keeps the bearer
+token in the Authorization header, URL-escapes path IDs, bounds JSON response
+reads, refuses redirects, and does not retry. Keep the coordination base URL
+under operator control and use HTTPS for remote services; the adapter rejects
+plain HTTP except to loopback hosts. `dispatch_once`
+refuses an idempotent reservation replay without calling `send_once`; a
+reservation error also propagates before the callback. It accepts standard
+`status_code`/`headers` responses and normalizes numeric or HTTP-date
+`Retry-After` values for the client-reported receipt. Invalid or greater-than-
+24-hour retry hints are represented as `null`; the valid HTTP status receipt is
+still recorded. A 429 is never retried automatically. If sending or receipt
+recording is ambiguous, the helper raises a sanitized error without resending;
+the durable slot remains consumed. A deliberate retry must be a new call with
+a fresh idempotency key and another reservation. The supplied provider
+transport must itself disable retries and redirects: the helper invokes a
+callback once but cannot inspect or control behavior inside that transport.
+This is not a provider adapter, universal request gate, or protection against
+direct calls or provider-internal fan-out.
+
 Task views expose local and descendant dispatch-attempt budgets with unit
 `dispatch_attempt_reservations`, consumed/remaining counts, status, source,
 enforcement point, and observation time. `reserved` and `released` remain zero:

@@ -1069,6 +1069,12 @@ clients that manage outbound model calls themselves. These durable slots are
 not provider request or spend limits; client-reported 429/Retry-After receipts
 do not schedule retries or refund capacity. See [run budgets and usage
 provenance](docs/RUN_BUDGETS.md) for the exact API contract and limitations.
+Python clients can use `CoordinationHttpDispatchLedger` with
+`agent_control_plane.dispatch_client.dispatch_once` for the published API's
+reservation and receipt routes. Its standard-library HTTP adapter uses bearer
+auth, rejects cleartext HTTP except to loopback, escapes path IDs, bounds response
+reads, and refuses redirects. This only sequences the supplied callback once:
+the caller's provider transport must still disable its own retries and redirects.
 
 ### Fenced external side effects
 

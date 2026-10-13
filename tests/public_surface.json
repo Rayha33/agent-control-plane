@@ -204,6 +204,100 @@
       "uuid"
     ]
   },
+  "agent_control_plane.dispatch_client": {
+    "class:CoordinationHttpDispatchLedger": [
+      "_post_json",
+      "record_dispatch_attempt_receipt",
+      "reserve_dispatch_attempt"
+    ],
+    "class:DispatchHttpResponse": [
+      "_abc_impl",
+      "_is_protocol"
+    ],
+    "class:DispatchLedger": [
+      "_abc_impl",
+      "_is_protocol",
+      "record_dispatch_attempt_receipt",
+      "reserve_dispatch_attempt"
+    ],
+    "class:DispatchLedgerError": [],
+    "class:DispatchLedgerHttpError": [],
+    "class:DispatchLedgerProtocolError": [],
+    "class:DispatchLedgerTransportError": [],
+    "class:DispatchOutcomeUnknown": [],
+    "class:DispatchReceiptUnrecorded": [],
+    "class:DispatchReservation": [
+      "created",
+      "dispatch_attempt_id"
+    ],
+    "class:DispatchReservationInvalid": [],
+    "class:DispatchReservationReplay": [],
+    "class:DispatchResponseInvalid": [],
+    "class:DispatchResult": [
+      "dispatch_attempt_id",
+      "response"
+    ],
+    "class:_JsonOpener": [
+      "_abc_impl",
+      "_is_protocol",
+      "open"
+    ],
+    "class:_JsonResponse": [
+      "_abc_impl",
+      "_is_protocol",
+      "close",
+      "read"
+    ],
+    "class:_NoRedirectHandler": [
+      "redirect_request"
+    ],
+    "module": [
+      "Any",
+      "Callable",
+      "CoordinationHttpDispatchLedger",
+      "DispatchHttpResponse",
+      "DispatchLedger",
+      "DispatchLedgerError",
+      "DispatchLedgerHttpError",
+      "DispatchLedgerProtocolError",
+      "DispatchLedgerTransportError",
+      "DispatchOutcomeUnknown",
+      "DispatchReceiptUnrecorded",
+      "DispatchReservation",
+      "DispatchReservationInvalid",
+      "DispatchReservationReplay",
+      "DispatchResponseInvalid",
+      "DispatchResult",
+      "Generic",
+      "HTTPError",
+      "HTTPRedirectHandler",
+      "Mapping",
+      "Protocol",
+      "Request",
+      "ResponseT",
+      "TypeVar",
+      "UTC",
+      "_JsonOpener",
+      "_JsonResponse",
+      "_MAX_COORDINATION_RESPONSE_BYTES",
+      "_NoRedirectHandler",
+      "_bounded_retry_after",
+      "_is_loopback_host",
+      "_retry_after_seconds",
+      "_safe_failure_type",
+      "annotations",
+      "build_opener",
+      "ceil",
+      "dataclass",
+      "datetime",
+      "dispatch_once",
+      "ipaddress",
+      "json",
+      "parsedate_to_datetime",
+      "quote",
+      "urlsplit"
+    ]
+  },
   "agent_control_plane.git_supervisor": {
     "class:AgentIntentMixin": [
       "_observed_changed_paths",
