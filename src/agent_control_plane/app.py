@@ -7,6 +7,8 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 from fastapi import Depends, FastAPI, Header, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -132,6 +134,45 @@ def create_app(
         return JSONResponse(
             status_code=error.status_code,
             content={"error": error.code, "message": error.message},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        route = request.scope.get("route")
+        if getattr(route, "path", None) != "/v1/tasks/{task_id}/interruption-reports":
+            return await request_validation_exception_handler(request, error)
+
+        allowed_fields = {
+            "claim_fencing_token",
+            "resource_fencing_tokens",
+            "reason",
+            "summary",
+            "checkpoint",
+            "dispatch_attempt_ids",
+        }
+        details = []
+        for item in error.errors():
+            field = next(
+                (
+                    part
+                    for part in reversed(item.get("loc", ()))
+                    if isinstance(part, str) and part in allowed_fields
+                ),
+                None,
+            )
+            detail = {"code": str(item.get("type", "validation_error"))}
+            if field is not None:
+                detail["field"] = field
+            details.append(detail)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "request_validation_error",
+                "message": "Request validation failed.",
+                "details": details,
+            },
         )
 
     def require_admin(x_control_plane_key: str = Header(default="")) -> None:

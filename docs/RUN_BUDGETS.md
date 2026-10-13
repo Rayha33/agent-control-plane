@@ -528,9 +528,15 @@ and `promotable: false`; recording it does not change task status or create a
 submission. The report is not
 host-authored evidence, a verified worktree/tree snapshot, a provider meter, a
 cancellation mechanism, or a hard stop for later dispatches. Callers must not
-include credentials or raw provider response bodies. Existing submission and
-independent-QC gates remain the only route to completion. This is a recovery
-breadcrumb, not full crash-durable result recovery.
+include credentials or raw provider response bodies. The API rejects common
+sensitive field names and credential-like values in the summary/checkpoint and
+rejects nesting deeper than 32 levels. Validation responses for this endpoint
+omit submitted values. These are guardrails, not comprehensive secret scanning
+or DLP: unknown formats may pass, so callers must still minimize and redact
+content before submission.
+Existing submission and independent-QC gates remain the only route to
+completion. This is a recovery breadcrumb, not full crash-durable result
+recovery.
 
 Example request (the checkpoint is caller-supplied JSON and is not host-verified):
 

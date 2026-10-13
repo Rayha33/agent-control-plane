@@ -498,11 +498,104 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
         "resource_fencing_tokens": resource_tokens(claim),
         "reason": "provider_quota_exhausted",
         "summary": "Stopped before submission; the latest safe checkpoint is recorded below.",
-        "checkpoint": {"phase": "tests", "last_safe_revision": "a" * 40},
+        "checkpoint": {
+            "phase": "tests",
+            "last_safe_revision": "a" * 40,
+            "debug_note": "retry_count=3",
+        },
         "dispatch_attempt_ids": [dispatch_id],
     }
     endpoint = f"/v1/tasks/{task['id']}/interruption-reports"
     headers = {"Authorization": f"Bearer {token}"}
+
+    secret_shaped_payloads = [
+        {"checkpoint": {"phase": "tests", "provider_api_key": "placeholder-value"}},
+        {"checkpoint": {"apiKey": "placeholder-value"}},
+        {"checkpoint": {"APIKey": "placeholder-value"}},
+        {"checkpoint": {"accessToken": "placeholder-value"}},
+        {"checkpoint": {"clientSecret": "placeholder-value"}},
+        {"checkpoint": {"secretKey": "placeholder-value"}},
+        {"checkpoint": {"awsSecretAccessKey": "placeholder-value"}},
+        {"checkpoint": {"authToken": "placeholder-value"}},
+        {"checkpoint": {"bearerToken": "placeholder-value"}},
+        {"checkpoint": {"sessionToken": "placeholder-value"}},
+        {"checkpoint": {"idToken": "placeholder-value"}},
+        {"checkpoint": {"apiToken": "placeholder-value"}},
+        {"checkpoint": {"githubToken": "opaque-value"}},
+        {"checkpoint": {"token": "opaque-value"}},
+        {"checkpoint": {"awsAccessKeyId": "opaque-value"}},
+        {"checkpoint": {"clientKey": "opaque-value"}},
+        {"checkpoint": {"consumerKey": "opaque-value"}},
+        {"checkpoint": {"consumerSecret": "opaque-value"}},
+        {"checkpoint": {"apiSecret": "opaque-value"}},
+        {"checkpoint": {"databasePassword": "opaque-value"}},
+        {"checkpoint": {"dbPassword": "opaque-value"}},
+        {"checkpoint": {"sessionCookie": "opaque-value"}},
+        {"checkpoint": {"serviceCredential": "opaque-value"}},
+        {"checkpoint": {"accountKey": "opaque-value"}},
+        {"checkpoint": {"storageKey": "opaque-value"}},
+        {"checkpoint": {"subscriptionKey": "opaque-value"}},
+        {"checkpoint": {"masterKey": "opaque-value"}},
+        {
+            "checkpoint": {
+                "connectionString": "DefaultEndpointsProtocol=https;AccountName=sample;"
+                "AccountKey=opaque-connection-key-value"
+            }
+        },
+        {
+            "checkpoint": {
+                "serviceConfig": "Endpoint=https://example.invalid;"
+                "SubscriptionKey=opaque-subscription-key;MasterKey=opaque-master-key"
+            }
+        },
+        {
+            "checkpoint": {
+                "connectionString": "Endpoint=sb://example.invalid/;"
+                "SharedAccessSignature=opaque-shared-access-signature"
+            }
+        },
+        {
+            "checkpoint": {
+                "query": "https://example.invalid/resource?sv=1&sig=opaque-signature-value"
+            }
+        },
+        {"checkpoint": {"environment": "AWS_SECRET_ACCESS_KEY=opaque-aws-secret-access-key"}},
+        {"checkpoint": {"tokenResponse": "refresh_token=opaque-refresh-token-value"}},
+        {"checkpoint": {"environment": "AWS_SESSION_TOKEN=opaque-aws-session-token"}},
+        {"checkpoint": {"environment": "session_token=opaque-session-token-value"}},
+        {"checkpoint": {"environment": "API_TOKEN=opaque-api-token-value"}},
+        {"checkpoint": {"environment": "GITHUB_TOKEN=opaque-github-token-value"}},
+        {"summary": "Provider rejected Authorization: Bearer " + "x" * 32},
+        {"checkpoint": {"details": ["sk-proj-" + "x" * 24]}},
+        {"checkpoint": {"details": ["password=" + "x" * 20]}},
+    ]
+    secret_sentinel = "SENTINEL_SECRET_SHOULD_NOT_ECHO_92f84e16"
+    secret_shaped_payloads.append({"checkpoint": {"clientSecret": secret_sentinel}})
+    for sensitive_fields in secret_shaped_payloads:
+        rejected = client.post(
+            endpoint,
+            headers=headers,
+            json={**request, **sensitive_fields, "dispatch_attempt_ids": []},
+        )
+        assert rejected.status_code == 422, rejected.text
+        assert secret_sentinel not in rejected.text
+
+    deeply_nested_checkpoint = {"leaf": "safe"}
+    for _ in range(40):
+        deeply_nested_checkpoint = {"nested": deeply_nested_checkpoint}
+    deeply_nested = client.post(
+        endpoint,
+        headers=headers,
+        json={**request, "checkpoint": deeply_nested_checkpoint},
+    )
+    assert deeply_nested.status_code == 422, deeply_nested.text
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM budget_interruption_reports WHERE task_id = ?",
+            (task["id"],),
+        )["count"]
+        == 0
+    )
 
     too_large = client.post(
         endpoint,
@@ -639,6 +732,13 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
             connection.execute(
                 "DELETE FROM budget_interruption_reports WHERE id = ?", (report["id"],)
             )
+
+
+def test_non_interruption_validation_errors_keep_default_input_details(client, admin_headers):
+    response = client.post("/v1/tasks", headers=admin_headers, json={"title": 123})
+
+    assert response.status_code == 422
+    assert any("input" in detail for detail in response.json()["detail"])
 
 
 def test_interruption_report_rechecks_claim_expiry_before_insert(

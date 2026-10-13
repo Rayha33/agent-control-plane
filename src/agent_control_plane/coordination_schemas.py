@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -19,6 +20,108 @@ TaskStatus = Literal[
     "orphaned",
     "conflicted",
 ]
+
+_SENSITIVE_INTERRUPTION_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b", re.IGNORECASE),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", re.IGNORECASE),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b", re.IGNORECASE),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b", re.IGNORECASE),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b", re.IGNORECASE),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    re.compile(r"://[^/\s:@]+:[^/\s@]+@"),
+)
+
+_SENSITIVE_INTERRUPTION_ASSIGNMENT = re.compile(
+    r"(?<![A-Za-z0-9])[\"']?([A-Za-z][A-Za-z0-9_.-]{0,79})[\"']?\s*[:=]\s*[\"']?[^\s&;,\"']+",
+    re.IGNORECASE,
+)
+
+_SENSITIVE_INTERRUPTION_KEY_NAMES = {
+    "auth",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "cookie",
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "passwd",
+    "private_key",
+    "secret",
+    "shared_access_signature",
+    "sig",
+    "signature",
+    "token",
+}
+
+_SENSITIVE_INTERRUPTION_KEY_SUFFIXES = (
+    "_auth",
+    "_authorization",
+    "_bearer",
+    "_cookie",
+    "_credential",
+    "_credentials",
+    "_passwd",
+    "_password",
+    "_pwd",
+    "_secret",
+    "_token",
+)
+
+_MAX_INTERRUPTION_CONTENT_DEPTH = 32
+
+
+def _is_sensitive_interruption_key(key: Any) -> bool:
+    key_text = str(key)
+    key_text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key_text)
+    key_text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key_text)
+    normalized_key = re.sub(r"[^a-zA-Z0-9]+", "_", key_text).strip("_").lower()
+    key_parts = set(normalized_key.split("_"))
+    return (
+        normalized_key in _SENSITIVE_INTERRUPTION_KEY_NAMES
+        or {"account", "key"} <= key_parts
+        or {"api", "key"} <= key_parts
+        or {"access", "key"} <= key_parts
+        or {"client", "key"} <= key_parts
+        or {"consumer", "key"} <= key_parts
+        or {"master", "key"} <= key_parts
+        or {"storage", "key"} <= key_parts
+        or {"subscription", "key"} <= key_parts
+        or {"signing", "key"} <= key_parts
+        or {"encryption", "key"} <= key_parts
+        or {"private", "key"} <= key_parts
+        or {"secret", "key"} <= key_parts
+        or {"shared", "access", "signature"} <= key_parts
+        or normalized_key.endswith(_SENSITIVE_INTERRUPTION_KEY_SUFFIXES)
+    )
+
+
+def _contains_sensitive_interruption_content(value: Any) -> bool:
+    pending = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > _MAX_INTERRUPTION_CONTENT_DEPTH:
+            raise ValueError("interruption content exceeds the maximum nesting depth")
+        if isinstance(current, dict):
+            for key, nested_value in current.items():
+                if _is_sensitive_interruption_key(key):
+                    return True
+                pending.append((nested_value, depth + 1))
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+        elif isinstance(current, str):
+            if any(pattern.search(current) for pattern in _SENSITIVE_INTERRUPTION_VALUE_PATTERNS):
+                return True
+            if any(
+                _is_sensitive_interruption_key(match.group(1))
+                for match in _SENSITIVE_INTERRUPTION_ASSIGNMENT.finditer(current)
+            ):
+                return True
+    return False
 
 
 class ReviewFinding(BaseModel):
@@ -475,21 +578,26 @@ class BudgetInterruptionReportCreate(BaseModel):
     checkpoint: dict[str, Any] = Field(default_factory=dict)
     dispatch_attempt_ids: list[str] = Field(default_factory=list, max_length=50)
 
-    @field_validator("checkpoint")
+    @field_validator("summary", "checkpoint")
     @classmethod
-    def validate_bounded_checkpoint(cls, value: dict[str, Any]) -> dict[str, Any]:
-        try:
-            serialized = json.dumps(
-                value,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
+    def validate_bounded_checkpoint(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            try:
+                serialized = json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError, RecursionError):
+                raise ValueError("checkpoint must contain JSON-compatible values") from None
+            if len(serialized.encode("utf-8")) > 8192:
+                raise ValueError("checkpoint exceeds the 8192-byte limit")
+        if _contains_sensitive_interruption_content(value):
+            raise ValueError(
+                "interruption content contains a sensitive field or credential-like value"
             )
-        except (TypeError, ValueError, RecursionError):
-            raise ValueError("checkpoint must contain JSON-compatible values") from None
-        if len(serialized.encode("utf-8")) > 8192:
-            raise ValueError("checkpoint exceeds the 8192-byte limit")
         return value
 
     @field_validator("dispatch_attempt_ids")
