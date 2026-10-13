@@ -443,6 +443,46 @@ class ClaimsMixin:
         expires = int(time.time()) + ttl
         attempt_id = str(uuid.uuid4())
         worktree_root, worktree = self._prepare_attempt_worktree(attempt_id)
+        try:
+            with self._git_operation_guard():
+                repository_common = self._run_git_while_locked(
+                    "rev-parse", "--path-format=absolute", "--git-common-dir"
+                )
+                if repository_common.returncode:
+                    raise SupervisorError(
+                        "source_repo_identity_unavailable",
+                        "source repository identity could not be proven",
+                    )
+                common_dir_text = repository_common.stdout.decode(
+                    "utf-8", errors="surrogateescape"
+                ).rstrip("\r\n")
+                common_dir = Path(common_dir_text)
+                resolved_common_dir = common_dir.resolve(strict=True)
+                if not common_dir.is_absolute() or resolved_common_dir != common_dir:
+                    raise SupervisorError(
+                        "source_repo_identity_unavailable",
+                        "source repository identity could not be proven",
+                    )
+                common_dir_stat = common_dir.stat(follow_symlinks=False)
+                if not stat.S_ISDIR(common_dir_stat.st_mode):
+                    raise SupervisorError(
+                        "source_repo_identity_unavailable",
+                        "source repository identity could not be proven",
+                    )
+                identity_payload = "\0".join(
+                    (
+                        "v1",
+                        str(common_dir),
+                        str(common_dir_stat.st_dev),
+                        str(common_dir_stat.st_ino),
+                    )
+                ).encode("utf-8")
+                source_repo_identity = "acp-repo-v1:" + hashlib.sha256(identity_payload).hexdigest()
+        except (OSError, RuntimeError, UnicodeError, ValueError) as error:
+            raise SupervisorError(
+                "source_repo_identity_unavailable",
+                "source repository identity could not be proven",
+            ) from error
         now = utc_now()
         # Resolve ``current`` once, before the attempt exists. Every later phase
         # reads this stored pin, so a rotation affects only subsequent claims.
@@ -596,9 +636,9 @@ class ClaimsMixin:
                    read_resources_snapshot_json, trust_bundle_json,
                    pid, log_path, status,
                    lease_expires_at, created_at, updated_at, base_checkout_snapshot_json,
-                   base_checkout_snapshot_required, task_brief_sha256)
+                   base_checkout_snapshot_required, source_repo_identity, task_brief_sha256)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, NULL, NULL,
-                        'provisioning', ?, ?, ?, ?, 1, ?)
+                        'provisioning', ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     attempt_id,
@@ -620,6 +660,7 @@ class ClaimsMixin:
                     now,
                     now,
                     canonical_json(base_checkout_snapshot),
+                    source_repo_identity,
                     task_brief_sha256,
                 ),
             )
@@ -691,7 +732,12 @@ class ClaimsMixin:
                 except (OSError, subprocess.SubprocessError, SupervisorError):
                     pass
                 try:
-                    self._remove_worktree(worktree, delete_branch=True, expected_branch=branch)
+                    self._remove_worktree(
+                        worktree,
+                        delete_branch=True,
+                        expected_branch=branch,
+                        source_repo_identity=source_repo_identity,
+                    )
                 except (OSError, subprocess.SubprocessError, SupervisorError):
                     pass
             else:
@@ -708,7 +754,12 @@ class ClaimsMixin:
                     registered_branch = None
                 if registered_branch == branch:
                     try:
-                        self._remove_worktree(worktree, delete_branch=True, expected_branch=branch)
+                        self._remove_worktree(
+                            worktree,
+                            delete_branch=True,
+                            expected_branch=branch,
+                            source_repo_identity=source_repo_identity,
+                        )
                     except (OSError, subprocess.SubprocessError, SupervisorError):
                         pass
             self._rollback_provision(task_id, attempt_id)
@@ -1036,7 +1087,28 @@ class ClaimsMixin:
                 declared=declared,
             )
 
-        worktree = Path(attempt["worktree"]).resolve()
+        source_repo_identity = attempt["source_repo_identity"]
+        worktree_root = attempt["worktree_root"]
+        if (
+            not source_repo_identity
+            or not worktree_root
+            or self._attempt_worktree_head(
+                attempt_id,
+                Path(attempt["worktree"]),
+                Path(worktree_root),
+                attempt["branch"],
+                source_repo_identity=source_repo_identity,
+            )
+            is None
+        ):
+            return self._guard_denial(
+                attempt_id,
+                path,
+                "attempt_worktree_identity_unverified",
+                "the attempt worktree no longer matches its registered source repository",
+                declared=declared,
+            )
+        worktree = Path(attempt["worktree"]).resolve(strict=True)
         working_directory = worktree
         if cwd is not None:
             supplied_cwd = Path(cwd)
@@ -2222,13 +2294,16 @@ class ClaimsMixin:
         """Prove the exact registered attempt worktree is still clean at its base."""
 
         worktree = Path(attempt["worktree"])
+        source_repo_identity = attempt["source_repo_identity"]
         root = (
             Path(attempt["worktree_root"])
             if attempt["worktree_root"]
             else (self.state_dir / "worktrees").resolve(strict=False)
         )
         if (
-            not self._attempt_worktree_is_managed(attempt["id"], worktree, root)
+            not isinstance(source_repo_identity, str)
+            or re.fullmatch(r"acp-repo-v1:[0-9a-f]{64}", source_repo_identity) is None
+            or not self._attempt_worktree_is_managed(attempt["id"], worktree, root)
             or worktree.is_symlink()
         ):
             raise SupervisorError(
@@ -2258,6 +2333,11 @@ class ClaimsMixin:
         common = Path(
             git("-C", canonical, "rev-parse", "--path-format=absolute", "--git-common-dir")
         ).resolve(strict=True)
+        common_stat = common.stat(follow_symlinks=False)
+        common_identity_payload = "\0".join(
+            ("v1", str(common), str(common_stat.st_dev), str(common_stat.st_ino))
+        ).encode("utf-8")
+        common_identity = "acp-repo-v1:" + hashlib.sha256(common_identity_payload).hexdigest()
         expected_common = Path(self._git_common_dir).resolve(strict=True)
         branch = git("-C", canonical, "branch", "--show-current")
         head = git("-C", canonical, "rev-parse", "--verify", "HEAD")
@@ -2265,6 +2345,8 @@ class ClaimsMixin:
         if (
             top != Path(canonical)
             or common != expected_common
+            or not stat.S_ISDIR(common_stat.st_mode)
+            or common_identity != source_repo_identity
             or branch != attempt["branch"]
             or head != base_sha
             or status.returncode != 0
@@ -3693,6 +3775,24 @@ class ClaimsMixin:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, epoch)
             self._authenticate_attempt(connection, attempt, credential)
+            source_repo_identity = attempt["source_repo_identity"]
+            worktree_root = attempt["worktree_root"]
+            if (
+                not source_repo_identity
+                or not worktree_root
+                or self._attempt_worktree_head(
+                    attempt_id,
+                    Path(attempt["worktree"]),
+                    Path(worktree_root),
+                    attempt["branch"],
+                    source_repo_identity=source_repo_identity,
+                )
+                is None
+            ):
+                raise SupervisorError(
+                    "attempt_worktree_identity_unverified",
+                    "attempt worktree no longer matches its registered source repository",
+                )
             _require_sandbox_execution_result_eligible(connection, attempt_id)
             sandbox_execution = connection.execute(
                 "SELECT 1 FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)

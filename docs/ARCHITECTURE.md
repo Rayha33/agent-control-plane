@@ -38,7 +38,7 @@ the old approval as current.
 | Record | Purpose |
 |---|---|
 | task | specification, acceptance, dependencies, declared resources, base, optional attempt cap |
-| attempt | agent, bound credential digest, branch, worktree, claim token, checkpoint, PID, latest commit, pinned trust manifest and executable identities |
+| attempt | agent, bound credential digest, branch, worktree, claim token, pinned source-repository identity, checkpoint, PID, latest commit, pinned trust manifest and executable identities |
 | resource lease | normalized resource, owner, monotonic fencing token, expiry |
 | runtime environment | generated environment, setup/teardown evidence and lifecycle state |
 | runtime allocation | unique local port-pool value, attempt owner and expiry |
@@ -49,6 +49,24 @@ the old approval as current.
 | QC run | reviewer, immutable commit, commands, outputs, structured findings, inherited attempt trust pin |
 | integration | merge result, integration commands, branch and commit |
 | event | same-transaction domain event in a hash chain |
+
+The attempt's claim-time source-repository fingerprint is write-once. Guard,
+submission, result import, supervised worker launch, expiry recovery, and GC use it
+to reject a same-path/same-branch checkout from another repository. Worker execution
+is checked before process creation and again before its blocked command gate opens;
+runtime setup and teardown hooks refuse to run unless the attempt worktree still
+matches the pin, and expiry cleanup stops when its recovery check fails. GC rechecks
+the pin while holding the Git-operation lock before removal. Legacy attempts remain
+explicitly unpinned and are retained or denied rather than being silently adopted.
+
+The schema-v33 upgrade refuses to run while an unpinned attempt is live, awaiting QC,
+integrating, or still owns unreleased runtime resources. Drain those attempts using the
+previous ACP version, then retry the migration; it never fabricates a historical pin.
+If an unpinned active attempt was already migrated by an earlier build, ACP stays
+fail-closed and requires operator recovery. These repository identity checks are
+point-in-time checks, not atomic filesystem isolation: a replacement after validation
+can race a later path-based operation. Keep workers and lifecycle hooks inside an
+OS-level sandbox with protected worktree parents.
 
 ## Invariants
 

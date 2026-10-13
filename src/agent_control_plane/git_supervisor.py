@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -341,6 +341,87 @@ def _add_attempt_worktree_root(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
     if "worktree_root" not in columns:
         connection.execute("ALTER TABLE attempts ADD COLUMN worktree_root TEXT NOT NULL DEFAULT ''")
+
+
+def _add_attempt_source_repository_identity(connection: sqlite3.Connection) -> None:
+    """Pin the source Git repository for new attempts; legacy identity stays unknown.
+
+    Do not strand a running pre-v33 attempt behind an identity value that cannot be
+    reconstructed truthfully. Refuse the upgrade until live work and runtime cleanup
+    have been drained by the old binary.
+    """
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+    tables = {
+        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "tasks" in tables:
+        legacy_identity = (
+            "COALESCE(attempt.source_repo_identity, '') = ''"
+            if "source_repo_identity" in columns
+            else "1 = 1"
+        )
+        runtime_join = (
+            "LEFT JOIN runtime_environments AS runtime ON runtime.attempt_id = attempt.id"
+            if "runtime_environments" in tables
+            else ""
+        )
+        runtime_active = (
+            "OR (runtime.attempt_id IS NOT NULL AND runtime.state != 'released')"
+            if "runtime_environments" in tables
+            else ""
+        )
+        active = connection.execute(
+            f"""
+            SELECT attempt.id
+            FROM attempts AS attempt
+            JOIN tasks AS task ON task.id = attempt.task_id
+            {runtime_join}
+            WHERE {legacy_identity}
+              AND (
+                attempt.status IN ('provisioning', 'working', 'terminating', 'quarantined')
+                OR task.status IN (
+                  'provisioning', 'working', 'terminating', 'cleanup_pending',
+                  'submitted', 'qc_review', 'approved', 'integrating'
+                )
+                {runtime_active}
+              )
+            LIMIT 1
+            """
+        ).fetchone()
+        if active:
+            raise SchemaVersionError(
+                "schema_upgrade_requires_drain",
+                "schema v33 cannot migrate while a legacy attempt is live or still owns "
+                "runtime resources; use the previous acp version to finish or safely "
+                "drain active attempts, then retry the migration",
+            )
+
+    if "source_repo_identity" not in columns:
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN source_repo_identity TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS attempts_require_source_repo_identity
+        BEFORE INSERT ON attempts
+        WHEN length(NEW.source_repo_identity) != 76
+          OR substr(NEW.source_repo_identity, 1, 12) != 'acp-repo-v1:'
+          OR substr(NEW.source_repo_identity, 13) GLOB '*[^0-9a-f]*'
+        BEGIN
+          SELECT RAISE(ABORT, 'attempt_source_repo_identity_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS attempts_source_repo_identity_immutable
+        BEFORE UPDATE OF source_repo_identity ON attempts
+        BEGIN
+          SELECT RAISE(ABORT, 'attempt_source_repo_identity_immutable');
+        END
+        """
+    )
 
 
 def _add_attempt_task_brief_pin(connection: sqlite3.Connection) -> None:
@@ -1978,6 +2059,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (30, _add_task_attempt_budget),
     (31, _add_attempt_budget_exhaustion_marker),
     (32, _add_hierarchical_attempt_budget),
+    (33, _add_attempt_source_repository_identity),
 )
 
 
@@ -2218,7 +2300,10 @@ class GitSupervisor(
 
     @staticmethod
     def _apply_migration_ledger(connection: sqlite3.Connection, stored: int | None) -> None:
-        _apply_ledger(connection, stored, MIGRATIONS)
+        try:
+            _apply_ledger(connection, stored, MIGRATIONS)
+        except SchemaVersionError as error:
+            raise SupervisorError(error.code, str(error)) from None
 
     def _finish_open(self) -> None:
         arguments = ("rev-parse", "--path-format=absolute", "--git-common-dir")

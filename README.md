@@ -53,6 +53,7 @@ wedge.
 | Atomic claims | SQLite immediate transactions make a colliding claim fail closed |
 | Fencing | Every attempt and exact resource receives a monotonic token |
 | Worktree ownership | Every successful claim provisions a dedicated branch and worktree |
+| Repository identity | A write-once claim-time fingerprint binds the attempt to its source repository; guard, submit, workers, lifecycle hooks, recovery, and GC verify it without backfilling legacy identity |
 | Crash recovery | Expired attempts become orphaned; their branch and latest committed SHA remain |
 | Runtime isolation | Attempts receive unique configured ports and lifecycle hooks; optional target preflights bind QC/integration receipts to assigned resources and the expected source revision |
 | Trusted resource drivers | Compose projects, PostgreSQL schemas, browser profiles, and CoreSimulator clones have scoped setup/probe/teardown proofs |
@@ -1142,8 +1143,17 @@ service.
   --claude-code` closes most of that gap for Claude Code by putting `acp guard` in
   front of every file-editing tool call — it refuses a write outside the attempt's
   worktree or outside the task's declared write set, using the same check `submit`
-  applies to the diff. It also requires Claude's hook-reported `cwd` to resolve inside
-  the attempt worktree and resolves relative edit paths from that directory. `Bash`
+  applies to the diff. Before allowing, the guard verifies the attempt's stored
+  repository fingerprint, exact managed-root path, Git worktree registration, and
+  branch; submission repeats that identity check. Supervised workers verify the pin
+  before process creation and once more while candidate code remains behind its
+  start gate. Expired recovery captures `HEAD` only from the pinned repository, and
+  GC retains unknown/mismatched pins and rechecks them under the Git-operation lock
+  before worktree or branch removal. Older attempts without a truthful
+  claim-time repository pin remain unknown and cannot be guarded, submitted, or
+  worker-launched, so reclaim the task to create a new attempt. It also requires Claude's hook-reported
+  `cwd` to resolve inside the attempt worktree and resolves relative edit paths from
+  that directory. `Bash`
   is deliberately not guarded: what a shell command writes cannot be read off the
   command string, and a pattern that can be walked around by rephrasing would read as
   coverage without being any. `acp mcp-serve` additionally

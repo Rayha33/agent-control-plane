@@ -814,7 +814,7 @@ class ReaperMixin:
         rows = connection.execute(
             """
             SELECT attempt.id AS attempt_id, attempt.task_id, attempt.branch,
-                   attempt.worktree, attempt.worktree_root,
+                   attempt.worktree, attempt.worktree_root, attempt.source_repo_identity,
                    attempt.status AS attempt_status,
                    attempt.updated_at AS attempt_updated_at,
                    task.status AS task_status, task.updated_at AS task_updated_at,
@@ -844,6 +844,7 @@ class ReaperMixin:
                 "branch": row["branch"],
                 "worktree": str(worktree),
                 "worktree_root": str(worktree_root),
+                "source_repo_identity": row["source_repo_identity"],
             }
             if not self._attempt_worktree_is_managed(row["attempt_id"], worktree, worktree_root):
                 retained.append({**entry, "reason": "worktree_path_unmanaged"})
@@ -853,6 +854,20 @@ class ReaperMixin:
                 and registered_worktrees.get(str(worktree.resolve(strict=False))) != row["branch"]
             ):
                 retained.append({**entry, "reason": "worktree_unregistered"})
+                continue
+            if worktree.exists() and (
+                not isinstance(row["source_repo_identity"], str)
+                or not row["source_repo_identity"]
+                or self._attempt_worktree_head(
+                    row["attempt_id"],
+                    worktree,
+                    worktree_root,
+                    row["branch"],
+                    source_repo_identity=row["source_repo_identity"],
+                )
+                is None
+            ):
+                retained.append({**entry, "reason": "source_repository_identity_unverified"})
                 continue
             worktree_bytes = self._directory_bytes(worktree) if worktree.exists() else 0
             age = _age_seconds(row["task_updated_at"], now)
@@ -957,6 +972,7 @@ class ReaperMixin:
                     worktree,
                     delete_branch=True,
                     expected_branch=entry["branch"],
+                    source_repo_identity=entry["source_repo_identity"],
                 ):
                     removed.append(entry["attempt_id"])
                     removed_entries.append(entry)
@@ -1184,13 +1200,25 @@ class ReaperMixin:
                     attempt_state = self.attempt(attempt_id)
                     worktree = Path(attempt_state["worktree"])
                     worktree_root = Path(attempt_state["worktree_root"])
-                    if worktree.exists():
+                    if worktree.exists() or worktree.is_symlink():
+                        source_identity_view = attempt_state["source_repository_identity"]
+                        source_identity = (
+                            source_identity_view["fingerprint"]
+                            if source_identity_view["status"] == "pinned"
+                            else ""
+                        )
                         latest = self._attempt_worktree_head(
                             attempt_id,
                             worktree,
                             worktree_root,
                             attempt_state["branch"],
+                            source_repo_identity=source_identity,
                         )
+                        if latest is None:
+                            raise SupervisorError(
+                                "attempt_worktree_identity_unverified",
+                                "expired attempt cleanup is fenced because its worktree identity is unverified",
+                            )
                         if latest and latest != attempt_state["latest_sha"]:
                             recovered_at = utc_now()
                             with self.connect() as connection:

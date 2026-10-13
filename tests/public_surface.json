@@ -575,6 +575,7 @@
       "_allocate_runtime",
       "_apply_migration_ledger",
       "_assert_attempt_worktree_headroom",
+      "_assert_attempt_worktree_identity",
       "_assert_base_checkout_unchanged",
       "_assert_driver_config_unchanged",
       "_assert_integration_git_boundary",
@@ -1005,6 +1006,7 @@
     "class:RuntimeMixin": [
       "_abandon_runtime",
       "_allocate_runtime",
+      "_assert_attempt_worktree_identity",
       "_assert_driver_config_unchanged",
       "_assert_restart_owner",
       "_assert_restart_owner_in",
@@ -1218,6 +1220,7 @@
       "_add_agent_intent_revisions",
       "_add_attempt_budget_exhaustion_marker",
       "_add_attempt_progress_timestamps",
+      "_add_attempt_source_repository_identity",
       "_add_attempt_task_brief_pin",
       "_add_attempt_worktree_root",
       "_add_base_checkout_snapshot",
@@ -2413,6 +2416,7 @@
     "class:RuntimeMixin": [
       "_abandon_runtime",
       "_allocate_runtime",
+      "_assert_attempt_worktree_identity",
       "_assert_driver_config_unchanged",
       "_assert_restart_owner",
       "_assert_restart_owner_in",

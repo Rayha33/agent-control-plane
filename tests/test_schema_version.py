@@ -307,6 +307,108 @@ def test_v32_hierarchical_attempt_budget_migration_preserves_legacy_unlimited_ta
     connection.close()
 
 
+def test_v33_source_repository_identity_migration_keeps_legacy_rows_unknown_and_fences_new_rows() -> (
+    None
+):
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE attempts (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO attempts (id) VALUES ('legacy-attempt')")
+
+    migration = dict(MIGRATIONS)[33]
+    migration(connection)
+    legacy = connection.execute(
+        "SELECT source_repo_identity FROM attempts WHERE id = 'legacy-attempt'"
+    ).fetchone()
+    assert legacy["source_repo_identity"] == ""
+    migration(connection)
+
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_source_repo_identity_required"):
+        connection.execute("INSERT INTO attempts (id) VALUES ('unpinned-attempt')")
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_source_repo_identity_required"):
+        connection.execute(
+            "INSERT INTO attempts (id, source_repo_identity) VALUES (?, ?)",
+            ("malformed-attempt", "wrong-repo:abc"),
+        )
+
+    identity = "acp-repo-v1:" + "a" * 64
+    connection.execute(
+        "INSERT INTO attempts (id, source_repo_identity) VALUES (?, ?)",
+        ("pinned-attempt", identity),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_source_repo_identity_immutable"):
+        connection.execute(
+            "UPDATE attempts SET source_repo_identity = ? WHERE id = 'pinned-attempt'",
+            ("acp-repo-v1:" + "b" * 64,),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="attempt_source_repo_identity_immutable"):
+        connection.execute(
+            "UPDATE attempts SET source_repo_identity = ? WHERE id = 'legacy-attempt'",
+            (identity,),
+        )
+    connection.close()
+
+
+def test_v33_migration_requires_draining_legacy_active_attempts(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER attempts_require_source_repo_identity")
+        connection.execute("DROP TRIGGER attempts_source_repo_identity_immutable")
+        connection.execute("ALTER TABLE attempts DROP COLUMN source_repo_identity")
+        connection.execute("UPDATE meta SET value = '32' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    with pytest.raises(SupervisorError) as refused:
+        GitSupervisor(repo)
+
+    assert refused.value.code == "schema_upgrade_requires_drain"
+    connection = sqlite3.connect(db_path(repo))
+    try:
+        assert (
+            connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+            ).fetchone()[0]
+            == "32"
+        )
+        assert "source_repo_identity" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(attempts)")
+        }
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = 'attempts_require_source_repo_identity'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+    # Model draining with the old binary: the task and attempt are terminal and
+    # their runtime is released. The unchanged empty pin stays unknown after upgrade.
+    with sqlite3.connect(db_path(repo)) as connection:
+        connection.execute("UPDATE attempts SET status = 'orphaned' WHERE id = ?", (attempt["id"],))
+        connection.execute(
+            "UPDATE tasks SET status = 'done', current_attempt_id = NULL WHERE id = ?",
+            (created["id"],),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+
+    migrated = GitSupervisor(repo)
+
+    assert migrated.schema_version_on_open == 32
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+    with migrated.connect() as connection:
+        legacy = connection.execute(
+            "SELECT source_repo_identity FROM attempts WHERE id = ?", (attempt["id"],)
+        ).fetchone()
+    assert legacy["source_repo_identity"] == ""
+
+
 def test_qc_latest_lookup_index_migration_is_idempotent() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row

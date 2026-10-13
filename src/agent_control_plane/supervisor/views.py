@@ -232,6 +232,11 @@ class ViewsMixin:
             "SELECT * FROM runtime_environments WHERE attempt_id = ?", (row["id"],)
         ).fetchone()
         trust_pin = json.loads(row["trust_bundle_json"] or "{}")
+        source_repo_identity = row["source_repo_identity"] or ""
+        source_repo_identity_pinned = (
+            isinstance(source_repo_identity, str)
+            and re.fullmatch(r"acp-repo-v1:[0-9a-f]{64}", source_repo_identity) is not None
+        )
         return {
             "id": row["id"],
             "task_id": row["task_id"],
@@ -241,6 +246,10 @@ class ViewsMixin:
             "worktree": row["worktree"],
             "worktree_root": row["worktree_root"]
             or str((self.state_dir / "worktrees").resolve(strict=False)),
+            "source_repository_identity": {
+                "status": "pinned" if source_repo_identity_pinned else "unknown",
+                "fingerprint": source_repo_identity if source_repo_identity_pinned else None,
+            },
             "claim_token": row["claim_token"],
             "attempt_budget": attempt_budget_evidence(
                 row["task_id"],

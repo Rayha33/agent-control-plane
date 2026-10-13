@@ -13,6 +13,7 @@ import io
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,121 @@ def test_a_declared_path_is_allowed(claimed) -> None:
     assert absolute["allow"] is True
     assert relative["allow"] is True
     assert relative["relative_path"] == "alpha.txt"
+    assert attempt["source_repository_identity"]["status"] == "pinned"
+    assert len(attempt["source_repository_identity"]["fingerprint"]) == 76
+
+
+def test_guard_denies_replaced_attempt_worktree_before_resolving_symlink(
+    claimed, repo: Path
+) -> None:
+    supervisor, attempt = claimed
+    worktree = Path(attempt["worktree"])
+    parked = worktree.with_name(f"{worktree.name}.parked")
+    worktree.rename(parked)
+    try:
+        worktree.symlink_to(repo, target_is_directory=True)
+
+        decision = supervisor.guard(attempt["id"], "alpha.txt")
+
+        assert decision["allow"] is False
+        assert decision["reason"] == "attempt_worktree_identity_unverified"
+    finally:
+        if worktree.is_symlink():
+            worktree.unlink()
+        if parked.exists():
+            parked.rename(worktree)
+
+
+def test_legacy_attempt_without_repository_identity_fails_closed(claimed) -> None:
+    supervisor, attempt = claimed
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER attempts_source_repo_identity_immutable")
+        connection.execute(
+            "UPDATE attempts SET source_repo_identity = '' WHERE id = ?", (attempt["id"],)
+        )
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt")
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "attempt_worktree_identity_unverified"
+    assert supervisor.attempt(attempt["id"])["source_repository_identity"] == {
+        "status": "unknown",
+        "fingerprint": None,
+    }
+
+
+def test_submit_rejects_same_branch_worktree_from_another_repository(
+    claimed, tmp_path: Path
+) -> None:
+    supervisor, attempt = claimed
+    original_worktree = Path(attempt["worktree"])
+    foreign_repo_path = tmp_path / "foreign-repo"
+    foreign_repo_path.mkdir()
+    foreign_repo = init_repo(foreign_repo_path)
+    assert supervisor._remove_worktree(
+        original_worktree, delete_branch=True, expected_branch=attempt["branch"]
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(foreign_repo),
+            "worktree",
+            "add",
+            "-b",
+            attempt["branch"],
+            str(original_worktree),
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt")
+    worker_marker = supervisor.root / "foreign-worker-must-not-start"
+    with pytest.raises(SupervisorError) as launch_error:
+        supervisor.run_worker(
+            attempt["id"], attempt["claim_token"], ["/usr/bin/touch", str(worker_marker)]
+        )
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "attempt_worktree_identity_unverified"
+    expected_launch_error = (
+        "attempt_worktree_identity_unverified"
+        if sys.platform.startswith("linux")
+        else "process_containment_unavailable"
+    )
+    assert launch_error.value.code == expected_launch_error
+    assert not worker_marker.exists()
+    assert error.value.code == "attempt_worktree_identity_unverified"
+    with supervisor.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM submissions WHERE task_id = ?", (attempt["task_id"],)
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_submit_rejects_attempt_worktree_branch_mismatch(claimed) -> None:
+    supervisor, attempt = claimed
+    subprocess.run(
+        ["git", "-C", attempt["worktree"], "checkout", "--detach"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    decision = supervisor.guard(attempt["id"], "alpha.txt")
+    with pytest.raises(SupervisorError) as error:
+        supervisor.submit(attempt["id"], attempt["claim_token"])
+
+    assert decision["allow"] is False
+    assert decision["reason"] == "attempt_worktree_identity_unverified"
+    assert error.value.code == "attempt_worktree_identity_unverified"
 
 
 def test_claim_snapshot_ignores_unrelated_parent_directory_updates(
