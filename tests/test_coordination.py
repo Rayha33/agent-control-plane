@@ -1341,39 +1341,48 @@ def test_outstanding_dispatch_reservation_cap_survives_restart_and_receipt_relea
     assert first.status_code == 201, first.text
     first_id = first.json()["reservation"]["id"]
 
-    Database(app.state.database.path).initialize()
-    denied = reserve_dispatch_attempt(client, task["id"], token, claim, "second-call")
-    assert denied.status_code == 409
-    assert denied.json()["error"] == "task_dispatch_outstanding_budget_exhausted"
+    restarted_app = create_app(app.state.settings)
+    assert restarted_app is not app
+    assert restarted_app.state.database.path == app.state.database.path
+    assert restarted_app.state.database is not app.state.database
+    assert restarted_app.state.coordination is not app.state.coordination
+    with TestClient(restarted_app) as restarted_client:
+        denied = reserve_dispatch_attempt(restarted_client, task["id"], token, claim, "second-call")
+        assert denied.status_code == 409
+        assert denied.json()["error"] == "task_dispatch_outstanding_budget_exhausted"
 
-    before_receipt = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
-    assert before_receipt["outstanding_dispatch_budget"]["reserved"] == 1
-    assert before_receipt["outstanding_dispatch_budget"]["released"] == 0
-    assert before_receipt["outstanding_dispatch_budget"]["remaining"] == 0
-    assert before_receipt["outstanding_dispatch_budget"]["freshness"] == "current_snapshot"
-    assert before_receipt["outstanding_dispatch_budget"]["provider_usage"]["status"] == (
-        "unsupported"
-    )
+        before_receipt = restarted_client.get(
+            f"/v1/tasks/{task['id']}", headers=admin_headers
+        ).json()
+        assert before_receipt["outstanding_dispatch_budget"]["reserved"] == 1
+        assert before_receipt["outstanding_dispatch_budget"]["released"] == 0
+        assert before_receipt["outstanding_dispatch_budget"]["remaining"] == 0
+        assert before_receipt["outstanding_dispatch_budget"]["freshness"] == ("current_snapshot")
+        assert before_receipt["outstanding_dispatch_budget"]["provider_usage"]["status"] == (
+            "unsupported"
+        )
 
-    receipt = app.state.coordination.record_dispatch_attempt_receipt(
-        task["id"],
-        first_id,
-        token,
-        DispatchAttemptReceiptCreate(
-            claim_fencing_token=claim["task"]["claim_fencing_token"],
-            http_status_code=429,
-            retry_after_seconds=60,
-        ),
-    )
-    assert receipt["created"] is True
-    after_receipt = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
-    assert after_receipt["outstanding_dispatch_budget"]["reserved"] == 0
-    assert after_receipt["outstanding_dispatch_budget"]["released"] == 1
-    assert after_receipt["outstanding_dispatch_budget"]["remaining"] == 1
-    assert after_receipt["outstanding_dispatch_budget"]["status"] == "available"
+        receipt_response = restarted_client.post(
+            f"/v1/tasks/{task['id']}/dispatch-attempts/{first_id}/receipt",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "claim_fencing_token": claim["task"]["claim_fencing_token"],
+                "http_status_code": 429,
+                "retry_after_seconds": 60,
+            },
+        )
+        assert receipt_response.status_code == 200, receipt_response.text
+        assert receipt_response.json()["created"] is True
+        after_receipt = restarted_client.get(
+            f"/v1/tasks/{task['id']}", headers=admin_headers
+        ).json()
+        assert after_receipt["outstanding_dispatch_budget"]["reserved"] == 0
+        assert after_receipt["outstanding_dispatch_budget"]["released"] == 1
+        assert after_receipt["outstanding_dispatch_budget"]["remaining"] == 1
+        assert after_receipt["outstanding_dispatch_budget"]["status"] == "available"
 
-    second = reserve_dispatch_attempt(client, task["id"], token, claim, "second-call")
-    assert second.status_code == 201, second.text
+        second = reserve_dispatch_attempt(restarted_client, task["id"], token, claim, "second-call")
+        assert second.status_code == 201, second.text
 
 
 def test_sibling_dispatch_fanout_shares_atomic_unreceipted_reservation_cap(
