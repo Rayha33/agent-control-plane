@@ -97,12 +97,14 @@
       "_claim_limit",
       "_clear_heartbeats",
       "_descendant_claim_count",
-      "_descendant_dispatch_attempt_count",
+      "_descendant_dispatch_attempt_counts",
       "_dispatch_attempt_budget_view",
       "_dispatch_attempt_count",
+      "_dispatch_attempt_outstanding_count",
       "_dispatch_attempt_receipt_view",
       "_dispatch_attempt_view",
       "_dispatch_limit",
+      "_outstanding_dispatch_budget_view",
       "_raise_claim_guard_error",
       "_raise_dispatch_guard_error",
       "_reported_provider_usage_view",
@@ -158,6 +160,10 @@
       "_abc_impl",
       "model_config"
     ],
+    "class:OutstandingDispatchBudgetView": [
+      "_abc_impl",
+      "model_config"
+    ],
     "class:ProviderUsageEvidence": [
       "_abc_impl",
       "model_config"
@@ -199,6 +205,7 @@
       "DispatchAttemptReceiptView",
       "DispatchAttemptReservationCreate",
       "HeartbeatRequest",
+      "OutstandingDispatchBudgetView",
       "ProviderUsageEvidence",
       "ProviderUsageReport",
       "QCReviewCreate",

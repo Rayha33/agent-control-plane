@@ -437,6 +437,8 @@ class DispatchRetryStopped(RuntimeError, Generic[ResponseT]):
                 in {
                     "task_dispatch_budget_exhausted",
                     "descendant_dispatch_budget_exhausted",
+                    "task_dispatch_outstanding_budget_exhausted",
+                    "descendant_dispatch_outstanding_budget_exhausted",
                 }
             )
             self.current_attempt_state = (

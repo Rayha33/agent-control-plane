@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 6
+SERVICE_SCHEMA_VERSION = 7
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -587,6 +587,174 @@ def _add_dispatch_attempt_provider_usage(connection: sqlite3.Connection) -> None
         )
 
 
+def _add_outstanding_dispatch_budgets(connection: sqlite3.Connection) -> None:
+    """Persist and enforce task-tree caps on reservations without response receipts."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+    if "max_unreceipted_dispatch_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_unreceipted_dispatch_attempts INTEGER CHECK ("
+            "max_unreceipted_dispatch_attempts IS NULL OR "
+            "(typeof(max_unreceipted_dispatch_attempts) = 'integer' "
+            "AND max_unreceipted_dispatch_attempts >= 0))"
+        )
+    if "max_descendant_unreceipted_dispatch_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_descendant_unreceipted_dispatch_attempts "
+            "INTEGER CHECK (max_descendant_unreceipted_dispatch_attempts IS NULL OR "
+            "(typeof(max_descendant_unreceipted_dispatch_attempts) = 'integer' "
+            "AND max_descendant_unreceipted_dispatch_attempts >= 0))"
+        )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS task_dispatch_outstanding_config_immutable "
+        "BEFORE UPDATE OF max_unreceipted_dispatch_attempts, "
+        "max_descendant_unreceipted_dispatch_attempts ON tasks "
+        "WHEN NEW.max_unreceipted_dispatch_attempts IS NOT OLD.max_unreceipted_dispatch_attempts "
+        "OR NEW.max_descendant_unreceipted_dispatch_attempts "
+        "IS NOT OLD.max_descendant_unreceipted_dispatch_attempts "
+        "BEGIN SELECT RAISE(ABORT, 'task_dispatch_outstanding_config_immutable'); END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS task_dispatch_outstanding_insert_guard "
+        "BEFORE INSERT ON tasks BEGIN "
+        "SELECT CASE WHEN NEW.max_unreceipted_dispatch_attempts IS NOT NULL AND "
+        "(typeof(NEW.max_unreceipted_dispatch_attempts) <> 'integer' "
+        "OR NEW.max_unreceipted_dispatch_attempts < 0) "
+        "THEN RAISE(ABORT, 'task_dispatch_outstanding_budget_invalid') END; "
+        "SELECT CASE WHEN NEW.max_descendant_unreceipted_dispatch_attempts IS NOT NULL AND "
+        "(typeof(NEW.max_descendant_unreceipted_dispatch_attempts) <> 'integer' "
+        "OR NEW.max_descendant_unreceipted_dispatch_attempts < 0) "
+        "THEN RAISE(ABORT, 'descendant_dispatch_outstanding_budget_invalid') END; END"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS dispatch_attempt_outstanding_budget_guard
+        BEFORE INSERT ON dispatch_attempt_reservations
+        BEGIN
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM tasks AS task
+                WHERE task.id = NEW.task_id
+                  AND task.max_unreceipted_dispatch_attempts IS NOT NULL
+                  AND (typeof(task.max_unreceipted_dispatch_attempts) <> 'integer'
+                       OR task.max_unreceipted_dispatch_attempts < 0)
+            ) THEN RAISE(ABORT, 'task_dispatch_outstanding_budget_invalid') END;
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM tasks AS task
+                WHERE task.id = NEW.task_id
+                  AND task.max_unreceipted_dispatch_attempts IS NOT NULL
+                  AND (
+                      SELECT COUNT(*)
+                      FROM dispatch_attempt_reservations AS reservation
+                      LEFT JOIN dispatch_attempt_receipts AS receipt
+                        ON receipt.dispatch_attempt_id = reservation.id
+                      WHERE reservation.task_id = task.id
+                        AND receipt.dispatch_attempt_id IS NULL
+                  ) >= task.max_unreceipted_dispatch_attempts
+            ) THEN RAISE(ABORT, 'task_dispatch_outstanding_budget_exhausted') END;
+            SELECT CASE WHEN EXISTS (
+                WITH RECURSIVE
+                ancestors(id, parent_task_id, cap, path, cycle) AS (
+                    SELECT parent.id, parent.parent_task_id,
+                           parent.max_descendant_unreceipted_dispatch_attempts,
+                           '|' || parent.id || '|', 0
+                    FROM tasks AS child
+                    JOIN tasks AS parent ON parent.id = child.parent_task_id
+                    WHERE child.id = NEW.task_id
+                    UNION ALL
+                    SELECT parent.id, parent.parent_task_id,
+                           parent.max_descendant_unreceipted_dispatch_attempts,
+                           ancestors.path || parent.id || '|',
+                           instr(ancestors.path, '|' || parent.id || '|') > 0
+                    FROM tasks AS parent
+                    JOIN ancestors ON parent.id = ancestors.parent_task_id
+                    WHERE ancestors.cycle = 0
+                ),
+                descendants(ancestor_id, id, path, cycle) AS (
+                    SELECT ancestor.id, child.id,
+                           '|' || ancestor.id || '|' || child.id || '|',
+                           child.id = ancestor.id
+                    FROM ancestors AS ancestor
+                    JOIN tasks AS child ON child.parent_task_id = ancestor.id
+                    UNION ALL
+                    SELECT descendants.ancestor_id, child.id,
+                           descendants.path || child.id || '|',
+                           instr(descendants.path, '|' || child.id || '|') > 0
+                    FROM tasks AS child
+                    JOIN descendants ON child.parent_task_id = descendants.id
+                    WHERE descendants.cycle = 0
+                ),
+                usage(ancestor_id, outstanding) AS (
+                    SELECT ancestor.id,
+                           COUNT(CASE WHEN receipt.dispatch_attempt_id IS NULL
+                                      THEN reservation.id END)
+                    FROM ancestors AS ancestor
+                    LEFT JOIN descendants
+                      ON descendants.ancestor_id = ancestor.id
+                    LEFT JOIN dispatch_attempt_reservations AS reservation
+                      ON reservation.task_id = descendants.id
+                    LEFT JOIN dispatch_attempt_receipts AS receipt
+                      ON receipt.dispatch_attempt_id = reservation.id
+                    GROUP BY ancestor.id
+                )
+                SELECT 1 FROM ancestors AS ancestor
+                LEFT JOIN usage ON usage.ancestor_id = ancestor.id
+                WHERE ancestor.cap IS NOT NULL
+                  AND (typeof(ancestor.cap) <> 'integer' OR ancestor.cap < 0)
+            ) THEN RAISE(ABORT, 'descendant_dispatch_outstanding_budget_invalid') END;
+            SELECT CASE WHEN EXISTS (
+                WITH RECURSIVE
+                ancestors(id, parent_task_id, cap, path, cycle) AS (
+                    SELECT parent.id, parent.parent_task_id,
+                           parent.max_descendant_unreceipted_dispatch_attempts,
+                           '|' || parent.id || '|', 0
+                    FROM tasks AS child
+                    JOIN tasks AS parent ON parent.id = child.parent_task_id
+                    WHERE child.id = NEW.task_id
+                    UNION ALL
+                    SELECT parent.id, parent.parent_task_id,
+                           parent.max_descendant_unreceipted_dispatch_attempts,
+                           ancestors.path || parent.id || '|',
+                           instr(ancestors.path, '|' || parent.id || '|') > 0
+                    FROM tasks AS parent
+                    JOIN ancestors ON parent.id = ancestors.parent_task_id
+                    WHERE ancestors.cycle = 0
+                ),
+                descendants(ancestor_id, id, path, cycle) AS (
+                    SELECT ancestor.id, child.id,
+                           '|' || ancestor.id || '|' || child.id || '|',
+                           child.id = ancestor.id
+                    FROM ancestors AS ancestor
+                    JOIN tasks AS child ON child.parent_task_id = ancestor.id
+                    UNION ALL
+                    SELECT descendants.ancestor_id, child.id,
+                           descendants.path || child.id || '|',
+                           instr(descendants.path, '|' || child.id || '|') > 0
+                    FROM tasks AS child
+                    JOIN descendants ON child.parent_task_id = descendants.id
+                    WHERE descendants.cycle = 0
+                ),
+                usage(ancestor_id, outstanding) AS (
+                    SELECT ancestor.id,
+                           COUNT(CASE WHEN receipt.dispatch_attempt_id IS NULL
+                                      THEN reservation.id END)
+                    FROM ancestors AS ancestor
+                    LEFT JOIN descendants
+                      ON descendants.ancestor_id = ancestor.id
+                    LEFT JOIN dispatch_attempt_reservations AS reservation
+                      ON reservation.task_id = descendants.id
+                    LEFT JOIN dispatch_attempt_receipts AS receipt
+                      ON receipt.dispatch_attempt_id = reservation.id
+                    GROUP BY ancestor.id
+                )
+                SELECT 1 FROM ancestors AS ancestor
+                LEFT JOIN usage ON usage.ancestor_id = ancestor.id
+                WHERE ancestor.cap IS NOT NULL
+                  AND COALESCE(usage.outstanding, 0) >= ancestor.cap
+            ) THEN RAISE(ABORT, 'descendant_dispatch_outstanding_budget_exhausted') END;
+        END;
+        """
+    )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -608,6 +776,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (4, _add_task_claim_budgets),
     (5, _add_dispatch_attempt_budgets),
     (6, _add_dispatch_attempt_provider_usage),
+    (7, _add_outstanding_dispatch_budgets),
 )
 
 SCHEMA = """

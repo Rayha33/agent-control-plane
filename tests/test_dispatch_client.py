@@ -949,7 +949,12 @@ def test_explicit_retry_policy_stops_without_an_approved_retry_hint(response, po
 
 @pytest.mark.parametrize(
     "error_code",
-    ["task_dispatch_budget_exhausted", "descendant_dispatch_budget_exhausted"],
+    [
+        "task_dispatch_budget_exhausted",
+        "descendant_dispatch_budget_exhausted",
+        "task_dispatch_outstanding_budget_exhausted",
+        "descendant_dispatch_outstanding_budget_exhausted",
+    ],
 )
 def test_explicit_retry_policy_surfaces_dispatch_cap_before_second_send(error_code: str) -> None:
     ledger = FakeLedger()

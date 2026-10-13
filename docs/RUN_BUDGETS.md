@@ -279,6 +279,26 @@ and the SQLite insert trigger rechecks live task/resource fences and cap limits.
 Descendant caps include every descendant depth and exclude the capped task's
 own reservations. A cap of zero denies all new reservations.
 
+For fan-out control, tasks may also set `max_unreceipted_dispatch_attempts`
+and `max_descendant_unreceipted_dispatch_attempts`. These cap durable
+reservations that do not yet have a response receipt, independently for one
+task or across all descendants. Reservation admission checks run in the same
+serialized transaction and are repeated by a SQLite trigger, so concurrent
+sibling launches cannot consume the same last outstanding slot. A persisted
+receipt releases that slot; an unreceipted reservation remains held across
+service restarts and blocks further work until a receipt is recorded. There is
+no timeout-based release or automatic retry because a missing receipt may mean
+the provider request is still running or its outcome is ambiguous.
+
+Task views expose `outstanding_dispatch_budget` and
+`descendant_outstanding_dispatch_budget` with the unresolved count (`reserved`),
+receipt-resolved count (`released`), remaining capacity, source, freshness, and
+enforcement point. These are reservations at the ACP coordination boundary, not
+verified provider concurrency: callers can bypass the ledger, one request may
+fan out inside a provider, and a client-reported receipt is not a provider
+attestation. Provider usage therefore remains `unsupported` for hard-limit
+decisions.
+
 These are **dispatch-attempt reservation slots**, not proof that an HTTP request
 was sent, reached a provider, or incurred cost. Each new idempotency key
 permanently consumes a slot even if the process crashes before sending or the
@@ -293,10 +313,10 @@ If a later reservation is denied, or a later attempt ends in an ambiguous send,
 invalid response, or unconfirmed receipt, `dispatch_with_retries` raises
 `DispatchRetryStopped` with the already-receipted attempt results and the
 current attempt's reservation state, provider-send state, and ID when
-available. A recognized 409 `task_dispatch_budget_exhausted` or
-`descendant_dispatch_budget_exhausted` means the reservation was denied; a lost
-or malformed reservation response is marked unknown because the server may
-already have committed the slot. The exception separately identifies whether
+available. A recognized 409 for either total-attempt cap or either
+unreceipted-reservation cap means admission was denied; a lost or malformed
+reservation response is marked unknown because the server may already have
+committed the slot. The exception separately identifies whether
 the provider send was not started, received a response, or has an unknown
 outcome. For coordinator HTTP failures it also carries the status and a bounded
 machine error code when supplied. The coordination API error body and provider
@@ -498,9 +518,10 @@ recycle the runtime.
 ## Delivery gates
 
 1. Local per-task and descendant-attempt caps and cooperative public API
-   reservation slots are implemented separately from provider meters,
-   provider-enforced retries/quota lifecycle, and partial-result recovery;
-   these slices and this document do not complete #2998.
+   reservation slots, including hierarchical unreceipted-reservation caps, are
+   implemented separately from provider meters, provider-enforced
+   retries/quota lifecycle, and crash-durable partial-result recovery; these
+   slices and this document do not complete #2998.
 2. Local launch/resource-budget enforcement must use existing ACP fencing and
    durable state, and must not duplicate or weaken #2316's descendant cap or
    #2366's truthful runtime-resource reporting.
@@ -527,6 +548,13 @@ recycle the runtime.
 - [Claude Code issue #78231](https://github.com/anthropics/claude-code/issues/78231):
   reported parallel work discarded at spend exhaustion with a request for
   budget preflight and partial-result recovery.
+- [OpenAI Codex issue #39129](https://github.com/openai/codex/issues/39129):
+  a feature request for bounded batch fan-out calls out active-worker limits,
+  aggregate budgets, and preserving successful results on partial failure.
+- [Claude Code issue #72672](https://github.com/anthropics/claude-code/issues/72672):
+  one reported rate-limit retry storm consumed 8.6 million subagent tokens in
+  226 seconds without usable output; a single issue report, not a prevalence
+  estimate.
 - [How Do AI Agents Spend Your Money?](https://arxiv.org/abs/2604.22750):
   research on token use in evaluated coding-agent tasks; results are specific
   to its dataset and setup.

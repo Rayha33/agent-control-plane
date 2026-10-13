@@ -14,6 +14,7 @@ from .coordination_schemas import (
     DispatchAttemptReceiptView,
     DispatchAttemptReservationCreate,
     HeartbeatRequest,
+    OutstandingDispatchBudgetView,
     ProviderUsageEvidence,
     ProviderUsageReport,
     QCReviewCreate,
@@ -75,9 +76,10 @@ class CoordinationService:
                      resources_json, priority, status, owner_agent_id,
                      claim_expires_at, claim_fencing_token, parent_task_id,
                      max_claims, max_descendant_claims, max_dispatch_attempts,
-                     max_descendant_dispatch_attempts, version,
+                     max_descendant_dispatch_attempts, max_unreceipted_dispatch_attempts,
+                     max_descendant_unreceipted_dispatch_attempts, version,
                      created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, NULL, 0, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     task_id,
@@ -91,6 +93,8 @@ class CoordinationService:
                     request.max_descendant_claims,
                     request.max_dispatch_attempts,
                     request.max_descendant_dispatch_attempts,
+                    request.max_unreceipted_dispatch_attempts,
+                    request.max_descendant_unreceipted_dispatch_attempts,
                     created_at,
                     created_at,
                 ),
@@ -113,6 +117,12 @@ class CoordinationService:
                     "max_descendant_claims": request.max_descendant_claims,
                     "max_dispatch_attempts": request.max_dispatch_attempts,
                     "max_descendant_dispatch_attempts": request.max_descendant_dispatch_attempts,
+                    "max_unreceipted_dispatch_attempts": (
+                        request.max_unreceipted_dispatch_attempts
+                    ),
+                    "max_descendant_unreceipted_dispatch_attempts": (
+                        request.max_descendant_unreceipted_dispatch_attempts
+                    ),
                     "parent_task_id": request.parent_task_id,
                     "priority": request.priority,
                     "resources": request.resources,
@@ -462,21 +472,48 @@ class CoordinationService:
                     ancestor["max_descendant_dispatch_attempts"],
                     "max_descendant_dispatch_attempts",
                 )
-                descendant_used = self._descendant_dispatch_attempt_count(
+                descendant_outstanding_limit = self._dispatch_limit(
+                    ancestor["max_descendant_unreceipted_dispatch_attempts"],
+                    "max_descendant_unreceipted_dispatch_attempts",
+                )
+                descendant_counts = self._descendant_dispatch_attempt_counts(
                     connection, ancestor["id"]
                 )
-                if descendant_used is None:
+                if descendant_counts is None:
                     raise ControlPlaneError(
                         409,
                         "descendant_dispatch_budget_invalid",
                         "descendant task lineage is invalid",
                     )
+                descendant_used, descendant_outstanding = descendant_counts
                 if ancestor_limit is not None and descendant_used >= ancestor_limit:
                     raise ControlPlaneError(
                         409,
                         "descendant_dispatch_budget_exhausted",
                         "an ancestor task has exhausted its descendant dispatch-attempt limit",
                     )
+                if (
+                    descendant_outstanding_limit is not None
+                    and descendant_outstanding >= descendant_outstanding_limit
+                ):
+                    raise ControlPlaneError(
+                        409,
+                        "descendant_dispatch_outstanding_budget_exhausted",
+                        "an ancestor task has exhausted its outstanding descendant "
+                        "dispatch-reservation limit",
+                    )
+
+            task_outstanding_limit = self._dispatch_limit(
+                task["max_unreceipted_dispatch_attempts"],
+                "max_unreceipted_dispatch_attempts",
+            )
+            task_outstanding = self._dispatch_attempt_outstanding_count(connection, task_id)
+            if task_outstanding_limit is not None and task_outstanding >= task_outstanding_limit:
+                raise ControlPlaneError(
+                    409,
+                    "task_dispatch_outstanding_budget_exhausted",
+                    "task has exhausted its outstanding dispatch-reservation limit",
+                )
 
             # Recheck time-based task/resource leases immediately before the
             # irreversible reservation insert; BEGIN IMMEDIATE prevents their
@@ -1144,9 +1181,23 @@ class CoordinationService:
         return int(row["count"])
 
     @staticmethod
-    def _descendant_dispatch_attempt_count(
+    def _dispatch_attempt_outstanding_count(connection: sqlite3.Connection, task_id: str) -> int:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM dispatch_attempt_reservations AS reservation
+            LEFT JOIN dispatch_attempt_receipts AS receipt
+              ON receipt.dispatch_attempt_id = reservation.id
+            WHERE reservation.task_id = ? AND receipt.dispatch_attempt_id IS NULL
+            """,
+            (task_id,),
+        ).fetchone()
+        return int(row["count"])
+
+    @staticmethod
+    def _descendant_dispatch_attempt_counts(
         connection: sqlite3.Connection, ancestor_id: str
-    ) -> int | None:
+    ) -> tuple[int, int] | None:
         rows = connection.execute(
             """
             WITH RECURSIVE descendants(id, path, cycle) AS (
@@ -1159,17 +1210,25 @@ class CoordinationService:
                 JOIN descendants ON child.parent_task_id = descendants.id
                 WHERE descendants.cycle = 0
             )
-            SELECT descendants.id, descendants.cycle, COUNT(reservation.id) AS reservations
+            SELECT descendants.id, descendants.cycle,
+                   COUNT(reservation.id) AS reservations,
+                   COUNT(CASE WHEN receipt.dispatch_attempt_id IS NULL
+                              THEN reservation.id END) AS outstanding
             FROM descendants
             LEFT JOIN dispatch_attempt_reservations AS reservation
               ON reservation.task_id = descendants.id
+            LEFT JOIN dispatch_attempt_receipts AS receipt
+              ON receipt.dispatch_attempt_id = reservation.id
             GROUP BY descendants.id, descendants.cycle
             """,
             (f"|{ancestor_id}|", ancestor_id, ancestor_id),
         ).fetchall()
         if any(row["cycle"] for row in rows):
             return None
-        return sum(int(row["reservations"]) for row in rows)
+        return (
+            sum(int(row["reservations"]) for row in rows),
+            sum(int(row["outstanding"]) for row in rows),
+        )
 
     @staticmethod
     def _raise_dispatch_guard_error(error: sqlite3.IntegrityError) -> None:
@@ -1190,6 +1249,23 @@ class CoordinationService:
             "descendant_dispatch_budget_invalid": (
                 "descendant_dispatch_budget_invalid",
                 "stored descendant dispatch-attempt budget is invalid",
+            ),
+            "task_dispatch_outstanding_budget_exhausted": (
+                "task_dispatch_outstanding_budget_exhausted",
+                "task has exhausted its outstanding dispatch-reservation limit",
+            ),
+            "descendant_dispatch_outstanding_budget_exhausted": (
+                "descendant_dispatch_outstanding_budget_exhausted",
+                "an ancestor task has exhausted its outstanding descendant "
+                "dispatch-reservation limit",
+            ),
+            "task_dispatch_outstanding_budget_invalid": (
+                "task_dispatch_outstanding_budget_invalid",
+                "stored task outstanding dispatch-reservation budget is invalid",
+            ),
+            "descendant_dispatch_outstanding_budget_invalid": (
+                "descendant_dispatch_outstanding_budget_invalid",
+                "stored descendant outstanding dispatch-reservation budget is invalid",
             ),
             "dispatch_claim_fence_invalid": (
                 "stale_claim_fencing_token",
@@ -1239,6 +1315,10 @@ class CoordinationService:
             cls._dispatch_limit(
                 parent["max_descendant_dispatch_attempts"],
                 "max_descendant_dispatch_attempts",
+            )
+            cls._dispatch_limit(
+                parent["max_descendant_unreceipted_dispatch_attempts"],
+                "max_descendant_unreceipted_dispatch_attempts",
             )
             visited.add(parent_id)
             ancestors.append(parent)
@@ -1392,8 +1472,17 @@ class CoordinationService:
             except ControlPlaneError:
                 ancestor_lineage_integrity = "invalid"
             descendant_claims = self._descendant_claim_count(connection, row["id"])
-            descendant_dispatches = self._descendant_dispatch_attempt_count(connection, row["id"])
+            descendant_dispatch_counts = self._descendant_dispatch_attempt_counts(
+                connection, row["id"]
+            )
+            descendant_dispatches = (
+                descendant_dispatch_counts[0] if descendant_dispatch_counts is not None else None
+            )
             dispatches_used = self._dispatch_attempt_count(connection, row["id"])
+            dispatches_outstanding = self._dispatch_attempt_outstanding_count(connection, row["id"])
+            descendant_dispatches_outstanding = (
+                descendant_dispatch_counts[1] if descendant_dispatch_counts is not None else None
+            )
             try:
                 claims_used: int | None = self._claim_count(row["claim_fencing_token"])
             except ControlPlaneError:
@@ -1423,6 +1512,28 @@ class CoordinationService:
             max_descendant_dispatch_attempts = (
                 row["max_descendant_dispatch_attempts"]
                 if max_descendant_dispatch_attempts_valid
+                else None
+            )
+            max_unreceipted_dispatch_attempts_valid = row[
+                "max_unreceipted_dispatch_attempts"
+            ] is None or (
+                type(row["max_unreceipted_dispatch_attempts"]) is int
+                and row["max_unreceipted_dispatch_attempts"] >= 0
+            )
+            max_unreceipted_dispatch_attempts = (
+                row["max_unreceipted_dispatch_attempts"]
+                if max_unreceipted_dispatch_attempts_valid
+                else None
+            )
+            max_descendant_unreceipted_dispatch_attempts_valid = row[
+                "max_descendant_unreceipted_dispatch_attempts"
+            ] is None or (
+                type(row["max_descendant_unreceipted_dispatch_attempts"]) is int
+                and row["max_descendant_unreceipted_dispatch_attempts"] >= 0
+            )
+            max_descendant_unreceipted_dispatch_attempts = (
+                row["max_descendant_unreceipted_dispatch_attempts"]
+                if max_descendant_unreceipted_dispatch_attempts_valid
                 else None
             )
             observed_at = utc_now()
@@ -1466,6 +1577,10 @@ class CoordinationService:
                 ),
                 "max_dispatch_attempts": max_dispatch_attempts,
                 "max_descendant_dispatch_attempts": max_descendant_dispatch_attempts,
+                "max_unreceipted_dispatch_attempts": max_unreceipted_dispatch_attempts,
+                "max_descendant_unreceipted_dispatch_attempts": (
+                    max_descendant_unreceipted_dispatch_attempts
+                ),
                 "dispatch_attempt_budget": self._dispatch_attempt_budget_view(
                     "task",
                     max_dispatch_attempts,
@@ -1481,6 +1596,31 @@ class CoordinationService:
                     observed_at,
                     reported_provider_usage=descendant_reported_usage,
                     invalid=not max_descendant_dispatch_attempts_valid,
+                ),
+                "outstanding_dispatch_budget": self._outstanding_dispatch_budget_view(
+                    "task",
+                    max_unreceipted_dispatch_attempts,
+                    dispatches_outstanding,
+                    dispatches_used - dispatches_outstanding,
+                    observed_at,
+                    invalid=not max_unreceipted_dispatch_attempts_valid,
+                ),
+                "descendant_outstanding_dispatch_budget": self._outstanding_dispatch_budget_view(
+                    "descendant_tree",
+                    max_descendant_unreceipted_dispatch_attempts,
+                    descendant_dispatches_outstanding,
+                    (
+                        descendant_dispatches - descendant_dispatches_outstanding
+                        if descendant_dispatches is not None
+                        and descendant_dispatches_outstanding is not None
+                        else None
+                    ),
+                    observed_at,
+                    invalid=(
+                        not max_descendant_unreceipted_dispatch_attempts_valid
+                        or descendant_dispatches is None
+                        or descendant_dispatches_outstanding is None
+                    ),
                 ),
                 "descendant_claim_budget": self._claim_budget_view(
                     "descendant_tree",
@@ -1778,6 +1918,68 @@ class CoordinationService:
                 ),
             ),
             reported_provider_usage=reported_provider_usage,
+        ).model_dump()
+
+    @staticmethod
+    def _outstanding_dispatch_budget_view(
+        scope: str,
+        limit: int | None,
+        reserved: int | None,
+        released: int | None,
+        observed_at: str,
+        *,
+        invalid: bool = False,
+    ) -> dict[str, Any]:
+        if (
+            invalid
+            or reserved is None
+            or released is None
+            or (limit is not None and (type(limit) is not int or limit < 0))
+        ):
+            status = "invalid"
+            safe_limit = None if type(limit) is not int or limit < 0 else limit
+            safe_reserved = None
+            safe_released = None
+            remaining = None
+            freshness = "unknown"
+        elif limit is None:
+            status = "unlimited"
+            safe_limit = None
+            safe_reserved = reserved
+            safe_released = released
+            remaining = None
+            freshness = "current_snapshot"
+        else:
+            safe_limit = limit
+            safe_reserved = reserved
+            safe_released = released
+            remaining = max(0, limit - reserved)
+            status = "exhausted" if remaining == 0 else "available"
+            freshness = "current_snapshot"
+        return OutstandingDispatchBudgetView(
+            scope=scope,
+            unit="unreceipted_dispatch_attempt_reservations",
+            limit=safe_limit,
+            reserved=safe_reserved,
+            released=safe_released,
+            remaining=remaining,
+            status=status,
+            source="dispatch_attempt_reservations_and_receipts",
+            enforcement="BEGIN IMMEDIATE reservation and SQLite trigger",
+            observed_at=observed_at,
+            freshness=freshness,
+            provider_usage=ProviderUsageEvidence(
+                status="unsupported",
+                unit=None,
+                source=None,
+                scope="provider calls and provider-internal fan-out",
+                observed_at=None,
+                freshness="unknown",
+                enforcement_point=None,
+                reason=(
+                    "no authenticated provider meter or request gate are wired to this supervisor"
+                ),
+            ),
         ).model_dump()
 
     @staticmethod

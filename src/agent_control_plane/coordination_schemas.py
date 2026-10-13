@@ -127,6 +127,27 @@ class TaskCreate(BaseModel):
             "at any depth; the task's own reservations are excluded."
         ),
     )
+    max_unreceipted_dispatch_attempts: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=2**63 - 1,
+        description=(
+            "Maximum outstanding cooperative dispatch reservations for this task. "
+            "A reservation remains outstanding until a client-reported response receipt "
+            "is persisted; this is not provider concurrency or billing enforcement."
+        ),
+    )
+    max_descendant_unreceipted_dispatch_attempts: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=2**63 - 1,
+        description=(
+            "Maximum outstanding cooperative dispatch reservations across descendants "
+            "at any depth; the task's own reservations are excluded."
+        ),
+    )
     provider_cost_limit_usd_micros: int | None = Field(
         default=None,
         strict=True,
@@ -373,6 +394,23 @@ class DispatchAttemptBudgetView(BaseModel):
     reported_provider_usage: ReportedProviderUsageView | None = None
 
 
+class OutstandingDispatchBudgetView(BaseModel):
+    """Current durable reservations that do not yet have a response receipt."""
+
+    scope: Literal["task", "descendant_tree"]
+    unit: Literal["unreceipted_dispatch_attempt_reservations"]
+    limit: StrictInt | None = Field(default=None, ge=0)
+    reserved: StrictInt | None = Field(default=None, ge=0)
+    released: StrictInt | None = Field(default=None, ge=0)
+    remaining: StrictInt | None = Field(default=None, ge=0)
+    status: Literal["available", "exhausted", "unlimited", "invalid"]
+    source: Literal["dispatch_attempt_reservations_and_receipts"]
+    enforcement: Literal["BEGIN IMMEDIATE reservation and SQLite trigger"]
+    observed_at: str
+    freshness: Literal["current_snapshot", "unknown"]
+    provider_usage: ProviderUsageEvidence
+
+
 class DispatchAttemptReceiptCreate(BaseModel):
     claim_fencing_token: StrictInt = Field(ge=1)
     http_status_code: int = Field(strict=True, ge=100, le=599)
@@ -440,6 +478,10 @@ class TaskView(BaseModel):
     max_descendant_dispatch_attempts: int | None
     dispatch_attempt_budget: DispatchAttemptBudgetView
     descendant_dispatch_attempt_budget: DispatchAttemptBudgetView
+    max_unreceipted_dispatch_attempts: int | None
+    max_descendant_unreceipted_dispatch_attempts: int | None
+    outstanding_dispatch_budget: OutstandingDispatchBudgetView
+    descendant_outstanding_dispatch_budget: OutstandingDispatchBudgetView
     version: int
     created_at: str
     updated_at: str
