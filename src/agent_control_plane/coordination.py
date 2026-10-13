@@ -1561,6 +1561,18 @@ class CoordinationService:
             http_status_code=row["http_status_code"],
             retry_after_seconds=row["retry_after_seconds"],
             received_at=row["received_at"],
+            provider_usage=ProviderUsageEvidence(
+                status="unsupported",
+                unit=None,
+                source=None,
+                scope="provider calls and provider-internal fan-out",
+                observed_at=None,
+                freshness="unknown",
+                enforcement_point=None,
+                reason=(
+                    "no authenticated provider meter or request gate are wired to this supervisor"
+                ),
+            ),
         ).model_dump()
 
     @classmethod

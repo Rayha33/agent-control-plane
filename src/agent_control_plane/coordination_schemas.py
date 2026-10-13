@@ -208,6 +208,7 @@ class DispatchAttemptReceiptView(BaseModel):
     http_status_code: int
     retry_after_seconds: int | None
     received_at: str
+    provider_usage: ProviderUsageEvidence
 
 
 class DispatchAttemptReceiptResult(BaseModel):

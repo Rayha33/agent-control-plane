@@ -59,6 +59,19 @@ def create_task(client, admin_headers, resources=None, dependencies=None, title=
     return response.json()
 
 
+def _unsupported_provider_usage():
+    return {
+        "status": "unsupported",
+        "unit": None,
+        "source": None,
+        "scope": "provider calls and provider-internal fan-out",
+        "observed_at": None,
+        "freshness": "unknown",
+        "enforcement_point": None,
+        "reason": "no authenticated provider meter or request gate are wired to this supervisor",
+    }
+
+
 def test_public_task_api_refuses_unsupported_provider_limit_before_persistence(
     client, app, admin_headers
 ):
@@ -409,6 +422,8 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     assert receipt.json()["receipt"]["source"] == "client_reported"
     assert receipt.json()["receipt"]["http_status_code"] == 429
     assert receipt.json()["receipt"]["retry_after_seconds"] == 30
+    expected_provider_usage = _unsupported_provider_usage()
+    assert receipt.json()["receipt"]["provider_usage"] == expected_provider_usage
     receipt_replay = client.post(
         receipt_url,
         headers={"Authorization": f"Bearer {token}"},
@@ -416,6 +431,7 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     )
     assert receipt_replay.status_code == 200, receipt_replay.text
     assert receipt_replay.json()["created"] is False
+    assert receipt_replay.json()["receipt"]["provider_usage"] == expected_provider_usage
     conflicting_receipt = client.post(
         receipt_url,
         headers={"Authorization": f"Bearer {token}"},
@@ -434,16 +450,6 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     assert task_view["dispatch_attempt_budget"]["remaining"] == 0
     assert task_view["dispatch_attempt_budget"]["reserved"] == 0
     assert task_view["dispatch_attempt_budget"]["released"] == 0
-    expected_provider_usage = {
-        "status": "unsupported",
-        "unit": None,
-        "source": None,
-        "scope": "provider calls and provider-internal fan-out",
-        "observed_at": None,
-        "freshness": "unknown",
-        "enforcement_point": None,
-        "reason": "no authenticated provider meter or request gate are wired to this supervisor",
-    }
     assert task_view["dispatch_attempt_budget"]["provider_usage"] == expected_provider_usage
     assert (
         task_view["descendant_dispatch_attempt_budget"]["provider_usage"] == expected_provider_usage
@@ -506,6 +512,7 @@ def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
         assert restored_reservation["status"] == "reported"
         assert restored_reservation["receipt"]["http_status_code"] == 429
         assert restored_reservation["receipt"]["retry_after_seconds"] == 17
+        assert restored_reservation["receipt"]["provider_usage"] == _unsupported_provider_usage()
 
         second = reserve_dispatch_attempt(
             restarted_client, task["id"], token, claim, "restart-call-2"
