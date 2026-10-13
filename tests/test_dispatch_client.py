@@ -22,6 +22,7 @@ from agent_control_plane.dispatch_client import (
     DispatchReservationReplay,
     DispatchResponseInvalid,
     DispatchRetryPolicy,
+    DispatchRetryStopped,
     dispatch_anthropic_messages_once,
     dispatch_gemini_generate_content_once,
     dispatch_once,
@@ -58,6 +59,7 @@ class FakeLedger:
         self.reserve_error: Exception | None = None
         self.receipt_error: Exception | None = None
         self.reservation_limit: int | None = None
+        self.reservation_error_code = "task_dispatch_budget_exhausted"
 
     def reserve_dispatch_attempt(
         self,
@@ -77,7 +79,7 @@ class FakeLedger:
         if existing is not None:
             return DispatchReservation(existing.dispatch_attempt_id, created=False)
         if self.reservation_limit is not None and len(self.reservations) >= self.reservation_limit:
-            raise RuntimeError("task_dispatch_budget_exhausted")
+            raise DispatchLedgerHttpError(409, error_code=self.reservation_error_code)
         reservation = DispatchReservation(
             dispatch_attempt_id=f"attempt-{len(self.reservations) + 1}", created=True
         )
@@ -945,13 +947,19 @@ def test_explicit_retry_policy_stops_without_an_approved_retry_hint(response, po
     assert len(ledger.receipts) == 1
 
 
-def test_explicit_retry_policy_surfaces_dispatch_cap_before_second_send() -> None:
+@pytest.mark.parametrize(
+    "error_code",
+    ["task_dispatch_budget_exhausted", "descendant_dispatch_budget_exhausted"],
+)
+def test_explicit_retry_policy_surfaces_dispatch_cap_before_second_send(error_code: str) -> None:
     ledger = FakeLedger()
     ledger.reservation_limit = 1
-    responses = [FakeResponse(503, retry_after_seconds=0)]
+    ledger.reservation_error_code = error_code
+    response = FakeResponse(503, retry_after_seconds=0)
+    responses = [response]
     sends: list[None] = []
 
-    with pytest.raises(RuntimeError, match="task_dispatch_budget_exhausted"):
+    with pytest.raises(DispatchRetryStopped) as stopped:
         _dispatch_retries(
             ledger,
             "retry-cap",
@@ -960,8 +968,127 @@ def test_explicit_retry_policy_surfaces_dispatch_cap_before_second_send() -> Non
             lambda _delay: None,
         )
 
+    assert stopped.value.http_status_code == 409
+    assert stopped.value.error_code == error_code
+    assert stopped.value.failure_type == "DispatchLedgerHttpError"
+    assert stopped.value.current_attempt_state == "reservation_denied"
+    assert stopped.value.reservation_state == "denied"
+    assert stopped.value.provider_send_state == "not_started"
+    assert stopped.value.current_attempt_id is None
+    assert len(stopped.value.attempts) == 1
+    assert stopped.value.attempts[0].response is response
+    assert stopped.value.attempts[0].dispatch_attempt_id == "attempt-1"
+    assert "task_dispatch_budget_exhausted" not in str(stopped.value)
     assert sends == [None]
     assert ledger.reservation_keys == ["retry-cap:attempt:1", "retry-cap:attempt:2"]
+    assert ledger.receipts == [("attempt-1", 503, 0)]
+
+
+def test_retry_interruption_marks_lost_reservation_response_as_unknown() -> None:
+    class CommitThenLoseReservationResponseLedger(FakeLedger):
+        def reserve_dispatch_attempt(self, **kwargs) -> DispatchReservation:
+            reservation = super().reserve_dispatch_attempt(**kwargs)
+            if kwargs["idempotency_key"].endswith(":attempt:2"):
+                raise DispatchLedgerTransportError("TimeoutError")
+            return reservation
+
+    ledger = CommitThenLoseReservationResponseLedger()
+    first_response = FakeResponse(503, retry_after_seconds=0)
+    sends: list[None] = []
+
+    with pytest.raises(DispatchRetryStopped) as stopped:
+        _dispatch_retries(
+            ledger,
+            "retry-reservation-timeout",
+            lambda _provider_idempotency_key: (sends.append(None), first_response)[1],
+            DispatchRetryPolicy(max_attempts=3, max_retry_after_seconds=1),
+            lambda _delay: None,
+        )
+
+    assert stopped.value.failure_type == "DispatchLedgerTransportError"
+    assert stopped.value.current_attempt_state == "reservation_outcome_unknown"
+    assert stopped.value.reservation_state == "unknown"
+    assert stopped.value.provider_send_state == "not_started"
+    assert stopped.value.current_attempt_id is None
+    assert len(stopped.value.attempts) == 1
+    assert stopped.value.attempts[0].response is first_response
+    assert sends == [None]
+    assert ledger.reservation_keys == [
+        "retry-reservation-timeout:attempt:1",
+        "retry-reservation-timeout:attempt:2",
+    ]
+    assert len(ledger.reservations) == 2
+    assert ledger.receipts == [("attempt-1", 503, 0)]
+
+
+def test_retry_interruption_preserves_prior_receipt_when_later_send_is_ambiguous() -> None:
+    ledger = FakeLedger()
+    first_response = FakeResponse(503, retry_after_seconds=0)
+    sends: list[None] = []
+
+    def send_once(_provider_idempotency_key: str) -> FakeResponse:
+        sends.append(None)
+        if len(sends) == 1:
+            return first_response
+        raise TimeoutError("provider outcome contains sensitive detail")
+
+    with pytest.raises(DispatchRetryStopped) as stopped:
+        _dispatch_retries(
+            ledger,
+            "retry-timeout",
+            send_once,
+            DispatchRetryPolicy(max_attempts=3, max_retry_after_seconds=1),
+            lambda _delay: None,
+        )
+
+    rendered = "".join(traceback.format_exception(stopped.value))
+    assert stopped.value.failure_type == "DispatchOutcomeUnknown"
+    assert stopped.value.current_attempt_state == "outcome_unknown"
+    assert stopped.value.reservation_state == "created"
+    assert stopped.value.provider_send_state == "unknown"
+    assert stopped.value.current_attempt_id == "attempt-2"
+    assert stopped.value.current_attempt_http_status_code is None
+    assert len(stopped.value.attempts) == 1
+    assert stopped.value.attempts[0].response is first_response
+    assert "sensitive detail" not in str(stopped.value)
+    assert "sensitive detail" not in rendered
+    assert sends == [None, None]
+    assert ledger.receipts == [("attempt-1", 503, 0)]
+
+
+def test_retry_interruption_preserves_prior_receipt_when_later_receipt_fails() -> None:
+    ledger = FakeLedger()
+    first_response = FakeResponse(503, retry_after_seconds=0)
+    sends: list[None] = []
+
+    def send_once(_provider_idempotency_key: str) -> FakeResponse:
+        sends.append(None)
+        if len(sends) == 1:
+            return first_response
+        ledger.receipt_error = TimeoutError("receipt response contains sensitive detail")
+        return FakeResponse(200)
+
+    with pytest.raises(DispatchRetryStopped) as stopped:
+        _dispatch_retries(
+            ledger,
+            "retry-receipt-failure",
+            send_once,
+            DispatchRetryPolicy(max_attempts=3, max_retry_after_seconds=1),
+            lambda _delay: None,
+        )
+
+    rendered = "".join(traceback.format_exception(stopped.value))
+    assert stopped.value.failure_type == "DispatchReceiptUnrecorded"
+    assert stopped.value.current_attempt_state == "receipt_unconfirmed"
+    assert stopped.value.reservation_state == "created"
+    assert stopped.value.provider_send_state == "response_received"
+    assert stopped.value.current_attempt_id == "attempt-2"
+    assert stopped.value.current_attempt_http_status_code == 200
+    assert len(stopped.value.attempts) == 1
+    assert stopped.value.attempts[0].response is first_response
+    assert "sensitive detail" not in str(stopped.value)
+    assert "sensitive detail" not in rendered
+    assert sends == [None, None]
     assert ledger.receipts == [("attempt-1", 503, 0)]
 
 
@@ -1545,13 +1672,16 @@ def test_bounded_retry_sequence_integrates_with_reference_api(client, admin_head
 
 def test_coordination_http_adapter_does_not_send_after_api_error_or_redirect() -> None:
     error_body_secret = "API body secret"
+    error_body = json.dumps(
+        {"error": "task_dispatch_budget_exhausted", "message": error_body_secret}
+    )
     opener = FakeApiOpener(
         HTTPError(
             "https://coord.example/private?token=not-logged",
             409,
             error_body_secret,
             {},
-            io.BytesIO(error_body_secret.encode()),
+            io.BytesIO(error_body.encode()),
         )
     )
     ledger = CoordinationHttpDispatchLedger(
@@ -1570,11 +1700,46 @@ def test_coordination_http_adapter_does_not_send_after_api_error_or_redirect() -
 
     rendered = "".join(traceback.format_exception(failure.value))
     assert failure.value.status_code == 409
+    assert failure.value.error_code == "task_dispatch_budget_exhausted"
     assert error_body_secret not in str(failure.value)
     assert error_body_secret not in rendered
+    assert "task_dispatch_budget_exhausted" not in rendered
     assert "not-logged" not in rendered
     assert failure.value.__cause__ is None
     assert failure.value.__context__ is None
+    assert len(opener.requests) == 1
+
+
+def test_coordination_http_adapter_sanitizes_error_code_from_response_status() -> None:
+    error_body_secret = "API response body secret"
+    opener = FakeApiOpener(
+        FakeApiResponse(
+            409,
+            {
+                "error": "task dispatch budget exhausted",
+                "message": error_body_secret,
+            },
+        )
+    )
+    ledger = CoordinationHttpDispatchLedger(
+        base_url="https://coord.example",
+        bearer_token="bearer-secret",
+        opener=opener,
+    )
+
+    with pytest.raises(DispatchLedgerHttpError) as failure:
+        ledger.reserve_dispatch_attempt(
+            task_id="task-1",
+            claim_fencing_token=7,
+            resource_fencing_tokens={},
+            idempotency_key="call-1",
+        )
+
+    rendered = "".join(traceback.format_exception(failure.value))
+    assert failure.value.status_code == 409
+    assert failure.value.error_code is None
+    assert error_body_secret not in str(failure.value)
+    assert error_body_secret not in rendered
     assert len(opener.requests) == 1
 
 

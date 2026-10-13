@@ -289,6 +289,22 @@ new key and another available slot. Slots are never released or refunded.
 Reservations retain the task and resource fencing-token snapshot that was
 checked at creation. Reservation and client-reported receipt rows survive a
 service restart; task views recompute consumed slots from those persisted rows.
+If a later reservation is denied, or a later attempt ends in an ambiguous send,
+invalid response, or unconfirmed receipt, `dispatch_with_retries` raises
+`DispatchRetryStopped` with the already-receipted attempt results and the
+current attempt's reservation state, provider-send state, and ID when
+available. A recognized 409 `task_dispatch_budget_exhausted` or
+`descendant_dispatch_budget_exhausted` means the reservation was denied; a lost
+or malformed reservation response is marked unknown because the server may
+already have committed the slot. The exception separately identifies whether
+the provider send was not started, received a response, or has an unknown
+outcome. For coordinator HTTP failures it also carries the status and a bounded
+machine error code when supplied. The coordination API error body and provider
+credentials are not copied into the exception; prior provider response objects
+remain available in `attempts`. The current attempt is never labeled receipted
+or retried by this helper. This makes partial responses recoverable by the
+caller; it does not resume the sequence, release a consumed slot, or make an
+incomplete task successful.
 
 The optional receipt endpoint records one immutable response observation and
 labels it `source: client_reported`. In particular, a client-reported 429 or

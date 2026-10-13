@@ -71,8 +71,9 @@ class DispatchLedgerError(RuntimeError):
 
 
 class DispatchLedgerHttpError(DispatchLedgerError):
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, error_code: str | None = None) -> None:
         self.status_code = status_code
+        self.error_code = _safe_api_error_code(error_code)
         super().__init__(f"coordination API returned HTTP {status_code}")
 
 
@@ -114,6 +115,7 @@ class _ProviderHttpOpener(Protocol):
 
 
 _MAX_COORDINATION_RESPONSE_BYTES = 1_048_576
+_MAX_COORDINATION_ERROR_BYTES = 16_384
 _MAX_OPENAI_RESPONSES_BYTES = 16_777_216
 _MAX_PROVIDER_RESPONSE_BYTES = 16_777_216
 _OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -240,7 +242,12 @@ class CoordinationHttpDispatchLedger:
         try:
             response = self._opener.open(request, timeout=self._timeout_seconds)
         except HTTPError as exc:
-            error = DispatchLedgerHttpError(exc.code)
+            error_code = _read_dispatch_api_error_code(exc)
+            try:
+                exc.close()
+            except Exception:
+                pass
+            error = DispatchLedgerHttpError(exc.code, error_code)
         except Exception as exc:
             error = DispatchLedgerTransportError(_safe_failure_type(exc))
         else:
@@ -254,7 +261,7 @@ class CoordinationHttpDispatchLedger:
             if type(status_code) is not int:
                 raise DispatchLedgerProtocolError()
             if status_code != expected_status:
-                raise DispatchLedgerHttpError(status_code)
+                raise DispatchLedgerHttpError(status_code, _read_dispatch_api_error_code(response))
             response_body = response.read(_MAX_COORDINATION_RESPONSE_BYTES + 1)
         except DispatchLedgerError:
             raise
@@ -402,6 +409,69 @@ class DispatchRetryResult(Generic[ResponseT]):
         return self.attempts[-1].response
 
 
+class DispatchRetryStopped(RuntimeError, Generic[ResponseT]):
+    """A retry sequence stopped; prior receipted attempts remain available."""
+
+    def __init__(
+        self,
+        attempts: tuple[DispatchResult[ResponseT], ...],
+        failure: Exception,
+    ) -> None:
+        self.attempts = attempts
+        self.http_status_code = (
+            failure.status_code if isinstance(failure, DispatchLedgerHttpError) else None
+        )
+        self.error_code = (
+            failure.error_code if isinstance(failure, DispatchLedgerHttpError) else None
+        )
+        self.failure_type = _safe_failure_type(failure)
+        self.current_attempt_id = getattr(failure, "dispatch_attempt_id", None)
+        self.current_attempt_http_status_code = (
+            failure.http_status_code if isinstance(failure, DispatchReceiptUnrecorded) else None
+        )
+        if isinstance(failure, DispatchLedgerError):
+            budget_denied = (
+                isinstance(failure, DispatchLedgerHttpError)
+                and failure.status_code == 409
+                and failure.error_code
+                in {
+                    "task_dispatch_budget_exhausted",
+                    "descendant_dispatch_budget_exhausted",
+                }
+            )
+            self.current_attempt_state = (
+                "reservation_denied" if budget_denied else "reservation_outcome_unknown"
+            )
+            self.reservation_state = "denied" if budget_denied else "unknown"
+            self.provider_send_state = "not_started"
+        elif isinstance(failure, DispatchReservationReplay):
+            self.current_attempt_state = "reservation_replayed"
+            self.reservation_state = "existing"
+            self.provider_send_state = "not_started"
+        elif isinstance(failure, DispatchReservationInvalid):
+            self.current_attempt_state = "reservation_outcome_unknown"
+            self.reservation_state = "unknown"
+            self.provider_send_state = "not_started"
+        elif isinstance(failure, DispatchOutcomeUnknown):
+            self.current_attempt_state = "outcome_unknown"
+            self.reservation_state = "created"
+            self.provider_send_state = "unknown"
+        elif isinstance(failure, DispatchResponseInvalid):
+            self.current_attempt_state = "response_unreceipted"
+            self.reservation_state = "created"
+            self.provider_send_state = "response_received"
+        elif isinstance(failure, DispatchReceiptUnrecorded):
+            self.current_attempt_state = "receipt_unconfirmed"
+            self.reservation_state = "created"
+            self.provider_send_state = "response_received"
+        else:
+            raise TypeError("failure must be a known dispatch interruption")
+        super().__init__(
+            "dispatch retry sequence stopped; prior receipted attempts remain available; "
+            f"current attempt state: {self.current_attempt_state}"
+        )
+
+
 _RETRYABLE_SERVER_STATUS_CODES = frozenset({500, 502, 503, 504})
 _RETRY_IDEMPOTENCY_KEY_MAX_LENGTH = 188
 
@@ -454,15 +524,27 @@ def dispatch_with_retries(
     attempts: list[DispatchResult[ResponseT]] = []
     total_wait_seconds = 0
     for attempt_number in range(1, policy.max_attempts + 1):
-        result = dispatch_once(
-            ledger=ledger,
-            task_id=task_id,
-            claim_fencing_token=claim_fencing_token,
-            resource_fencing_tokens=resource_fencing_tokens,
-            idempotency_key=f"{idempotency_key}:attempt:{attempt_number}",
-            send_once=lambda: send_once(provider_idempotency_key),
-            usage_report_from_response=usage_report_from_response,
-        )
+        try:
+            result = dispatch_once(
+                ledger=ledger,
+                task_id=task_id,
+                claim_fencing_token=claim_fencing_token,
+                resource_fencing_tokens=resource_fencing_tokens,
+                idempotency_key=f"{idempotency_key}:attempt:{attempt_number}",
+                send_once=lambda: send_once(provider_idempotency_key),
+                usage_report_from_response=usage_report_from_response,
+            )
+        except (
+            DispatchLedgerError,
+            DispatchReservationReplay,
+            DispatchReservationInvalid,
+            DispatchOutcomeUnknown,
+            DispatchResponseInvalid,
+            DispatchReceiptUnrecorded,
+        ) as exc:
+            if attempts:
+                raise DispatchRetryStopped(tuple(attempts), exc) from None
+            raise
         attempts.append(result)
         delay = result.retry_after_seconds
         if (
@@ -988,6 +1070,35 @@ def _is_loopback_host(hostname: str | None) -> bool:
         return False
 
 
+def _read_dispatch_api_error_code(response: Any) -> str | None:
+    """Read only a bounded, machine-readable API error code; discard its body."""
+
+    try:
+        body = response.read(_MAX_COORDINATION_ERROR_BYTES + 1)
+    except Exception:
+        return None
+    if not isinstance(body, bytes) or len(body) > _MAX_COORDINATION_ERROR_BYTES:
+        return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    return _safe_api_error_code(payload.get("error"))
+
+
+def _safe_api_error_code(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 64
+        or value[0] not in "abcdefghijklmnopqrstuvwxyz"
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in value)
+    ):
+        return None
+    return value
+
+
 __all__ = [
     "DispatchHttpResponse",
     "DispatchLedger",
@@ -1007,6 +1118,7 @@ __all__ = [
     "DispatchResult",
     "DispatchRetryPolicy",
     "DispatchRetryResult",
+    "DispatchRetryStopped",
     "dispatch_with_retries",
     "dispatch_anthropic_messages_once",
     "dispatch_gemini_generate_content_once",
