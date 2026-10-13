@@ -6245,7 +6245,13 @@ def test_pipe_failure_does_not_leave_launch_reservation(
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
+    # Prove this attempt passes the new repository-identity preflight before
+    # injecting a host pipe failure. Stub only the repeated preflight inside
+    # run_worker so the fault reaches its own launch-pipe boundary, not Git's
+    # subprocess capture pipes.
+    supervisor._preflight_direct_worker_launch(attempt["id"], attempt["claim_token"], None)
     with monkeypatch.context() as patch:
+        patch.setattr(supervisor, "_preflight_direct_worker_launch", lambda *_args, **_kwargs: None)
         patch.setattr(
             "agent_control_plane.git_supervisor.os.pipe",
             lambda: (_ for _ in ()).throw(OSError("injected pipe failure")),
