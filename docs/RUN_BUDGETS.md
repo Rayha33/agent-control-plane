@@ -65,6 +65,30 @@ counts are not billable currency: model, cache, input/output mix, provider
 pricing version, plan, and quota window may differ. Do not calculate dollars
 without an authoritative rate card and its version.
 
+## Provider capability examples
+
+Provider controls are not interchangeable. This snapshot was checked against
+official documentation on 2026-10-13; it is an adapter-design input, not a
+guarantee that any particular account has the feature enabled.
+
+| Provider | Documented control | Boundary that ACP must preserve |
+| --- | --- | --- |
+| OpenAI API | Monthly organization/project spend limits can be set as alerts or explicitly configured with “Enforce a hard limit”; hard-limit requests return `429` after tracked spend reaches the limit. | Enforcement is not instantaneous and recorded spend can slightly exceed the configured limit. Provider usage/cost reporting does not establish that every request for one ACP task is isolated or stopped. [Spend limits](https://developers.openai.com/api/docs/guides/spend-limits) · [Usage API](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage) |
+| Anthropic Claude API | Usage reports can be filtered by workspace, model, and API key; cost reports can be filtered by workspace, model, and month. Prepaid organizations stop accepting new API calls after credits are depleted. | The documented cost report does not provide per-user attribution. A timed-out/disconnected request that was on track to succeed can still be charged. Invoiced accounts are billed monthly rather than stopped by a prepaid-credit balance. [Usage and cost reports](https://support.claude.com/en/articles/9534590-cost-and-usage-reporting-in-the-claude-console) · [API billing and credits](https://support.claude.com/en/articles/8977456-how-do-i-pay-for-my-claude-api-usage) |
+| Google Gemini API | AI Studio offers monthly project spend caps, but not for Invoiced/Offline accounts. Cloud Billing spend caps are monthly and scoped to one project plus one eligible service for first-party billing accounts. | AI Studio project caps are experimental and may lag by about ten minutes; long-running agent sessions may exceed them. Cloud spend caps use estimated gross costs, block new usage only after enforcement, and allow in-flight requests to finish; overage remains possible. [Gemini API billing](https://ai.google.dev/gemini-api/docs/billing) · [Cloud Billing spend caps](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) |
+
+The cross-provider design implication is that native spend controls are useful
+account/project backstops, but they are not a portable per-task reservation
+protocol. An isolated provider scope can reduce cross-run interference only
+when its vendor-specific lag, in-flight behavior, reset, and overage semantics
+are explicitly accepted and surfaced; it must not be presented as an exact
+spend ceiling. An ACP-enforced per-task dispatch limit additionally requires a
+trusted request gate through which every billable call must pass. The gate must
+reserve before dispatch and fail closed when usage, scope, or freshness is
+unsupported. Provider dashboards and delayed usage reports remain `reported`
+evidence, not per-task enforcement. ACP must not enable, change, or lift account
+spend controls implicitly.
+
 A hard constraint is admissible only when a control point can observe and
 prevent every operation that could consume that budget. If the operator asks
 for a hard provider-spend ceiling but the configured adapter cannot enforce
