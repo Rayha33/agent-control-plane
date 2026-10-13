@@ -109,6 +109,38 @@ unsupported. Provider dashboards and delayed usage reports remain `reported`
 evidence, not per-task enforcement. ACP must not enable, change, or lift account
 spend controls implicitly.
 
+### CLI routing as a broker seam
+
+Official CLI configuration shows a practical integration seam for a future
+ACP-owned provider broker: launch the CLI against a configured gateway endpoint
+and make that gateway the only route to the provider. The endpoint setting by
+itself is not proof that all inference, retries, or internal fan-out crossed the
+broker. This is feasibility evidence only; the current ACP worker has no
+integrated provider broker or provider-route egress proof.
+
+| CLI surface | Documented route | Scope and limitation |
+| --- | --- | --- |
+| Codex CLI | A custom `model_providers.<id>.base_url` can select a gateway, with a provider key supplied via `env_key` or command-backed auth. | Custom providers use the Responses wire API. Request retries default to 4 and stream retries to 5, so a broker design must account for these retry paths; a configured base URL alone does not prove there is no direct fallback or other billable path. Do not confuse Codex CLI's provider URL with the separate OpenAI API CLI's `OPENAI_BASE_URL`. [Configuration](https://developers.openai.com/codex/config-advanced) · [Reference](https://developers.openai.com/codex/config-reference) · [OpenAI API CLI](https://developers.openai.com/api/reference/cli) |
+| Claude Code | Current docs support `ANTHROPIC_BASE_URL` plus an explicit gateway credential (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `apiKeyHelper`). | While a gateway credential is active, it replaces the saved subscription login; requests are billed per token to the account that owns the upstream provider credential the gateway forwards, and the subscription's usage limits do not apply. Managed `allowedProviders` settings can pin a custom endpoint and reject other Claude Code provider routes, but do not establish containment for the whole worker or other traffic. Anthropic does not endorse, maintain, or audit third-party gateway products. [Gateway overview](https://code.claude.com/docs/en/llm-gateway) · [Connect to a gateway](https://code.claude.com/docs/en/llm-gateway-connect) |
+| Gemini CLI | `GOOGLE_GEMINI_BASE_URL` overrides the Gemini API endpoint when using `gemini-api-key` auth; `GOOGLE_VERTEX_BASE_URL` is the corresponding Vertex override. | The documented Gemini endpoint override is auth-mode-specific; it is not a universal interception setting for OAuth/consumer sign-in. Never piggyback a user's OAuth session through a third-party broker. [Configuration](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md) · [Authentication FAQ](https://github.com/google-gemini/gemini-cli/blob/main/docs/resources/faq.md) |
+
+For any provider hard cap, ACP would need to materialize a per-attempt
+configuration and narrowly scoped gateway credential from trusted settings,
+remove inherited provider credentials that could bypass the gateway, and
+enforce network egress so the worker cannot connect directly to provider
+endpoints. The gateway must reserve against the task-tree budget before each
+upstream request, account for automatic retries and concurrent descendants,
+and return attributable usage receipts. A hard dollar cap additionally needs
+enforced per-request usage ceilings and a conservative maximum billable
+reservation for every in-flight request and its retry path, covering every
+billable feature with a versioned rate card. If any feature or usage bound is
+unknown, refuse the dollar cap instead of promising an exact ceiling. Exercise
+the actual CLI binary against an offline fake gateway, including retry and
+streaming interruption cases, and prove direct egress is denied before
+advertising the capability. If the worker cannot establish these conditions, a
+configured endpoint is routing metadata only and provider usage remains
+`unsupported` for hard-cap admission.
+
 A hard constraint is admissible only when a control point can observe and
 prevent every operation that could consume that budget. If the operator asks
 for a hard provider-spend ceiling but the configured adapter cannot enforce
