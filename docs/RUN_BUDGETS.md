@@ -77,6 +77,26 @@ guarantee that any particular account has the feature enabled.
 | Anthropic Claude API | Usage reports can be filtered by workspace, model, and API key; cost reports can be filtered by workspace, model, and month. Prepaid organizations stop accepting new API calls after credits are depleted. | The documented cost report does not provide per-user attribution. A timed-out/disconnected request that was on track to succeed can still be charged. Invoiced accounts are billed monthly rather than stopped by a prepaid-credit balance. [Usage and cost reports](https://support.claude.com/en/articles/9534590-cost-and-usage-reporting-in-the-claude-console) · [API billing and credits](https://support.claude.com/en/articles/8977456-how-do-i-pay-for-my-claude-api-usage) |
 | Google Gemini API | AI Studio offers monthly project spend caps, but not for Invoiced/Offline accounts. Cloud Billing spend caps are monthly and scoped to one project plus one eligible service for first-party billing accounts. | AI Studio project caps are experimental and may lag by about ten minutes; long-running agent sessions may exceed them. Cloud spend caps use estimated gross costs, block new usage only after enforcement, and allow in-flight requests to finish; overage remains possible. [Gemini API billing](https://ai.google.dev/gemini-api/docs/billing) · [Cloud Billing spend caps](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) |
 
+### Per-request token controls
+
+Token APIs make useful preflight and reconciliation evidence available, but they
+do not create a portable task-level spend cap:
+
+| Provider | Preflight and request controls | Limit that matters for ACP |
+| --- | --- | --- |
+| OpenAI Responses API | `POST /v1/responses/input_tokens` counts the submitted input for a selected model; `max_output_tokens` bounds generated tokens for one response, including non-visible tokens. A completed response returns usage. | Input counting does not reserve output or tool-loop usage. The output bound is per response, not across an agent turn, retries, or descendants. [Token counting](https://developers.openai.com/api/docs/guides/token-counting) · [Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create) |
+| Anthropic Messages API | `messages.count_tokens` estimates model-specific input; `max_tokens` bounds generated tokens for one request. The beta `task_budget` gives Claude an advisory token countdown across an agentic turn. | Counts can differ from actual usage, and token counting does not support some valid inputs, including server tools/MCP connectors and some URL/file sources. If required preflight is unsupported, block dispatch for a strict budget; only reporting-only budgets may proceed with usage marked unknown. Task budgets are not enforced, may be exceeded mid-action, have no remaining-budget field in response usage, and are not supported in Claude Code or Cowork; treat them as a pacing hint, not an ACP admission gate. [Token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting) · [Task budgets](https://platform.claude.com/docs/en/build-with-claude/task-budgets) |
+| Gemini API | `countTokens` provides a preflight count; `maxOutputTokens` bounds each response candidate; `usageMetadata` reports usage after generation, including thinking-token fields where applicable. | With multiple candidates, aggregate response usage can exceed the per-candidate limit. These request-scoped controls do not reserve or cap usage across ACP retries, tools, or parallel descendants. [Count tokens](https://ai.google.dev/gemini-api/docs/tokens) · [Generate content](https://ai.google.dev/api/generate-content) |
+
+These controls support a provider adapter's estimate → dispatch → receipt loop.
+The adapter must preserve model, request/task scope, unit, provider, and
+observation time; count preflight values as estimates where the provider says
+they are estimates; and record post-call usage as reported evidence. A trusted
+ACP broker still has to reserve shared task capacity before every billable
+dispatch and reconcile all returned receipts. Token budgets and per-request
+output limits are not dollar limits, and raw token totals must not be converted
+to currency without the applicable versioned rate card.
+
 The cross-provider design implication is that native spend controls are useful
 account/project backstops, but they are not a portable per-task reservation
 protocol. An isolated provider scope can reduce cross-run interference only
