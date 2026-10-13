@@ -787,12 +787,35 @@ class StatusView:
         attempt_budget = entry["attempt_budget"]
         from .scheduling import CLAIMABLE_STATUSES
 
-        if entry["status"] in CLAIMABLE_STATUSES and attempt_budget["status"] == "exhausted":
-            return "human_required", (
-                "task attempt budget exhausted "
-                f"({attempt_budget['consumed']}/{attempt_budget['configured_limit']} attempts used); "
-                "retry is not claimable"
-            )
+        if entry["status"] in CLAIMABLE_STATUSES:
+            lineage = entry["ancestor_lineage_integrity"]
+            if lineage["status"] == "invalid":
+                issue = (lineage.get("issue") or {}).get("kind", "unknown")
+                return "human_required", (
+                    f"task hierarchy is invalid ({issue}); retry is not claimable"
+                )
+            if attempt_budget["status"] == "invalid":
+                return "human_required", "task attempt budget is invalid; retry is not claimable"
+            if attempt_budget["status"] == "exhausted":
+                return "human_required", (
+                    "task attempt budget exhausted "
+                    f"({attempt_budget['consumed']}/{attempt_budget['configured_limit']} attempts used); "
+                    "retry is not claimable"
+                )
+            for ancestor_budget in entry["ancestor_attempt_budgets"]:
+                if ancestor_budget["status"] == "invalid":
+                    return "human_required", (
+                        "ancestor task "
+                        f"{ancestor_budget['ancestor_task_id']} has an invalid descendant attempt "
+                        "budget; retry is not claimable"
+                    )
+                if ancestor_budget["status"] == "exhausted":
+                    return "human_required", (
+                        "ancestor task "
+                        f"{ancestor_budget['ancestor_task_id']} attempt budget exhausted "
+                        f"({ancestor_budget['consumed']}/{ancestor_budget['configured_limit']} "
+                        "descendant attempts used); retry is not claimable"
+                    )
         if entry["status"] in HUMAN_REQUIRED_STATUSES:
             verdict = (entry["qc"] or {}).get("verdict")
             return "human_required", f"task is {entry['status']}" + (

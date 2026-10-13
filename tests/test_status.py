@@ -215,10 +215,17 @@ def test_status_reports_hierarchical_attempt_budget_provenance(repo: Path) -> No
         ["child.txt"],
         parent_task_id=parent["id"],
     )
+    blocked_sibling = supervisor.create_task(
+        "Sibling blocked by parent cap",
+        "Status calls out a child whose parent exhausted its descendant budget.",
+        ["The inherited cap is actionable"],
+        ["sibling.txt"],
+        parent_task_id=parent["id"],
+    )
     supervisor.claim(parent["id"], "parent-worker")
     supervisor.claim(child["id"], "child-worker")
 
-    snapshot = supervisor.status()
+    snapshot = supervisor.status(limit=10)
     evidence = entry_for(snapshot, parent["id"])["descendant_attempt_budget"]
 
     assert evidence["dimension"] == "descendant_task_attempt_launches"
@@ -250,6 +257,14 @@ def test_status_reports_hierarchical_attempt_budget_provenance(repo: Path) -> No
     assert ancestor_budgets[1]["consumed"] == 2
     assert ancestor_budgets[1]["remaining"] == 1
     assert ancestor_budgets[1]["status"] == "enforced"
+    assert child_entry["category"] == "active"
+
+    blocked_attention = next(
+        item for item in snapshot["attention"] if item["task_id"] == blocked_sibling["id"]
+    )
+    assert blocked_attention["category"] == "human_required"
+    assert f"ancestor task {parent['id']} attempt budget exhausted" in blocked_attention["reason"]
+    assert "1/1 descendant attempts used" in blocked_attention["reason"]
 
 
 @pytest.mark.parametrize(
@@ -326,6 +341,11 @@ def test_status_flags_invalid_ancestor_lineage(repo: Path, corruption: str) -> N
     assert entry["descendant_attempt_budget"]["status"] == "invalid"
     assert entry["descendant_attempt_budget"]["remaining"] is None
     if corruption == "cycle_detected":
+        assert entry["category"] == "active"
+    else:
+        assert entry["category"] == "human_required"
+        assert "task hierarchy is invalid" in entry["reason"]
+    if corruption == "cycle_detected":
         preview = supervisor.plan_claim(child["id"])
         assert any(item["kind"] == "task_hierarchy_invalid" for item in preview["blockers"])
         assert not any(
@@ -371,6 +391,8 @@ def test_status_json_sanitizes_blob_parent_id(repo: Path) -> None:
             "value_type": "bytes",
         },
     }
+    assert child_entry["category"] == "human_required"
+    assert "task hierarchy is invalid (invalid_parent_id_type)" in child_entry["reason"]
     assert json.loads(json.dumps(snapshot)) == snapshot
 
 
@@ -1435,7 +1457,9 @@ def test_exhausted_claimable_attempt_budget_is_human_required(repo: Path) -> Non
     assert "retry is not claimable" in attention["reason"]
 
 
-def test_completed_or_invalid_attempt_budget_is_not_reported_as_exhausted(repo: Path) -> None:
+def test_completed_attempt_budget_is_not_exhausted_and_invalid_budget_is_actionable(
+    repo: Path,
+) -> None:
     supervisor = GitSupervisor(repo)
     task = supervisor.create_task(
         "Completed with one launch",
@@ -1453,11 +1477,27 @@ def test_completed_or_invalid_attempt_budget_is_not_reported_as_exhausted(repo: 
     invalid_entry = {
         "status": "orphaned",
         "attempt_budget": {"status": "invalid", "consumed": 1, "configured_limit": 0},
+        "ancestor_lineage_integrity": {"status": "valid", "issue": None},
+        "ancestor_attempt_budgets": [],
         "runtime": None,
         "lease_seconds_remaining": None,
         "checkpoint_stale_advisory": False,
     }
-    assert StatusView._categorize(invalid_entry, lease_risk_seconds=30) == (None, "")
+    category, reason = StatusView._categorize(invalid_entry, lease_risk_seconds=30)
+    assert category == "human_required"
+    assert reason == "task attempt budget is invalid; retry is not claimable"
+
+    invalid_ancestor_entry = {
+        **invalid_entry,
+        "attempt_budget": {"status": "unconfigured"},
+        "ancestor_attempt_budgets": [{"status": "invalid", "ancestor_task_id": "ancestor-1"}],
+    }
+    category, reason = StatusView._categorize(invalid_ancestor_entry, lease_risk_seconds=30)
+    assert category == "human_required"
+    assert (
+        reason
+        == "ancestor task ancestor-1 has an invalid descendant attempt budget; retry is not claimable"
+    )
 
 
 def test_failed_cleanup_outranks_review_and_is_listed(repo: Path) -> None:

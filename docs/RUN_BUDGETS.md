@@ -129,10 +129,12 @@ any budget refusal; for a valid chain, the task-local cap keeps precedence over
 ancestor caps.
 
 In the operator attention queue, a claimable task (`open`, `orphaned`, or
-`changes_requested`) whose task-local attempt budget is exhausted is ranked as
-`human_required`, with the consumed/configured count and the fact that retry is
-not claimable. Active attempts and completed tasks are not promoted by this
-rule; their budget evidence remains visible without implying a failed task.
+`changes_requested`) is ranked as `human_required` when its local cap is
+exhausted/invalid, an ancestor cap is exhausted/invalid, or its lineage is
+corrupt. Exhausted caps include the relevant consumed/configured count; invalid
+lineage and cap evidence is never treated as authoritative usage. Active attempts
+and completed tasks are not promoted by this rule; their budget evidence remains
+visible without implying a failed task.
 
 The CLI `task-add --provider-cost-limit-usd-micros` and public `POST /v1/tasks`
 API accept an explicit `provider_cost_limit_usd_micros` request so unsupported
