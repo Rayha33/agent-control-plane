@@ -20,6 +20,12 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .coordination_schemas import ProviderUsageReport
+from .provider_usage import (
+    ClientReportedProviderUsage,
+    _provider_usage_extraction_failed,
+)
+
 
 class DispatchHttpResponse(Protocol):
     """The response metadata that may be stored as a client-reported receipt."""
@@ -53,6 +59,7 @@ class DispatchLedger(Protocol):
         claim_fencing_token: int,
         http_status_code: int,
         retry_after_seconds: int | None,
+        provider_usage_report: Mapping[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -176,15 +183,19 @@ class CoordinationHttpDispatchLedger:
         claim_fencing_token: int,
         http_status_code: int,
         retry_after_seconds: int | None,
+        provider_usage_report: Mapping[str, Any] | None = None,
     ) -> None:
+        request_payload: dict[str, Any] = {
+            "claim_fencing_token": claim_fencing_token,
+            "http_status_code": http_status_code,
+            "retry_after_seconds": retry_after_seconds,
+        }
+        if provider_usage_report is not None:
+            request_payload["provider_usage_report"] = dict(provider_usage_report)
         payload = self._post_json(
             f"/v1/tasks/{quote(task_id, safe='')}/dispatch-attempts/"
             f"{quote(dispatch_attempt_id, safe='')}/receipt",
-            {
-                "claim_fencing_token": claim_fencing_token,
-                "http_status_code": http_status_code,
-                "retry_after_seconds": retry_after_seconds,
-            },
+            request_payload,
             expected_status=200,
         )
         try:
@@ -307,6 +318,7 @@ class DispatchResult(Generic[ResponseT]):
     dispatch_attempt_id: str
     response: ResponseT
     retry_after_seconds: int | None = None
+    provider_usage_report: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +375,7 @@ def dispatch_with_retries(
     send_once: Callable[[str], ResponseT],
     policy: DispatchRetryPolicy,
     wait: Callable[[float], None] = time.sleep,
+    usage_report_from_response: Callable[[ResponseT], ClientReportedProviderUsage] | None = None,
 ) -> DispatchRetryResult[ResponseT]:
     """Run an explicit bounded retry sequence through durable dispatch slots.
 
@@ -406,6 +419,7 @@ def dispatch_with_retries(
             resource_fencing_tokens=resource_fencing_tokens,
             idempotency_key=f"{idempotency_key}:attempt:{attempt_number}",
             send_once=lambda: send_once(provider_idempotency_key),
+            usage_report_from_response=usage_report_from_response,
         )
         attempts.append(result)
         delay = result.retry_after_seconds
@@ -431,6 +445,7 @@ def dispatch_once(
     resource_fencing_tokens: Mapping[str, int],
     idempotency_key: str,
     send_once: Callable[[], ResponseT],
+    usage_report_from_response: Callable[[ResponseT], ClientReportedProviderUsage] | None = None,
 ) -> DispatchResult[ResponseT]:
     """Reserve, invoke the supplied transport once, and record its response metadata.
 
@@ -479,14 +494,36 @@ def dispatch_once(
     ):
         raise DispatchResponseInvalid(reservation.dispatch_attempt_id)
 
+    provider_usage_report: Mapping[str, Any] | None = None
+    if usage_report_from_response is not None:
+        try:
+            observation = usage_report_from_response(response)
+            if not isinstance(observation, ClientReportedProviderUsage):
+                raise TypeError("usage extractor returned an unsupported result")
+            provider_usage_report = ProviderUsageReport.model_validate(
+                observation.as_dict()
+            ).model_dump()
+        except Exception:
+            observation = _provider_usage_extraction_failed()
+            provider_usage_report = ProviderUsageReport.model_validate(
+                observation.as_dict()
+            ).model_dump()
+
     try:
-        ledger.record_dispatch_attempt_receipt(
-            task_id=task_id,
-            dispatch_attempt_id=reservation.dispatch_attempt_id,
-            claim_fencing_token=claim_fencing_token,
-            http_status_code=status_code,
-            retry_after_seconds=retry_after_seconds,
-        )
+        receipt_arguments = {
+            "task_id": task_id,
+            "dispatch_attempt_id": reservation.dispatch_attempt_id,
+            "claim_fencing_token": claim_fencing_token,
+            "http_status_code": status_code,
+            "retry_after_seconds": retry_after_seconds,
+        }
+        if provider_usage_report is None:
+            ledger.record_dispatch_attempt_receipt(**receipt_arguments)
+        else:
+            ledger.record_dispatch_attempt_receipt(
+                **receipt_arguments,
+                provider_usage_report=provider_usage_report,
+            )
     except Exception as exc:
         error = DispatchReceiptUnrecorded(
             reservation.dispatch_attempt_id, status_code, _safe_failure_type(exc)
@@ -500,6 +537,7 @@ def dispatch_once(
         dispatch_attempt_id=reservation.dispatch_attempt_id,
         response=response,
         retry_after_seconds=retry_after_seconds,
+        provider_usage_report=provider_usage_report,
     )
 
 

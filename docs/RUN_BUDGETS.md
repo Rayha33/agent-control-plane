@@ -99,6 +99,27 @@ dispatch and reconcile all returned receipts. Token budgets and per-request
 output limits are not dollar limits, and raw token totals must not be converted
 to currency without the applicable versioned rate card.
 
+The optional non-streaming OpenAI Responses extractor stores one response's
+`input_tokens`, `output_tokens`, `total_tokens`, and known token-detail fields
+with its response ID, model, provider-created time (when supplied), and
+client-observed time. Its receipt status is `reported`, `missing`, or `invalid`;
+the API also timestamps receipt ingestion. This is client-reported evidence:
+ACP does not authenticate the response body, infer billing, aggregate a task's
+provider usage, or treat the report as fresh for admission. `provider_usage`
+therefore remains `unsupported` for hard-limit decisions even when a per-call
+`provider_usage_report` is present. Missing and malformed fields produce
+bounded reason codes without storing a raw response or credentials. Streaming,
+SDK retries, other providers, and provider-internal fan-out remain outside this
+extractor. A caller may pass `parse_openai_responses_usage` as the dispatch
+client's `usage_report_from_response` callback after decoding the response
+body. For a synchronous HTTP response, for example, use
+`lambda response: parse_openai_responses_usage(response.json())`; for a typed
+SDK response, pass its JSON-mode model dump instead. The parser accepts the
+decoded JSON mapping, not an HTTP/SDK response wrapper. ACP does not
+automatically intercept SDK requests or prove every billable request crosses
+this path. The Responses API documents these usage fields in its [response
+object](https://developers.openai.com/api/reference/resources/responses/methods/create).
+
 The cross-provider design implication is that native spend controls are useful
 account/project backstops, but they are not a portable per-task reservation
 protocol. An isolated provider scope can reduce cross-run interference only

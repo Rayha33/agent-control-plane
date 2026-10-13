@@ -135,6 +135,49 @@ def test_initialize_stamps_the_version_and_the_writer(database_path: Path) -> No
     assert recorded[SCHEMA_WRITTEN_BY_KEY] == __version__
 
 
+def test_v5_service_database_adds_the_report_only_usage_receipt_column(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TRIGGER service_schema_version_no_downgrade")
+        connection.execute("ALTER TABLE dispatch_attempt_receipts DROP COLUMN provider_usage_json")
+        connection.execute("UPDATE meta SET value = '5' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+        connection.execute(
+            """
+            CREATE TRIGGER service_schema_version_no_downgrade
+            BEFORE INSERT ON meta
+            WHEN NEW.key = 'schema_version'
+              AND EXISTS (
+                  SELECT 1 FROM meta
+                  WHERE key = NEW.key
+                    AND CAST(value AS INTEGER) > CAST(NEW.value AS INTEGER)
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'service_schema_version_downgrade');
+            END;
+            """
+        )
+
+    Database(str(database_path)).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(dispatch_attempt_receipts)")
+        }
+        version = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()[0]
+        usage_default = next(
+            row[4]
+            for row in connection.execute("PRAGMA table_info(dispatch_attempt_receipts)")
+            if row[1] == "provider_usage_json"
+        )
+
+    assert "provider_usage_json" in columns
+    assert usage_default == "'{}'"
+    assert version == str(SERVICE_SCHEMA_VERSION)
+
+
 def test_a_database_from_the_future_is_refused(database_path: Path) -> None:
     write_meta(database_path, SCHEMA_VERSION_KEY, str(SERVICE_SCHEMA_VERSION + 1))
 
@@ -373,6 +416,11 @@ def test_dispatch_reservation_sql_guard_enforces_caps_and_immutable_receipts(
         with pytest.raises(sqlite3.IntegrityError, match="dispatch_attempt_receipt_immutable"):
             connection.execute(
                 "UPDATE dispatch_attempt_receipts SET http_status_code = 200 "
+                "WHERE dispatch_attempt_id = 'dispatch-reservation-a'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="dispatch_attempt_receipt_immutable"):
+            connection.execute(
+                "UPDATE dispatch_attempt_receipts SET provider_usage_json = '{}' "
                 "WHERE dispatch_attempt_id = 'dispatch-reservation-a'"
             )
         with pytest.raises(sqlite3.IntegrityError, match="task_dispatch_budget_config_immutable"):

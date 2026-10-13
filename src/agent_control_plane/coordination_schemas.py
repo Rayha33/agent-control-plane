@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -181,6 +182,92 @@ class ProviderUsageEvidence(BaseModel):
     reason: Literal["no authenticated provider meter or request gate are wired to this supervisor"]
 
 
+class ProviderUsageReport(BaseModel):
+    """One unverified, report-only provider response usage observation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["reported", "missing", "invalid"]
+    provider: Literal["openai", "unknown"]
+    adapter: Literal["responses", "unknown"]
+    source: Literal["client_reported"]
+    scope: Literal["single_response"]
+    unit: Literal["tokens"] | None
+    observed_at: str = Field(min_length=20, max_length=40)
+    response_id: str | None = Field(
+        default=None, min_length=6, max_length=256, pattern=r"^resp_[A-Za-z0-9_-]+$"
+    )
+    model: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    response_created_at: StrictInt | None = Field(default=None, ge=0, le=253402300799)
+    measurements: dict[str, StrictInt] = Field(default_factory=dict, max_length=16)
+    freshness: Literal["unknown"]
+    enforcement: Literal["report_only"]
+    reason: (
+        Literal[
+            "provider_response_usage_object_missing",
+            "provider_response_metadata_malformed",
+            "provider_response_not_terminal",
+            "provider_usage_missing",
+            "provider_usage_malformed",
+            "provider_usage_inconsistent_total",
+            "provider_usage_extractor_failed",
+        ]
+        | None
+    ) = None
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_timestamp(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("observed_at must be an ISO-8601 timestamp") from None
+        if parsed.tzinfo is None:
+            raise ValueError("observed_at must include a timezone")
+        return value
+
+    @model_validator(mode="after")
+    def validate_measurements(self) -> ProviderUsageReport:
+        allowed_measurements = {
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_output_tokens",
+        }
+        if any(
+            not key.isascii()
+            or not key
+            or len(key) > 64
+            or key not in allowed_measurements
+            or any(not (char.isalnum() or char == "_") for char in key)
+            or not 0 <= value <= 2**63 - 1
+            for key, value in self.measurements.items()
+        ):
+            raise ValueError("provider usage measurement is invalid")
+
+        if self.status == "reported":
+            required = {"input_tokens", "output_tokens", "total_tokens"}
+            if (
+                self.provider != "openai"
+                or self.adapter != "responses"
+                or self.unit != "tokens"
+                or self.response_id is None
+                or self.model is None
+                or not required <= self.measurements.keys()
+                or self.measurements["total_tokens"]
+                != self.measurements["input_tokens"] + self.measurements["output_tokens"]
+                or self.reason is not None
+            ):
+                raise ValueError("reported usage requires consistent per-response token counts")
+        elif self.unit is not None or self.measurements or self.reason is None:
+            raise ValueError("missing or invalid usage cannot carry token counts")
+        return self
+
+
 class DispatchAttemptBudgetView(BaseModel):
     scope: Literal["task", "descendant_tree"]
     unit: Literal["dispatch_attempt_reservations"]
@@ -200,6 +287,7 @@ class DispatchAttemptReceiptCreate(BaseModel):
     claim_fencing_token: StrictInt = Field(ge=1)
     http_status_code: int = Field(strict=True, ge=100, le=599)
     retry_after_seconds: int | None = Field(default=None, strict=True, ge=0, le=86400)
+    provider_usage_report: ProviderUsageReport | None = None
 
 
 class DispatchAttemptReceiptView(BaseModel):
@@ -209,6 +297,7 @@ class DispatchAttemptReceiptView(BaseModel):
     retry_after_seconds: int | None
     received_at: str
     provider_usage: ProviderUsageEvidence
+    provider_usage_report: ProviderUsageReport | None = None
 
 
 class DispatchAttemptReceiptResult(BaseModel):

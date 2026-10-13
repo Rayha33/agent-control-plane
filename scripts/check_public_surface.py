@@ -40,6 +40,7 @@ MODULES = [
     "agent_control_plane.runtime_drivers",
     "agent_control_plane.coordination",
     "agent_control_plane.dispatch_client",
+    "agent_control_plane.provider_usage",
     "agent_control_plane.service",
     "agent_control_plane.assurance",
     # The phase modules the split created. Pinned so a later move BETWEEN phases (not just

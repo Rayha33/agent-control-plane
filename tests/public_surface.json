@@ -161,6 +161,12 @@
       "_abc_impl",
       "model_config"
     ],
+    "class:ProviderUsageReport": [
+      "_abc_impl",
+      "model_config",
+      "require_timestamp",
+      "validate_measurements"
+    ],
     "class:QCReviewCreate": [
       "_abc_impl",
       "model_config",
@@ -189,6 +195,7 @@
       "DispatchAttemptReservationCreate",
       "HeartbeatRequest",
       "ProviderUsageEvidence",
+      "ProviderUsageReport",
       "QCReviewCreate",
       "QC_RESERVATION_SECONDS",
       "SubmissionCreate",
@@ -205,6 +212,23 @@
     ]
   },
   "agent_control_plane.dispatch_client": {
+    "class:ClientReportedProviderUsage": [
+      "adapter",
+      "as_dict",
+      "enforcement",
+      "freshness",
+      "measurements",
+      "model",
+      "observed_at",
+      "provider",
+      "reason",
+      "response_created_at",
+      "response_id",
+      "scope",
+      "source",
+      "status",
+      "unit"
+    ],
     "class:CoordinationHttpDispatchLedger": [
       "_post_json",
       "record_dispatch_attempt_receipt",
@@ -235,6 +259,7 @@
     "class:DispatchResponseInvalid": [],
     "class:DispatchResult": [
       "dispatch_attempt_id",
+      "provider_usage_report",
       "response",
       "retry_after_seconds"
     ],
@@ -246,6 +271,12 @@
     "class:DispatchRetryResult": [
       "attempts",
       "response"
+    ],
+    "class:ProviderUsageReport": [
+      "_abc_impl",
+      "model_config",
+      "require_timestamp",
+      "validate_measurements"
     ],
     "class:_JsonOpener": [
       "_abc_impl",
@@ -264,6 +295,7 @@
     "module": [
       "Any",
       "Callable",
+      "ClientReportedProviderUsage",
       "CoordinationHttpDispatchLedger",
       "DispatchHttpResponse",
       "DispatchLedger",
@@ -285,6 +317,7 @@
       "HTTPRedirectHandler",
       "Mapping",
       "Protocol",
+      "ProviderUsageReport",
       "Request",
       "ResponseT",
       "TypeVar",
@@ -297,6 +330,7 @@
       "_RETRY_IDEMPOTENCY_KEY_MAX_LENGTH",
       "_bounded_retry_after",
       "_is_loopback_host",
+      "_provider_usage_extraction_failed",
       "_retry_after_seconds",
       "_safe_failure_type",
       "annotations",
@@ -1177,6 +1211,42 @@
       "validate_role",
       "verify_bundle_pin",
       "verify_credential"
+    ]
+  },
+  "agent_control_plane.provider_usage": {
+    "class:ClientReportedProviderUsage": [
+      "adapter",
+      "as_dict",
+      "enforcement",
+      "freshness",
+      "measurements",
+      "model",
+      "observed_at",
+      "provider",
+      "reason",
+      "response_created_at",
+      "response_id",
+      "scope",
+      "source",
+      "status",
+      "unit"
+    ],
+    "module": [
+      "ClientReportedProviderUsage",
+      "Literal",
+      "Mapping",
+      "UTC",
+      "UsageReportStatus",
+      "_provider_usage_extraction_failed",
+      "_report",
+      "_timestamp",
+      "_valid_count",
+      "_valid_model",
+      "_valid_response_id",
+      "annotations",
+      "dataclass",
+      "datetime",
+      "parse_openai_responses_usage"
     ]
   },
   "agent_control_plane.runtime_drivers": {

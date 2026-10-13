@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from threading import Barrier
 
 import pytest
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from agent_control_plane.app import create_app
 from agent_control_plane.coordination_schemas import DispatchAttemptReservationCreate
+from agent_control_plane.provider_usage import parse_openai_responses_usage
 from agent_control_plane.service import ControlPlaneError
 
 
@@ -483,17 +485,56 @@ def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
     reservation_id = first.json()["reservation"]["id"]
 
     receipt_url = f"/v1/tasks/{task['id']}/dispatch-attempts/{reservation_id}/receipt"
+    provider_usage_report = parse_openai_responses_usage(
+        {
+            "object": "response",
+            "id": "resp_restart_1",
+            "model": "gpt-5.6",
+            "status": "completed",
+            "created_at": 1_791_000_000,
+            "usage": {"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+        },
+        observed_at=datetime.fromisoformat("2026-10-13T07:00:00+00:00"),
+    ).as_dict()
     receipt = client.post(
         receipt_url,
         headers={"Authorization": f"Bearer {token}"},
         json={
             "claim_fencing_token": claim["task"]["claim_fencing_token"],
-            "http_status_code": 429,
-            "retry_after_seconds": 17,
+            "http_status_code": 200,
+            "retry_after_seconds": None,
+            "provider_usage_report": provider_usage_report,
         },
     )
     assert receipt.status_code == 200, receipt.text
     assert receipt.json()["receipt"]["source"] == "client_reported"
+    assert receipt.json()["receipt"]["provider_usage_report"] == provider_usage_report
+    receipt_replay = client.post(
+        receipt_url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "http_status_code": 200,
+            "retry_after_seconds": None,
+            "provider_usage_report": provider_usage_report,
+        },
+    )
+    assert receipt_replay.status_code == 200, receipt_replay.text
+    assert receipt_replay.json()["created"] is False
+    assert receipt_replay.json()["receipt"]["provider_usage_report"] == provider_usage_report
+    conflicting_usage = {**provider_usage_report, "response_id": "resp_different_1"}
+    usage_conflict = client.post(
+        receipt_url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "http_status_code": 200,
+            "retry_after_seconds": None,
+            "provider_usage_report": conflicting_usage,
+        },
+    )
+    assert usage_conflict.status_code == 409
+    assert usage_conflict.json()["error"] == "dispatch_attempt_receipt_conflict"
 
     restarted_app = create_app(app.state.settings)
     with TestClient(restarted_app) as restarted_client:
@@ -510,9 +551,10 @@ def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
         restored_reservation = replay.json()["reservation"]
         assert restored_reservation["id"] == reservation_id
         assert restored_reservation["status"] == "reported"
-        assert restored_reservation["receipt"]["http_status_code"] == 429
-        assert restored_reservation["receipt"]["retry_after_seconds"] == 17
+        assert restored_reservation["receipt"]["http_status_code"] == 200
+        assert restored_reservation["receipt"]["retry_after_seconds"] is None
         assert restored_reservation["receipt"]["provider_usage"] == _unsupported_provider_usage()
+        assert restored_reservation["receipt"]["provider_usage_report"] == provider_usage_report
 
         second = reserve_dispatch_attempt(
             restarted_client, task["id"], token, claim, "restart-call-2"

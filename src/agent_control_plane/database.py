@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 5
+SERVICE_SCHEMA_VERSION = 6
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -575,6 +575,18 @@ def _add_dispatch_attempt_budgets(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_dispatch_attempt_provider_usage(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(dispatch_attempt_receipts)")
+    }
+    if "provider_usage_json" not in columns:
+        connection.execute(
+            "ALTER TABLE dispatch_attempt_receipts ADD COLUMN provider_usage_json TEXT "
+            "NOT NULL DEFAULT '{}' CHECK(json_valid(provider_usage_json) = 1 AND "
+            "json_type(provider_usage_json) = 'object')"
+        )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -595,6 +607,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (3, _install_service_upgrade_guards),
     (4, _add_task_claim_budgets),
     (5, _add_dispatch_attempt_budgets),
+    (6, _add_dispatch_attempt_provider_usage),
 )
 
 SCHEMA = """

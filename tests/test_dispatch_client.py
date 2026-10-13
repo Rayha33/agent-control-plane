@@ -3,7 +3,8 @@ from __future__ import annotations
 import io
 import json
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from urllib.error import HTTPError
 from urllib.request import Request
 
@@ -22,6 +23,7 @@ from agent_control_plane.dispatch_client import (
     dispatch_once,
     dispatch_with_retries,
 )
+from agent_control_plane.provider_usage import parse_openai_responses_usage
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,10 @@ class FakeResponse:
 class StandardHttpResponse:
     status_code: int
     headers: dict[str, str]
+    body: dict[str, object] | None = None
+
+    def json(self) -> dict[str, object] | None:
+        return self.body
 
 
 class FakeLedger:
@@ -42,6 +48,7 @@ class FakeLedger:
         self.reservation_keys: list[str] = []
         self.reserve_calls: list[tuple[str, int, dict[str, int], str]] = []
         self.receipts: list[tuple[str, int, int | None]] = []
+        self.usage_reports: list[tuple[str, dict[str, object]]] = []
         self.lose_next_reservation_response = False
         self.reserve_error: Exception | None = None
         self.receipt_error: Exception | None = None
@@ -83,11 +90,14 @@ class FakeLedger:
         claim_fencing_token: int,
         http_status_code: int,
         retry_after_seconds: int | None,
+        provider_usage_report: dict[str, object] | None = None,
     ) -> None:
         del task_id, claim_fencing_token
         if self.receipt_error is not None:
             raise self.receipt_error
         self.receipts.append((dispatch_attempt_id, http_status_code, retry_after_seconds))
+        if provider_usage_report is not None:
+            self.usage_reports.append((dispatch_attempt_id, provider_usage_report))
 
 
 class FakeApiResponse:
@@ -145,7 +155,14 @@ def _dispatch(ledger: FakeLedger, idempotency_key: str, send_once):
     )
 
 
-def _dispatch_retries(ledger: FakeLedger, idempotency_key: str, send_once, policy, wait):
+def _dispatch_retries(
+    ledger: FakeLedger,
+    idempotency_key: str,
+    send_once,
+    policy,
+    wait,
+    usage_report_from_response=None,
+):
     return dispatch_with_retries(
         ledger=ledger,
         task_id="task-1",
@@ -156,6 +173,7 @@ def _dispatch_retries(ledger: FakeLedger, idempotency_key: str, send_once, polic
         send_once=send_once,
         policy=policy,
         wait=wait,
+        usage_report_from_response=usage_report_from_response,
     )
 
 
@@ -174,6 +192,45 @@ def test_reservation_denial_and_stale_fence_never_invoke_transport() -> None:
 
         assert sends == []
         assert ledger.receipts == []
+
+
+def test_dispatch_without_usage_preserves_legacy_ledger_receipt_signature() -> None:
+    class LegacyReceiptLedger:
+        def __init__(self) -> None:
+            self.inner = FakeLedger()
+
+        def reserve_dispatch_attempt(self, **kwargs) -> DispatchReservation:
+            return self.inner.reserve_dispatch_attempt(**kwargs)
+
+        def record_dispatch_attempt_receipt(
+            self,
+            *,
+            task_id: str,
+            dispatch_attempt_id: str,
+            claim_fencing_token: int,
+            http_status_code: int,
+            retry_after_seconds: int | None,
+        ) -> None:
+            self.inner.record_dispatch_attempt_receipt(
+                task_id=task_id,
+                dispatch_attempt_id=dispatch_attempt_id,
+                claim_fencing_token=claim_fencing_token,
+                http_status_code=http_status_code,
+                retry_after_seconds=retry_after_seconds,
+            )
+
+    ledger = LegacyReceiptLedger()
+    result = dispatch_once(
+        ledger=ledger,
+        task_id="task-1",
+        claim_fencing_token=7,
+        resource_fencing_tokens={},
+        idempotency_key="legacy-ledger-receipt",
+        send_once=lambda: FakeResponse(200),
+    )
+
+    assert result.response.status_code == 200
+    assert ledger.inner.receipts == [("attempt-1", 200, None)]
 
 
 def test_idempotent_reservation_replay_refuses_to_send() -> None:
@@ -243,12 +300,20 @@ def test_explicit_retry_policy_reserves_each_bounded_503_attempt() -> None:
 
 def test_explicit_retry_policy_never_retries_429_even_with_retry_after() -> None:
     ledger = FakeLedger()
-    sends: list[int] = []
+    responses = [
+        StandardHttpResponse(
+            429,
+            {"Retry-After": "1"},
+            {"error": {"type": "rate_limit_error"}},
+        )
+    ]
+    sends: list[StandardHttpResponse] = []
     waits: list[float] = []
 
-    def send_once(_provider_idempotency_key: str) -> FakeResponse:
-        sends.append(1)
-        return FakeResponse(429, retry_after_seconds=1)
+    def send_once(_provider_idempotency_key: str) -> StandardHttpResponse:
+        response = responses.pop(0)
+        sends.append(response)
+        return response
 
     result = _dispatch_retries(
         ledger,
@@ -256,14 +321,16 @@ def test_explicit_retry_policy_never_retries_429_even_with_retry_after() -> None
         send_once,
         DispatchRetryPolicy(max_attempts=4, max_retry_after_seconds=5),
         waits.append,
+        usage_report_from_response=lambda response: parse_openai_responses_usage(response.json()),
     )
 
     assert result.response.status_code == 429
     assert len(result.attempts) == 1
-    assert sends == [1]
+    assert len(sends) == 1
     assert waits == []
     assert len(ledger.reservation_keys) == 1
     assert ledger.receipts == [("attempt-1", 429, 1)]
+    assert ledger.usage_reports[0][1]["status"] == "missing"
 
 
 def test_explicit_retry_policy_does_not_retry_ambiguous_send() -> None:
@@ -441,6 +508,87 @@ def test_standard_http_response_retry_after_header_is_normalized() -> None:
 
     assert result.response.status_code == 429
     assert ledger.receipts == [("attempt-1", 429, 30)]
+
+
+def test_usage_extractor_failure_does_not_discard_the_http_receipt() -> None:
+    ledger = FakeLedger()
+
+    def fail_extraction(_response: FakeResponse):
+        raise ValueError("sensitive provider response body")
+
+    result = dispatch_once(
+        ledger=ledger,
+        task_id="task-1",
+        claim_fencing_token=7,
+        resource_fencing_tokens={},
+        idempotency_key="usage-extractor-failure",
+        send_once=lambda: FakeResponse(200),
+        usage_report_from_response=fail_extraction,
+    )
+
+    assert result.response.status_code == 200
+    assert ledger.receipts == [("attempt-1", 200, None)]
+    assert ledger.usage_reports == [
+        (
+            "attempt-1",
+            {
+                "status": "invalid",
+                "provider": "unknown",
+                "adapter": "unknown",
+                "source": "client_reported",
+                "scope": "single_response",
+                "unit": None,
+                "observed_at": result.provider_usage_report["observed_at"],
+                "response_id": None,
+                "model": None,
+                "response_created_at": None,
+                "measurements": {},
+                "freshness": "unknown",
+                "enforcement": "report_only",
+                "reason": "provider_usage_extractor_failed",
+            },
+        )
+    ]
+    assert "sensitive" not in str(ledger.usage_reports)
+
+
+def test_malformed_usage_report_falls_back_without_losing_http_receipt() -> None:
+    ledger = FakeLedger()
+
+    def inconsistent_extraction(_response: FakeResponse):
+        good_report = parse_openai_responses_usage(
+            {
+                "object": "response",
+                "id": "resp_bad_total",
+                "model": "gpt-5.6",
+                "status": "completed",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+            }
+        )
+        return replace(
+            good_report,
+            measurements=(
+                ("input_tokens", 2),
+                ("output_tokens", 3),
+                ("total_tokens", 99),
+            ),
+        )
+
+    result = dispatch_once(
+        ledger=ledger,
+        task_id="task-1",
+        claim_fencing_token=7,
+        resource_fencing_tokens={},
+        idempotency_key="malformed-usage-report",
+        send_once=lambda: FakeResponse(200),
+        usage_report_from_response=inconsistent_extraction,
+    )
+
+    assert result.response.status_code == 200
+    assert ledger.receipts == [("attempt-1", 200, None)]
+    assert ledger.usage_reports[0][1]["status"] == "invalid"
+    assert ledger.usage_reports[0][1]["reason"] == "provider_usage_extractor_failed"
+    assert ledger.usage_reports[0][1]["measurements"] == {}
 
 
 def test_standard_http_response_http_date_retry_after_is_normalized() -> None:
@@ -767,8 +915,29 @@ def test_bounded_retry_sequence_integrates_with_reference_api(client, admin_head
     sends: list[tuple[str, StandardHttpResponse]] = []
     waits: list[float] = []
     responses = [
-        StandardHttpResponse(503, {"Retry-After": "0"}),
-        StandardHttpResponse(200, {}),
+        StandardHttpResponse(
+            503,
+            {"Retry-After": "0"},
+            {"error": {"type": "server_error"}},
+        ),
+        StandardHttpResponse(
+            200,
+            {},
+            {
+                "object": "response",
+                "id": "resp_retry_2",
+                "model": "gpt-5.6",
+                "status": "completed",
+                "created_at": 1_791_000_000,
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "total_tokens": 19,
+                    "input_tokens_details": {"cached_tokens": 3},
+                    "output_tokens_details": {"reasoning_tokens": 2},
+                },
+            },
+        ),
     ]
 
     def send_once(provider_idempotency_key: str) -> StandardHttpResponse:
@@ -786,6 +955,9 @@ def test_bounded_retry_sequence_integrates_with_reference_api(client, admin_head
         send_once=send_once,
         policy=DispatchRetryPolicy(max_attempts=2, max_retry_after_seconds=1),
         wait=waits.append,
+        usage_report_from_response=lambda response: parse_openai_responses_usage(
+            response.json(), observed_at=datetime.fromisoformat("2026-10-13T07:00:00+00:00")
+        ),
     )
 
     assert len(result.attempts) == 2
@@ -798,6 +970,15 @@ def test_bounded_retry_sequence_integrates_with_reference_api(client, admin_head
     receipts = [opener.payloads[index]["receipt"] for index in (1, 3)]
     assert [receipt["http_status_code"] for receipt in receipts] == [503, 200]
     assert receipts[0]["dispatch_attempt_id"] != receipts[1]["dispatch_attempt_id"]
+    assert receipts[0]["provider_usage_report"]["status"] == "missing"
+    assert receipts[1]["provider_usage_report"]["status"] == "reported"
+    assert receipts[1]["provider_usage_report"]["measurements"] == {
+        "cached_input_tokens": 3,
+        "input_tokens": 12,
+        "output_tokens": 7,
+        "reasoning_output_tokens": 2,
+        "total_tokens": 19,
+    }
     task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
     assert task_view["dispatch_attempt_budget"]["consumed"] == 2
     assert task_view["dispatch_attempt_budget"]["provider_usage"]["status"] == "unsupported"

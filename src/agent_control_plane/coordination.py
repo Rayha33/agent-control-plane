@@ -14,6 +14,7 @@ from .coordination_schemas import (
     DispatchAttemptReservationCreate,
     HeartbeatRequest,
     ProviderUsageEvidence,
+    ProviderUsageReport,
     QCReviewCreate,
     SubmissionCreate,
     TaskCreate,
@@ -539,6 +540,11 @@ class CoordinationService:
             token, "coordination.dispatch_receipt", f"task:{task_id}", {"worker"}
         )
         received_at = utc_now()
+        provider_usage_json = (
+            canonical_json(request.provider_usage_report.model_dump())
+            if request.provider_usage_report is not None
+            else "{}"
+        )
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             reservation = connection.execute(
@@ -566,6 +572,7 @@ class CoordinationService:
                 if (
                     existing["http_status_code"] != request.http_status_code
                     or existing["retry_after_seconds"] != request.retry_after_seconds
+                    or (existing["provider_usage_json"] or "{}") != provider_usage_json
                 ):
                     raise ControlPlaneError(
                         409,
@@ -578,14 +585,15 @@ class CoordinationService:
                 """
                 INSERT INTO dispatch_attempt_receipts
                     (dispatch_attempt_id, source, http_status_code,
-                     retry_after_seconds, received_at)
-                VALUES (?, 'client_reported', ?, ?, ?)
+                     retry_after_seconds, received_at, provider_usage_json)
+                VALUES (?, 'client_reported', ?, ?, ?, ?)
                 """,
                 (
                     dispatch_attempt_id,
                     request.http_status_code,
                     request.retry_after_seconds,
                     received_at,
+                    provider_usage_json,
                 ),
             )
             self.database.append_audit(
@@ -597,6 +605,11 @@ class CoordinationService:
                     "retry_after_seconds": request.retry_after_seconds,
                     "source": "client_reported",
                     "task_id": task_id,
+                    "provider_usage_status": (
+                        request.provider_usage_report.status
+                        if request.provider_usage_report is not None
+                        else "unsupported"
+                    ),
                 },
                 connection=connection,
             )
@@ -1555,6 +1568,7 @@ class CoordinationService:
 
     @staticmethod
     def _dispatch_attempt_receipt_view(row: sqlite3.Row) -> dict[str, Any]:
+        raw_provider_usage_report = json.loads(row["provider_usage_json"] or "{}")
         return DispatchAttemptReceiptView(
             dispatch_attempt_id=row["dispatch_attempt_id"],
             source=row["source"],
@@ -1572,6 +1586,11 @@ class CoordinationService:
                 reason=(
                     "no authenticated provider meter or request gate are wired to this supervisor"
                 ),
+            ),
+            provider_usage_report=(
+                ProviderUsageReport.model_validate(raw_provider_usage_report)
+                if raw_provider_usage_report
+                else None
             ),
         ).model_dump()
 
