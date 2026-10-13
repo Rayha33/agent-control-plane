@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from .checkout_identity import CheckoutAdapterError, identify_checkout
 from .editor_hooks import DENY_EXIT_CODE, install_claude_code_hooks, path_from_hook_payload
 from .git_supervisor import GitSupervisor, SupervisorError
 from .runtime_drivers import DriverError, resolve_trusted_executable
@@ -122,6 +123,10 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("init", help="initialize config and local state")
     commands.add_parser("doctor", help="check repository and state integrity")
     commands.add_parser("migrate", help="upgrade the control database schema in place")
+    commands.add_parser(
+        "checkout-resource",
+        help="print an opaque local resource key for mediated checkout ownership",
+    )
     rootfs_manifest = commands.add_parser(
         "oci-rootfs-manifest",
         help="print a path/content-hash inventory for operator review of an OCI rootfs",
@@ -892,6 +897,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             emit(rootfs_tree_manifest(args.rootfs))
             return 0
+        if args.action == "checkout-resource":
+            emit(identify_checkout(args.repo).public_view())
+            return 0
         supervisor = GitSupervisor(
             args.repo,
             diagnostic=args.action == "doctor",
@@ -1119,7 +1127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action in {"doctor", "verify-events"} and not result["ok"]:
             return 1
         return 0
-    except (SupervisorError, TrustBundleError) as error:
+    except (SupervisorError, TrustBundleError, CheckoutAdapterError) as error:
         print(
             json.dumps({"ok": False, "error": error.code, "message": str(error)}),
             file=sys.stderr,
