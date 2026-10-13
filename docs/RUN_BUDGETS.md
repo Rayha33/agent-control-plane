@@ -219,7 +219,8 @@ same task/idempotency key returns the existing reservation with `created:
 false`; clients must not send on that replay. A deliberate retry requires a
 new key and another available slot. Slots are never released or refunded.
 Reservations retain the task and resource fencing-token snapshot that was
-checked at creation.
+checked at creation. Reservation and client-reported receipt rows survive a
+service restart; task views recompute consumed slots from those persisted rows.
 
 The optional receipt endpoint records one immutable response observation and
 labels it `source: client_reported`. In particular, a client-reported 429 or

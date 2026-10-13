@@ -443,6 +443,72 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     )
 
 
+def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
+    client, app, admin_headers
+):
+    worker = create_agent(client, admin_headers, "restart-dispatch-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(
+        client,
+        admin_headers,
+        title="Dispatch budget restored after restart",
+        resources=["repo:file:dispatch-restart.py"],
+        max_dispatch_attempts=2,
+    )
+    claim = claim_task(client, task["id"], token).json()
+
+    first = reserve_dispatch_attempt(client, task["id"], token, claim, "restart-call-1")
+    assert first.status_code == 201, first.text
+    assert first.json()["created"] is True
+    reservation_id = first.json()["reservation"]["id"]
+
+    receipt_url = f"/v1/tasks/{task['id']}/dispatch-attempts/{reservation_id}/receipt"
+    receipt = client.post(
+        receipt_url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "http_status_code": 429,
+            "retry_after_seconds": 17,
+        },
+    )
+    assert receipt.status_code == 200, receipt.text
+    assert receipt.json()["receipt"]["source"] == "client_reported"
+
+    restarted_app = create_app(app.state.settings)
+    with TestClient(restarted_app) as restarted_client:
+        restored = restarted_client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["dispatch_attempt_budget"]["consumed"] == 1
+        assert restored.json()["dispatch_attempt_budget"]["remaining"] == 1
+
+        replay = reserve_dispatch_attempt(
+            restarted_client, task["id"], token, claim, "restart-call-1"
+        )
+        assert replay.status_code == 201, replay.text
+        assert replay.json()["created"] is False
+        restored_reservation = replay.json()["reservation"]
+        assert restored_reservation["id"] == reservation_id
+        assert restored_reservation["status"] == "reported"
+        assert restored_reservation["receipt"]["http_status_code"] == 429
+        assert restored_reservation["receipt"]["retry_after_seconds"] == 17
+
+        second = reserve_dispatch_attempt(
+            restarted_client, task["id"], token, claim, "restart-call-2"
+        )
+        assert second.status_code == 201, second.text
+        exhausted = reserve_dispatch_attempt(
+            restarted_client, task["id"], token, claim, "restart-call-3"
+        )
+        assert exhausted.status_code == 409
+        assert exhausted.json()["error"] == "task_dispatch_budget_exhausted"
+
+        final_view = restarted_client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
+        assert final_view.status_code == 200, final_view.text
+        assert final_view.json()["dispatch_attempt_budget"]["consumed"] == 2
+        assert final_view.json()["dispatch_attempt_budget"]["remaining"] == 0
+
+
 def test_zero_dispatch_budget_and_expired_claim_fail_closed(client, app, admin_headers):
     worker = create_agent(client, admin_headers, "dispatch-zero-worker", "worker")
     token = issue_coordination_mandate(client, admin_headers, worker["id"])
