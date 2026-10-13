@@ -105,6 +105,7 @@
       "_dispatch_limit",
       "_raise_claim_guard_error",
       "_raise_dispatch_guard_error",
+      "_reported_provider_usage_view",
       "_review_view",
       "_submission_row",
       "_submission_view",
@@ -172,6 +173,10 @@
       "model_config",
       "validate_verdict"
     ],
+    "class:ReportedProviderUsageView": [
+      "_abc_impl",
+      "model_config"
+    ],
     "class:SubmissionCreate": [
       "_abc_impl",
       "model_config"
@@ -198,8 +203,10 @@
       "ProviderUsageReport",
       "QCReviewCreate",
       "QC_RESERVATION_SECONDS",
+      "ReportedProviderUsageView",
       "SubmissionCreate",
       "TaskCreate",
+      "_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS",
       "annotations",
       "canonical_json",
       "declared_resources",

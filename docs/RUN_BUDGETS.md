@@ -120,6 +120,26 @@ automatically intercept SDK requests or prove every billable request crosses
 this path. The Responses API documents these usage fields in its [response
 object](https://developers.openai.com/api/reference/resources/responses/methods/create).
 
+Task status includes a separate `reported_provider_usage` roll-up for the task
+and its descendant tree. It groups observed token sums by provider, adapter,
+and model, and reports counts for reported, missing, invalid, receipt-without-
+report, and reservation-without-receipt cases. Each scope returns and aggregates
+at most its latest 1,000 dispatch reservations; `truncated` and
+`sampled_reservation_count` make that sample limit explicit. This bounds sample
+size and application-side aggregation work, not database work: the descendant
+summary and exact reservation count may still scan or sort the full descendant
+history, so read cost can grow with task-tree history.
+The unpaginated `/v1/tasks` collection leaves both roll-ups `null` and skips
+per-task report aggregation. It still computes the existing exact descendant
+dispatch-budget counts, which can traverse task-tree history; fetch
+`/v1/tasks/{id}` for the report summary.
+`latest_receipt_received_at_in_sample` is when ACP recorded the response
+receipt, not when the provider measured or billed it. `observed` means the
+sampled receipts contain reports without known gaps; it does not prove all
+model traffic was intercepted. `partial`, `none`, and `invalid` are distinct
+from the separate `provider_usage` hard-limit field, which remains
+`unsupported`.
+
 The cross-provider design implication is that native spend controls are useful
 account/project backstops, but they are not a portable per-task reservation
 protocol. An isolated provider scope can reduce cross-run interference only

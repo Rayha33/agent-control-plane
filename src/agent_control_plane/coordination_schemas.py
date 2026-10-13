@@ -268,6 +268,73 @@ class ProviderUsageReport(BaseModel):
         return self
 
 
+class ProviderUsageSummaryGroup(BaseModel):
+    """Sampled report-only totals for one provider, adapter, and model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
+    adapter: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
+    model: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    response_count: StrictInt = Field(ge=1, le=1000)
+    measurements: dict[str, StrictInt] = Field(min_length=1, max_length=16)
+    measurement_response_counts: dict[str, StrictInt] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_measurement_counts(self) -> ProviderUsageSummaryGroup:
+        allowed = {
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_output_tokens",
+        }
+        if (
+            set(self.measurements) != set(self.measurement_response_counts)
+            or not set(self.measurements) <= allowed
+            or any(
+                not 0 <= count <= self.response_count
+                for count in self.measurement_response_counts.values()
+            )
+            or any(value < 0 for value in self.measurements.values())
+        ):
+            raise ValueError("provider usage summary measurements are invalid")
+        return self
+
+
+class ReportedProviderUsageView(BaseModel):
+    """Bounded summaries of client-reported dispatch receipts, not provider metering."""
+
+    scope: Literal["task", "descendant_tree"]
+    status: Literal["none", "observed", "partial", "invalid"]
+    source: Literal["client_reported"]
+    capture_scope: Literal["ACP dispatch receipts only"]
+    unit: Literal["tokens"]
+    reservation_count: StrictInt | None = Field(default=None, ge=0)
+    sampled_reservation_count: StrictInt | None = Field(default=None, ge=0, le=1000)
+    reported_response_count: StrictInt | None = Field(default=None, ge=0, le=1000)
+    missing_report_count: StrictInt | None = Field(default=None, ge=0, le=1000)
+    invalid_report_count: StrictInt | None = Field(default=None, ge=0, le=1000)
+    receipt_without_report_count: StrictInt | None = Field(default=None, ge=0, le=1000)
+    reservation_without_receipt_count: StrictInt | None = Field(default=None, ge=0, le=1000)
+    latest_receipt_received_at_in_sample: str | None = Field(
+        default=None, min_length=20, max_length=40
+    )
+    truncated: bool
+    sample_limit: StrictInt = Field(ge=1, le=1000)
+    freshness: Literal["unknown"]
+    enforcement: Literal["report_only"]
+    reasons: list[
+        Literal[
+            "descendant_lineage_invalid",
+            "stored_usage_report_invalid",
+            "summary_truncated",
+        ]
+    ] = Field(default_factory=list)
+    groups: list[ProviderUsageSummaryGroup] = Field(default_factory=list, max_length=1000)
+
+
 class DispatchAttemptBudgetView(BaseModel):
     scope: Literal["task", "descendant_tree"]
     unit: Literal["dispatch_attempt_reservations"]
@@ -281,6 +348,7 @@ class DispatchAttemptBudgetView(BaseModel):
     enforcement: Literal["BEGIN IMMEDIATE reservation and SQLite trigger"]
     observed_at: str
     provider_usage: ProviderUsageEvidence
+    reported_provider_usage: ReportedProviderUsageView | None = None
 
 
 class DispatchAttemptReceiptCreate(BaseModel):

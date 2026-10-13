@@ -8,6 +8,7 @@ from threading import Barrier
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_control_plane import coordination as coordination_module
 from agent_control_plane.app import create_app
 from agent_control_plane.coordination_schemas import DispatchAttemptReservationCreate
 from agent_control_plane.provider_usage import parse_openai_responses_usage
@@ -465,6 +466,225 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     )
 
 
+def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
+    client, app, admin_headers, monkeypatch
+):
+    worker = create_agent(client, admin_headers, "usage-summary-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    root = create_task(client, admin_headers, title="Usage summary root")
+    child = create_task(
+        client,
+        admin_headers,
+        title="Usage summary child",
+        parent_task_id=root["id"],
+    )
+    root_claim = claim_task(client, root["id"], token).json()
+    child_claim = claim_task(client, child["id"], token).json()
+
+    def reserve_and_receipt(task, claim, key, *, report_marker="omit"):
+        reservation_response = reserve_dispatch_attempt(client, task["id"], token, claim, key)
+        assert reservation_response.status_code == 201, reservation_response.text
+        attempt_id = reservation_response.json()["reservation"]["id"]
+        payload = {
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "http_status_code": 200,
+            "retry_after_seconds": None,
+        }
+        if report_marker != "omit":
+            payload["provider_usage_report"] = report_marker
+        response = client.post(
+            f"/v1/tasks/{task['id']}/dispatch-attempts/{attempt_id}/receipt",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["receipt"]
+
+    root_report = parse_openai_responses_usage(
+        {
+            "object": "response",
+            "id": "resp_root_usage",
+            "model": "gpt-root",
+            "status": "completed",
+            "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+        }
+    ).as_dict()
+    child_report = parse_openai_responses_usage(
+        {
+            "object": "response",
+            "id": "resp_child_usage",
+            "model": "gpt-child",
+            "status": "completed",
+            "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+        }
+    ).as_dict()
+    child_other_model_report = parse_openai_responses_usage(
+        {
+            "object": "response",
+            "id": "resp_child_other_model",
+            "model": "gpt-child-alt",
+            "status": "completed",
+            "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+        }
+    ).as_dict()
+    root_second_report = parse_openai_responses_usage(
+        {
+            "object": "response",
+            "id": "resp_root_usage_2",
+            "model": "gpt-root",
+            "status": "completed",
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        }
+    ).as_dict()
+    missing_report = parse_openai_responses_usage({"error": {"type": "rate_limit_error"}}).as_dict()
+    invalid_report = parse_openai_responses_usage(
+        {
+            "object": "response",
+            "id": "resp_invalid_child",
+            "model": "gpt-child",
+            "status": "completed",
+            "usage": {"input_tokens": True, "output_tokens": 3, "total_tokens": 10},
+        }
+    ).as_dict()
+
+    reserve_and_receipt(root, root_claim, "usage-root", report_marker=root_report)
+    reserve_and_receipt(root, root_claim, "usage-root-2", report_marker=root_second_report)
+    child_report_receipt = reserve_and_receipt(
+        child, child_claim, "usage-child-reported", report_marker=child_report
+    )
+    reserve_and_receipt(
+        child, child_claim, "usage-child-other-model", report_marker=child_other_model_report
+    )
+    reserve_and_receipt(child, child_claim, "usage-child-missing", report_marker=missing_report)
+    reserve_and_receipt(child, child_claim, "usage-child-invalid", report_marker=invalid_report)
+    reserve_and_receipt(child, child_claim, "usage-child-no-report")
+    unreceipted = reserve_dispatch_attempt(
+        client, child["id"], token, child_claim, "usage-child-unreceipted"
+    )
+    assert unreceipted.status_code == 201, unreceipted.text
+
+    child_view = client.get(f"/v1/tasks/{child['id']}", headers=admin_headers).json()
+    child_usage = child_view["dispatch_attempt_budget"]["reported_provider_usage"]
+    assert child_usage["scope"] == "task"
+    assert child_usage["status"] == "partial"
+    assert child_usage["source"] == "client_reported"
+    assert child_usage["capture_scope"] == "ACP dispatch receipts only"
+    assert child_usage["unit"] == "tokens"
+    assert child_usage["freshness"] == "unknown"
+    assert child_usage["enforcement"] == "report_only"
+    assert child_usage["reservation_count"] == 6
+    assert child_usage["sampled_reservation_count"] == 6
+    assert child_usage["reported_response_count"] == 2
+    assert child_usage["missing_report_count"] == 1
+    assert child_usage["invalid_report_count"] == 1
+    assert child_usage["receipt_without_report_count"] == 1
+    assert child_usage["reservation_without_receipt_count"] == 1
+    assert child_usage["latest_receipt_received_at_in_sample"] is not None
+    assert child_usage["groups"] == [
+        {
+            "provider": "openai",
+            "adapter": "responses",
+            "model": "gpt-child",
+            "response_count": 1,
+            "measurements": {
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "total_tokens": 10,
+            },
+            "measurement_response_counts": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 1,
+            },
+        },
+        {
+            "provider": "openai",
+            "adapter": "responses",
+            "model": "gpt-child-alt",
+            "response_count": 1,
+            "measurements": {
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "total_tokens": 3,
+            },
+            "measurement_response_counts": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 1,
+            },
+        },
+    ]
+    assert child_view["dispatch_attempt_budget"]["provider_usage"] == _unsupported_provider_usage()
+    assert child_view["dispatch_attempt_budget"]["reported_provider_usage"]["status"] != "observed"
+    assert (
+        child_view["descendant_dispatch_attempt_budget"]["reported_provider_usage"]["status"]
+        == "none"
+    )
+
+    root_view = client.get(f"/v1/tasks/{root['id']}", headers=admin_headers).json()
+    root_task_usage = root_view["dispatch_attempt_budget"]["reported_provider_usage"]
+    root_descendant_usage = root_view["descendant_dispatch_attempt_budget"][
+        "reported_provider_usage"
+    ]
+    assert root_task_usage["status"] == "observed"
+    assert root_task_usage["groups"][0]["model"] == "gpt-root"
+    assert root_task_usage["groups"][0]["response_count"] == 2
+    assert root_task_usage["groups"][0]["measurements"] == {
+        "input_tokens": 14,
+        "output_tokens": 3,
+        "total_tokens": 17,
+    }
+    assert root_task_usage["groups"][0]["measurement_response_counts"] == {
+        "input_tokens": 2,
+        "output_tokens": 2,
+        "total_tokens": 2,
+    }
+    assert root_descendant_usage["status"] == "partial"
+    assert root_descendant_usage["reported_response_count"] == 2
+    assert root_descendant_usage["invalid_report_count"] == 1
+    assert [group["model"] for group in root_descendant_usage["groups"]] == [
+        "gpt-child",
+        "gpt-child-alt",
+    ]
+
+    listed = client.get("/v1/tasks", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    listed_by_id = {task["id"]: task for task in listed.json()}
+    assert listed_by_id[root["id"]]["dispatch_attempt_budget"]["reported_provider_usage"] is None
+    assert (
+        listed_by_id[root["id"]]["descendant_dispatch_attempt_budget"]["reported_provider_usage"]
+        is None
+    )
+    assert listed_by_id[child["id"]]["dispatch_attempt_budget"]["reported_provider_usage"] is None
+
+    monkeypatch.setattr(coordination_module, "_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS", 2)
+    truncated = client.get(f"/v1/tasks/{child['id']}", headers=admin_headers).json()
+    truncated_usage = truncated["dispatch_attempt_budget"]["reported_provider_usage"]
+    assert truncated_usage["reservation_count"] == 6
+    assert truncated_usage["sampled_reservation_count"] == 2
+    assert truncated_usage["truncated"] is True
+    assert truncated_usage["status"] == "partial"
+    assert "summary_truncated" in truncated_usage["reasons"]
+
+    monkeypatch.setattr(coordination_module, "_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS", 1000)
+    with sqlite3.connect(app.state.database.path) as connection:
+        connection.execute("DROP TRIGGER dispatch_attempt_receipt_immutable")
+        connection.execute(
+            "UPDATE dispatch_attempt_receipts SET provider_usage_json = ? "
+            "WHERE dispatch_attempt_id = ?",
+            (
+                '{"unexpected":"secret-shaped test value"}',
+                child_report_receipt["dispatch_attempt_id"],
+            ),
+        )
+    malformed_stored = client.get(f"/v1/tasks/{child['id']}", headers=admin_headers).json()
+    malformed_usage = malformed_stored["dispatch_attempt_budget"]["reported_provider_usage"]
+    assert malformed_usage["status"] == "partial"
+    assert malformed_usage["invalid_report_count"] == 2
+    assert "stored_usage_report_invalid" in malformed_usage["reasons"]
+    assert "secret-shaped" not in str(malformed_usage)
+
+
 def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
     client, app, admin_headers
 ):
@@ -542,6 +762,10 @@ def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
         assert restored.status_code == 200, restored.text
         assert restored.json()["dispatch_attempt_budget"]["consumed"] == 1
         assert restored.json()["dispatch_attempt_budget"]["remaining"] == 1
+        restored_usage = restored.json()["dispatch_attempt_budget"]["reported_provider_usage"]
+        assert restored_usage["status"] == "observed"
+        assert restored_usage["reported_response_count"] == 1
+        assert restored_usage["groups"][0]["measurements"]["total_tokens"] == 25
 
         replay = reserve_dispatch_attempt(
             restarted_client, task["id"], token, claim, "restart-call-1"
@@ -568,6 +792,11 @@ def test_dispatch_attempt_usage_and_receipt_survive_service_database_restart(
 
         final_view = restarted_client.get(f"/v1/tasks/{task['id']}", headers=admin_headers)
         assert final_view.status_code == 200, final_view.text
+        final_usage = final_view.json()["dispatch_attempt_budget"]["reported_provider_usage"]
+        assert final_usage["status"] == "partial"
+        assert final_usage["reported_response_count"] == 1
+        assert final_usage["reservation_without_receipt_count"] == 1
+        assert final_usage["groups"][0]["measurements"]["total_tokens"] == 25
         assert final_view.json()["dispatch_attempt_budget"]["consumed"] == 2
         assert final_view.json()["dispatch_attempt_budget"]["remaining"] == 0
 

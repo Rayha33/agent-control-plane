@@ -16,6 +16,7 @@ from .coordination_schemas import (
     ProviderUsageEvidence,
     ProviderUsageReport,
     QCReviewCreate,
+    ReportedProviderUsageView,
     SubmissionCreate,
     TaskCreate,
 )
@@ -25,6 +26,7 @@ from .scheduling import declared_resources
 from .service import ControlPlaneError, ControlPlaneService
 
 QC_RESERVATION_SECONDS = 3600
+_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS = 1000
 
 
 class CoordinationService:
@@ -137,7 +139,7 @@ class CoordinationService:
             )
         else:
             rows = self.database.all("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC")
-        return [self._task_view(row) for row in rows]
+        return [self._task_view(row, include_reported_usage=False) for row in rows]
 
     def claim_task(self, task_id: str, token: str, ttl_seconds: int) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
@@ -1354,7 +1356,9 @@ class CoordinationService:
             ):
                 raise ControlPlaneError(409, "stale_fencing_token", f"stale lease for {resource}")
 
-    def _task_view(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _task_view(
+        self, row: sqlite3.Row, *, include_reported_usage: bool = True
+    ) -> dict[str, Any]:
         with self.database.connect() as connection:
             connection.execute("BEGIN")
             row = self._task_row(connection, row["id"])
@@ -1421,6 +1425,21 @@ class CoordinationService:
                 else None
             )
             observed_at = utc_now()
+            task_reported_usage = (
+                self._reported_provider_usage_view(connection, row["id"], "task", dispatches_used)
+                if include_reported_usage
+                else None
+            )
+            descendant_reported_usage = (
+                self._reported_provider_usage_view(
+                    connection,
+                    row["id"],
+                    "descendant_tree",
+                    descendant_dispatches,
+                )
+                if include_reported_usage
+                else None
+            )
             return {
                 "id": row["id"],
                 "title": row["title"],
@@ -1451,6 +1470,7 @@ class CoordinationService:
                     max_dispatch_attempts,
                     dispatches_used,
                     observed_at,
+                    reported_provider_usage=task_reported_usage,
                     invalid=not max_dispatch_attempts_valid,
                 ),
                 "descendant_dispatch_attempt_budget": self._dispatch_attempt_budget_view(
@@ -1458,6 +1478,7 @@ class CoordinationService:
                     max_descendant_dispatch_attempts,
                     descendant_dispatches,
                     observed_at,
+                    reported_provider_usage=descendant_reported_usage,
                     invalid=not max_descendant_dispatch_attempts_valid,
                 ),
                 "descendant_claim_budget": self._claim_budget_view(
@@ -1513,12 +1534,181 @@ class CoordinationService:
         ).model_dump()
 
     @staticmethod
+    def _reported_provider_usage_view(
+        connection: sqlite3.Connection,
+        task_id: str,
+        scope: str,
+        reservation_count: int | None,
+    ) -> dict[str, Any]:
+        if reservation_count is None:
+            return ReportedProviderUsageView(
+                scope=scope,
+                status="invalid",
+                source="client_reported",
+                capture_scope="ACP dispatch receipts only",
+                unit="tokens",
+                reservation_count=None,
+                sampled_reservation_count=None,
+                reported_response_count=None,
+                missing_report_count=None,
+                invalid_report_count=None,
+                receipt_without_report_count=None,
+                reservation_without_receipt_count=None,
+                latest_receipt_received_at_in_sample=None,
+                truncated=False,
+                sample_limit=_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS,
+                freshness="unknown",
+                enforcement="report_only",
+                reasons=["descendant_lineage_invalid"],
+                groups=[],
+            ).model_dump()
+
+        if scope == "task":
+            rows = connection.execute(
+                """
+                SELECT receipt.provider_usage_json, receipt.received_at
+                FROM dispatch_attempt_reservations AS reservation
+                LEFT JOIN dispatch_attempt_receipts AS receipt
+                  ON receipt.dispatch_attempt_id = reservation.id
+                WHERE reservation.task_id = ?
+                ORDER BY reservation.created_at DESC, reservation.id DESC
+                LIMIT ?
+                """,
+                (task_id, _PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                WITH RECURSIVE descendants(id) AS (
+                    SELECT id FROM tasks WHERE parent_task_id = ?
+                    UNION
+                    SELECT child.id FROM tasks AS child
+                    JOIN descendants ON child.parent_task_id = descendants.id
+                )
+                SELECT receipt.provider_usage_json, receipt.received_at
+                FROM descendants
+                JOIN dispatch_attempt_reservations AS reservation
+                  ON reservation.task_id = descendants.id
+                LEFT JOIN dispatch_attempt_receipts AS receipt
+                  ON receipt.dispatch_attempt_id = reservation.id
+                ORDER BY reservation.created_at DESC, reservation.id DESC
+                LIMIT ?
+                """,
+                (task_id, _PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS),
+            ).fetchall()
+
+        reported_response_count = 0
+        missing_report_count = 0
+        invalid_report_count = 0
+        receipt_without_report_count = 0
+        reservation_without_receipt_count = 0
+        latest_receipt_received_at = max(
+            (row["received_at"] for row in rows if row["received_at"] is not None),
+            default=None,
+        )
+        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        invalid_stored_report = False
+
+        for row in rows:
+            stored_report = row["provider_usage_json"]
+            if stored_report is None:
+                reservation_without_receipt_count += 1
+                continue
+            try:
+                report_payload = json.loads(stored_report or "{}")
+                if report_payload == {}:
+                    receipt_without_report_count += 1
+                    continue
+                report = ProviderUsageReport.model_validate(report_payload)
+            except (TypeError, ValueError):
+                invalid_report_count += 1
+                invalid_stored_report = True
+                continue
+
+            if report.status == "missing":
+                missing_report_count += 1
+                continue
+            if report.status == "invalid":
+                invalid_report_count += 1
+                continue
+
+            assert report.model is not None
+            reported_response_count += 1
+            key = (report.provider, report.adapter, report.model)
+            group = groups.setdefault(
+                key,
+                {"response_count": 0, "measurements": {}, "measurement_response_counts": {}},
+            )
+            group["response_count"] += 1
+            for name, value in report.measurements.items():
+                group["measurements"][name] = group["measurements"].get(name, 0) + value
+                group["measurement_response_counts"][name] = (
+                    group["measurement_response_counts"].get(name, 0) + 1
+                )
+
+        truncated = reservation_count > len(rows)
+        reasons: list[str] = []
+        if invalid_stored_report:
+            reasons.append("stored_usage_report_invalid")
+        if truncated:
+            reasons.append("summary_truncated")
+        has_gaps = any(
+            (
+                missing_report_count,
+                invalid_report_count,
+                receipt_without_report_count,
+                reservation_without_receipt_count,
+                int(truncated),
+            )
+        )
+        if reservation_count == 0:
+            status = "none"
+        elif has_gaps:
+            status = "partial"
+        elif reported_response_count:
+            status = "observed"
+        else:
+            status = "partial"
+
+        group_views = [
+            {
+                "provider": provider,
+                "adapter": adapter,
+                "model": model,
+                **groups[(provider, adapter, model)],
+            }
+            for provider, adapter, model in sorted(groups)
+        ]
+        return ReportedProviderUsageView(
+            scope=scope,
+            status=status,
+            source="client_reported",
+            capture_scope="ACP dispatch receipts only",
+            unit="tokens",
+            reservation_count=reservation_count,
+            sampled_reservation_count=len(rows),
+            reported_response_count=reported_response_count,
+            missing_report_count=missing_report_count,
+            invalid_report_count=invalid_report_count,
+            receipt_without_report_count=receipt_without_report_count,
+            reservation_without_receipt_count=reservation_without_receipt_count,
+            latest_receipt_received_at_in_sample=latest_receipt_received_at,
+            truncated=truncated,
+            sample_limit=_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS,
+            freshness="unknown",
+            enforcement="report_only",
+            reasons=reasons,
+            groups=group_views,
+        ).model_dump()
+
+    @staticmethod
     def _dispatch_attempt_budget_view(
         scope: str,
         limit: int | None,
         consumed: int | None,
         observed_at: str,
         *,
+        reported_provider_usage: dict[str, Any] | None,
         invalid: bool = False,
     ) -> dict[str, Any]:
         if (
@@ -1564,6 +1754,7 @@ class CoordinationService:
                     "no authenticated provider meter or request gate are wired to this supervisor"
                 ),
             ),
+            reported_provider_usage=reported_provider_usage,
         ).model_dump()
 
     @staticmethod
