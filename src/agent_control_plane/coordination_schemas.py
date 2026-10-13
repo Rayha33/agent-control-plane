@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -456,6 +457,84 @@ class DispatchAttemptReservationResult(BaseModel):
     created: bool
 
 
+class BudgetInterruptionReportCreate(BaseModel):
+    """Bounded client-reported checkpoint for work that stopped before submission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    claim_fencing_token: StrictInt = Field(ge=1)
+    resource_fencing_tokens: dict[str, StrictInt]
+    reason: Literal[
+        "provider_quota_exhausted",
+        "local_budget_exhausted",
+        "retry_exhausted",
+        "operator_interrupted",
+        "unknown",
+    ]
+    summary: str = Field(min_length=1, max_length=2000)
+    checkpoint: dict[str, Any] = Field(default_factory=dict)
+    dispatch_attempt_ids: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("checkpoint")
+    @classmethod
+    def validate_bounded_checkpoint(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            serialized = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, RecursionError):
+            raise ValueError("checkpoint must contain JSON-compatible values") from None
+        if len(serialized.encode("utf-8")) > 8192:
+            raise ValueError("checkpoint exceeds the 8192-byte limit")
+        return value
+
+    @field_validator("dispatch_attempt_ids")
+    @classmethod
+    def validate_dispatch_attempt_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("dispatch_attempt_ids must be unique")
+        if any(not item or len(item) > 200 for item in value):
+            raise ValueError("dispatch_attempt_ids must be non-empty bounded identifiers")
+        return value
+
+
+class BudgetInterruptionReportView(BaseModel):
+    id: str
+    task_id: str
+    agent_id: str
+    claim_fencing_token: int
+    resource_fencing_tokens: dict[str, int]
+    interruption_status: Literal["interrupted"]
+    status: Literal["partial"]
+    source: Literal["client_reported"]
+    reason: Literal[
+        "provider_quota_exhausted",
+        "local_budget_exhausted",
+        "retry_exhausted",
+        "operator_interrupted",
+        "unknown",
+    ]
+    summary: str
+    checkpoint: dict[str, Any]
+    checkpoint_sha256: str
+    checkpoint_integrity: Literal["valid", "invalid"]
+    resource_fencing_tokens_integrity: Literal["valid", "invalid"]
+    dispatch_attempt_ids: list[str]
+    dispatch_attempts: list[DispatchAttemptView]
+    dispatch_attempts_integrity: Literal["valid", "invalid"]
+    received_at: str
+    promotable: Literal[False]
+
+
+class BudgetInterruptionReportResult(BaseModel):
+    report: BudgetInterruptionReportView
+    created: bool
+
+
 class TaskView(BaseModel):
     id: str
     title: str
@@ -482,6 +561,7 @@ class TaskView(BaseModel):
     max_descendant_unreceipted_dispatch_attempts: int | None
     outstanding_dispatch_budget: OutstandingDispatchBudgetView
     descendant_outstanding_dispatch_budget: OutstandingDispatchBudgetView
+    latest_interruption_report: BudgetInterruptionReportView | None = None
     version: int
     created_at: str
     updated_at: str

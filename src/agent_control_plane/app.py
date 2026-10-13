@@ -13,6 +13,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import Settings
 from .coordination import CoordinationService
 from .coordination_schemas import (
+    BudgetInterruptionReportCreate,
+    BudgetInterruptionReportResult,
     DispatchAttemptReceiptCreate,
     DispatchAttemptReceiptResult,
     DispatchAttemptReservationCreate,
@@ -317,6 +319,18 @@ def create_app(
         return coordination.record_dispatch_attempt_receipt(
             task_id, dispatch_attempt_id, token, request
         )
+
+    @app.post(
+        "/v1/tasks/{task_id}/interruption-reports",
+        response_model=BudgetInterruptionReportResult,
+        status_code=201,
+    )
+    def report_task_interruption(
+        task_id: str,
+        request: BudgetInterruptionReportCreate,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.record_budget_interruption_report(task_id, token, request)
 
     @app.post(
         "/v1/side-effects/{operation}",

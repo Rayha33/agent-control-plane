@@ -515,13 +515,48 @@ independently verified. If identity or cleanup is ambiguous, stop granting new
 authority and surface the state for recovery; do not signal a guessed PID or
 recycle the runtime.
 
+The Coordination API provides an opt-in
+`POST /v1/tasks/{task_id}/interruption-reports` receipt for a worker that can
+report a partial checkpoint before it exits. It is claim- and resource-fenced,
+immutable per claim generation, survives service restart, and is bounded to an
+8 KiB JSON checkpoint plus a 2,000-character summary. The checkpoint digest is
+computed by the service. Linked dispatch IDs must already have client-reported
+response receipts for the same task; the view includes those exact receipts and
+their provider-usage provenance. Task detail shows the latest report as
+`interruption_status: interrupted`, `status: partial`, `source: client_reported`,
+and `promotable: false`; recording it does not change task status or create a
+submission. The report is not
+host-authored evidence, a verified worktree/tree snapshot, a provider meter, a
+cancellation mechanism, or a hard stop for later dispatches. Callers must not
+include credentials or raw provider response bodies. Existing submission and
+independent-QC gates remain the only route to completion. This is a recovery
+breadcrumb, not full crash-durable result recovery.
+
+Example request (the checkpoint is caller-supplied JSON and is not host-verified):
+
+```json
+{
+  "claim_fencing_token": 3,
+  "resource_fencing_tokens": {"repo:file:src/example.py": 2},
+  "reason": "retry_exhausted",
+  "summary": "Tests were not completed; resume from the listed phase.",
+  "checkpoint": {"phase": "tests", "next_step": "rerun focused suite"},
+  "dispatch_attempt_ids": ["reservation-id-with-a-client-receipt"]
+}
+```
+
+An exact repeat for the same claim returns the existing report; a different
+payload for that claim conflicts. Expired claims can replay an already-created
+report idempotently but cannot create a new one.
+
 ## Delivery gates
 
 1. Local per-task and descendant-attempt caps and cooperative public API
    reservation slots, including hierarchical unreceipted-reservation caps, are
    implemented separately from provider meters, provider-enforced
-   retries/quota lifecycle, and crash-durable partial-result recovery; these
-   slices and this document do not complete #2998.
+   retries/quota lifecycle, host-authored worker checkpoints, and full
+   crash-durable partial-result recovery; this client-reported interruption
+   receipt is deliberately non-promotable and does not complete #2998.
 2. Local launch/resource-budget enforcement must use existing ACP fencing and
    durable state, and must not duplicate or weaken #2316's descendant cap or
    #2366's truthful runtime-resource reporting.

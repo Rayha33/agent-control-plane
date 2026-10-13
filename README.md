@@ -1075,6 +1075,12 @@ reservation and receipt routes. Its standard-library HTTP adapter uses bearer
 auth, rejects cleartext HTTP except to loopback, escapes path IDs, bounds response
 reads, and refuses redirects. This only sequences the supplied callback once:
 the caller's provider transport must still disable its own retries and redirects.
+Before exiting a claimed task after a bounded run stops, a worker may also post
+an immutable, claim-fenced partial checkpoint to
+`POST /v1/tasks/{task_id}/interruption-reports`. The task detail retains that
+report across restarts and labels it client-reported and non-promotable; it does
+not cancel work, change task status, or bypass the ordinary submission and QC
+gates. See [run budgets and usage provenance](docs/RUN_BUDGETS.md) for limits.
 
 ### Fenced external side effects
 

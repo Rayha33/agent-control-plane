@@ -346,6 +346,49 @@ def test_v6_service_database_migrates_to_outstanding_dispatch_reservations(
     assert version == str(SERVICE_SCHEMA_VERSION)
 
 
+def test_v7_service_database_migrates_append_only_interruption_reports(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        for trigger in (
+            "budget_interruption_report_immutable_update",
+            "budget_interruption_report_immutable_delete",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
+        connection.execute("DROP TABLE budget_interruption_reports")
+        connection.execute("UPDATE meta SET value = '7' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    Database(str(database_path)).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(budget_interruption_reports)")
+        }
+        triggers = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        }
+        version = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()[0]
+    assert {
+        "task_id",
+        "agent_id",
+        "claim_fencing_token",
+        "status",
+        "source",
+        "checkpoint_json",
+        "checkpoint_sha256",
+        "dispatch_attempt_ids_json",
+        "received_at",
+    } <= columns
+    assert {
+        "budget_interruption_report_immutable_update",
+        "budget_interruption_report_immutable_delete",
+    } <= triggers
+    assert version == str(SERVICE_SCHEMA_VERSION)
+
+
 def test_dispatch_outstanding_budget_sql_guard_cannot_be_bypassed(database_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")

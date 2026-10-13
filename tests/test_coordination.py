@@ -478,6 +478,258 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     )
 
 
+def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
+    client, app, admin_headers
+):
+    worker = create_agent(client, admin_headers, "interruption-report-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(
+        client,
+        admin_headers,
+        title="Preserve interrupted partial work",
+        resources=["repo:file:café.py"],
+    )
+    claim = claim_task(client, task["id"], token).json()
+    reservation = reserve_dispatch_attempt(client, task["id"], token, claim, "interrupted-call")
+    assert reservation.status_code == 201, reservation.text
+    dispatch_id = reservation.json()["reservation"]["id"]
+    request = {
+        "claim_fencing_token": claim["task"]["claim_fencing_token"],
+        "resource_fencing_tokens": resource_tokens(claim),
+        "reason": "provider_quota_exhausted",
+        "summary": "Stopped before submission; the latest safe checkpoint is recorded below.",
+        "checkpoint": {"phase": "tests", "last_safe_revision": "a" * 40},
+        "dispatch_attempt_ids": [dispatch_id],
+    }
+    endpoint = f"/v1/tasks/{task['id']}/interruption-reports"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    too_large = client.post(
+        endpoint,
+        headers=headers,
+        json={**request, "checkpoint": {"payload": "x" * 9000}},
+    )
+    assert too_large.status_code == 422
+    unreceipted = client.post(endpoint, headers=headers, json=request)
+    assert unreceipted.status_code == 422
+    assert unreceipted.json()["error"] == "interruption_dispatch_receipt_invalid"
+
+    receipt_response = client.post(
+        f"/v1/tasks/{task['id']}/dispatch-attempts/{dispatch_id}/receipt",
+        headers=headers,
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "http_status_code": 429,
+            "retry_after_seconds": 300,
+        },
+    )
+    assert receipt_response.status_code == 200, receipt_response.text
+    usage_reservation = reserve_dispatch_attempt(
+        client, task["id"], token, claim, "interrupted-usage-call"
+    )
+    assert usage_reservation.status_code == 201, usage_reservation.text
+    usage_dispatch_id = usage_reservation.json()["reservation"]["id"]
+    usage_report = ProviderUsageReport(
+        status="reported",
+        provider="openai",
+        adapter="responses",
+        source="client_reported",
+        scope="single_response",
+        unit="tokens",
+        observed_at="2026-10-13T13:00:00Z",
+        response_id="resp_interruption",
+        model="gpt-test",
+        response_created_at=1791896400,
+        measurements={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
+        freshness="unknown",
+        enforcement="report_only",
+        reason=None,
+    )
+    usage_receipt_response = client.post(
+        f"/v1/tasks/{task['id']}/dispatch-attempts/{usage_dispatch_id}/receipt",
+        headers=headers,
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "http_status_code": 200,
+            "provider_usage_report": usage_report.model_dump(),
+        },
+    )
+    assert usage_receipt_response.status_code == 200, usage_receipt_response.text
+    request["dispatch_attempt_ids"].append(usage_dispatch_id)
+
+    stale_fence = client.post(
+        endpoint,
+        headers=headers,
+        json={**request, "claim_fencing_token": claim["task"]["claim_fencing_token"] + 1},
+    )
+    assert stale_fence.status_code == 409
+    assert stale_fence.json()["error"] == "stale_claim_fencing_token"
+
+    report_response = client.post(endpoint, headers=headers, json=request)
+    assert report_response.status_code == 201, report_response.text
+    result = report_response.json()
+    report = result["report"]
+    assert result["created"] is True
+    assert report["interruption_status"] == "interrupted"
+    assert report["status"] == "partial"
+    assert report["source"] == "client_reported"
+    assert report["promotable"] is False
+    assert report["checkpoint_integrity"] == "valid"
+    assert report["checkpoint"] == request["checkpoint"]
+    assert report["resource_fencing_tokens_integrity"] == "valid"
+    assert report["resource_fencing_tokens"] == resource_tokens(claim)
+    assert report["dispatch_attempt_ids"] == [dispatch_id, usage_dispatch_id]
+    assert report["dispatch_attempts_integrity"] == "valid"
+    assert (
+        report["dispatch_attempts"][0]["claim_fencing_token"]
+        == claim["task"]["claim_fencing_token"]
+    )
+    assert report["dispatch_attempts"][0]["receipt"]["source"] == "client_reported"
+    assert report["dispatch_attempts"][0]["receipt"]["http_status_code"] == 429
+    assert report["dispatch_attempts"][0]["receipt"]["provider_usage"]["status"] == "unsupported"
+    assert (
+        report["dispatch_attempts"][1]["receipt"]["provider_usage_report"]["measurements"][
+            "total_tokens"
+        ]
+        == 7
+    )
+    assert report["received_at"]
+
+    replay = client.post(endpoint, headers=headers, json=request)
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["created"] is False
+    assert replay.json()["report"]["id"] == report["id"]
+    conflict = client.post(
+        endpoint,
+        headers=headers,
+        json={**request, "summary": "A conflicting second immutable report."},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"] == "interruption_report_conflict"
+    with app.state.database.connect() as connection:
+        connection.execute("UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (task["id"],))
+    expired_replay = client.post(endpoint, headers=headers, json=request)
+    assert expired_replay.status_code == 201, expired_replay.text
+    assert expired_replay.json()["created"] is False
+
+    task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert task_view["status"] == claim["task"]["status"]
+    assert task_view["latest_submission"] is None
+    assert task_view["latest_interruption_report"]["id"] == report["id"]
+    assert task_view["latest_interruption_report"]["promotable"] is False
+    cannot_complete = client.post(
+        f"/v1/tasks/{task['id']}/complete",
+        headers=admin_headers,
+        json={"reason": "A partial interruption report is not completed work."},
+    )
+    assert cannot_complete.status_code == 409
+    assert cannot_complete.json()["error"] == "qc_gate_not_passed"
+
+    Database(app.state.database.path).initialize()
+    after_restart = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert after_restart["latest_interruption_report"] == task_view["latest_interruption_report"]
+    with pytest.raises(sqlite3.IntegrityError, match="budget_interruption_report_immutable"):
+        with app.state.database.connect() as connection:
+            connection.execute(
+                "UPDATE budget_interruption_reports SET summary = 'changed' WHERE id = ?",
+                (report["id"],),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="budget_interruption_report_immutable"):
+        with app.state.database.connect() as connection:
+            connection.execute(
+                "DELETE FROM budget_interruption_reports WHERE id = ?", (report["id"],)
+            )
+
+
+def test_interruption_report_rechecks_claim_expiry_before_insert(
+    client, app, admin_headers, monkeypatch
+):
+    worker = create_agent(client, admin_headers, "interruption-expiry-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(
+        client,
+        admin_headers,
+        title="Reject a checkpoint after claim expiry",
+        resources=["repo:file:expiring-claim.py"],
+    )
+    claim = claim_task(client, task["id"], token).json()
+    reservation = reserve_dispatch_attempt(
+        client, task["id"], token, claim, "claim-expiry-checkpoint"
+    )
+    assert reservation.status_code == 201, reservation.text
+    dispatch_attempt_id = reservation.json()["reservation"]["id"]
+    receipt = client.post(
+        f"/v1/tasks/{task['id']}/dispatch-attempts/{dispatch_attempt_id}/receipt",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "http_status_code": 429,
+            "retry_after_seconds": 30,
+        },
+    )
+    assert receipt.status_code == 200, receipt.text
+    request = {
+        "claim_fencing_token": claim["task"]["claim_fencing_token"],
+        "resource_fencing_tokens": resource_tokens(claim),
+        "reason": "provider_quota_exhausted",
+        "summary": "The claim expires during report validation.",
+        "checkpoint": {"phase": "tests"},
+        "dispatch_attempt_ids": [dispatch_attempt_id],
+    }
+    service = app.state.coordination
+    original_assert_active_claim = service._assert_active_claim
+    calls = 0
+
+    def expire_on_final_check(connection, task_row, agent_id, fence, resource_fences, now):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            now = task_row["claim_expires_at"]
+        return original_assert_active_claim(
+            connection, task_row, agent_id, fence, resource_fences, now
+        )
+
+    monkeypatch.setattr(service, "_assert_active_claim", expire_on_final_check)
+    response = client.post(
+        f"/v1/tasks/{task['id']}/interruption-reports",
+        headers={"Authorization": f"Bearer {token}"},
+        json=request,
+    )
+
+    assert calls == 2
+    assert response.status_code == 409
+    assert response.json()["error"] == "stale_claim_fencing_token"
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM budget_interruption_reports WHERE task_id = ?",
+            (task["id"],),
+        )["count"]
+        == 0
+    )
+
+
+def test_interruption_report_rejects_duplicate_dispatch_receipt_ids():
+    from agent_control_plane.coordination_schemas import BudgetInterruptionReportCreate
+
+    with pytest.raises(ValueError, match="must be unique"):
+        BudgetInterruptionReportCreate.model_validate(
+            {
+                "claim_fencing_token": 1,
+                "resource_fencing_tokens": {},
+                "reason": "retry_exhausted",
+                "summary": "Retry budget was exhausted.",
+                "checkpoint": {},
+                "dispatch_attempt_ids": ["receipt-1", "receipt-1"],
+            }
+        )
+
+
+def test_legacy_task_has_no_interruption_report(client, admin_headers):
+    task = create_task(client, admin_headers, title="Legacy task without interruption")
+    task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert task_view["latest_interruption_report"] is None
+
+
 def test_provider_usage_report_rejects_timestamp_that_cannot_normalize_to_utc():
     with pytest.raises(ValueError, match="normalize to UTC"):
         ProviderUsageReport.model_validate(

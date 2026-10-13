@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 7
+SERVICE_SCHEMA_VERSION = 8
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -755,6 +755,67 @@ def _add_outstanding_dispatch_budgets(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_budget_interruption_reports(connection: sqlite3.Connection) -> None:
+    """Persist bounded, non-promotable client checkpoints for interrupted work."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS budget_interruption_reports (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id),
+          agent_id TEXT NOT NULL REFERENCES agents(id),
+          claim_fencing_token INTEGER NOT NULL CHECK
+            (typeof(claim_fencing_token) = 'integer' AND claim_fencing_token > 0),
+          resource_fencing_tokens_json TEXT NOT NULL CHECK
+            (json_valid(resource_fencing_tokens_json) = 1
+              AND json_type(resource_fencing_tokens_json) = 'object'),
+          status TEXT NOT NULL CHECK(status = 'partial'),
+          source TEXT NOT NULL CHECK(source = 'client_reported'),
+          reason TEXT NOT NULL CHECK(reason IN (
+            'provider_quota_exhausted', 'local_budget_exhausted',
+            'retry_exhausted', 'operator_interrupted', 'unknown'
+          )),
+          summary TEXT NOT NULL CHECK
+            (typeof(summary) = 'text' AND length(summary) BETWEEN 1 AND 2000),
+          checkpoint_json TEXT NOT NULL CHECK
+            (typeof(checkpoint_json) = 'text'
+              AND json_valid(checkpoint_json) = 1
+              AND json_type(checkpoint_json) = 'object'
+              AND length(CAST(checkpoint_json AS BLOB)) <= 8192),
+          checkpoint_sha256 TEXT NOT NULL CHECK
+            (typeof(checkpoint_sha256) = 'text'
+              AND length(checkpoint_sha256) = 64
+              AND checkpoint_sha256 NOT GLOB '*[^0-9a-f]*'),
+          dispatch_attempt_ids_json TEXT NOT NULL CHECK
+            (typeof(dispatch_attempt_ids_json) = 'text'
+              AND json_valid(dispatch_attempt_ids_json) = 1
+              AND json_type(dispatch_attempt_ids_json) = 'array'
+              AND length(CAST(dispatch_attempt_ids_json AS BLOB)) <= 12000),
+          received_at TEXT NOT NULL,
+          UNIQUE(task_id, claim_fencing_token)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_budget_interruption_reports_task "
+        "ON budget_interruption_reports(task_id, received_at DESC, id)"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS budget_interruption_report_immutable_update
+        BEFORE UPDATE ON budget_interruption_reports
+        BEGIN SELECT RAISE(ABORT, 'budget_interruption_report_immutable'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS budget_interruption_report_immutable_delete
+        BEFORE DELETE ON budget_interruption_reports
+        BEGIN SELECT RAISE(ABORT, 'budget_interruption_report_immutable'); END
+        """
+    )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -777,6 +838,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (5, _add_dispatch_attempt_budgets),
     (6, _add_dispatch_attempt_provider_usage),
     (7, _add_outstanding_dispatch_budgets),
+    (8, _add_budget_interruption_reports),
 )
 
 SCHEMA = """

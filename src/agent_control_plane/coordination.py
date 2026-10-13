@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -8,6 +9,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .coordination_schemas import (
+    BudgetInterruptionReportCreate,
+    BudgetInterruptionReportView,
     ClaimBudgetView,
     DispatchAttemptBudgetView,
     DispatchAttemptReceiptCreate,
@@ -150,7 +153,10 @@ class CoordinationService:
             )
         else:
             rows = self.database.all("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC")
-        return [self._task_view(row, include_reported_usage=False) for row in rows]
+        return [
+            self._task_view(row, include_reported_usage=False, include_interruption_report=False)
+            for row in rows
+        ]
 
     def claim_task(self, task_id: str, token: str, ttl_seconds: int) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
@@ -659,6 +665,146 @@ class CoordinationService:
             ).fetchone()
             assert receipt is not None
             return {"receipt": self._dispatch_attempt_receipt_view(receipt), "created": True}
+
+    def record_budget_interruption_report(
+        self,
+        task_id: str,
+        token: str,
+        request: BudgetInterruptionReportCreate,
+    ) -> dict[str, Any]:
+        """Persist a fenced, bounded checkpoint without changing task lifecycle state."""
+        claims, _mandate, agent = self._agent_for_action(
+            token, "coordination.interruption_report", f"task:{task_id}", {"worker"}
+        )
+        report_id = str(uuid.uuid4())
+        received_at = utc_now()
+        checkpoint_json = canonical_json(request.checkpoint)
+        checkpoint_sha256 = hashlib.sha256(checkpoint_json.encode("utf-8")).hexdigest()
+        resource_tokens_json = canonical_json(request.resource_fencing_tokens)
+        dispatch_ids_json = canonical_json(request.dispatch_attempt_ids)
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            values = {
+                "agent_id": agent["id"],
+                "claim_fencing_token": request.claim_fencing_token,
+                "resource_fencing_tokens_json": resource_tokens_json,
+                "reason": request.reason,
+                "summary": request.summary,
+                "checkpoint_json": checkpoint_json,
+                "checkpoint_sha256": checkpoint_sha256,
+                "dispatch_attempt_ids_json": dispatch_ids_json,
+            }
+            existing = connection.execute(
+                """SELECT * FROM budget_interruption_reports
+                   WHERE task_id = ? AND claim_fencing_token = ?""",
+                (task_id, request.claim_fencing_token),
+            ).fetchone()
+            if existing is not None:
+                if any(existing[key] != value for key, value in values.items()):
+                    raise ControlPlaneError(
+                        409,
+                        "interruption_report_conflict",
+                        "this claim already has a different immutable interruption report",
+                    )
+                return {
+                    "report": self._budget_interruption_report_view(connection, existing),
+                    "created": False,
+                }
+
+            task = self._task_row(connection, task_id)
+            self._assert_active_claim(
+                connection,
+                task,
+                agent["id"],
+                request.claim_fencing_token,
+                request.resource_fencing_tokens,
+                int(time.time()),
+            )
+            for dispatch_attempt_id in request.dispatch_attempt_ids:
+                receipt = connection.execute(
+                    """
+                    SELECT reservation.id, reservation.resource_fencing_tokens_json
+                    FROM dispatch_attempt_reservations AS reservation
+                    JOIN dispatch_attempt_receipts AS receipt
+                      ON receipt.dispatch_attempt_id = reservation.id
+                    WHERE reservation.id = ? AND reservation.task_id = ?
+                      AND reservation.agent_id = ?
+                      AND reservation.claim_fencing_token = ?
+                    """,
+                    (
+                        dispatch_attempt_id,
+                        task_id,
+                        agent["id"],
+                        request.claim_fencing_token,
+                    ),
+                ).fetchone()
+                if receipt is None or not self._resource_fencing_tokens_match(
+                    receipt["resource_fencing_tokens_json"],
+                    request.resource_fencing_tokens,
+                ):
+                    raise ControlPlaneError(
+                        422,
+                        "interruption_dispatch_receipt_invalid",
+                        "every linked dispatch attempt must have a client-reported receipt "
+                        "from this task claim and resource fence",
+                    )
+
+            # The first check fences linked receipts. Recheck the wall-clock expiry
+            # immediately before persistence so a claim expiring during validation
+            # cannot create a fresh interruption report.
+            self._assert_active_claim(
+                connection,
+                task,
+                agent["id"],
+                request.claim_fencing_token,
+                request.resource_fencing_tokens,
+                int(time.time()),
+            )
+            connection.execute(
+                """
+                INSERT INTO budget_interruption_reports
+                  (id, task_id, agent_id, claim_fencing_token,
+                   resource_fencing_tokens_json, status, source, reason, summary,
+                   checkpoint_json, checkpoint_sha256, dispatch_attempt_ids_json, received_at)
+                VALUES (?, ?, ?, ?, ?, 'partial', 'client_reported', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_id,
+                    task_id,
+                    agent["id"],
+                    request.claim_fencing_token,
+                    resource_tokens_json,
+                    request.reason,
+                    request.summary,
+                    checkpoint_json,
+                    checkpoint_sha256,
+                    dispatch_ids_json,
+                    received_at,
+                ),
+            )
+            self.database.append_audit(
+                "task.interruption_reported",
+                claims["actor"],
+                {
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "claim_fencing_token": request.claim_fencing_token,
+                    "dispatch_attempt_ids": request.dispatch_attempt_ids,
+                    "reason": request.reason,
+                    "report_id": report_id,
+                    "source": "client_reported",
+                    "status": "partial",
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
+            report = connection.execute(
+                "SELECT * FROM budget_interruption_reports WHERE id = ?", (report_id,)
+            ).fetchone()
+            assert report is not None
+            return {
+                "report": self._budget_interruption_report_view(connection, report),
+                "created": True,
+            }
 
     def submit(self, task_id: str, token: str, request: SubmissionCreate) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
@@ -1438,7 +1584,11 @@ class CoordinationService:
                 raise ControlPlaneError(409, "stale_fencing_token", f"stale lease for {resource}")
 
     def _task_view(
-        self, row: sqlite3.Row, *, include_reported_usage: bool = True
+        self,
+        row: sqlite3.Row,
+        *,
+        include_reported_usage: bool = True,
+        include_interruption_report: bool = True,
     ) -> dict[str, Any]:
         with self.database.connect() as connection:
             connection.execute("BEGIN")
@@ -1466,6 +1616,15 @@ class CoordinationService:
                 """,
                 (row["id"],),
             ).fetchone()
+            latest_interruption = (
+                connection.execute(
+                    """SELECT * FROM budget_interruption_reports
+                       WHERE task_id = ? ORDER BY received_at DESC, id DESC LIMIT 1""",
+                    (row["id"],),
+                ).fetchone()
+                if include_interruption_report
+                else None
+            )
             try:
                 self._task_ancestor_chain(connection, row)
                 ancestor_lineage_integrity = "valid"
@@ -1636,7 +1795,118 @@ class CoordinationService:
                     self._submission_view(latest_submission) if latest_submission else None
                 ),
                 "latest_review": self._review_view(latest_review) if latest_review else None,
+                "latest_interruption_report": (
+                    self._budget_interruption_report_view(connection, latest_interruption)
+                    if latest_interruption
+                    else None
+                ),
             }
+
+    @staticmethod
+    def _budget_interruption_report_view(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        checkpoint_raw = row["checkpoint_json"]
+        try:
+            checkpoint = json.loads(checkpoint_raw) if isinstance(checkpoint_raw, str) else None
+            if not isinstance(checkpoint, dict):
+                checkpoint = {}
+                checkpoint_integrity = "invalid"
+            else:
+                checkpoint_integrity = "valid"
+        except (TypeError, ValueError):
+            checkpoint = {}
+            checkpoint_integrity = "invalid"
+        expected_digest = (
+            hashlib.sha256(checkpoint_raw.encode("utf-8")).hexdigest()
+            if isinstance(checkpoint_raw, str)
+            else None
+        )
+        if expected_digest is None or expected_digest != row["checkpoint_sha256"]:
+            checkpoint = {}
+            checkpoint_integrity = "invalid"
+        try:
+            resource_fencing_tokens = json.loads(row["resource_fencing_tokens_json"])
+            if not isinstance(resource_fencing_tokens, dict) or any(
+                not isinstance(key, str) or type(value) is not int or value < 1
+                for key, value in resource_fencing_tokens.items()
+            ):
+                resource_fencing_tokens = {}
+                resource_fencing_tokens_integrity = "invalid"
+            else:
+                resource_fencing_tokens_integrity = "valid"
+        except (TypeError, ValueError):
+            resource_fencing_tokens = {}
+            resource_fencing_tokens_integrity = "invalid"
+        try:
+            dispatch_attempt_ids = json.loads(row["dispatch_attempt_ids_json"])
+            if not isinstance(dispatch_attempt_ids, list) or any(
+                not isinstance(item, str) for item in dispatch_attempt_ids
+            ):
+                dispatch_attempt_ids = []
+                dispatch_attempts_integrity = "invalid"
+            else:
+                dispatch_attempts_integrity = "valid"
+        except (TypeError, ValueError):
+            dispatch_attempt_ids = []
+            dispatch_attempts_integrity = "invalid"
+        dispatch_attempts = []
+        for dispatch_attempt_id in dispatch_attempt_ids:
+            reservation = connection.execute(
+                """SELECT * FROM dispatch_attempt_reservations
+                   WHERE id = ? AND task_id = ?""",
+                (dispatch_attempt_id, row["task_id"]),
+            ).fetchone()
+            if reservation is None:
+                dispatch_attempts_integrity = "invalid"
+                continue
+            attempt_view = CoordinationService._dispatch_attempt_view(connection, reservation)
+            if (
+                reservation["agent_id"] != row["agent_id"]
+                or reservation["claim_fencing_token"] != row["claim_fencing_token"]
+                or not CoordinationService._resource_fencing_tokens_match(
+                    reservation["resource_fencing_tokens_json"], resource_fencing_tokens
+                )
+                or attempt_view["status"] != "reported"
+            ):
+                dispatch_attempts_integrity = "invalid"
+            dispatch_attempts.append(attempt_view)
+        return BudgetInterruptionReportView(
+            id=row["id"],
+            task_id=row["task_id"],
+            agent_id=row["agent_id"],
+            claim_fencing_token=row["claim_fencing_token"],
+            resource_fencing_tokens=resource_fencing_tokens,
+            interruption_status="interrupted",
+            status=row["status"],
+            source=row["source"],
+            reason=row["reason"],
+            summary=row["summary"],
+            checkpoint=checkpoint,
+            checkpoint_sha256=row["checkpoint_sha256"],
+            checkpoint_integrity=checkpoint_integrity,
+            resource_fencing_tokens_integrity=resource_fencing_tokens_integrity,
+            dispatch_attempt_ids=dispatch_attempt_ids,
+            dispatch_attempts=dispatch_attempts,
+            dispatch_attempts_integrity=dispatch_attempts_integrity,
+            received_at=row["received_at"],
+            promotable=False,
+        ).model_dump()
+
+    @staticmethod
+    def _resource_fencing_tokens_match(stored_json: str, expected: dict[str, int]) -> bool:
+        try:
+            stored = json.loads(stored_json)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(stored, dict)
+            and all(
+                isinstance(resource, str) and type(token) is int and token >= 1
+                for resource, token in stored.items()
+            )
+            and stored == expected
+        )
 
     @staticmethod
     def _claim_budget_view(
