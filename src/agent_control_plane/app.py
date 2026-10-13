@@ -13,6 +13,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import Settings
 from .coordination import CoordinationService
 from .coordination_schemas import (
+    DispatchAttemptReceiptCreate,
+    DispatchAttemptReceiptResult,
+    DispatchAttemptReservationCreate,
+    DispatchAttemptReservationResult,
     HeartbeatRequest,
     HeartbeatView,
     QCReviewCreate,
@@ -287,6 +291,32 @@ def create_app(
         token: str = Depends(require_mandate),
     ) -> dict:
         return coordination.heartbeat(task_id, token, request)
+
+    @app.post(
+        "/v1/tasks/{task_id}/dispatch-attempts",
+        response_model=DispatchAttemptReservationResult,
+        status_code=201,
+    )
+    def reserve_dispatch_attempt(
+        task_id: str,
+        request: DispatchAttemptReservationCreate,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.reserve_dispatch_attempt(task_id, token, request)
+
+    @app.post(
+        "/v1/tasks/{task_id}/dispatch-attempts/{dispatch_attempt_id}/receipt",
+        response_model=DispatchAttemptReceiptResult,
+    )
+    def record_dispatch_attempt_receipt(
+        task_id: str,
+        dispatch_attempt_id: str,
+        request: DispatchAttemptReceiptCreate,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.record_dispatch_attempt_receipt(
+            task_id, dispatch_attempt_id, token, request
+        )
 
     @app.post(
         "/v1/side-effects/{operation}",

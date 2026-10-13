@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 TaskStatus = Literal[
     "open",
@@ -106,6 +106,26 @@ class TaskCreate(BaseModel):
             "at any depth; the task's own claims are excluded."
         ),
     )
+    max_dispatch_attempts: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=2**63 - 1,
+        description=(
+            "Maximum cooperative dispatch-attempt reservations for this task. "
+            "This counts reservations, not verified provider requests or spend."
+        ),
+    )
+    max_descendant_dispatch_attempts: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=2**63 - 1,
+        description=(
+            "Maximum cooperative dispatch-attempt reservations across descendants "
+            "at any depth; the task's own reservations are excluded."
+        ),
+    )
     provider_cost_limit_usd_micros: int | None = Field(
         default=None,
         strict=True,
@@ -150,6 +170,62 @@ class ClaimBudgetView(BaseModel):
     observed_at: str
 
 
+class DispatchAttemptBudgetView(BaseModel):
+    scope: Literal["task", "descendant_tree"]
+    unit: Literal["dispatch_attempt_reservations"]
+    limit: int | None
+    consumed: int | None
+    remaining: int | None
+    reserved: Literal[0]
+    released: Literal[0]
+    status: Literal["available", "exhausted", "unlimited", "invalid"]
+    source: Literal["dispatch_attempt_reservations"]
+    enforcement: Literal["BEGIN IMMEDIATE reservation and SQLite trigger"]
+    observed_at: str
+
+
+class DispatchAttemptReceiptCreate(BaseModel):
+    claim_fencing_token: StrictInt = Field(ge=1)
+    http_status_code: int = Field(strict=True, ge=100, le=599)
+    retry_after_seconds: int | None = Field(default=None, strict=True, ge=0, le=86400)
+
+
+class DispatchAttemptReceiptView(BaseModel):
+    dispatch_attempt_id: str
+    source: Literal["client_reported"]
+    http_status_code: int
+    retry_after_seconds: int | None
+    received_at: str
+
+
+class DispatchAttemptReceiptResult(BaseModel):
+    receipt: DispatchAttemptReceiptView
+    created: bool
+
+
+class DispatchAttemptReservationCreate(BaseModel):
+    claim_fencing_token: StrictInt = Field(ge=1)
+    resource_fencing_tokens: dict[str, StrictInt]
+    idempotency_key: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$")
+
+
+class DispatchAttemptView(BaseModel):
+    id: str
+    task_id: str
+    agent_id: str
+    claim_fencing_token: int
+    resource_fencing_tokens: dict[str, int]
+    idempotency_key: str
+    status: Literal["reserved", "reported"]
+    created_at: str
+    receipt: DispatchAttemptReceiptView | None = None
+
+
+class DispatchAttemptReservationResult(BaseModel):
+    reservation: DispatchAttemptView
+    created: bool
+
+
 class TaskView(BaseModel):
     id: str
     title: str
@@ -168,6 +244,10 @@ class TaskView(BaseModel):
     max_descendant_claims: int | None
     claim_budget: ClaimBudgetView
     descendant_claim_budget: ClaimBudgetView
+    max_dispatch_attempts: int | None
+    max_descendant_dispatch_attempts: int | None
+    dispatch_attempt_budget: DispatchAttemptBudgetView
+    descendant_dispatch_attempt_budget: DispatchAttemptBudgetView
     version: int
     created_at: str
     updated_at: str

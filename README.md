@@ -1064,6 +1064,12 @@ claim receives fresh fencing tokens; old tokens do not regain authority.
 The Git supervisor is the primary v0.2 product path. The HTTP authority API is a
 separate reference layer and does not create Git worktrees.
 
+The HTTP API also supports cooperative dispatch-attempt reservation slots for
+clients that manage outbound model calls themselves. These durable slots are
+not provider request or spend limits; client-reported 429/Retry-After receipts
+do not schedule retries or refund capacity. See [run budgets and usage
+provenance](docs/RUN_BUDGETS.md) for the exact API contract and limitations.
+
 ### Fenced external side effects
 
 The authority API exposes a provider-neutral gate for mutations that worktrees

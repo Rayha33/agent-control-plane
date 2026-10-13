@@ -1,10 +1,10 @@
 # Run budgets and usage provenance
 
 **Status:** design contract plus local supervisor attempt caps and public
-Coordination API claim-reservation caps for task #2998. Provider adapters,
-provider quota handling, and budget-exhaustion checkpoint recovery are not
-implemented. This document is not a provider billing cap or evidence that ACP
-meters model work.
+Coordination claim- and dispatch-attempt-reservation caps for task #2998.
+Provider adapters, provider quota handling, and budget-exhaustion checkpoint
+recovery are not implemented. This document is not a provider billing cap or
+evidence that ACP meters model work.
 
 ## Problem
 
@@ -33,9 +33,10 @@ Current ACP controls cover only parts of that boundary:
   Claim checks run inside the serialized write transaction; failed provisioning
   and expired attempts still consume the slot. Plan/queue simulate slot use for
   their proposed concurrent-ready set, but do not persist reservations.
-- The separate public Coordination `POST /v1/tasks` API does not implement the
-  local supervisor's attempt counters. It rejects unknown request fields, so an
-  unsupported attempt-cap field cannot be silently ignored there.
+- The public Coordination API has its own durable claim and cooperative
+  dispatch-attempt reservations. These are separate from the local supervisor's
+  `--max-attempts` counters and do not meter provider requests, SDK retries,
+  provider-internal fan-out, tokens, or spend.
 - The supervised OCI worker launch, independent cleanup verification, and
   sandbox-aware result import remain unproven end to end (#2370 and #2439).
 
@@ -200,6 +201,41 @@ status, source, enforcement point, and observation time. The local supervisor's
 `attempt_budget` evidence remains a different unit and enforcement boundary.
 These Coordination counters are durable claim generations, not a worker
 attempt ledger or proof that any worker actually started.
+
+Coordination also accepts immutable `max_dispatch_attempts` and
+`max_descendant_dispatch_attempts` caps on `POST /v1/tasks`. A worker with a
+live task claim and current resource fences reserves a slot through
+`POST /v1/tasks/{task_id}/dispatch-attempts` before a cooperative outbound
+call. The reservation and local/ancestor cap checks run under `BEGIN IMMEDIATE`,
+and the SQLite insert trigger rechecks live task/resource fences and cap limits.
+Descendant caps include every descendant depth and exclude the capped task's
+own reservations. A cap of zero denies all new reservations.
+
+These are **dispatch-attempt reservation slots**, not proof that an HTTP request
+was sent, reached a provider, or incurred cost. Each new idempotency key
+permanently consumes a slot even if the process crashes before sending or the
+outcome is ambiguous. While the original claim remains active, replaying the
+same task/idempotency key returns the existing reservation with `created:
+false`; clients must not send on that replay. A deliberate retry requires a
+new key and another available slot. Slots are never released or refunded.
+Reservations retain the task and resource fencing-token snapshot that was
+checked at creation.
+
+The optional receipt endpoint records one immutable response observation and
+labels it `source: client_reported`. In particular, a client-reported 429 or
+Retry-After is evidence only: it does not authorize, schedule, or perform a
+retry, and it never restores a slot. ACP does not yet run a provider adapter,
+observe whether the client actually sent a request, or control provider/CLI
+internal retries and fan-out. A worker that calls a provider directly can
+bypass these cooperative reservations. Therefore these counters are not a
+provider request limit, egress gate, quota control, token budget, or spend cap.
+
+Task views expose local and descendant dispatch-attempt budgets with unit
+`dispatch_attempt_reservations`, consumed/remaining counts, status, source,
+enforcement point, and observation time. `reserved` and `released` remain zero:
+the slot is consumed atomically when its immutable reservation row is written.
+The receipt is separately identified as client-reported, not provider-verified.
+
 The task, ancestor chain, descendants, dependencies, and latest submission/review
 are read from one SQLite snapshot; `ancestor_lineage_integrity` is `invalid` if
 an ancestor link, cap, or fencing counter is corrupt. Invalid lineage is never
@@ -294,9 +330,10 @@ recycle the runtime.
 
 ## Delivery gates
 
-1. Local per-task and descendant-attempt caps are implemented separately from
-   provider meters, retry/quota lifecycle, and partial-result recovery; these
-   slices and this document do not complete #2998.
+1. Local per-task and descendant-attempt caps and cooperative public API
+   reservation slots are implemented separately from provider meters,
+   provider-enforced retries/quota lifecycle, and partial-result recovery;
+   these slices and this document do not complete #2998.
 2. Local launch/resource-budget enforcement must use existing ACP fencing and
    durable state, and must not duplicate or weaken #2316's descendant cap or
    #2366's truthful runtime-resource reporting.

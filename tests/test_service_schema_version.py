@@ -13,6 +13,7 @@ The two databases version INDEPENDENTLY. They share the mechanism, not the numbe
 from __future__ import annotations
 
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -237,15 +238,145 @@ def test_v3_service_database_adds_nullable_task_claim_budgets_and_legacy_guard(
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
         }
 
-    assert {"parent_task_id", "max_claims", "max_descendant_claims"} <= columns
+    assert {
+        "parent_task_id",
+        "max_claims",
+        "max_descendant_claims",
+        "max_dispatch_attempts",
+        "max_descendant_dispatch_attempts",
+    } <= columns
+    reservation_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(dispatch_attempt_reservations)")
+    }
+    assert "resource_fencing_tokens_json" in reservation_columns
     assert legacy == (None, None, None)
     assert {
         "task_claim_budget_guard",
         "task_claim_budget_config_immutable",
         "task_claim_budget_insert_guard",
+        "task_dispatch_budget_config_immutable",
+        "task_dispatch_budget_insert_guard",
+        "dispatch_attempt_insert_guard",
+        "dispatch_attempt_reservation_immutable",
+        "dispatch_attempt_receipt_immutable",
     } <= triggers
     assert "idx_tasks_parent_task" in indexes
+    assert "idx_dispatch_attempt_reservations_task" in indexes
     assert meta(database_path)[SCHEMA_VERSION_KEY] == str(SERVICE_SCHEMA_VERSION)
+
+
+def test_dispatch_reservation_sql_guard_enforces_caps_and_immutable_receipts(
+    database_path: Path,
+) -> None:
+    now = int(time.time())
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO agents(id, name, owner, created_at) VALUES "
+            "('dispatch-worker', 'worker', 'owner', 'now')"
+        )
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, title, description, acceptance_criteria_json, resources_json,
+                status, max_descendant_dispatch_attempts, created_at, updated_at
+            ) VALUES ('dispatch-root', 'root', 'budget', '[]', '[]', 'open', 1, 'now', 'now')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, title, description, acceptance_criteria_json, resources_json,
+                status, parent_task_id, created_at, updated_at
+            ) VALUES ('dispatch-middle', 'middle', 'nested', '[]', '[]', 'open',
+                      'dispatch-root', 'now', 'now')
+            """
+        )
+        for task_id in ("dispatch-a", "dispatch-b"):
+            resource = f"repo:file:{task_id}.py"
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, description, acceptance_criteria_json, resources_json,
+                    status, owner_agent_id, claim_expires_at, claim_fencing_token,
+                    parent_task_id, max_dispatch_attempts, created_at, updated_at
+                ) VALUES (?, 'child', 'budget', '[]', ?, 'open', NULL, NULL,
+                          0, 'dispatch-middle', 1, 'now', 'now')
+                """,
+                (task_id, f'["{resource}"]'),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'working', owner_agent_id = 'dispatch-worker', "
+                "claim_expires_at = ?, claim_fencing_token = 1 WHERE id = ?",
+                (now + 3600, task_id),
+            )
+            connection.execute(
+                "INSERT INTO resource_leases("
+                "resource, task_id, holder_agent_id, fencing_token, expires_at, updated_at) "
+                "VALUES (?, ?, 'dispatch-worker', 1, ?, 'now')",
+                (resource, task_id, now + 3600),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="dispatch_resource_fence_invalid"):
+            connection.execute(
+                """
+                INSERT INTO dispatch_attempt_reservations(
+                    id, task_id, agent_id, claim_fencing_token,
+                    resource_fencing_tokens_json, idempotency_key, created_at
+                ) VALUES ('bad-resource-fence', 'dispatch-a', 'dispatch-worker', 1,
+                          '{"repo:file:dispatch-a.py":2}', 'bad-call', 'now')
+                """
+            )
+        connection.execute(
+            "UPDATE resource_leases SET task_id = NULL, holder_agent_id = NULL "
+            "WHERE resource = 'repo:file:dispatch-a.py'"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="dispatch_resource_fence_invalid"):
+            connection.execute(
+                """
+                INSERT INTO dispatch_attempt_reservations(
+                    id, task_id, agent_id, claim_fencing_token, resource_fencing_tokens_json,
+                    idempotency_key, created_at
+                ) VALUES ('ownerless-resource-fence', 'dispatch-a', 'dispatch-worker', 1,
+                          '{"repo:file:dispatch-a.py":1}', 'ownerless-call', 'now')
+                """
+            )
+        connection.execute(
+            "UPDATE resource_leases SET task_id = 'dispatch-a', holder_agent_id = 'dispatch-worker' "
+            "WHERE resource = 'repo:file:dispatch-a.py'"
+        )
+        connection.execute(
+            """
+            INSERT INTO dispatch_attempt_reservations(
+                id, task_id, agent_id, claim_fencing_token, resource_fencing_tokens_json,
+                idempotency_key, created_at
+            ) VALUES ('dispatch-reservation-a', 'dispatch-a', 'dispatch-worker', 1,
+                      '{"repo:file:dispatch-a.py":1}', 'call-a', 'now')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="descendant_dispatch_budget_exhausted"):
+            connection.execute(
+                """
+                INSERT INTO dispatch_attempt_reservations(
+                    id, task_id, agent_id, claim_fencing_token, resource_fencing_tokens_json,
+                    idempotency_key, created_at
+                ) VALUES ('dispatch-reservation-b', 'dispatch-b', 'dispatch-worker', 1,
+                          '{"repo:file:dispatch-b.py":1}', 'call-b', 'now')
+                """
+            )
+        connection.execute(
+            """
+            INSERT INTO dispatch_attempt_receipts(
+                dispatch_attempt_id, source, http_status_code, retry_after_seconds, received_at
+            ) VALUES ('dispatch-reservation-a', 'client_reported', 429, 30, 'now')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="dispatch_attempt_receipt_immutable"):
+            connection.execute(
+                "UPDATE dispatch_attempt_receipts SET http_status_code = 200 "
+                "WHERE dispatch_attempt_id = 'dispatch-reservation-a'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="task_dispatch_budget_config_immutable"):
+            connection.execute("UPDATE tasks SET max_dispatch_attempts = 2 WHERE id = 'dispatch-a'")
 
 
 def test_stale_service_sql_writer_cannot_bypass_task_claim_cap(

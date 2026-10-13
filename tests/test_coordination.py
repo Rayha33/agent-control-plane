@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_control_plane.app import create_app
+from agent_control_plane.coordination_schemas import DispatchAttemptReservationCreate
 from agent_control_plane.service import ControlPlaneError
 
 
@@ -228,6 +229,18 @@ def submit_task(client, task_id, token, claim, artifact_hash="a" * 64):
     )
 
 
+def reserve_dispatch_attempt(client, task_id, token, claim, idempotency_key):
+    return client.post(
+        f"/v1/tasks/{task_id}/dispatch-attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "resource_fencing_tokens": resource_tokens(claim),
+            "idempotency_key": idempotency_key,
+        },
+    )
+
+
 def test_simultaneous_claims_have_exactly_one_winner(client, app, admin_headers):
     worker_a = create_agent(client, admin_headers, "parallel-worker-a", "worker")
     worker_b = create_agent(client, admin_headers, "parallel-worker-b", "worker")
@@ -334,6 +347,302 @@ def test_sibling_claims_share_atomic_descendant_budget(client, app, admin_header
     assert parent_after_claim["descendant_claim_budget"]["consumed"] == 1
     assert parent_after_claim["descendant_claim_budget"]["remaining"] == 0
     assert parent_after_claim["ancestor_lineage_integrity"] == "valid"
+
+
+def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_untrusted(
+    client, app, admin_headers
+):
+    worker = create_agent(client, admin_headers, "dispatch-budget-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(
+        client,
+        admin_headers,
+        title="Two cooperative dispatch slots",
+        resources=["repo:file:dispatch-budget.py"],
+        max_dispatch_attempts=2,
+    )
+    claim = claim_task(client, task["id"], token).json()
+
+    malformed_fence = client.post(
+        f"/v1/tasks/{task['id']}/dispatch-attempts",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "claim_fencing_token": claim["task"]["claim_fencing_token"],
+            "resource_fencing_tokens": {resource: True for resource in resource_tokens(claim)},
+            "idempotency_key": "boolean-is-not-a-fence",
+        },
+    )
+    assert malformed_fence.status_code == 422
+
+    first = reserve_dispatch_attempt(client, task["id"], token, claim, "call-1")
+    assert first.status_code == 201, first.text
+    assert first.json()["created"] is True
+    reservation = first.json()["reservation"]
+    assert reservation["status"] == "reserved"
+    assert reservation["claim_fencing_token"] == claim["task"]["claim_fencing_token"]
+    assert reservation["resource_fencing_tokens"] == resource_tokens(claim)
+
+    replay = reserve_dispatch_attempt(client, task["id"], token, claim, "call-1")
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["created"] is False
+    assert replay.json()["reservation"]["id"] == reservation["id"]
+    assert (
+        client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()[
+            "dispatch_attempt_budget"
+        ]["consumed"]
+        == 1
+    )
+
+    receipt_url = f"/v1/tasks/{task['id']}/dispatch-attempts/{reservation['id']}/receipt"
+    receipt_body = {
+        "claim_fencing_token": claim["task"]["claim_fencing_token"],
+        "http_status_code": 429,
+        "retry_after_seconds": 30,
+    }
+    receipt = client.post(
+        receipt_url,
+        headers={"Authorization": f"Bearer {token}"},
+        json=receipt_body,
+    )
+    assert receipt.status_code == 200, receipt.text
+    assert receipt.json()["created"] is True
+    assert receipt.json()["receipt"]["source"] == "client_reported"
+    assert receipt.json()["receipt"]["http_status_code"] == 429
+    assert receipt.json()["receipt"]["retry_after_seconds"] == 30
+    receipt_replay = client.post(
+        receipt_url,
+        headers={"Authorization": f"Bearer {token}"},
+        json=receipt_body,
+    )
+    assert receipt_replay.status_code == 200, receipt_replay.text
+    assert receipt_replay.json()["created"] is False
+    conflicting_receipt = client.post(
+        receipt_url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={**receipt_body, "http_status_code": 503},
+    )
+    assert conflicting_receipt.status_code == 409
+    assert conflicting_receipt.json()["error"] == "dispatch_attempt_receipt_conflict"
+
+    second = reserve_dispatch_attempt(client, task["id"], token, claim, "call-2")
+    assert second.status_code == 201, second.text
+    exhausted = reserve_dispatch_attempt(client, task["id"], token, claim, "call-3")
+    assert exhausted.status_code == 409
+    assert exhausted.json()["error"] == "task_dispatch_budget_exhausted"
+    task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert task_view["dispatch_attempt_budget"]["consumed"] == 2
+    assert task_view["dispatch_attempt_budget"]["remaining"] == 0
+    assert task_view["dispatch_attempt_budget"]["reserved"] == 0
+    assert task_view["dispatch_attempt_budget"]["released"] == 0
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM audit_events "
+            "WHERE event_type = 'dispatch_attempt.receipt_reported'"
+        )["count"]
+        == 1
+    )
+
+
+def test_zero_dispatch_budget_and_expired_claim_fail_closed(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "dispatch-zero-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    zero_task = create_task(
+        client,
+        admin_headers,
+        title="No cooperative dispatch slots",
+        resources=["repo:file:dispatch-zero.py"],
+        max_dispatch_attempts=0,
+    )
+    zero_claim = claim_task(client, zero_task["id"], token).json()
+    denied = reserve_dispatch_attempt(client, zero_task["id"], token, zero_claim, "never-send")
+    assert denied.status_code == 409
+    assert denied.json()["error"] == "task_dispatch_budget_exhausted"
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM dispatch_attempt_reservations WHERE task_id = ?",
+            (zero_task["id"],),
+        )["count"]
+        == 0
+    )
+
+    task = create_task(
+        client,
+        admin_headers,
+        title="Expired claim cannot reserve",
+        resources=["repo:file:dispatch-expired.py"],
+        max_dispatch_attempts=1,
+    )
+    claim = claim_task(client, task["id"], token).json()
+    app.state.database.execute("UPDATE tasks SET claim_expires_at = 1 WHERE id = ?", (task["id"],))
+    stale = reserve_dispatch_attempt(client, task["id"], token, claim, "expired-call")
+    assert stale.status_code == 409
+    assert stale.json()["error"] == "stale_claim_fencing_token"
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM dispatch_attempt_reservations WHERE task_id = ?",
+            (task["id"],),
+        )["count"]
+        == 0
+    )
+
+
+def test_sibling_dispatch_attempts_share_atomic_ancestor_budget(client, app, admin_headers):
+    workers = [
+        create_agent(client, admin_headers, f"dispatch-race-worker-{i}", "worker") for i in range(2)
+    ]
+    tokens = [issue_coordination_mandate(client, admin_headers, worker["id"]) for worker in workers]
+    parent = create_task(
+        client,
+        admin_headers,
+        title="One descendant dispatch slot",
+        max_descendant_dispatch_attempts=1,
+    )
+    children = [
+        create_task(
+            client,
+            admin_headers,
+            title=f"Dispatch child {i}",
+            parent_task_id=parent["id"],
+            resources=[f"repo:file:dispatch-child-{i}.py"],
+        )
+        for i in range(2)
+    ]
+    claims = [
+        claim_task(client, child["id"], token).json()
+        for child, token in zip(children, tokens, strict=True)
+    ]
+    start = Barrier(2)
+
+    def reserve(args):
+        task_id, token, claim, key = args
+        start.wait(timeout=5)
+        try:
+            return "created", app.state.coordination.reserve_dispatch_attempt(
+                task_id,
+                token,
+                DispatchAttemptReservationCreate(
+                    claim_fencing_token=claim["task"]["claim_fencing_token"],
+                    resource_fencing_tokens=resource_tokens(claim),
+                    idempotency_key=key,
+                ),
+            )
+        except ControlPlaneError as error:
+            return "rejected", getattr(error, "code", type(error).__name__)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(
+            executor.map(
+                reserve,
+                zip(
+                    [child["id"] for child in children],
+                    tokens,
+                    claims,
+                    ["race-a", "race-b"],
+                    strict=True,
+                ),
+            )
+        )
+
+    assert sum(outcome[0] == "created" for outcome in outcomes) == 1
+    assert (
+        sum(outcome == ("rejected", "descendant_dispatch_budget_exhausted") for outcome in outcomes)
+        == 1
+    )
+    parent_view = client.get(f"/v1/tasks/{parent['id']}", headers=admin_headers).json()
+    assert parent_view["descendant_dispatch_attempt_budget"]["consumed"] == 1
+    assert parent_view["descendant_dispatch_attempt_budget"]["remaining"] == 0
+
+
+def test_concurrent_dispatch_idempotency_returns_only_one_new_slot(client, app, admin_headers):
+    worker = create_agent(client, admin_headers, "dispatch-idempotency-worker", "worker")
+    token = issue_coordination_mandate(client, admin_headers, worker["id"])
+    task = create_task(
+        client,
+        admin_headers,
+        title="Concurrent idempotent reservation",
+        resources=["repo:file:dispatch-idempotency.py"],
+        max_dispatch_attempts=1,
+    )
+    claim = claim_task(client, task["id"], token).json()
+    request = DispatchAttemptReservationCreate(
+        claim_fencing_token=claim["task"]["claim_fencing_token"],
+        resource_fencing_tokens=resource_tokens(claim),
+        idempotency_key="same-logical-call",
+    )
+    start = Barrier(2)
+
+    def reserve(_index):
+        start.wait(timeout=5)
+        return app.state.coordination.reserve_dispatch_attempt(task["id"], token, request)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(reserve, range(2)))
+
+    assert sorted(result["created"] for result in results) == [False, True]
+    assert results[0]["reservation"]["id"] == results[1]["reservation"]["id"]
+    assert (
+        app.state.database.one(
+            "SELECT COUNT(*) AS count FROM dispatch_attempt_reservations WHERE task_id = ?",
+            (task["id"],),
+        )["count"]
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("root_cap", "middle_cap", "blocking_ancestor"),
+    [(2, 1, "middle"), (1, 2, "root")],
+)
+def test_deep_ancestor_dispatch_budget_covers_grandchildren(
+    client, admin_headers, root_cap, middle_cap, blocking_ancestor
+):
+    workers = [
+        create_agent(client, admin_headers, f"deep-dispatch-worker-{i}", "worker") for i in range(2)
+    ]
+    tokens = [issue_coordination_mandate(client, admin_headers, worker["id"]) for worker in workers]
+    root = create_task(
+        client,
+        admin_headers,
+        title="One slot for all descendants",
+        max_descendant_dispatch_attempts=root_cap,
+    )
+    middle = create_task(
+        client,
+        admin_headers,
+        title="Intermediate task",
+        parent_task_id=root["id"],
+        max_descendant_dispatch_attempts=middle_cap,
+    )
+    leaves = [
+        create_task(
+            client,
+            admin_headers,
+            title=f"Grandchild {i}",
+            parent_task_id=middle["id"],
+            resources=[f"repo:file:deep-dispatch-{i}.py"],
+        )
+        for i in range(2)
+    ]
+    claims = [
+        claim_task(client, leaf["id"], token).json()
+        for leaf, token in zip(leaves, tokens, strict=True)
+    ]
+
+    first = reserve_dispatch_attempt(client, leaves[0]["id"], tokens[0], claims[0], "deep-a")
+    second = reserve_dispatch_attempt(client, leaves[1]["id"], tokens[1], claims[1], "deep-b")
+    assert first.status_code == 201, first.text
+    assert second.status_code == 409
+    assert second.json()["error"] == "descendant_dispatch_budget_exhausted"
+    root_view = client.get(f"/v1/tasks/{root['id']}", headers=admin_headers).json()
+    middle_view = client.get(f"/v1/tasks/{middle['id']}", headers=admin_headers).json()
+    assert root_view["descendant_dispatch_attempt_budget"]["consumed"] == 1
+    assert middle_view["descendant_dispatch_attempt_budget"]["consumed"] == 1
+    assert root_view["descendant_dispatch_attempt_budget"]["status"] == (
+        "exhausted" if blocking_ancestor == "root" else "available"
+    )
+    assert middle_view["descendant_dispatch_attempt_budget"]["status"] == (
+        "exhausted" if blocking_ancestor == "middle" else "available"
+    )
 
 
 def test_zero_descendant_cap_allows_parent_claim_but_denies_child(client, admin_headers):

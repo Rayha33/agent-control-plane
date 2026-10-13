@@ -97,7 +97,14 @@
       "_claim_limit",
       "_clear_heartbeats",
       "_descendant_claim_count",
+      "_descendant_dispatch_attempt_count",
+      "_dispatch_attempt_budget_view",
+      "_dispatch_attempt_count",
+      "_dispatch_attempt_receipt_view",
+      "_dispatch_attempt_view",
+      "_dispatch_limit",
       "_raise_claim_guard_error",
+      "_raise_dispatch_guard_error",
       "_review_view",
       "_submission_row",
       "_submission_view",
@@ -110,7 +117,9 @@
       "heartbeat",
       "list_tasks",
       "reap_expired",
+      "record_dispatch_attempt_receipt",
       "reopen_task",
+      "reserve_dispatch_attempt",
       "review",
       "review_view",
       "submission",
@@ -127,6 +136,22 @@
       "initialize",
       "one",
       "verify_audit_chain"
+    ],
+    "class:DispatchAttemptBudgetView": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:DispatchAttemptReceiptCreate": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:DispatchAttemptReceiptView": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:DispatchAttemptReservationCreate": [
+      "_abc_impl",
+      "model_config"
     ],
     "class:HeartbeatRequest": [
       "_abc_impl",
@@ -154,6 +179,10 @@
       "ControlPlaneService",
       "CoordinationService",
       "Database",
+      "DispatchAttemptBudgetView",
+      "DispatchAttemptReceiptCreate",
+      "DispatchAttemptReceiptView",
+      "DispatchAttemptReservationCreate",
       "HeartbeatRequest",
       "QCReviewCreate",
       "QC_RESERVATION_SECONDS",

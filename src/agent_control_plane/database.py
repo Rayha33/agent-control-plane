@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 4
+SERVICE_SCHEMA_VERSION = 5
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -372,6 +372,209 @@ def _add_task_claim_budgets(connection: sqlite3.Connection) -> None:
     _install_task_claim_budget_guards(connection)
 
 
+def _add_dispatch_attempt_budgets(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+    if "max_dispatch_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_dispatch_attempts INTEGER CHECK ("
+            "max_dispatch_attempts IS NULL OR "
+            "(typeof(max_dispatch_attempts) = 'integer' AND max_dispatch_attempts >= 0))"
+        )
+    if "max_descendant_dispatch_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN max_descendant_dispatch_attempts INTEGER CHECK ("
+            "max_descendant_dispatch_attempts IS NULL OR "
+            "(typeof(max_descendant_dispatch_attempts) = 'integer' "
+            "AND max_descendant_dispatch_attempts >= 0))"
+        )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS dispatch_attempt_reservations ("
+        "id TEXT PRIMARY KEY, "
+        "task_id TEXT NOT NULL REFERENCES tasks(id), "
+        "agent_id TEXT NOT NULL REFERENCES agents(id), "
+        "claim_fencing_token INTEGER NOT NULL CHECK "
+        "(typeof(claim_fencing_token) = 'integer' AND claim_fencing_token > 0), "
+        "resource_fencing_tokens_json TEXT NOT NULL DEFAULT '{}', "
+        "idempotency_key TEXT NOT NULL CHECK "
+        "(typeof(idempotency_key) = 'text' AND length(idempotency_key) BETWEEN 1 AND 200), "
+        "created_at TEXT NOT NULL, UNIQUE(task_id, idempotency_key))"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dispatch_attempt_reservations_task "
+        "ON dispatch_attempt_reservations(task_id, created_at, id)"
+    )
+    reservation_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(dispatch_attempt_reservations)")
+    }
+    if "resource_fencing_tokens_json" not in reservation_columns:
+        connection.execute(
+            "ALTER TABLE dispatch_attempt_reservations "
+            "ADD COLUMN resource_fencing_tokens_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS dispatch_attempt_receipts ("
+        "dispatch_attempt_id TEXT PRIMARY KEY "
+        "REFERENCES dispatch_attempt_reservations(id), "
+        "source TEXT NOT NULL CHECK(source = 'client_reported'), "
+        "http_status_code INTEGER NOT NULL CHECK "
+        "(typeof(http_status_code) = 'integer' AND http_status_code BETWEEN 100 AND 599), "
+        "retry_after_seconds INTEGER CHECK "
+        "(retry_after_seconds IS NULL OR "
+        "(typeof(retry_after_seconds) = 'integer' AND retry_after_seconds BETWEEN 0 AND 86400)), "
+        "received_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS task_dispatch_budget_config_immutable "
+        "BEFORE UPDATE OF max_dispatch_attempts, max_descendant_dispatch_attempts ON tasks "
+        "WHEN NEW.max_dispatch_attempts IS NOT OLD.max_dispatch_attempts "
+        "OR NEW.max_descendant_dispatch_attempts IS NOT OLD.max_descendant_dispatch_attempts "
+        "BEGIN SELECT RAISE(ABORT, 'task_dispatch_budget_config_immutable'); END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS task_dispatch_budget_insert_guard "
+        "BEFORE INSERT ON tasks BEGIN "
+        "SELECT CASE WHEN NEW.max_dispatch_attempts IS NOT NULL AND "
+        "(typeof(NEW.max_dispatch_attempts) <> 'integer' OR NEW.max_dispatch_attempts < 0) "
+        "THEN RAISE(ABORT, 'task_dispatch_budget_invalid') END; "
+        "SELECT CASE WHEN NEW.max_descendant_dispatch_attempts IS NOT NULL AND "
+        "(typeof(NEW.max_descendant_dispatch_attempts) <> 'integer' "
+        "OR NEW.max_descendant_dispatch_attempts < 0) "
+        "THEN RAISE(ABORT, 'descendant_dispatch_budget_invalid') END; END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS dispatch_attempt_insert_guard "
+        "BEFORE INSERT ON dispatch_attempt_reservations BEGIN "
+        "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM tasks AS task "
+        "WHERE task.id = NEW.task_id AND task.owner_agent_id = NEW.agent_id "
+        "AND task.claim_fencing_token = NEW.claim_fencing_token "
+        "AND task.status IN ('claimed', 'working') AND task.claim_expires_at > "
+        "CAST(strftime('%s', 'now') AS INTEGER)) "
+        "THEN RAISE(ABORT, 'dispatch_claim_fence_invalid') END; "
+        "SELECT CASE WHEN json_valid(NEW.resource_fencing_tokens_json) <> 1 "
+        "THEN RAISE(ABORT, 'dispatch_resource_fence_invalid') END; "
+        "SELECT CASE WHEN json_type(NEW.resource_fencing_tokens_json) <> 'object' "
+        "THEN RAISE(ABORT, 'dispatch_resource_fence_invalid') END; "
+        "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM tasks AS task "
+        "WHERE task.id = NEW.task_id AND "
+        "(SELECT COUNT(*) FROM json_each(NEW.resource_fencing_tokens_json)) "
+        "= json_array_length(task.resources_json) AND NOT EXISTS ("
+        "SELECT 1 FROM json_each(NEW.resource_fencing_tokens_json) AS fence "
+        "LEFT JOIN resource_leases AS lease ON lease.resource = fence.key "
+        "WHERE fence.type <> 'integer' OR fence.value < 1 OR lease.resource IS NULL "
+        "OR lease.task_id IS NOT NEW.task_id "
+        "OR lease.holder_agent_id IS NOT NEW.agent_id "
+        "OR lease.fencing_token <> fence.value OR lease.expires_at <= "
+        "CAST(strftime('%s', 'now') AS INTEGER) OR NOT EXISTS ("
+        "SELECT 1 FROM json_each(task.resources_json) AS declared "
+        "WHERE declared.value = fence.key)) AND NOT EXISTS ("
+        "SELECT 1 FROM json_each(task.resources_json) AS declared "
+        "WHERE NOT EXISTS (SELECT 1 FROM json_each(NEW.resource_fencing_tokens_json) "
+        "AS fence WHERE fence.key = declared.value))) "
+        "THEN RAISE(ABORT, 'dispatch_resource_fence_invalid') END; "
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM tasks AS task WHERE task.id = NEW.task_id "
+        "AND task.max_dispatch_attempts IS NOT NULL "
+        "AND (typeof(task.max_dispatch_attempts) <> 'integer' "
+        "OR task.max_dispatch_attempts < 0)) "
+        "THEN RAISE(ABORT, 'task_dispatch_budget_invalid') END; "
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM tasks AS task WHERE task.id = NEW.task_id "
+        "AND task.max_dispatch_attempts IS NOT NULL AND "
+        "(SELECT COUNT(*) FROM dispatch_attempt_reservations WHERE task_id = NEW.task_id) "
+        ">= task.max_dispatch_attempts) "
+        "THEN RAISE(ABORT, 'task_dispatch_budget_exhausted') END; "
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM tasks AS child WHERE child.id = NEW.task_id "
+        "AND child.parent_task_id IS NOT NULL AND NOT EXISTS "
+        "(SELECT 1 FROM tasks AS parent WHERE parent.id = child.parent_task_id)) "
+        "THEN RAISE(ABORT, 'task_lineage_invalid') END; "
+        "SELECT CASE WHEN EXISTS (WITH RECURSIVE ancestors(id, parent_task_id, "
+        "max_descendant_dispatch_attempts, path, cycle) AS ("
+        "SELECT parent.id, parent.parent_task_id, parent.max_descendant_dispatch_attempts, "
+        "'|' || parent.id || '|', 0 "
+        "FROM tasks AS child JOIN tasks AS parent ON parent.id = child.parent_task_id "
+        "WHERE child.id = NEW.task_id UNION ALL "
+        "SELECT parent.id, parent.parent_task_id, parent.max_descendant_dispatch_attempts, "
+        "ancestors.path || parent.id || '|', "
+        "instr(ancestors.path, '|' || parent.id || '|') > 0 "
+        "FROM tasks AS parent JOIN ancestors ON parent.id = ancestors.parent_task_id "
+        "WHERE ancestors.cycle = 0) SELECT 1 FROM ancestors WHERE cycle = 1 "
+        "OR (parent_task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM tasks AS parent "
+        "WHERE parent.id = ancestors.parent_task_id))) "
+        "THEN RAISE(ABORT, 'task_lineage_invalid') END; "
+        "SELECT CASE WHEN EXISTS (WITH RECURSIVE ancestors(id, parent_task_id, "
+        "max_descendant_dispatch_attempts, path, cycle) AS ("
+        "SELECT parent.id, parent.parent_task_id, parent.max_descendant_dispatch_attempts, "
+        "'|' || parent.id || '|', 0 "
+        "FROM tasks AS child JOIN tasks AS parent ON parent.id = child.parent_task_id "
+        "WHERE child.id = NEW.task_id UNION ALL "
+        "SELECT parent.id, parent.parent_task_id, parent.max_descendant_dispatch_attempts, "
+        "ancestors.path || parent.id || '|', "
+        "instr(ancestors.path, '|' || parent.id || '|') > 0 "
+        "FROM tasks AS parent JOIN ancestors ON parent.id = ancestors.parent_task_id "
+        "WHERE ancestors.cycle = 0), descendants(ancestor_id, id, path, cycle) AS ("
+        "SELECT ancestor.id, child.id, '|' || ancestor.id || '|' || child.id || '|', "
+        "child.id = ancestor.id FROM ancestors AS ancestor JOIN tasks AS child "
+        "ON child.parent_task_id = ancestor.id UNION ALL "
+        "SELECT descendants.ancestor_id, child.id, descendants.path || child.id || '|', "
+        "instr(descendants.path, '|' || child.id || '|') > 0 FROM tasks AS child "
+        "JOIN descendants ON child.parent_task_id = descendants.id WHERE descendants.cycle = 0), "
+        "usage(ancestor_id, reservations) AS (SELECT ancestor.id, COUNT(reservation.id) "
+        "FROM ancestors AS ancestor LEFT JOIN descendants "
+        "ON descendants.ancestor_id = ancestor.id LEFT JOIN dispatch_attempt_reservations AS reservation "
+        "ON reservation.task_id = descendants.id GROUP BY ancestor.id) "
+        "SELECT 1 FROM ancestors AS ancestor LEFT JOIN usage "
+        "ON usage.ancestor_id = ancestor.id WHERE ancestor.max_descendant_dispatch_attempts "
+        "IS NOT NULL AND (typeof(ancestor.max_descendant_dispatch_attempts) <> 'integer' "
+        "OR ancestor.max_descendant_dispatch_attempts < 0)) "
+        "THEN RAISE(ABORT, 'descendant_dispatch_budget_invalid') END; "
+        "SELECT CASE WHEN EXISTS (WITH RECURSIVE ancestors(id, parent_task_id, "
+        "max_descendant_dispatch_attempts, path, cycle) AS ("
+        "SELECT parent.id, parent.parent_task_id, parent.max_descendant_dispatch_attempts, "
+        "'|' || parent.id || '|', 0 "
+        "FROM tasks AS child JOIN tasks AS parent ON parent.id = child.parent_task_id "
+        "WHERE child.id = NEW.task_id UNION ALL "
+        "SELECT parent.id, parent.parent_task_id, parent.max_descendant_dispatch_attempts, "
+        "ancestors.path || parent.id || '|', "
+        "instr(ancestors.path, '|' || parent.id || '|') > 0 "
+        "FROM tasks AS parent JOIN ancestors ON parent.id = ancestors.parent_task_id "
+        "WHERE ancestors.cycle = 0), descendants(ancestor_id, id, path, cycle) AS ("
+        "SELECT ancestor.id, child.id, '|' || ancestor.id || '|' || child.id || '|', "
+        "child.id = ancestor.id FROM ancestors AS ancestor JOIN tasks AS child "
+        "ON child.parent_task_id = ancestor.id UNION ALL "
+        "SELECT descendants.ancestor_id, child.id, descendants.path || child.id || '|', "
+        "instr(descendants.path, '|' || child.id || '|') > 0 FROM tasks AS child "
+        "JOIN descendants ON child.parent_task_id = descendants.id WHERE descendants.cycle = 0), "
+        "usage(ancestor_id, reservations) AS (SELECT ancestor.id, COUNT(reservation.id) "
+        "FROM ancestors AS ancestor LEFT JOIN descendants "
+        "ON descendants.ancestor_id = ancestor.id LEFT JOIN dispatch_attempt_reservations AS reservation "
+        "ON reservation.task_id = descendants.id GROUP BY ancestor.id) "
+        "SELECT 1 FROM ancestors AS ancestor LEFT JOIN usage "
+        "ON usage.ancestor_id = ancestor.id WHERE ancestor.max_descendant_dispatch_attempts "
+        "IS NOT NULL AND COALESCE(usage.reservations, 0) >= "
+        "ancestor.max_descendant_dispatch_attempts) "
+        "THEN RAISE(ABORT, 'descendant_dispatch_budget_exhausted') END; END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS dispatch_attempt_reservation_immutable "
+        "BEFORE UPDATE ON dispatch_attempt_reservations "
+        "BEGIN SELECT RAISE(ABORT, 'dispatch_attempt_reservation_immutable'); END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS dispatch_attempt_reservation_no_delete "
+        "BEFORE DELETE ON dispatch_attempt_reservations "
+        "BEGIN SELECT RAISE(ABORT, 'dispatch_attempt_reservation_immutable'); END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS dispatch_attempt_receipt_immutable "
+        "BEFORE UPDATE ON dispatch_attempt_receipts "
+        "BEGIN SELECT RAISE(ABORT, 'dispatch_attempt_receipt_immutable'); END"
+    )
+    connection.execute(
+        "CREATE TRIGGER IF NOT EXISTS dispatch_attempt_receipt_no_delete "
+        "BEFORE DELETE ON dispatch_attempt_receipts "
+        "BEGIN SELECT RAISE(ABORT, 'dispatch_attempt_receipt_immutable'); END"
+    )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -391,6 +594,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_mandate_descendant_cap),
     (3, _install_service_upgrade_guards),
     (4, _add_task_claim_budgets),
+    (5, _add_dispatch_attempt_budgets),
 )
 
 SCHEMA = """
@@ -476,6 +680,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_descendant_claims INTEGER CHECK (
         max_descendant_claims IS NULL OR
         (typeof(max_descendant_claims) = 'integer' AND max_descendant_claims >= 0)
+    ),
+    max_dispatch_attempts INTEGER CHECK (
+        max_dispatch_attempts IS NULL OR
+        (typeof(max_dispatch_attempts) = 'integer' AND max_dispatch_attempts >= 0)
+    ),
+    max_descendant_dispatch_attempts INTEGER CHECK (
+        max_descendant_dispatch_attempts IS NULL OR
+        (typeof(max_descendant_dispatch_attempts) = 'integer' AND max_descendant_dispatch_attempts >= 0)
     ),
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
