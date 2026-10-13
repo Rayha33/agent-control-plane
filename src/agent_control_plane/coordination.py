@@ -13,6 +13,7 @@ from .coordination_schemas import (
     DispatchAttemptReceiptView,
     DispatchAttemptReservationCreate,
     HeartbeatRequest,
+    ProviderUsageEvidence,
     QCReviewCreate,
     SubmissionCreate,
     TaskCreate,
@@ -1538,6 +1539,18 @@ class CoordinationService:
             source="dispatch_attempt_reservations",
             enforcement="BEGIN IMMEDIATE reservation and SQLite trigger",
             observed_at=observed_at,
+            provider_usage=ProviderUsageEvidence(
+                status="unsupported",
+                unit=None,
+                source=None,
+                scope="provider calls and provider-internal fan-out",
+                observed_at=None,
+                freshness="unknown",
+                enforcement_point=None,
+                reason=(
+                    "no authenticated provider meter or request gate are wired to this supervisor"
+                ),
+            ),
         ).model_dump()
 
     @staticmethod

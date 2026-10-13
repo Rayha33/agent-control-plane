@@ -235,7 +235,13 @@ Task views expose local and descendant dispatch-attempt budgets with unit
 `dispatch_attempt_reservations`, consumed/remaining counts, status, source,
 enforcement point, and observation time. `reserved` and `released` remain zero:
 the slot is consumed atomically when its immutable reservation row is written.
-The receipt is separately identified as client-reported, not provider-verified.
+Each budget also carries a typed `provider_usage` record with
+`status: unsupported`, null unit/source/observation/enforcement point, and
+`freshness: unknown`. This is distinct from the current local reservation
+observation and makes clear that its counters are not provider usage. The
+receipt is separately identified as client-reported, not provider-verified;
+recording a 429 receipt does not change `provider_usage` or turn it into trusted
+provider telemetry.
 
 The task, ancestor chain, descendants, dependencies, and latest submission/review
 are read from one SQLite snapshot; `ancestor_lineage_integrity` is `invalid` if

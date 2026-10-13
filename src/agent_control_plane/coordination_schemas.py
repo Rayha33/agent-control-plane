@@ -170,6 +170,17 @@ class ClaimBudgetView(BaseModel):
     observed_at: str
 
 
+class ProviderUsageEvidence(BaseModel):
+    status: Literal["unsupported"]
+    unit: None
+    source: None
+    scope: Literal["provider calls and provider-internal fan-out"]
+    observed_at: None
+    freshness: Literal["unknown"]
+    enforcement_point: None
+    reason: Literal["no authenticated provider meter or request gate are wired to this supervisor"]
+
+
 class DispatchAttemptBudgetView(BaseModel):
     scope: Literal["task", "descendant_tree"]
     unit: Literal["dispatch_attempt_reservations"]
@@ -182,6 +193,7 @@ class DispatchAttemptBudgetView(BaseModel):
     source: Literal["dispatch_attempt_reservations"]
     enforcement: Literal["BEGIN IMMEDIATE reservation and SQLite trigger"]
     observed_at: str
+    provider_usage: ProviderUsageEvidence
 
 
 class DispatchAttemptReceiptCreate(BaseModel):

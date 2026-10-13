@@ -157,6 +157,10 @@
       "_abc_impl",
       "model_config"
     ],
+    "class:ProviderUsageEvidence": [
+      "_abc_impl",
+      "model_config"
+    ],
     "class:QCReviewCreate": [
       "_abc_impl",
       "model_config",
@@ -184,6 +188,7 @@
       "DispatchAttemptReceiptView",
       "DispatchAttemptReservationCreate",
       "HeartbeatRequest",
+      "ProviderUsageEvidence",
       "QCReviewCreate",
       "QC_RESERVATION_SECONDS",
       "SubmissionCreate",

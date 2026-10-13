@@ -434,6 +434,20 @@ def test_dispatch_attempt_reservations_are_idempotent_bounded_and_receipts_are_u
     assert task_view["dispatch_attempt_budget"]["remaining"] == 0
     assert task_view["dispatch_attempt_budget"]["reserved"] == 0
     assert task_view["dispatch_attempt_budget"]["released"] == 0
+    expected_provider_usage = {
+        "status": "unsupported",
+        "unit": None,
+        "source": None,
+        "scope": "provider calls and provider-internal fan-out",
+        "observed_at": None,
+        "freshness": "unknown",
+        "enforcement_point": None,
+        "reason": "no authenticated provider meter or request gate are wired to this supervisor",
+    }
+    assert task_view["dispatch_attempt_budget"]["provider_usage"] == expected_provider_usage
+    assert (
+        task_view["descendant_dispatch_attempt_budget"]["provider_usage"] == expected_provider_usage
+    )
     assert (
         app.state.database.one(
             "SELECT COUNT(*) AS count FROM audit_events "
