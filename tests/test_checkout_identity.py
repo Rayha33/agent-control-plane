@@ -8,6 +8,7 @@ from multiprocessing import get_context
 from pathlib import Path
 from threading import Barrier, Lock, Thread
 from time import sleep
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -201,6 +202,137 @@ def test_local_checkout_lease_performs_mediated_write_and_advances_fence(tmp_pat
         next_owner.run("write", lambda: target.write_text("second owner\n"))
 
     assert target.read_text(encoding="utf-8") == "second owner\n"
+
+
+def test_checkout_run_write_resolves_relative_targets_from_leased_root(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = tmp_path / "repo-alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    observed_targets: list[Path] = []
+
+    def write(target: Path) -> int:
+        observed_targets.append(target)
+        return target.write_text("target-bound write\n", encoding="utf-8")
+
+    with CheckoutWriteLease.local(alias) as owner:
+        monkeypatch.chdir(outside)
+        result = owner.run_write("tracked.txt", write)
+
+    assert result == len("target-bound write\n")
+    assert observed_targets == [(repo / "tracked.txt").resolve()]
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "target-bound write\n"
+    assert not (outside / "tracked.txt").exists()
+
+
+def test_checkout_run_write_rejects_a_different_linked_worktree_before_mutation(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    linked = tmp_path / "linked"
+    git(repo, "worktree", "add", "-q", "-b", "secondary", str(linked))
+    target = linked / "tracked.txt"
+    original_primary = (repo / "tracked.txt").read_text(encoding="utf-8")
+    original_linked = target.read_text(encoding="utf-8")
+    identity = identify_checkout(repo)
+
+    with CheckoutWriteLease.local(repo) as owner:
+        with pytest.raises(CheckoutAdapterError) as mismatch:
+            owner.run_write(target, lambda resolved: resolved.write_text("wrong tree\n"))
+
+    assert mismatch.value.code == "checkout_target_mismatch"
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == original_primary
+    assert target.read_text(encoding="utf-8") == original_linked
+    assert not (identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending").exists()
+
+    # A rejected target does not leave recovery-required state for the actual owner.
+    with CheckoutWriteLease.local(repo) as next_owner:
+        next_owner.run_write(repo / "tracked.txt", lambda resolved: resolved.write_text("safe\n"))
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "safe\n"
+
+
+def test_checkout_run_write_rejects_symlink_escape_and_checkout_root(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside stays intact\n", encoding="utf-8")
+    (repo / "escape.txt").symlink_to(outside)
+    identity = identify_checkout(repo)
+
+    with CheckoutWriteLease.local(repo) as owner:
+        with pytest.raises(CheckoutAdapterError) as escape:
+            owner.run_write(repo / "escape.txt", lambda resolved: resolved.write_text("bad\n"))
+        assert escape.value.code == "checkout_target_mismatch"
+
+    with CheckoutWriteLease.local(repo) as owner:
+        with pytest.raises(CheckoutAdapterError) as root_target:
+            owner.run_write(repo, lambda resolved: resolved.write_text("bad\n"))
+        assert root_target.value.code == "checkout_target_ambiguous"
+
+    assert outside.read_text(encoding="utf-8") == "outside stays intact\n"
+    assert not (identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending").exists()
+
+
+def test_checkout_run_write_rejects_none_without_poisoning_lease(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+
+    with CheckoutWriteLease.local(repo) as owner:
+        with pytest.raises(CheckoutAdapterError) as invalid_target:
+            owner.run_write(None, lambda target: target.write_text("unsafe\n"))
+
+        assert invalid_target.value.code == "checkout_target_invalid"
+        assert not (identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending").exists()
+        owner.run_write("tracked.txt", lambda target: target.write_text("safe\n"))
+
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "safe\n"
+
+
+def test_checkout_run_write_rejects_missing_path_below_file_before_marker(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    target = repo / "tracked.txt" / "child.txt"
+    called = False
+
+    def write(resolved: Path) -> None:
+        nonlocal called
+        called = True
+        resolved.write_text("unexpected\n")
+
+    with CheckoutWriteLease.local(repo) as owner:
+        with pytest.raises(CheckoutAdapterError) as invalid_parent:
+            owner.run_write(target, write)
+
+    assert invalid_parent.value.code == "checkout_target_unavailable"
+    assert not called
+    assert not (identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending").exists()
+
+
+def test_checkout_run_write_checks_existing_file_device_before_parent(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    target = repo / "tracked.txt"
+    identity = identify_checkout(repo)
+    real_stat = Path.stat
+
+    def mounted_file_stat(path: Path, *, follow_symlinks: bool = True):
+        result = real_stat(path, follow_symlinks=follow_symlinks)
+        if path == target:
+            return SimpleNamespace(st_dev=result.st_dev + 1, st_mode=result.st_mode)
+        return result
+
+    monkeypatch.setattr(Path, "stat", mounted_file_stat)
+    called = False
+
+    def write(resolved: Path) -> None:
+        nonlocal called
+        called = True
+        resolved.write_text("unexpected\n")
+
+    with CheckoutWriteLease.local(repo) as owner:
+        with pytest.raises(CheckoutAdapterError) as boundary:
+            owner.run_write(target, write)
+
+    assert boundary.value.code == "checkout_target_mismatch"
+    assert not called
+    assert not (identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending").exists()
 
 
 def test_local_checkout_lease_refuses_corrupt_fence_state_before_action(tmp_path):

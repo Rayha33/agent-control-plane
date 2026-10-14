@@ -34,6 +34,25 @@ with CheckoutWriteLease.local(checkout_path) as lease:
     lease.run("write", lambda: typed_editor_write(...))
 ```
 
+For a path-specific editor adapter, bind each write to an explicit target and use
+the canonical path supplied to the callback:
+
+```python
+with CheckoutWriteLease.local(checkout_path) as lease:
+    lease.run_write("src/module.py", lambda target: typed_editor_write(target, patch))
+```
+
+Relative targets resolve from the leased checkout root, not the process cwd. Before
+recording a pending operation, ACP resolves symlinks, checks the nearest existing
+directory's Git worktree identity, and verifies the filesystem device of the existing
+target (when present) or its nearest existing ancestor. It refuses a missing path
+whose existing parent is not a directory, the checkout root, an external path, a
+nested/different worktree, or a different-device crossing. The callback receives the
+canonical absolute path. A typed adapter must actually use that supplied path; the
+lease cannot stop a callback from ignoring it, and it does not contain hard-link
+aliases, same-device mount aliases (including bind mounts), or other direct filesystem
+writers.
+
 It combines the per-worktree Git-directory lock with a monotonically increasing,
 0600 fencing-token record in that worktree's Git metadata. It is usable across
 cooperating processes on the same local filesystem, including after a process restart.
@@ -93,7 +112,12 @@ response is likewise treated as an unknown remote lease.
 `CheckoutWriteLease.run` mediates only the callback passed to it for one of these
 operation labels: `write`, `attach`, `switch`, `sync`, or `cleanup`. It does not parse
 or constrain shell commands inside a callback; integrations should call a narrow,
-typed operation, not pass arbitrary model-generated shell text.
+typed operation, not pass arbitrary model-generated shell text. `run_write(target,
+callback)` is the target-bound path-specific form: it resolves and checks the target
+before the pending marker or callback begins, then supplies that canonical path to
+the callback. It improves adapter correctness when the caller honors the supplied
+path; it does not make a native editor or patch API use ACP unless that API is
+actually routed through this method.
 
 The adapter is opt-in: callers must route each write through `run`. The current
 Claude Code hooks still perform their existing path guard, but do not hold this lease

@@ -31,6 +31,13 @@ _DESTRUCTIVE_OPERATIONS = frozenset({"attach", "switch", "sync", "cleanup"})
 _GIT_ENV_ALLOWLIST = frozenset({"PATH", "HOME", "TMPDIR", "SYSTEMROOT", "WINDIR"})
 
 
+class _NoWriteTarget:
+    """Internal sentinel distinguishing ordinary mediated actions from bad targets."""
+
+
+_NO_WRITE_TARGET = _NoWriteTarget()
+
+
 class CheckoutAdapterError(RuntimeError):
     """A fail-closed checkout identity, lock, or write-gate refusal."""
 
@@ -168,6 +175,66 @@ def identify_checkout(path: str | os.PathLike[str]) -> CheckoutIdentity:
 def _digest(parts: tuple[str | int, ...]) -> str:
     canonical = json.dumps(parts, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     return hashlib.sha256(canonical).hexdigest()[:32]
+
+
+def _resolve_checkout_write_target(
+    identity: CheckoutIdentity, target: str | os.PathLike[str]
+) -> Path:
+    """Resolve a write target inside the exact leased worktree, never ambient cwd."""
+
+    try:
+        requested = Path(target).expanduser()
+        if not requested.is_absolute():
+            requested = identity.root / requested
+        resolved = requested.resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise CheckoutAdapterError(
+            "checkout_target_unavailable", "write target could not be resolved"
+        ) from error
+
+    try:
+        relative = resolved.relative_to(identity.root)
+    except ValueError as error:
+        raise CheckoutAdapterError(
+            "checkout_target_mismatch", "write target resolves outside the leased checkout"
+        ) from error
+    if not relative.parts:
+        raise CheckoutAdapterError(
+            "checkout_target_ambiguous", "a checkout root is not a file write target"
+        )
+
+    probe = resolved
+    try:
+        while not probe.exists():
+            parent = probe.parent
+            if parent == probe:
+                raise OSError("write target has no existing parent")
+            probe = parent
+        root_device = identity.root.stat().st_dev
+        if probe.stat().st_dev != root_device:
+            raise CheckoutAdapterError(
+                "checkout_target_mismatch",
+                "write target is on a different filesystem device",
+            )
+        if probe != resolved and not probe.is_dir():
+            raise CheckoutAdapterError(
+                "checkout_target_unavailable",
+                "an existing parent of the write target is not a directory",
+            )
+        identity_probe = probe if probe.is_dir() else probe.parent
+        target_identity = identify_checkout(identity_probe)
+    except CheckoutAdapterError:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise CheckoutAdapterError(
+            "checkout_target_unavailable", "write target's checkout could not be verified"
+        ) from error
+
+    if target_identity.resource != identity.resource:
+        raise CheckoutAdapterError(
+            "checkout_target_mismatch", "write target belongs to a different Git worktree"
+        )
+    return resolved
 
 
 def _pending_operation_name(identity: CheckoutIdentity) -> str:
@@ -644,6 +711,34 @@ class CheckoutWriteLease:
     def run(self, operation: CheckoutOperation, action: Callable[[], object]) -> object:
         """Run one mediated action, refusing stale fences and dirty replacement work."""
 
+        return self._run(operation, action)
+
+    def run_write(
+        self,
+        target: str | os.PathLike[str],
+        action: Callable[[Path], object],
+    ) -> object:
+        """Run a typed write with an explicit target bound to this leased worktree.
+
+        Relative targets are resolved from the checkout root, not the caller's cwd.
+        The callback receives the canonical target path and must use that path. This
+        validates cooperative adapters; it is not a sandbox for a callback that
+        ignores the supplied target or for writers that bypass this method.
+        """
+
+        if target is None:
+            raise CheckoutAdapterError(
+                "checkout_target_invalid", "an explicit write target is required"
+            )
+        return self._run("write", action, write_target=target)
+
+    def _run(
+        self,
+        operation: CheckoutOperation,
+        action: Callable[..., object],
+        *,
+        write_target: str | os.PathLike[str] | None | _NoWriteTarget = _NO_WRITE_TARGET,
+    ) -> object:
         with self._run_lock:
             thread_id = threading.get_ident()
             if self._active_thread == thread_id:
@@ -653,11 +748,17 @@ class CheckoutWriteLease:
                 )
             self._active_thread = thread_id
             try:
-                return self._run_locked(operation, action)
+                return self._run_locked(operation, action, write_target=write_target)
             finally:
                 self._active_thread = None
 
-    def _run_locked(self, operation: CheckoutOperation, action: Callable[[], object]) -> object:
+    def _run_locked(
+        self,
+        operation: CheckoutOperation,
+        action: Callable[..., object],
+        *,
+        write_target: str | os.PathLike[str] | None | _NoWriteTarget = _NO_WRITE_TARGET,
+    ) -> object:
         identity = self.identity
         token = self.fencing_token
         if self._lock_fd is None or identity is None or token is None or self._closed:
@@ -669,6 +770,15 @@ class CheckoutWriteLease:
         if not callable(action):
             raise CheckoutAdapterError(
                 "checkout_action_invalid", "checkout action must be callable"
+            )
+        if write_target is not _NO_WRITE_TARGET and operation != "write":
+            raise CheckoutAdapterError(
+                "checkout_target_operation_invalid",
+                "explicit write targets are supported only for write operations",
+            )
+        if write_target is None:
+            raise CheckoutAdapterError(
+                "checkout_target_invalid", "an explicit write target is required"
             )
         if self._operation_failed:
             raise CheckoutAdapterError(
@@ -688,8 +798,11 @@ class CheckoutWriteLease:
             _require_no_pending_operation(identity)
             if operation in _DESTRUCTIVE_OPERATIONS:
                 _require_clean_checkout(identity)
+            resolved_target = None
+            if write_target is not _NO_WRITE_TARGET:
+                resolved_target = _resolve_checkout_write_target(identity, write_target)
             pending_handles = _begin_pending_operation(identity, operation, token)
-            result = action()
+            result = action(resolved_target) if resolved_target is not None else action()
             if (
                 operation != "cleanup"
                 and identify_checkout(self.path).resource != identity.resource
