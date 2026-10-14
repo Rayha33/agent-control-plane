@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 8
+SERVICE_SCHEMA_VERSION = 9
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -816,6 +816,37 @@ def _add_budget_interruption_reports(connection: sqlite3.Connection) -> None:
     )
 
 
+def _guard_interrupted_claim_writes(connection: sqlite3.Connection) -> None:
+    """Enforce interruption fences in SQLite, including for older service workers."""
+
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS budget_interruption_dispatch_insert_guard
+        BEFORE INSERT ON dispatch_attempt_reservations
+        WHEN EXISTS (
+            SELECT 1 FROM budget_interruption_reports
+            WHERE task_id = NEW.task_id
+              AND agent_id = NEW.agent_id
+              AND claim_fencing_token = NEW.claim_fencing_token
+        )
+        BEGIN SELECT RAISE(ABORT, 'claim_interrupted'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS budget_interruption_submission_insert_guard
+        BEFORE INSERT ON submissions
+        WHEN EXISTS (
+            SELECT 1 FROM budget_interruption_reports
+            WHERE task_id = NEW.task_id
+              AND agent_id = NEW.worker_agent_id
+              AND claim_fencing_token = NEW.claim_fencing_token
+        )
+        BEGIN SELECT RAISE(ABORT, 'claim_interrupted'); END
+        """
+    )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -839,6 +870,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (6, _add_dispatch_attempt_provider_usage),
     (7, _add_outstanding_dispatch_budgets),
     (8, _add_budget_interruption_reports),
+    (9, _guard_interrupted_claim_writes),
 )
 
 SCHEMA = """

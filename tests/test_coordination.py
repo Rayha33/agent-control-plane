@@ -688,6 +688,62 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
     )
     assert report["received_at"]
 
+    blocked_dispatch = reserve_dispatch_attempt(
+        client, task["id"], token, claim, "after-interruption"
+    )
+    assert blocked_dispatch.status_code == 409
+    assert blocked_dispatch.json()["error"] == "claim_interrupted"
+    blocked_replay = reserve_dispatch_attempt(client, task["id"], token, claim, "interrupted-call")
+    assert blocked_replay.status_code == 409
+    assert blocked_replay.json()["error"] == "claim_interrupted"
+    blocked_submission = submit_task(client, task["id"], token, claim)
+    assert blocked_submission.status_code == 409
+    assert blocked_submission.json()["error"] == "claim_interrupted"
+    with app.state.database.connect() as connection:
+        connection.execute("DROP TRIGGER budget_interruption_dispatch_insert_guard")
+        connection.execute("DROP TRIGGER budget_interruption_submission_insert_guard")
+        connection.execute("UPDATE meta SET value = '8' WHERE key = 'schema_version'")
+    Database(app.state.database.path).initialize()
+    with app.state.database.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="claim_interrupted"):
+            connection.execute(
+                """INSERT INTO dispatch_attempt_reservations
+                   (id, task_id, agent_id, claim_fencing_token,
+                    resource_fencing_tokens_json, idempotency_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "legacy-dispatch-after-interruption",
+                    task["id"],
+                    worker["id"],
+                    claim["task"]["claim_fencing_token"],
+                    json.dumps(resource_tokens(claim), separators=(",", ":"), sort_keys=True),
+                    "legacy-dispatch-after-interruption",
+                    "2026-10-14T00:00:00Z",
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="claim_interrupted"):
+            connection.execute(
+                """INSERT INTO submissions
+                   (id, task_id, worker_agent_id, task_version, claim_fencing_token,
+                    resource_fencing_tokens_json, base_revision, artifact_uri,
+                    artifact_hash, summary, evidence_json, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_qc', ?)""",
+                (
+                    "legacy-submission-after-interruption",
+                    task["id"],
+                    worker["id"],
+                    claim["task"]["version"],
+                    claim["task"]["claim_fencing_token"],
+                    json.dumps(resource_tokens(claim), separators=(",", ":"), sort_keys=True),
+                    "main@abc123",
+                    "patch://legacy",
+                    "a" * 64,
+                    "Legacy service must not submit interrupted work.",
+                    "[]",
+                    "2026-10-14T00:00:00Z",
+                ),
+            )
+
     replay = client.post(endpoint, headers=headers, json=request)
     assert replay.status_code == 201, replay.text
     assert replay.json()["created"] is False
@@ -732,6 +788,26 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
             connection.execute(
                 "DELETE FROM budget_interruption_reports WHERE id = ?", (report["id"],)
             )
+
+    with app.state.database.connect() as connection:
+        connection.execute("UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (task["id"],))
+        connection.execute(
+            "UPDATE resource_leases SET expires_at = 0 WHERE task_id = ?", (task["id"],)
+        )
+    reaped = client.post("/v1/coordination/reap", headers=admin_headers)
+    assert reaped.status_code == 200, reaped.text
+    assert task["id"] in reaped.json()["orphaned_task_ids"]
+
+    resumed_claim_response = claim_task(client, task["id"], token)
+    assert resumed_claim_response.status_code == 200, resumed_claim_response.text
+    resumed_claim = resumed_claim_response.json()
+    assert resumed_claim["task"]["claim_fencing_token"] > claim["task"]["claim_fencing_token"]
+    resumed_dispatch = reserve_dispatch_attempt(
+        client, task["id"], token, resumed_claim, "resumed-after-interruption"
+    )
+    assert resumed_dispatch.status_code == 201, resumed_dispatch.text
+    resumed_submission = submit_task(client, task["id"], token, resumed_claim)
+    assert resumed_submission.status_code == 201, resumed_submission.text
 
 
 def test_non_interruption_validation_errors_keep_default_input_details(client, admin_headers):

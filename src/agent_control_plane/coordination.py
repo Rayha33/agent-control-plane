@@ -441,6 +441,18 @@ class CoordinationService:
                 request.resource_fencing_tokens,
                 now,
             )
+            interrupted = connection.execute(
+                """SELECT 1 FROM budget_interruption_reports
+                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
+                (task_id, agent["id"], request.claim_fencing_token),
+            ).fetchone()
+            if interrupted is not None:
+                raise ControlPlaneError(
+                    409,
+                    "claim_interrupted",
+                    "this claim generation reported an interruption and cannot reserve more "
+                    "dispatches or submit; resume only under a newly fenced claim",
+                )
             existing = connection.execute(
                 "SELECT * FROM dispatch_attempt_reservations "
                 "WHERE task_id = ? AND idempotency_key = ?",
@@ -825,6 +837,18 @@ class CoordinationService:
                 request.resource_fencing_tokens,
                 now,
             )
+            interrupted = connection.execute(
+                """SELECT 1 FROM budget_interruption_reports
+                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
+                (task_id, agent["id"], request.claim_fencing_token),
+            ).fetchone()
+            if interrupted is not None:
+                raise ControlPlaneError(
+                    409,
+                    "claim_interrupted",
+                    "this claim generation reported an interruption and cannot reserve more "
+                    "dispatches or submit; resume only under a newly fenced claim",
+                )
             if task["version"] != request.task_version:
                 raise ControlPlaneError(
                     409,
