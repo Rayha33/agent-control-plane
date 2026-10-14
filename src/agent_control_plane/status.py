@@ -22,7 +22,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from .scheduling import Scheduler
+from .scheduling import Scheduler, attempt_budget_evidence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .git_supervisor import GitSupervisor
@@ -226,11 +226,14 @@ class StatusView:
     ) -> dict[str, Any]:
         if checkpoint_stale_seconds is not None and checkpoint_stale_seconds < 1:
             raise ValueError("checkpoint_stale_seconds must be at least 1")
-        now = time.time()
-        epoch = int(now)
         scheduler = Scheduler(self.supervisor)
         with self.supervisor.connect() as connection:
+            connection.execute("BEGIN")
             tasks = scheduler._task_records(connection)
+            # The first read establishes the SQLite snapshot. Timestamp that view
+            # here and use the same instant for lease and age advisories.
+            now = time.time()
+            epoch = int(now)
             holders = scheduler._active_leases(connection, epoch)
             attempts = self._latest_attempts(connection)
             attempts_for_inventory = [
@@ -250,6 +253,7 @@ class StatusView:
         # "launchable now, alongside everything above it", not "launchable alone".
         plan = scheduler.plan_pass(tasks, holders)
         previews = {entry["task_id"]: entry for entry in [*plan["ready"], *plan["blocked"]]}
+        tasks_by_id = {task["id"]: task for task in tasks}
         read_resource_tree_cache: dict[tuple[str, tuple[str, ...]], dict[str, str]] = {}
         entries: list[dict[str, Any]] = []
         for task in tasks:
@@ -261,6 +265,62 @@ class StatusView:
                 task["base_branch"],
                 tree_cache=read_resource_tree_cache,
             )
+            ancestor_attempt_budgets: list[dict[str, Any]] = []
+            ancestor_tasks: list[dict[str, Any]] = []
+            ancestor_lineage_integrity: dict[str, Any] = {"status": "valid", "issue": None}
+            ancestor_id = task.get("parent_task_id")
+            seen_ancestors = {task["id"]}
+            while ancestor_id is not None:
+                if not isinstance(ancestor_id, str):
+                    safe_ancestor_id = f"<invalid-parent-id:{type(ancestor_id).__name__}>"
+                    ancestor_lineage_integrity = {
+                        "status": "invalid",
+                        "issue": {
+                            "kind": "invalid_parent_id_type",
+                            "task_id": safe_ancestor_id,
+                            "value_type": type(ancestor_id).__name__,
+                        },
+                    }
+                    break
+                if not ancestor_id.strip():
+                    ancestor_lineage_integrity = {
+                        "status": "invalid",
+                        "issue": {"kind": "empty_parent_id", "task_id": ancestor_id},
+                    }
+                    break
+                if ancestor_id in seen_ancestors:
+                    ancestor_lineage_integrity = {
+                        "status": "invalid",
+                        "issue": {"kind": "cycle_detected", "task_id": ancestor_id},
+                    }
+                    break
+                seen_ancestors.add(ancestor_id)
+                ancestor = tasks_by_id.get(ancestor_id)
+                if ancestor is None:
+                    ancestor_lineage_integrity = {
+                        "status": "invalid",
+                        "issue": {"kind": "missing_parent", "task_id": ancestor_id},
+                    }
+                    break
+                ancestor_tasks.append(ancestor)
+                ancestor_id = ancestor.get("parent_task_id")
+
+            if ancestor_lineage_integrity["status"] == "valid":
+                for ancestor in ancestor_tasks:
+                    limit = ancestor.get("max_descendant_attempts")
+                    if limit is None:
+                        continue
+                    ancestor_attempt_budgets.append(
+                        {
+                            "ancestor_task_id": ancestor["id"],
+                            **attempt_budget_evidence(
+                                ancestor["id"],
+                                limit,
+                                ancestor.get("descendant_attempts_used", 0),
+                                scope_kind="task_descendants",
+                            ),
+                        }
+                    )
             entries.append(
                 self._task_entry(
                     task=task,
@@ -276,6 +336,8 @@ class StatusView:
                     checkpoint_stale_seconds=checkpoint_stale_seconds,
                     held_resources=held_resources.get(task["id"], []),
                     read_dependency_advisory=read_dependency_advisory,
+                    ancestor_attempt_budgets=ancestor_attempt_budgets,
+                    ancestor_lineage_integrity=ancestor_lineage_integrity,
                 )
             )
 
@@ -586,6 +648,8 @@ class StatusView:
         held_resources: list[str],
         repeated_qc_findings: list[dict[str, Any]],
         read_dependency_advisory: dict[str, Any] | None,
+        ancestor_attempt_budgets: list[dict[str, Any]],
+        ancestor_lineage_integrity: dict[str, Any],
     ) -> dict[str, Any]:
         live = bool(attempt and attempt["status"] in LIVE_ATTEMPT_STATUSES)
         remaining = int(attempt["lease_expires_at"] - now) if live else None
@@ -597,8 +661,23 @@ class StatusView:
             and checkpoint_age is not None
             and checkpoint_age >= checkpoint_stale_seconds
         )
+        descendant_attempt_budget = attempt_budget_evidence(
+            task["id"],
+            task.get("max_descendant_attempts"),
+            task.get("descendant_attempts_used", 0),
+            scope_kind="task_descendants",
+        )
+        if ancestor_lineage_integrity["status"] == "invalid":
+            descendant_attempt_budget["status"] = "invalid"
+            descendant_attempt_budget["remaining"] = None
+        parent_task_id = task.get("parent_task_id")
+        if parent_task_id is not None and not isinstance(parent_task_id, str):
+            parent_task_id = f"<invalid-parent-id:{type(parent_task_id).__name__}>"
         entry: dict[str, Any] = {
             "task_id": task["id"],
+            "parent_task_id": parent_task_id,
+            "ancestor_attempt_budgets": ancestor_attempt_budgets,
+            "ancestor_lineage_integrity": ancestor_lineage_integrity,
             "title": task["title"],
             "priority": task["priority"],
             "status": task["status"],
@@ -656,6 +735,12 @@ class StatusView:
             "repeated_qc_findings": repeated_qc_findings,
             "ready": preview["ready"] if preview else None,
             "blockers": preview["blockers"] if preview else [],
+            "attempt_budget": attempt_budget_evidence(
+                task["id"],
+                task.get("max_attempts"),
+                task.get("attempts_used", 0),
+            ),
+            "descendant_attempt_budget": descendant_attempt_budget,
         }
         entry["category"], entry["reason"] = self._categorize(entry, lease_risk_seconds)
         return entry
@@ -699,6 +784,38 @@ class StatusView:
             if entry["cleanup_error"]:
                 details.append(f"last error: {entry['cleanup_error']}")
             return "cleanup_failed", "; ".join(details)
+        attempt_budget = entry["attempt_budget"]
+        from .scheduling import CLAIMABLE_STATUSES
+
+        if entry["status"] in CLAIMABLE_STATUSES:
+            lineage = entry["ancestor_lineage_integrity"]
+            if lineage["status"] == "invalid":
+                issue = (lineage.get("issue") or {}).get("kind", "unknown")
+                return "human_required", (
+                    f"task hierarchy is invalid ({issue}); retry is not claimable"
+                )
+            if attempt_budget["status"] == "invalid":
+                return "human_required", "task attempt budget is invalid; retry is not claimable"
+            if attempt_budget["status"] == "exhausted":
+                return "human_required", (
+                    "task attempt budget exhausted "
+                    f"({attempt_budget['consumed']}/{attempt_budget['configured_limit']} attempts used); "
+                    "retry is not claimable"
+                )
+            for ancestor_budget in entry["ancestor_attempt_budgets"]:
+                if ancestor_budget["status"] == "invalid":
+                    return "human_required", (
+                        "ancestor task "
+                        f"{ancestor_budget['ancestor_task_id']} has an invalid descendant attempt "
+                        "budget; retry is not claimable"
+                    )
+                if ancestor_budget["status"] == "exhausted":
+                    return "human_required", (
+                        "ancestor task "
+                        f"{ancestor_budget['ancestor_task_id']} attempt budget exhausted "
+                        f"({ancestor_budget['consumed']}/{ancestor_budget['configured_limit']} "
+                        "descendant attempts used); retry is not claimable"
+                    )
         if entry["status"] in HUMAN_REQUIRED_STATUSES:
             verdict = (entry["qc"] or {}).get("verdict")
             return "human_required", f"task is {entry['status']}" + (

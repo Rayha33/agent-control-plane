@@ -81,6 +81,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   base_branch TEXT NOT NULL,
   base_sha TEXT NOT NULL,
   priority INTEGER NOT NULL,
+  max_attempts INTEGER CHECK (
+    max_attempts IS NULL OR (typeof(max_attempts) = 'integer' AND max_attempts > 0)
+  ),
+  attempt_budget_exhausted_at TEXT NOT NULL DEFAULT '',
+  parent_task_id TEXT REFERENCES tasks(id),
+  max_descendant_attempts INTEGER CHECK (
+    max_descendant_attempts IS NULL OR
+    (typeof(max_descendant_attempts) = 'integer' AND max_descendant_attempts >= 0)
+  ),
+  descendant_attempt_budget_exhausted_at TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   cleanup_target_status TEXT NOT NULL DEFAULT '',
   cleanup_error TEXT NOT NULL DEFAULT '',
@@ -342,3 +352,22 @@ def migrate(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE qc_runs ADD COLUMN {column} TEXT NOT NULL DEFAULT {default}"
             )
+
+
+def __execute_schema(connection: sqlite3.Connection, script: str = SCHEMA) -> None:
+    """Execute a multi-statement schema script without escaping the caller's transaction.
+
+    ``sqlite3.executescript`` commits any pending transaction before running its input.
+    The supervisor needs to validate the schema stamp under a write lock and then apply
+    the base DDL plus ledger migrations atomically, so execute each complete SQL
+    statement through the existing connection instead.
+    """
+
+    statement = ""
+    for character in script:
+        statement += character
+        if character == ";" and sqlite3.complete_statement(statement):
+            connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.ProgrammingError("incomplete SQL statement in schema script")

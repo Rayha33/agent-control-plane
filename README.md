@@ -167,12 +167,42 @@ Create and claim bounded work:
 ~~~bash
 uv run --extra dev acp task-add --title "Harden token refresh" --accept "refresh regression tests pass" --resource "src/auth/**" --resource "tests/auth/**"
 
+# Optional local limit: permit at most three ACP-created attempts for this task.
+uv run --extra dev acp task-add --title "Migrate cache keys" --accept "migration tests pass" \
+  --resource "src/cache/**" --resource "tests/cache/**" --max-attempts 3
+
 # Optional read inputs are tracked for freshness; they do not reserve write access.
 uv run --extra dev acp task-add --title "Update API client" --accept "client tests pass" \
   --resource "client/**" --read-resource "src/api/schema.py" --read-resource "openapi/**"
 
 uv run --extra dev acp claim TASK_ID --agent codex-session-17
 ~~~
+
+`--max-attempts` is an optional, positive per-task cap on durable attempt records
+created by this supervisor. It defaults to unlimited for compatibility and is
+checked again inside the atomic claim transaction, so concurrent retries cannot
+create more attempts than the cap. A durable attempt record counts even if the
+subsequent Git worktree or runtime provisioning fails. Once exhausted, `claim`
+returns `attempt_budget_exhausted`; existing branches, checkpoints, and attempt
+records remain available for inspection. The first refusal is durably recorded once;
+repeated refusals do not grow the event log. `show`, `plan`, and `queue` report
+the cap and usage. This is only a limit on ACP-created attempts: it does not
+measure or stop provider-internal fan-out, provider SDK retries, model tokens,
+elapsed time, or billing. Use an explicit follow-up task for additional work
+rather than treating a quota reset as permission to restart.
+
+For fan-out within the local supervisor, `task-add --parent-task-id ID` records an explicit
+parent/child relationship; it is separate from `--depends-on`. A parent may set
+`--max-descendant-attempts N` to cap durable attempts across every descendant task, at any
+depth. A task's own attempts do not consume its descendant cap, while each configured
+ancestor's cap applies to every attempt below it. Claim admission checks those caps in the
+same serialized transaction that inserts the attempt row, so concurrent siblings cannot
+spend the same last slot. Attempts that expire or fail during provisioning still consume a
+slot; there is no reset/refund. `plan` and `queue` simulate descendant slots for their
+proposed concurrent-ready set, but only the claim transaction commits durable consumption.
+This counts ACP supervisor attempts only, not provider-internal fan-out, SDK retries, tokens,
+or cost. The public Coordination task API uses a separate store and rejects unknown task
+fields; it does not claim to enforce these local attempt limits.
 
 Read-input globs use recursive `**` matching and are advisory only. A glob must
 have a literal directory prefix; repository-root-wide patterns report `unknown`
@@ -1033,6 +1063,24 @@ claim receives fresh fencing tokens; old tokens do not regain authority.
 
 The Git supervisor is the primary v0.2 product path. The HTTP authority API is a
 separate reference layer and does not create Git worktrees.
+
+The HTTP API also supports cooperative dispatch-attempt reservation slots for
+clients that manage outbound model calls themselves. These durable slots are
+not provider request or spend limits; client-reported 429/Retry-After receipts
+do not schedule retries or refund capacity. See [run budgets and usage
+provenance](docs/RUN_BUDGETS.md) for the exact API contract and limitations.
+Python clients can use `CoordinationHttpDispatchLedger` with
+`agent_control_plane.dispatch_client.dispatch_once` for the published API's
+reservation and receipt routes. Its standard-library HTTP adapter uses bearer
+auth, rejects cleartext HTTP except to loopback, escapes path IDs, bounds response
+reads, and refuses redirects. This only sequences the supplied callback once:
+the caller's provider transport must still disable its own retries and redirects.
+Before exiting a claimed task after a bounded run stops, a worker may also post
+an immutable, claim-fenced partial checkpoint to
+`POST /v1/tasks/{task_id}/interruption-reports`. The task detail retains that
+report across restarts and labels it client-reported and non-promotable; it does
+not cancel work, change task status, or bypass the ordinary submission and QC
+gates. See [run budgets and usage provenance](docs/RUN_BUDGETS.md) for limits.
 
 ### Fenced external side effects
 

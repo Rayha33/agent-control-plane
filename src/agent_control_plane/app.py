@@ -7,12 +7,20 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 from fastapi import Depends, FastAPI, Header, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import Settings
 from .coordination import CoordinationService
 from .coordination_schemas import (
+    BudgetInterruptionReportCreate,
+    BudgetInterruptionReportResult,
+    DispatchAttemptReceiptCreate,
+    DispatchAttemptReceiptResult,
+    DispatchAttemptReservationCreate,
+    DispatchAttemptReservationResult,
     HeartbeatRequest,
     HeartbeatView,
     QCReviewCreate,
@@ -126,6 +134,45 @@ def create_app(
         return JSONResponse(
             status_code=error.status_code,
             content={"error": error.code, "message": error.message},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        route = request.scope.get("route")
+        if getattr(route, "path", None) != "/v1/tasks/{task_id}/interruption-reports":
+            return await request_validation_exception_handler(request, error)
+
+        allowed_fields = {
+            "claim_fencing_token",
+            "resource_fencing_tokens",
+            "reason",
+            "summary",
+            "checkpoint",
+            "dispatch_attempt_ids",
+        }
+        details = []
+        for item in error.errors():
+            field = next(
+                (
+                    part
+                    for part in reversed(item.get("loc", ()))
+                    if isinstance(part, str) and part in allowed_fields
+                ),
+                None,
+            )
+            detail = {"code": str(item.get("type", "validation_error"))}
+            if field is not None:
+                detail["field"] = field
+            details.append(detail)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "request_validation_error",
+                "message": "Request validation failed.",
+                "details": details,
+            },
         )
 
     def require_admin(x_control_plane_key: str = Header(default="")) -> None:
@@ -287,6 +334,44 @@ def create_app(
         token: str = Depends(require_mandate),
     ) -> dict:
         return coordination.heartbeat(task_id, token, request)
+
+    @app.post(
+        "/v1/tasks/{task_id}/dispatch-attempts",
+        response_model=DispatchAttemptReservationResult,
+        status_code=201,
+    )
+    def reserve_dispatch_attempt(
+        task_id: str,
+        request: DispatchAttemptReservationCreate,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.reserve_dispatch_attempt(task_id, token, request)
+
+    @app.post(
+        "/v1/tasks/{task_id}/dispatch-attempts/{dispatch_attempt_id}/receipt",
+        response_model=DispatchAttemptReceiptResult,
+    )
+    def record_dispatch_attempt_receipt(
+        task_id: str,
+        dispatch_attempt_id: str,
+        request: DispatchAttemptReceiptCreate,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.record_dispatch_attempt_receipt(
+            task_id, dispatch_attempt_id, token, request
+        )
+
+    @app.post(
+        "/v1/tasks/{task_id}/interruption-reports",
+        response_model=BudgetInterruptionReportResult,
+        status_code=201,
+    )
+    def report_task_interruption(
+        task_id: str,
+        request: BudgetInterruptionReportCreate,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.record_budget_interruption_report(task_id, token, request)
 
     @app.post(
         "/v1/side-effects/{operation}",

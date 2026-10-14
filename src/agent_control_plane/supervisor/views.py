@@ -15,9 +15,14 @@ from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ..scheduling import Scheduler, declared_read_resources
+from ..scheduling import (
+    Scheduler,
+    attempt_budget_evidence,
+    declared_read_resources,
+    descendant_attempt_count,
+)
 from ..status import DEFAULT_LEASE_RISK_SECONDS, StatusView
-from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError, canonical_json, sha256
+from .common import DEFAULT_GC_RETENTION_SECONDS, SupervisorError, canonical_json, sha256, utc_now
 
 
 class ViewsMixin:
@@ -136,6 +141,13 @@ class ViewsMixin:
             """,
             (row["id"],),
         ).fetchone()
+        attempts_used = connection.execute(
+            "SELECT COUNT(*) AS value FROM attempts WHERE task_id = ?", (row["id"],)
+        ).fetchone()["value"]
+        descendant_attempts_used = descendant_attempt_count(connection, row["id"])
+        max_attempts = row["max_attempts"]
+        max_descendant_attempts = row["max_descendant_attempts"]
+        observed_at = utc_now()
         return {
             "id": row["id"],
             "title": row["title"],
@@ -155,11 +167,40 @@ class ViewsMixin:
             "base_branch": row["base_branch"],
             "base_sha": row["base_sha"],
             "priority": row["priority"],
+            "parent_task_id": row["parent_task_id"],
+            "max_attempts": max_attempts,
+            "attempts_used": attempts_used,
+            "attempts_remaining": (
+                max(0, max_attempts - attempts_used) if max_attempts is not None else None
+            ),
+            "attempt_budget": attempt_budget_evidence(
+                row["id"], max_attempts, attempts_used, observed_at=observed_at
+            ),
+            "attempt_budget_exhausted_at": row["attempt_budget_exhausted_at"],
+            "max_descendant_attempts": max_descendant_attempts,
+            "descendant_attempts_used": descendant_attempts_used,
+            "descendant_attempts_remaining": (
+                max(0, max_descendant_attempts - descendant_attempts_used)
+                if max_descendant_attempts is not None
+                else None
+            ),
+            "descendant_attempt_budget": attempt_budget_evidence(
+                row["id"],
+                max_descendant_attempts,
+                descendant_attempts_used,
+                scope_kind="task_descendants",
+                observed_at=observed_at,
+            ),
+            "descendant_attempt_budget_exhausted_at": row["descendant_attempt_budget_exhausted_at"],
             "status": row["status"],
             "cleanup_target_status": row["cleanup_target_status"],
             "cleanup_error": row["cleanup_error"],
             "current_attempt_id": row["current_attempt_id"],
-            "latest_attempt": self._attempt_view(connection, attempt) if attempt else None,
+            "latest_attempt": (
+                self._attempt_view(connection, attempt, max_attempts=max_attempts)
+                if attempt
+                else None
+            ),
             "latest_submission": self._submission_view(connection, submission)
             if submission
             else None,
@@ -167,7 +208,19 @@ class ViewsMixin:
             "updated_at": row["updated_at"],
         }
 
-    def _attempt_view(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    def _attempt_view(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        max_attempts: int | None = None,
+    ) -> dict[str, Any]:
+        if max_attempts is None:
+            task = connection.execute(
+                "SELECT max_attempts FROM tasks WHERE id = ?", (row["task_id"],)
+            ).fetchone()
+            if task is not None:
+                max_attempts = task["max_attempts"]
         leases = connection.execute(
             """
             SELECT resource, fencing_token, lease_expires_at
@@ -189,6 +242,13 @@ class ViewsMixin:
             "worktree_root": row["worktree_root"]
             or str((self.state_dir / "worktrees").resolve(strict=False)),
             "claim_token": row["claim_token"],
+            "attempt_budget": attempt_budget_evidence(
+                row["task_id"],
+                max_attempts,
+                row["number"],
+                observed_at=row["created_at"],
+                freshness="historical",
+            ),
             "start_sha": row["start_sha"],
             "task_brief_sha256": row["task_brief_sha256"],
             "latest_sha": row["latest_sha"],
@@ -313,6 +373,7 @@ class ViewsMixin:
 
     def task(self, task_id: str) -> dict[str, Any]:
         with self.connect() as connection:
+            connection.execute("BEGIN")
             return self._task_view(connection, self._task_row(connection, task_id))
 
     def owner_feedback(
@@ -478,6 +539,7 @@ class ViewsMixin:
     def list_tasks(self) -> list[dict[str, Any]]:
         self.reap_expired()
         with self.connect() as connection:
+            connection.execute("BEGIN")
             rows = connection.execute(
                 "SELECT * FROM tasks ORDER BY priority DESC, created_at"
             ).fetchall()

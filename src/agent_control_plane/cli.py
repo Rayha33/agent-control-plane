@@ -235,6 +235,35 @@ def parser() -> argparse.ArgumentParser:
     )
     add.add_argument("--priority", type=int, default=50)
     add.add_argument("--base", default="HEAD", dest="base_branch")
+    add.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help="optional maximum number of ACP-created attempts; does not meter provider usage",
+    )
+    add.add_argument(
+        "--parent-task-id",
+        default=None,
+        help="existing task that owns this child task; independent of dependency edges",
+    )
+    add.add_argument(
+        "--max-descendant-attempts",
+        type=int,
+        default=None,
+        help=(
+            "optional lifetime cap on durable attempts across all child tasks; "
+            "0 permits no descendant attempts"
+        ),
+    )
+    add.add_argument(
+        "--provider-cost-limit-usd-micros",
+        type=int,
+        default=None,
+        help=(
+            "request a hard provider-cost limit in USD micros; task-add refuses it unless an "
+            "authenticated provider meter and request gate are configured"
+        ),
+    )
 
     show = commands.add_parser("show", help="show a task")
     show.add_argument("task_id")
@@ -929,6 +958,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.produces,
                 args.consumes,
                 read_resources=args.read_resources,
+                max_attempts=args.max_attempts,
+                provider_cost_limit_usd_micros=args.provider_cost_limit_usd_micros,
+                parent_task_id=args.parent_task_id,
+                max_descendant_attempts=args.max_descendant_attempts,
             )
         elif args.action == "show":
             result = supervisor.task(args.task_id)

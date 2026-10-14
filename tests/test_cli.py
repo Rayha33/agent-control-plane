@@ -629,6 +629,93 @@ def _add(repo: Path, title: str, resource: str, *extra: str) -> dict:
     return json.loads(created.stdout)
 
 
+def test_cli_attempt_limit_is_visible_and_blocks_a_retry(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "bounded retries", "owned.txt", "--max-attempts", "1")
+    assert task["max_attempts"] == 1
+    assert task["attempts_used"] == 0
+    assert task["attempts_remaining"] == 1
+
+    claimed = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
+    assert claimed.returncode == 0, claimed.stderr
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE tasks SET status = 'orphaned', current_attempt_id = NULL WHERE id = ?",
+            (task["id"],),
+        )
+
+    denied = run_cli(repo, "claim", task["id"], "--agent", "cli-worker")
+    assert denied.returncode == 1
+    result = json.loads(denied.stderr)
+    assert result["error"] == "attempt_budget_exhausted"
+    assert "1/1" in result["message"]
+    shown = json.loads(run_cli(repo, "show", task["id"]).stdout)
+    assert shown["attempts_used"] == 1
+    assert shown["attempts_remaining"] == 0
+
+
+def test_cli_hierarchical_attempt_cap_is_visible_and_blocks_sibling_launch(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    parent = _add(
+        repo,
+        "bounded descendant launches",
+        "parent.txt",
+        "--max-descendant-attempts",
+        "1",
+    )
+    child = _add(
+        repo,
+        "first child",
+        "child.txt",
+        "--parent-task-id",
+        parent["id"],
+    )
+    sibling = _add(
+        repo,
+        "second child",
+        "sibling.txt",
+        "--parent-task-id",
+        parent["id"],
+    )
+    assert child["parent_task_id"] == parent["id"]
+    assert parent["max_descendant_attempts"] == 1
+
+    claimed = run_cli(repo, "claim", child["id"], "--agent", "child-worker")
+    assert claimed.returncode == 0, claimed.stderr
+    denied = run_cli(repo, "claim", sibling["id"], "--agent", "sibling-worker")
+    assert denied.returncode == 1
+    assert json.loads(denied.stderr)["error"] == "descendant_attempt_budget_exhausted"
+    parent_view = json.loads(run_cli(repo, "show", parent["id"]).stdout)
+    assert parent_view["descendant_attempts_used"] == 1
+    assert parent_view["descendant_attempts_remaining"] == 0
+
+
+def test_cli_provider_cost_limit_fails_closed_before_task_creation(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+
+    refused = run_cli(
+        repo,
+        "task-add",
+        "--title",
+        "provider limited",
+        "--accept",
+        "work stays within the hard provider cost limit",
+        "--resource",
+        "owned.txt",
+        "--provider-cost-limit-usd-micros",
+        "2500000",
+    )
+
+    assert refused.returncode == 1
+    response = json.loads(refused.stderr)
+    assert response["error"] == "budget_capability_unsupported"
+    assert "authenticated provider meter" in response["message"]
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
 def test_cli_heartbeat_without_checkpoint_only_renews_liveness(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     task = _add(repo, "heartbeat keeps progress", "owned.txt")
@@ -709,6 +796,28 @@ def test_cli_plan_queue_and_status_are_read_only_previews(tmp_path: Path) -> Non
     assert text.returncode == 0
     assert "ATTENTION" in text.stdout
     assert "cli-worker" in text.stdout
+
+
+def test_cli_plan_and_queue_json_sanitize_corrupt_blob_parent_id(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    task = _add(repo, "malformed hierarchy", "owned.txt")
+    with sqlite3.connect(repo / ".acp" / "control.db") as connection:
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+            (sqlite3.Binary(b"\x00\xff"), task["id"]),
+        )
+
+    plan = run_cli(repo, "plan", task["id"])
+    assert plan.returncode == 0, plan.stderr
+    preview = json.loads(plan.stdout)
+    assert preview["parent_task_id"] == "<invalid-parent-id:bytes>"
+    assert any(item["kind"] == "task_hierarchy_invalid" for item in preview["blockers"])
+
+    queue = run_cli(repo, "queue")
+    assert queue.returncode == 0, queue.stderr
+    queue_view = json.loads(queue.stdout)
+    blocked = next(item for item in queue_view["blocked"] if item["task_id"] == task["id"])
+    assert blocked["parent_task_id"] == "<invalid-parent-id:bytes>"
 
 
 def test_cli_publishes_intent_and_read_only_views_share_the_structured_snapshot(

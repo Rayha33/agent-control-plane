@@ -37,7 +37,7 @@ the old approval as current.
 
 | Record | Purpose |
 |---|---|
-| task | specification, acceptance criteria, dependencies, declared resources, base |
+| task | specification, acceptance, dependencies, declared resources, base, optional attempt cap |
 | attempt | agent, bound credential digest, branch, worktree, claim token, checkpoint, PID, latest commit, pinned trust manifest and executable identities |
 | resource lease | normalized resource, owner, monotonic fencing token, expiry |
 | runtime environment | generated environment, setup/teardown evidence and lifecycle state |
@@ -159,6 +159,13 @@ concrete cycle, never followed into an infinite walk.
 Each successful claim increments a global claim token. Each exact normalized
 resource independently increments its fencing token. An attempt must still own
 the task, have an unexpired lease, and present its current claim token.
+
+An optional `max_attempts` task cap is checked inside the same immediate
+transaction that inserts the next attempt. The inserted attempt is the durable
+reservation, so concurrent claimers cannot oversubscribe the cap. The count is
+local to records created by this supervisor (including provisioning failures);
+it does not meter provider-internal work, tokens, or billing. No cap preserves
+the legacy unlimited behavior.
 
 Submissions persist the complete resource-token map. QC and integration compare
 that map with the live reservation. An expired or replaced reservation closes

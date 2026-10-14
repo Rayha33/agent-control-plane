@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import time
 import uuid
@@ -20,7 +21,8 @@ from support import (
     write_config,
 )
 
-from agent_control_plane.git_supervisor import GitSupervisor
+from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.scheduling import Scheduler
 from agent_control_plane.status import StatusView, _format_bytes
 
 
@@ -137,6 +139,261 @@ def test_status_reports_phase_paths_and_runtime_for_a_working_attempt(repo: Path
     assert entry["checkpoint_stale_advisory"] is False
     assert entry["read_dependency_advisory"] is None
     assert entry["worker"]["status"] == "working"
+
+
+def test_status_reads_task_and_lease_views_from_one_database_snapshot(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    make_task(supervisor, "alpha.txt")
+    original = Scheduler._active_leases
+    observed_transactions: list[bool] = []
+
+    def assert_snapshot(connection, now: int) -> list[dict]:
+        observed_transactions.append(connection.in_transaction)
+        assert connection.in_transaction
+        return original(connection, now)
+
+    monkeypatch.setattr(Scheduler, "_active_leases", staticmethod(assert_snapshot))
+
+    snapshot = supervisor.status()
+
+    assert observed_transactions == [True]
+    assert type(snapshot["generated_at"]) is int
+
+
+def test_status_reports_typed_local_attempt_budget_provenance(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Bounded status view",
+        "Expose only local attempt-count evidence.",
+        ["The budget evidence matches the task attempt history"],
+        ["alpha.txt"],
+        max_attempts=1,
+    )
+    supervisor.claim(task["id"], "budget-worker")
+
+    snapshot = supervisor.status()
+    evidence = entry_for(snapshot, task["id"])["attempt_budget"]
+
+    assert evidence["dimension"] == "task_attempt_launches"
+    assert evidence["unit"] == "attempts"
+    assert evidence["scope"] == {"kind": "task", "id": task["id"]}
+    assert evidence["status"] == "exhausted"
+    assert evidence["configured_limit"] == 1
+    assert evidence["consumed"] == 1
+    assert evidence["reserved"] == 0
+    assert evidence["released"] == 0
+    assert evidence["remaining"] == 0
+    assert evidence["observed_at"] is None
+    assert evidence["observation_time_ref"] == "generated_at"
+    assert evidence["freshness"] == "current"
+    assert evidence["provider_usage"]["status"] == "unsupported"
+
+
+def test_status_reports_hierarchical_attempt_budget_provenance(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    grandparent = supervisor.create_task(
+        "Top-level budget",
+        "Status identifies inherited task-tree limits at every ancestor.",
+        ["Ancestor lineage is visible"],
+        ["top.txt"],
+        max_descendant_attempts=3,
+    )
+    parent = supervisor.create_task(
+        "Parent budget",
+        "Status reports task-tree usage without equating it to provider spend.",
+        ["One child attempt is visible"],
+        ["parent.txt"],
+        parent_task_id=grandparent["id"],
+        max_descendant_attempts=1,
+    )
+    child = supervisor.create_task(
+        "Child budget consumer",
+        "Consume one durable attempt under the parent.",
+        ["Attempt counted"],
+        ["child.txt"],
+        parent_task_id=parent["id"],
+    )
+    blocked_sibling = supervisor.create_task(
+        "Sibling blocked by parent cap",
+        "Status calls out a child whose parent exhausted its descendant budget.",
+        ["The inherited cap is actionable"],
+        ["sibling.txt"],
+        parent_task_id=parent["id"],
+    )
+    supervisor.claim(parent["id"], "parent-worker")
+    supervisor.claim(child["id"], "child-worker")
+
+    snapshot = supervisor.status(limit=10)
+    evidence = entry_for(snapshot, parent["id"])["descendant_attempt_budget"]
+
+    assert evidence["dimension"] == "descendant_task_attempt_launches"
+    assert evidence["unit"] == "attempts"
+    assert evidence["scope"] == {"kind": "task_descendants", "id": parent["id"]}
+    assert evidence["status"] == "exhausted"
+    assert evidence["configured_limit"] == 1
+    assert evidence["consumed"] == 1
+    assert evidence["reserved"] == 0
+    assert evidence["released"] == 0
+    assert evidence["remaining"] == 0
+    assert evidence["observed_at"] is None
+    assert evidence["observation_time_ref"] == "generated_at"
+    assert evidence["freshness"] == "current"
+    assert evidence["provider_usage"]["status"] == "unsupported"
+
+    child_entry = entry_for(snapshot, child["id"])
+    assert child_entry["parent_task_id"] == parent["id"]
+    ancestor_budgets = child_entry["ancestor_attempt_budgets"]
+    assert [budget["ancestor_task_id"] for budget in ancestor_budgets] == [
+        parent["id"],
+        grandparent["id"],
+    ]
+    assert ancestor_budgets[0]["configured_limit"] == 1
+    assert ancestor_budgets[0]["consumed"] == 1
+    assert ancestor_budgets[0]["remaining"] == 0
+    assert ancestor_budgets[0]["status"] == "exhausted"
+    assert ancestor_budgets[1]["configured_limit"] == 3
+    assert ancestor_budgets[1]["consumed"] == 2
+    assert ancestor_budgets[1]["remaining"] == 1
+    assert ancestor_budgets[1]["status"] == "enforced"
+    assert child_entry["category"] == "active"
+
+    blocked_attention = next(
+        item for item in snapshot["attention"] if item["task_id"] == blocked_sibling["id"]
+    )
+    assert blocked_attention["category"] == "human_required"
+    assert f"ancestor task {parent['id']} attempt budget exhausted" in blocked_attention["reason"]
+    assert "1/1 descendant attempts used" in blocked_attention["reason"]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_parent", "empty_parent", "whitespace_parent", "cycle_detected"],
+)
+def test_status_flags_invalid_ancestor_lineage(repo: Path, corruption: str) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Parent budget",
+        "Status flags corrupted task ancestry instead of implying a complete budget chain.",
+        ["Lineage integrity is explicit"],
+        ["parent.txt"],
+        max_descendant_attempts=2,
+    )
+    child = supervisor.create_task(
+        "Child",
+        "The child has a normally valid parent before direct database corruption.",
+        ["Corruption is reported"],
+        ["child.txt"],
+        parent_task_id=parent["id"],
+        max_descendant_attempts=2,
+    )
+
+    if corruption == "cycle_detected":
+        supervisor.claim(parent["id"], "parent-worker")
+        supervisor.claim(child["id"], "child-worker")
+
+    with sqlite3.connect(supervisor.db_path) as connection:
+        if corruption == "missing_parent":
+            connection.execute(
+                "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+                ("missing-parent", child["id"]),
+            )
+        elif corruption in {"empty_parent", "whitespace_parent"}:
+            invalid_parent_id = "" if corruption == "empty_parent" else " "
+            connection.execute(
+                "UPDATE tasks SET id = ? WHERE id = ?", (invalid_parent_id, parent["id"])
+            )
+            connection.execute(
+                "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+                (invalid_parent_id, child["id"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+                (child["id"], parent["id"]),
+            )
+
+    snapshot = supervisor.status()
+    entry = entry_for(snapshot, child["id"])
+    assert entry["ancestor_lineage_integrity"] == {
+        "status": "invalid",
+        "issue": {
+            "kind": (
+                "missing_parent"
+                if corruption == "missing_parent"
+                else "empty_parent_id"
+                if corruption in {"empty_parent", "whitespace_parent"}
+                else corruption
+            ),
+            "task_id": (
+                "missing-parent"
+                if corruption == "missing_parent"
+                else ""
+                if corruption == "empty_parent"
+                else " "
+                if corruption == "whitespace_parent"
+                else child["id"]
+            ),
+        },
+    }
+    assert entry["ancestor_attempt_budgets"] == []
+    assert entry["descendant_attempt_budget"]["status"] == "invalid"
+    assert entry["descendant_attempt_budget"]["remaining"] is None
+    if corruption == "cycle_detected":
+        assert entry["category"] == "active"
+    else:
+        assert entry["category"] == "human_required"
+        assert "task hierarchy is invalid" in entry["reason"]
+    if corruption == "cycle_detected":
+        preview = supervisor.plan_claim(child["id"])
+        assert any(item["kind"] == "task_hierarchy_invalid" for item in preview["blockers"])
+        assert not any(
+            item["kind"] == "descendant_attempt_budget_exhausted" for item in preview["blockers"]
+        )
+        parent_entry = entry_for(snapshot, parent["id"])
+        assert parent_entry["ancestor_lineage_integrity"]["status"] == "invalid"
+        assert parent_entry["ancestor_attempt_budgets"] == []
+        assert parent_entry["descendant_attempt_budget"]["status"] == "invalid"
+        assert parent_entry["descendant_attempt_budget"]["remaining"] is None
+
+
+def test_status_json_sanitizes_blob_parent_id(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    parent = supervisor.create_task(
+        "Parent",
+        "A malformed BLOB parent id must not break the JSON status endpoint.",
+        ["Status stays serializable"],
+        ["parent.txt"],
+    )
+    child = supervisor.create_task(
+        "Child",
+        "The parent link is corrupted after valid task creation.",
+        ["The invalid type is disclosed safely"],
+        ["child.txt"],
+        parent_task_id=parent["id"],
+    )
+    with sqlite3.connect(supervisor.db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET parent_task_id = ? WHERE id = ?",
+            (sqlite3.Binary(b"\x00\xff"), child["id"]),
+        )
+
+    snapshot = supervisor.status()
+    child_entry = entry_for(snapshot, child["id"])
+
+    assert child_entry["parent_task_id"] == "<invalid-parent-id:bytes>"
+    assert child_entry["ancestor_lineage_integrity"] == {
+        "status": "invalid",
+        "issue": {
+            "kind": "invalid_parent_id_type",
+            "task_id": "<invalid-parent-id:bytes>",
+            "value_type": "bytes",
+        },
+    }
+    assert child_entry["category"] == "human_required"
+    assert "task hierarchy is invalid (invalid_parent_id_type)" in child_entry["reason"]
+    assert json.loads(json.dumps(snapshot)) == snapshot
 
 
 def test_status_tracks_only_declared_glob_read_inputs_and_is_read_only(repo: Path) -> None:
@@ -1167,6 +1424,80 @@ def test_attention_queue_ranks_human_required_above_active_work(repo: Path) -> N
     assert attention[-1]["task_id"] == busy["id"]
     assert attention[-1]["category"] == "active"
     assert attention[0]["reason"]
+
+
+def test_exhausted_claimable_attempt_budget_is_human_required(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Budget exhausted",
+        "Implement and verify one isolated change.",
+        ["Tests pass"],
+        ["alpha.txt"],
+        max_attempts=1,
+    )
+    supervisor.claim(task["id"], "agent-a")
+    assert entry_for(supervisor.status(), task["id"])["category"] == "active"
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE tasks SET status = 'orphaned', current_attempt_id = NULL WHERE id = ?",
+            (task["id"],),
+        )
+    with pytest.raises(SupervisorError) as error:
+        supervisor.claim(task["id"], "agent-b")
+    assert error.value.code == "attempt_budget_exhausted"
+
+    snapshot = supervisor.status()
+    entry = entry_for(snapshot, task["id"])
+    attention = next(item for item in snapshot["attention"] if item["task_id"] == task["id"])
+
+    assert entry["status"] == "orphaned"
+    assert entry["attempt_budget"]["status"] == "exhausted"
+    assert attention["category"] == "human_required"
+    assert "1/1 attempts used" in attention["reason"]
+    assert "retry is not claimable" in attention["reason"]
+
+
+def test_completed_attempt_budget_is_not_exhausted_and_invalid_budget_is_actionable(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    task = supervisor.create_task(
+        "Completed with one launch",
+        "Implement and verify one isolated change.",
+        ["Tests pass"],
+        ["beta.txt"],
+        max_attempts=1,
+    )
+    approve(supervisor, task["id"], "beta.txt", "done\n")
+
+    completed = entry_for(supervisor.status(), task["id"])
+    assert completed["status"] == "approved"
+    assert completed["category"] != "human_required"
+
+    invalid_entry = {
+        "status": "orphaned",
+        "attempt_budget": {"status": "invalid", "consumed": 1, "configured_limit": 0},
+        "ancestor_lineage_integrity": {"status": "valid", "issue": None},
+        "ancestor_attempt_budgets": [],
+        "runtime": None,
+        "lease_seconds_remaining": None,
+        "checkpoint_stale_advisory": False,
+    }
+    category, reason = StatusView._categorize(invalid_entry, lease_risk_seconds=30)
+    assert category == "human_required"
+    assert reason == "task attempt budget is invalid; retry is not claimable"
+
+    invalid_ancestor_entry = {
+        **invalid_entry,
+        "attempt_budget": {"status": "unconfigured"},
+        "ancestor_attempt_budgets": [{"status": "invalid", "ancestor_task_id": "ancestor-1"}],
+    }
+    category, reason = StatusView._categorize(invalid_ancestor_entry, lease_risk_seconds=30)
+    assert category == "human_required"
+    assert (
+        reason
+        == "ancestor task ancestor-1 has an invalid descendant attempt budget; retry is not claimable"
+    )
 
 
 def test_failed_cleanup_outranks_review_and_is_listed(repo: Path) -> None:

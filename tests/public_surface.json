@@ -64,6 +64,20 @@
     ]
   },
   "agent_control_plane.coordination": {
+    "class:BudgetInterruptionReportCreate": [
+      "_abc_impl",
+      "model_config",
+      "validate_bounded_checkpoint",
+      "validate_dispatch_attempt_ids"
+    ],
+    "class:BudgetInterruptionReportView": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:ClaimBudgetView": [
+      "_abc_impl",
+      "model_config"
+    ],
     "class:ControlPlaneError": [],
     "class:ControlPlaneService": [
       "_agent",
@@ -88,10 +102,28 @@
     "class:CoordinationService": [
       "_agent_for_action",
       "_assert_active_claim",
+      "_budget_interruption_report_view",
+      "_claim_budget_view",
+      "_claim_count",
+      "_claim_limit",
       "_clear_heartbeats",
+      "_descendant_claim_count",
+      "_descendant_dispatch_attempt_counts",
+      "_dispatch_attempt_budget_view",
+      "_dispatch_attempt_count",
+      "_dispatch_attempt_outstanding_count",
+      "_dispatch_attempt_receipt_view",
+      "_dispatch_attempt_view",
+      "_dispatch_limit",
+      "_outstanding_dispatch_budget_view",
+      "_raise_claim_guard_error",
+      "_raise_dispatch_guard_error",
+      "_reported_provider_usage_view",
+      "_resource_fencing_tokens_match",
       "_review_view",
       "_submission_row",
       "_submission_view",
+      "_task_ancestor_chain",
       "_task_row",
       "_task_view",
       "claim_task",
@@ -100,7 +132,10 @@
       "heartbeat",
       "list_tasks",
       "reap_expired",
+      "record_budget_interruption_report",
+      "record_dispatch_attempt_receipt",
       "reopen_task",
+      "reserve_dispatch_attempt",
       "review",
       "review_view",
       "submission",
@@ -118,14 +153,48 @@
       "one",
       "verify_audit_chain"
     ],
+    "class:DispatchAttemptBudgetView": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:DispatchAttemptReceiptCreate": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:DispatchAttemptReceiptView": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:DispatchAttemptReservationCreate": [
+      "_abc_impl",
+      "model_config"
+    ],
     "class:HeartbeatRequest": [
       "_abc_impl",
       "model_config"
+    ],
+    "class:OutstandingDispatchBudgetView": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:ProviderUsageEvidence": [
+      "_abc_impl",
+      "model_config"
+    ],
+    "class:ProviderUsageReport": [
+      "_abc_impl",
+      "model_config",
+      "require_timestamp",
+      "validate_measurements"
     ],
     "class:QCReviewCreate": [
       "_abc_impl",
       "model_config",
       "validate_verdict"
+    ],
+    "class:ReportedProviderUsageView": [
+      "_abc_impl",
+      "model_config"
     ],
     "class:SubmissionCreate": [
       "_abc_impl",
@@ -134,28 +203,238 @@
     "class:TaskCreate": [
       "_abc_impl",
       "model_config",
+      "require_nonempty_parent_id",
       "require_unique_nonempty_values"
     ],
     "module": [
       "Any",
+      "BudgetInterruptionReportCreate",
+      "BudgetInterruptionReportView",
+      "ClaimBudgetView",
       "ControlPlaneError",
       "ControlPlaneService",
       "CoordinationService",
       "Database",
+      "DispatchAttemptBudgetView",
+      "DispatchAttemptReceiptCreate",
+      "DispatchAttemptReceiptView",
+      "DispatchAttemptReservationCreate",
       "HeartbeatRequest",
+      "OutstandingDispatchBudgetView",
+      "ProviderUsageEvidence",
+      "ProviderUsageReport",
       "QCReviewCreate",
       "QC_RESERVATION_SECONDS",
+      "ReportedProviderUsageView",
       "SubmissionCreate",
       "TaskCreate",
+      "UTC",
+      "_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS",
       "annotations",
       "canonical_json",
+      "datetime",
       "declared_resources",
+      "hashlib",
       "json",
       "scope_allows",
       "sqlite3",
       "time",
       "utc_now",
       "uuid"
+    ]
+  },
+  "agent_control_plane.dispatch_client": {
+    "class:ClientReportedProviderUsage": [
+      "adapter",
+      "as_dict",
+      "enforcement",
+      "freshness",
+      "measurements",
+      "model",
+      "observed_at",
+      "provider",
+      "reason",
+      "response_created_at",
+      "response_id",
+      "scope",
+      "source",
+      "status",
+      "unit"
+    ],
+    "class:CoordinationHttpDispatchLedger": [
+      "_post_json",
+      "record_dispatch_attempt_receipt",
+      "reserve_dispatch_attempt"
+    ],
+    "class:DispatchHttpResponse": [
+      "_abc_impl",
+      "_is_protocol"
+    ],
+    "class:DispatchLedger": [
+      "_abc_impl",
+      "_is_protocol",
+      "record_dispatch_attempt_receipt",
+      "reserve_dispatch_attempt"
+    ],
+    "class:DispatchLedgerError": [],
+    "class:DispatchLedgerHttpError": [],
+    "class:DispatchLedgerProtocolError": [],
+    "class:DispatchLedgerTransportError": [],
+    "class:DispatchOutcomeUnknown": [],
+    "class:DispatchReceiptUnrecorded": [],
+    "class:DispatchReservation": [
+      "created",
+      "dispatch_attempt_id"
+    ],
+    "class:DispatchReservationInvalid": [],
+    "class:DispatchReservationReplay": [],
+    "class:DispatchResponseInvalid": [],
+    "class:DispatchResult": [
+      "dispatch_attempt_id",
+      "provider_usage_report",
+      "response",
+      "retry_after_seconds"
+    ],
+    "class:DispatchRetryPolicy": [
+      "max_attempts",
+      "max_retry_after_seconds",
+      "max_total_wait_seconds"
+    ],
+    "class:DispatchRetryResult": [
+      "attempts",
+      "response"
+    ],
+    "class:DispatchRetryStopped": [],
+    "class:OpenAIResponsesHttpResponse": [
+      "body_status",
+      "headers",
+      "json",
+      "payload",
+      "status_code"
+    ],
+    "class:ProviderJsonHttpResponse": [
+      "body_status",
+      "headers",
+      "json",
+      "payload",
+      "status_code"
+    ],
+    "class:ProviderUsageReport": [
+      "_abc_impl",
+      "model_config",
+      "require_timestamp",
+      "validate_measurements"
+    ],
+    "class:_JsonOpener": [
+      "_abc_impl",
+      "_is_protocol",
+      "open"
+    ],
+    "class:_JsonResponse": [
+      "_abc_impl",
+      "_is_protocol",
+      "close",
+      "read"
+    ],
+    "class:_NoRedirectHandler": [
+      "redirect_request"
+    ],
+    "class:_ProviderHttpOpener": [
+      "_abc_impl",
+      "_is_protocol",
+      "open"
+    ],
+    "class:_ProviderHttpResponse": [
+      "_abc_impl",
+      "_is_protocol",
+      "close",
+      "read"
+    ],
+    "module": [
+      "Any",
+      "Callable",
+      "ClientReportedProviderUsage",
+      "CoordinationHttpDispatchLedger",
+      "DispatchHttpResponse",
+      "DispatchLedger",
+      "DispatchLedgerError",
+      "DispatchLedgerHttpError",
+      "DispatchLedgerProtocolError",
+      "DispatchLedgerTransportError",
+      "DispatchOutcomeUnknown",
+      "DispatchReceiptUnrecorded",
+      "DispatchReservation",
+      "DispatchReservationInvalid",
+      "DispatchReservationReplay",
+      "DispatchResponseInvalid",
+      "DispatchResult",
+      "DispatchRetryPolicy",
+      "DispatchRetryResult",
+      "DispatchRetryStopped",
+      "Generic",
+      "HTTPError",
+      "HTTPRedirectHandler",
+      "Literal",
+      "Mapping",
+      "OpenAIResponsesHttpResponse",
+      "Protocol",
+      "ProviderJsonHttpResponse",
+      "ProviderUsageReport",
+      "Request",
+      "ResponseT",
+      "TypeVar",
+      "UTC",
+      "_ANTHROPIC_API_VERSION",
+      "_ANTHROPIC_MESSAGES_URL",
+      "_GEMINI_GENERATE_CONTENT_URL",
+      "_JsonOpener",
+      "_JsonResponse",
+      "_MAX_COORDINATION_ERROR_BYTES",
+      "_MAX_COORDINATION_RESPONSE_BYTES",
+      "_MAX_OPENAI_RESPONSES_BYTES",
+      "_MAX_PROVIDER_RESPONSE_BYTES",
+      "_NoRedirectHandler",
+      "_OPENAI_RESPONSES_URL",
+      "_ProviderHttpOpener",
+      "_ProviderHttpResponse",
+      "_RETRYABLE_SERVER_STATUS_CODES",
+      "_RETRY_IDEMPOTENCY_KEY_MAX_LENGTH",
+      "_bounded_retry_after",
+      "_close_openai_response",
+      "_encode_provider_request_payload",
+      "_is_loopback_host",
+      "_provider_usage_extraction_failed",
+      "_read_dispatch_api_error_code",
+      "_read_openai_responses_response",
+      "_read_provider_json_response",
+      "_retry_after_seconds",
+      "_safe_api_error_code",
+      "_safe_failure_type",
+      "_safe_openai_response_headers",
+      "_send_provider_json_request",
+      "_valid_gemini_model_name",
+      "_validate_provider_api_key",
+      "_validate_provider_timeout",
+      "annotations",
+      "build_opener",
+      "ceil",
+      "dataclass",
+      "datetime",
+      "dispatch_anthropic_messages_once",
+      "dispatch_gemini_generate_content_once",
+      "dispatch_once",
+      "dispatch_openai_responses_once",
+      "dispatch_with_retries",
+      "field",
+      "ipaddress",
+      "json",
+      "parse_anthropic_messages_usage",
+      "parse_gemini_generate_content_usage",
+      "parse_openai_responses_usage",
+      "parsedate_to_datetime",
+      "quote",
+      "time",
+      "urlsplit"
     ]
   },
   "agent_control_plane.git_supervisor": {
@@ -192,6 +471,8 @@
       "_capture_base_checkout_snapshot",
       "_capture_read_resource_snapshot",
       "_case_sensitive_paths",
+      "_check_attempt_budget",
+      "_check_descendant_attempt_budget",
       "_cleanup_completed_result_stages_locked",
       "_cleanup_result_import_staging_locked",
       "_clear_result_import_staging_paths",
@@ -321,6 +602,8 @@
       "_capture_base_checkout_snapshot",
       "_capture_read_resource_snapshot",
       "_case_sensitive_paths",
+      "_check_attempt_budget",
+      "_check_descendant_attempt_budget",
       "_child_env",
       "_cleanup_calibration_artifact",
       "_cleanup_completed_result_stages_locked",
@@ -933,11 +1216,13 @@
       "WorkersMixin",
       "_add_agent_intent_attempt_latest_index",
       "_add_agent_intent_revisions",
+      "_add_attempt_budget_exhaustion_marker",
       "_add_attempt_progress_timestamps",
       "_add_attempt_task_brief_pin",
       "_add_attempt_worktree_root",
       "_add_base_checkout_snapshot",
       "_add_declared_resources",
+      "_add_hierarchical_attempt_budget",
       "_add_qc_acceptance_coverage",
       "_add_qc_runs_latest_lookup_index",
       "_add_read_dependency_snapshots",
@@ -956,6 +1241,7 @@
       "_add_sandbox_runtime_content_pins",
       "_add_sandbox_workspace_binding",
       "_add_submission_result_manifest",
+      "_add_task_attempt_budget",
       "_age_seconds",
       "_apply_ledger",
       "_assert_not_newer",
@@ -1014,6 +1300,48 @@
       "validate_role",
       "verify_bundle_pin",
       "verify_credential"
+    ]
+  },
+  "agent_control_plane.provider_usage": {
+    "class:ClientReportedProviderUsage": [
+      "adapter",
+      "as_dict",
+      "enforcement",
+      "freshness",
+      "measurements",
+      "model",
+      "observed_at",
+      "provider",
+      "reason",
+      "response_created_at",
+      "response_id",
+      "scope",
+      "source",
+      "status",
+      "unit"
+    ],
+    "module": [
+      "ClientReportedProviderUsage",
+      "Literal",
+      "Mapping",
+      "UTC",
+      "UsageReportStatus",
+      "_anthropic_invalid_usage",
+      "_gemini_invalid_usage",
+      "_provider_usage_extraction_failed",
+      "_report",
+      "_timestamp",
+      "_valid_count",
+      "_valid_model",
+      "_valid_prefixed_response_id",
+      "_valid_provider_response_id",
+      "_valid_response_id",
+      "annotations",
+      "dataclass",
+      "datetime",
+      "parse_anthropic_messages_usage",
+      "parse_gemini_generate_content_usage",
+      "parse_openai_responses_usage"
     ]
   },
   "agent_control_plane.runtime_drivers": {
@@ -1211,6 +1539,7 @@
     ]
   },
   "agent_control_plane.scheduling": {
+    "class:AttemptBudgetEvidence": [],
     "class:Scheduler": [
       "_active_leases",
       "_advisory_changed_paths",
@@ -1232,16 +1561,26 @@
       "ready_queue"
     ],
     "class:SupervisorError": [],
+    "class:TaskBudgetScope": [],
+    "class:UnsupportedProviderUsage": [],
     "module": [
       "Any",
+      "AttemptBudgetEvidence",
       "CLAIMABLE_STATUSES",
+      "Literal",
       "Scheduler",
       "SupervisorError",
       "TYPE_CHECKING",
+      "TaskBudgetScope",
+      "TypedDict",
+      "UnsupportedProviderUsage",
       "_MERGE_PLAN_CHANGED_PATHS_MAX_BYTES",
+      "_attempt_budget_fields",
       "annotations",
+      "attempt_budget_evidence",
       "declared_read_resources",
       "declared_resources",
+      "descendant_attempt_count",
       "json",
       "normalize_artifact",
       "sqlite3",
@@ -1509,6 +1848,7 @@
       "_path_key",
       "_process_liveness",
       "annotations",
+      "attempt_budget_evidence",
       "datetime",
       "json",
       "os",
@@ -1532,6 +1872,8 @@
       "_capture_base_checkout_snapshot",
       "_capture_read_resource_snapshot",
       "_case_sensitive_paths",
+      "_check_attempt_budget",
+      "_check_descendant_attempt_budget",
       "_cleanup_completed_result_stages_locked",
       "_cleanup_result_import_staging_locked",
       "_clear_result_import_staging_paths",
@@ -1629,6 +1971,7 @@
       "cleanup_candidate_object_temps",
       "declared_read_resources",
       "declared_resources",
+      "descendant_attempt_count",
       "fnmatch",
       "hashlib",
       "json",
@@ -2265,14 +2608,17 @@
       "SupervisorError",
       "ViewsMixin",
       "annotations",
+      "attempt_budget_evidence",
       "canonical_json",
       "declared_read_resources",
+      "descendant_attempt_count",
       "json",
       "re",
       "sha256",
       "shutil",
       "sqlite3",
-      "time"
+      "time",
+      "utc_now"
     ]
   },
   "agent_control_plane.supervisor.workers": {

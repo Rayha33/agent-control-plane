@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from .coordination_schemas import (
+    BudgetInterruptionReportCreate,
+    BudgetInterruptionReportView,
+    ClaimBudgetView,
+    DispatchAttemptBudgetView,
+    DispatchAttemptReceiptCreate,
+    DispatchAttemptReceiptView,
+    DispatchAttemptReservationCreate,
     HeartbeatRequest,
+    OutstandingDispatchBudgetView,
+    ProviderUsageEvidence,
+    ProviderUsageReport,
     QCReviewCreate,
+    ReportedProviderUsageView,
     SubmissionCreate,
     TaskCreate,
 )
@@ -18,6 +31,7 @@ from .scheduling import declared_resources
 from .service import ControlPlaneError, ControlPlaneService
 
 QC_RESERVATION_SECONDS = 3600
+_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS = 1000
 
 
 class CoordinationService:
@@ -26,6 +40,13 @@ class CoordinationService:
         self.control_plane = control_plane
 
     def create_task(self, request: TaskCreate) -> dict[str, Any]:
+        if request.provider_cost_limit_usd_micros is not None:
+            raise ControlPlaneError(
+                422,
+                "budget_capability_unsupported",
+                "provider cost hard limit requested but unsupported: no authenticated provider "
+                "meter or request gate is configured",
+            )
         task_id = str(uuid.uuid4())
         created_at = utc_now()
         with self.database.connect() as connection:
@@ -40,14 +61,28 @@ class CoordinationService:
                         "dependency_not_found",
                         f"dependency task {dependency_id} does not exist",
                     )
+            if request.parent_task_id is not None:
+                parent = connection.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (request.parent_task_id,)
+                ).fetchone()
+                if not parent:
+                    raise ControlPlaneError(
+                        404,
+                        "parent_task_not_found",
+                        f"parent task {request.parent_task_id} does not exist",
+                    )
+                self._task_ancestor_chain(connection, parent)
             connection.execute(
                 """
                 INSERT INTO tasks
                     (id, title, description, acceptance_criteria_json,
                      resources_json, priority, status, owner_agent_id,
-                     claim_expires_at, claim_fencing_token, version,
+                     claim_expires_at, claim_fencing_token, parent_task_id,
+                     max_claims, max_descendant_claims, max_dispatch_attempts,
+                     max_descendant_dispatch_attempts, max_unreceipted_dispatch_attempts,
+                     max_descendant_unreceipted_dispatch_attempts, version,
                      created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, NULL, 0, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     task_id,
@@ -56,6 +91,13 @@ class CoordinationService:
                     canonical_json(request.acceptance_criteria),
                     canonical_json(request.resources),
                     request.priority,
+                    request.parent_task_id,
+                    request.max_claims,
+                    request.max_descendant_claims,
+                    request.max_dispatch_attempts,
+                    request.max_descendant_dispatch_attempts,
+                    request.max_unreceipted_dispatch_attempts,
+                    request.max_descendant_unreceipted_dispatch_attempts,
                     created_at,
                     created_at,
                 ),
@@ -74,6 +116,17 @@ class CoordinationService:
                 "admin",
                 {
                     "dependencies": request.dependencies,
+                    "max_claims": request.max_claims,
+                    "max_descendant_claims": request.max_descendant_claims,
+                    "max_dispatch_attempts": request.max_dispatch_attempts,
+                    "max_descendant_dispatch_attempts": request.max_descendant_dispatch_attempts,
+                    "max_unreceipted_dispatch_attempts": (
+                        request.max_unreceipted_dispatch_attempts
+                    ),
+                    "max_descendant_unreceipted_dispatch_attempts": (
+                        request.max_descendant_unreceipted_dispatch_attempts
+                    ),
+                    "parent_task_id": request.parent_task_id,
                     "priority": request.priority,
                     "resources": request.resources,
                     "task_id": task_id,
@@ -100,7 +153,10 @@ class CoordinationService:
             )
         else:
             rows = self.database.all("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC")
-        return [self._task_view(row) for row in rows]
+        return [
+            self._task_view(row, include_reported_usage=False, include_interruption_report=False)
+            for row in rows
+        ]
 
     def claim_task(self, task_id: str, token: str, ttl_seconds: int) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
@@ -119,6 +175,37 @@ class CoordinationService:
                     "task_unavailable",
                     f"task cannot be claimed while status is {task['status']}",
                 )
+            ancestors = self._task_ancestor_chain(connection, task)
+            claims_used = self._claim_count(task["claim_fencing_token"])
+            local_limit = self._claim_limit(task["max_claims"], "max_claims")
+            if local_limit is not None and claims_used >= local_limit:
+                raise ControlPlaneError(
+                    409,
+                    "task_claim_budget_exhausted",
+                    f"task {task_id} has used {claims_used} of {local_limit} successful claims",
+                )
+            for ancestor in ancestors:
+                descendant_limit = self._claim_limit(
+                    ancestor["max_descendant_claims"],
+                    "max_descendant_claims",
+                    allow_zero=True,
+                )
+                if descendant_limit is None:
+                    continue
+                descendant_claims = self._descendant_claim_count(connection, ancestor["id"])
+                if descendant_claims is None:
+                    raise ControlPlaneError(
+                        409,
+                        "task_lineage_invalid",
+                        f"task lineage below ancestor {ancestor['id']} is invalid",
+                    )
+                if descendant_claims >= descendant_limit:
+                    raise ControlPlaneError(
+                        409,
+                        "descendant_claim_budget_exhausted",
+                        f"descendants of task {ancestor['id']} have used "
+                        f"{descendant_claims} of {descendant_limit} successful claims",
+                    )
             incomplete = connection.execute(
                 """
                 SELECT dependency.id, dependency.status
@@ -150,21 +237,24 @@ class CoordinationService:
 
             claim_fencing_token = task["claim_fencing_token"] + 1
             updated_at = utc_now()
-            connection.execute(
-                """
-                UPDATE tasks
-                SET status = 'claimed', owner_agent_id = ?, claim_expires_at = ?,
-                    claim_fencing_token = ?, version = version + 1, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    agent["id"],
-                    expires_at,
-                    claim_fencing_token,
-                    updated_at,
-                    task_id,
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'claimed', owner_agent_id = ?, claim_expires_at = ?,
+                        claim_fencing_token = ?, version = version + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        agent["id"],
+                        expires_at,
+                        claim_fencing_token,
+                        updated_at,
+                        task_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                self._raise_claim_guard_error(error)
             for resource in resources:
                 prior = connection.execute(
                     "SELECT fencing_token FROM resource_leases WHERE resource = ?",
@@ -327,6 +417,407 @@ class CoordinationService:
             "checkpoint": request.checkpoint,
         }
 
+    def reserve_dispatch_attempt(
+        self, task_id: str, token: str, request: DispatchAttemptReservationCreate
+    ) -> dict[str, Any]:
+        """Reserve one cooperative outbound-dispatch slot before a client call."""
+        claims, _mandate, agent = self._agent_for_action(
+            token, "coordination.dispatch", f"task:{task_id}", {"worker"}
+        )
+        reservation_id = str(uuid.uuid4())
+        resource_fencing_tokens_json = json.dumps(
+            request.resource_fencing_tokens, sort_keys=True, separators=(",", ":")
+        )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = int(time.time())
+            created_at = utc_now()
+            task = self._task_row(connection, task_id)
+            self._assert_active_claim(
+                connection,
+                task,
+                agent["id"],
+                request.claim_fencing_token,
+                request.resource_fencing_tokens,
+                now,
+            )
+            interrupted = connection.execute(
+                """SELECT 1 FROM budget_interruption_reports
+                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
+                (task_id, agent["id"], request.claim_fencing_token),
+            ).fetchone()
+            if interrupted is not None:
+                raise ControlPlaneError(
+                    409,
+                    "claim_interrupted",
+                    "this claim generation reported an interruption and cannot reserve more "
+                    "dispatches or submit; resume only under a newly fenced claim",
+                )
+            existing = connection.execute(
+                "SELECT * FROM dispatch_attempt_reservations "
+                "WHERE task_id = ? AND idempotency_key = ?",
+                (task_id, request.idempotency_key),
+            ).fetchone()
+            if existing:
+                if (
+                    existing["agent_id"] != agent["id"]
+                    or existing["claim_fencing_token"] != request.claim_fencing_token
+                    or existing["resource_fencing_tokens_json"] != resource_fencing_tokens_json
+                ):
+                    raise ControlPlaneError(
+                        409,
+                        "dispatch_idempotency_conflict",
+                        "idempotency key belongs to a different claim generation",
+                    )
+                return {
+                    "reservation": self._dispatch_attempt_view(connection, existing),
+                    "created": False,
+                }
+
+            ancestors = self._task_ancestor_chain(connection, task)
+            task_limit = self._dispatch_limit(
+                task["max_dispatch_attempts"], "max_dispatch_attempts"
+            )
+            task_used = self._dispatch_attempt_count(connection, task_id)
+            if task_limit is not None and task_used >= task_limit:
+                raise ControlPlaneError(
+                    409,
+                    "task_dispatch_budget_exhausted",
+                    "task has exhausted its cooperative dispatch-attempt limit",
+                )
+            for ancestor in ancestors:
+                ancestor_limit = self._dispatch_limit(
+                    ancestor["max_descendant_dispatch_attempts"],
+                    "max_descendant_dispatch_attempts",
+                )
+                descendant_outstanding_limit = self._dispatch_limit(
+                    ancestor["max_descendant_unreceipted_dispatch_attempts"],
+                    "max_descendant_unreceipted_dispatch_attempts",
+                )
+                descendant_counts = self._descendant_dispatch_attempt_counts(
+                    connection, ancestor["id"]
+                )
+                if descendant_counts is None:
+                    raise ControlPlaneError(
+                        409,
+                        "descendant_dispatch_budget_invalid",
+                        "descendant task lineage is invalid",
+                    )
+                descendant_used, descendant_outstanding = descendant_counts
+                if ancestor_limit is not None and descendant_used >= ancestor_limit:
+                    raise ControlPlaneError(
+                        409,
+                        "descendant_dispatch_budget_exhausted",
+                        "an ancestor task has exhausted its descendant dispatch-attempt limit",
+                    )
+                if (
+                    descendant_outstanding_limit is not None
+                    and descendant_outstanding >= descendant_outstanding_limit
+                ):
+                    raise ControlPlaneError(
+                        409,
+                        "descendant_dispatch_outstanding_budget_exhausted",
+                        "an ancestor task has exhausted its outstanding descendant "
+                        "dispatch-reservation limit",
+                    )
+
+            task_outstanding_limit = self._dispatch_limit(
+                task["max_unreceipted_dispatch_attempts"],
+                "max_unreceipted_dispatch_attempts",
+            )
+            task_outstanding = self._dispatch_attempt_outstanding_count(connection, task_id)
+            if task_outstanding_limit is not None and task_outstanding >= task_outstanding_limit:
+                raise ControlPlaneError(
+                    409,
+                    "task_dispatch_outstanding_budget_exhausted",
+                    "task has exhausted its outstanding dispatch-reservation limit",
+                )
+
+            # Recheck time-based task/resource leases immediately before the
+            # irreversible reservation insert; BEGIN IMMEDIATE prevents their
+            # fencing rows from changing while this transaction is held.
+            self._assert_active_claim(
+                connection,
+                task,
+                agent["id"],
+                request.claim_fencing_token,
+                request.resource_fencing_tokens,
+                int(time.time()),
+            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO dispatch_attempt_reservations
+                        (id, task_id, agent_id, claim_fencing_token,
+                         resource_fencing_tokens_json, idempotency_key, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        reservation_id,
+                        task_id,
+                        agent["id"],
+                        request.claim_fencing_token,
+                        resource_fencing_tokens_json,
+                        request.idempotency_key,
+                        created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                self._raise_dispatch_guard_error(error)
+            self.database.append_audit(
+                "dispatch_attempt.reserved",
+                claims["actor"],
+                {
+                    "agent_id": agent["id"],
+                    "claim_fencing_token": request.claim_fencing_token,
+                    "dispatch_attempt_id": reservation_id,
+                    "resource_fencing_tokens": request.resource_fencing_tokens,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
+            reservation = connection.execute(
+                "SELECT * FROM dispatch_attempt_reservations WHERE id = ?",
+                (reservation_id,),
+            ).fetchone()
+            assert reservation is not None
+            return {
+                "reservation": self._dispatch_attempt_view(connection, reservation),
+                "created": True,
+            }
+
+    def record_dispatch_attempt_receipt(
+        self,
+        task_id: str,
+        dispatch_attempt_id: str,
+        token: str,
+        request: DispatchAttemptReceiptCreate,
+    ) -> dict[str, Any]:
+        """Persist an immutable, explicitly client-reported response observation."""
+        claims, _mandate, agent = self._agent_for_action(
+            token, "coordination.dispatch_receipt", f"task:{task_id}", {"worker"}
+        )
+        received_at = utc_now()
+        provider_usage_json = (
+            canonical_json(request.provider_usage_report.model_dump())
+            if request.provider_usage_report is not None
+            else "{}"
+        )
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = connection.execute(
+                "SELECT * FROM dispatch_attempt_reservations WHERE id = ? AND task_id = ?",
+                (dispatch_attempt_id, task_id),
+            ).fetchone()
+            if not reservation:
+                raise ControlPlaneError(
+                    404, "dispatch_attempt_not_found", "dispatch attempt reservation not found"
+                )
+            if (
+                reservation["agent_id"] != agent["id"]
+                or reservation["claim_fencing_token"] != request.claim_fencing_token
+            ):
+                raise ControlPlaneError(
+                    409,
+                    "dispatch_attempt_fence_mismatch",
+                    "receipt does not match the reservation's worker and claim fence",
+                )
+            existing = connection.execute(
+                "SELECT * FROM dispatch_attempt_receipts WHERE dispatch_attempt_id = ?",
+                (dispatch_attempt_id,),
+            ).fetchone()
+            if existing:
+                if (
+                    existing["http_status_code"] != request.http_status_code
+                    or existing["retry_after_seconds"] != request.retry_after_seconds
+                    or (existing["provider_usage_json"] or "{}") != provider_usage_json
+                ):
+                    raise ControlPlaneError(
+                        409,
+                        "dispatch_attempt_receipt_conflict",
+                        "dispatch attempt already has a different immutable receipt",
+                    )
+                return {"receipt": self._dispatch_attempt_receipt_view(existing), "created": False}
+
+            connection.execute(
+                """
+                INSERT INTO dispatch_attempt_receipts
+                    (dispatch_attempt_id, source, http_status_code,
+                     retry_after_seconds, received_at, provider_usage_json)
+                VALUES (?, 'client_reported', ?, ?, ?, ?)
+                """,
+                (
+                    dispatch_attempt_id,
+                    request.http_status_code,
+                    request.retry_after_seconds,
+                    received_at,
+                    provider_usage_json,
+                ),
+            )
+            self.database.append_audit(
+                "dispatch_attempt.receipt_reported",
+                claims["actor"],
+                {
+                    "dispatch_attempt_id": dispatch_attempt_id,
+                    "http_status_code": request.http_status_code,
+                    "retry_after_seconds": request.retry_after_seconds,
+                    "source": "client_reported",
+                    "task_id": task_id,
+                    "provider_usage_status": (
+                        request.provider_usage_report.status
+                        if request.provider_usage_report is not None
+                        else "unsupported"
+                    ),
+                },
+                connection=connection,
+            )
+            receipt = connection.execute(
+                "SELECT * FROM dispatch_attempt_receipts WHERE dispatch_attempt_id = ?",
+                (dispatch_attempt_id,),
+            ).fetchone()
+            assert receipt is not None
+            return {"receipt": self._dispatch_attempt_receipt_view(receipt), "created": True}
+
+    def record_budget_interruption_report(
+        self,
+        task_id: str,
+        token: str,
+        request: BudgetInterruptionReportCreate,
+    ) -> dict[str, Any]:
+        """Persist a fenced, bounded checkpoint without changing task lifecycle state."""
+        claims, _mandate, agent = self._agent_for_action(
+            token, "coordination.interruption_report", f"task:{task_id}", {"worker"}
+        )
+        report_id = str(uuid.uuid4())
+        received_at = utc_now()
+        checkpoint_json = canonical_json(request.checkpoint)
+        checkpoint_sha256 = hashlib.sha256(checkpoint_json.encode("utf-8")).hexdigest()
+        resource_tokens_json = canonical_json(request.resource_fencing_tokens)
+        dispatch_ids_json = canonical_json(request.dispatch_attempt_ids)
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            values = {
+                "agent_id": agent["id"],
+                "claim_fencing_token": request.claim_fencing_token,
+                "resource_fencing_tokens_json": resource_tokens_json,
+                "reason": request.reason,
+                "summary": request.summary,
+                "checkpoint_json": checkpoint_json,
+                "checkpoint_sha256": checkpoint_sha256,
+                "dispatch_attempt_ids_json": dispatch_ids_json,
+            }
+            existing = connection.execute(
+                """SELECT * FROM budget_interruption_reports
+                   WHERE task_id = ? AND claim_fencing_token = ?""",
+                (task_id, request.claim_fencing_token),
+            ).fetchone()
+            if existing is not None:
+                if any(existing[key] != value for key, value in values.items()):
+                    raise ControlPlaneError(
+                        409,
+                        "interruption_report_conflict",
+                        "this claim already has a different immutable interruption report",
+                    )
+                return {
+                    "report": self._budget_interruption_report_view(connection, existing),
+                    "created": False,
+                }
+
+            task = self._task_row(connection, task_id)
+            self._assert_active_claim(
+                connection,
+                task,
+                agent["id"],
+                request.claim_fencing_token,
+                request.resource_fencing_tokens,
+                int(time.time()),
+            )
+            for dispatch_attempt_id in request.dispatch_attempt_ids:
+                receipt = connection.execute(
+                    """
+                    SELECT reservation.id, reservation.resource_fencing_tokens_json
+                    FROM dispatch_attempt_reservations AS reservation
+                    JOIN dispatch_attempt_receipts AS receipt
+                      ON receipt.dispatch_attempt_id = reservation.id
+                    WHERE reservation.id = ? AND reservation.task_id = ?
+                      AND reservation.agent_id = ?
+                      AND reservation.claim_fencing_token = ?
+                    """,
+                    (
+                        dispatch_attempt_id,
+                        task_id,
+                        agent["id"],
+                        request.claim_fencing_token,
+                    ),
+                ).fetchone()
+                if receipt is None or not self._resource_fencing_tokens_match(
+                    receipt["resource_fencing_tokens_json"],
+                    request.resource_fencing_tokens,
+                ):
+                    raise ControlPlaneError(
+                        422,
+                        "interruption_dispatch_receipt_invalid",
+                        "every linked dispatch attempt must have a client-reported receipt "
+                        "from this task claim and resource fence",
+                    )
+
+            # The first check fences linked receipts. Recheck the wall-clock expiry
+            # immediately before persistence so a claim expiring during validation
+            # cannot create a fresh interruption report.
+            self._assert_active_claim(
+                connection,
+                task,
+                agent["id"],
+                request.claim_fencing_token,
+                request.resource_fencing_tokens,
+                int(time.time()),
+            )
+            connection.execute(
+                """
+                INSERT INTO budget_interruption_reports
+                  (id, task_id, agent_id, claim_fencing_token,
+                   resource_fencing_tokens_json, status, source, reason, summary,
+                   checkpoint_json, checkpoint_sha256, dispatch_attempt_ids_json, received_at)
+                VALUES (?, ?, ?, ?, ?, 'partial', 'client_reported', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_id,
+                    task_id,
+                    agent["id"],
+                    request.claim_fencing_token,
+                    resource_tokens_json,
+                    request.reason,
+                    request.summary,
+                    checkpoint_json,
+                    checkpoint_sha256,
+                    dispatch_ids_json,
+                    received_at,
+                ),
+            )
+            self.database.append_audit(
+                "task.interruption_reported",
+                claims["actor"],
+                {
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "claim_fencing_token": request.claim_fencing_token,
+                    "dispatch_attempt_ids": request.dispatch_attempt_ids,
+                    "reason": request.reason,
+                    "report_id": report_id,
+                    "source": "client_reported",
+                    "status": "partial",
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
+            report = connection.execute(
+                "SELECT * FROM budget_interruption_reports WHERE id = ?", (report_id,)
+            ).fetchone()
+            assert report is not None
+            return {
+                "report": self._budget_interruption_report_view(connection, report),
+                "created": True,
+            }
+
     def submit(self, task_id: str, token: str, request: SubmissionCreate) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(
             token, "coordination.submit", f"task:{task_id}", {"worker"}
@@ -346,6 +837,18 @@ class CoordinationService:
                 request.resource_fencing_tokens,
                 now,
             )
+            interrupted = connection.execute(
+                """SELECT 1 FROM budget_interruption_reports
+                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
+                (task_id, agent["id"], request.claim_fencing_token),
+            ).fetchone()
+            if interrupted is not None:
+                raise ControlPlaneError(
+                    409,
+                    "claim_interrupted",
+                    "this claim generation reported an interruption and cannot reserve more "
+                    "dispatches or submit; resume only under a newly fenced claim",
+                )
             if task["version"] != request.task_version:
                 raise ControlPlaneError(
                     409,
@@ -804,6 +1307,260 @@ class CoordinationService:
             raise ControlPlaneError(404, "task_not_found", "task not found")
         return row
 
+    @staticmethod
+    def _claim_count(value: Any) -> int:
+        if type(value) is not int or value < 0:
+            raise ControlPlaneError(
+                409,
+                "task_claim_budget_invalid",
+                "stored successful-claim count is not a non-negative integer",
+            )
+        return value
+
+    @staticmethod
+    def _claim_limit(value: Any, field: str, *, allow_zero: bool = False) -> int | None:
+        if value is None:
+            return None
+        minimum = 0 if allow_zero else 1
+        if type(value) is not int or value < minimum:
+            raise ControlPlaneError(
+                409,
+                "task_claim_budget_invalid",
+                f"stored {field} is not a valid non-negative claim limit",
+            )
+        return value
+
+    @staticmethod
+    def _dispatch_limit(value: Any, field: str) -> int | None:
+        if value is None:
+            return None
+        if type(value) is not int or value < 0:
+            raise ControlPlaneError(
+                409,
+                "dispatch_budget_invalid",
+                f"stored {field} is not a valid non-negative dispatch-attempt limit",
+            )
+        return value
+
+    @staticmethod
+    def _dispatch_attempt_count(connection: sqlite3.Connection, task_id: str) -> int:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count FROM dispatch_attempt_reservations WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row["count"])
+
+    @staticmethod
+    def _dispatch_attempt_outstanding_count(connection: sqlite3.Connection, task_id: str) -> int:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM dispatch_attempt_reservations AS reservation
+            LEFT JOIN dispatch_attempt_receipts AS receipt
+              ON receipt.dispatch_attempt_id = reservation.id
+            WHERE reservation.task_id = ? AND receipt.dispatch_attempt_id IS NULL
+            """,
+            (task_id,),
+        ).fetchone()
+        return int(row["count"])
+
+    @staticmethod
+    def _descendant_dispatch_attempt_counts(
+        connection: sqlite3.Connection, ancestor_id: str
+    ) -> tuple[int, int] | None:
+        rows = connection.execute(
+            """
+            WITH RECURSIVE descendants(id, path, cycle) AS (
+                SELECT id, ? || id || '|', id = ?
+                FROM tasks WHERE parent_task_id = ?
+                UNION ALL
+                SELECT child.id, descendants.path || child.id || '|',
+                       instr(descendants.path, '|' || child.id || '|') > 0
+                FROM tasks AS child
+                JOIN descendants ON child.parent_task_id = descendants.id
+                WHERE descendants.cycle = 0
+            )
+            SELECT descendants.id, descendants.cycle,
+                   COUNT(reservation.id) AS reservations,
+                   COUNT(CASE WHEN receipt.dispatch_attempt_id IS NULL
+                              THEN reservation.id END) AS outstanding
+            FROM descendants
+            LEFT JOIN dispatch_attempt_reservations AS reservation
+              ON reservation.task_id = descendants.id
+            LEFT JOIN dispatch_attempt_receipts AS receipt
+              ON receipt.dispatch_attempt_id = reservation.id
+            GROUP BY descendants.id, descendants.cycle
+            """,
+            (f"|{ancestor_id}|", ancestor_id, ancestor_id),
+        ).fetchall()
+        if any(row["cycle"] for row in rows):
+            return None
+        return (
+            sum(int(row["reservations"]) for row in rows),
+            sum(int(row["outstanding"]) for row in rows),
+        )
+
+    @staticmethod
+    def _raise_dispatch_guard_error(error: sqlite3.IntegrityError) -> None:
+        message = str(error)
+        errors = {
+            "task_dispatch_budget_exhausted": (
+                "task_dispatch_budget_exhausted",
+                "task has exhausted its cooperative dispatch-attempt limit",
+            ),
+            "descendant_dispatch_budget_exhausted": (
+                "descendant_dispatch_budget_exhausted",
+                "an ancestor task has exhausted its descendant dispatch-attempt limit",
+            ),
+            "task_dispatch_budget_invalid": (
+                "task_dispatch_budget_invalid",
+                "stored task dispatch-attempt budget is invalid",
+            ),
+            "descendant_dispatch_budget_invalid": (
+                "descendant_dispatch_budget_invalid",
+                "stored descendant dispatch-attempt budget is invalid",
+            ),
+            "task_dispatch_outstanding_budget_exhausted": (
+                "task_dispatch_outstanding_budget_exhausted",
+                "task has exhausted its outstanding dispatch-reservation limit",
+            ),
+            "descendant_dispatch_outstanding_budget_exhausted": (
+                "descendant_dispatch_outstanding_budget_exhausted",
+                "an ancestor task has exhausted its outstanding descendant "
+                "dispatch-reservation limit",
+            ),
+            "task_dispatch_outstanding_budget_invalid": (
+                "task_dispatch_outstanding_budget_invalid",
+                "stored task outstanding dispatch-reservation budget is invalid",
+            ),
+            "descendant_dispatch_outstanding_budget_invalid": (
+                "descendant_dispatch_outstanding_budget_invalid",
+                "stored descendant outstanding dispatch-reservation budget is invalid",
+            ),
+            "dispatch_claim_fence_invalid": (
+                "stale_claim_fencing_token",
+                "dispatch attempt reservation has a stale or inactive task claim",
+            ),
+            "dispatch_resource_fence_invalid": (
+                "stale_fencing_token",
+                "dispatch attempt reservation has a stale or incomplete resource fence",
+            ),
+            "task_lineage_invalid": (
+                "task_lineage_invalid",
+                "task parent lineage is invalid",
+            ),
+        }
+        for marker, (code, detail) in errors.items():
+            if marker in message:
+                raise ControlPlaneError(409, code, detail) from error
+        raise error
+
+    @classmethod
+    def _task_ancestor_chain(
+        cls, connection: sqlite3.Connection, task: sqlite3.Row
+    ) -> list[sqlite3.Row]:
+        """Return nearest-first parents; malformed, missing, or cyclic links fail closed."""
+        ancestors: list[sqlite3.Row] = []
+        visited = {task["id"]}
+        parent_id = task["parent_task_id"]
+        while parent_id is not None:
+            if (
+                not isinstance(parent_id, str)
+                or not parent_id.strip()
+                or parent_id != parent_id.strip()
+                or parent_id in visited
+            ):
+                raise ControlPlaneError(
+                    409, "task_lineage_invalid", "task parent lineage is invalid"
+                )
+            parent = connection.execute("SELECT * FROM tasks WHERE id = ?", (parent_id,)).fetchone()
+            if not parent:
+                raise ControlPlaneError(
+                    409, "task_lineage_invalid", "task parent lineage is invalid"
+                )
+            cls._claim_count(parent["claim_fencing_token"])
+            cls._claim_limit(
+                parent["max_descendant_claims"], "max_descendant_claims", allow_zero=True
+            )
+            cls._dispatch_limit(
+                parent["max_descendant_dispatch_attempts"],
+                "max_descendant_dispatch_attempts",
+            )
+            cls._dispatch_limit(
+                parent["max_descendant_unreceipted_dispatch_attempts"],
+                "max_descendant_unreceipted_dispatch_attempts",
+            )
+            visited.add(parent_id)
+            ancestors.append(parent)
+            parent_id = parent["parent_task_id"]
+        return ancestors
+
+    @classmethod
+    def _descendant_claim_count(
+        cls, connection: sqlite3.Connection, ancestor_id: str
+    ) -> int | None:
+        """Count claim generations below one task; return None for corrupt descendants."""
+        rows = connection.execute(
+            """
+            WITH RECURSIVE descendants(id, claim_fencing_token, path, cycle) AS (
+                SELECT id, claim_fencing_token, ? || id || '|', id = ?
+                FROM tasks WHERE parent_task_id = ?
+                UNION ALL
+                SELECT child.id, child.claim_fencing_token,
+                       descendants.path || child.id || '|',
+                       instr(descendants.path, '|' || child.id || '|') > 0
+                FROM tasks AS child
+                JOIN descendants ON child.parent_task_id = descendants.id
+                WHERE descendants.cycle = 0
+            )
+            SELECT id, claim_fencing_token, cycle FROM descendants
+            """,
+            (f"|{ancestor_id}|", ancestor_id, ancestor_id),
+        ).fetchall()
+        consumed = 0
+        for row in rows:
+            if row["cycle"]:
+                return None
+            try:
+                consumed += cls._claim_count(row["claim_fencing_token"])
+            except ControlPlaneError:
+                return None
+        return consumed
+
+    @staticmethod
+    def _raise_claim_guard_error(error: sqlite3.IntegrityError) -> None:
+        message = str(error)
+        errors = {
+            "task_claim_budget_exhausted": (
+                "task_claim_budget_exhausted",
+                "task has exhausted its successful-claim limit",
+            ),
+            "descendant_claim_budget_exhausted": (
+                "descendant_claim_budget_exhausted",
+                "an ancestor task has exhausted its descendant successful-claim limit",
+            ),
+            "task_lineage_invalid": (
+                "task_lineage_invalid",
+                "task parent lineage is invalid",
+            ),
+            "task_claim_budget_invalid": (
+                "task_claim_budget_invalid",
+                "stored task claim budget is invalid",
+            ),
+            "descendant_claim_budget_invalid": (
+                "descendant_claim_budget_invalid",
+                "stored descendant claim budget is invalid",
+            ),
+            "task_claim_fencing_invalid": (
+                "task_claim_fencing_invalid",
+                "stored claim fencing generation is invalid",
+            ),
+        }
+        for marker, (code, detail) in errors.items():
+            if marker in message:
+                raise ControlPlaneError(409, code, detail) from error
+        raise error
+
     def _submission_row(self, submission_id: str) -> sqlite3.Row:
         row = self.database.one("SELECT * FROM submissions WHERE id = ?", (submission_id,))
         if not row:
@@ -850,51 +1607,721 @@ class CoordinationService:
             ):
                 raise ControlPlaneError(409, "stale_fencing_token", f"stale lease for {resource}")
 
-    def _task_view(self, row: sqlite3.Row) -> dict[str, Any]:
-        dependencies = self.database.all(
-            """
-            SELECT depends_on_task_id FROM task_dependencies
-            WHERE task_id = ? ORDER BY depends_on_task_id
-            """,
-            (row["id"],),
+    def _task_view(
+        self,
+        row: sqlite3.Row,
+        *,
+        include_reported_usage: bool = True,
+        include_interruption_report: bool = True,
+    ) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            connection.execute("BEGIN")
+            row = self._task_row(connection, row["id"])
+            dependencies = connection.execute(
+                """
+                SELECT depends_on_task_id FROM task_dependencies
+                WHERE task_id = ? ORDER BY depends_on_task_id
+                """,
+                (row["id"],),
+            ).fetchall()
+            latest_submission = connection.execute(
+                """
+                SELECT * FROM submissions
+                WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            latest_review = connection.execute(
+                """
+                SELECT review.* FROM reviews AS review
+                JOIN submissions AS submission ON submission.id = review.submission_id
+                WHERE submission.task_id = ?
+                ORDER BY review.created_at DESC, review.id DESC LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            latest_interruption = (
+                connection.execute(
+                    """SELECT * FROM budget_interruption_reports
+                       WHERE task_id = ? ORDER BY received_at DESC, id DESC LIMIT 1""",
+                    (row["id"],),
+                ).fetchone()
+                if include_interruption_report
+                else None
+            )
+            try:
+                self._task_ancestor_chain(connection, row)
+                ancestor_lineage_integrity = "valid"
+            except ControlPlaneError:
+                ancestor_lineage_integrity = "invalid"
+            descendant_claims = self._descendant_claim_count(connection, row["id"])
+            descendant_dispatch_counts = self._descendant_dispatch_attempt_counts(
+                connection, row["id"]
+            )
+            descendant_dispatches = (
+                descendant_dispatch_counts[0] if descendant_dispatch_counts is not None else None
+            )
+            dispatches_used = self._dispatch_attempt_count(connection, row["id"])
+            dispatches_outstanding = self._dispatch_attempt_outstanding_count(connection, row["id"])
+            descendant_dispatches_outstanding = (
+                descendant_dispatch_counts[1] if descendant_dispatch_counts is not None else None
+            )
+            try:
+                claims_used: int | None = self._claim_count(row["claim_fencing_token"])
+            except ControlPlaneError:
+                claims_used = None
+            max_claims_valid = row["max_claims"] is None or (
+                type(row["max_claims"]) is int and row["max_claims"] > 0
+            )
+            max_claims = row["max_claims"] if max_claims_valid else None
+            max_descendant_claims_valid = row["max_descendant_claims"] is None or (
+                type(row["max_descendant_claims"]) is int and row["max_descendant_claims"] >= 0
+            )
+            max_descendant_claims = (
+                row["max_descendant_claims"] if max_descendant_claims_valid else None
+            )
+            max_dispatch_attempts_valid = row["max_dispatch_attempts"] is None or (
+                type(row["max_dispatch_attempts"]) is int and row["max_dispatch_attempts"] >= 0
+            )
+            max_dispatch_attempts = (
+                row["max_dispatch_attempts"] if max_dispatch_attempts_valid else None
+            )
+            max_descendant_dispatch_attempts_valid = row[
+                "max_descendant_dispatch_attempts"
+            ] is None or (
+                type(row["max_descendant_dispatch_attempts"]) is int
+                and row["max_descendant_dispatch_attempts"] >= 0
+            )
+            max_descendant_dispatch_attempts = (
+                row["max_descendant_dispatch_attempts"]
+                if max_descendant_dispatch_attempts_valid
+                else None
+            )
+            max_unreceipted_dispatch_attempts_valid = row[
+                "max_unreceipted_dispatch_attempts"
+            ] is None or (
+                type(row["max_unreceipted_dispatch_attempts"]) is int
+                and row["max_unreceipted_dispatch_attempts"] >= 0
+            )
+            max_unreceipted_dispatch_attempts = (
+                row["max_unreceipted_dispatch_attempts"]
+                if max_unreceipted_dispatch_attempts_valid
+                else None
+            )
+            max_descendant_unreceipted_dispatch_attempts_valid = row[
+                "max_descendant_unreceipted_dispatch_attempts"
+            ] is None or (
+                type(row["max_descendant_unreceipted_dispatch_attempts"]) is int
+                and row["max_descendant_unreceipted_dispatch_attempts"] >= 0
+            )
+            max_descendant_unreceipted_dispatch_attempts = (
+                row["max_descendant_unreceipted_dispatch_attempts"]
+                if max_descendant_unreceipted_dispatch_attempts_valid
+                else None
+            )
+            observed_at = utc_now()
+            task_reported_usage = (
+                self._reported_provider_usage_view(connection, row["id"], "task", dispatches_used)
+                if include_reported_usage
+                else None
+            )
+            descendant_reported_usage = (
+                self._reported_provider_usage_view(
+                    connection,
+                    row["id"],
+                    "descendant_tree",
+                    descendant_dispatches,
+                )
+                if include_reported_usage
+                else None
+            )
+            return {
+                "id": row["id"],
+                "title": row["title"],
+                "description": row["description"],
+                "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
+                "resources": json.loads(row["resources_json"]),
+                # #1764: folded above is the lease key; declared is the operator's capitalisation.
+                "declared_resources": declared_resources(row),
+                "dependencies": [dependency["depends_on_task_id"] for dependency in dependencies],
+                "priority": row["priority"],
+                "status": row["status"],
+                "owner_agent_id": row["owner_agent_id"],
+                "claim_expires_at": row["claim_expires_at"],
+                "claim_fencing_token": row["claim_fencing_token"],
+                "parent_task_id": (
+                    row["parent_task_id"] if isinstance(row["parent_task_id"], str) else None
+                ),
+                "ancestor_lineage_integrity": ancestor_lineage_integrity,
+                "max_claims": max_claims,
+                "max_descendant_claims": max_descendant_claims,
+                "claim_budget": self._claim_budget_view(
+                    "task", max_claims, claims_used, observed_at, invalid=not max_claims_valid
+                ),
+                "max_dispatch_attempts": max_dispatch_attempts,
+                "max_descendant_dispatch_attempts": max_descendant_dispatch_attempts,
+                "max_unreceipted_dispatch_attempts": max_unreceipted_dispatch_attempts,
+                "max_descendant_unreceipted_dispatch_attempts": (
+                    max_descendant_unreceipted_dispatch_attempts
+                ),
+                "dispatch_attempt_budget": self._dispatch_attempt_budget_view(
+                    "task",
+                    max_dispatch_attempts,
+                    dispatches_used,
+                    observed_at,
+                    reported_provider_usage=task_reported_usage,
+                    invalid=not max_dispatch_attempts_valid,
+                ),
+                "descendant_dispatch_attempt_budget": self._dispatch_attempt_budget_view(
+                    "descendant_tree",
+                    max_descendant_dispatch_attempts,
+                    descendant_dispatches,
+                    observed_at,
+                    reported_provider_usage=descendant_reported_usage,
+                    invalid=not max_descendant_dispatch_attempts_valid,
+                ),
+                "outstanding_dispatch_budget": self._outstanding_dispatch_budget_view(
+                    "task",
+                    max_unreceipted_dispatch_attempts,
+                    dispatches_outstanding,
+                    dispatches_used - dispatches_outstanding,
+                    observed_at,
+                    invalid=not max_unreceipted_dispatch_attempts_valid,
+                ),
+                "descendant_outstanding_dispatch_budget": self._outstanding_dispatch_budget_view(
+                    "descendant_tree",
+                    max_descendant_unreceipted_dispatch_attempts,
+                    descendant_dispatches_outstanding,
+                    (
+                        descendant_dispatches - descendant_dispatches_outstanding
+                        if descendant_dispatches is not None
+                        and descendant_dispatches_outstanding is not None
+                        else None
+                    ),
+                    observed_at,
+                    invalid=(
+                        not max_descendant_unreceipted_dispatch_attempts_valid
+                        or descendant_dispatches is None
+                        or descendant_dispatches_outstanding is None
+                    ),
+                ),
+                "descendant_claim_budget": self._claim_budget_view(
+                    "descendant_tree",
+                    max_descendant_claims,
+                    descendant_claims,
+                    observed_at,
+                    invalid=not max_descendant_claims_valid,
+                ),
+                "version": row["version"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "latest_submission": (
+                    self._submission_view(latest_submission) if latest_submission else None
+                ),
+                "latest_review": self._review_view(latest_review) if latest_review else None,
+                "latest_interruption_report": (
+                    self._budget_interruption_report_view(connection, latest_interruption)
+                    if latest_interruption
+                    else None
+                ),
+            }
+
+    @staticmethod
+    def _budget_interruption_report_view(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        checkpoint_raw = row["checkpoint_json"]
+        try:
+            checkpoint = json.loads(checkpoint_raw) if isinstance(checkpoint_raw, str) else None
+            if not isinstance(checkpoint, dict):
+                checkpoint = {}
+                checkpoint_integrity = "invalid"
+            else:
+                checkpoint_integrity = "valid"
+        except (TypeError, ValueError):
+            checkpoint = {}
+            checkpoint_integrity = "invalid"
+        expected_digest = (
+            hashlib.sha256(checkpoint_raw.encode("utf-8")).hexdigest()
+            if isinstance(checkpoint_raw, str)
+            else None
         )
-        latest_submission = self.database.one(
-            """
-            SELECT * FROM submissions
-            WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
-            """,
-            (row["id"],),
+        if expected_digest is None or expected_digest != row["checkpoint_sha256"]:
+            checkpoint = {}
+            checkpoint_integrity = "invalid"
+        try:
+            resource_fencing_tokens = json.loads(row["resource_fencing_tokens_json"])
+            if not isinstance(resource_fencing_tokens, dict) or any(
+                not isinstance(key, str) or type(value) is not int or value < 1
+                for key, value in resource_fencing_tokens.items()
+            ):
+                resource_fencing_tokens = {}
+                resource_fencing_tokens_integrity = "invalid"
+            else:
+                resource_fencing_tokens_integrity = "valid"
+        except (TypeError, ValueError):
+            resource_fencing_tokens = {}
+            resource_fencing_tokens_integrity = "invalid"
+        try:
+            dispatch_attempt_ids = json.loads(row["dispatch_attempt_ids_json"])
+            if not isinstance(dispatch_attempt_ids, list) or any(
+                not isinstance(item, str) for item in dispatch_attempt_ids
+            ):
+                dispatch_attempt_ids = []
+                dispatch_attempts_integrity = "invalid"
+            else:
+                dispatch_attempts_integrity = "valid"
+        except (TypeError, ValueError):
+            dispatch_attempt_ids = []
+            dispatch_attempts_integrity = "invalid"
+        dispatch_attempts = []
+        for dispatch_attempt_id in dispatch_attempt_ids:
+            reservation = connection.execute(
+                """SELECT * FROM dispatch_attempt_reservations
+                   WHERE id = ? AND task_id = ?""",
+                (dispatch_attempt_id, row["task_id"]),
+            ).fetchone()
+            if reservation is None:
+                dispatch_attempts_integrity = "invalid"
+                continue
+            attempt_view = CoordinationService._dispatch_attempt_view(connection, reservation)
+            if (
+                reservation["agent_id"] != row["agent_id"]
+                or reservation["claim_fencing_token"] != row["claim_fencing_token"]
+                or not CoordinationService._resource_fencing_tokens_match(
+                    reservation["resource_fencing_tokens_json"], resource_fencing_tokens
+                )
+                or attempt_view["status"] != "reported"
+            ):
+                dispatch_attempts_integrity = "invalid"
+            dispatch_attempts.append(attempt_view)
+        return BudgetInterruptionReportView(
+            id=row["id"],
+            task_id=row["task_id"],
+            agent_id=row["agent_id"],
+            claim_fencing_token=row["claim_fencing_token"],
+            resource_fencing_tokens=resource_fencing_tokens,
+            interruption_status="interrupted",
+            status=row["status"],
+            source=row["source"],
+            reason=row["reason"],
+            summary=row["summary"],
+            checkpoint=checkpoint,
+            checkpoint_sha256=row["checkpoint_sha256"],
+            checkpoint_integrity=checkpoint_integrity,
+            resource_fencing_tokens_integrity=resource_fencing_tokens_integrity,
+            dispatch_attempt_ids=dispatch_attempt_ids,
+            dispatch_attempts=dispatch_attempts,
+            dispatch_attempts_integrity=dispatch_attempts_integrity,
+            received_at=row["received_at"],
+            promotable=False,
+        ).model_dump()
+
+    @staticmethod
+    def _resource_fencing_tokens_match(stored_json: str, expected: dict[str, int]) -> bool:
+        try:
+            stored = json.loads(stored_json)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(stored, dict)
+            and all(
+                isinstance(resource, str) and type(token) is int and token >= 1
+                for resource, token in stored.items()
+            )
+            and stored == expected
         )
-        latest_review = self.database.one(
-            """
-            SELECT review.* FROM reviews AS review
-            JOIN submissions AS submission ON submission.id = review.submission_id
-            WHERE submission.task_id = ?
-            ORDER BY review.created_at DESC, review.id DESC LIMIT 1
-            """,
-            (row["id"],),
+
+    @staticmethod
+    def _claim_budget_view(
+        scope: str,
+        limit: int | None,
+        consumed: int | None,
+        observed_at: str,
+        *,
+        invalid: bool = False,
+    ) -> dict[str, Any]:
+        if invalid or consumed is None or (limit is not None and type(limit) is not int):
+            status = "invalid"
+            safe_limit = None if type(limit) is not int else limit
+            safe_consumed = None
+            remaining = None
+        elif limit is None:
+            status = "unlimited"
+            safe_limit = None
+            safe_consumed = consumed
+            remaining = None
+        else:
+            safe_limit = limit
+            safe_consumed = consumed
+            remaining = max(0, limit - consumed)
+            status = "exhausted" if remaining == 0 else "available"
+        return ClaimBudgetView(
+            scope=scope,
+            unit="successful_claim_reservations",
+            limit=safe_limit,
+            consumed=safe_consumed,
+            remaining=remaining,
+            status=status,
+            source="tasks.claim_fencing_token",
+            enforcement="BEGIN IMMEDIATE task claim and SQLite trigger",
+            observed_at=observed_at,
+        ).model_dump()
+
+    @staticmethod
+    def _reported_provider_usage_view(
+        connection: sqlite3.Connection,
+        task_id: str,
+        scope: str,
+        reservation_count: int | None,
+    ) -> dict[str, Any]:
+        if reservation_count is None:
+            return ReportedProviderUsageView(
+                scope=scope,
+                status="invalid",
+                source="client_reported",
+                capture_scope="ACP dispatch receipts only",
+                unit="tokens",
+                reservation_count=None,
+                sampled_reservation_count=None,
+                reported_response_count=None,
+                missing_report_count=None,
+                invalid_report_count=None,
+                receipt_without_report_count=None,
+                reservation_without_receipt_count=None,
+                latest_receipt_received_at_in_sample=None,
+                truncated=False,
+                sample_limit=_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS,
+                freshness="unknown",
+                enforcement="report_only",
+                reasons=["descendant_lineage_invalid"],
+                groups=[],
+            ).model_dump()
+
+        if scope == "task":
+            rows = connection.execute(
+                """
+                SELECT receipt.provider_usage_json, receipt.received_at
+                FROM dispatch_attempt_reservations AS reservation
+                LEFT JOIN dispatch_attempt_receipts AS receipt
+                  ON receipt.dispatch_attempt_id = reservation.id
+                WHERE reservation.task_id = ?
+                ORDER BY reservation.created_at DESC, reservation.id DESC
+                LIMIT ?
+                """,
+                (task_id, _PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                WITH RECURSIVE descendants(id) AS (
+                    SELECT id FROM tasks WHERE parent_task_id = ?
+                    UNION
+                    SELECT child.id FROM tasks AS child
+                    JOIN descendants ON child.parent_task_id = descendants.id
+                )
+                SELECT receipt.provider_usage_json, receipt.received_at
+                FROM descendants
+                JOIN dispatch_attempt_reservations AS reservation
+                  ON reservation.task_id = descendants.id
+                LEFT JOIN dispatch_attempt_receipts AS receipt
+                  ON receipt.dispatch_attempt_id = reservation.id
+                ORDER BY reservation.created_at DESC, reservation.id DESC
+                LIMIT ?
+                """,
+                (task_id, _PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS),
+            ).fetchall()
+
+        reported_response_count = 0
+        missing_report_count = 0
+        invalid_report_count = 0
+        receipt_without_report_count = 0
+        reservation_without_receipt_count = 0
+        latest_receipt_received_at = max(
+            (row["received_at"] for row in rows if row["received_at"] is not None),
+            default=None,
         )
+        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        invalid_stored_report = False
+
+        for row in rows:
+            stored_report = row["provider_usage_json"]
+            if stored_report is None:
+                reservation_without_receipt_count += 1
+                continue
+            try:
+                report_payload = json.loads(stored_report or "{}")
+                if report_payload == {}:
+                    receipt_without_report_count += 1
+                    continue
+                report = ProviderUsageReport.model_validate(report_payload)
+                client_observed_at = datetime.fromisoformat(
+                    report.observed_at.replace("Z", "+00:00")
+                ).astimezone(UTC)
+            except (OverflowError, TypeError, ValueError):
+                invalid_report_count += 1
+                invalid_stored_report = True
+                continue
+
+            if report.status == "missing":
+                missing_report_count += 1
+                continue
+            if report.status == "invalid":
+                invalid_report_count += 1
+                continue
+
+            assert report.model is not None
+            reported_response_count += 1
+            key = (report.provider, report.adapter, report.model)
+            group = groups.setdefault(
+                key,
+                {
+                    "response_count": 0,
+                    "measurements": {},
+                    "measurement_response_counts": {},
+                    "_latest_client_observed_at": None,
+                },
+            )
+            group["response_count"] += 1
+            if (
+                group["_latest_client_observed_at"] is None
+                or client_observed_at > group["_latest_client_observed_at"]
+            ):
+                group["_latest_client_observed_at"] = client_observed_at
+            for name, value in report.measurements.items():
+                group["measurements"][name] = group["measurements"].get(name, 0) + value
+                group["measurement_response_counts"][name] = (
+                    group["measurement_response_counts"].get(name, 0) + 1
+                )
+
+        truncated = reservation_count > len(rows)
+        reasons: list[str] = []
+        if invalid_stored_report:
+            reasons.append("stored_usage_report_invalid")
+        if truncated:
+            reasons.append("summary_truncated")
+        has_gaps = any(
+            (
+                missing_report_count,
+                invalid_report_count,
+                receipt_without_report_count,
+                reservation_without_receipt_count,
+                int(truncated),
+            )
+        )
+        if reservation_count == 0:
+            status = "none"
+        elif has_gaps:
+            status = "partial"
+        elif reported_response_count:
+            status = "observed"
+        else:
+            status = "partial"
+
+        group_views = []
+        for provider, adapter, model in sorted(groups):
+            group = groups[(provider, adapter, model)]
+            latest_client_observed_at = group["_latest_client_observed_at"]
+            assert isinstance(latest_client_observed_at, datetime)
+            group_views.append(
+                {
+                    "provider": provider,
+                    "adapter": adapter,
+                    "model": model,
+                    "response_count": group["response_count"],
+                    "latest_client_observed_at": latest_client_observed_at.isoformat().replace(
+                        "+00:00", "Z"
+                    ),
+                    "measurements": group["measurements"],
+                    "measurement_response_counts": group["measurement_response_counts"],
+                }
+            )
+        return ReportedProviderUsageView(
+            scope=scope,
+            status=status,
+            source="client_reported",
+            capture_scope="ACP dispatch receipts only",
+            unit="tokens",
+            reservation_count=reservation_count,
+            sampled_reservation_count=len(rows),
+            reported_response_count=reported_response_count,
+            missing_report_count=missing_report_count,
+            invalid_report_count=invalid_report_count,
+            receipt_without_report_count=receipt_without_report_count,
+            reservation_without_receipt_count=reservation_without_receipt_count,
+            latest_receipt_received_at_in_sample=latest_receipt_received_at,
+            truncated=truncated,
+            sample_limit=_PROVIDER_USAGE_SUMMARY_MAX_RESERVATIONS,
+            freshness="unknown",
+            enforcement="report_only",
+            reasons=reasons,
+            groups=group_views,
+        ).model_dump()
+
+    @staticmethod
+    def _dispatch_attempt_budget_view(
+        scope: str,
+        limit: int | None,
+        consumed: int | None,
+        observed_at: str,
+        *,
+        reported_provider_usage: dict[str, Any] | None,
+        invalid: bool = False,
+    ) -> dict[str, Any]:
+        if (
+            invalid
+            or consumed is None
+            or (limit is not None and (type(limit) is not int or limit < 0))
+        ):
+            status = "invalid"
+            safe_limit = None
+            safe_consumed = None
+            remaining = None
+        elif limit is None:
+            status = "unlimited"
+            safe_limit = None
+            safe_consumed = consumed
+            remaining = None
+        else:
+            safe_limit = limit
+            safe_consumed = consumed
+            remaining = max(0, limit - consumed)
+            status = "exhausted" if remaining == 0 else "available"
+        return DispatchAttemptBudgetView(
+            scope=scope,
+            unit="dispatch_attempt_reservations",
+            limit=safe_limit,
+            consumed=safe_consumed,
+            remaining=remaining,
+            reserved=0,
+            released=0,
+            status=status,
+            source="dispatch_attempt_reservations",
+            enforcement="BEGIN IMMEDIATE reservation and SQLite trigger",
+            observed_at=observed_at,
+            provider_usage=ProviderUsageEvidence(
+                status="unsupported",
+                unit=None,
+                source=None,
+                scope="provider calls and provider-internal fan-out",
+                observed_at=None,
+                freshness="unknown",
+                enforcement_point=None,
+                reason=(
+                    "no authenticated provider meter or request gate are wired to this supervisor"
+                ),
+            ),
+            reported_provider_usage=reported_provider_usage,
+        ).model_dump()
+
+    @staticmethod
+    def _outstanding_dispatch_budget_view(
+        scope: str,
+        limit: int | None,
+        reserved: int | None,
+        released: int | None,
+        observed_at: str,
+        *,
+        invalid: bool = False,
+    ) -> dict[str, Any]:
+        if (
+            invalid
+            or reserved is None
+            or released is None
+            or (limit is not None and (type(limit) is not int or limit < 0))
+        ):
+            status = "invalid"
+            safe_limit = None if type(limit) is not int or limit < 0 else limit
+            safe_reserved = None
+            safe_released = None
+            remaining = None
+            freshness = "unknown"
+        elif limit is None:
+            status = "unlimited"
+            safe_limit = None
+            safe_reserved = reserved
+            safe_released = released
+            remaining = None
+            freshness = "current_snapshot"
+        else:
+            safe_limit = limit
+            safe_reserved = reserved
+            safe_released = released
+            remaining = max(0, limit - reserved)
+            status = "exhausted" if remaining == 0 else "available"
+            freshness = "current_snapshot"
+        return OutstandingDispatchBudgetView(
+            scope=scope,
+            unit="unreceipted_dispatch_attempt_reservations",
+            limit=safe_limit,
+            reserved=safe_reserved,
+            released=safe_released,
+            remaining=remaining,
+            status=status,
+            source="dispatch_attempt_reservations_and_receipts",
+            enforcement="BEGIN IMMEDIATE reservation and SQLite trigger",
+            observed_at=observed_at,
+            freshness=freshness,
+            provider_usage=ProviderUsageEvidence(
+                status="unsupported",
+                unit=None,
+                source=None,
+                scope="provider calls and provider-internal fan-out",
+                observed_at=None,
+                freshness="unknown",
+                enforcement_point=None,
+                reason=(
+                    "no authenticated provider meter or request gate are wired to this supervisor"
+                ),
+            ),
+        ).model_dump()
+
+    @staticmethod
+    def _dispatch_attempt_receipt_view(row: sqlite3.Row) -> dict[str, Any]:
+        raw_provider_usage_report = json.loads(row["provider_usage_json"] or "{}")
+        return DispatchAttemptReceiptView(
+            dispatch_attempt_id=row["dispatch_attempt_id"],
+            source=row["source"],
+            http_status_code=row["http_status_code"],
+            retry_after_seconds=row["retry_after_seconds"],
+            received_at=row["received_at"],
+            provider_usage=ProviderUsageEvidence(
+                status="unsupported",
+                unit=None,
+                source=None,
+                scope="provider calls and provider-internal fan-out",
+                observed_at=None,
+                freshness="unknown",
+                enforcement_point=None,
+                reason=(
+                    "no authenticated provider meter or request gate are wired to this supervisor"
+                ),
+            ),
+            provider_usage_report=(
+                ProviderUsageReport.model_validate(raw_provider_usage_report)
+                if raw_provider_usage_report
+                else None
+            ),
+        ).model_dump()
+
+    @classmethod
+    def _dispatch_attempt_view(
+        cls, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        receipt = connection.execute(
+            "SELECT * FROM dispatch_attempt_receipts WHERE dispatch_attempt_id = ?",
+            (row["id"],),
+        ).fetchone()
         return {
             "id": row["id"],
-            "title": row["title"],
-            "description": row["description"],
-            "acceptance_criteria": json.loads(row["acceptance_criteria_json"]),
-            "resources": json.loads(row["resources_json"]),
-            # #1764: folded above is the lease key; declared is the operator's capitalisation.
-            "declared_resources": declared_resources(row),
-            "dependencies": [dependency["depends_on_task_id"] for dependency in dependencies],
-            "priority": row["priority"],
-            "status": row["status"],
-            "owner_agent_id": row["owner_agent_id"],
-            "claim_expires_at": row["claim_expires_at"],
+            "task_id": row["task_id"],
+            "agent_id": row["agent_id"],
             "claim_fencing_token": row["claim_fencing_token"],
-            "version": row["version"],
+            "resource_fencing_tokens": json.loads(row["resource_fencing_tokens_json"]),
+            "idempotency_key": row["idempotency_key"],
+            "status": "reported" if receipt else "reserved",
             "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "latest_submission": (
-                self._submission_view(latest_submission) if latest_submission else None
-            ),
-            "latest_review": self._review_view(latest_review) if latest_review else None,
+            "receipt": cls._dispatch_attempt_receipt_view(receipt) if receipt else None,
         }
 
     @staticmethod
