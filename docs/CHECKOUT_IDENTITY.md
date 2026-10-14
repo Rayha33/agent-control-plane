@@ -190,6 +190,46 @@ writes, tools that do not use this adapter, and agents that ignore the wrapper r
 outside this guarantee.
 Consequently this prototype does not claim general protection against unmediated writers.
 
+## Verification map
+
+The following regression tests make the intended failure boundaries easier to audit.
+They demonstrate the listed scenarios; they are not a proof for every filesystem,
+process tree, editor, or coordinator implementation.
+
+- **Path aliases and same-filesystem renames:** `tests/test_checkout_identity.py` —
+  `test_checkout_identity_is_stable_for_symlink_alias_and_same_filesystem_move`.
+- **Target binding and refusal before mutation:** `tests/test_checkout_identity.py` —
+  `test_checkout_run_write_resolves_relative_targets_from_leased_root`,
+  `test_checkout_run_write_rejects_a_different_linked_worktree_before_mutation`,
+  `test_checkout_run_write_rejects_symlink_escape_and_checkout_root`, and
+  `test_checkout_run_write_rejects_missing_path_below_file_before_marker`.
+- **Serialization and stale-fence rejection:** `tests/test_checkout_identity.py` —
+  `test_checkout_lease_serializes_adapters_and_rejects_stale_fence`,
+  `test_one_checkout_lease_serializes_concurrent_threads`, and
+  `test_generated_checkout_resource_serializes_task_claims_and_fences_stale_owner`.
+- **Dirty destructive-operation refusal:** `tests/test_checkout_identity.py` —
+  `test_destructive_checkout_operations_refuse_hidden_tracked_changes`,
+  `test_destructive_checkout_operations_refuse_untracked_or_ignored_state`,
+  `test_destructive_checkout_operations_detect_mode_change_when_git_config_hides_it`,
+  `test_destructive_checkout_operations_detect_case_only_rename`, and
+  `test_destructive_checkout_operations_fail_closed_for_dirty_ignored_submodule`.
+- **Crash and ambiguous-recovery blocking:** `tests/test_checkout_identity.py` —
+  `test_process_crash_during_mediated_write_blocks_next_owner`,
+  `test_completion_sync_failure_keeps_marker_and_blocks_next_owner`, and
+  `test_ambiguous_cleanup_is_not_retried_and_recovery_marker_blocks_next_owner`;
+  `tests/test_cli.py` — `test_checkout_exec_preserves_recovery_marker_after_failed_agent_command`
+  and `test_checkout_exec_child_keeps_lock_if_wrapper_is_killed`.
+- **Claude structured-editor fence:** `tests/test_guard.py` —
+  `test_hook_mode_can_require_an_active_checkout_exec_fence` and
+  `test_hook_mode_fails_closed_without_a_cwd`.
+
+`run_write` tests establish the lower-level typed adapter contract only. They do not
+show that a native editor or patch API routes its writes through that callback. The
+current Claude hook covers only the structured tools and configuration described
+above; other editor APIs and direct writers remain outside the guarantee. Full local
+and hosted test results for a change should be recorded against the exact commit under
+review; this map is not a substitute for rerunning them.
+
 ## Limits
 
 - The write lease currently requires POSIX `flock`; unsupported platforms fail closed.
