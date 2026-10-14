@@ -67,6 +67,27 @@ Repositories with registered submodules are currently refused for these operatio
 Git's local submodule-ignore settings can hide dirty nested worktrees; recursive
 submodule cleanliness has not yet been implemented.
 
+## Interrupted-operation recovery
+
+Before every mediated callback, the adapter creates and synchronizes a per-worktree
+pending marker in Git's common directory. After the callback returns and the checkout
+identity is revalidated, it synchronizes a completed state to that marker before removing
+it. If the process exits during a callback or completion cannot be synchronized, the
+marker remains. A new adapter refuses before acquiring a coordinator fence, including for
+ordinary `write` operations; it never assumes that a partial write is safe to continue.
+If directory synchronization fails after the marker is unlinked, the callback result is
+still reported as successful because its completed state was already synchronized. A
+crash may restore the marker, which conservatively blocks the next owner.
+This detects process interruption; it is not a transaction over arbitrary callback
+outputs and does not establish power-loss durability for worktree files. Callbacks remain
+responsible for synchronizing their own data when that guarantee is required.
+
+The marker is named `.acp-checkout-<checkout_id>.pending`. Inspect and preserve or recover
+the worktree contents first. Remove that exact marker manually only after the checkout is
+safe to resume. ACP does not automatically discard, stash, reset, or replay interrupted
+work. A cleanup operation that removes the entire common Git directory leaves no
+checkout to resume; subsequent identity resolution fails closed.
+
 The current Claude Code hook integration still mediates only its documented structured
 Edit/Write/MultiEdit/NotebookEdit targets in the attempt worktree. It does not route
 those hooks through `CheckoutWriteLease` yet. Bash, direct Git commands, native editor

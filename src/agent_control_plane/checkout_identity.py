@@ -169,6 +169,208 @@ def _digest(parts: tuple[str | int, ...]) -> str:
     return hashlib.sha256(canonical).hexdigest()[:32]
 
 
+def _pending_operation_name(identity: CheckoutIdentity) -> str:
+    return f".acp-checkout-{identity.checkout_id}.pending"
+
+
+def _require_no_pending_operation(identity: CheckoutIdentity) -> None:
+    directory_fd = _open_checkout_lock(identity.common_dir)
+    try:
+        try:
+            marker = os.stat(
+                _pending_operation_name(identity),
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise CheckoutAdapterError(
+                "checkout_recovery_unknown",
+                "the prior checkout operation state cannot be verified; inspect before retrying",
+            ) from error
+        if (
+            not stat.S_ISREG(marker.st_mode)
+            or marker.st_uid != os.geteuid()
+            or marker.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        ):
+            raise CheckoutAdapterError(
+                "checkout_recovery_unknown",
+                "the prior checkout operation marker is unsafe; inspect before retrying",
+            )
+        raise CheckoutAdapterError(
+            "checkout_recovery_required",
+            "a prior mediated operation has unresolved recovery state; inspect and resolve "
+            "the checkout before removing its marker",
+        )
+    finally:
+        os.close(directory_fd)
+
+
+def _begin_pending_operation(
+    identity: CheckoutIdentity, operation: CheckoutOperation, fencing_token: int
+) -> tuple[int, int]:
+    directory_fd = _open_checkout_lock(identity.common_dir)
+    marker_fd: int | None = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        try:
+            marker_fd = os.open(
+                _pending_operation_name(identity), flags, 0o600, dir_fd=directory_fd
+            )
+        except FileExistsError as error:
+            raise CheckoutAdapterError(
+                "checkout_recovery_required",
+                "a prior mediated operation may have been interrupted; inspect and resolve "
+                "the checkout before retrying",
+            ) from error
+        except OSError as error:
+            raise CheckoutAdapterError(
+                "checkout_recovery_unavailable",
+                "cannot durably record the pending checkout operation; no action was run",
+            ) from error
+
+        payload = json.dumps(
+            {
+                "identity_version": 1,
+                "state": "pending",
+                "resource": identity.resource,
+                "operation": operation,
+                "fencing_token": fencing_token,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(marker_fd, remaining)
+            if written <= 0:
+                raise OSError("short write while recording checkout operation")
+            remaining = remaining[written:]
+        os.fsync(marker_fd)
+        os.fsync(directory_fd)
+        return directory_fd, marker_fd
+    except BaseException:
+        if marker_fd is not None:
+            os.close(marker_fd)
+        os.close(directory_fd)
+        raise
+
+
+def _mark_pending_operation_complete(
+    identity: CheckoutIdentity,
+    operation: CheckoutOperation,
+    fencing_token: int,
+    handles: tuple[int, int],
+) -> None:
+    directory_fd, marker_fd = handles
+    marker_name = _pending_operation_name(identity)
+    try:
+        opened = os.fstat(marker_fd)
+        current = os.stat(marker_name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise CheckoutAdapterError(
+            "checkout_recovery_marker_changed",
+            "the pending checkout marker changed during the operation; inspect before retrying",
+        ) from error
+    if not stat.S_ISREG(current.st_mode) or (opened.st_dev, opened.st_ino) != (
+        current.st_dev,
+        current.st_ino,
+    ):
+        raise CheckoutAdapterError(
+            "checkout_recovery_marker_changed",
+            "the pending checkout marker changed during the operation; inspect before retrying",
+        )
+
+    payload = json.dumps(
+        {
+            "fencing_token": fencing_token,
+            "identity_version": 1,
+            "operation": operation,
+            "resource": identity.resource,
+            "state": "complete",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        os.ftruncate(marker_fd, 0)
+        os.lseek(marker_fd, 0, os.SEEK_SET)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(marker_fd, remaining)
+            if written <= 0:
+                raise OSError("short write while recording completed checkout operation")
+            remaining = remaining[written:]
+        # The pending directory entry was already synchronized before the callback.
+        # Syncing this state before unlink means an ambiguous directory fsync after
+        # unlink cannot turn a completed callback into an ambiguous API failure.
+        os.fsync(marker_fd)
+    except OSError as error:
+        raise CheckoutAdapterError(
+            "checkout_recovery_completion_failed",
+            "the callback completed but its outcome could not be recorded durably; inspect "
+            "the checkout before retrying",
+        ) from error
+
+
+def _clear_pending_operation(identity: CheckoutIdentity, handles: tuple[int, int]) -> None:
+    directory_fd, marker_fd = handles
+    marker_name = _pending_operation_name(identity)
+    try:
+        opened = os.fstat(marker_fd)
+        current = os.stat(marker_name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        # Completion is already durable. If cleanup status is unavailable, do not
+        # turn a known callback result into an ambiguous exception; the next owner
+        # independently checks for any marker and fails closed if one remains.
+        return
+    if not stat.S_ISREG(current.st_mode) or (opened.st_dev, opened.st_ino) != (
+        current.st_dev,
+        current.st_ino,
+    ):
+        raise CheckoutAdapterError(
+            "checkout_recovery_marker_changed",
+            "the pending checkout marker changed during the operation; inspect before retrying",
+        )
+    try:
+        os.unlink(marker_name, dir_fd=directory_fd)
+    except OSError as error:
+        try:
+            current = os.stat(marker_name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            # The completed state was fsynced before cleanup. If the entry is absent,
+            # the callback result is not ambiguous; if status is unavailable, the
+            # next owner's no-follow check still fails closed when a marker remains.
+            return
+        if stat.S_ISREG(current.st_mode) and (opened.st_dev, opened.st_ino) == (
+            current.st_dev,
+            current.st_ino,
+        ):
+            raise CheckoutAdapterError(
+                "checkout_recovery_marker_clear_failed",
+                "the callback completed durably but its recovery marker remains; inspect "
+                "the checkout before retrying",
+            ) from error
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        # The callback completion was fsynced first. After a crash, the marker may
+        # reappear (and safely block) or remain absent (the completed callback is safe).
+        # Do not report an error after a successful callback when its result is known.
+        return
+
+
+def _close_pending_operation(handles: tuple[int, int]) -> None:
+    for descriptor in handles:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 class CheckoutWriteLease:
     """Hold a local OS lock and a durable ACP resource fence around mediated writes.
 
@@ -225,6 +427,7 @@ class CheckoutWriteLease:
                 raise CheckoutAdapterError(
                     "checkout_identity_changed", "checkout identity changed while locking"
                 )
+            _require_no_pending_operation(identity)
             try:
                 token = self.acquire_fence(identity.resource)
             except BaseException as error:
@@ -278,7 +481,6 @@ class CheckoutWriteLease:
                 self._active_thread = None
 
     def _run_locked(self, operation: CheckoutOperation, action: Callable[[], object]) -> object:
-
         identity = self.identity
         token = self.fencing_token
         if self._lock_fd is None or identity is None or token is None or self._closed:
@@ -296,6 +498,7 @@ class CheckoutWriteLease:
                 "checkout_operation_blocked",
                 "a prior mediated operation failed; inspect before further writes",
             )
+        pending_handles: tuple[int, int] | None = None
         try:
             if identify_checkout(self.path).resource != identity.resource:
                 raise CheckoutAdapterError(
@@ -305,8 +508,10 @@ class CheckoutWriteLease:
                 raise CheckoutAdapterError(
                     "checkout_fence_stale", "stale checkout owner cannot mutate this checkout"
                 )
+            _require_no_pending_operation(identity)
             if operation in _DESTRUCTIVE_OPERATIONS:
                 _require_clean_checkout(identity)
+            pending_handles = _begin_pending_operation(identity, operation, token)
             result = action()
             if (
                 operation != "cleanup"
@@ -315,12 +520,21 @@ class CheckoutWriteLease:
                 raise CheckoutAdapterError(
                     "checkout_identity_changed", "checkout identity changed during mutation"
                 )
+            if operation == "cleanup" and not identity.common_dir.exists():
+                _close_pending_operation(pending_handles)
+                pending_handles = None
+            else:
+                _mark_pending_operation_complete(identity, operation, token, pending_handles)
+                _clear_pending_operation(identity, pending_handles)
             return result
         except BaseException:
-            # An interrupted write may have left partial state. Do not retry or continue
-            # mutating under the same lease; a new owner must inspect it first.
+            # The durable marker survives process death; this flag also prevents a
+            # caught failure from being retried through the same adapter instance.
             self._operation_failed = True
             raise
+        finally:
+            if pending_handles is not None:
+                _close_pending_operation(pending_handles)
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
         with self._run_lock:

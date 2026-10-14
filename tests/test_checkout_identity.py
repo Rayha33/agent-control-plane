@@ -12,6 +12,7 @@ from time import sleep
 import pytest
 from fastapi.testclient import TestClient
 
+import agent_control_plane.checkout_identity as checkout_identity_module
 from agent_control_plane.app import create_app
 from agent_control_plane.checkout_identity import (
     CheckoutAdapterError,
@@ -90,6 +91,23 @@ def _hold_checkout_lock(path: str, entered, finish) -> None:
         entered.set()
         if not finish.wait(15):
             raise TimeoutError("test did not release child checkout lock")
+
+
+def _hold_interrupted_checkout_write(path: str, target: str, entered) -> None:
+    with CheckoutWriteLease(
+        path,
+        acquire_fence=_fixed_acquire,
+        validate_fence=_fixed_validate,
+        release_fence=_fixed_release,
+    ) as owner:
+
+        def partial_write() -> None:
+            Path(target).write_text("partial write\n", encoding="utf-8")
+            entered.set()
+            while True:
+                sleep(0.01)
+
+        owner.run("write", partial_write)
 
 
 def test_checkout_identity_is_stable_for_symlink_alias_and_same_filesystem_move(tmp_path):
@@ -487,6 +505,104 @@ def test_checkout_write_lock_is_shared_across_processes(tmp_path):
         process.join(15)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX advisory locks are not available")
+def test_process_crash_during_mediated_write_blocks_next_owner(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    target = repo / "tracked.txt"
+    context = get_context("spawn")
+    entered = context.Event()
+    process = context.Process(
+        target=_hold_interrupted_checkout_write,
+        args=(str(repo), str(target), entered),
+    )
+    process.start()
+    try:
+        assert entered.wait(15), "child did not reach the partial write"
+        process.terminate()
+        process.join(15)
+        assert not process.is_alive()
+        assert process.exitcode != 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(15)
+
+    identity = identify_checkout(repo)
+    marker = identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending"
+    assert marker.is_file()
+    assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "fencing_token": 1,
+        "identity_version": 1,
+        "operation": "write",
+        "resource": identity.resource,
+        "state": "pending",
+    }
+    assert target.read_text(encoding="utf-8") == "partial write\n"
+
+    state, acquire, validate, release = fencing_callbacks()
+    next_owner = lease_for(repo, acquire, validate, release)
+    with pytest.raises(CheckoutAdapterError) as recovery:
+        next_owner.__enter__()
+    assert recovery.value.code == "checkout_recovery_required"
+    assert state["token"] == 0
+
+
+def test_completion_sync_failure_keeps_marker_and_blocks_next_owner(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    marker = identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending"
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def fail_completion_sync(descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 3:
+            raise OSError("simulated completion fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(checkout_identity_module.os, "fsync", fail_completion_sync)
+    state, acquire, validate, release = fencing_callbacks()
+    with lease_for(repo, acquire, validate, release) as owner:
+        with pytest.raises(CheckoutAdapterError) as completion:
+            owner.run("write", lambda: "callback completed")
+
+    assert completion.value.code == "checkout_recovery_completion_failed"
+    assert fsync_calls == 3
+    assert marker.is_file()
+    next_owner = lease_for(repo, acquire, validate, release)
+    with pytest.raises(CheckoutAdapterError) as recovery:
+        next_owner.__enter__()
+    assert recovery.value.code == "checkout_recovery_required"
+    assert state["token"] == 1
+
+
+def test_marker_directory_sync_failure_after_completion_is_not_ambiguous(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    marker = identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending"
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def fail_marker_directory_sync(descriptor):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 4:
+            raise OSError("simulated marker directory fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(checkout_identity_module.os, "fsync", fail_marker_directory_sync)
+    state, acquire, validate, release = fencing_callbacks()
+    with lease_for(repo, acquire, validate, release) as owner:
+        assert owner.run("write", lambda: "callback completed") == "callback completed"
+
+    assert fsync_calls == 4
+    assert not marker.exists()
+    with lease_for(repo, acquire, validate, release) as next_owner:
+        assert next_owner.run("write", lambda: "next operation") == "next operation"
+    assert state["token"] == 2
+
+
 @pytest.mark.parametrize("relative_path", ["new.txt", "ignored.bin"])
 def test_destructive_checkout_operations_refuse_untracked_or_ignored_state(tmp_path, relative_path):
     repo = init_repo(tmp_path / "repo")
@@ -506,7 +622,7 @@ def test_destructive_checkout_operations_refuse_untracked_or_ignored_state(tmp_p
     assert (repo / relative_path).read_text(encoding="utf-8") == "preserve me\n"
 
 
-def test_ambiguous_cleanup_is_not_retried_and_dirty_state_blocks_next_cleanup(tmp_path):
+def test_ambiguous_cleanup_is_not_retried_and_recovery_marker_blocks_next_owner(tmp_path):
     repo = init_repo(tmp_path / "repo")
     state, acquire, validate, release = fencing_callbacks()
     with lease_for(repo, acquire, validate, release) as owner:
@@ -522,10 +638,10 @@ def test_ambiguous_cleanup_is_not_retried_and_dirty_state_blocks_next_cleanup(tm
         assert blocked.value.code == "checkout_operation_blocked"
 
     called = []
-    with lease_for(repo, acquire, validate, release) as next_owner:
-        with pytest.raises(CheckoutAdapterError) as dirty:
-            next_owner.run("cleanup", lambda: called.append("retried"))
+    next_owner = lease_for(repo, acquire, validate, release)
+    with pytest.raises(CheckoutAdapterError) as recovery:
+        next_owner.__enter__()
 
-    assert dirty.value.code == "checkout_dirty"
+    assert recovery.value.code == "checkout_recovery_required"
     assert called == []
     assert not (repo / "tracked.txt").exists()
