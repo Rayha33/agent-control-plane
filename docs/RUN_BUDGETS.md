@@ -304,8 +304,16 @@ was sent, reached a provider, or incurred cost. Each new idempotency key
 permanently consumes a slot even if the process crashes before sending or the
 outcome is ambiguous. While the original claim remains active, replaying the
 same task/idempotency key returns the existing reservation with `created:
-false`; clients must not send on that replay. A deliberate retry requires a
-new key and another available slot. Slots are never released or refunded.
+false`; clients must not send on that replay. If that claim generation has
+reported an interruption, the interruption fence takes precedence: all further
+reservation requests, including replay of an existing key, fail with
+`claim_interrupted` in the current service. Migration 9 also rejects new
+reservation and submission inserts at the database layer, including writes
+from an older service process sharing the migrated database. A pre-migration
+process can still return an already-existing reservation on a read-only
+idempotency replay; that does not create a reservation, and clients must never
+send on a replay. A deliberate retry requires a new key and another available
+slot under a newly fenced claim. Slots are never released or refunded.
 Reservations retain the task and resource fencing-token snapshot that was
 checked at creation. Reservation and client-reported receipt rows survive a
 service restart; task views recompute consumed slots from those persisted rows.
@@ -525,10 +533,16 @@ response receipts for the same task; the view includes those exact receipts and
 their provider-usage provenance. Task detail shows the latest report as
 `interruption_status: interrupted`, `status: partial`, `source: client_reported`,
 and `promotable: false`; recording it does not change task status or create a
-submission. The report is not
-host-authored evidence, a verified worktree/tree snapshot, a provider meter, a
-cancellation mechanism, or a hard stop for later dispatches. Callers must not
-include credentials or raw provider response bodies. The API rejects common
+submission. Once recorded, that claim generation cannot reserve another
+mediated dispatch or submit; resumption requires the normal expiry/recovery
+path and a newly fenced claim. This is a cooperative API boundary, not a
+provider cancellation mechanism: already-running calls, unmediated client
+calls, and read-only replay of an already-existing reservation by a
+pre-migration service process are unaffected. Migration 9 installs database
+guards against fresh reservation and submission inserts for the reported
+claim. The report is not host-authored evidence, a verified worktree/tree
+snapshot, or a provider meter. Callers must not include credentials or raw
+provider response bodies. The API rejects common
 sensitive field names and credential-like values in the summary/checkpoint and
 rejects nesting deeper than 32 levels. Validation responses for this endpoint
 omit submitted values. These are guardrails, not comprehensive secret scanning
