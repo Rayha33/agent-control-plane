@@ -82,24 +82,14 @@ def _fixed_release(_resource: str, _token: int) -> None:
 
 
 def _hold_checkout_lock(path: str, entered, finish) -> None:
-    with CheckoutWriteLease(
-        path,
-        acquire_fence=_fixed_acquire,
-        validate_fence=_fixed_validate,
-        release_fence=_fixed_release,
-    ):
+    with CheckoutWriteLease.local(path):
         entered.set()
         if not finish.wait(15):
             raise TimeoutError("test did not release child checkout lock")
 
 
 def _hold_interrupted_checkout_write(path: str, target: str, entered) -> None:
-    with CheckoutWriteLease(
-        path,
-        acquire_fence=_fixed_acquire,
-        validate_fence=_fixed_validate,
-        release_fence=_fixed_release,
-    ) as owner:
+    with CheckoutWriteLease.local(path) as owner:
 
         def partial_write() -> None:
             Path(target).write_text("partial write\n", encoding="utf-8")
@@ -183,6 +173,88 @@ def test_checkout_resource_cli_is_read_only_and_does_not_expose_paths(tmp_path, 
     assert view["resource"].startswith("checkout:v1:")
     assert str(repo) not in json.dumps(view)
     assert not (repo / ".acp").exists()
+
+
+def test_local_checkout_lease_performs_mediated_write_and_advances_fence(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    alias = tmp_path / "repo-alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    identity = identify_checkout(repo)
+    fence_state = identity.git_dir / f".acp-checkout-{identity.checkout_id}.fence-v1"
+    target = repo / "tracked.txt"
+
+    with CheckoutWriteLease.local(alias) as first_owner:
+        first_token = first_owner.fencing_token
+        assert first_token == 1
+        first_owner.run("write", lambda: target.write_text("mediated through local adapter\n"))
+
+    first_record = json.loads(fence_state.read_text(encoding="utf-8"))
+    assert first_record == {
+        "fencing_token": first_token,
+        "identity_version": 1,
+        "resource": identity.resource,
+    }
+    assert stat.S_IMODE(fence_state.stat().st_mode) == 0o600
+
+    with CheckoutWriteLease.local(repo) as next_owner:
+        assert next_owner.fencing_token == first_token + 1
+        next_owner.run("write", lambda: target.write_text("second owner\n"))
+
+    assert target.read_text(encoding="utf-8") == "second owner\n"
+
+
+def test_local_checkout_lease_refuses_corrupt_fence_state_before_action(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    fence_state = identity.git_dir / f".acp-checkout-{identity.checkout_id}.fence-v1"
+    fence_state.write_text("not valid fencing state\n", encoding="utf-8")
+    fence_state.chmod(0o600)
+
+    owner = CheckoutWriteLease.local(repo)
+    with pytest.raises(CheckoutAdapterError) as state_error:
+        owner.__enter__()
+
+    assert state_error.value.code == "checkout_fence_state_unknown"
+    assert owner._lock_fd is None
+
+
+@pytest.mark.parametrize("boolean_field", ["identity_version", "fencing_token"])
+def test_local_checkout_lease_rejects_boolean_integer_fields(tmp_path, boolean_field):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    fence_state = identity.git_dir / f".acp-checkout-{identity.checkout_id}.fence-v1"
+    record = {
+        "identity_version": 1,
+        "resource": identity.resource,
+        "fencing_token": 1,
+    }
+    record[boolean_field] = True
+    fence_state.write_text(json.dumps(record), encoding="utf-8")
+    fence_state.chmod(0o600)
+
+    with pytest.raises(CheckoutAdapterError) as state_error:
+        CheckoutWriteLease.local(repo).__enter__()
+
+    assert state_error.value.code == "checkout_fence_state_unknown"
+
+
+def test_local_checkout_lease_requires_fence_state_sync_before_authority(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    fence_state = identity.git_dir / f".acp-checkout-{identity.checkout_id}.fence-v1"
+    owner = CheckoutWriteLease.local(repo)
+
+    def fail_sync(_descriptor):
+        raise OSError("simulated local fence sync failure")
+
+    monkeypatch.setattr(checkout_identity_module.os, "fsync", fail_sync)
+
+    with pytest.raises(CheckoutAdapterError) as state_error:
+        owner.__enter__()
+
+    assert state_error.value.code == "checkout_fence_state_unavailable"
+    assert owner._lock_fd is None
+    assert not fence_state.exists()
 
 
 def test_non_git_directory_fails_closed(tmp_path):
@@ -490,14 +562,14 @@ def test_checkout_write_lock_is_shared_across_processes(tmp_path):
     process.start()
     try:
         assert entered.wait(15), "child did not acquire the checkout lock"
-        second = lease_for(repo, _fixed_acquire, _fixed_validate, _fixed_release)
+        second = CheckoutWriteLease.local(repo)
         with pytest.raises(CheckoutAdapterError) as busy:
             second.__enter__()
         assert busy.value.code == "checkout_busy"
         finish.set()
         process.join(15)
         assert process.exitcode == 0
-        with lease_for(repo, _fixed_acquire, _fixed_validate, _fixed_release):
+        with CheckoutWriteLease.local(repo):
             pass
     finally:
         if process.is_alive():
@@ -539,12 +611,12 @@ def test_process_crash_during_mediated_write_blocks_next_owner(tmp_path):
     }
     assert target.read_text(encoding="utf-8") == "partial write\n"
 
-    state, acquire, validate, release = fencing_callbacks()
-    next_owner = lease_for(repo, acquire, validate, release)
+    next_owner = CheckoutWriteLease.local(repo)
     with pytest.raises(CheckoutAdapterError) as recovery:
         next_owner.__enter__()
     assert recovery.value.code == "checkout_recovery_required"
-    assert state["token"] == 0
+    fence_state = identity.git_dir / f".acp-checkout-{identity.checkout_id}.fence-v1"
+    assert json.loads(fence_state.read_text(encoding="utf-8"))["fencing_token"] == 1
 
 
 def test_completion_sync_failure_keeps_marker_and_blocks_next_owner(tmp_path, monkeypatch):

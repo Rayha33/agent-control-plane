@@ -24,7 +24,24 @@ filesystem; its lock and inode semantics must be independently qualified first.
 
 ## Opt-in coordination contract
 
-For a task intended to write through this adapter:
+For a same-host integration that does not have a shared coordinator, use the built-in
+local backend:
+
+```python
+from agent_control_plane.checkout_identity import CheckoutWriteLease
+
+with CheckoutWriteLease.local(checkout_path) as lease:
+    lease.run("write", lambda: typed_editor_write(...))
+```
+
+It combines the per-worktree Git-directory lock with a monotonically increasing,
+0600 fencing-token record in that worktree's Git metadata. It is usable across
+cooperating processes on the same local filesystem, including after a process restart.
+It does not coordinate separate clones, other hosts, or independent copies of the
+repository. Those require callbacks backed by the same authoritative coordinator; a
+local token must never be described as a distributed lease.
+
+For a multi-host or centrally coordinated integration:
 
 1. Compute the checkout resource key and include it in the Coordination API task's
    `resources` list along with any other resources.
@@ -52,6 +69,11 @@ response is likewise treated as an unknown remote lease.
 operation labels: `write`, `attach`, `switch`, `sync`, or `cleanup`. It does not parse
 or constrain shell commands inside a callback; integrations should call a narrow,
 typed operation, not pass arbitrary model-generated shell text.
+
+The adapter is opt-in: callers must route each write through `run`. The current
+Claude Code hooks still perform their existing path guard, but do not hold this lease
+around the editor's subsequent write. They therefore do not yet gain this checkout
+fence merely by being installed.
 
 `attach`, `switch`, `sync`, and `cleanup` are replacement/destructive categories. They
 run only when Git reports no tracked changes, untracked files, or ignored files. If Git

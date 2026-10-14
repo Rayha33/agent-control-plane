@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -371,16 +372,176 @@ def _close_pending_operation(handles: tuple[int, int]) -> None:
             pass
 
 
+class _LocalCheckoutFenceProvider:
+    """Durable, same-host fencing tokens for the cooperative local adapter.
+
+    The token counter lives in the worktree's Git metadata directory. It is only
+    authoritative when used after ``CheckoutWriteLease`` has acquired its local
+    ``flock``. It deliberately does not pretend to coordinate separate clones,
+    hosts, or copies of a repository; use callbacks backed by a shared coordinator
+    for that boundary.
+    """
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        self.path = path
+
+    def acquire(self, resource: str) -> int:
+        identity = self._identity_for(resource)
+        directory_fd = _open_checkout_lock(identity.git_dir)
+        try:
+            current = self._read_token(identity, directory_fd)
+            token = current + 1
+            target = _fence_state_name(identity)
+            temporary = f"{target}.{uuid.uuid4().hex}.tmp"
+            payload = json.dumps(
+                {"identity_version": 1, "resource": resource, "fencing_token": token},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            temporary_fd: int | None = None
+            try:
+                temporary_fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+                _write_all(temporary_fd, payload)
+                os.fsync(temporary_fd)
+                os.close(temporary_fd)
+                temporary_fd = None
+                os.replace(
+                    temporary,
+                    target,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                os.fsync(directory_fd)
+            except OSError as error:
+                if temporary_fd is not None:
+                    try:
+                        os.close(temporary_fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(temporary, dir_fd=directory_fd)
+                except OSError:
+                    pass
+                raise CheckoutAdapterError(
+                    "checkout_fence_state_unavailable",
+                    "cannot durably advance the local checkout fencing token",
+                ) from error
+            return token
+        finally:
+            os.close(directory_fd)
+
+    def validate(self, resource: str, fencing_token: int) -> bool:
+        try:
+            identity = self._identity_for(resource)
+        except CheckoutAdapterError:
+            return False
+        directory_fd = _open_checkout_lock(identity.git_dir)
+        try:
+            return self._read_token(identity, directory_fd) == fencing_token
+        finally:
+            os.close(directory_fd)
+
+    def release(self, resource: str, fencing_token: int) -> None:
+        # The open Git-directory descriptor is the local lease. Closing that
+        # descriptor releases it in CheckoutWriteLease.__exit__; a persistent
+        # active bit would strand a checkout after process termination. The
+        # monotonic token remains for stale-owner validation on each operation.
+        del resource, fencing_token
+
+    def _identity_for(self, resource: str) -> CheckoutIdentity:
+        identity = identify_checkout(self.path)
+        if identity.resource != resource:
+            raise CheckoutAdapterError(
+                "checkout_fence_identity_mismatch",
+                "local fence provider was used for a different checkout resource",
+            )
+        return identity
+
+    @staticmethod
+    def _read_token(identity: CheckoutIdentity, directory_fd: int) -> int:
+        name = _fence_state_name(identity)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return 0
+        except OSError as error:
+            raise CheckoutAdapterError(
+                "checkout_fence_state_unknown", "local checkout fencing state is unreadable"
+            ) from error
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+                or metadata.st_size > 512
+            ):
+                raise CheckoutAdapterError(
+                    "checkout_fence_state_unsafe", "local checkout fencing state is unsafe"
+                )
+            chunks: list[bytes] = []
+            remaining = 513
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+        except OSError as error:
+            raise CheckoutAdapterError(
+                "checkout_fence_state_unknown", "local checkout fencing state is unreadable"
+            ) from error
+        finally:
+            os.close(descriptor)
+        try:
+            record = json.loads(raw.decode("utf-8", errors="strict"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise CheckoutAdapterError(
+                "checkout_fence_state_unknown", "local checkout fencing state is malformed"
+            ) from error
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"identity_version", "resource", "fencing_token"}
+            or type(record["identity_version"]) is not int
+            or record["identity_version"] != 1
+            or record["resource"] != identity.resource
+            or type(record["fencing_token"]) is not int
+            or record["fencing_token"] < 1
+        ):
+            raise CheckoutAdapterError(
+                "checkout_fence_state_unknown", "local checkout fencing state is inconsistent"
+            )
+        return record["fencing_token"]
+
+
+def _fence_state_name(identity: CheckoutIdentity) -> str:
+    return f".acp-checkout-{identity.checkout_id}.fence-v1"
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("short write while recording local checkout fencing token")
+        remaining = remaining[written:]
+
+
 class CheckoutWriteLease:
-    """Hold a local OS lock and a durable ACP resource fence around mediated writes.
+    """Hold a local OS lock and fencing token around mediated writes.
 
     ``acquire_fence`` must obtain the durable checkout resource lease after the local
     lock is held and return its positive fencing token. ``validate_fence`` must check
     that exact resource/token against the authoritative coordination store before each
-    operation. The OS lock is held for this context, so another adapter cannot take
-    over locally until it is released. This ordering is important: callers must not
-    obtain a durable checkout lease outside this adapter and then treat it as write
-    authority.
+    operation. ``local()`` supplies a same-host token provider instead; it does not
+    coordinate other hosts or clones. The OS lock is held for this context, so another
+    adapter cannot take over locally until it is released. This ordering is important:
+    callers must not obtain a durable checkout lease outside this adapter and then
+    treat it as write authority.
     """
 
     def __init__(
@@ -402,6 +563,22 @@ class CheckoutWriteLease:
         self._active_thread: int | None = None
         self._operation_failed = False
         self._closed = False
+
+    @classmethod
+    def local(cls, path: str | os.PathLike[str]) -> CheckoutWriteLease:
+        """Build a usable same-host lease with durable local fencing tokens.
+
+        For multi-host coordination, construct this class with callbacks backed by
+        the deployment's authoritative shared lease service instead.
+        """
+
+        provider = _LocalCheckoutFenceProvider(path)
+        return cls(
+            path,
+            acquire_fence=provider.acquire,
+            validate_fence=provider.validate,
+            release_fence=provider.release,
+        )
 
     def __enter__(self) -> CheckoutWriteLease:
         with self._run_lock:
