@@ -89,6 +89,15 @@ limit instead returns HTTP `400`. Claude Code workspace limits are separate and
 can return `429` with `retry-after`, so inspect the response before treating an
 Anthropic `429` as transient rate limiting. [Anthropic rate-limit and spend-limit behavior](https://platform.claude.com/docs/en/api/rate-limits)
 
+OpenAI also uses HTTP `429` for both temporary request-rate errors and blocking
+credit, spend, or usage-limit errors. Treat request-rate `429`s, including
+`slow_down`, as pacing signals: reduce rate, honor `Retry-After` when present,
+and bound retries. Inspect `error.code`: `credit_balance_exhausted`,
+`organization_spend_limit_exceeded`, `project_spend_limit_exceeded`, and
+`organization_usage_limit_exceeded` require a billing or limit action; retrying
+quota or billing errors will not restore access. The broader `error.type` may
+still be `insufficient_quota`. [API error codes](https://developers.openai.com/api/docs/guides/error-codes) · [Retry guidance](https://developers.openai.com/api/docs/guides/rate-limits)
+
 ### Per-request token controls
 
 Token APIs make useful preflight and reconciliation evidence available, but they
