@@ -81,6 +81,14 @@ guarantee that any particular account has the feature enabled.
 | Anthropic Claude API | Usage reports can be filtered by workspace, model, and API key; cost reports can be filtered by workspace, model, and month. Prepaid organizations stop accepting new API calls after credits are depleted. | The documented cost report does not provide per-user attribution. A timed-out/disconnected request that was on track to succeed can still be charged. Invoiced accounts are billed monthly rather than stopped by a prepaid-credit balance. [Usage and cost reports](https://support.claude.com/en/articles/9534590-cost-and-usage-reporting-in-the-claude-console) · [API billing and credits](https://support.claude.com/en/articles/8977456-how-do-i-pay-for-my-claude-api-usage) |
 | Google Gemini API | AI Studio offers monthly project spend caps, but not for Invoiced/Offline accounts. Cloud Billing spend caps are monthly and scoped to one project plus one eligible service for first-party billing accounts. | AI Studio project caps are experimental and may lag by about ten minutes; long-running agent sessions may exceed them. Cloud spend caps use estimated gross costs and enforce faster than billing reports, but enforcement is not instantaneous and overage remains possible. Actual Cloud Billing cost details are typically available within a day and can take more than 24 hours, so they are reconciliation evidence, not an in-flight gate. Gemini Prepay's monthly auto-charge limit caps automatic reloads only; manually initiated credit purchases do not count toward it. [Gemini API billing](https://ai.google.dev/gemini-api/docs/billing) · [Cloud Billing spend caps](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) |
 
+Anthropic API spend-limit responses are not uniform: an organization tier spend
+cap pauses API usage until the next monthly reset or a tier increase. On the
+Messages API, its `429` has no `retry-after` and carries
+`error.details.error_code: "enforced_spend_limit_reached"`; a user-set API spend
+limit instead returns HTTP `400`. Claude Code workspace limits are separate and
+can return `429` with `retry-after`, so inspect the response before treating an
+Anthropic `429` as transient rate limiting. [Anthropic rate-limit and spend-limit behavior](https://platform.claude.com/docs/en/api/rate-limits)
+
 ### Per-request token controls
 
 Token APIs make useful preflight and reconciliation evidence available, but they
