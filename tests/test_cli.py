@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import pytest
 from support import requires_linux_worker
 
 from agent_control_plane import cli
+from agent_control_plane.checkout_identity import CheckoutWriteLease, identify_checkout
 from agent_control_plane.trust_bundles import install_bundle
 
 
@@ -178,6 +180,189 @@ def test_cli_submit_and_run_accept_a_result_manifest_path() -> None:
     )
     assert run.result_manifest == "reports/result-manifest.json"
     assert run.command == ["python", "worker.py"]
+
+
+def test_checkout_exec_clears_pending_marker_after_successful_agent_command(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    created = repo / "agent-write.txt"
+    child_code = (
+        "from pathlib import Path; "
+        "Path('agent-write.txt').write_text('written under fence', encoding='utf-8'); "
+    )
+
+    result = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "checkout-exec",
+            "--",
+            sys.executable,
+            "-c",
+            child_code,
+        ]
+    )
+
+    assert result == 0
+    assert created.read_text(encoding="utf-8") == "written under fence"
+    assert not list(identify_checkout(repo).common_dir.glob(".acp-checkout-*.pending"))
+
+
+@pytest.mark.parametrize(
+    ("child_code", "expected_status"),
+    [
+        (
+            "from pathlib import Path; "
+            "Path('partial-write.txt').write_text('partial', encoding='utf-8'); "
+            "raise SystemExit(23)",
+            23,
+        ),
+        pytest.param(
+            "import os, signal; "
+            "from pathlib import Path; "
+            "Path('partial-write.txt').write_text('partial', encoding='utf-8'); "
+            "os.kill(os.getpid(), signal.SIGTERM)",
+            143,
+            marks=pytest.mark.skipif(os.name != "posix", reason="POSIX signals are required"),
+            id="signal-terminated",
+        ),
+    ],
+    ids=["nonzero-exit", None],
+)
+def test_checkout_exec_preserves_recovery_marker_after_failed_agent_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], child_code: str, expected_status: int
+) -> None:
+    repo = _repo(tmp_path)
+    identity = identify_checkout(repo)
+    partial_write = repo / "partial-write.txt"
+
+    result = cli.main(
+        ["--repo", str(repo), "checkout-exec", "--", sys.executable, "-c", child_code]
+    )
+
+    assert result == expected_status
+    assert partial_write.read_text(encoding="utf-8") == "partial"
+    pending = list(identity.common_dir.glob(".acp-checkout-*.pending"))
+    assert len(pending) == 1
+    assert json.loads(pending[0].read_text(encoding="utf-8"))["state"] == "pending"
+    assert "left recovery-required" in capsys.readouterr().err
+
+    should_not_run = repo / "must-not-run.txt"
+    next_result = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "checkout-exec",
+            "--",
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(should_not_run)!r}).touch()",
+        ]
+    )
+
+    assert next_result == 1
+    assert not should_not_run.exists()
+    assert json.loads(capsys.readouterr().err)["error"] == "checkout_recovery_required"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inherited lock descriptors are required")
+def test_checkout_exec_child_keeps_lock_if_wrapper_is_killed(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    child_ready = repo / "agent-child-ready"
+    stop_child = repo / "stop-agent-child"
+    child_code = (
+        "from pathlib import Path\n"
+        "import time\n"
+        "Path('agent-child-ready').touch()\n"
+        "while not Path('stop-agent-child').exists():\n"
+        "    time.sleep(0.01)\n"
+    )
+    wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "agent_control_plane.cli",
+            "--repo",
+            str(repo),
+            "checkout-exec",
+            "--",
+            sys.executable,
+            "-c",
+            child_code,
+        ],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not child_ready.exists() and wrapper.poll() is None:
+            if time.monotonic() >= deadline:
+                pytest.fail("checkout-exec child did not start")
+            time.sleep(0.01)
+        assert child_ready.is_file()
+
+        wrapper.kill()
+        assert wrapper.wait(timeout=5) is not None
+
+        while_child_running = run_cli(
+            repo, "checkout-exec", "--", sys.executable, "-c", "raise SystemExit(0)"
+        )
+        assert while_child_running.returncode == 1
+        assert json.loads(while_child_running.stderr)["error"] == "checkout_busy"
+
+        stop_child.touch()
+        deadline = time.monotonic() + 5
+        while True:
+            after_child_exit = run_cli(
+                repo, "checkout-exec", "--", sys.executable, "-c", "raise SystemExit(0)"
+            )
+            if json.loads(after_child_exit.stderr).get("error") != "checkout_busy":
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail("checkout-exec child did not release its inherited lock")
+            time.sleep(0.01)
+
+        assert after_child_exit.returncode == 1
+        assert json.loads(after_child_exit.stderr)["error"] == "checkout_recovery_required"
+    finally:
+        if wrapper.poll() is None:
+            wrapper.kill()
+            wrapper.wait(timeout=5)
+        stop_child.touch()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            cleanup_probe = run_cli(
+                repo, "checkout-exec", "--", sys.executable, "-c", "raise SystemExit(0)"
+            )
+            if json.loads(cleanup_probe.stderr).get("error") != "checkout_busy":
+                break
+            time.sleep(0.01)
+
+
+def test_checkout_exec_fails_closed_when_another_mediated_writer_holds_lock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = _repo(tmp_path)
+    created = repo / "should-not-exist.txt"
+
+    with CheckoutWriteLease.local(repo):
+        result = cli.main(
+            [
+                "--repo",
+                str(repo),
+                "checkout-exec",
+                "--",
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(created)!r}).touch()",
+            ]
+        )
+
+    assert result == 1
+    assert not created.exists()
+    assert json.loads(capsys.readouterr().err)["error"] == "checkout_busy"
 
 
 def test_cli_prints_operator_reviewable_rootfs_manifest_without_opening_repo(

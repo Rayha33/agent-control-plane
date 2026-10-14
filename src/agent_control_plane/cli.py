@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .checkout_identity import CheckoutAdapterError, identify_checkout
+from .checkout_identity import CheckoutAdapterError, CheckoutWriteLease, identify_checkout
 from .editor_hooks import DENY_EXIT_CODE, install_claude_code_hooks, path_from_hook_payload
 from .git_supervisor import GitSupervisor, SupervisorError
 from .runtime_drivers import DriverError, resolve_trusted_executable
@@ -49,6 +49,12 @@ able to open one in order to say so.
 
 
 DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+class _CheckoutCommandFailed(RuntimeError):
+    def __init__(self, returncode: int, detail: str) -> None:
+        super().__init__(detail)
+        self.returncode = returncode
 
 
 def parse_duration(text: str) -> int:
@@ -126,6 +132,15 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "checkout-resource",
         help="print an opaque local resource key for mediated checkout ownership",
+    )
+    checkout_exec = commands.add_parser(
+        "checkout-exec",
+        help="run one agent session under a cooperative same-host checkout write fence",
+    )
+    checkout_exec.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command and arguments to run after --",
     )
     rootfs_manifest = commands.add_parser(
         "oci-rootfs-manifest",
@@ -900,6 +915,52 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action == "checkout-resource":
             emit(identify_checkout(args.repo).public_view())
             return 0
+        if args.action == "checkout-exec":
+            command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            if not command:
+                raise SupervisorError(
+                    "missing_command", "pass an agent command after `checkout-exec --`"
+                )
+            identity = identify_checkout(args.repo)
+            with CheckoutWriteLease.local(identity.root) as lease:
+
+                def run_agent() -> int:
+                    try:
+                        if lease._lock_fd is None:
+                            raise SupervisorError(
+                                "checkout_lock_missing",
+                                "checkout-exec lost its local checkout lock",
+                            )
+                        child_returncode = subprocess.run(
+                            command,
+                            cwd=identity.root,
+                            check=False,
+                            pass_fds=(lease._lock_fd,),
+                        ).returncode
+                    except OSError as error:
+                        raise _CheckoutCommandFailed(
+                            127,
+                            f"acp checkout-exec could not start or supervise the child: {error}",
+                        ) from error
+                    if child_returncode != 0:
+                        raise _CheckoutCommandFailed(
+                            child_returncode,
+                            f"acp checkout-exec child exited with status {child_returncode}",
+                        )
+                    return child_returncode
+
+                try:
+                    return_code = lease.run("write", run_agent)
+                except _CheckoutCommandFailed as error:
+                    print(error, file=sys.stderr)
+                    print(
+                        "the checkout was left recovery-required; inspect its contents "
+                        "before another wrapped session",
+                        file=sys.stderr,
+                    )
+                    return 128 + abs(error.returncode) if error.returncode < 0 else error.returncode
+            # Preserve the usual shell convention when the child dies from a signal.
+            return 128 + abs(return_code) if return_code < 0 else return_code
         supervisor = GitSupervisor(
             args.repo,
             diagnostic=args.action == "doctor",

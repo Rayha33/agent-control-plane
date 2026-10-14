@@ -41,6 +41,31 @@ It does not coordinate separate clones, other hosts, or independent copies of th
 repository. Those require callbacks backed by the same authoritative coordinator; a
 local token must never be described as a distributed lease.
 
+To serialize whole same-host agent sessions without writing a custom launcher, use the
+CLI wrapper:
+
+```bash
+acp --repo /path/to/checkout checkout-exec -- claude
+```
+
+The advisory lock is held while the foreground child runs. A zero exit clears the
+recovery marker; a nonzero exit returns that status and leaves the marker pending. The
+foreground child inherits the checkout-lock file descriptor. If the wrapper is
+interrupted or killed, its descriptor closes but the child retains the lock while it is
+alive, so cooperating invocations fail with `checkout_busy`. The durable pending marker
+also remains; after the child exits, cooperating invocations fail with
+`checkout_recovery_required` until the worktree is inspected and the exact marker is
+resolved as described below. Forced termination of the wrapper does not guarantee that
+its descendants stopped: confirm the agent process tree has stopped and the worktree is
+safe before resolving the marker. Use separate ACP attempt worktrees when agents should
+run in parallel.
+
+This wraps one foreground agent process, not each native editor write, and is not an OS
+sandbox. The agent command must not daemonize or leave background writers behind after
+the foreground process exits. Commands that bypass the wrapper, write outside the
+selected checkout, close the inherited lock descriptor, or leave writers that do not
+inherit it running are outside this lock's guarantee.
+
 For a multi-host or centrally coordinated integration:
 
 1. Compute the checkout resource key and include it in the Coordination API task's
