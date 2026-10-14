@@ -12,7 +12,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .checkout_identity import CheckoutAdapterError, CheckoutWriteLease, identify_checkout
+from .checkout_identity import (
+    CheckoutAdapterError,
+    CheckoutWriteLease,
+    _has_active_checkout_write_lease,
+    identify_checkout,
+)
 from .editor_hooks import DENY_EXIT_CODE, install_claude_code_hooks, path_from_hook_payload
 from .git_supervisor import GitSupervisor, SupervisorError
 from .runtime_drivers import DriverError, resolve_trusted_executable
@@ -166,6 +171,11 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the attempt's worktree and declared write set (SessionStart hook)",
     )
+    guard.add_argument(
+        "--require-checkout-exec",
+        action="store_true",
+        help="deny editor writes unless this process presents checkout-exec's active session token",
+    )
 
     hooks = commands.add_parser("hooks", help="install editor adapters that call the kernel")
     hooks_commands = hooks.add_subparsers(dest="hooks_action", required=True)
@@ -175,6 +185,11 @@ def parser() -> argparse.ArgumentParser:
     )
     hooks_install.add_argument(
         "--command", default="acp", help="how the hook should invoke acp (default: acp)"
+    )
+    hooks_install.add_argument(
+        "--require-checkout-exec",
+        action="store_true",
+        help="make structured editor writes require an active checkout-exec session fence",
     )
 
     gc = commands.add_parser(
@@ -898,7 +913,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return serve(args.repo)
         if args.action == "hooks":
-            emit(install_claude_code_hooks(Path(args.repo).resolve(), args.command))
+            emit(
+                install_claude_code_hooks(
+                    Path(args.repo).resolve(),
+                    args.command,
+                    require_checkout_exec=args.require_checkout_exec,
+                )
+            )
             return 0
         if args.action == "trust":
             if args.trust_action == "list":
@@ -923,6 +944,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             identity = identify_checkout(args.repo)
             with CheckoutWriteLease.local(identity.root) as lease:
+                if type(lease.fencing_token) is not int:
+                    raise CheckoutAdapterError(
+                        "checkout_fence_invalid", "checkout-exec has no active fencing token"
+                    )
+                child_environment = os.environ.copy()
+                child_environment["ACP_CHECKOUT_FENCE_RESOURCE"] = identity.resource
+                child_environment["ACP_CHECKOUT_FENCE_TOKEN"] = str(lease.fencing_token)
 
                 def run_agent() -> int:
                     try:
@@ -934,6 +962,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         child_returncode = subprocess.run(
                             command,
                             cwd=identity.root,
+                            env=child_environment,
                             check=False,
                             pass_fds=(lease._lock_fd,),
                         ).returncode
@@ -999,6 +1028,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target, hook_cwd = hook_request
             if not target:
                 raise SupervisorError("missing_path", "pass --path or use --hook")
+            if args.require_checkout_exec:
+                resource = os.environ.get("ACP_CHECKOUT_FENCE_RESOURCE", "")
+                token_text = os.environ.get("ACP_CHECKOUT_FENCE_TOKEN", "")
+                token = (
+                    int(token_text)
+                    if token_text.isascii() and token_text.isdigit() and len(token_text) <= 20
+                    else 0
+                )
+                if not _has_active_checkout_write_lease(hook_cwd or args.repo, resource, token):
+                    return _deny(
+                        {
+                            "ok": True,
+                            "allow": False,
+                            "reason": "checkout_fence_required",
+                            "detail": (
+                                "this editor write is not running inside the active ACP "
+                                "checkout-exec fence; launch the session with "
+                                "`acp --repo <checkout> checkout-exec -- claude`"
+                            ),
+                        }
+                    )
             decision = supervisor.guard(attempt_id, target, cwd=hook_cwd)
             if not decision["allow"]:
                 return _deny(decision)

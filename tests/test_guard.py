@@ -18,10 +18,12 @@ from pathlib import Path
 import pytest
 from support import init_repo, make_task
 
+from agent_control_plane.checkout_identity import CheckoutWriteLease, identify_checkout
 from agent_control_plane.cli import main
 from agent_control_plane.editor_hooks import (
     DENY_EXIT_CODE,
     GUARDED_TOOLS,
+    claude_code_hooks,
     install_claude_code_hooks,
     path_from_hook_payload,
 )
@@ -456,6 +458,84 @@ def test_install_creates_settings_when_absent(tmp_path: Path) -> None:
     result = install_claude_code_hooks(tmp_path)
     written = json.loads(Path(result["settings"]).read_text(encoding="utf-8"))
     assert written["hooks"]["PreToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
+
+
+def test_install_can_require_the_session_checkout_fence(tmp_path: Path) -> None:
+    result = install_claude_code_hooks(tmp_path, require_checkout_exec=True)
+    written = json.loads(Path(result["settings"]).read_text(encoding="utf-8"))
+    command = written["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+    assert command == "acp guard --hook --require-checkout-exec || exit 2"
+    assert result["checkout_fence"] == "required"
+
+
+@pytest.mark.parametrize("executable", ["missing", "non_executable"])
+def test_pre_tool_hook_maps_launch_failures_to_blocking_exit(
+    tmp_path: Path, executable: str
+) -> None:
+    """Claude continues on generic hook errors, so launch failures must become exit 2."""
+
+    command_path = tmp_path / "acp"
+    if executable == "non_executable":
+        command_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        command_path.chmod(0o600)
+    else:
+        command_path = tmp_path / "missing-acp"
+
+    hook_command = claude_code_hooks(str(command_path))["PreToolUse"][0]["hooks"][0]["command"]
+    result = subprocess.run(["/bin/sh", "-c", hook_command], check=False)
+
+    assert result.returncode == DENY_EXIT_CODE
+
+
+def test_hook_mode_can_require_an_active_checkout_exec_fence(
+    repo: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("ACP_CHECKOUT_FENCE_RESOURCE", raising=False)
+    monkeypatch.delenv("ACP_CHECKOUT_FENCE_TOKEN", raising=False)
+    monkeypatch.setattr(
+        GitSupervisor,
+        "guard",
+        lambda _self, _attempt, _target, cwd=None: {"allow": True, "path": _target},
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(repo / "target.txt")},
+        "cwd": str(repo),
+    }
+
+    def invoke_guard() -> int:
+        import io
+        import sys
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        return main(
+            [
+                "--repo",
+                str(repo),
+                "guard",
+                "--attempt",
+                "test-attempt",
+                "--hook",
+                "--require-checkout-exec",
+            ]
+        )
+
+    assert invoke_guard() == DENY_EXIT_CODE
+    denied = json.loads(capsys.readouterr().out)
+    assert denied["reason"] == "checkout_fence_required"
+
+    identity = identify_checkout(repo)
+    with CheckoutWriteLease.local(repo) as lease:
+        assert lease.fencing_token is not None
+        monkeypatch.setenv("ACP_CHECKOUT_FENCE_RESOURCE", identity.resource)
+        monkeypatch.setenv("ACP_CHECKOUT_FENCE_TOKEN", str(lease.fencing_token))
+        allowed = {}
+        lease.run("write", lambda: allowed.setdefault("code", invoke_guard()))
+
+    assert allowed["code"] == 0
+    assert json.loads(capsys.readouterr().out)["allow"] is True
 
 
 def test_hook_mode_fails_closed_when_the_supervisor_cannot_open(tmp_path, monkeypatch) -> None:

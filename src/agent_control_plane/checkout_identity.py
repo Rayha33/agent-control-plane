@@ -241,6 +241,127 @@ def _pending_operation_name(identity: CheckoutIdentity) -> str:
     return f".acp-checkout-{identity.checkout_id}.pending"
 
 
+def _has_active_checkout_write_lease(
+    path: str | os.PathLike[str], resource: str, fencing_token: int
+) -> bool:
+    """Verify a matching pending marker and its active advisory lock.
+
+    This is a cooperative integration check, not an authentication boundary: it does
+    not prove the caller is a descendant of ``checkout-exec``. A same-user process
+    that can read the pending marker can copy its token while a wrapper-owned operation
+    marker is actively locked. The operation marker itself carries the advisory lock, so an unrelated
+    checkout lock cannot validate an abandoned marker. After observing marker-lock
+    contention, its path inode and contents are checked again to catch replacement or
+    completion during the check.
+    """
+
+    if fcntl is None or not isinstance(resource, str) or type(fencing_token) is not int:
+        return False
+    if fencing_token < 1:
+        return False
+
+    try:
+        identity = identify_checkout(path)
+        if identity.resource != resource:
+            return False
+
+        common_fd = _open_checkout_lock(identity.common_dir)
+        marker_fd: int | None = None
+        try:
+            marker_fd = os.open(
+                _pending_operation_name(identity),
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=common_fd,
+            )
+
+            def read_marker(fd: int) -> str | None:
+                marker_stat = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(marker_stat.st_mode)
+                    or marker_stat.st_uid != os.geteuid()
+                    or marker_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+                    or marker_stat.st_size > 4096
+                ):
+                    return None
+                os.lseek(fd, 0, os.SEEK_SET)
+                chunks: list[bytes] = []
+                size = 0
+                while size <= 4096:
+                    chunk = os.read(fd, 4097 - size)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                if size > 4096:
+                    return None
+                return b"".join(chunks).decode("utf-8")
+
+            def parse_marker(marker_text: str) -> dict[str, object]:
+                def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                    result: dict[str, object] = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError("duplicate marker key")
+                        result[key] = value
+                    return result
+
+                marker = json.loads(marker_text, object_pairs_hook=reject_duplicate_keys)
+                if not isinstance(marker, dict):
+                    raise ValueError("marker is not an object")
+                return marker
+
+            def marker_matches(marker: dict[str, object]) -> bool:
+                return (
+                    type(marker.get("identity_version")) is int
+                    and marker["identity_version"] == 1
+                    and marker.get("state") == "pending"
+                    and marker.get("resource") == identity.resource
+                    and marker.get("operation") == "write"
+                    and type(marker.get("fencing_token")) is int
+                    and marker["fencing_token"] == fencing_token
+                )
+
+            marker_text = read_marker(marker_fd)
+            if marker_text is None:
+                return False
+            marker = parse_marker(marker_text)
+            if not marker_matches(marker):
+                return False
+
+            try:
+                fcntl.flock(marker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                marker_path_stat = os.stat(
+                    _pending_operation_name(identity),
+                    dir_fd=common_fd,
+                    follow_symlinks=False,
+                )
+                marker_fd_stat = os.fstat(marker_fd)
+                if (
+                    not stat.S_ISREG(marker_path_stat.st_mode)
+                    or marker_path_stat.st_dev != marker_fd_stat.st_dev
+                    or marker_path_stat.st_ino != marker_fd_stat.st_ino
+                ):
+                    return False
+                current_marker_text = read_marker(marker_fd)
+                if current_marker_text is None:
+                    return False
+                current_marker = parse_marker(current_marker_text)
+                return current_marker == marker and marker_matches(current_marker)
+            else:
+                fcntl.flock(marker_fd, fcntl.LOCK_UN)
+                return False
+        finally:
+            if marker_fd is not None:
+                os.close(marker_fd)
+            os.close(common_fd)
+    except (CheckoutAdapterError, OSError, UnicodeDecodeError, ValueError, TypeError):
+        return False
+
+
 def _require_no_pending_operation(identity: CheckoutIdentity) -> None:
     directory_fd = _open_checkout_lock(identity.common_dir)
     try:
@@ -297,6 +418,14 @@ def _begin_pending_operation(
             raise CheckoutAdapterError(
                 "checkout_recovery_unavailable",
                 "cannot durably record the pending checkout operation; no action was run",
+            ) from error
+
+        try:
+            fcntl.flock(marker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise CheckoutAdapterError(
+                "checkout_marker_lock_unavailable",
+                "cannot lock the pending checkout marker; no action was run",
             ) from error
 
         payload = json.dumps(

@@ -18,6 +18,7 @@ from agent_control_plane.app import create_app
 from agent_control_plane.checkout_identity import (
     CheckoutAdapterError,
     CheckoutWriteLease,
+    _has_active_checkout_write_lease,
     _open_checkout_lock,
     identify_checkout,
 )
@@ -224,6 +225,33 @@ def test_checkout_run_write_resolves_relative_targets_from_leased_root(tmp_path,
     assert observed_targets == [(repo / "tracked.txt").resolve()]
     assert (repo / "tracked.txt").read_text(encoding="utf-8") == "target-bound write\n"
     assert not (outside / "tracked.txt").exists()
+
+
+def test_active_checkout_write_lease_requires_matching_marker_and_held_fence(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    owner = CheckoutWriteLease.local(repo)
+
+    assert not _has_active_checkout_write_lease(repo, identity.resource, 1)
+
+    with owner:
+        token = owner.fencing_token
+        assert token is not None
+        checks = {}
+
+        def inspect_active_lease():
+            checks["exact"] = _has_active_checkout_write_lease(repo, identity.resource, token)
+            checks["stale_token"] = _has_active_checkout_write_lease(
+                repo, identity.resource, token + 1
+            )
+            checks["wrong_resource"] = _has_active_checkout_write_lease(
+                repo, "checkout:other", token
+            )
+
+        owner.run("write", inspect_active_lease)
+
+    assert checks == {"exact": True, "stale_token": False, "wrong_resource": False}
+    assert not _has_active_checkout_write_lease(repo, identity.resource, token)
 
 
 def test_checkout_run_write_rejects_a_different_linked_worktree_before_mutation(tmp_path):
@@ -749,6 +777,94 @@ def test_process_crash_during_mediated_write_blocks_next_owner(tmp_path):
     assert recovery.value.code == "checkout_recovery_required"
     fence_state = identity.git_dir / f".acp-checkout-{identity.checkout_id}.fence-v1"
     assert json.loads(fence_state.read_text(encoding="utf-8"))["fencing_token"] == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO markers require POSIX")
+def test_active_checkout_fence_rejects_fifo_marker_without_blocking(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    marker = identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending"
+    os.mkfifo(marker, 0o600)
+
+    assert not _has_active_checkout_write_lease(repo, identity.resource, 1)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or checkout_identity_module.fcntl is None,
+    reason="POSIX advisory locks are not available",
+)
+def test_active_checkout_fence_rejects_unlocked_marker_while_checkout_lock_is_held(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    marker = identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending"
+    marker.write_text(
+        json.dumps(
+            {
+                "fencing_token": 1,
+                "identity_version": 1,
+                "operation": "write",
+                "resource": identity.resource,
+                "state": "pending",
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker.chmod(0o600)
+    flock = checkout_identity_module.fcntl.flock
+    lock_fd = _open_checkout_lock(identity.git_dir)
+    flock(lock_fd, checkout_identity_module.fcntl.LOCK_EX | checkout_identity_module.fcntl.LOCK_NB)
+    try:
+        assert not _has_active_checkout_write_lease(repo, identity.resource, 1)
+    finally:
+        flock(lock_fd, checkout_identity_module.fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or checkout_identity_module.fcntl is None,
+    reason="POSIX advisory locks are not available",
+)
+def test_active_checkout_fence_rejects_marker_replaced_during_lock_contention(
+    tmp_path, monkeypatch
+):
+    repo = init_repo(tmp_path / "repo")
+    identity = identify_checkout(repo)
+    marker = identity.common_dir / f".acp-checkout-{identity.checkout_id}.pending"
+
+    def write_marker(token: int) -> None:
+        marker.write_text(
+            json.dumps(
+                {
+                    "fencing_token": token,
+                    "identity_version": 1,
+                    "operation": "write",
+                    "resource": identity.resource,
+                    "state": "pending",
+                }
+            ),
+            encoding="utf-8",
+        )
+        marker.chmod(0o600)
+
+    write_marker(1)
+    original_flock = checkout_identity_module.fcntl.flock
+    replaced = False
+
+    def replace_marker_then_report_contention(descriptor: int, operation: int) -> None:
+        nonlocal replaced
+        if operation & checkout_identity_module.fcntl.LOCK_NB and not replaced:
+            replaced = True
+            marker.unlink()
+            write_marker(2)
+            raise BlockingIOError("simulated active marker owner")
+        original_flock(descriptor, operation)
+
+    monkeypatch.setattr(
+        checkout_identity_module.fcntl, "flock", replace_marker_then_report_contention
+    )
+
+    assert not _has_active_checkout_write_lease(repo, identity.resource, 1)
+    assert replaced
 
 
 def test_completion_sync_failure_keeps_marker_and_blocks_next_owner(tmp_path, monkeypatch):

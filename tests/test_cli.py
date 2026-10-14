@@ -188,6 +188,9 @@ def test_checkout_exec_clears_pending_marker_after_successful_agent_command(
     repo = _repo(tmp_path)
     created = repo / "agent-write.txt"
     child_code = (
+        "import os; "
+        "assert os.environ.get('ACP_CHECKOUT_FENCE_RESOURCE'); "
+        "assert int(os.environ.get('ACP_CHECKOUT_FENCE_TOKEN', '0')) > 0; "
         "from pathlib import Path; "
         "Path('agent-write.txt').write_text('written under fence', encoding='utf-8'); "
     )

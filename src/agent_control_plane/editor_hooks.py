@@ -51,14 +51,21 @@ def path_from_hook_payload(payload: Any) -> str | None:
     return None
 
 
-def claude_code_hooks(command: str) -> dict[str, Any]:
+def claude_code_hooks(command: str, *, require_checkout_exec: bool = False) -> dict[str, Any]:
     """The hook block ACP owns, keyed so an update can replace it in place."""
 
+    guard_command = f"{command} guard --hook"
+    if require_checkout_exec:
+        guard_command += " --require-checkout-exec"
+    # Claude Code only blocks a PreToolUse call on exit 2. If the executable cannot
+    # launch (126/127), the ACP CLI never gets a chance to translate its own errors
+    # into that blocking status; map every unsuccessful invocation to exit 2 here.
+    guard_command += " || exit 2"
     return {
         "PreToolUse": [
             {
                 "matcher": HOOK_TOOL_MATCHER,
-                "hooks": [{"type": "command", "command": f"{command} guard --hook"}],
+                "hooks": [{"type": "command", "command": guard_command}],
             }
         ],
         "SessionStart": [
@@ -102,7 +109,9 @@ def _is_acp_entry(entry: Any, command: str) -> bool:
     )
 
 
-def install_claude_code_hooks(root: Path, command: str = "acp") -> dict[str, Any]:
+def install_claude_code_hooks(
+    root: Path, command: str = "acp", *, require_checkout_exec: bool = False
+) -> dict[str, Any]:
     """Write ACP's hooks into `<root>/.claude/settings.json`, preserving the rest."""
 
     settings_path = root / SETTINGS_RELATIVE_PATH
@@ -117,7 +126,7 @@ def install_claude_code_hooks(root: Path, command: str = "acp") -> dict[str, Any
 
     settings["hooks"] = _merge_hook_events(
         settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {},
-        claude_code_hooks(command),
+        claude_code_hooks(command, require_checkout_exec=require_checkout_exec),
         command,
     )
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +135,7 @@ def install_claude_code_hooks(root: Path, command: str = "acp") -> dict[str, Any
         "ok": True,
         "settings": str(settings_path),
         "guarded_tools": list(GUARDED_TOOLS),
+        "checkout_fence": "required" if require_checkout_exec else "not_required",
         "unguarded": ["Bash"],
         "note": (
             "Bash is not guarded: what a shell command writes cannot be read off the "

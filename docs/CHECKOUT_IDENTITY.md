@@ -119,10 +119,32 @@ the callback. It improves adapter correctness when the caller honors the supplie
 path; it does not make a native editor or patch API use ACP unless that API is
 actually routed through this method.
 
-The adapter is opt-in: callers must route each write through `run`. The current
-Claude Code hooks still perform their existing path guard, but do not hold this lease
-around the editor's subsequent write. They therefore do not yet gain this checkout
-fence merely by being installed.
+The adapter is opt-in. For Claude Code, install its structured editor hooks in
+checkout-fence-required mode and start the session through the wrapper:
+
+```bash
+acp --repo /path/to/checkout hooks install --claude-code --require-checkout-exec
+acp --repo /path/to/checkout checkout-exec -- claude
+```
+
+In this mode, `checkout-exec` holds the checkout lease for the foreground Claude Code
+process and passes its resource and fencing token to that process. The synchronous
+`PreToolUse` guard verifies that the matching pending write marker itself is still
+locked by the active session before allowing a structured editor write; an unrelated
+checkout lock is not sufficient. A session started without the wrapper and without a
+matching token fails closed for those tools. This cooperative
+check does not authenticate process ancestry: another same-user process that can read
+the marker can copy its token while the wrapper's lock is active. The hook itself does
+not own or release the lock; the wrapper covers the whole session, including tool
+execution and permission prompts. This is session-level same-host serialization, not a
+per-file or distributed lease. The default hook installation remains path-only and
+does not imply checkout serialization.
+
+This design follows Claude Code's documented lifecycle: `PreToolUse` runs before a tool
+call, `PostToolUse` only runs after success, and `PostToolUseFailure` does not run for
+permission denials. A command hook is therefore not a reliable acquire/action/release
+wrapper by itself; the enclosing `checkout-exec` process owns the lock instead. See the
+[Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
 
 `attach`, `switch`, `sync`, and `cleanup` are replacement/destructive categories. They
 run only when Git reports no tracked changes, untracked files, or ignored files. If Git
@@ -159,12 +181,14 @@ safe to resume. ACP does not automatically discard, stash, reset, or replay inte
 work. A cleanup operation that removes the entire common Git directory leaves no
 checkout to resume; subsequent identity resolution fails closed.
 
-The current Claude Code hook integration still mediates only its documented structured
-Edit/Write/MultiEdit/NotebookEdit targets in the attempt worktree. It does not route
-those hooks through `CheckoutWriteLease` yet. Bash, direct Git commands, native editor
-patches that bypass the hook, other MCP/file APIs, direct filesystem writes, and tools
-that do not use this adapter remain unmediated. Consequently this prototype does not
-claim general protection against two sessions that ignore the adapter.
+The Claude Code hook integration can check structured Edit/Write/MultiEdit/NotebookEdit
+targets against the attempt write set and, when explicitly configured, require the
+session-level `checkout-exec` token and active marker lock. This remains cooperative,
+not an authentication boundary between same-user processes. Bash, direct Git commands,
+native editor patches that bypass the hook, other MCP/file APIs, direct filesystem
+writes, tools that do not use this adapter, and agents that ignore the wrapper remain
+outside this guarantee.
+Consequently this prototype does not claim general protection against unmediated writers.
 
 ## Limits
 
