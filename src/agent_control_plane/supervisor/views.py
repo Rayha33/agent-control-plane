@@ -1341,6 +1341,25 @@ class ViewsMixin:
                 DEFAULT_GC_RETENTION_SECONDS,
                 registered_worktrees=registered_worktrees,
             )
+            worker_admission = self._worker_admission_evidence(connection, sample_memory=True)
+            last_refusal_row = connection.execute(
+                "SELECT payload_json, created_at FROM events "
+                "WHERE event_type = 'worker.launch_denied' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            last_refusal = None
+            if last_refusal_row is not None:
+                try:
+                    refusal_payload = json.loads(last_refusal_row["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    refusal_payload = None
+                reason = (
+                    refusal_payload.get("reason") if isinstance(refusal_payload, dict) else None
+                )
+                if isinstance(reason, str) and re.fullmatch(r"worker_[a-z_]+", reason):
+                    last_refusal = {
+                        "reason": reason,
+                        "observed_at": last_refusal_row["created_at"],
+                    }
         try:
             filesystem_usage = shutil.disk_usage(self.state_dir)
         except OSError:
@@ -1400,6 +1419,16 @@ class ViewsMixin:
         snapshot["disk"]["attempt_worktrees"] = {
             "configured_root": str(configured_worktree_root),
             "managed_roots": managed_roots,
+        }
+        maximum_workers = worker_admission["configured_max_active_workers"]
+        snapshot["worker_admission"] = {
+            **worker_admission,
+            "available_slots": (
+                max(0, maximum_workers - worker_admission["retained_slots"])
+                if maximum_workers is not None
+                else None
+            ),
+            "last_refusal": last_refusal,
         }
         snapshot["intent_coordination"] = self.intent_snapshot()
         return snapshot

@@ -25,7 +25,12 @@ from typing import Any
 
 from ..worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from ..worker_trampoline import MONITOR_MODE as MONITOR_MODE
-from .common import SupervisorError, utc_now
+from .common import SupervisorError, canonical_json, utc_now
+from .host_memory import (
+    HostMemorySnapshot,
+    host_memory_snapshot_is_fresh,
+    read_host_memory_snapshot,
+)
 from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
 
 _MAX_WORKER_LOG_BYTES = 8 * 1024 * 1024
@@ -84,29 +89,29 @@ class WorkersMixin:
         # unavailable executor cannot mutate that attempt while refusing it.
         # This is only a side-effect-free preflight: _reserve_worker_launch
         # retains the transactional check that arbitrates concurrent claims.
-        self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
+        attempt = self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
         if not sys.platform.startswith("linux"):
             raise SupervisorError(
                 "process_containment_unavailable",
                 "long-running workers require Linux child-subreaper containment",
             )
-        attempt = self.heartbeat(
-            attempt_id,
-            claim_token,
-            {
-                "phase": "launching",
-                "command_digest": command_digest,
-                "command_argument_count": len(command),
-            },
-            credential=credential,
-        )
+        # Reject a known capacity violation before heartbeat, log, pipe or child
+        # setup. `_reserve_worker_launch` repeats this check under the write lock
+        # immediately before Popen, so racing launchers cannot spend one slot twice.
+        self._preflight_worker_admission(attempt_id, claim_token, credential)
         worker_env = self._child_env(
             self._phase_runtime_env(
                 self._runtime_env(attempt_id), "worker", Path(attempt["worktree"])
             )
         )
         log_path = self.state_dir / "logs" / f"worker-{attempt_id}.log"
-        with log_path.open("ab") as log:
+        self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
+        try:
+            log_context = log_path.open("ab")
+        except BaseException:
+            self._clear_worker_registration(attempt_id, {-1}, "worker.launch_aborted", None)
+            raise
+        with log_context as log:
             process: subprocess.Popen[bytes] | None = None
             handshake_read = -1
             handshake_write = -1
@@ -118,21 +123,31 @@ class WorkersMixin:
             output_open = False
             output_bytes_written = 0
             output_truncated = False
-            log_bytes_existing = os.fstat(log.fileno()).st_size
-            log_bytes_available = _MAX_WORKER_LOG_BYTES - log_bytes_existing
-            if log_bytes_available < len(_WORKER_LOG_TRUNCATION_MARKER):
-                raise SupervisorError(
-                    "worker_log_budget_exhausted",
-                    "existing worker log leaves no room for the bounded output notice",
-                )
-            output_bytes_budget = log_bytes_available - len(_WORKER_LOG_TRUNCATION_MARKER)
-            launch_reserved = False
+            launch_reserved = True
             try:
+                log_bytes_existing = os.fstat(log.fileno()).st_size
+                log_bytes_available = _MAX_WORKER_LOG_BYTES - log_bytes_existing
+                if log_bytes_available < len(_WORKER_LOG_TRUNCATION_MARKER):
+                    raise SupervisorError(
+                        "worker_log_budget_exhausted",
+                        "existing worker log leaves no room for the bounded output notice",
+                    )
+                output_bytes_budget = log_bytes_available - len(_WORKER_LOG_TRUNCATION_MARKER)
+                # Do not advertise launch progress until the authoritative
+                # write-locked admission check has granted and recorded a slot.
+                attempt = self.heartbeat(
+                    attempt_id,
+                    claim_token,
+                    {
+                        "phase": "launching",
+                        "command_digest": command_digest,
+                        "command_argument_count": len(command),
+                    },
+                    credential=credential,
+                )
                 handshake_read, handshake_write = os.pipe()
                 target_read, target_write = os.pipe()
                 start_read, start_write = os.pipe()
-                self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
-                launch_reserved = True
                 trampoline = Path(__file__).parent.with_name("worker_trampoline.py").resolve()
                 process = subprocess.Popen(
                     [
@@ -410,7 +425,7 @@ class WorkersMixin:
         attempt_id: str,
         claim_token: int,
         credential: str | None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Reject an existing sandbox reservation before direct-launch side effects.
 
         This does not reserve the attempt slot: a concurrent sandbox reservation
@@ -428,6 +443,118 @@ class WorkersMixin:
                     "sandbox_execution_reserved",
                     "a journaled sandbox execution owns this attempt slot",
                 )
+            return dict(attempt)
+
+    def _worker_admission_evidence(
+        self,
+        connection: Any,
+        *,
+        sample_memory: bool,
+    ) -> dict[str, Any]:
+        policy_json = self._worker_admission_policy_json()
+        policy_summary = connection.execute(
+            """
+            SELECT COUNT(*) AS retained_slots,
+              COALESCE(SUM(CASE WHEN COALESCE(worker_admission_policy_json, '') != ?
+                THEN 1 ELSE 0 END), 0) AS conflicting_slots
+            FROM attempts WHERE pid IS NOT NULL
+            """,
+            (policy_json,),
+        ).fetchone()
+        memory: dict[str, Any]
+        if self.config.min_available_memory_bytes is None and not sample_memory:
+            memory = {"status": "not_configured"}
+        else:
+            memory = read_host_memory_snapshot().as_dict()
+        return {
+            "retained_slots": policy_summary["retained_slots"],
+            "configured_max_active_workers": self.config.max_active_workers,
+            "configured_min_available_memory_bytes": self.config.min_available_memory_bytes,
+            "policy_conflict": policy_summary["conflicting_slots"] > 0,
+            "host_memory": memory,
+        }
+
+    def _worker_admission_policy_json(self) -> str:
+        return canonical_json(
+            {
+                "max_active_workers": self.config.max_active_workers,
+                "min_available_memory_bytes": self.config.min_available_memory_bytes,
+            }
+        )
+
+    def _worker_admission_refusal(self, evidence: dict[str, Any]) -> tuple[str, str] | None:
+        if evidence["policy_conflict"]:
+            return (
+                "worker_admission_policy_conflict",
+                "retained workers use a different or unknown admission policy; "
+                "wait for their slots to clear before changing worker admission settings",
+            )
+        maximum = evidence["configured_max_active_workers"]
+        if maximum is not None and evidence["retained_slots"] >= maximum:
+            return (
+                "worker_concurrency_exhausted",
+                "configured supervised worker concurrency is full",
+            )
+
+        minimum_memory = evidence["configured_min_available_memory_bytes"]
+        if minimum_memory is None:
+            return None
+        memory = evidence["host_memory"]
+        if memory.get("status") != "available":
+            return (
+                "worker_memory_unavailable",
+                "configured host-memory admission signal is unavailable",
+            )
+        snapshot = HostMemorySnapshot(
+            status=memory.get("status"),
+            source=memory.get("source"),
+            observed_at=memory.get("observed_at"),
+            available_bytes=memory.get("available_bytes"),
+            error=memory.get("error"),
+        )
+        if not host_memory_snapshot_is_fresh(snapshot):
+            return (
+                "worker_memory_stale",
+                "configured host-memory admission signal is stale or malformed",
+            )
+        if snapshot.available_bytes is None or snapshot.available_bytes < minimum_memory:
+            return (
+                "worker_memory_below_minimum",
+                "available host memory is below the configured admission floor",
+            )
+        return None
+
+    def _preflight_worker_admission(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None,
+    ) -> None:
+        refusal: tuple[str, str] | None = None
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            self._authenticate_attempt(connection, attempt, credential)
+            if attempt["pid"] is not None:
+                raise SupervisorError(
+                    "worker_already_running",
+                    "this attempt already has a launching or running worker",
+                )
+            evidence = self._worker_admission_evidence(connection, sample_memory=False)
+            refusal = self._worker_admission_refusal(evidence)
+            if refusal is not None:
+                self._event(
+                    connection,
+                    "worker.launch_denied",
+                    attempt["agent_id"],
+                    {
+                        "attempt_id": attempt_id,
+                        "reason": refusal[0],
+                        **evidence,
+                    },
+                )
+        if refusal is not None:
+            raise SupervisorError(*refusal)
 
     def _reserve_worker_launch(
         self,
@@ -443,6 +570,7 @@ class WorkersMixin:
                 "worker_identity_unavailable",
                 "worker launcher kernel identity could not be recorded",
             )
+        refusal: tuple[str, str] | None = None
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
@@ -459,31 +587,45 @@ class WorkersMixin:
                     "sandbox_execution_reserved",
                     "a journaled sandbox execution owns this attempt slot",
                 )
-            changed = connection.execute(
-                """
-                UPDATE attempts SET pid = -1, pid_identity = '', termination_proof = '',
-                  launch_owner_pid = ?, launch_owner_identity = ?, log_path = ?, updated_at = ?
-                WHERE id = ? AND pid IS NULL
-                """,
-                (
-                    launch_owner_pid,
-                    launch_owner_identity,
-                    log_path,
-                    utc_now(),
-                    attempt_id,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise SupervisorError(
-                    "worker_already_running",
-                    "this attempt already has a launching or running worker",
+            evidence = self._worker_admission_evidence(connection, sample_memory=False)
+            refusal = self._worker_admission_refusal(evidence)
+            if refusal is not None:
+                self._event(
+                    connection,
+                    "worker.launch_denied",
+                    attempt["agent_id"],
+                    {"attempt_id": attempt_id, "reason": refusal[0], **evidence},
                 )
-            self._event(
-                connection,
-                "worker.launch_reserved",
-                attempt["agent_id"],
-                {"attempt_id": attempt_id, "command_log": log_path},
-            )
+            else:
+                changed = connection.execute(
+                    """
+                    UPDATE attempts SET pid = -1, pid_identity = '', termination_proof = '',
+                      launch_owner_pid = ?, launch_owner_identity = ?, log_path = ?,
+                      worker_admission_policy_json = ?, updated_at = ?
+                    WHERE id = ? AND pid IS NULL
+                    """,
+                    (
+                        launch_owner_pid,
+                        launch_owner_identity,
+                        log_path,
+                        self._worker_admission_policy_json(),
+                        utc_now(),
+                        attempt_id,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise SupervisorError(
+                        "worker_already_running",
+                        "this attempt already has a launching or running worker",
+                    )
+                self._event(
+                    connection,
+                    "worker.launch_reserved",
+                    attempt["agent_id"],
+                    {"attempt_id": attempt_id, "command_log": log_path, **evidence},
+                )
+        if refusal is not None:
+            raise SupervisorError(*refusal)
 
     def _clear_worker_registration(
         self,

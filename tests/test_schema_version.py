@@ -79,6 +79,34 @@ def test_initialize_stamps_the_version_and_the_writer(repo: Path) -> None:
     assert recorded[SCHEMA_WRITTEN_BY_KEY] == __version__
 
 
+def test_worker_admission_policy_migration_adds_identity_idempotently() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript("CREATE TABLE attempts (id TEXT PRIMARY KEY, pid INTEGER);")
+    migration = dict(MIGRATIONS)[33]
+
+    migration(connection)
+    column = connection.execute("PRAGMA table_info(attempts)").fetchall()
+    admission_column = next(row for row in column if row["name"] == "worker_admission_policy_json")
+    assert admission_column["dflt_value"] == "''"
+    indexes = {row["name"] for row in connection.execute("PRAGMA index_list(attempts)").fetchall()}
+    assert "idx_attempts_worker_admission_active" in indexes
+    connection.execute(
+        "INSERT INTO attempts (id, worker_admission_policy_json) VALUES (?, ?)",
+        ("legacy", "pinned-policy"),
+    )
+
+    migration(connection)
+
+    assert (
+        connection.execute(
+            "SELECT worker_admission_policy_json FROM attempts WHERE id = 'legacy'"
+        ).fetchone()[0]
+        == "pinned-policy"
+    )
+    connection.close()
+
+
 def test_attempt_progress_migration_keeps_legacy_ages_unknown() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
