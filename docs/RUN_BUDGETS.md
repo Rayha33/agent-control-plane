@@ -609,6 +609,14 @@ Existing submission and independent-QC gates remain the only route to
 completion. This is a recovery breadcrumb, not full crash-durable result
 recovery.
 
+ACP task, attempt, and checkpoint records are separate from an interactive
+agent's conversation transcript. A chat application's restored history does
+not establish that ACP's durable task records rolled back, and ACP records do
+not automatically capture or reconstruct that transcript. Caller-supplied
+checkpoint fields may retain text, but they are not a complete or authoritative
+transcript backup. Keep checkpoints bounded to task-relevant progress and
+evidence; do not use the interruption-report API as transcript backup.
+
 Example request (the checkpoint is caller-supplied JSON and is not host-verified):
 
 ```json
@@ -675,6 +683,13 @@ promotable evidence.
   one reported rate-limit retry storm consumed 8.6 million subagent tokens in
   226 seconds without usable output; a single issue report, not a prevalence
   estimate.
+- [OpenAI Codex issue #43885](https://github.com/openai/codex/issues/43885):
+  opened 2026-09-08, this individual report describes completed post-recovery
+  conversation history appearing to roll back after a desktop restart; later
+  comments include Mac and Windows reports. A commenter alleges that the
+  source rollout log retained later messages while a derived SQLite history
+  view was stale. These are unverified user reports, not evidence of ACP data
+  loss or a confirmed product root cause.
 - [How Do AI Agents Spend Your Money?](https://arxiv.org/abs/2604.22750):
   research on token use in evaluated coding-agent tasks; results are specific
   to its dataset and setup.
