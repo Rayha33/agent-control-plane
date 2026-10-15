@@ -207,6 +207,38 @@ routing, not confidentiality: any local process with access to the project's con
 database can inspect its event chain. Messages remain in that log as long as
 `.acp/control.db` is retained.
 
+### Message provenance and visibility
+
+Each returned ACP message identifies its source as `acp_mediated`, includes the
+message event ID, sequence, timestamp, sender and recipient attempt IDs, task ID,
+commit SHA, and is labeled `untrusted_agent_content`. Inbox reads verify the
+hash-chained event log in the same database snapshot; each returned message reports
+`event_chain_verified: true` only for that verified snapshot. This proves hash-chain
+consistency, not tamper-proof provenance: event sequence numbers are ordering metadata
+and are not included in the event hash. `sequence_trust` and
+`as_of_event_sequence_trust` therefore report `ordering_metadata_not_hash_bound`.
+
+The inbox's `source_coverage` is deliberately narrower than a communication audit.
+`acp_mediated.coverage` is `complete_for_source` only when the read starts at sequence
+zero and the first page contains every matching ACP message through the returned
+`as_of_event_sequence`. A paginated or cursor-based read reports `partial`. This
+completeness applies only to matching `agent.message` records in that SQLite read
+snapshot; the numeric sequence watermark is not authenticated by the event hash. It
+says nothing about later events or communication outside ACP. An empty first-page
+inbox means only that no matching ACP-mediated entries were found in that snapshot;
+an empty cursor page means only that none were found after its sequence cursor.
+
+`provider_reported.coverage` is `unknown` because ACP has no connected, documented
+provider metadata adapter for this inbox. `opaque_external.coverage` is
+`not_observable`: this inbox does not ingest or independently inspect provider-native
+or other external channels. This is not a claim that ACP stores no emitted provider
+output: configured workers' stdout/stderr is written to per-attempt worker logs, which
+may contain such output and has its own access and retention behavior. The label makes
+no claim about encryption, confidentiality, or provider access. Other sources remain
+`unknown` unless an authoritative documented contract establishes their coverage.
+The inbox does not ingest private transcripts or infer completeness from an empty
+inbox.
+
 ## `acp mcp-serve`
 
 A read-only MCP server over stdio, so a session can read the board it works under
