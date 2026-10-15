@@ -389,6 +389,112 @@ def test_v7_service_database_migrates_append_only_interruption_reports(
     assert version == str(SERVICE_SCHEMA_VERSION)
 
 
+def test_v9_service_database_guards_interrupted_resume_across_old_writers(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS budget_interruption_task_resume_guard")
+        connection.execute("UPDATE meta SET value = '9' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    Database(str(database_path)).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO agents(id, name, owner, role, created_at) "
+            "VALUES ('legacy-worker', 'legacy worker', 'owner', 'worker', 'now')"
+        )
+
+        def add_interrupted_task(task_id: str, status: str, owner: str | None) -> None:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, description, acceptance_criteria_json, resources_json,
+                    status, owner_agent_id, claim_expires_at, claim_fencing_token,
+                    created_at, updated_at
+                ) VALUES (?, 'task', 'description', '[]', '[]', 'open', NULL, NULL, 0,
+                          'now', 'now')
+                """,
+                (task_id,),
+            )
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, owner_agent_id = ?, claim_expires_at = 0,
+                    claim_fencing_token = 1
+                WHERE id = ?
+                """,
+                (status, owner, task_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO budget_interruption_reports(
+                    id, task_id, agent_id, claim_fencing_token,
+                    resource_fencing_tokens_json, status, source, reason, summary,
+                    checkpoint_json, checkpoint_sha256, dispatch_attempt_ids_json,
+                    received_at
+                ) VALUES (?, ?, 'legacy-worker', 1, '{}', 'partial', 'client_reported',
+                          'provider_quota_exhausted', 'interrupted', '{}', ?, '[]', 'now')
+                """,
+                (f"report-{task_id}", task_id, "0" * 64),
+            )
+
+        add_interrupted_task("expired-interrupted", "claimed", "legacy-worker")
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="task_interruption_requires_reopen",
+        ):
+            connection.execute(
+                "UPDATE tasks SET status = 'orphaned' WHERE id = 'expired-interrupted'"
+            )
+        assert (
+            connection.execute(
+                "SELECT status FROM tasks WHERE id = 'expired-interrupted'"
+            ).fetchone()[0]
+            == "claimed"
+        )
+
+        add_interrupted_task("orphaned-interrupted", "orphaned", None)
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="task_interruption_requires_reopen",
+        ):
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'claimed', owner_agent_id = 'legacy-worker',
+                    claim_expires_at = 4102444800, claim_fencing_token = 2
+                WHERE id = 'orphaned-interrupted'
+                """
+            )
+
+        # The current reaper's blocked state and the operator's audited reopen path
+        # remain valid, and the next claim uses a fresh generation.
+        connection.execute("UPDATE tasks SET status = 'blocked' WHERE id = 'orphaned-interrupted'")
+        connection.execute("UPDATE tasks SET status = 'open' WHERE id = 'orphaned-interrupted'")
+        connection.execute(
+            """
+            UPDATE tasks
+            SET status = 'claimed', owner_agent_id = 'legacy-worker',
+                claim_expires_at = 4102444800, claim_fencing_token = 2
+            WHERE id = 'orphaned-interrupted'
+            """
+        )
+        assert connection.execute(
+            "SELECT status, claim_fencing_token FROM tasks WHERE id = 'orphaned-interrupted'"
+        ).fetchone() == ("claimed", 2)
+
+        triggers = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        }
+        version = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()[0]
+
+    assert "budget_interruption_task_resume_guard" in triggers
+    assert version == str(SERVICE_SCHEMA_VERSION)
+
+
 def test_dispatch_outstanding_budget_sql_guard_cannot_be_bypassed(database_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")

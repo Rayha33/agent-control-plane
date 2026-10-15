@@ -269,6 +269,16 @@ def reserve_dispatch_attempt(client, task_id, token, claim, idempotency_key):
     )
 
 
+def test_interrupted_resume_database_guard_maps_to_reopen_conflict() -> None:
+    with pytest.raises(ControlPlaneError) as error:
+        coordination_module.CoordinationService._raise_claim_guard_error(
+            sqlite3.IntegrityError("task_interruption_requires_reopen")
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "task_interruption_requires_reopen"
+
+
 def test_simultaneous_claims_have_exactly_one_winner(client, app, admin_headers):
     worker_a = create_agent(client, admin_headers, "parallel-worker-a", "worker")
     worker_b = create_agent(client, admin_headers, "parallel-worker-b", "worker")
@@ -796,7 +806,23 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
         )
     reaped = client.post("/v1/coordination/reap", headers=admin_headers)
     assert reaped.status_code == 200, reaped.text
-    assert task["id"] in reaped.json()["orphaned_task_ids"]
+    reap_report = reaped.json()
+    assert task["id"] in reap_report["blocked_interruption_task_ids"]
+    assert task["id"] not in reap_report["orphaned_task_ids"]
+    parked = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert parked["status"] == "blocked"
+
+    automatic_resume = claim_task(client, task["id"], token)
+    assert automatic_resume.status_code == 409
+    assert automatic_resume.json()["error"] == "task_unavailable"
+
+    explicit_resume = client.post(
+        f"/v1/tasks/{task['id']}/reopen",
+        headers=admin_headers,
+        json={"reason": "Operator reviewed the partial interruption and authorized resume."},
+    )
+    assert explicit_resume.status_code == 200, explicit_resume.text
+    assert explicit_resume.json()["status"] == "open"
 
     resumed_claim_response = claim_task(client, task["id"], token)
     assert resumed_claim_response.status_code == 200, resumed_claim_response.text
@@ -2018,6 +2044,7 @@ def test_expired_claim_is_reaped_and_zombie_writer_is_rejected(client, app, admi
 
     reaped = client.post("/v1/coordination/reap", headers=admin_headers)
     assert reaped.status_code == 200
+    assert reaped.json()["blocked_interruption_task_ids"] == []
     assert task["id"] in reaped.json()["orphaned_task_ids"]
 
     replacement = claim_task(client, task["id"], token_b)

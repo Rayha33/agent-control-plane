@@ -343,7 +343,20 @@ from an older service process sharing the migrated database. A pre-migration
 process can still return an already-existing reservation on a read-only
 idempotency replay; that does not create a reservation, and clients must never
 send on a replay. A deliberate retry requires a new key and another available
-slot under a newly fenced claim. Slots are never released or refunded.
+slot under a newly fenced claim. Slots are never released or refunded. When
+that claim expires, the coordination reaper moves the task to `blocked` instead
+of making it automatically claimable, and reports it in
+`blocked_interruption_task_ids`. An administrator must explicitly reopen the
+task with a reason before a new claim can start; a provider quota reset alone
+does not resume it. Migration 10 installs a SQLite status-transition guard as
+well: a pre-migration reaper cannot orphan the interrupted generation, and an
+older claimant cannot automatically resume an already-orphaned generation. The
+current reaper may park it as `blocked`; only the audited `blocked` → `open`
+reopen followed by a fresh claim is allowed. This lifecycle fence does not stop
+an active local process or prove sandbox cleanup; those remain separate runtime
+gates. If an older reaper encounters an interrupted task, the database guard
+rejects its legacy transition and may roll back that reaper transaction as a
+whole, delaying cleanup of other expired claims until the upgraded reaper runs.
 Reservations retain the task and resource fencing-token snapshot that was
 checked at creation. Reservation and client-reported receipt rows survive a
 service restart; task views recompute consumed slots from those persisted rows.

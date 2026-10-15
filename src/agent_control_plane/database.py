@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 9
+SERVICE_SCHEMA_VERSION = 10
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -847,6 +847,34 @@ def _guard_interrupted_claim_writes(connection: sqlite3.Connection) -> None:
     )
 
 
+def _guard_interrupted_task_resume(connection: sqlite3.Connection) -> None:
+    """Require explicit operator reopen across mixed-version task lifecycles.
+
+    A pre-migration service process can keep writing the migrated database without
+    seeing this binary's Python reaper/claim checks. The persistent trigger prevents
+    its legacy `orphaned` transition or automatic orphaned-task claim from resuming
+    the same interrupted claim generation.
+    """
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS budget_interruption_task_resume_guard
+        BEFORE UPDATE OF status ON tasks
+        WHEN (
+            (OLD.status IN ('claimed', 'working') AND NEW.status = 'orphaned')
+            OR (OLD.status = 'orphaned' AND NEW.status IN ('claimed', 'working'))
+        )
+        AND EXISTS (
+            SELECT 1 FROM budget_interruption_reports
+            WHERE task_id = OLD.id
+              AND claim_fencing_token = OLD.claim_fencing_token
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'task_interruption_requires_reopen');
+        END
+        """
+    )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -871,6 +899,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (7, _add_outstanding_dispatch_budgets),
     (8, _add_budget_interruption_reports),
     (9, _guard_interrupted_claim_writes),
+    (10, _guard_interrupted_task_resume),
 )
 
 SCHEMA = """

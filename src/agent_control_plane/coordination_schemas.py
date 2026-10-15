@@ -718,6 +718,7 @@ class TaskReopenRequest(BaseModel):
 
 
 class ReapReport(BaseModel):
+    blocked_interruption_task_ids: list[str]
     orphaned_task_ids: list[str]
     conflicted_task_ids: list[str]
     released_resources: int
