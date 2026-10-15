@@ -2963,7 +2963,7 @@ durable journal transitions, provider authentication, Git/result transfer, or
 supervisor-restart cancellation/recovery. The configured-OCI `run_worker`
 route remains fail-closed, and the broader proof gates above remain open.
 
-### Explicit host-process visibility follow-up (2026-10-15; pass)
+### Explicit process and Git-metadata visibility follow-up (2026-10-15; pass)
 
 The direct-runc no-model fixture now starts a live host-only process with a
 unique command-line marker, verifies the marker through host `/proc` before
@@ -2973,9 +2973,15 @@ in-container process-table control was captured, that the host marker is
 absent, and that the marked host process is still alive with the marker after
 the snapshot. Failed reads of extant `/proc` entries fail the probe; only
 entries that disappear during enumeration are skipped. The marker is not
-passed to the worker. The exact test passed twice (`1 passed` each) on the
-disposable Lima guest `acp-2370-live-sandbox-20261010` after these assertions
-were added, with the latest verbose run reporting `1 passed in 5.71s`:
+passed to the worker. The candidate-facing `/workspace` also fails closed if
+any `.git` file, directory, or symlink is present at launch; this establishes
+that the mounted file snapshot does not present shared Git administration or
+object metadata. This remains a primitive-level visibility proof, not an
+integrated result-transfer proof. The exact test passed twice (`1 passed` each)
+on the disposable Lima guest `acp-2370-live-sandbox-20261010` after the process
+assertions were added. After adding the `.git` visibility assertion, the full
+opt-in runtime-test module passed `47 passed in 5.69s`; the exact test-source
+hash is recorded below:
 Ubuntu 26.04.1 ARM64, Linux `7.0.0-38-generic`, Python 3.14.4, systemd 259.5,
 cgroup v2, rootless runc 1.5.2 (SHA-256
 `d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
@@ -2989,7 +2995,7 @@ Exact hashes for the exercised source are:
 
 | File | SHA-256 |
 | --- | --- |
-| `tests/test_oci_worker_runtime.py` | `61819e11e66d24cd3540cf113cd8475a3dce44c43b641cf7a74b50862a03f861` |
+| `tests/test_oci_worker_runtime.py` | `7c311fa94b9a9ac7aebcdfacbceb25c8f50b0e201167b040e08ab152a6cfb857` |
 | `src/agent_control_plane/supervisor/oci_worker.py` | `bcd015a23f3bbd0293d6d8fc864f31e5add53bfad33c592588c3f6ce1191a90d` |
 | `src/agent_control_plane/supervisor/sandbox_attestation.py` | `f842834dfd47ac1bd124c36604e8124fc9f9b8e747128bc4cd6671d7f4afa9f0` |
 | `src/agent_control_plane/supervisor/sandbox_workspace.py` | `793ab9000dadd310af81867395f476bb69e7cb2e64d923f1b542277c992ce188` |
@@ -2999,9 +3005,12 @@ For this disposable guest only, rootless user-namespace creation required
 temporarily setting `kernel.apparmor_restrict_unprivileged_userns` from `1` to
 `0`; an exit/signal restore trap was installed first, and postflight confirmed
 the value returned to `1`. No AppArmor profile was applied, so this is not
-AppArmor-confinement evidence. The systemd user manager remained running, and
-postflight found no ACP test units, attempt fixture roots, or host marker
-process. No model, provider credential, paid inference, or NAS host was used.
+AppArmor-confinement evidence. The systemd user manager remained running. After
+the full module replay, postflight found no runc or host-marker process and no
+ACP test unit; the live test's own attempt tree was removed by its verified
+finalizer. Other synthetic roots left by the module's
+`test_private_attempt_tree_*` unit cases are not live attempts and were left
+untouched. No model, provider credential, paid inference, or NAS host was used.
 This adds explicit process-visibility evidence to the primitive-level probe
 only: it does not exercise `run_worker()`, monitor-owned cleanup, provider
 authentication/egress, crash recovery, or result import; configured OCI worker

@@ -2421,6 +2421,10 @@ esac
 /bin/busybox touch /workspace/fd-audit-ready
 while [ ! -e /workspace/fd-audit-release ]; do :; done
 
+# The worker gets a file snapshot, never the registered worktree's Git admin
+# directory, pointer file, or object database.
+if [ -e /workspace/.git ] || [ -L /workspace/.git ]; then exit 56; fi
+
 test -r /workspace/input.txt
 test "$(/bin/busybox cat /workspace/input.txt)" = 'snapshot input'
 printf 'candidate result\\n' > /workspace/result.txt
@@ -2476,7 +2480,7 @@ else
 fi
 
 {apparmor_probe}
-printf 'network_probe_rc=%s\\ninterfaces=%s\\nworker_apparmor=%s\\n' "$network_rc" "$interfaces" "$worker_apparmor" > /workspace/isolation-result.txt
+printf 'network_probe_rc=%s\\ninterfaces=%s\\nworker_apparmor=%s\\ngit_metadata=absent\\n' "$network_rc" "$interfaces" "$worker_apparmor" > /workspace/isolation-result.txt
 """
 
 
@@ -3359,6 +3363,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         result_fields = dict(line.split("=", 1) for line in result.splitlines())
         assert int(result_fields["network_probe_rc"]) != 0
         assert result_fields["interfaces"] == "lo"
+        assert result_fields["git_metadata"] == "absent"
+        assert not os.path.lexists(workspace / ".git")
         process_table = (workspace / "process-table.bin").read_bytes()
         assert b"fd-audit-ready" in process_table
         assert host_process_marker.encode("ascii") not in process_table
@@ -3440,6 +3446,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     "systemd_unit": systemd_unit,
                     "isolation_result": result.strip(),
                     "process_visibility": "unique live host-process marker absent from worker /proc",
+                    "worker_git_metadata": "no shared .git file, directory, or symlink at launch",
                     "host_paths_denied": [
                         "source checkout",
                         "sibling attempt",
@@ -3450,6 +3457,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                         "host /tmp sentinel",
                         "host /tmp Unix-socket sentinel",
                         "host process visibility via a unique live cmdline marker",
+                        "shared .git file, directory, or symlink",
                         "absolute and relative symlink targets",
                     ],
                     "checkout_write_probe": "unique test-owned canary; removed during teardown",
