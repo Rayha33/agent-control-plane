@@ -923,13 +923,24 @@ passed all four Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-
 fixture commit `9a6368d`; this receipt does not cover later documentation-only
 commits. Task #2417 records the current PR head and its latest check. The
 unisolated diagnostic helper remains unsafe and is not called by `run_worker`.
-No runtime path/digest is durably tied to the attempt journal before candidate
-exec, and the attempt journal still cannot reach `cleanup_verified`. When
-`[sandbox.oci]` is configured, `run_worker` continues to fail before heartbeat
-or process reservation with `sandbox_executor_unavailable`; it cannot silently
-fall back to host execution. The direct live test is not a
-supervisor-managed attempt and establishes no result-import or crash/cancel
-recovery claim.
+The earlier statement that no runtime path/digest was tied to the journal before
+candidate exec is superseded: the current journal commits a one-use
+`launch_submission_digest` over every descriptor-backed target field, including
+the verified pinned-runc path/digest, config digest, argv, bundle/rootfs/state/
+workspace path identities, and resource limits, before the private launcher's
+exec acknowledgement. This is a commitment to the launch target, not to every
+reservation field. After the returned handle is bound, the journal persists the
+canonical readable launch plan and the `launch_target` payload in
+`sandbox.execution_launched`. These records bind launch intent; they do not
+prove successful production `run_worker()` execution, and an ambiguous
+post-latch crash remains fenced and cannot resubmit. The attempt journal still
+cannot reach `cleanup_verified`.
+When `[sandbox.oci]` is configured, `run_worker` continues to fail before
+heartbeat or process reservation with `sandbox_executor_unavailable`; it cannot
+silently fall back to host execution. The direct live test exercises a claimed
+attempt and journaled launch components through a test fixture, not the
+production `run_worker()` lifecycle; it establishes no result-import or
+crash/cancel recovery claim.
 
 The contained process trampoline now has an opt-in Linux `exec_fd` input: the
 trusted monitor passes a caller-held regular-file descriptor to its blocked
