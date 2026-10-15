@@ -3447,6 +3447,19 @@ single-tenant test: its private host fixture paths and path-based teardown
 assume no concurrent same-host-UID process mutates those paths. Hostile same-UID
 filesystem isolation is not established.
 
+The encrypted-redirect regression was separately replayed in this same guest:
+`tests/test_provider_proxy.py::test_tls_redirect_requires_a_second_connect_and_only_that_authority_is_denied`
+passed 1/1 in 0.04s. The test client validates a generated local TLS certificate,
+receives a `302` for `https://blocked.example/redirected` inside TLS from the
+allowed `api.example.com:443` tunnel, and then explicitly sends a second CONNECT
+for `blocked.example:443`. The proxy returns 403 for that second authority
+before DNS or dial; the only resolver/dial calls are for the first allowed
+CONNECT. DNS and the numeric dial are test-injected, with the dial redirected
+to the local TLS fixture. The worker-facing side in this test is a socketpair,
+not an OCI worker process: this demonstrates the proxy/client CONNECT contract,
+not an application's redirect-follow behavior in the sandbox or provider
+authentication. It does not imply that the proxy inspects redirects inside TLS.
+
 Both accepted proxy channels remain tracked through teardown. The test's
 finalizer shuts down and closes them, bounded-joins every started handler, and
 fails cleanup if a handler remains alive.
@@ -3457,6 +3470,7 @@ worktree):
 | File | SHA-256 |
 | --- | --- |
 | `test_oci_worker_runtime.py` | `c74906a0e78ba3d34a1379eae1d52921cc26914450fe36fecdd52d09ebc1aaab` |
+| `test_provider_proxy.py` | `aff9efbdf1a7a9e261141cbc86680c454047db7bfd256a092a14420083ec5837` |
 | `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
 | `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
 
@@ -3468,8 +3482,10 @@ or host-only socket fixtures. This does not prove AppArmor confinement. No real
 provider credential, endpoint, TLS session, model inference, or paid call was
 used. The collector-issued receipt predicates were replaced with a test-only
 receipt; process identity, peer PIDFD, UID/GID, and exact cgroup checks were
-real. This proves the live worker-to-socket CONNECT path and its same-UID peer
-rejection, not provider authentication, encrypted redirect handling, credential
-handoff, crash recovery, cleanup verification, result transfer, or production
+real. Together, these tests prove the live worker-to-socket CONNECT path,
+same-UID peer rejection, and the separate proxy rule requiring a new CONNECT
+for a TLS redirect target. They do not prove provider authentication, the
+application following redirects inside the OCI worker, credential handoff,
+crash recovery, cleanup verification, result transfer, or production
 `run_worker()` integration. Task #3112 and parent task #2370 remain open, and
 configured OCI worker execution remains fail-closed.
