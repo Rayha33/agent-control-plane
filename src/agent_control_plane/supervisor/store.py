@@ -32,6 +32,42 @@ _SANDBOX_LAUNCH_SUBMISSION_AUTHORIZATION: ContextVar[
 _SANDBOX_RESERVATION_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str]] | None
 ] = ContextVar("acp_sandbox_reservation_authorization", default=None)
+_INTEGRATION_REF_PUBLICATION_AUTHORIZATION: ContextVar[tuple[int, str] | None] = ContextVar(
+    "acp_integration_ref_publication_authorization", default=None
+)
+
+
+@contextmanager
+def _authorize_integration_ref_publication_write(
+    connection: sqlite3.Connection, payload: dict[str, Any]
+) -> Iterator[None]:
+    """Scope the ownership-event insert capability to one exact publication payload.
+
+    This protects the ordinary supervisor SQL path. It is not an OS boundary against a
+    hostile same-UID process that can rewrite the control database or register SQLite UDFs.
+    """
+
+    token = _INTEGRATION_REF_PUBLICATION_AUTHORIZATION.set(
+        (id(connection), canonical_json(payload))
+    )
+    try:
+        yield
+    finally:
+        _INTEGRATION_REF_PUBLICATION_AUTHORIZATION.reset(token)
+
+
+def _integration_ref_publication_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(payload_json: str) -> int:
+        authorization = _INTEGRATION_REF_PUBLICATION_AUTHORIZATION.get()
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == payload_json
+        )
+
+    return authorized
 
 
 @contextmanager
@@ -311,6 +347,11 @@ class StoreMixin:
                 5,
                 _sandbox_reservation_authorized_for(connection),
             )
+            connection.create_function(
+                "acp_integration_ref_publication_authorized",
+                1,
+                _integration_ref_publication_authorized_for(connection),
+            )
             try:
                 yield connection
             finally:
@@ -337,6 +378,11 @@ class StoreMixin:
             "acp_sandbox_reservation_authorized",
             5,
             _sandbox_reservation_authorized_for(connection),
+        )
+        connection.create_function(
+            "acp_integration_ref_publication_authorized",
+            1,
+            _integration_ref_publication_authorized_for(connection),
         )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")

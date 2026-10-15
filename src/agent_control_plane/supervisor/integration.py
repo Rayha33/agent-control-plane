@@ -37,6 +37,7 @@ from .common import (
     utc_now,
 )
 from .runtime_targets import runtime_target_phase
+from .store import _authorize_integration_ref_publication_write
 
 
 class IntegrationMixin:
@@ -167,7 +168,10 @@ class IntegrationMixin:
         results: list[dict[str, Any]] = []
         verdict = "failed"
         commit: str | None = None
+        published_ref_owned = False
         error_message = ""
+        target_preflight_link: dict[str, Any] | None = None
+        target_preflight_receipt: dict[str, Any] | None = None
         try:
             if (
                 self._git_text("cat-file", "-t", submission["commit_sha"]) != "commit"
@@ -177,6 +181,51 @@ class IntegrationMixin:
                 raise SupervisorError(
                     "submission_evidence_mismatch",
                     "replacement-free submission object no longer matches reviewed evidence",
+                )
+            strict_phase_targets = tuple(
+                target
+                for target in self.config.runtime_targets
+                if "integration" in target.phases and target.require_command_binding
+            )
+            if strict_phase_targets:
+                # The command-binding capability is currently unavailable. Persist
+                # that known blocker against the submitted candidate before making
+                # an integration merge or restarting its runtime. An app self-report
+                # cannot make command routing trustworthy, so do not probe it here.
+                preflight_environment = self._runtime_env(
+                    submission["attempt_id"], require_ready=False
+                )
+                driver_resource_rows, live_runtime_sample = self._runtime_target_driver_snapshot(
+                    submission["attempt_id"]
+                )
+                receipt, _target_environment, blocked = runtime_target_phase(
+                    definitions=strict_phase_targets,
+                    commands=self.config.integration_commands,
+                    runtime_environment=preflight_environment,
+                    driver_resources=driver_resource_rows,
+                    live_runtime_sample=live_runtime_sample,
+                    attempt_id=str(submission["attempt_id"]),
+                    task_id=str(task_id),
+                    claim_token=int(attempt["claim_token"]),
+                    reservation_fence_sha256=sha256(
+                        str(submission["resource_tokens_json"]).encode("utf-8")
+                    ),
+                    phase="integration",
+                    source_revision=str(submission["commit_sha"]),
+                    runtime_dir=Path(preflight_environment["ACP_RUNTIME_DIR"]),
+                    receipt_id=integration_id,
+                    probe_identity_endpoint=False,
+                )
+                results.append(receipt)
+                if blocked:
+                    blocking_reason = receipt.get("blocking_reason")
+                    raise SupervisorError(
+                        str(blocking_reason or "runtime_target_command_binding_unavailable"),
+                        "integration requires command network binding, but no trusted executor can prove it; blocked before merge or runtime restart",
+                    )
+                raise SupervisorError(
+                    "runtime_target_command_binding_unavailable",
+                    "strict integration command binding has no trusted enforcement backend",
                 )
             current_base = self._git_text("rev-parse", task["base_branch"])
             with self._isolated_integration_git(worktree, current_base) as git_boundary:
@@ -244,10 +293,15 @@ class IntegrationMixin:
                         phase_context=phase_context,
                     )
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
+                    driver_resource_rows, live_runtime_sample = (
+                        self._runtime_target_driver_snapshot(submission["attempt_id"])
+                    )
                     receipt, target_env, blocked = runtime_target_phase(
                         definitions=phase_targets,
+                        commands=self.config.integration_commands,
                         runtime_environment=runtime_env,
-                        driver_resources=self.driver_resources(submission["attempt_id"]),
+                        driver_resources=driver_resource_rows,
+                        live_runtime_sample=live_runtime_sample,
                         attempt_id=str(submission["attempt_id"]),
                         task_id=str(task_id),
                         claim_token=int(attempt["claim_token"]),
@@ -259,31 +313,91 @@ class IntegrationMixin:
                         runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
                         receipt_id=integration_id,
                     )
+                    target_preflight_receipt = receipt
                     results.append(receipt)
+                    target_preflight_link = {
+                        "evidence_id": receipt["evidence_id"],
+                        "evidence_sha256": receipt["evidence_sha256"],
+                        "command_set_sha256": receipt["command_set_sha256"],
+                        "command_count": receipt["command_count"],
+                    }
                     if blocked:
+                        blocking_reason = receipt.get("blocking_reason")
+                        if blocking_reason == "runtime_target_command_binding_unavailable":
+                            raise SupervisorError(
+                                blocking_reason,
+                                "integration requires command network binding, but no trusted executor can prove it",
+                            )
                         raise SupervisorError(
-                            "runtime_target_identity_mismatch",
+                            str(blocking_reason or "runtime_target_identity_mismatch"),
                             "required integration runtime target identity is missing or mismatched",
                         )
-                for command in self.config.integration_commands:
+                for command_index, command in enumerate(self.config.integration_commands, start=1):
                     self._restore_integration_workspace(
                         worktree,
                         integration_commit,
                         operation_guard_fd,
                         git_boundary,
                     )
+                    target_freshness_link: dict[str, Any] | None = None
+                    if target_preflight_receipt is not None:
+                        driver_resource_rows, live_runtime_sample = (
+                            self._runtime_target_driver_snapshot(submission["attempt_id"])
+                        )
+                        freshness_receipt, freshness_env, freshness_blocked = runtime_target_phase(
+                            definitions=phase_targets,
+                            commands=self.config.integration_commands,
+                            runtime_environment=runtime_env,
+                            driver_resources=driver_resource_rows,
+                            live_runtime_sample=live_runtime_sample,
+                            attempt_id=str(submission["attempt_id"]),
+                            task_id=str(task_id),
+                            claim_token=int(attempt["claim_token"]),
+                            reservation_fence_sha256=sha256(
+                                str(submission["resource_tokens_json"]).encode("utf-8")
+                            ),
+                            phase="integration",
+                            source_revision=integration_commit,
+                            runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
+                            receipt_id=f"{integration_id}-cmd-{command_index:03d}",
+                            baseline_receipt=target_preflight_receipt,
+                        )
+                        results.append(freshness_receipt)
+                        if freshness_blocked:
+                            raise SupervisorError(
+                                str(
+                                    freshness_receipt.get("blocking_reason")
+                                    or "runtime_target_identity_mismatch"
+                                ),
+                                "integration target identity or resource snapshot changed after preflight",
+                            )
+                        target_freshness_link = {
+                            "evidence_id": freshness_receipt["evidence_id"],
+                            "evidence_sha256": freshness_receipt["evidence_sha256"],
+                            "preflight_evidence_id": target_preflight_receipt["evidence_id"],
+                            "command_index": command_index,
+                        }
                     command_environment = self._phase_runtime_env(
                         runtime_env, "integration", worktree
                     )
                     if phase_context:
                         command_environment.update(phase_context)
                         command_environment.update(target_env)
+                        if target_preflight_receipt is not None:
+                            command_environment.update(freshness_env)
                     result = self._run_command(
                         command,
                         worktree,
                         command_environment,
                         pass_fds=(operation_guard_fd,),
                     )
+                    if target_preflight_link is not None:
+                        result["runtime_target_preflight_link"] = {
+                            **target_preflight_link,
+                            "command_index": command_index,
+                        }
+                    if target_freshness_link is not None:
+                        result["runtime_target_freshness_link"] = target_freshness_link
                     results.append(result)
                     if result["exit_code"]:
                         raise SupervisorError(
@@ -404,21 +518,38 @@ class IntegrationMixin:
             if publication_pending:
                 try:
                     assert commit is not None
-                    self._publish_integration_ref(branch, commit, operation_guard_fd)
+                    published_ref_owned = self._publish_integration_ref(
+                        branch, commit, operation_guard_fd
+                    )
                 except (OSError, subprocess.SubprocessError, SupervisorError) as publish_error:
                     verdict = "failed"
                     error_message = f"integration publication failed: {publish_error}"
+                    with self.connect() as connection:
+                        publication_recorded = self._integration_ref_publication_recorded(
+                            connection, integration_id, branch, commit
+                        )
+                    ref_owned = published_ref_owned or publication_recorded
                     with self.connect() as connection:
                         connection.execute("BEGIN IMMEDIATE")
                         pending = connection.execute(
                             "SELECT verdict FROM integrations WHERE id = ?", (integration_id,)
                         ).fetchone()
                         if pending and pending["verdict"] == "publish_pending":
-                            connection.execute(
-                                "UPDATE integrations SET verdict = 'delete_pending', "
-                                "error = ? WHERE id = ? AND verdict = 'publish_pending'",
-                                (error_message, integration_id),
-                            )
+                            if ref_owned:
+                                connection.execute(
+                                    "UPDATE integrations SET verdict = 'delete_pending', "
+                                    "error = ? WHERE id = ? AND verdict = 'publish_pending'",
+                                    (error_message, integration_id),
+                                )
+                            else:
+                                error_message = (
+                                    f"{error_message}; ref ownership unproven, preserving ref"
+                                )
+                                connection.execute(
+                                    "UPDATE integrations SET verdict = 'failed', branch = NULL, "
+                                    "error = ? WHERE id = ? AND verdict = 'publish_pending'",
+                                    (error_message, integration_id),
+                                )
                             current_task = self._task_row(connection, task_id)
                             if current_task["status"] == "integrating":
                                 self._fence_task_cleanup(
@@ -439,24 +570,34 @@ class IntegrationMixin:
                                     "verdict": verdict,
                                     "commit_sha": commit,
                                     "error": error_message,
+                                    "ref_cleanup": "delete_owned"
+                                    if ref_owned
+                                    else "preserve_unowned",
                                 },
                             )
-                    try:
-                        self._finalize_integration_ref_deletion(
-                            integration_id,
-                            branch,
-                            commit,
-                            operation_guard_fd,
-                        )
-                    except (OSError, subprocess.SubprocessError, SupervisorError) as delete_error:
-                        publication_pending = True
-                        error_message = f"{error_message}; ref cleanup pending: {delete_error}"
-                        with self.connect() as connection:
-                            connection.execute(
-                                "UPDATE integrations SET error = ? "
-                                "WHERE id = ? AND verdict = 'delete_pending'",
-                                (error_message, integration_id),
+                    if ref_owned:
+                        try:
+                            self._finalize_integration_ref_deletion(
+                                integration_id,
+                                branch,
+                                commit,
+                                operation_guard_fd,
                             )
+                        except (
+                            OSError,
+                            subprocess.SubprocessError,
+                            SupervisorError,
+                        ) as delete_error:
+                            publication_pending = True
+                            error_message = f"{error_message}; ref cleanup pending: {delete_error}"
+                            with self.connect() as connection:
+                                connection.execute(
+                                    "UPDATE integrations SET error = ? "
+                                    "WHERE id = ? AND verdict = 'delete_pending'",
+                                    (error_message, integration_id),
+                                )
+                        else:
+                            publication_pending = False
                     else:
                         publication_pending = False
                 else:
@@ -508,7 +649,12 @@ class IntegrationMixin:
                 worktree.unlink()
             elif worktree.exists():
                 shutil.rmtree(worktree)
-            if (not recorded or verdict != "pass") and not publication_pending:
+            if (
+                (not recorded or verdict != "pass")
+                and not publication_pending
+                and commit is not None
+                and published_ref_owned
+            ):
                 self._delete_integration_ref(branch, commit, operation_guard_fd)
         try:
             runtime_cleanup: dict[str, Any] = self.runtime_down(submission["attempt_id"])
@@ -567,8 +713,8 @@ class IntegrationMixin:
 
     def _publish_integration_ref(
         self, branch: str, commit_sha: str, operation_guard_fd: int
-    ) -> None:
-        """Create the public ref after its durable publication intent exists."""
+    ) -> bool:
+        """Create the public ref and report whether this call established ownership."""
 
         reference = f"refs/heads/{branch}"
         result = self._run_ref_git_contained(
@@ -577,22 +723,76 @@ class IntegrationMixin:
             operation_guard_fd,
         )
         if result["exit_code"] == 0:
-            return
+            self._record_integration_ref_publication(branch, commit_sha)
+            return True
         verify = self._run_ref_git_contained(
             ["rev-parse", "--verify", reference],
             f"git rev-parse --verify {reference}",
             operation_guard_fd,
         )
         if verify["exit_code"] == 0 and verify["stdout"].strip() == commit_sha:
-            return
+            return False
         raise SupervisorError(
             "integration_publication_failed",
             result["stderr"].strip() or "integration ref could not be created",
         )
 
+    def _record_integration_ref_publication(self, branch: str, commit_sha: str) -> None:
+        """Persist proof that this supervisor created the pending integration ref."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            integration = connection.execute(
+                "SELECT id FROM integrations WHERE branch = ? AND commit_sha = ? "
+                "AND verdict = 'publish_pending'",
+                (branch, commit_sha),
+            ).fetchone()
+            if integration:
+                payload = {
+                    "integration_id": integration["id"],
+                    "branch": branch,
+                    "commit_sha": commit_sha,
+                }
+                with _authorize_integration_ref_publication_write(connection, payload):
+                    self._event(
+                        connection,
+                        "integration.ref_published",
+                        "integration",
+                        payload,
+                    )
+
+    def _integration_ref_publication_recorded(
+        self,
+        connection: sqlite3.Connection,
+        integration_id: str,
+        branch: str,
+        commit_sha: str,
+    ) -> bool:
+        """Return whether the append-only event log proves ownership of this ref."""
+
+        if not self._verify_event_chain(connection)["ok"]:
+            return False
+        rows = connection.execute(
+            "SELECT payload_json FROM events WHERE event_type = 'integration.ref_published'"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (json.JSONDecodeError, TypeError, UnicodeError):
+                continue
+            if (
+                payload.get("integration_id") == integration_id
+                and payload.get("branch") == branch
+                and payload.get("commit_sha") == commit_sha
+            ):
+                return True
+        return False
+
     def _delete_integration_ref(
         self, branch: str, commit_sha: str | None, operation_guard_fd: int
     ) -> None:
+        if commit_sha is None:
+            return
         reference = f"refs/heads/{branch}"
         arguments = ["update-ref", "-d", reference]
         if commit_sha:
@@ -737,6 +937,31 @@ class IntegrationMixin:
                 "integration_ref_cleanup_invalid",
                 "durable integration ref cleanup intent is incomplete",
             )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ref_owned = self._integration_ref_publication_recorded(
+                connection, pending["id"], branch, commit_sha
+            )
+            if not ref_owned:
+                error_message = "ref ownership unproven during recovery; preserving ref"
+                connection.execute(
+                    "UPDATE integrations SET branch = NULL, verdict = 'failed', error = ? "
+                    "WHERE id = ? AND verdict = 'delete_pending'",
+                    (error_message, pending["id"]),
+                )
+                self._event(
+                    connection,
+                    "integration.ref_cleanup_preserved",
+                    "recovery",
+                    {
+                        "integration_id": pending["id"],
+                        "task_id": pending["task_id"],
+                        "branch": branch,
+                        "commit_sha": commit_sha,
+                        "reason": "ownership_unproven",
+                    },
+                )
+                return
         self._finalize_integration_ref_deletion(
             pending["id"], branch, commit_sha, operation_guard_fd
         )
@@ -752,21 +977,32 @@ class IntegrationMixin:
                 "durable integration publication intent is incomplete",
             )
         try:
-            self._publish_integration_ref(branch, commit_sha, operation_guard_fd)
+            ref_created_now = self._publish_integration_ref(branch, commit_sha, operation_guard_fd)
         except (OSError, subprocess.SubprocessError, SupervisorError) as error:
             error_message = f"restart publication failed: {error}"
             with self.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                ref_owned = self._integration_ref_publication_recorded(
+                    connection, pending["id"], branch, commit_sha
+                )
                 row = connection.execute(
                     "SELECT verdict FROM integrations WHERE id = ?", (pending["id"],)
                 ).fetchone()
                 if not row or row["verdict"] != "publish_pending":
                     return
-                connection.execute(
-                    "UPDATE integrations SET verdict = 'delete_pending', error = ? "
-                    "WHERE id = ? AND verdict = 'publish_pending'",
-                    (error_message, pending["id"]),
-                )
+                if ref_owned:
+                    connection.execute(
+                        "UPDATE integrations SET verdict = 'delete_pending', error = ? "
+                        "WHERE id = ? AND verdict = 'publish_pending'",
+                        (error_message, pending["id"]),
+                    )
+                else:
+                    error_message = f"{error_message}; ref ownership unproven, preserving ref"
+                    connection.execute(
+                        "UPDATE integrations SET verdict = 'failed', branch = NULL, error = ? "
+                        "WHERE id = ? AND verdict = 'publish_pending'",
+                        (error_message, pending["id"]),
+                    )
                 task = self._task_row(connection, pending["task_id"])
                 if task["status"] == "integrating":
                     self._fence_task_cleanup(
@@ -786,15 +1022,20 @@ class IntegrationMixin:
                         "task_id": pending["task_id"],
                         "verdict": "failed",
                         "error": error_message,
+                        "ref_cleanup": "delete_owned" if ref_owned else "preserve_unowned",
                     },
                 )
-            self._finalize_integration_ref_deletion(
-                pending["id"], branch, commit_sha, operation_guard_fd
-            )
+            if ref_owned:
+                self._finalize_integration_ref_deletion(
+                    pending["id"], branch, commit_sha, operation_guard_fd
+                )
             return
         delete_ref = False
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            ref_owned = ref_created_now or self._integration_ref_publication_recorded(
+                connection, pending["id"], branch, commit_sha
+            )
             row = connection.execute(
                 "SELECT verdict FROM integrations WHERE id = ?", (pending["id"],)
             ).fetchone()
@@ -825,13 +1066,21 @@ class IntegrationMixin:
                 recovered_verdict = "pass"
             else:
                 error_message = "task changed before publication recovery"
-                connection.execute(
-                    "UPDATE integrations SET verdict = 'delete_pending', error = ? "
-                    "WHERE id = ? AND verdict = 'publish_pending'",
-                    (error_message, pending["id"]),
-                )
+                if ref_owned:
+                    connection.execute(
+                        "UPDATE integrations SET verdict = 'delete_pending', error = ? "
+                        "WHERE id = ? AND verdict = 'publish_pending'",
+                        (error_message, pending["id"]),
+                    )
+                else:
+                    error_message = f"{error_message}; ref ownership unproven, preserving ref"
+                    connection.execute(
+                        "UPDATE integrations SET verdict = 'failed', branch = NULL, error = ? "
+                        "WHERE id = ? AND verdict = 'publish_pending'",
+                        (error_message, pending["id"]),
+                    )
                 recovered_verdict = "failed"
-                delete_ref = True
+                delete_ref = ref_owned
             self._event(
                 connection,
                 "integration.publication_recovered",

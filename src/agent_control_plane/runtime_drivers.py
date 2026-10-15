@@ -323,6 +323,7 @@ def run_trusted(
     pass_fds: Sequence[int] = (),
     lifecycle_fds: Sequence[int] = (),
     create_cwd: bool = True,
+    max_output_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Execute *argv* directly — no shell, no PATH search, no worktree cwd.
 
@@ -331,11 +332,24 @@ def run_trusted(
     before executing the external command, so recovery remains fenced without
     giving the command an unlock capability. Read-only diagnostics set
     ``create_cwd=False`` so a missing attempt directory is refused instead of
-    recreated.
+    recreated. ``max_output_bytes`` requires a contained process runner and
+    bounds combined stdout/stderr capture, terminating the monitored command if
+    it exceeds the limit.
     """
 
     if not argv:
         raise DriverError("invalid_driver_invocation", "empty driver argv")
+    if max_output_bytes is not None and (
+        type(max_output_bytes) is not int or not 1 <= max_output_bytes <= 1_048_576
+    ):
+        raise DriverError(
+            "invalid_driver_invocation", "captured output limit must be between 1 byte and 1 MiB"
+        )
+    if max_output_bytes is not None and process_runner is None:
+        raise DriverError(
+            "bounded_output_requires_monitor",
+            "bounded driver output requires a contained process monitor",
+        )
     requested_executable = Path(argv[0])
     if not requested_executable.is_absolute():
         raise DriverError(
@@ -468,7 +482,11 @@ def run_trusted(
                 tuple(sorted(command_fds)),
                 tuple(sorted(retained_fds)),
             )
-            contained = process_runner(*process_args)
+            contained = (
+                process_runner(*process_args)
+                if max_output_bytes is None
+                else process_runner(*process_args, max_output_bytes=max_output_bytes)
+            )
             return {
                 "argv": [redact(value) for value in execution_argv],
                 "exit_code": int(contained["exit_code"]),
@@ -476,6 +494,7 @@ def run_trusted(
                 "stderr": redact(str(contained.get("stderr", ""))),
                 "duration_ms": int(contained["duration_ms"]),
                 "timed_out": bool(contained.get("timed_out", False)),
+                "output_limited": bool(contained.get("output_limited", False)),
             }
         if retained_fds:
             raise DriverError(

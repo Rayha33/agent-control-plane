@@ -598,6 +598,8 @@ class QcMixin:
         acceptance_coverage: list[dict[str, Any]] = []
         critic_verdict = "pass"
         packet: dict[str, Any] | None = None
+        target_preflight_link: dict[str, Any] | None = None
+        target_preflight_receipt: dict[str, Any] | None = None
         packet_hash = sha256(b"")
         try:
             self._assert_safe_git_execution_config()
@@ -605,6 +607,33 @@ class QcMixin:
             packet = self._review_packet(task, submission, qc_dir, qc_id)
             packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
             packet_hash = sha256(packet_path.read_bytes())
+
+            def record_target_preflight(receipt: dict[str, Any]) -> None:
+                nonlocal target_preflight_receipt, target_preflight_link, packet_hash
+                if packet is None:
+                    raise SupervisorError("qc_packet_missing", "QC review packet is unavailable")
+                target_preflight_receipt = receipt
+                results.append(receipt)
+                target_preflight_link = {
+                    "evidence_id": receipt["evidence_id"],
+                    "evidence_sha256": receipt["evidence_sha256"],
+                    "command_set_sha256": receipt["command_set_sha256"],
+                    "command_count": receipt["command_count"],
+                }
+                packet["runtime_target_preflight"] = receipt
+                packet["evidence_catalog"].append(
+                    {
+                        "id": receipt["evidence_id"],
+                        "kind": "runtime_target_preflight",
+                        "run_id": qc_id,
+                        "commit_sha": submission["commit_sha"],
+                        "sha256": receipt["evidence_sha256"],
+                        "exit_code": receipt["exit_code"],
+                    }
+                )
+                packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+                packet_hash = sha256(packet_path.read_bytes())
+
             # Fresh services before review. Otherwise QC can pass against an app
             # server the worker left running, which proves the worker's old code
             # works, not the code being reviewed.
@@ -636,33 +665,91 @@ class QcMixin:
                             "ACP_CLAIM_TOKEN": str(attempt["claim_token"]),
                             "ACP_TASK_ID": str(submission["task_id"]),
                         }
+
+                        if any(target.require_command_binding for target in phase_targets):
+                            # Strict command binding is currently unavailable, so
+                            # QC cannot run any configured gate. Record that
+                            # decision against the candidate before any service
+                            # restart. Normal post-review cleanup still follows
+                            # the terminal QC verdict.
+                            fence_sha = sha256(
+                                str(submission["resource_tokens_json"]).encode("utf-8")
+                            )
+                            driver_resource_rows, live_runtime_sample = (
+                                self._runtime_target_driver_snapshot(submission["attempt_id"])
+                            )
+                            receipt, _target_env, blocked = runtime_target_phase(
+                                definitions=phase_targets,
+                                commands=self.config.qc_commands,
+                                runtime_environment=runtime_env,
+                                driver_resources=driver_resource_rows,
+                                live_runtime_sample=live_runtime_sample,
+                                attempt_id=str(submission["attempt_id"]),
+                                task_id=str(submission["task_id"]),
+                                claim_token=int(attempt["claim_token"]),
+                                reservation_fence_sha256=fence_sha,
+                                phase="qc",
+                                source_revision=str(submission["commit_sha"]),
+                                runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
+                                receipt_id=qc_id,
+                                probe_identity_endpoint=False,
+                            )
+                            record_target_preflight(receipt)
+                            if blocked:
+                                blocking_reason = receipt.get("blocking_reason")
+                                if blocking_reason == "runtime_target_command_binding_unavailable":
+                                    raise SupervisorError(
+                                        blocking_reason,
+                                        "QC requires command network binding, but no trusted executor can prove it",
+                                    )
+                                raise SupervisorError(
+                                    str(blocking_reason or "runtime_target_identity_mismatch"),
+                                    "required QC runtime target identity is missing or mismatched",
+                                )
+                            raise SupervisorError(
+                                "runtime_target_command_binding_unavailable",
+                                "QC command binding has no trusted executor; refusing runtime restart",
+                            )
+
                     self._runtime_restart_in_operation(
                         submission["attempt_id"],
                         operation_guard_fd,
                         phase_context=phase_context,
                     )
                 except SupervisorError as error:
-                    findings.append(
-                        {
-                            "severity": "high",
-                            "requirement": "review runs against freshly started services",
-                            "finding": f"runtime restart before QC failed: {error.code}",
-                            "evidence": error.message,
-                            "required_fix": (
-                                "resolve the runtime cleanup/startup failure; a review against a "
-                                "stale or unproven runtime is not evidence"
-                            ),
-                        }
-                    )
+                    # A target preflight that already recorded a blocked receipt
+                    # is an intentional fail-closed gate, not a restart failure.
+                    if not (
+                        target_preflight_receipt is not None
+                        and target_preflight_receipt.get("status") == "blocked"
+                        and error.code.startswith("runtime_target_")
+                    ):
+                        findings.append(
+                            {
+                                "severity": "high",
+                                "requirement": "review runs against freshly started services",
+                                "finding": f"runtime restart before QC failed: {error.code}",
+                                "evidence": str(error),
+                                "required_fix": (
+                                    "resolve the runtime cleanup/startup failure; a review against a "
+                                    "stale or unproven runtime is not evidence"
+                                ),
+                            }
+                        )
                     raise
                 else:
                     runtime_env = self._runtime_env(submission["attempt_id"], require_ready=False)
                     if phase_targets:
                         fence_sha = sha256(str(submission["resource_tokens_json"]).encode("utf-8"))
+                        driver_resource_rows, live_runtime_sample = (
+                            self._runtime_target_driver_snapshot(submission["attempt_id"])
+                        )
                         receipt, target_env, blocked = runtime_target_phase(
                             definitions=phase_targets,
+                            commands=self.config.qc_commands,
                             runtime_environment=runtime_env,
-                            driver_resources=self.driver_resources(submission["attempt_id"]),
+                            driver_resources=driver_resource_rows,
+                            live_runtime_sample=live_runtime_sample,
                             attempt_id=str(submission["attempt_id"]),
                             task_id=str(submission["task_id"]),
                             claim_token=int(attempt["claim_token"]),
@@ -672,35 +759,86 @@ class QcMixin:
                             runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
                             receipt_id=qc_id,
                         )
-                        results.append(receipt)
-                        packet["runtime_target_preflight"] = receipt
-                        packet["evidence_catalog"].append(
-                            {
-                                "id": receipt["evidence_id"],
-                                "kind": "runtime_target_preflight",
-                                "run_id": qc_id,
-                                "commit_sha": submission["commit_sha"],
-                                "sha256": receipt["evidence_sha256"],
-                                "exit_code": receipt["exit_code"],
-                            }
-                        )
-                        packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
-                        packet_hash = sha256(packet_path.read_bytes())
+                        record_target_preflight(receipt)
                         if blocked:
+                            blocking_reason = receipt.get("blocking_reason")
+                            if blocking_reason == "runtime_target_command_binding_unavailable":
+                                raise SupervisorError(
+                                    blocking_reason,
+                                    "QC requires command network binding, but no trusted executor can prove it",
+                                )
                             raise SupervisorError(
-                                "runtime_target_identity_mismatch",
+                                str(blocking_reason or "runtime_target_identity_mismatch"),
                                 "required QC runtime target identity is missing or mismatched",
                             )
                         runtime_env.update(phase_context or {})
                         runtime_env.update(target_env)
             for index, command in enumerate(self.config.qc_commands, start=1):
                 self._restore_candidate(qc_dir, submission["commit_sha"])
+                target_freshness_link: dict[str, Any] | None = None
+                if target_preflight_receipt is not None:
+                    driver_resource_rows, live_runtime_sample = (
+                        self._runtime_target_driver_snapshot(submission["attempt_id"])
+                    )
+                    freshness_receipt, freshness_env, freshness_blocked = runtime_target_phase(
+                        definitions=phase_targets,
+                        commands=self.config.qc_commands,
+                        runtime_environment=runtime_env,
+                        driver_resources=driver_resource_rows,
+                        live_runtime_sample=live_runtime_sample,
+                        attempt_id=str(submission["attempt_id"]),
+                        task_id=str(submission["task_id"]),
+                        claim_token=int(attempt["claim_token"]),
+                        reservation_fence_sha256=fence_sha,
+                        phase="qc",
+                        source_revision=str(submission["commit_sha"]),
+                        runtime_dir=Path(runtime_env["ACP_RUNTIME_DIR"]),
+                        receipt_id=f"{qc_id}-cmd-{index:03d}",
+                        baseline_receipt=target_preflight_receipt,
+                    )
+                    results.append(freshness_receipt)
+                    packet["evidence_catalog"].append(
+                        {
+                            "id": freshness_receipt["evidence_id"],
+                            "kind": "runtime_target_revalidation",
+                            "run_id": qc_id,
+                            "commit_sha": submission["commit_sha"],
+                            "sha256": freshness_receipt["evidence_sha256"],
+                            "exit_code": freshness_receipt["exit_code"],
+                            "command_index": index,
+                        }
+                    )
+                    packet_path.write_text(json.dumps(packet, indent=2), encoding="utf-8")
+                    packet_hash = sha256(packet_path.read_bytes())
+                    if freshness_blocked:
+                        raise SupervisorError(
+                            str(
+                                freshness_receipt.get("blocking_reason")
+                                or "runtime_target_identity_mismatch"
+                            ),
+                            "QC target identity or resource snapshot changed after preflight",
+                        )
+                    runtime_env.update(freshness_env)
+                    target_freshness_link = {
+                        "evidence_id": freshness_receipt["evidence_id"],
+                        "evidence_sha256": freshness_receipt["evidence_sha256"],
+                        "preflight_evidence_id": target_preflight_receipt["evidence_id"],
+                        "command_index": index,
+                    }
+                command_environment = self._phase_runtime_env(runtime_env, "qc", qc_dir)
                 result = self._run_command(
                     command,
                     qc_dir,
-                    self._phase_runtime_env(runtime_env, "qc", qc_dir),
+                    command_environment,
                     pass_fds=(operation_guard_fd,),
                 )
+                if target_preflight_link is not None:
+                    result["runtime_target_preflight_link"] = {
+                        **target_preflight_link,
+                        "command_index": index,
+                    }
+                if target_freshness_link is not None:
+                    result["runtime_target_freshness_link"] = target_freshness_link
                 evidence_id = f"{qc_id}:command:{index:03d}"
                 result["evidence_id"] = evidence_id
                 result["evidence_sha256"] = sha256(
@@ -718,6 +856,15 @@ class QcMixin:
                         "sha256": result["evidence_sha256"],
                         "command": command,
                         "exit_code": result["exit_code"],
+                        **(
+                            {
+                                "runtime_target_preflight_link": result[
+                                    "runtime_target_preflight_link"
+                                ]
+                            }
+                            if target_preflight_link is not None
+                            else {}
+                        ),
                     }
                 )
                 if result["exit_code"]:

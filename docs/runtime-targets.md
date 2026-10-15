@@ -34,7 +34,8 @@ required = true
 `http://127.0.0.1:<allocated-port>`, never from an arbitrary URL. `driver` and the optional database/queue
 drivers must be configured trusted drivers. `phases` may contain `qc`,
 `integration`, or both. `required` defaults to true. `schema_version` is an
-optional expected value.
+optional expected value. `require_command_binding` is a separate strict opt-in
+that defaults to false.
 
 The identity endpoint must return a small JSON object with
 `contract: "acp-runtime-target-v1"`. Required fields for a fully corroborated
@@ -65,6 +66,38 @@ invocation ID, ACP includes them as `host_identity` evidence and compares a
 single known ID if the app reports `container_id` or `process_identity`. If the
 driver cannot expose that identity, the receipt says
 `host_identity.status = "unknown"`; ACP does not invent a PID or container ID.
+Each target receipt also carries allowlisted `resource_snapshots` for its API,
+database, and queue drivers. These bind resource IDs and stored host identities
+to the target receipt with `resource_snapshot_sha256`. For
+`namespace_runtime` drivers, both preflight and each pre-command revalidation
+also run the existing read-only systemd probe and include its validated active
+`InvocationID` in the target resource snapshot and its hash. The sample time is
+recorded separately on the overall manifest and receipt and covered by their
+full evidence hashes; it is not part of `resource_snapshot_sha256`. A missing, malformed, inactive,
+or inconsistent live ID blocks a required target. Samples older than 30 seconds
+or more than 5 seconds in the future are treated as unavailable. A changed ID
+changes the snapshot even if the unit name is stable. For target-referenced
+`docker_compose` drivers, the same fresh sample runs the trusted driver's
+fixed `compose -p <attempt-project> ps --all --quiet` inventory probe and adds
+only presence, count, and a SHA-256 of the sorted container IDs to the snapshot.
+This detects a changed inventory across preflight/revalidation even when the
+Compose project ID stays the same. Malformed, duplicate, failed, stale, or
+ambiguous Docker observations are marked unavailable; unlike a missing
+systemd invocation ID, that fact alone does not block a required target. If
+either preflight or revalidation lacks a valid Docker fingerprint while the
+other snapshot evidence is unchanged, the cross-phase comparison is `null`
+(unknown), not a match or a replacement finding. A changed resource ID or
+host-captured identity remains an independent replacement finding even when a
+Docker sample is unavailable. The sample's top-level `available` field continues to
+describe systemd/cgroup usage; `resource_identity_available` separately reports
+whether any Docker resource identity was sampled successfully. The shared
+sample timestamp is taken before the sequential probes, conservatively dating
+the earliest observation. ACP
+omits raw driver stdout/stderr and credential data. These are sampled
+lifecycle fingerprints, not socket attribution: they do not prove that
+QC/integration reached those resources or close the race between sampling and
+command launch. `require_command_binding = true` therefore remains unknown and
+blocks until a trusted command/network enforcement backend exists.
 
 During a target-aware restart ACP supplies the attempt/task/claim identity,
 phase, phase checkout, and exact source revision to the trusted runtime drivers
@@ -75,7 +108,9 @@ pass through the fields its service needs. Test commands receive
 `ACP_RUNTIME_TARGETS_SHA256`. The manifest is created mode `0400` outside the
 checkout and the receipt records its hash. These permissions and hashes detect
 accidental mutation; a same-UID command is not prevented from changing the
-file.
+file. The `acp-runtime-target-manifest-v1` object is extensible: consumers
+must ignore unknown fields, while incompatible changes to required fields or
+their meaning require a new contract version.
 
 QC and integration hold the task-operation lock continuously across target preflight
 and their configured commands. Public runtime restart and recovery acquire that same
@@ -95,8 +130,20 @@ missing evidence blocks the phase before tests. A missing response or field is
 `unknown`, not a match. Receipts are stored with the QC or integration run and
 include the attempt, task, claim counter, digest of the resource fencing-token
 map, phase, source revision, expected endpoint, driver resource state, available
-host identity, and expected-versus-observed identity fields. Secret values, arbitrary response
-bodies, process command lines, credentials, and endpoint tokens are not stored.
+host identity snapshots for each configured service/database/queue resource,
+and expected-versus-observed app identity fields. Secret values, arbitrary
+response bodies, process command lines, credentials, and endpoint tokens are not
+stored.
+
+When a target preflight exists, each configured QC/integration gate-command
+result links to its exact preflight evidence ID and SHA-256, the planned
+command-set digest/count, and its 1-based position in that set. This makes the
+plan-to-result relationship directly auditable; it does not attest executable
+bytes, effective environment, or which endpoint the process actually used. The
+digest is not reversible: for a complete run, compare the ordered command
+results with it; for an interrupted or early-failed run, retain the exact
+configuration used for that run to recover commands that never produced a
+result.
 
 An exact report is labeled `corroborated`, with `verified: false`. The service
 controls its own report; this contract does not authenticate that report, prove
@@ -104,6 +151,24 @@ which process owns the listening socket, prove that the app connected to the
 reported database/queue, or enforce that an arbitrary test command uses the
 declared endpoint. The endpoint and manifest are available for the command to
 use, but a command may ignore them. Use OS-level process/container attribution
-and network policy when those stronger guarantees are required. Projects that
-do not configure `runtime.targets` keep their existing QC and integration
-behavior and make no target-identity claim.
+and network policy when those stronger guarantees are required. At present,
+there is no trusted phase-command network executor. Therefore a target with
+`require_command_binding = true` records `command_binding_status: "unknown"` and
+blocks before the configured deterministic QC/integration gate commands run,
+even if the app's identity report matches. Strict QC records the
+unavailable-binding receipt against the submitted candidate without probing the
+app or restarting services for a review that is guaranteed to block. The normal
+post-review cleanup policy still applies to a blocked QC result. Non-strict QC
+continues to restart services before its identity preflight. Strict integration
+records the unavailable-binding receipt against the submitted candidate revision
+before integration merge or runtime restart; it does not probe the app identity
+endpoint because that self-report cannot establish command routing. The receipt
+is an explicit `unknown`, not a verified target. This strict mode is a fail-closed
+guard, not proof that cross-attempt isolation has been implemented. The positive
+enforcement backend remains tracked by the open ACP coordination task #2523.
+Projects that do not configure `runtime.targets` keep their existing QC and
+integration behavior and make no target-identity claim.
+
+The reviewed Linux broker direction and its security/acceptance boundary are in
+[Command-binding broker design](command-binding-broker.md). That document is a
+proposal, not a supported backend; strict command binding remains unavailable.

@@ -273,6 +273,22 @@ CREATE TABLE IF NOT EXISTS events (
   event_hash TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS integration_ref_publication_insert_guard
+  BEFORE INSERT ON events
+  WHEN NEW.event_type = 'integration.ref_published'
+  BEGIN
+    SELECT CASE WHEN acp_integration_ref_publication_authorized(NEW.payload_json) IS NOT 1
+      THEN RAISE(ABORT, 'integration_ref_publication_capability_required') END;
+  END;
+CREATE TRIGGER IF NOT EXISTS integration_ref_publication_update_guard
+  BEFORE UPDATE ON events
+  WHEN OLD.event_type = 'integration.ref_published'
+    OR NEW.event_type = 'integration.ref_published'
+  BEGIN SELECT RAISE(ABORT, 'integration_ref_publication_immutable'); END;
+CREATE TRIGGER IF NOT EXISTS integration_ref_publication_delete_guard
+  BEFORE DELETE ON events
+  WHEN OLD.event_type = 'integration.ref_published'
+  BEGIN SELECT RAISE(ABORT, 'integration_ref_publication_immutable'); END;
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, priority DESC);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, number DESC);
 CREATE INDEX IF NOT EXISTS idx_submissions_task ON submissions(task_id, created_at DESC);

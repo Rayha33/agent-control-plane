@@ -734,21 +734,57 @@ class RuntimeMixin:
             "live_sample": self._fresh_runtime_usage_sample(attempt_id),
         }
 
+    def _runtime_target_driver_snapshot(
+        self, attempt_id: str
+    ) -> tuple[list[dict[str, Any]], Mapping[str, Any] | None]:
+        """Return persisted resource rows together with their read-only live sample."""
+
+        snapshot = self.driver_resources(attempt_id, fresh=True)
+        if not isinstance(snapshot, Mapping):
+            return snapshot if isinstance(snapshot, list) else [], None
+        resources = snapshot.get("resources")
+        live_sample = snapshot.get("live_sample")
+        return (
+            resources if isinstance(resources, list) else [],
+            live_sample if isinstance(live_sample, Mapping) else None,
+        )
+
     def _fresh_runtime_usage_sample(self, attempt_id: str) -> dict[str, Any]:
-        """Read current cgroup counters without persisting probe evidence."""
+        """Read current cgroup and target-container identities without persisting evidence."""
 
         runtime = self.runtime_environment(attempt_id)
         rows = self._stored_driver_rows(attempt_id)
-        driver_names = {str(row["driver"]) for row in rows if row["kind"] == "namespace_runtime"}
+        row_by_name = {str(row["driver"]): row for row in rows}
+        target_resource_names: set[str] = set()
+        for target in self.config.runtime_targets:
+            target_resource_names.add(target.driver)
+            if target.database_driver:
+                target_resource_names.add(target.database_driver)
+            if target.queue_driver:
+                target_resource_names.add(target.queue_driver)
+        namespace_driver_names = {
+            name for name, row in row_by_name.items() if row["kind"] == "namespace_runtime"
+        }
+        docker_target_names = {
+            name
+            for name in target_resource_names
+            if (row := row_by_name.get(name)) and row["kind"] == "docker_compose"
+        }
+        driver_names = namespace_driver_names | docker_target_names
         if not driver_names:
             return {
                 "sampled_at": utc_now(),
                 "source": "systemd user unit / cgroup",
                 "available": False,
+                "resource_identity_available": False,
                 "reason": "no_namespace_runtime_driver",
                 "drivers": [],
+                "resource_identities": [],
             }
 
+        # Timestamp the batch before any sequential driver invocation so the
+        # freshness check is conservative for the earliest observation.
+        sampled_at = utc_now()
         evidence = self._run_driver_phase(
             "verify",
             attempt_id,
@@ -757,7 +793,7 @@ class RuntimeMixin:
             persist_evidence=False,
             read_only=True,
         )
-        sampled_at = utc_now()
+        resource_identities: list[dict[str, Any]] = []
         fields = (
             "tasks_current",
             "tasks_max",
@@ -774,6 +810,45 @@ class RuntimeMixin:
         for item in evidence:
             observation = item.proof.get("observation")
             observation = observation if isinstance(observation, dict) else {}
+            if item.kind == "docker_compose":
+                raw_ids = observation.get("stdout")
+                lines = raw_ids.splitlines() if isinstance(raw_ids, str) else []
+                ids_are_valid = (
+                    isinstance(raw_ids, str)
+                    and len(raw_ids) <= 8192
+                    and len(lines) <= 64
+                    and all(re.fullmatch(r"[0-9a-f]{12,64}", value) for value in lines)
+                    and len(set(lines)) == len(lines)
+                )
+                container_ids = sorted(set(lines)) if ids_are_valid else []
+                observation_ok = (
+                    type(observation.get("exit_code")) is int and observation.get("exit_code") == 0
+                )
+                identity_available = bool(
+                    type(item.exit_code) is int
+                    and item.exit_code == 0
+                    and observation_ok
+                    and type(item.present) is bool
+                    and ids_are_valid
+                    and item.present == bool(container_ids)
+                )
+                resource_identities.append(
+                    {
+                        "driver": item.driver,
+                        "kind": item.kind,
+                        "identity_available": identity_available,
+                        "present": item.present if identity_available else None,
+                        "container_count": len(container_ids) if identity_available else None,
+                        "container_ids_sha256": (
+                            sha256(canonical_json(container_ids).encode("utf-8"))
+                            if identity_available
+                            else None
+                        ),
+                    }
+                )
+                continue
+            if item.kind != "namespace_runtime":
+                continue
             # A successful read of ActiveState is useful status, even when an
             # inactive unit is not strong enough to prove teardown. Keep that
             # diagnostic separate from the stricter verify/recovery result.
@@ -798,6 +873,14 @@ class RuntimeMixin:
                 error_code = "systemd_absence_conflict"
             if error_code is None and not observation_ok:
                 error_code = "runtime_probe_unavailable"
+            live_invocation_id = observation.get("systemd_unit_invocation_id")
+            identity_available = bool(
+                observation_ok
+                and active_state == "active"
+                and error_code is None
+                and isinstance(live_invocation_id, str)
+                and re.fullmatch(r"[0-9a-f]{32}", live_invocation_id)
+            )
             drivers.append(
                 {
                     "driver": item.driver,
@@ -805,6 +888,14 @@ class RuntimeMixin:
                     "present": present,
                     "available": available,
                     "error_code": error_code,
+                    # Expose only the live unit incarnation when systemd
+                    # returned a clean, active observation. Persisted setup
+                    # evidence can lag a restart and must not stand in for this
+                    # read-only identity sample.
+                    "systemd_unit_invocation_id": (
+                        live_invocation_id if identity_available else None
+                    ),
+                    "identity_available": identity_available,
                     # systemd can return useful-looking partial stdout alongside
                     # an error, and inactive-unit counters can reflect stale
                     # state. Only an active, successful probe is a current sample.
@@ -817,9 +908,13 @@ class RuntimeMixin:
             )
         return {
             "sampled_at": sampled_at,
-            "source": "systemd user unit / cgroup",
+            "source": "systemd user unit / cgroup and read-only Docker Compose probe",
             "available": any(driver["available"] for driver in drivers),
+            "resource_identity_available": any(
+                resource["identity_available"] for resource in resource_identities
+            ),
             "drivers": drivers,
+            "resource_identities": resource_identities,
             "limitations": [
                 "task and memory values describe the host cgroup, not AI-agent count or model work",
                 "CPUUsageNSec is cumulative CPU time, not instantaneous utilization",

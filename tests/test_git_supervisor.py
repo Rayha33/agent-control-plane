@@ -3507,6 +3507,59 @@ def test_whitespace_gate_configuration_fails_closed(
     assert captured.value.code == "invalid_config"
 
 
+def append_api_runtime_target(repo: Path, phases: list[str]) -> None:
+    with (repo / "acp.toml").open("a", encoding="utf-8") as config:
+        config.write(
+            '\n[[runtime.drivers]]\nname = "api"\nkind = "browser_profile"\n'
+            '\n[[runtime.targets]]\nname = "api"\nport_env = "APP_PORT"\n'
+            f'driver = "api"\nphases = {json.dumps(phases)}\n'
+        )
+
+
+@pytest.mark.parametrize(
+    ("qc_commands", "integration_commands", "target_phase"),
+    [
+        (["pass"] * 129, [python_command("pass")], "qc"),
+        ([python_command("pass")], ["pass"] * 129, "integration"),
+        (["x" * 65537], [python_command("pass")], "qc"),
+        ([python_command("pass")], ["x" * 65537], "integration"),
+    ],
+)
+def test_gate_command_set_limits_are_enforced_when_target_receipts_are_enabled(
+    repo: Path,
+    qc_commands: list[str],
+    integration_commands: list[str],
+    target_phase: str,
+) -> None:
+    write_config(
+        repo,
+        qc_commands,
+        integration_commands,
+        runtime_ports={"APP_PORT": (43123, 43123)},
+    )
+    append_api_runtime_target(repo, [target_phase])
+    with pytest.raises(SupervisorError) as captured:
+        GitSupervisor(repo)
+    assert captured.value.code == "invalid_config"
+
+
+def test_command_set_limits_preserve_non_target_config_compatibility(repo: Path) -> None:
+    write_config(repo, ["pass"] * 129, ["pass"] * 129)
+    GitSupervisor(repo)
+
+    repo = repo / "targeted-qc-only"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    write_config(
+        repo,
+        [python_command("pass")],
+        ["pass"] * 129,
+        runtime_ports={"APP_PORT": (43123, 43123)},
+    )
+    append_api_runtime_target(repo, ["qc"])
+    GitSupervisor(repo)
+
+
 def test_runtime_configuration_rejects_unsafe_names_and_blank_hooks(repo: Path) -> None:
     write_config(repo, runtime_ports={"bad-name": (41000, 41001)})
     with pytest.raises(SupervisorError) as unsafe:
@@ -3721,6 +3774,111 @@ def test_command_cannot_escape_by_terminating_its_monitor(repo: Path, close_stdi
     assert result["exit_code"] != 0
     time.sleep(1)
     assert not marker.exists()
+
+
+def test_contained_process_enforces_combined_output_limit_while_draining(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        "import os,time\n"
+        "chunk = b'x' * 4096\n"
+        "while True:\n"
+        "    os.write(1, chunk)\n"
+        "    os.write(2, chunk)\n"
+        "    time.sleep(0.001)\n",
+    ]
+
+    result = supervisor._run_process(
+        command,
+        "bounded process output test",
+        repo,
+        supervisor._child_env(),
+        timeout_seconds=5,
+        max_output_bytes=1024,
+    )
+
+    captured_bytes = len(result["stdout"].encode()) + len(result["stderr"].encode())
+    assert result["output_limited"] is True
+    assert result["timed_out"] is False
+    assert result["exit_code"] == 125
+    assert captured_bytes <= 1024
+
+
+def test_bounded_output_selector_error_stops_command_and_releases_lifecycle_fd(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    command_pid_file = repo / "bounded-selector-command-pid"
+    started = repo / "bounded-selector-command-started"
+    late_marker = repo / "bounded-selector-command-survived"
+    read_fd, write_fd = os.pipe()
+    real_selector = process_module.selectors.DefaultSelector
+
+    class FailingSelector:
+        def __init__(self) -> None:
+            self.delegate = real_selector()
+
+        def register(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return self.delegate.register(*args, **kwargs)
+
+        def unregister(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return self.delegate.unregister(*args, **kwargs)
+
+        def get_map(self):  # type: ignore[no-untyped-def]
+            return self.delegate.get_map()
+
+        def select(self, _timeout=None):  # type: ignore[no-untyped-def]
+            deadline = time.monotonic() + 3
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not started.exists():
+                raise AssertionError("contained command did not start before selector failure")
+            raise OSError("forced bounded selector failure")
+
+        def close(self) -> None:
+            self.delegate.close()
+
+    monkeypatch.setattr(process_module.selectors, "DefaultSelector", FailingSelector)
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            "import os,pathlib,time; "
+            f"pathlib.Path({str(command_pid_file)!r}).write_text(str(os.getpid())); "
+            f"pathlib.Path({str(started)!r}).write_text('ready'); "
+            "time.sleep(0.3); "
+            f"pathlib.Path({str(late_marker)!r}).write_text('alive'); "
+            "time.sleep(30)"
+        ),
+    ]
+    try:
+        with pytest.raises(OSError, match="forced bounded selector failure"):
+            supervisor._run_process(
+                command,
+                "bounded selector cleanup test",
+                repo,
+                supervisor._child_env(),
+                timeout_seconds=5,
+                lifecycle_fds=(write_fd,),
+                max_output_bytes=1024,
+            )
+        assert started.exists()
+        command_pid = int(command_pid_file.read_text(encoding="ascii"))
+        os.close(write_fd)
+        write_fd = -1
+        ready, _, _ = process_module.select.select([read_fd], [], [], 2)
+        assert ready, "the monitor retained its lifecycle descriptor after the error"
+        assert os.read(read_fd, 1) == b"", "a contained command retained the lifecycle descriptor"
+        time.sleep(0.4)
+        assert not late_marker.exists()
+        assert supervisor._process_identity(command_pid) is None
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
 
 
 def test_process_maps_fd3_only_into_command_and_closes_monitor_copy(repo: Path) -> None:

@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import sqlite3
 import stat
 import subprocess
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,8 @@ import pytest
 from support import init_repo, python_command, write_config
 
 from agent_control_plane.git_supervisor import GitSupervisor, SupervisorError
+from agent_control_plane.supervisor import integration as integration_module
+from agent_control_plane.supervisor import qc as qc_module
 from agent_control_plane.supervisor import runtime_targets
 from agent_control_plane.supervisor.common import canonical_json, sha256
 
@@ -34,6 +38,7 @@ def target_definition(**overrides: Any) -> runtime_targets.RuntimeTargetDefiniti
         "phases": ["qc", "integration"],
         "required": True,
         "schema_version": "v7",
+        "require_command_binding": False,
     }
     entry.update(overrides)
     return runtime_targets.parse_runtime_target_definitions(
@@ -50,6 +55,14 @@ def driver_resources() -> list[dict[str, Any]]:
             "kind": "docker_compose",
             "resource_id": "api-project-attempt-17",
             "state": "active",
+            "evidence": {
+                "proof": {
+                    "observation": {
+                        "stdout": "0123456789ab\n",
+                        "stderr": "private driver diagnostic",
+                    }
+                }
+            },
         },
         {
             "driver": "postgres",
@@ -62,8 +75,71 @@ def driver_resources() -> list[dict[str, Any]]:
             "kind": "docker_compose",
             "resource_id": "queue-project-attempt-17",
             "state": "active",
+            "evidence": {
+                "proof": {
+                    "observation": {
+                        "stdout": "fedcba987654\n",
+                        "stderr": "private queue diagnostic",
+                    }
+                }
+            },
         },
     ]
+
+
+def namespace_driver_resources(invocation_id: str) -> list[dict[str, Any]]:
+    resources = driver_resources()
+    resources[0]["kind"] = "namespace_runtime"
+    resources[0]["evidence"] = {
+        "proof": {"observation": {"systemd_unit_invocation_id": invocation_id}}
+    }
+    return resources
+
+
+def live_namespace_sample(
+    invocation_id: str | None, *, sampled_at: str | None = None
+) -> dict[str, Any]:
+    available = invocation_id is not None
+    return {
+        "sampled_at": sampled_at or datetime.now(UTC).isoformat(timespec="seconds"),
+        "source": "systemd user unit / cgroup",
+        "available": available,
+        "drivers": [
+            {
+                "driver": "api",
+                "active_state": "active" if available else "inactive",
+                "present": available,
+                "available": available,
+                "identity_available": available,
+                "systemd_unit_invocation_id": invocation_id,
+            }
+        ],
+    }
+
+
+def live_docker_sample(
+    api_ids: list[str], queue_ids: list[str], *, sampled_at: str | None = None
+) -> dict[str, Any]:
+    resources = []
+    for driver, container_ids in (("api", api_ids), ("queue", queue_ids)):
+        canonical_ids = sorted(container_ids)
+        resources.append(
+            {
+                "driver": driver,
+                "kind": "docker_compose",
+                "identity_available": True,
+                "present": bool(container_ids),
+                "container_count": len(container_ids),
+                "container_ids_sha256": sha256(canonical_json(canonical_ids).encode("utf-8")),
+            }
+        )
+    return {
+        "sampled_at": sampled_at or datetime.now(UTC).isoformat(timespec="seconds"),
+        "source": "read-only Docker Compose probe",
+        "available": False,
+        "drivers": [],
+        "resource_identities": resources,
+    }
 
 
 def expected_report(
@@ -84,6 +160,7 @@ def expected_report(
         "source_revision": source_revision,
         "port": port,
         "driver_resource_id": "api-project-attempt-17",
+        "container_id": "0123456789ab",
         "database_namespace": "acp_attempt_17",
         "schema_version": "v7",
         "queue_namespace": "queue-project-attempt-17",
@@ -97,6 +174,12 @@ def evaluate_target(
     *,
     probe_status: str = "ok",
     resources: list[dict[str, Any]] | None = None,
+    live_runtime_sample: dict[str, Any] | None = None,
+    baseline_receipt: dict[str, Any] | None = None,
+    receipt_id: str = "qc-run-17",
+    require_command_binding: bool = False,
+    required: bool = True,
+    commands: tuple[str, ...] = ("pytest -q",),
 ) -> tuple[dict[str, Any], dict[str, str], bool]:
     observed = expected_report() if report is None else report
     monkeypatch.setattr(
@@ -105,9 +188,16 @@ def evaluate_target(
         lambda _port, _path: (observed, probe_status),
     )
     return runtime_targets.runtime_target_phase(
-        definitions=(target_definition(),),
+        definitions=(
+            target_definition(
+                required=required,
+                require_command_binding=require_command_binding,
+            ),
+        ),
+        commands=commands,
         runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(tmp_path)},
         driver_resources=driver_resources() if resources is None else resources,
+        live_runtime_sample=live_runtime_sample,
         attempt_id="attempt-17",
         task_id="task-17",
         claim_token=9,
@@ -115,7 +205,8 @@ def evaluate_target(
         phase="qc",
         source_revision=SOURCE_REVISION,
         runtime_dir=tmp_path,
-        receipt_id="qc-run-17",
+        receipt_id=receipt_id,
+        baseline_receipt=baseline_receipt,
     )
 
 
@@ -140,13 +231,450 @@ def test_matching_app_report_is_only_corroboration_and_manifest_is_read_only(
     assert target["expected"]["queue_namespace"] == "queue-project-attempt-17"
     assert manifest["phase"] == "qc"
     assert manifest["source_revision"] == SOURCE_REVISION
+    assert manifest["command_set_scope"] == runtime_targets.COMMAND_SET_SCOPE
+    assert manifest["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
+    assert receipt["command_set_scope"] == manifest["command_set_scope"]
+    assert receipt["command_set_sha256"] == manifest["command_set_sha256"]
+    assert manifest["command_count"] == 1
     assert manifest["targets"][0]["endpoint"] == "http://127.0.0.1:43123"
+    snapshots = manifest["targets"][0]["resource_snapshots"]
+    assert [snapshot["role"] for snapshot in snapshots] == ["service", "database", "queue"]
+    assert snapshots[0]["host_identity"]["container_ids"] == ["0123456789ab"]
+    assert snapshots[1]["host_identity"]["status"] == "unknown"
+    assert snapshots[2]["host_identity"]["container_ids"] == ["fedcba987654"]
+    assert manifest["targets"][0]["resource_snapshot_sha256"] == sha256(
+        canonical_json(snapshots).encode("utf-8")
+    )
+    assert receipt["targets"][0]["resource_snapshots"] == snapshots
+    assert (
+        receipt["targets"][0]["resource_snapshot_sha256"]
+        == manifest["targets"][0]["resource_snapshot_sha256"]
+    )
+    assert "private driver diagnostic" not in manifest_path.read_text(encoding="utf-8")
+    assert "private queue diagnostic" not in manifest_path.read_text(encoding="utf-8")
+    assert "private driver diagnostic" not in canonical_json(receipt)
+    assert "private queue diagnostic" not in canonical_json(receipt)
     assert environment["ACP_TARGET_API_URL"] == "http://127.0.0.1:43123"
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o400
     assert (
         hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         == environment["ACP_RUNTIME_TARGETS_SHA256"]
     )
+
+
+def test_required_command_network_binding_is_unknown_and_blocks_matching_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path,
+        monkeypatch,
+        require_command_binding=True,
+        live_runtime_sample=live_docker_sample(["0123456789ab"], ["fedcba987654"]),
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is True
+    assert receipt["status"] == "blocked"
+    assert receipt["exit_code"] == 1
+    assert receipt["blocking_reason"] == "runtime_target_command_binding_unavailable"
+    assert receipt["verified"] is False
+    assert target["status"] == "unknown"
+    assert target["command_binding_status"] == "unknown"
+    assert "command_network_binding" in target["missing_evidence"]
+    assert target["resource_snapshots"][0]["live_container_identity"]["identity_available"]
+    assert receipt["command_set_sha256"] == runtime_targets._command_set_sha256(("pytest -q",))
+
+
+def test_docker_compose_target_revalidation_detects_live_inventory_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight_sample = live_docker_sample(["0123456789ab"], ["fedcba987654"])
+    preflight, _environment, preflight_blocked = evaluate_target(
+        tmp_path / "preflight", monkeypatch, live_runtime_sample=preflight_sample
+    )
+    assert preflight_blocked is False
+
+    revalidation_dir = tmp_path / "revalidation"
+    revalidation_dir.mkdir()
+    receipt, _environment, blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+        driver_resources=driver_resources(),
+        live_runtime_sample=live_docker_sample(["abcdef123456"], ["fedcba987654"]),
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=revalidation_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_resource_replaced"
+    assert target["resource_snapshot_matches_preflight"] is False
+    assert target["mismatches"] == ["resource_snapshot_sha256"]
+    assert target["resource_snapshots"][0]["resource_id"] == "api-project-attempt-17"
+    assert target["resource_snapshots"][0]["live_container_identity"]["container_ids_sha256"] == (
+        sha256(canonical_json(["abcdef123456"]).encode("utf-8"))
+    )
+    assert receipt["verified"] is False
+
+
+@pytest.mark.parametrize(
+    ("preflight_available", "revalidation_available"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+    ],
+    ids=("both-unavailable", "revalidation-unavailable", "preflight-unavailable"),
+)
+def test_docker_resource_comparison_is_unknown_without_two_valid_samples(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preflight_available: bool,
+    revalidation_available: bool,
+) -> None:
+    preflight, _environment, preflight_blocked = evaluate_target(
+        tmp_path / "preflight",
+        monkeypatch,
+        live_runtime_sample=(
+            live_docker_sample(["0123456789ab"], ["fedcba987654"]) if preflight_available else None
+        ),
+    )
+    assert preflight_blocked is False
+
+    revalidation_dir = tmp_path / "revalidation"
+    receipt, _environment, blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+        driver_resources=driver_resources(),
+        live_runtime_sample=(
+            live_docker_sample(["0123456789ab"], ["fedcba987654"])
+            if revalidation_available
+            else None
+        ),
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=revalidation_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is False
+    assert target["resource_snapshot_matches_preflight"] is None
+    assert target["mismatches"] == []
+    assert receipt["resource_replacement_detected"] is False
+
+
+def test_live_docker_identity_rejects_stale_or_ambiguous_samples() -> None:
+    stale = live_docker_sample(
+        ["0123456789ab"],
+        ["fedcba987654"],
+        sampled_at=(datetime.now(UTC) - timedelta(minutes=2)).isoformat(timespec="seconds"),
+    )
+    assert runtime_targets._live_docker_container_identities(stale) == {}
+
+    duplicate = live_docker_sample(["0123456789ab"], ["fedcba987654"])
+    duplicate["resource_identities"].append(dict(duplicate["resource_identities"][0]))
+    identities = runtime_targets._live_docker_container_identities(duplicate)
+    assert identities["api"]["identity_available"] is False
+    assert identities["queue"]["identity_available"] is True
+
+
+@pytest.mark.parametrize("replacement_kind", ["host_identity", "resource_id"])
+def test_required_target_revalidation_blocks_replaced_host_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement_kind: str
+) -> None:
+    preflight, _environment, preflight_blocked = evaluate_target(
+        tmp_path / "preflight",
+        monkeypatch,
+        live_runtime_sample=live_docker_sample(["0123456789ab"], ["fedcba987654"]),
+    )
+    assert preflight_blocked is False
+
+    replacement = driver_resources()
+    report = expected_report()
+    if replacement_kind == "host_identity":
+        replacement[0]["evidence"]["proof"]["observation"]["stdout"] = "abcdef123456\n"
+        report["container_id"] = "abcdef123456"
+    else:
+        replacement[0]["resource_id"] = "api-project-attempt-17-replaced"
+        report["driver_resource_id"] = "api-project-attempt-17-replaced"
+    monkeypatch.setattr(
+        runtime_targets, "probe_target_identity", lambda _port, _path: (report, "ok")
+    )
+    revalidation_dir = tmp_path / "revalidation"
+    revalidation_dir.mkdir()
+    receipt, _environment, blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+        driver_resources=replacement,
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=revalidation_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert blocked is True
+    assert receipt["kind"] == "runtime_target_revalidation"
+    assert receipt["blocking_reason"] == "runtime_target_resource_replaced"
+    assert receipt["baseline_evidence_id"] == preflight["evidence_id"]
+    assert receipt["baseline_evidence_sha256"] == preflight["evidence_sha256"]
+    assert target["resource_snapshot_matches_preflight"] is False
+    assert target["resource_snapshots"][0]["live_container_identity"] is None
+    assert target["status"] == "mismatch"
+    assert "resource_snapshot_sha256" in target["mismatches"]
+    assert receipt["verified"] is False
+
+
+def test_namespace_runtime_revalidation_binds_live_invocation_id_and_blocks_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_id = "0123456789abcdef0123456789abcdef"
+    replacement_id = "fedcba9876543210fedcba9876543210"
+    preflight_sample = live_namespace_sample(original_id)
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = original_id
+    preflight, environment, blocked = evaluate_target(
+        tmp_path / "preflight",
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(original_id),
+        live_runtime_sample=preflight_sample,
+    )
+
+    assert blocked is False
+    assert preflight["verified"] is False
+    assert preflight["live_runtime_sampled_at"] == preflight_sample["sampled_at"]
+    assert preflight["targets"][0]["expected"]["process_identity"] == original_id
+    assert (
+        preflight["targets"][0]["resource_snapshots"][0]["live_systemd_invocation_id"]
+        == original_id
+    )
+    manifest = json.loads(Path(environment["ACP_RUNTIME_TARGETS_FILE"]).read_text())
+    assert manifest["live_runtime_sampled_at"] == preflight_sample["sampled_at"]
+
+    replacement_report = expected_report()
+    replacement_report.pop("container_id")
+    replacement_report["process_identity"] = replacement_id
+    replacement_sample = live_namespace_sample(replacement_id)
+    monkeypatch.setattr(
+        runtime_targets,
+        "probe_target_identity",
+        lambda _port, _path: (replacement_report, "ok"),
+    )
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    receipt, _environment, replacement_blocked = runtime_targets.runtime_target_phase(
+        definitions=(target_definition(),),
+        commands=("pytest -q",),
+        runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(replacement_dir)},
+        driver_resources=namespace_driver_resources(replacement_id),
+        live_runtime_sample=replacement_sample,
+        attempt_id="attempt-17",
+        task_id="task-17",
+        claim_token=9,
+        reservation_fence_sha256="a" * 64,
+        phase="qc",
+        source_revision=SOURCE_REVISION,
+        runtime_dir=replacement_dir,
+        receipt_id="qc-run-18",
+        baseline_receipt=preflight,
+    )
+
+    target = receipt["targets"][0]
+    assert replacement_blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_resource_replaced"
+    assert target["expected"]["process_identity"] == replacement_id
+    assert target["resource_snapshot_matches_preflight"] is False
+    assert target["mismatches"] == ["resource_snapshot_sha256"]
+    assert target["live_runtime_identity_unavailable"] is False
+    assert receipt["resource_replacement_detected"] is True
+
+
+@pytest.mark.parametrize("live_id", [None, "not-a-systemd-invocation-id"])
+def test_namespace_runtime_target_fails_closed_without_live_invocation_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_id: str | None
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = invocation_id
+
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path,
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(invocation_id),
+        live_runtime_sample=live_namespace_sample(live_id),
+    )
+
+    assert blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_live_identity_unavailable"
+    assert receipt["targets"][0]["status"] == "unknown"
+    assert receipt["targets"][0]["live_runtime_identity_unavailable"] is True
+    assert "api.live_systemd_invocation_id" in receipt["targets"][0]["missing_evidence"]
+    assert receipt["targets"][0]["expected"].get("process_identity") is None
+    assert receipt["verified"] is False
+
+
+def test_namespace_runtime_target_fails_closed_on_stale_live_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = invocation_id
+    stale_sampled_at = (datetime.now(UTC) - timedelta(minutes=2)).isoformat(timespec="seconds")
+
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path,
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(invocation_id),
+        live_runtime_sample=live_namespace_sample(invocation_id, sampled_at=stale_sampled_at),
+    )
+
+    assert blocked is True
+    assert receipt["blocking_reason"] == "runtime_target_live_identity_unavailable"
+    assert receipt["live_runtime_sampled_at"] == stale_sampled_at
+    assert receipt["targets"][0]["live_runtime_identity_unavailable"] is True
+
+
+@pytest.mark.parametrize(
+    ("offset_seconds", "identity_expected"),
+    [(-20, True), (-40, False), (1, True), (10, False)],
+)
+def test_live_namespace_sample_age_and_clock_skew_limits(
+    offset_seconds: int, identity_expected: bool
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    sampled_at = (datetime.now(UTC) + timedelta(seconds=offset_seconds)).isoformat(
+        timespec="microseconds"
+    )
+    sample = live_namespace_sample(invocation_id, sampled_at=sampled_at)
+
+    identities, returned_sampled_at = runtime_targets._live_systemd_invocation_ids(sample)
+
+    assert bool(identities) is identity_expected
+    assert returned_sampled_at == sampled_at
+    assert identities == ({"api": invocation_id} if identity_expected else {})
+
+
+def test_live_namespace_sample_rejects_impossible_utc_timestamp() -> None:
+    sample = live_namespace_sample(
+        "0123456789abcdef0123456789abcdef",
+        sampled_at="2026-99-99T00:00:00+00:00",
+    )
+
+    identities, returned_sampled_at = runtime_targets._live_systemd_invocation_ids(sample)
+
+    assert identities == {}
+    assert returned_sampled_at is None
+
+
+def test_optional_namespace_target_keeps_identity_failure_diagnostic_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_id = "0123456789abcdef0123456789abcdef"
+    report = expected_report()
+    report.pop("container_id")
+    report["process_identity"] = invocation_id
+
+    receipt, _environment, blocked = evaluate_target(
+        tmp_path,
+        monkeypatch,
+        report,
+        resources=namespace_driver_resources(invocation_id),
+        live_runtime_sample=live_namespace_sample(None),
+        required=False,
+    )
+
+    assert blocked is False
+    assert receipt["status"] == "complete"
+    assert receipt["blocking_reason"] is None
+    assert receipt["targets"][0]["status"] == "unknown"
+    assert receipt["targets"][0]["live_runtime_identity_unavailable"] is True
+
+
+def test_target_revalidation_rejects_receipt_from_another_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight, _environment, _blocked = evaluate_target(tmp_path / "preflight", monkeypatch)
+    foreign = dict(preflight)
+    foreign["task_id"] = "other-task"
+    foreign.pop("evidence_sha256")
+    foreign["evidence_sha256"] = sha256(canonical_json(foreign).encode("utf-8"))
+    revalidation_dir = tmp_path / "revalidation"
+    revalidation_dir.mkdir()
+
+    with pytest.raises(SupervisorError) as rejected:
+        runtime_targets.runtime_target_phase(
+            definitions=(target_definition(),),
+            commands=("pytest -q",),
+            runtime_environment={"APP_PORT": "43123", "ACP_RUNTIME_DIR": str(revalidation_dir)},
+            driver_resources=driver_resources(),
+            attempt_id="attempt-17",
+            task_id="task-17",
+            claim_token=9,
+            reservation_fence_sha256="a" * 64,
+            phase="qc",
+            source_revision=SOURCE_REVISION,
+            runtime_dir=revalidation_dir,
+            receipt_id="qc-run-19",
+            baseline_receipt=foreign,
+        )
+
+    assert rejected.value.code == "runtime_target_baseline_invalid"
+
+
+def test_command_set_digest_binds_order_and_exact_shell_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _, _ = evaluate_target(tmp_path, monkeypatch, commands=("pytest -q", "ruff check ."))
+    second_dir = tmp_path / "reordered"
+    second_dir.mkdir()
+    second, _, _ = evaluate_target(second_dir, monkeypatch, commands=("ruff check .", "pytest -q"))
+    third_dir = tmp_path / "edited"
+    third_dir.mkdir()
+    third, _, _ = evaluate_target(third_dir, monkeypatch, commands=("pytest -q -x", "ruff check ."))
+
+    assert (
+        len(
+            {first["command_set_sha256"], second["command_set_sha256"], third["command_set_sha256"]}
+        )
+        == 3
+    )
+    assert first["verified"] is second["verified"] is third["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "commands",
+    ["pytest", ("pytest", 3), ("x" * 65537,), tuple("x" for _ in range(129))],
+)
+def test_invalid_command_set_is_rejected(commands: Any) -> None:
+    with pytest.raises(SupervisorError, match="phase command"):
+        runtime_targets._command_set_sha256(commands)
 
 
 @pytest.mark.parametrize(
@@ -296,6 +824,230 @@ def test_target_identity_probe_is_loopback_bounded_and_does_not_follow_redirects
     assert status == expected_status
 
 
+def test_stale_before_publication_preserves_same_commit_unowned_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo(repo)
+    gate_started = tmp_path / "integration-gate-started"
+    gate = python_command(
+        f"import pathlib,time; pathlib.Path({str(gate_started)!r}).write_text('started'); "
+        "time.sleep(0.8)"
+    )
+    write_config(repo, integration_commands=[gate])
+    supervisor = GitSupervisor(repo)
+    created = supervisor.create_task(
+        "already integrated candidate",
+        "Reproduce stale reservation cleanup before publication.",
+        ["The unowned integration ref remains untouched"],
+        ["alpha.txt"],
+    )
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "alpha.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "alpha.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-m", "candidate"],
+        check=True,
+        capture_output=True,
+    )
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--detach", "HEAD"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", "-f", "main", submission["commit_sha"]],
+        check=True,
+        capture_output=True,
+    )
+    current_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    unowned_ref: dict[str, str] = {}
+    original_event = supervisor._event
+
+    def plant_unowned_ref(connection, event_type, actor, payload):
+        if event_type == "integration.started":
+            reference = (
+                f"refs/heads/acp/integrate-{created['id'][:8]}-{payload['integration_id'][:8]}"
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "update-ref", reference, current_base],
+                check=True,
+                capture_output=True,
+            )
+            unowned_ref["reference"] = reference
+        return original_event(connection, event_type, actor, payload)
+
+    monkeypatch.setattr(supervisor, "_event", plant_unowned_ref)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(supervisor.integrate, created["id"])
+        deadline = time.monotonic() + 5
+        while not gate_started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert gate_started.exists(), "integration gate did not start"
+        with supervisor.connect() as connection:
+            connection.execute(
+                "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
+                (created["id"],),
+            )
+        supervisor.reap_expired()
+        result = future.result(timeout=15)
+
+    assert result["verdict"] == "stale"
+    assert result["commit_sha"] == current_base
+    assert unowned_ref.get("reference")
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", unowned_ref["reference"]],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == current_base
+    )
+
+
+def test_restart_recovery_preserves_same_commit_ref_without_ownership_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo(repo)
+    supervisor = GitSupervisor(repo)
+    created = supervisor.create_task(
+        "recover an ambiguous publication",
+        "Do not delete a same-commit ref unless this integration created it.",
+        ["An unowned same-commit ref survives recovery"],
+        ["alpha.txt"],
+    )
+    attempt = supervisor.claim(created["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    (worktree / "alpha.txt").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "alpha.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-m", "candidate"],
+        check=True,
+        capture_output=True,
+    )
+    submission = supervisor.submit(attempt["id"], attempt["claim_token"])
+    assert supervisor.run_qc(submission["id"], "independent-qc")["verdict"] == "pass"
+    planted_ref: dict[str, str] = {}
+
+    def plant_unowned_ref_and_crash(branch: str, commit_sha: str, _operation_guard_fd: int) -> bool:
+        reference = f"refs/heads/{branch}"
+        subprocess.run(
+            ["git", "-C", str(repo), "update-ref", reference, commit_sha],
+            check=True,
+            capture_output=True,
+        )
+        planted_ref.update(reference=reference, commit=commit_sha)
+        raise KeyboardInterrupt("simulated crash after an external ref appeared")
+
+    monkeypatch.setattr(supervisor, "_publish_integration_ref", plant_unowned_ref_and_crash)
+    with pytest.raises(KeyboardInterrupt, match="external ref appeared"):
+        supervisor.integrate(created["id"])
+
+    with supervisor.connect() as connection:
+        pending = connection.execute(
+            "SELECT id, branch, commit_sha, verdict FROM integrations WHERE task_id = ?",
+            (created["id"],),
+        ).fetchone()
+        assert not connection.execute(
+            "SELECT 1 FROM events WHERE event_type = 'integration.ref_published'"
+        ).fetchone()
+        forged_payload = canonical_json(
+            {
+                "integration_id": pending["id"],
+                "branch": pending["branch"],
+                "commit_sha": pending["commit_sha"],
+            }
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="integration_ref_publication_capability_required",
+        ):
+            connection.execute(
+                """
+                INSERT INTO events
+                  (id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+                VALUES (?, 'integration.ref_published', 'untrusted-test', ?, ?, ?, ?)
+                """,
+                (
+                    f"forged-{pending['id']}",
+                    forged_payload,
+                    "0" * 64,
+                    "0" * 64,
+                    datetime.now(UTC).isoformat(timespec="microseconds"),
+                ),
+            )
+        assert supervisor._verify_event_chain(connection)["ok"]
+        assert not supervisor._integration_ref_publication_recorded(
+            connection,
+            pending["id"],
+            pending["branch"],
+            pending["commit_sha"],
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = 0 WHERE task_id = ?",
+            (created["id"],),
+        )
+    with sqlite3.connect(supervisor.db_path) as untrusted_connection:
+        untrusted_connection.create_function(
+            "acp_integration_ref_publication_authorized", 1, lambda _payload: None
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="integration_ref_publication_capability_required",
+        ):
+            untrusted_connection.execute(
+                """
+                INSERT INTO events
+                  (id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+                VALUES (?, 'integration.ref_published', 'untrusted-test', ?, ?, ?, ?)
+                """,
+                (
+                    f"null-forged-{pending['id']}",
+                    forged_payload,
+                    "0" * 64,
+                    "0" * 64,
+                    datetime.now(UTC).isoformat(timespec="microseconds"),
+                ),
+            )
+    assert pending["verdict"] == "publish_pending"
+    assert pending["branch"] == planted_ref["reference"].removeprefix("refs/heads/")
+    supervisor.reap_expired()
+
+    recovered = GitSupervisor(repo)
+
+    with recovered.connect() as connection:
+        terminal = connection.execute(
+            "SELECT branch, commit_sha, verdict, error FROM integrations WHERE id = ?",
+            (pending["id"],),
+        ).fetchone()
+    assert terminal["verdict"] == "failed"
+    assert terminal["branch"] is None
+    assert "ownership unproven, preserving ref" in terminal["error"]
+    assert terminal["commit_sha"] == planted_ref["commit"]
+    assert (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", planted_ref["reference"]],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == planted_ref["commit"]
+    )
+
+
 def test_host_captured_container_identity_is_exposed_but_not_overstated() -> None:
     resource = {
         "driver": "api",
@@ -345,6 +1097,87 @@ def test_single_host_captured_container_must_match_the_app_report(
     assert "container_id" in receipt["targets"][0]["mismatches"]
 
 
+def test_resource_snapshot_digest_changes_when_related_host_identity_evidence_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, _, _ = evaluate_target(tmp_path, monkeypatch)
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    resources = driver_resources()
+    resources[2]["evidence"] = {
+        "proof": {"observation": {"stdout": "aaaaaaaaaaaa\n", "stderr": "ignored"}}
+    }
+    second, _, _ = evaluate_target(replacement_dir, monkeypatch, resources=resources)
+
+    first_queue = first["targets"][0]["resource_snapshots"][2]
+    second_queue = second["targets"][0]["resource_snapshots"][2]
+    assert first_queue["resource_id"] == second_queue["resource_id"]
+    assert first_queue["host_identity"]["container_ids"] == ["fedcba987654"]
+    assert second_queue["host_identity"]["container_ids"] == ["aaaaaaaaaaaa"]
+    assert (
+        first["targets"][0]["resource_snapshot_sha256"]
+        != second["targets"][0]["resource_snapshot_sha256"]
+    )
+    assert second["verified"] is False
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "private-evidence-sentinel",
+        ["private-list-evidence-sentinel"],
+        {"proof": {"observation": "private-observation-sentinel"}},
+        {
+            "proof": {
+                "observation": {
+                    "stdout": "private-driver-output-sentinel",
+                    "stderr": "private-driver-stderr-sentinel",
+                }
+            }
+        },
+        {
+            "proof": {
+                "observation": {
+                    "stdout": "x" * 8193,
+                    "stderr": "private-oversize-stderr-sentinel",
+                }
+            }
+        },
+    ],
+)
+def test_resource_snapshot_malformed_or_untrusted_evidence_fails_closed_and_is_not_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evidence: Any
+) -> None:
+    resources = driver_resources()
+    resources[0]["evidence"] = evidence
+    receipt, environment, _blocked = evaluate_target(tmp_path, monkeypatch, resources=resources)
+
+    target = receipt["targets"][0]
+    snapshot = target["resource_snapshots"][0]
+    assert snapshot["host_identity"] == {
+        "status": "unknown",
+        "container_ids": [],
+        "process_identity": None,
+    }
+    assert target["resource_snapshot_sha256"] == sha256(
+        canonical_json(target["resource_snapshots"]).encode("utf-8")
+    )
+    serialized = canonical_json(receipt)
+    manifest = Path(environment["ACP_RUNTIME_TARGETS_FILE"]).read_text(encoding="utf-8")
+    for sentinel in (
+        "private-evidence-sentinel",
+        "private-list-evidence-sentinel",
+        "private-observation-sentinel",
+        "private-driver-output-sentinel",
+        "private-driver-stderr-sentinel",
+        "private-oversize-stderr-sentinel",
+    ):
+        assert sentinel not in serialized
+        assert sentinel not in manifest
+    assert "x" * 8193 not in serialized
+    assert "x" * 8193 not in manifest
+
+
 @pytest.mark.parametrize(
     ("entry", "port_envs", "driver_names"),
     [
@@ -367,6 +1200,16 @@ def test_single_host_captured_container_must_match_the_app_report(
         ),
         (
             {"name": "api", "port_env": "APP_PORT", "driver": "api", "unexpected": "value"},
+            {"APP_PORT"},
+            {"api"},
+        ),
+        (
+            {
+                "name": "api",
+                "port_env": "APP_PORT",
+                "driver": "api",
+                "require_command_binding": "yes",
+            },
             {"APP_PORT"},
             {"api"},
         ),
@@ -398,14 +1241,30 @@ def test_target_names_must_not_alias_environment_variables() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stale_qc_worktree", "pause_phase"),
-    [(False, None), (True, None), (False, "qc"), (False, "integration")],
+    (
+        "stale_qc_worktree",
+        "pause_phase",
+        "strict_binding_phase",
+        "resource_replacement_phase",
+    ),
+    [
+        (False, None, None, None),
+        (True, None, None, None),
+        (False, "qc", None, None),
+        (False, "integration", None, None),
+        (False, None, "qc", None),
+        (False, None, "integration", None),
+        (False, None, None, "qc"),
+        (False, None, None, "integration"),
+    ],
 )
 def test_qc_and_integration_receive_claim_fenced_target_receipts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stale_qc_worktree: bool,
     pause_phase: str | None,
+    strict_binding_phase: str | None,
+    resource_replacement_phase: str | None,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -415,9 +1274,11 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         port = probe.getsockname()[1]
     gate_started = tmp_path / "target-gate-started"
     gate_release = tmp_path / "target-gate-release"
+    command_entered = tmp_path / "target-command-entered"
     gate = python_command(
         "import hashlib, json, os, stat, time\n"
         "from pathlib import Path\n"
+        f"Path({str(command_entered)!r}).write_text('entered')\n"
         "p = Path(os.environ['ACP_RUNTIME_TARGETS_FILE'])\n"
         "raw = p.read_bytes()\n"
         "m = json.loads(raw)\n"
@@ -426,6 +1287,7 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         "assert m['phase'] == os.environ['ACP_PHASE']\n"
         "assert m['claim_token'] == int(os.environ['ACP_CLAIM_TOKEN'])\n"
         "assert m['source_revision'] == os.environ['ACP_SOURCE_REVISION']\n"
+        "assert m['live_runtime_sampled_at']\n"
         "assert m['targets'][0]['endpoint'] == os.environ['ACP_TARGET_API_URL']\n"
         f"if os.environ['ACP_PHASE'] == {pause_phase!r}:\n"
         f"    Path({str(gate_started)!r}).write_text('started')\n"
@@ -435,13 +1297,26 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         f"    assert Path({str(gate_release)!r}).exists(), 'restart race gate was not released'\n"
         "Path(os.environ['ACP_RUNTIME_DIR'], 'target-gate-ran').write_text(os.environ['ACP_PHASE'])"
     )
-    write_config(repo, qc_commands=[gate], integration_commands=[gate])
+    qc_command = python_command("pass") if strict_binding_phase == "integration" else gate
+    second_gate_command = python_command("pass")
+    write_config(
+        repo,
+        qc_commands=[qc_command, second_gate_command],
+        integration_commands=[gate, second_gate_command],
+    )
+    target_phases = (
+        [strict_binding_phase] if strict_binding_phase is not None else ["qc", "integration"]
+    )
+    target_phase_text = json.dumps(target_phases)
+    strict_binding_text = (
+        "require_command_binding = true\n" if strict_binding_phase is not None else ""
+    )
     with (repo / "acp.toml").open("a", encoding="utf-8") as config:
         config.write(
             f"\n[runtime.ports]\nAPP_PORT = [{port}, {port}]\n"
             '\n[[runtime.drivers]]\nname = "api"\nkind = "browser_profile"\n'
             '\n[[runtime.targets]]\nname = "api"\nport_env = "APP_PORT"\n'
-            'driver = "api"\nphases = ["qc", "integration"]\n'
+            f'driver = "api"\nphases = {target_phase_text}\n{strict_binding_text}'
         )
     supervisor = GitSupervisor(repo)
     concurrent_supervisor = GitSupervisor(repo)
@@ -452,9 +1327,71 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         ["alpha.txt"],
     )
     attempt = supervisor.claim(created["id"], "worker")
-    server = _TargetIdentityServer(200, "application/json", b"{}", port=port)
     context: dict[str, Any] = {}
+    replacement_state = {"armed": False}
+    original_driver_resources = supervisor.driver_resources
+
+    def replaced_driver_resources(attempt_id: str, *, fresh: bool = False):
+        rows = original_driver_resources(attempt_id, fresh=fresh)
+        if (
+            replacement_state["armed"]
+            and attempt_id == attempt["id"]
+            and (
+                isinstance(rows, list)
+                or isinstance(rows, dict)
+                and isinstance(rows.get("resources"), list)
+            )
+        ):
+            replacement_state["armed"] = False
+            is_snapshot = isinstance(rows, dict)
+            resource_rows = rows["resources"] if is_snapshot else rows
+            replaced_rows = []
+            for item in resource_rows:
+                if item.get("driver") == "api":
+                    replacement_id = f"{item['resource_id']}-replaced"
+                    context["driver_resource_id"] = replacement_id
+                    replaced_rows.append({**item, "resource_id": replacement_id})
+                else:
+                    replaced_rows.append(item)
+            return {**rows, "resources": replaced_rows} if is_snapshot else replaced_rows
+        return rows
+
+    monkeypatch.setattr(supervisor, "driver_resources", replaced_driver_resources)
+
+    def arm_replacement_after_preflight(original):
+        def wrapped_runtime_target_phase(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if (
+                resource_replacement_phase is not None
+                and kwargs.get("baseline_receipt") is None
+                and kwargs.get("phase") == resource_replacement_phase
+            ):
+                replacement_state["armed"] = True
+            return result
+
+        return wrapped_runtime_target_phase
+
+    monkeypatch.setattr(
+        qc_module,
+        "runtime_target_phase",
+        arm_replacement_after_preflight(qc_module.runtime_target_phase),
+    )
+    monkeypatch.setattr(
+        integration_module,
+        "runtime_target_phase",
+        arm_replacement_after_preflight(integration_module.runtime_target_phase),
+    )
+    identity_probes: list[tuple[int, str]] = []
+    original_identity_probe = runtime_targets.probe_target_identity
+
+    def capture_identity_probe(port: int, identity_path: str):
+        identity_probes.append((port, identity_path))
+        return original_identity_probe(port, identity_path)
+
+    monkeypatch.setattr(runtime_targets, "probe_target_identity", capture_identity_probe)
+    server = _TargetIdentityServer(200, "application/json", b"{}", port=port)
     original_restart = supervisor._runtime_restart_in_operation
+    restart_phases: list[str] = []
 
     def capture_phase(
         attempt_id: str,
@@ -463,6 +1400,8 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         *,
         phase_context=None,
     ):
+        if phase_context:
+            restart_phases.append(phase_context.get("ACP_PHASE", ""))
         restarted = original_restart(
             attempt_id,
             operation_guard_fd,
@@ -543,6 +1482,68 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         qc_result = run_with_restart_race(
             "qc", lambda: supervisor.run_qc(submission["id"], "independent-qc")
         )
+        if strict_binding_phase == "qc":
+            assert qc_result["verdict"] == "block"
+            assert qc_result["runtime_cleanup"]["state"] == "teardown_failed"
+            with supervisor.connect() as connection:
+                task_status = connection.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (submission["task_id"],)
+                ).fetchone()["status"]
+                teardown_events = connection.execute(
+                    "SELECT payload_json FROM events WHERE event_type = ? ORDER BY sequence DESC",
+                    ("runtime.teardown_failed",),
+                ).fetchall()
+            assert task_status == "cleanup_pending"
+            teardown_payloads = [json.loads(row["payload_json"]) for row in teardown_events]
+            teardown_payload = next(
+                payload
+                for payload in teardown_payloads
+                if payload.get("attempt_id") == attempt["id"]
+            )
+            assert teardown_payload["occupied"] == [f"APP_PORT={port}"]
+            assert any(
+                allocation["pool_name"] == "APP_PORT" and allocation["value"] == port
+                for allocation in qc_result["runtime_cleanup"]["allocations"]
+            )
+            assert restart_phases == [], "strict QC restarted a runtime before its guaranteed block"
+            assert identity_probes == [], "strict QC probed app self-report without command binding"
+            with supervisor.connect() as connection:
+                qc = connection.execute(
+                    "SELECT id, packet_sha256, results_json FROM qc_runs "
+                    "WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
+                    (submission["id"],),
+                ).fetchone()
+            qc_receipt = next(
+                item
+                for item in json.loads(qc["results_json"])
+                if item.get("kind") == "runtime_target_preflight"
+            )
+            assert qc_receipt["blocking_reason"] == ("runtime_target_command_binding_unavailable")
+            assert qc_receipt["targets"][0]["status"] == "unknown"
+            assert qc_receipt["targets"][0]["probe_status"] == "skipped_command_binding_unavailable"
+            packet_path = (
+                supervisor.state_dir / "logs" / f"review-{submission['id']}-{qc['id']}.json"
+            )
+            packet_bytes = packet_path.read_bytes()
+            assert hashlib.sha256(packet_bytes).hexdigest() == qc["packet_sha256"]
+            packet = json.loads(packet_bytes)
+            assert (
+                packet["runtime_target_preflight"]["evidence_sha256"]
+                == qc_receipt["evidence_sha256"]
+            )
+            assert any(
+                item.get("sha256") == qc_receipt["evidence_sha256"]
+                for item in packet["evidence_catalog"]
+            )
+            assert not any(
+                "runtime_target_preflight_link" in item for item in json.loads(qc["results_json"])
+            )
+            assert not any(
+                item.get("command") in {qc_command, second_gate_command}
+                for item in json.loads(qc["results_json"])
+            )
+            assert not command_entered.exists(), "strict QC command was launched"
+            return
         if stale_qc_worktree:
             assert qc_result["verdict"] == "block"
             with supervisor.connect() as connection:
@@ -572,9 +1573,39 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 item.get("sha256") == qc_receipt["evidence_sha256"]
                 for item in packet["evidence_catalog"]
             )
-            assert not (
-                Path(attempt["runtime"]["environment"]["ACP_RUNTIME_DIR"]) / "target-gate-ran"
-            ).exists()
+            assert not command_entered.exists(), "stale QC command was launched"
+            return
+        if resource_replacement_phase == "qc":
+            assert qc_result["verdict"] == "block"
+            with supervisor.connect() as connection:
+                qc = connection.execute(
+                    "SELECT id, packet_sha256, results_json FROM qc_runs "
+                    "WHERE submission_id = ? ORDER BY finished_at DESC LIMIT 1",
+                    (submission["id"],),
+                ).fetchone()
+            qc_results = json.loads(qc["results_json"])
+            replacement_receipt = next(
+                item for item in qc_results if item.get("kind") == "runtime_target_revalidation"
+            )
+            assert replacement_receipt["status"] == "blocked"
+            assert replacement_receipt["blocking_reason"] == "runtime_target_resource_replaced"
+            assert replacement_receipt["resource_replacement_detected"] is True
+            assert replacement_receipt["targets"][0]["resource_snapshot_matches_preflight"] is False
+            assert replacement_receipt["targets"][0]["mismatches"] == ["resource_snapshot_sha256"]
+            packet_path = (
+                supervisor.state_dir / "logs" / f"review-{submission['id']}-{qc['id']}.json"
+            )
+            packet_bytes = packet_path.read_bytes()
+            packet = json.loads(packet_bytes)
+            assert hashlib.sha256(packet_bytes).hexdigest() == qc["packet_sha256"]
+            assert any(
+                item.get("sha256") == replacement_receipt["evidence_sha256"]
+                for item in packet["evidence_catalog"]
+            )
+            assert not any(
+                item.get("command") in {qc_command, second_gate_command} for item in qc_results
+            )
+            assert not command_entered.exists(), "replaced-target QC command was launched"
             return
         assert qc_result["verdict"] == "pass", qc_result.get("findings")
         with supervisor.connect() as connection:
@@ -584,18 +1615,171 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
                 (submission["id"],),
             ).fetchone()
         qc_results = json.loads(qc["results_json"])
-        qc_receipt = next(
+        qc_target_receipts = [
             item for item in qc_results if item.get("kind") == "runtime_target_preflight"
-        )
-        assert qc_receipt["phase"] == "qc"
-        assert qc_receipt["source_revision"] == submission["commit_sha"]
-        assert qc_receipt["claim_token"] == attempt["claim_token"]
-        assert qc_receipt["targets"][0]["status"] == "corroborated"
-        assert qc_receipt["verified"] is False
+        ]
+        if strict_binding_phase == "integration":
+            assert qc_target_receipts == []
+            qc_gate_results = [
+                item
+                for item in qc_results
+                if item.get("command") in {qc_command, second_gate_command}
+            ]
+            assert [item["command"] for item in qc_gate_results] == [
+                qc_command,
+                second_gate_command,
+            ]
+            assert not any("runtime_target_preflight_link" in item for item in qc_gate_results)
+        else:
+            qc_receipt = qc_target_receipts[0]
+            assert qc_receipt["phase"] == "qc"
+            assert qc_receipt["source_revision"] == submission["commit_sha"]
+            assert qc_receipt["claim_token"] == attempt["claim_token"]
+            assert qc_receipt["targets"][0]["status"] == "corroborated"
+            assert qc_receipt["verified"] is False
+            qc_revalidations = [
+                item for item in qc_results if item.get("kind") == "runtime_target_revalidation"
+            ]
+            assert len(qc_revalidations) == 2
+            for _index, receipt in enumerate(qc_revalidations, start=1):
+                assert receipt["baseline_evidence_id"] == qc_receipt["evidence_id"]
+                assert receipt["baseline_evidence_sha256"] == qc_receipt["evidence_sha256"]
+                assert receipt["targets"][0]["resource_snapshot_matches_preflight"] is True
+            qc_gate_results = [
+                item for item in qc_results if item.get("runtime_target_preflight_link")
+            ]
+            assert len(qc_gate_results) == 2
+            assert [item["command"] for item in qc_gate_results] == [
+                qc_command,
+                second_gate_command,
+            ]
+            for index, result in enumerate(qc_gate_results, start=1):
+                assert result["runtime_target_preflight_link"] == {
+                    "evidence_id": qc_receipt["evidence_id"],
+                    "evidence_sha256": qc_receipt["evidence_sha256"],
+                    "command_set_sha256": qc_receipt["command_set_sha256"],
+                    "command_count": 2,
+                    "command_index": index,
+                }
+                assert result["runtime_target_freshness_link"] == {
+                    "evidence_id": qc_revalidations[index - 1]["evidence_id"],
+                    "evidence_sha256": qc_revalidations[index - 1]["evidence_sha256"],
+                    "preflight_evidence_id": qc_receipt["evidence_id"],
+                    "command_index": index,
+                }
 
+        unowned_integration_ref: dict[str, str] = {}
+        if strict_binding_phase == "integration":
+            original_event = supervisor._event
+
+            def expose_integration_ref_name(
+                connection, event_type: str, actor: str, payload: dict[str, Any]
+            ) -> None:
+                original_event(connection, event_type, actor, payload)
+                if event_type == "integration.started":
+                    reference = (
+                        f"refs/heads/acp/integrate-{attempt['task_id'][:8]}-"
+                        f"{payload['integration_id'][:8]}"
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            reference,
+                            submission["commit_sha"],
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    unowned_integration_ref["reference"] = reference
+
+            monkeypatch.setattr(supervisor, "_event", expose_integration_ref_name)
+        if resource_replacement_phase == "integration":
+            command_entered.unlink(missing_ok=True)
         integrated = run_with_restart_race(
             "integration", lambda: supervisor.integrate(attempt["task_id"])
         )
+        if strict_binding_phase == "integration":
+            assert integrated["verdict"] == "failed"
+            with supervisor.connect() as connection:
+                integration = connection.execute(
+                    "SELECT results_json FROM integrations "
+                    "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (attempt["task_id"],),
+                ).fetchone()
+            integration_receipt = next(
+                item
+                for item in json.loads(integration["results_json"])
+                if item.get("kind") == "runtime_target_preflight"
+            )
+            integration_results = json.loads(integration["results_json"])
+            assert integration_receipt["blocking_reason"] == (
+                "runtime_target_command_binding_unavailable"
+            )
+            assert integration_receipt["targets"][0]["status"] == "unknown"
+            assert integration_receipt["phase"] == "integration"
+            assert integration_receipt["source_revision"] == submission["commit_sha"]
+            assert integration_receipt["claim_token"] == attempt["claim_token"]
+            assert integration_receipt["targets"][0]["probe_status"] == (
+                "skipped_command_binding_unavailable"
+            )
+            assert "app identity endpoint was not probed" in " ".join(
+                integration_receipt["limitations"]
+            )
+            assert not any("runtime_target_preflight_link" in item for item in integration_results)
+            assert not any(
+                item.get("command") in {gate, second_gate_command} for item in integration_results
+            )
+            assert len(integration_results) == 1, "integration merge ran before strict block"
+            assert integrated["commit_sha"] is None
+            assert integrated["branch"] is None
+            assert "integration" not in restart_phases
+            assert identity_probes == [], "strict integration block probed the app endpoint"
+            assert unowned_integration_ref.get("reference")
+            assert (
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "rev-parse",
+                        "--verify",
+                        unowned_integration_ref["reference"],
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                == submission["commit_sha"]
+            )
+            assert not command_entered.exists(), "strict integration command was launched"
+            return
+        if resource_replacement_phase == "integration":
+            assert integrated["verdict"] == "failed", integrated
+            with supervisor.connect() as connection:
+                integration = connection.execute(
+                    "SELECT results_json FROM integrations "
+                    "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (attempt["task_id"],),
+                ).fetchone()
+            integration_results = json.loads(integration["results_json"])
+            replacement_receipt = next(
+                item
+                for item in integration_results
+                if item.get("kind") == "runtime_target_revalidation"
+            )
+            assert replacement_receipt["status"] == "blocked"
+            assert replacement_receipt["blocking_reason"] == "runtime_target_resource_replaced"
+            assert replacement_receipt["resource_replacement_detected"] is True
+            assert replacement_receipt["targets"][0]["resource_snapshot_matches_preflight"] is False
+            assert replacement_receipt["targets"][0]["mismatches"] == ["resource_snapshot_sha256"]
+            assert not any(
+                item.get("command") in {gate, second_gate_command} for item in integration_results
+            )
+            assert not command_entered.exists(), "replaced-target integration command was launched"
+            return
         assert integrated["verdict"] == "pass", integrated["error"]
         with supervisor.connect() as connection:
             integration = connection.execute(
@@ -612,6 +1796,38 @@ def test_qc_and_integration_receive_claim_fenced_target_receipts(
         assert integration_receipt["claim_token"] == attempt["claim_token"]
         assert integration_receipt["targets"][0]["status"] == "corroborated"
         assert integration_receipt["verified"] is False
+        integration_revalidations = [
+            item
+            for item in integration_results
+            if item.get("kind") == "runtime_target_revalidation"
+        ]
+        assert len(integration_revalidations) == 2
+        for receipt in integration_revalidations:
+            assert receipt["baseline_evidence_id"] == integration_receipt["evidence_id"]
+            assert receipt["baseline_evidence_sha256"] == integration_receipt["evidence_sha256"]
+            assert receipt["targets"][0]["resource_snapshot_matches_preflight"] is True
+        integration_gate_results = [
+            item for item in integration_results if item.get("runtime_target_preflight_link")
+        ]
+        assert len(integration_gate_results) == 2
+        assert [item["command"] for item in integration_gate_results] == [
+            gate,
+            second_gate_command,
+        ]
+        for index, result in enumerate(integration_gate_results, start=1):
+            assert result["runtime_target_preflight_link"] == {
+                "evidence_id": integration_receipt["evidence_id"],
+                "evidence_sha256": integration_receipt["evidence_sha256"],
+                "command_set_sha256": integration_receipt["command_set_sha256"],
+                "command_count": 2,
+                "command_index": index,
+            }
+            assert result["runtime_target_freshness_link"] == {
+                "evidence_id": integration_revalidations[index - 1]["evidence_id"],
+                "evidence_sha256": integration_revalidations[index - 1]["evidence_sha256"],
+                "preflight_evidence_id": integration_receipt["evidence_id"],
+                "command_index": index,
+            }
     finally:
         server.shutdown()
         server.server_close()

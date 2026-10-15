@@ -2381,10 +2381,13 @@ class GitSupervisor(
             definitions = tuple(
                 definition for definition in definitions if definition.name in only_drivers
             )
-        if read_only and any(definition.kind != "namespace_runtime" for definition in definitions):
+        if read_only and any(
+            definition.kind not in {"namespace_runtime", "docker_compose"}
+            for definition in definitions
+        ):
             raise SupervisorError(
                 "runtime_probe_mode_invalid",
-                "read-only resource sampling only supports namespace runtime drivers",
+                "read-only resource sampling only supports namespace and Docker Compose drivers",
             )
         if not definitions:
             return []
@@ -2396,10 +2399,18 @@ class GitSupervisor(
             credential_name = definition.option("credential")
             if not credential_name:
                 continue
-            if read_only and phase == "verify" and definition.kind == "namespace_runtime":
-                # A cgroup usage probe only asks systemd for its owned unit's
-                # accounting properties; it must never materialize payload
-                # credentials merely to inspect process/resource counters.
+            if (
+                read_only
+                and phase == "verify"
+                and definition.kind
+                in {
+                    "namespace_runtime",
+                    "docker_compose",
+                }
+            ):
+                # These probes only inspect their already-owned resource (systemd
+                # accounting properties or `docker compose ps`); they must never
+                # materialize payload credentials during read-only sampling.
                 continue
             stored = stored_by_name.get(definition.name)
             use_stored = stored is not None and not (
@@ -2462,6 +2473,8 @@ class GitSupervisor(
             execution_options["process_runner"] = self._run_trusted_contained
             if read_only:
                 execution_options["create_cwd"] = False
+                if definition.kind == "docker_compose":
+                    execution_options["max_output_bytes"] = 8192
             return run_trusted(
                 argv,
                 cwd,
