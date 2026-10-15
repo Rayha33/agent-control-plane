@@ -67,6 +67,31 @@ def test_openai_responses_usage_is_a_report_only_per_response_observation() -> N
     }
 
 
+@pytest.mark.parametrize(
+    ("detail_path", "detail"),
+    [
+        ("input_tokens_details", {"cached_tokens": 3, "cache_write_tokens": 2}),
+        ("output_tokens_details", {"reasoning_tokens": 4}),
+    ],
+)
+def test_openai_responses_usage_rejects_detail_counts_above_parent(detail_path, detail) -> None:
+    usage = {
+        "input_tokens": 4,
+        "output_tokens": 3,
+        "total_tokens": 7,
+        "input_tokens_details": {},
+        "output_tokens_details": {},
+    }
+    usage[detail_path] = detail
+    response = _response(usage=usage)
+
+    report = parse_openai_responses_usage(response, observed_at=OBSERVED_AT).as_dict()
+
+    assert report["status"] == "invalid"
+    assert report["measurements"] == {}
+    assert report["reason"] == "provider_usage_malformed"
+
+
 def test_anthropic_messages_usage_normalizes_cached_input_and_validates_contract() -> None:
     response = {
         "type": "message",
@@ -185,7 +210,7 @@ def test_gemini_usage_includes_thinking_tokens_in_normalized_output() -> None:
             "candidatesTokenCount": 6,
             "thoughtsTokenCount": 3,
             "toolUsePromptTokenCount": 2,
-            "totalTokenCount": 19,
+            "totalTokenCount": 21,
         },
     }
 
@@ -204,11 +229,11 @@ def test_gemini_usage_includes_thinking_tokens_in_normalized_output() -> None:
         "response_created_at": None,
         "measurements": {
             "cached_input_tokens": 4,
-            "input_tokens": 10,
+            "input_tokens": 12,
             "output_tokens": 9,
             "reasoning_output_tokens": 3,
             "tool_use_prompt_tokens": 2,
-            "total_tokens": 19,
+            "total_tokens": 21,
         },
         "freshness": "unknown",
         "enforcement": "report_only",
@@ -226,6 +251,32 @@ def test_gemini_usage_includes_thinking_tokens_in_normalized_output() -> None:
             "measurement_response_counts": {name: 1 for name in report["measurements"]},
         }
     )
+
+
+def test_gemini_url_context_usage_counts_tool_use_prompt_in_input_and_total() -> None:
+    response = {
+        "responseId": "geminiResponse_url_context",
+        "modelVersion": "gemini-2.5-pro",
+        "usageMetadata": {
+            "promptTokenCount": 27,
+            "toolUsePromptTokenCount": 10309,
+            "candidatesTokenCount": 45,
+            "thoughtsTokenCount": 31,
+            "totalTokenCount": 10412,
+        },
+    }
+
+    report = parse_gemini_generate_content_usage(response, observed_at=OBSERVED_AT).as_dict()
+
+    assert report["status"] == "reported"
+    assert report["measurements"] == {
+        "input_tokens": 10336,
+        "output_tokens": 76,
+        "reasoning_output_tokens": 31,
+        "tool_use_prompt_tokens": 10309,
+        "total_tokens": 10412,
+    }
+    ProviderUsageReport.model_validate(report)
 
 
 @pytest.mark.parametrize(
@@ -256,6 +307,15 @@ def test_gemini_usage_includes_thinking_tokens_in_normalized_output() -> None:
                 "totalTokenCount": 2,
             },
             "provider_usage_malformed",
+        ),
+        (
+            {
+                "promptTokenCount": 1,
+                "toolUsePromptTokenCount": 2,
+                "candidatesTokenCount": 1,
+                "totalTokenCount": 3,
+            },
+            "provider_usage_inconsistent_total",
         ),
     ],
 )

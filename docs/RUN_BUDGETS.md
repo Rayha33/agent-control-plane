@@ -139,11 +139,16 @@ and known token-detail fields with a provider response ID, model, and
 client-observed time; provider-created time is retained when the provider
 supplies it. Anthropic's documented total input is the sum of ordinary input,
 cache-read, and cache-creation tokens; ACP retains the cache components as
-details. Gemini thinking tokens are included in normalized output and retained
-as details. Gemini `toolUsePromptTokenCount` is retained as a detail but is
-excluded from this Developer API's documented total; Vertex AI documents a
-different total-token formula that includes tool-use prompt tokens and needs a
-separate parser. Each report is `reported`, `missing`, or `invalid`; the API
+details. OpenAI Responses exposes `cached_tokens` and `cache_write_tokens` as
+input details and `reasoning_tokens` as an output detail; ACP retains and
+parent-bounds them ([Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create)).
+Gemini thinking tokens are included in normalized output and retained as
+details; `toolUsePromptTokenCount` is included in normalized input while
+remaining available as a detail. Both Gemini Developer API GenerateContent and
+Vertex AI document totals that include prompt, tool-use prompt, thoughts, and
+response candidates. ACP currently implements only the Developer API response
+adapter; matching token accounting does not imply Vertex adapter support. Each
+report is `reported`, `missing`, or `invalid`; the API
 also timestamps receipt ingestion.
 These are client-reported observations: ACP does not authenticate response
 bodies or infer billing. ACP can aggregate a bounded sample of these

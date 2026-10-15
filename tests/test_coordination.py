@@ -958,6 +958,90 @@ def test_provider_usage_report_rejects_timestamp_that_cannot_normalize_to_utc():
         )
 
 
+@pytest.mark.parametrize(
+    ("provider", "adapter", "measurements"),
+    [
+        (
+            "openai",
+            "responses",
+            {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "cached_input_tokens": 3,
+                "cache_write_input_tokens": 2,
+            },
+        ),
+        (
+            "openai",
+            "responses",
+            {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "reasoning_output_tokens": 4,
+            },
+        ),
+        (
+            "gemini",
+            "generate_content",
+            {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "tool_use_prompt_tokens": 5,
+            },
+        ),
+    ],
+)
+def test_provider_usage_report_rejects_detail_counts_above_parent(provider, adapter, measurements):
+    with pytest.raises(ValueError, match="detail exceeds its parent token count"):
+        ProviderUsageReport.model_validate(
+            {
+                "status": "reported",
+                "provider": provider,
+                "adapter": adapter,
+                "source": "client_reported",
+                "scope": "single_response",
+                "unit": "tokens",
+                "observed_at": "2026-10-15T00:00:00Z",
+                "response_id": "resp_usage_detail",
+                "model": "model-test",
+                "measurements": measurements,
+                "freshness": "unknown",
+                "enforcement": "report_only",
+                "reason": None,
+            }
+        )
+
+
+def test_provider_usage_report_accepts_details_at_parent_boundaries():
+    ProviderUsageReport.model_validate(
+        {
+            "status": "reported",
+            "provider": "openai",
+            "adapter": "responses",
+            "source": "client_reported",
+            "scope": "single_response",
+            "unit": "tokens",
+            "observed_at": "2026-10-15T00:00:00Z",
+            "response_id": "resp_usage_boundary",
+            "model": "model-test",
+            "measurements": {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "cached_input_tokens": 3,
+                "cache_write_input_tokens": 1,
+                "reasoning_output_tokens": 3,
+            },
+            "freshness": "unknown",
+            "enforcement": "report_only",
+            "reason": None,
+        }
+    )
+
+
 def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
     client, app, admin_headers, monkeypatch
 ):

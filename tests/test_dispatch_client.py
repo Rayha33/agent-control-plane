@@ -371,7 +371,7 @@ def test_gemini_generate_content_adapter_sends_once_and_records_report_only_usag
             "candidatesTokenCount": 4,
             "thoughtsTokenCount": 2,
             "toolUsePromptTokenCount": 1,
-            "totalTokenCount": 11,
+            "totalTokenCount": 12,
         },
     }
     raw = FakeProviderResponse(200, {"content-type": "application/json"}, json.dumps(body).encode())
@@ -396,11 +396,11 @@ def test_gemini_generate_content_adapter_sends_once_and_records_report_only_usag
     assert result.provider_usage_report["status"] == "reported"
     assert result.provider_usage_report["measurements"] == {
         "cached_input_tokens": 1,
-        "input_tokens": 5,
+        "input_tokens": 6,
         "output_tokens": 6,
         "reasoning_output_tokens": 2,
         "tool_use_prompt_tokens": 1,
-        "total_tokens": 11,
+        "total_tokens": 12,
     }
     assert ledger.receipts == [("attempt-1", 200, None)]
     assert ledger.usage_reports == [("attempt-1", result.provider_usage_report)]
