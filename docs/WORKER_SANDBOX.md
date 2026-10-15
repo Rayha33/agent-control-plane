@@ -806,18 +806,44 @@ A/AAAA pin construction, the trailing-dot resolver argument, and a fake-socket
 assertion that policy-authorized dialing uses the vetted numeric sockaddr with
 no second hostname lookup.
 
-This is not a proxy implementation or a live network/guest test. It does not
-prove worker reachability is restricted to a per-attempt proxy, same-UID socket
-denial, socket-FD hygiene, TLS CONNECT behavior, redirect handling, real DNS
-resolver behavior, credential delivery, or provider authentication. A blind
-HTTPS CONNECT proxy can gate only the requested authority and pinned IP; it
-cannot inspect encrypted SNI, HTTP `Host`, URL/path, API method, or redirects,
-and cannot stop exfiltration to an explicitly allowed provider hostname. Any
-redirect policy must be enforced when the client requests its next CONNECT.
+The policy primitive alone does not prove worker reachability is restricted to
+a per-attempt proxy, same-UID socket denial, socket-FD hygiene, TLS CONNECT
+behavior, redirect handling, real DNS resolver behavior, credential delivery,
+or provider authentication. A blind HTTPS CONNECT proxy can gate only the
+requested authority and pinned IP; it cannot inspect encrypted SNI, HTTP
+`Host`, URL/path, API method, or redirects, and cannot stop exfiltration to an
+explicitly allowed provider hostname. Any redirect policy must be enforced
+when the client requests its next CONNECT.
 The existing systemd `LoadCredential=` evidence establishes read-only
 per-unit visibility only, not secrecy from the host UID or root. No code here
 is wired to `run_worker()`, and configured OCI worker execution remains
 fail-closed.
+
+### Provider CONNECT handler primitive (2026-10-15; socketpair/TLS unit proof)
+
+`supervisor/provider_proxy.py` adds a one-CONNECT-per-channel handler. It
+requires the caller to supply a peer-authorization callback before request
+parsing or dialing; it does not create a listener, obtain `SO_PEERCRED`, bind
+the channel to an attempt cgroup, or manage socket lifecycle. It rejects
+malformed CONNECT requests, request bodies, proxy credentials, mismatching
+`Host` fields, tunnel bytes co-read with the CONNECT headers, and tunnel bytes
+already queued when a post-dial preflight runs before the 200 response. A byte
+that arrives after that check races acceptance and is relayed unchanged; the
+protocol handler cannot provide a strict temporal boundary on a TCP stream.
+After policy approval it relays raw TLS bytes bidirectionally with bounded
+buffers and idle timeout. A redirect therefore needs a fresh channel and a
+second independent authority decision.
+
+The local TLS mock test proves the handler can tunnel a TLS request, return an
+HTTP 302 received inside TLS, and reject the client's next CONNECT to a
+non-allowlisted host before DNS or a second dial. The test injects a dial to
+its loopback TLS fixture only through a private test monkeypatch; the
+production policy still classifies a public test address, and production code
+cannot select the local target through policy configuration. These tests
+verify protocol/tunnel behavior only, not an authenticated attempt socket or
+provider-SDK compatibility. No live guest, systemd integration, credential
+handoff, or `run_worker()` integration is claimed; configured OCI execution
+remains fail-closed.
 
 ### Supervisor restart: public cancellation and launch-gate fencing (2026-10-15)
 
