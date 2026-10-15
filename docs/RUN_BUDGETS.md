@@ -452,9 +452,13 @@ must submit it with the same semantic operation/payload to a provider that
 guarantees deduplication. ACP cannot verify provider support or that the
 callback uses the key; if those conditions are not met, use `dispatch_once`
 instead. The policy requires a finite maximum of 1–10 attempts, caps each
-delay, and also caps the sum of scheduled retry delays to at most 24 hours
-(60 seconds by default). It retries only HTTP 500, 502, 503, or 504 when the
-response contains a valid `Retry-After` within both caps; every attempt uses a distinct ACP
+requested delay, and also caps cumulative retry waiting at up to 24 hours (60
+seconds by default). Each wait charges the greater of its requested
+`Retry-After` delay and the elapsed time measured monotonically around the
+wait. If a sleeper overshoots the total cap, the sequence stops before another
+provider callback; provider request time is not part of this wait-only cap. It
+retries only HTTP 500, 502, 503, or 504 when the response contains a valid
+`Retry-After` within both caps; every attempt uses a distinct ACP
 reservation/idempotency key, and each response with a confirmed receipt write
 gets its own immutable client-reported receipt. An ambiguous send or receipt failure ends the sequence
 without a confirmed receipt; its durable slot remains consumed. HTTP 429 is
