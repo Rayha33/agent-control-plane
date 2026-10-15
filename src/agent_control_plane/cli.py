@@ -143,6 +143,11 @@ def parser() -> argparse.ArgumentParser:
         help="run one agent session under a cooperative same-host checkout write fence",
     )
     checkout_exec.add_argument(
+        "--attempt",
+        dest="checkout_attempt_id",
+        help="active ACP attempt ID to pass to the child as ACP_ATTEMPT_ID",
+    )
+    checkout_exec.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="command and arguments to run after --",
@@ -942,6 +947,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise SupervisorError(
                     "missing_command", "pass an agent command after `checkout-exec --`"
                 )
+            inherited_attempt_id = os.environ.get("ACP_ATTEMPT_ID", "")
+            if (
+                args.checkout_attempt_id
+                and inherited_attempt_id
+                and args.checkout_attempt_id != inherited_attempt_id
+            ):
+                raise SupervisorError(
+                    "attempt_context_mismatch",
+                    "checkout-exec --attempt conflicts with the inherited ACP_ATTEMPT_ID",
+                )
+            attempt_id = args.checkout_attempt_id or inherited_attempt_id
             identity = identify_checkout(args.repo)
             with CheckoutWriteLease.local(identity.root) as lease:
                 if type(lease.fencing_token) is not int:
@@ -949,6 +965,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "checkout_fence_invalid", "checkout-exec has no active fencing token"
                     )
                 child_environment = os.environ.copy()
+                if attempt_id:
+                    child_environment["ACP_ATTEMPT_ID"] = attempt_id
                 child_environment["ACP_CHECKOUT_FENCE_RESOURCE"] = identity.resource
                 child_environment["ACP_CHECKOUT_FENCE_TOKEN"] = str(lease.fencing_token)
 
@@ -1044,8 +1062,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "reason": "checkout_fence_required",
                             "detail": (
                                 "this editor write is not running inside the active ACP "
-                                "checkout-exec fence; launch the session with "
-                                "`acp --repo <checkout> checkout-exec -- claude`"
+                                "checkout-exec fence; launch the active attempt worktree "
+                                "through checkout-exec and pass its active ID with "
+                                "`checkout-exec --attempt <active-attempt-id>`"
                             ),
                         }
                     )

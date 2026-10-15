@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -12,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from support import requires_linux_worker
+from support import make_task, requires_linux_worker
 
 from agent_control_plane import cli
 from agent_control_plane.checkout_identity import CheckoutWriteLease, identify_checkout
@@ -209,6 +210,140 @@ def test_checkout_exec_clears_pending_marker_after_successful_agent_command(
 
     assert result == 0
     assert created.read_text(encoding="utf-8") == "written under fence"
+    assert not list(identify_checkout(repo).common_dir.glob(".acp-checkout-*.pending"))
+
+
+def test_checkout_exec_attempt_context_allows_required_editor_hook(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    supervisor = cli.GitSupervisor(repo)
+    task = make_task(supervisor, "owned.txt")
+    attempt = supervisor.claim(task["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    command_prefix = (
+        f"{shlex.quote(sys.executable)} -m agent_control_plane.cli --repo {shlex.quote(str(repo))}"
+    )
+    install = cli.main(
+        [
+            "--repo",
+            str(worktree),
+            "hooks",
+            "install",
+            "--claude-code",
+            "--command",
+            command_prefix,
+            "--require-checkout-exec",
+        ]
+    )
+    assert install == 0
+    settings_path = worktree / ".claude" / "settings.json"
+    installed = json.loads(settings_path.read_text(encoding="utf-8"))
+    hook_command = installed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert hook_command == f"{command_prefix} guard --hook --require-checkout-exec || exit 2"
+
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(worktree / "owned.txt")},
+            "cwd": str(worktree),
+        }
+    )
+    child_code = (
+        "import io, sys; "
+        "from agent_control_plane.cli import main; "
+        f"sys.stdin = io.StringIO({payload!r}); "
+        f"raise SystemExit(main(['--repo', {str(repo)!r}, 'guard', '--hook', "
+        "'--require-checkout-exec']))"
+    )
+
+    result = cli.main(
+        [
+            "--repo",
+            str(worktree),
+            "checkout-exec",
+            "--attempt",
+            attempt["id"],
+            "--",
+            sys.executable,
+            "-c",
+            child_code,
+        ]
+    )
+
+    assert result == 0
+    assert not list(identify_checkout(worktree).common_dir.glob(".acp-checkout-*.pending"))
+
+
+def test_checkout_exec_without_attempt_context_does_not_fabricate_one(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    monkeypatch.delenv("ACP_ATTEMPT_ID", raising=False)
+    command_prefix = (
+        f"{shlex.quote(sys.executable)} -m agent_control_plane.cli --repo {shlex.quote(str(repo))}"
+    )
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(repo / "owned.txt")},
+            "cwd": str(repo),
+        }
+    )
+    install = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "hooks",
+            "install",
+            "--claude-code",
+            "--command",
+            command_prefix,
+            "--require-checkout-exec",
+        ]
+    )
+    assert install == 0
+    child_code = (
+        "import io, sys; "
+        "from agent_control_plane.cli import main; "
+        f"sys.stdin = io.StringIO({payload!r}); "
+        f"raise SystemExit(main(['--repo', {str(repo)!r}, 'guard', '--hook', "
+        "'--require-checkout-exec']))"
+    )
+
+    result = cli.main(
+        ["--repo", str(repo), "checkout-exec", "--", sys.executable, "-c", child_code]
+    )
+
+    assert result == 2
+    assert "missing_attempt" in capfd.readouterr().err
+    assert list(identify_checkout(repo).common_dir.glob(".acp-checkout-*.pending"))
+
+
+def test_checkout_exec_rejects_conflicting_attempt_context_before_starting_child(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    monkeypatch.setenv("ACP_ATTEMPT_ID", "inherited-attempt")
+
+    result = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "checkout-exec",
+            "--attempt",
+            "explicit-attempt",
+            "--",
+            sys.executable,
+            "-c",
+            "raise SystemExit(99)",
+        ]
+    )
+
+    assert result == 1
+    assert json.loads(capsys.readouterr().err)["error"] == "attempt_context_mismatch"
     assert not list(identify_checkout(repo).common_dir.glob(".acp-checkout-*.pending"))
 
 

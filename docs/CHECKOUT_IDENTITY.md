@@ -119,16 +119,31 @@ the callback. It improves adapter correctness when the caller honors the supplie
 path; it does not make a native editor or patch API use ACP unless that API is
 actually routed through this method.
 
-The adapter is opt-in. For Claude Code, install its structured editor hooks in
-checkout-fence-required mode and start the session through the wrapper:
+The adapter is opt-in. For Claude Code, use the active claim's worktree and attempt ID.
+Install the project hook settings into that worktree, but make the hook command open
+the initialized project root that owns `.acp/control.db`; attempt worktrees do not carry
+this local state:
 
 ```bash
-acp --repo /path/to/checkout hooks install --claude-code --require-checkout-exec
-acp --repo /path/to/checkout checkout-exec -- claude
+# Values come from the active claim and the initialized project root.
+acp --repo /path/to/attempt-worktree hooks install --claude-code \
+  --command "/path/to/acp --repo /path/to/project-root" --require-checkout-exec
+acp --repo /path/to/attempt-worktree checkout-exec \
+  --attempt <active-attempt-id> -- claude
 ```
 
+The hook requires both that live attempt context and the checkout fence;
+`checkout-exec --attempt` passes the ID to its child as `ACP_ATTEMPT_ID`. The
+`--command` value points `guard` back at the initialized project root while Claude's
+working directory and the lease remain bound to the attempt worktree. If the parent
+already exports `ACP_ATTEMPT_ID`, it may instead be inherited, but a conflicting
+explicit value is refused before the child starts. Omitting the attempt ID does not
+invent one: the hook remains fail-closed and rejects writes with `missing_attempt`.
+The default, non-required hook mode is unchanged. Quote paths with shell metacharacters
+for the hook's `--command` value.
+
 In this mode, `checkout-exec` holds the checkout lease for the foreground Claude Code
-process and passes its resource and fencing token to that process. The synchronous
+process and passes its attempt ID, resource, and fencing token to that process. The synchronous
 `PreToolUse` guard verifies that the matching pending write marker itself is still
 locked by the active session before allowing a structured editor write; an unrelated
 checkout lock is not sufficient. A session started without the wrapper and without a
