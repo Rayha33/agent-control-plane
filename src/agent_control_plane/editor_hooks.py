@@ -10,6 +10,7 @@ check `submit` applies to the diff — the adapter asks, the supervisor answers.
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -123,18 +124,39 @@ def _is_acp_hook(hook: Any, command: str) -> bool:
     if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
         return False
     hook_command = hook["command"]
-    if hook_command.startswith(f"{command} guard") or ACP_MANAGED_COMMAND_MARKER in hook_command:
+    if hook_command.startswith(f"{command} guard") or hook_command.endswith(
+        ACP_MANAGED_COMMAND_MARKER
+    ):
         return True
-    # Older installs had no stable marker. Recognize the default `acp guard`
-    # executable (including an absolute path or wrapper prefix) so switching to
-    # a state-root command removes the stale fail-closed hook instead of leaving
-    # two ACP hooks installed. New custom commands carry the marker above.
-    words = hook_command.split()
-    for index, word in enumerate(words[:-1]):
-        executable = word.strip("\"'")
-        if Path(executable).name == "acp" and "guard" in words[index + 1 :]:
-            return True
-    return False
+    return _is_legacy_acp_hook_command(hook_command)
+
+
+def _is_legacy_acp_hook_command(command: str) -> bool:
+    """Recognize only hook commands emitted before the stable ACP marker existed."""
+
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if not words or Path(words[0]).name != "acp":
+        return False
+
+    arguments = words[1:]
+    while arguments and arguments[0] != "guard":
+        if arguments[0] == "--repo" and len(arguments) > 1:
+            arguments = arguments[2:]
+        elif arguments[0].startswith("--repo="):
+            arguments = arguments[1:]
+        else:
+            return False
+    if not arguments or arguments[0] != "guard":
+        return False
+
+    generated_arguments = arguments[1:]
+    return generated_arguments == ["--describe"] or generated_arguments in (
+        ["--hook", "||", "exit", "2"],
+        ["--hook", "--require-checkout-exec", "||", "exit", "2"],
+    )
 
 
 def install_claude_code_hooks(

@@ -457,8 +457,14 @@ def test_install_replaces_legacy_default_hook_when_command_changes(tmp_path: Pat
     legacy_hooks["PreToolUse"][0]["hooks"].append(
         {"type": "command", "command": "my co-located user hook"}
     )
+    legacy_hooks["PreToolUse"][0]["hooks"].append(
+        {"type": "command", "command": "my-hook acp guard --audit"}
+    )
     legacy_hooks["SessionStart"].append(
         {"hooks": [{"type": "command", "command": "my session hook"}]}
+    )
+    legacy_hooks["SessionStart"].append(
+        {"hooks": [{"type": "command", "command": 'echo "acp guard is disabled"'}]}
     )
     settings_path.write_text(json.dumps({"hooks": legacy_hooks}), encoding="utf-8")
 
@@ -476,10 +482,12 @@ def test_install_replaces_legacy_default_hook_when_command_changes(tmp_path: Pat
     ]
     assert pre_tool_commands.count("my user hook") == 1
     assert pre_tool_commands.count("my co-located user hook") == 1
+    assert pre_tool_commands.count("my-hook acp guard --audit") == 1
     assert session_start_commands.count("my session hook") == 1
+    assert session_start_commands.count('echo "acp guard is disabled"') == 1
     assert sum(command.startswith(second_command) for command in pre_tool_commands) == 1
     assert sum(command.startswith(second_command) for command in session_start_commands) == 1
-    assert not any(command.startswith("acp guard") for command in pre_tool_commands)
+    assert "acp guard --hook --require-checkout-exec || exit 2" not in pre_tool_commands
     assert not any(command.startswith(first_command) for command in pre_tool_commands)
     assert not any(command.startswith(first_command) for command in session_start_commands)
 
