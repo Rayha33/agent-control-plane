@@ -240,7 +240,9 @@ def test_checkout_exec_attempt_context_allows_required_editor_hook(
     settings_path = worktree / ".claude" / "settings.json"
     installed = json.loads(settings_path.read_text(encoding="utf-8"))
     hook_command = installed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert hook_command == f"{command_prefix} guard --hook --require-checkout-exec || exit 2"
+    assert hook_command == (
+        f"{command_prefix} guard --hook --require-checkout-exec || exit 2 # acp-managed-hook:v1"
+    )
 
     payload = json.dumps(
         {

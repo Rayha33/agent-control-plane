@@ -28,6 +28,7 @@ HOOK_TOOL_MATCHER = "|".join(GUARDED_TOOLS)
 SETTINGS_RELATIVE_PATH = Path(".claude") / "settings.json"
 DENY_EXIT_CODE = 2
 """Claude Code blocks a PreToolUse hook's tool call on exit 2 and shows it stderr."""
+ACP_MANAGED_COMMAND_MARKER = " # acp-managed-hook:v1"
 
 
 def path_from_hook_payload(payload: Any) -> str | None:
@@ -61,6 +62,7 @@ def claude_code_hooks(command: str, *, require_checkout_exec: bool = False) -> d
     # launch (126/127), the ACP CLI never gets a chance to translate its own errors
     # into that blocking status; map every unsuccessful invocation to exit 2 here.
     guard_command += " || exit 2"
+    guard_command += ACP_MANAGED_COMMAND_MARKER
     return {
         "PreToolUse": [
             {
@@ -69,7 +71,14 @@ def claude_code_hooks(command: str, *, require_checkout_exec: bool = False) -> d
             }
         ],
         "SessionStart": [
-            {"hooks": [{"type": "command", "command": f"{command} guard --describe"}]}
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{command} guard --describe{ACP_MANAGED_COMMAND_MARKER}",
+                    }
+                ]
+            }
         ],
         # No heartbeat hook yet. `acp heartbeat` is a write that needs the claim token
         # and the runner credential, so wiring it here means deciding how a secret
@@ -87,26 +96,45 @@ def _merge_hook_events(
     A settings file is the user's, and it is normal for it to carry hooks that have
     nothing to do with ACP. Replacing the file — or even the `hooks` key — to install
     an integration would be a destructive act performed on the user's behalf, so this
-    drops only previous ACP entries (recognised by the command prefix) and appends the
-    current ones, leaving every other hook untouched.
+    drops only previous ACP entries (recognised by their command prefix or stable
+    command marker) and appends the current ones, leaving every other hook untouched.
     """
 
     merged = dict(existing)
     for event, entries in generated.items():
-        kept = [entry for entry in merged.get(event, []) if not _is_acp_entry(entry, command)]
+        kept = []
+        for entry in merged.get(event, []):
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                kept.append(entry)
+                continue
+            hooks = entry["hooks"]
+            remaining_hooks = [hook for hook in hooks if not _is_acp_hook(hook, command)]
+            if len(remaining_hooks) == len(hooks):
+                kept.append(entry)
+            elif remaining_hooks:
+                preserved_entry = dict(entry)
+                preserved_entry["hooks"] = remaining_hooks
+                kept.append(preserved_entry)
         merged[event] = kept + entries
     return merged
 
 
-def _is_acp_entry(entry: Any, command: str) -> bool:
-    if not isinstance(entry, dict):
+def _is_acp_hook(hook: Any, command: str) -> bool:
+    if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
         return False
-    return any(
-        isinstance(hook, dict)
-        and isinstance(hook.get("command"), str)
-        and hook["command"].startswith(f"{command} guard")
-        for hook in entry.get("hooks", [])
-    )
+    hook_command = hook["command"]
+    if hook_command.startswith(f"{command} guard") or ACP_MANAGED_COMMAND_MARKER in hook_command:
+        return True
+    # Older installs had no stable marker. Recognize the default `acp guard`
+    # executable (including an absolute path or wrapper prefix) so switching to
+    # a state-root command removes the stale fail-closed hook instead of leaving
+    # two ACP hooks installed. New custom commands carry the marker above.
+    words = hook_command.split()
+    for index, word in enumerate(words[:-1]):
+        executable = word.strip("\"'")
+        if Path(executable).name == "acp" and "guard" in words[index + 1 :]:
+            return True
+    return False
 
 
 def install_claude_code_hooks(

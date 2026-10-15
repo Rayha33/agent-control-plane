@@ -140,7 +140,10 @@ already exports `ACP_ATTEMPT_ID`, it may instead be inherited, but a conflicting
 explicit value is refused before the child starts. Omitting the attempt ID does not
 invent one: the hook remains fail-closed and rejects writes with `missing_attempt`.
 The default, non-required hook mode is unchanged. Quote paths with shell metacharacters
-for the hook's `--command` value.
+for the hook's `--command` value. Reinstalling after changing that command replaces
+ACP-managed hook entries, including legacy default `acp guard` entries, while preserving
+unrelated user hooks; this avoids a stale hook that reads attempt-worktree state and
+continues to block edits after the new state-root command is installed.
 
 In this mode, `checkout-exec` holds the checkout lease for the foreground Claude Code
 process and passes its attempt ID, resource, and fencing token to that process. The synchronous
@@ -152,8 +155,10 @@ check does not authenticate process ancestry: another same-user process that can
 the marker can copy its token while the wrapper's lock is active. The hook itself does
 not own or release the lock; the wrapper covers the whole session, including tool
 execution and permission prompts. This is session-level same-host serialization, not a
-per-file or distributed lease. The default hook installation remains path-only and
-does not imply checkout serialization.
+per-file, per-agent, or distributed lease. A child agent or subagent inside the same
+wrapper may inherit its active token and write concurrently with other writers in that
+session; use separate ACP attempts/worktrees for parallel writers. The default hook
+installation remains path-only and does not imply checkout serialization.
 
 This design follows Claude Code's documented lifecycle: `PreToolUse` runs before a tool
 call, `PostToolUse` only runs after success, and `PostToolUseFailure` does not run for
