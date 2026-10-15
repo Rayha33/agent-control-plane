@@ -3251,6 +3251,40 @@ transport/lifecycle primitive: ACP's production monitor still does not use
 processes under the same host UID, prove provider authentication, or wire the
 monitor into `run_worker()`. Keep configured OCI worker execution fail-closed.
 
+### Namespace resource payload receives a scoped fake credential (2026-10-15; opt-in proof)
+
+The opt-in `test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps`
+passed 1/1 on disposable Lima guest `acp-2370-live-sandbox-20261010`:
+Ubuntu 26.04.1 ARM64, Linux `7.0.0-38-generic`, Python 3.14.4, systemd
+259.5, and cgroup v2. The exact test source SHA-256 was
+`3c2f970b21a45893acc9b7dab4288af32955dceca27deda5f2e077bd627f3203`; its
+shared test helper was `25e1516836fb491e0723d6cfb23edd672bbb2f97c0dc534bedbe98dffb9a253d`,
+and the unchanged `runtime_drivers.py` loaded in the guest was
+`ade6bbbec9bfdaaf3043a46e9957dba7692afd29421d3ebe9c1e70b62621c46c`.
+
+Using a random fake pgpass value and the existing `CredentialRegistry`, the
+real `NamespaceRuntimeDriver` materialized a descriptor-backed credential for
+systemd `LoadCredential=` and bind-mounted only `/credential` read-only into
+its private namespace root. The test removed the source after unit activation;
+the delayed payload still read the matching digest. A write attempt failed,
+the credential path was the only worker-visible channel, and
+`CREDENTIALS_DIRECTORY` was absent from the payload environment. The raw fake
+value was absent from launch argv/environment, the process argv/environment,
+captured launch/probe output, the worktree/runtime fixture, and the scoped
+temporary tree after teardown. Exact unit absence and cleanup were verified;
+the test does not inspect systemd's internal credential backing path directly.
+The guest's `kernel.apparmor_restrict_unprivileged_userns` setting was
+temporarily changed from 1 to 0 for this disposable run and restored to 1;
+this is not AppArmor confinement evidence. Postflight found no matching ACP
+units or `unshare` processes, no worktree fixture, and no D-state processes.
+
+This proves the resource-driver credential handoff primitive only. It does not
+prove provider authentication, secrecy from same-host-UID or root actors,
+production `run_worker()` integration, or result/recovery lifecycle. A separate
+unit test deletes the retained credential source and confirms setup fails before
+any systemd worker unit is submitted. No real provider secret, model inference,
+or paid call was used; configured OCI worker execution remains fail-closed.
+
 ### No-model sandbox output collection gate (2026-10-15; opt-in proof only)
 
 The exact test source SHA-256

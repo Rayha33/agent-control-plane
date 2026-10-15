@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -3183,6 +3184,40 @@ def test_namespace_runtime_refuses_a_named_credential_with_no_registry(tmp_path:
     assert error.value.code == "credential_unavailable"
 
 
+def test_namespace_runtime_refuses_a_missing_named_credential_before_unit_launch(
+    tmp_path: Path,
+) -> None:
+    credential_context = postgres_context(tmp_path)
+    assert credential_context.credential_registry is not None
+    handle = (credential_context.credential_handles or {})["database"]
+    Path(handle.source_reference).unlink()
+    named = DriverContext(
+        attempt_id=credential_context.attempt_id,
+        task_id=credential_context.task_id,
+        runtime_dir=credential_context.runtime_dir,
+        expires_at=credential_context.expires_at,
+        secret=credential_context.secret,
+        environment=credential_context.environment,
+        credential_registry=credential_context.credential_registry,
+        credential_handles={"runtime": handle},
+    )
+    driver = namespace_driver()
+    calls: list[list[str]] = []
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        calls.append(list(argv))
+        return {"argv": list(argv), "exit_code": 0, "stdout": "", "stderr": ""}
+
+    with pytest.raises(DriverError) as error:
+        driver.setup(named, runner)
+
+    assert error.value.code == "credential_unavailable"
+    assert calls, "namespace capability preflight must run before credential materialization"
+    assert not any(any(str(part).startswith("--unit=") for part in argv) for argv in calls), (
+        "a missing credential must fail before a systemd worker unit is submitted"
+    )
+
+
 def test_namespace_runtime_disk_quota_is_a_sized_tmpfs(tmp_path: Path) -> None:
     """`io` is not a delegated controller, so the cap is a mount, not a cgroup attr.
 
@@ -3349,6 +3384,7 @@ def test_namespace_runtime_parser_uses_adaptive_chroot_default(tmp_path: Path, m
 
 def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Measure the real resource driver; this is not registered-worker proof."""
 
@@ -3365,6 +3401,22 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
     worktree = Path.home() / f".acp-live-worktree-{uuid.uuid4().hex}"
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
+    credential_secret = f"fixture-provider-{uuid.uuid4().hex}"
+    credential_context = postgres_context(
+        tmp_path, attempt_id=attempt_id, password=credential_secret
+    )
+    assert credential_context.credential_registry is not None
+    credential_handle = (credential_context.credential_handles or {})["database"]
+    credential_source = Path(credential_handle.source_reference)
+
+    def remove_credential_source() -> None:
+        credential_source.unlink(missing_ok=True)
+        assert not credential_source.exists(), (
+            "fake credential source remained after test finalization"
+        )
+
+    request.addfinalizer(remove_credential_source)
+    expected_credential_digest = hashlib.sha256(credential_source.read_bytes()).hexdigest()
     driver_context = DriverContext(
         attempt_id=attempt_id,
         task_id="task-2370-live-probe",
@@ -3375,7 +3427,10 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             "ACP_ATTEMPT_ID": attempt_id,
             "ACP_WORKTREE": str(worktree),
             "ACP_REPO_ROOT": str(worktree),
+            "ACP_EXPECTED_CREDENTIAL_SHA256": expected_credential_digest,
         },
+        credential_registry=credential_context.credential_registry,
+        credential_handles={"runtime": credential_handle},
     )
     chroot_path = runtime_driver_module._default_chroot_path()
     if not Path(chroot_path).is_file():
@@ -3411,6 +3466,7 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
         worktree_identity = (worktree_stat.st_dev, worktree_stat.st_ino)
         (worktree / "fake-agent.sh").write_text(
             "#!/bin/sh\n"
+            "sleep 1\n"
             "{\n"
             "  printf 'inner_pid=%s\\n' \"$$\"\n"
             "  printf 'home=%s\\n' \"$HOME\"\n"
@@ -3421,16 +3477,42 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             "else echo host_etc_passwd=absent; fi\n"
             "  if touch /workspace/should-not-write 2>/dev/null; then "
             "echo workspace_write=allowed; else echo workspace_write=denied; fi\n"
-            "} > /work/acp-agent-marker\n"
+            '  if [ "${ACP_RUNTIME_CREDENTIAL:-}" = /credential ] && '
+            "[ -r /credential ]; then\n"
+            "    echo credential_path=present\n"
+            "    printf 'credential_sha256=%s\\n' "
+            "\"$(sha256sum /credential | cut -d' ' -f1)\"\n"
+            "    printf 'credential_mode=%s\\n' \"$(stat -c '%a' /credential)\"\n"
+            "    if printf x >> /credential 2>/dev/null; then "
+            "echo credential_write=allowed; else echo credential_write=denied; fi\n"
+            "  else echo credential_path=missing; fi\n"
+            '  if [ "${CREDENTIALS_DIRECTORY+x}" = x ]; then '
+            "echo credential_dir_env=present; else echo credential_dir_env=absent; fi\n"
+            "  if [ \"$(sha256sum /credential 2>/dev/null | cut -d' ' -f1)\" "
+            '= "$ACP_EXPECTED_CREDENTIAL_SHA256" ]; then '
+            "echo credential_digest_matches=yes; "
+            "else echo credential_digest_matches=no; fi\n"
+            "} > /work/acp-agent-marker.tmp\n"
+            "mv /work/acp-agent-marker.tmp /work/acp-agent-marker\n"
             "sleep 30\n",
             encoding="utf-8",
         )
 
-        launch = driver.setup(driver_context, run_trusted)
+        launch_calls: list[tuple[list[str], dict[str, str]]] = []
+
+        def audited_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+            launch_calls.append((list(argv), dict(env)))
+            return run_trusted(argv, cwd, env, timeout, credential)
+
+        launch = driver.setup(driver_context, audited_runner)
         assert launch.get("exit_code") == 0, launch
         present, observation = driver.probe(driver_context, run_trusted)
         assert present is True, observation
         assert observation.get("systemd_unit_invocation_id")
+        # systemd has copied the descriptor-backed credential at activation;
+        # the running namespace must continue to read only its unit copy.
+        credential_source.unlink()
+        assert not credential_source.exists()
 
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and marker is None:
@@ -3493,6 +3575,20 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
         assert sandbox_os_release != Path("/etc/os-release").read_text(encoding="utf-8")
         assert observed["workspace_write"] == "denied"
         assert int(observed["inner_pid"]) > 0
+        assert observed["credential_path"] == "present"
+        assert observed["credential_digest_matches"] == "yes"
+        assert observed["credential_write"] == "denied"
+        assert int(observed["credential_mode"], 8) & 0o222 == 0
+        assert observed["credential_dir_env"] == "absent"
+        assert credential_secret not in marker
+        process_environ = Path(f"/proc/{marker_host_pid}/environ").read_bytes()
+        process_cmdline = Path(f"/proc/{marker_host_pid}/cmdline").read_bytes()
+        assert credential_secret.encode() not in process_environ
+        assert credential_secret.encode() not in process_cmdline
+        assert b"ACP_RUNTIME_CREDENTIAL=/credential" in process_environ
+        recorded_launch = json.dumps({"calls": launch_calls, "result": launch}, sort_keys=True)
+        assert credential_secret not in recorded_launch
+        assert credential_secret not in json.dumps(observation, sort_keys=True)
         assert os.readlink(f"/proc/{marker_host_pid}/ns/pid") != os.readlink("/proc/self/ns/pid")
         if apparmor_profile:
             effective_label = (
@@ -3500,6 +3596,10 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             )
             assert effective_label.split(" (", 1)[0] == apparmor_profile
         assert not (worktree / "should-not-write").exists()
+        for root in (worktree, runtime_dir):
+            for path in root.rglob("*"):
+                if path.is_file():
+                    assert credential_secret.encode() not in path.read_bytes(), path
     finally:
         cleanup_proven = False
         try:
@@ -3507,18 +3607,27 @@ def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
             present_after, cleanup_observation = driver.probe(driver_context, run_trusted)
             cleanup_proven = driver.cleanup_is_proven(present_after, cleanup_observation)
             assert cleanup_proven, (cleanup_observation, str(worktree))
+            assert credential_secret not in json.dumps(cleanup_observation, sort_keys=True)
+            assert not credential_source.exists(), "fake credential source remained after teardown"
+            for path in tmp_path.rglob("*"):
+                if path.is_file():
+                    assert credential_secret.encode() not in path.read_bytes(), path
         finally:
             try:
-                if cleanup_proven and worktree_identity is not None:
-                    assert shutil.rmtree.avoids_symlink_attacks, "fd-safe rmtree is unavailable"
-                    current_stat = os.stat(
-                        worktree.name,
-                        dir_fd=parent_fd,
-                        follow_symlinks=False,
-                    )
-                    assert stat.S_ISDIR(current_stat.st_mode)
-                    assert (current_stat.st_dev, current_stat.st_ino) == worktree_identity
-                    shutil.rmtree(worktree.name, dir_fd=parent_fd)
+                try:
+                    credential_source.unlink(missing_ok=True)
+                    assert not credential_source.exists(), "fake credential source remained"
+                finally:
+                    if cleanup_proven and worktree_identity is not None:
+                        assert shutil.rmtree.avoids_symlink_attacks, "fd-safe rmtree is unavailable"
+                        current_stat = os.stat(
+                            worktree.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        assert stat.S_ISDIR(current_stat.st_mode)
+                        assert (current_stat.st_dev, current_stat.st_ino) == worktree_identity
+                        shutil.rmtree(worktree.name, dir_fd=parent_fd)
             finally:
                 os.close(parent_fd)
 
