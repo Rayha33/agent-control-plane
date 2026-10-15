@@ -876,7 +876,12 @@ proof below covers one worker's socket reachability and the real peer
 authorizer, but not production listener lifecycle, descriptor hygiene, or
 provider protocol behavior.
 
-### Rootless per-attempt provider socket-directory feasibility (2026-10-15; direct-runc guest probe)
+### Rootless per-attempt provider socket-directory feasibility (2026-10-15; superseded direct-runc guest probe)
+
+Historical evidence only: this earlier direct-runc probe was superseded by the
+rootless worker CONNECT test documented in the later subsection below. That
+CONNECT subsection is authoritative for the current live-test behavior and
+scope.
 
 The opt-in `test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
 passed 1/1 in the disposable `acp-2370-live-sandbox-20261010` Lima VZ guest:
@@ -3359,3 +3364,53 @@ idempotent cancel replay. It does not prove the supervised worker boundary,
 provider credential/egress policy, validated result import, or production
 `run_worker()` integration; configured OCI worker execution remains
 fail-closed.
+
+### Rootless worker CONNECT through attempt-scoped proxy socket (2026-10-15; pass)
+
+The focused opt-in live test passed 1/1 on the disposable Lima guest
+`acp-2370-live-sandbox-20261010`: Ubuntu 26.04.1 ARM64, Linux
+`7.0.0-38-generic`, systemd 259.5, Python 3.14.4, pytest 9.1.1, cgroup v2,
+and rootless runc 1.5.2. The runc executable was the preinstalled
+root-owned `/usr/local/bin/runc-1.5.2` release binary with SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+
+The worker connected to the attempt's mode-0600 Unix proxy socket through a
+read-only `nosuid,nodev,noexec` bind mount and issued a syntactically valid
+HTTP CONNECT for `api.example.com:443`. The production CONNECT parser, exact
+host/port policy, numeric-address classifier, and peer authorizer handled that
+request. The test-only resolver returned the public numeric address
+`8.8.8.8`; a test-only dial hook redirected that vetted endpoint to a local TCP
+fixture that exchanged opaque sentinel bytes with the worker. The loopback
+fixture is not selectable by production policy, and the sentinel exchange is
+not a TLS handshake or provider-SDK test. A same-UID host peer connected to the
+same socket but fell outside the exact worker cgroup; the real peer-PIDFD,
+UID/GID, and cgroup checks rejected it with HTTP 403 before resolver or dial
+invocation. The recorded resolver/dial call counts contained only the worker's
+single approved CONNECT.
+
+Both accepted proxy channels remain tracked through teardown. The test's
+finalizer shuts down and closes them, bounded-joins every started handler, and
+fails cleanup if a handler remains alive.
+
+SHA-256 values for the exact files run in the guest (matching the host
+worktree):
+
+| File | SHA-256 |
+| --- | --- |
+| `test_oci_worker_runtime.py` | `a1109a27528082cd860d1831284ef7de1d554b6c0a7e6523dbd5c64b66fa6577` |
+| `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
+| `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
+
+The guest's `kernel.apparmor_restrict_unprivileged_userns` value was 1 before
+the run; it was set to 0 only for this disposable test and restored by an exit
+trap. Postflight confirmed the value was 1 again, no ACP units or runc process
+remained, no attempt root or provider socket remained, and there were no
+D-state processes. This does not prove AppArmor confinement. No real provider
+credential, provider endpoint, TLS session, model inference, or paid call was
+used. The collector-issued receipt predicates were replaced with a test-only
+receipt; process identity, peer PIDFD, UID/GID, and exact cgroup checks were
+real. This proves the live worker-to-socket CONNECT path and its same-UID peer
+rejection, not provider authentication, encrypted redirect handling, credential
+handoff, crash recovery, cleanup verification, result transfer, or production
+`run_worker()` integration. Task #3112 and parent task #2370 remain open, and
+configured OCI worker execution remains fail-closed.

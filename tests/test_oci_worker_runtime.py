@@ -30,6 +30,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -42,6 +43,7 @@ from typing import Any
 import pytest
 
 import agent_control_plane.supervisor.oci_worker as oci_worker
+import agent_control_plane.supervisor.provider_egress as provider_egress
 import agent_control_plane.supervisor.provider_proxy as provider_proxy
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
@@ -3998,12 +4000,14 @@ def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prove a rootless worker can connect through, but not mutate, a socket-dir mount.
+    """Prove a rootless worker uses the authorized CONNECT proxy over a read-only mount.
 
     This is a runtime primitive probe, not the production launch path. The
     collector-issued attestation predicates are replaced with one exact
     test-only receipt so the real peer-PIDFD, UID/GID, and cgroup checks can be
-    exercised against this live rootless container.
+    exercised against this live rootless container. DNS and the numeric dial
+    are redirected only by this test to a local TCP fixture; production policy
+    cannot select that test destination.
     """
 
     if not sys.platform.startswith("linux"):
@@ -4085,6 +4089,11 @@ def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
     socket_identity: tuple[int, int] | None = None
     runc_descriptor = -1
     runc_process: subprocess.Popen[bytes] | None = None
+    target_listener: socket.socket | None = None
+    target_connection: socket.socket | None = None
+    proxy_threads: list[threading.Thread] = []
+    proxy_channels: list[socket.socket] = []
+    proxy_errors: list[BaseException] = []
     cleanup_errors: list[str] = []
 
     try:
@@ -4125,10 +4134,14 @@ static int write_all(int fd, const char *buffer, size_t length) {
 }
 
 int main(int argc, char **argv) {
-    static const char request[] = "probe\n";
-    static const char expected[] = "proxy-ok\n";
+    static const char request[] =
+        "CONNECT api.example.com:443 HTTP/1.1\r\n"
+        "Host: api.example.com:443\r\n\r\n";
+    static const char expected_status[] = "HTTP/1.1 200 Connection Established\r\n";
+    static const char outbound[] = "client-tls-record";
+    static const char inbound[] = "server-tls-record";
     struct sockaddr_un address = {0};
-    char response[sizeof(expected) - 1];
+    char response[512] = {0};
     size_t path_length;
     size_t received = 0;
     int fd;
@@ -4149,16 +4162,35 @@ int main(int argc, char **argv) {
         close(fd);
         return 6;
     }
-    while (received < sizeof(response)) {
-        ssize_t count = read(fd, response + received, sizeof(response) - received);
+    while (strstr(response, "\r\n\r\n") == NULL && received < sizeof(response) - 1) {
+        ssize_t count = read(fd, response + received, sizeof(response) - 1 - received);
         if (count <= 0) {
             close(fd);
             return 7;
         }
         received += (size_t)count;
+        response[received] = '\0';
+    }
+    if (strstr(response, "\r\n\r\n") == NULL ||
+        strncmp(response, expected_status, sizeof(expected_status) - 1) != 0) {
+        close(fd);
+        return 8;
+    }
+    if (write_all(fd, outbound, sizeof(outbound) - 1) != 0) {
+        close(fd);
+        return 9;
+    }
+    received = 0;
+    while (received < sizeof(inbound) - 1) {
+        ssize_t count = read(fd, response + received, sizeof(inbound) - 1 - received);
+        if (count <= 0) {
+            close(fd);
+            return 10;
+        }
+        received += (size_t)count;
     }
     close(fd);
-    if (memcmp(response, expected, sizeof(response)) != 0) return 8;
+    if (memcmp(response, inbound, sizeof(inbound) - 1) != 0) return 11;
     return write_all(STDOUT_FILENO, "CONNECT_OK\n", 11);
 }
 """,
@@ -4215,6 +4247,35 @@ int main(int argc, char **argv) {
             or (socket_info.st_dev, socket_info.st_ino) != socket_identity
         ):
             pytest.fail("provider socket is not a test-owned mode-0600 Unix socket")
+
+        target_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target_listener.bind(("127.0.0.1", 0))
+        target_listener.listen(1)
+        target_listener.settimeout(5)
+        target_address = target_listener.getsockname()
+        resolver_calls: list[tuple[str, int]] = []
+        dial_calls: list[tuple[int, tuple[object, ...]]] = []
+
+        def test_only_resolver(host: str, port: int, **_kwargs: object) -> list[tuple[object, ...]]:
+            resolver_calls.append((host, port))
+            if (host, port) != ("api.example.com.", 443):
+                raise AssertionError("unexpected CONNECT authority reached test resolver")
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))]
+
+        def test_only_dial(
+            endpoint: provider_egress.PinnedEndpoint, *, timeout: float
+        ) -> socket.socket:
+            dial_calls.append((endpoint.family, endpoint.sockaddr))
+            if endpoint.sockaddr != ("8.8.8.8", 443):
+                raise AssertionError("production classifier returned an unexpected test pin")
+            connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            connection.settimeout(timeout)
+            connection.connect(target_address)
+            return connection
+
+        monkeypatch.setattr(provider_egress.socket, "getaddrinfo", test_only_resolver)
+        monkeypatch.setattr(provider_egress, "_connect_pinned", test_only_dial)
+        egress_policy = provider_egress.ProviderEgressPolicy({"api.example.com": {443}})
 
         script = r"""
 set -eu
@@ -4428,14 +4489,39 @@ printf 'MOUNT_OPTIONS_OK\n'
         if not authorize(worker_channel):
             pytest.fail("attempt authorizer rejected the live rootless worker peer")
 
-        worker_request = bytearray()
-        while b"\n" not in worker_request and len(worker_request) < 128:
-            chunk = worker_channel.recv(128 - len(worker_request))
+        def handle_proxy_channel(channel: socket.socket) -> None:
+            try:
+                provider_proxy.serve_connect_connection(
+                    channel, egress_policy, authorize_peer=authorize
+                )
+            except BaseException as error:
+                proxy_errors.append(error)
+
+        worker_handler = threading.Thread(
+            target=handle_proxy_channel, args=(worker_channel,), daemon=True
+        )
+        proxy_channels.append(worker_channel)
+        worker_handler.start()
+        proxy_threads.append(worker_handler)
+        worker_channel = None
+
+        assert target_listener is not None
+        target_connection, _target_peer = target_listener.accept()
+        target_connection.settimeout(4)
+        tunneled_request = bytearray()
+        while len(tunneled_request) < len(b"client-tls-record"):
+            chunk = target_connection.recv(len(b"client-tls-record") - len(tunneled_request))
             if not chunk:
                 break
-            worker_request.extend(chunk)
-        if bytes(worker_request) != b"probe\n":
-            pytest.fail(f"worker did not send the expected proxy probe: {bytes(worker_request)!r}")
+            tunneled_request.extend(chunk)
+        if bytes(tunneled_request) != b"client-tls-record":
+            pytest.fail(f"proxy did not relay worker tunnel bytes: {bytes(tunneled_request)!r}")
+        target_connection.sendall(b"server-tls-record")
+        target_connection.shutdown(socket.SHUT_WR)
+        target_connection.close()
+        target_connection = None
+        target_listener.close()
+        target_listener = None
 
         outside_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         outside_client.settimeout(4)
@@ -4453,15 +4539,36 @@ printf 'MOUNT_OPTIONS_OK\n'
             pytest.fail("same-UID negative peer unexpectedly shared the worker attempt cgroup")
         if authorize(outside_channel):
             pytest.fail("same-UID peer outside the attempt cgroup was authorized")
-        outside_channel.close()
+        outside_client.sendall(
+            b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n"
+        )
+        outside_handler = threading.Thread(
+            target=handle_proxy_channel, args=(outside_channel,), daemon=True
+        )
+        proxy_channels.append(outside_channel)
+        outside_handler.start()
+        proxy_threads.append(outside_handler)
         outside_channel = None
+
+        denied_response = bytearray()
+        while b"\r\n\r\n" not in denied_response:
+            chunk = outside_client.recv(4096)
+            if not chunk:
+                break
+            denied_response.extend(chunk)
+        if not bytes(denied_response).startswith(b"HTTP/1.1 403 Forbidden\r\n"):
+            outside_handler.join(timeout=4)
+            pytest.fail(
+                "same-UID peer outside the attempt cgroup was not denied by proxy: "
+                f"response={bytes(denied_response)!r}, handler_alive={outside_handler.is_alive()}, "
+                f"handler_errors={proxy_errors!r}"
+            )
+        outside_handler.join(timeout=4)
+        if outside_handler.is_alive():
+            pytest.fail("same-UID denial handler did not finish")
         outside_client.close()
         outside_client = None
 
-        worker_channel.sendall(b"proxy-ok\n")
-        worker_channel.shutdown(socket.SHUT_WR)
-        worker_channel.close()
-        worker_channel = None
         returncode = runc_process.wait(timeout=12)
         stdout, stderr = runc_process.communicate(timeout=1)
         if returncode != 0:
@@ -4470,7 +4577,17 @@ printf 'MOUNT_OPTIONS_OK\n'
                 f"exit={returncode}, stdout={stdout[-2048:]!r}, stderr={stderr[-2048:]!r}"
             )
         if b"MOUNT_OPTIONS_OK\n" not in stdout or b"CONNECT_OK\n" not in stdout:
-            pytest.fail("worker did not confirm read-only mount and successful socket exchange")
+            pytest.fail("worker did not confirm read-only mount and successful CONNECT tunnel")
+        for thread in proxy_threads:
+            thread.join(timeout=4)
+            if thread.is_alive():
+                pytest.fail("attempt proxy handler did not finish after the worker exited")
+        if proxy_errors:
+            pytest.fail(f"attempt proxy handler raised unexpectedly: {proxy_errors!r}")
+        if resolver_calls != [("api.example.com.", 443)]:
+            pytest.fail(f"unexpected provider resolver calls: {resolver_calls!r}")
+        if dial_calls != [(socket.AF_INET, ("8.8.8.8", 443))]:
+            pytest.fail(f"unexpected vetted provider pins dialed: {dial_calls!r}")
         if busybox_version == "":
             pytest.fail("BusyBox version evidence is empty")
 
@@ -4483,6 +4600,10 @@ printf 'MOUNT_OPTIONS_OK\n'
         if [entry.name for entry in socket_dir.iterdir()] != ["provider.sock"]:
             pytest.fail("worker created or removed an entry in the host provider directory")
     finally:
+        if target_connection is not None:
+            target_connection.close()
+        if target_listener is not None:
+            target_listener.close()
         if outside_channel is not None:
             outside_channel.close()
         if outside_client is not None:
@@ -4539,6 +4660,19 @@ printf 'MOUNT_OPTIONS_OK\n'
 
         if worker_channel is not None:
             worker_channel.close()
+        for channel in proxy_channels:
+            try:
+                channel.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                channel.close()
+            except OSError as error:
+                cleanup_errors.append(f"could not close proxy handler channel: {error}")
+        for thread in proxy_threads:
+            thread.join(timeout=4)
+            if thread.is_alive():
+                cleanup_errors.append("attempt proxy handler thread remained alive after cleanup")
         if listener is not None:
             try:
                 listener.close()
