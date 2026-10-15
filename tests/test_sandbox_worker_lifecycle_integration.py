@@ -1,0 +1,781 @@
+"""Opt-in live proof joining the OCI launch gate to the durable sandbox journal.
+
+All process-local launch capabilities must remain in the exact systemd monitor
+process. This test proves only the real Linux launch-to-``running`` gate; it
+does not wire ``run_worker``, prove crash recovery or cleanup, authorize result
+import, or write a ``cleanup_verified`` receipt.
+
+Run on a disposable supported Linux host with rootless runc 1.5.2, delegated
+cgroup v2, and an active private systemd user manager:
+
+    ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+    ACP_OCI_TEST_RUNC=/usr/bin/runc \
+    ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+    uv run --extra dev pytest -q tests/test_sandbox_worker_lifecycle_integration.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import posixpath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import pytest
+from support import init_repo, make_task
+from test_oci_worker_runtime import (
+    _CONTAINER_CPU_PERIOD_US,
+    _CONTAINER_CPU_QUOTA_US,
+    _CONTAINER_MEMORY_BYTES,
+    _CONTAINER_PIDS_LIMIT,
+    _copy_busybox_closure,
+)
+
+import agent_control_plane.supervisor.oci_worker as oci_worker
+from agent_control_plane.git_supervisor import GitSupervisor
+from agent_control_plane.supervisor import sandbox_attestation
+from agent_control_plane.supervisor.sandbox_attestation import collect_running_runtime_attestation
+from agent_control_plane.supervisor.sandbox_monitor_ipc import _linux_process_identity
+from agent_control_plane.supervisor.sandbox_monitor_receipt import (
+    sandbox_attempt_slice_unit,
+    sandbox_monitor_service_unit,
+)
+from agent_control_plane.supervisor.sandbox_workspace import copy_snapshot
+
+_LIVE_ENABLED = os.environ.get("ACP_RUN_SANDBOX_WORKER_LIFECYCLE") == "1"
+_SUPPORTED_RUNC_VERSION = "1.5.2"
+_MONITOR_SLICE_UNIT = "user-acp.slice"
+_PAYLOAD_MARKER = "lifecycle-gate-marker"
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("x", encoding="utf-8") as stream:
+        json.dump(value, stream, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
+    raw = sandbox_attestation._run_trusted_runtime_command(
+        [
+            str(sandbox_attestation._trusted_systemctl_executable()),
+            "--user",
+            "show",
+            "--no-pager",
+            f"--property={','.join(properties)}",
+            "--",
+            unit,
+        ],
+        environment=sandbox_attestation._trusted_systemd_command_environment(),
+    )
+    values: dict[str, str] = {}
+    for line in raw.decode("ascii").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in values:
+            raise RuntimeError(f"malformed systemd properties for {unit}")
+        values[key] = value
+    if set(values) != set(properties):
+        raise RuntimeError(f"incomplete systemd properties for {unit}: {values!r}")
+    return values
+
+
+def _assert_units_available_for_test(*units: str) -> None:
+    for unit in units:
+        props = _unit_properties(unit, ("ActiveState", "ControlGroup", "FragmentPath", "LoadState"))
+        if props["LoadState"] == "not-found":
+            continue
+        # systemd keeps implicit, inactive slices loaded after they are stopped.
+        # Reusing one is safe only while it has no backing unit file or cgroup.
+        if (
+            unit.endswith(".slice")
+            and props["LoadState"] == "loaded"
+            and props["ActiveState"] == "inactive"
+            and not props["ControlGroup"]
+            and not props["FragmentPath"]
+        ):
+            continue
+        pytest.fail(f"refusing to use pre-existing systemd unit {unit}")
+
+
+def _wait_for_path(path: Path, error_path: Path, timeout: float = 45.0) -> Path:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return path
+        if error_path.is_file():
+            error = json.loads(error_path.read_text(encoding="utf-8"))
+            raise AssertionError(
+                f"monitor child failed:\n{error.get('traceback', 'unknown error')}"
+            )
+        time.sleep(0.05)
+    raise TimeoutError(f"timed out waiting for monitor receipt {path.name}")
+
+
+def _wait_for_receipt(control: Path, name: str, timeout: float = 45.0) -> Path:
+    return _wait_for_path(control / name, control / "error.json", timeout)
+
+
+def _apparmor_identity() -> str | None:
+    try:
+        return Path("/proc/self/attr/current").read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+
+
+def _cgroup_is_empty(control_group: str) -> bool:
+    if (
+        not isinstance(control_group, str)
+        or not control_group.startswith("/")
+        or posixpath.normpath(control_group) != control_group
+        or any(part in {".", ".."} for part in PurePosixPath(control_group).parts)
+    ):
+        return False
+    root = Path("/sys/fs/cgroup").resolve()
+    path = root.joinpath(*PurePosixPath(control_group).parts[1:])
+    if not path.exists():
+        return True
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(root):
+            return False
+        events = (resolved / "cgroup.events").read_text(encoding="ascii").splitlines()
+    except OSError:
+        return False
+    return "populated 0" in events
+
+
+def _monitor_child(
+    repo: Path,
+    rootfs_source: Path,
+    source_worktree: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    control: Path,
+) -> None:
+    """Perform every process-local launch and attestation step in the monitor."""
+
+    handle: oci_worker.RuncLaunchHandle | None = None
+    try:
+        supervisor = GitSupervisor(repo)
+        execution = supervisor._sandbox_execution_get(attempt_id)
+        if (
+            execution is None
+            or execution["claim_token"] != claim_token
+            or execution["execution_id"] != execution_id
+            or execution["phase"] != "reserved"
+        ):
+            raise RuntimeError("child did not reopen the exact reserved execution")
+        rootfs_pin = supervisor.config.oci_rootfs_pin
+        runc_pin = supervisor.config.oci_runc_executable
+        if rootfs_pin is None or runc_pin is None:
+            raise RuntimeError("child configuration did not recreate trusted OCI pins")
+
+        execution_root = Path(execution["bundle_path"]).parent
+        bundle_root = Path(execution["bundle_path"])
+        state_root = Path(execution["state_path"])
+        baseline_root = execution_root / "baseline"
+        workspace_root = execution_root / "workspace"
+        for path in (execution_root, bundle_root, state_root):
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            info = path.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise RuntimeError(f"reserved execution directory is not private: {path.name}")
+        rootfs = bundle_root / "rootfs"
+        if rootfs.exists():
+            raise RuntimeError("reserved bundle rootfs already exists")
+        shutil.copytree(rootfs_source, rootfs, symlinks=True)
+        baseline = copy_snapshot(source_worktree, baseline_root)
+        workspace = copy_snapshot(baseline.root, workspace_root)
+        execution = supervisor._sandbox_execution_bind_workspace(
+            attempt_id, claim_token, baseline, workspace
+        )
+        container_id = execution["container_id"]
+        wrapper_unit = sandbox_monitor_service_unit(attempt_id, claim_token, execution_id)
+        wrapper = _unit_properties(
+            wrapper_unit,
+            ("ActiveState", "ControlGroup", "Id", "InvocationID", "MainPID", "Slice"),
+        )
+        if (
+            wrapper["Id"] != wrapper_unit
+            or wrapper["ActiveState"] != "active"
+            or wrapper["Slice"] != _MONITOR_SLICE_UNIT
+            or int(wrapper["MainPID"]) != os.getpid()
+            or not wrapper["InvocationID"]
+            or not wrapper["ControlGroup"]
+        ):
+            raise RuntimeError("child is not the exact live systemd monitor MainPID")
+
+        attempt_slice_unit = oci_worker._oci_worker_systemd_slice(container_id)
+        scope_unit = f"acp-{container_id}.scope"
+        pid_file = state_root / "init.pid"
+        marker = workspace_root / _PAYLOAD_MARKER
+        config = oci_worker.build_oci_worker_config(
+            bundle_root,
+            workspace,
+            (
+                "/bin/sh",
+                "-c",
+                f"printf 'candidate-payload-ran\\n' > /workspace/{_PAYLOAD_MARKER}; "
+                "/bin/busybox sleep 3",
+            ),
+            rootfs_pin=rootfs_pin,
+            container_id=container_id,
+            memory_bytes=_CONTAINER_MEMORY_BYTES,
+            pids_limit=_CONTAINER_PIDS_LIMIT,
+            cpu_quota_us=_CONTAINER_CPU_QUOTA_US,
+            cpu_period_us=_CONTAINER_CPU_PERIOD_US,
+        )
+        binding = oci_worker._apply_pinned_runc_recursive_private_policy(
+            config, runc_pin, expected_version=_SUPPORTED_RUNC_VERSION
+        )
+        submission: Any | None = None
+
+        def authorize(target: oci_worker._RuncLaunchTarget) -> Any:
+            nonlocal submission
+            submission = supervisor._sandbox_execution_authorize_launch_submission(
+                attempt_id, claim_token, launch_target=target
+            )
+            return submission
+
+        handle = oci_worker.spawn_pinned_runc(
+            binding,
+            state_root,
+            bundle_root,
+            workspace_root,
+            pid_file,
+            container_id,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            _authorize_runc_submission=authorize,
+        )
+        client_pid = oci_worker._runc_launch_pid(handle)
+        client_identity = oci_worker._runc_launch_process_identity(handle)
+        process = oci_worker._runc_launch_process_for_testing(handle)
+        if submission is None or client_pid is None or client_identity is None or process is None:
+            raise RuntimeError("pinned runc did not retain the exact launch capability")
+        deadline = time.monotonic() + 15.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("pinned runc exited before reaching the held init gate")
+            time.sleep(0.05)
+        if not pid_file.is_file():
+            raise TimeoutError("pinned runc did not create its private init PID file")
+
+        attempt_slice = _unit_properties(
+            attempt_slice_unit, ("ActiveState", "ControlGroup", "Id", "InvocationID")
+        )
+        scope = _unit_properties(scope_unit, ("ActiveState", "ControlGroup", "Id", "InvocationID"))
+        for unit, props in ((attempt_slice_unit, attempt_slice), (scope_unit, scope)):
+            if (
+                props["ActiveState"] != "active"
+                or props["Id"] != unit
+                or not props["InvocationID"]
+                or not props["ControlGroup"]
+            ):
+                raise RuntimeError(f"exact worker systemd identity is incomplete: {unit}")
+        if Path(wrapper["ControlGroup"]).is_relative_to(Path(attempt_slice["ControlGroup"])):
+            raise RuntimeError("monitor service is incorrectly inside the attempt slice")
+        if Path(scope["ControlGroup"]).parent.as_posix() != attempt_slice["ControlGroup"]:
+            raise RuntimeError("worker scope is not inside its exact attempt slice")
+
+        monitor_identity = _linux_process_identity(os.getpid())
+        if monitor_identity is None or _linux_process_identity(client_pid) != client_identity:
+            raise RuntimeError("monitor or runc process identity changed before launch recording")
+        supervisor._sandbox_execution_record_launch(
+            attempt_id,
+            claim_token,
+            monitor_pid=os.getpid(),
+            monitor_identity=monitor_identity,
+            runc_handle=handle,
+            launch_submission=submission,
+            wrapper_unit=wrapper_unit,
+            wrapper_invocation_id=wrapper["InvocationID"],
+            wrapper_cgroup_path=wrapper["ControlGroup"],
+            attempt_slice_unit=attempt_slice_unit,
+            attempt_slice_invocation_id=attempt_slice["InvocationID"],
+            attempt_slice_cgroup_path=attempt_slice["ControlGroup"],
+            scope_unit=scope_unit,
+            scope_invocation_id=scope["InvocationID"],
+            cgroup_path=scope["ControlGroup"],
+        )
+        attestation = collect_running_runtime_attestation(
+            runc_executable_pin=runc_pin,
+            state_root=state_root,
+            pid_file_path=pid_file,
+            expected_container_id=container_id,
+            expected_bundle_path=str(bundle_root),
+            expected_monitor_pid=os.getpid(),
+            expected_monitor_identity=monitor_identity,
+            expected_runc_client_pid=client_pid,
+            expected_runc_client_identity=client_identity,
+            expected_wrapper_unit=wrapper_unit,
+            expected_wrapper_invocation_id=wrapper["InvocationID"],
+            expected_attempt_slice_unit=attempt_slice_unit,
+            expected_attempt_slice_invocation_id=attempt_slice["InvocationID"],
+            expected_scope_unit=scope_unit,
+            expected_scope_invocation_id=scope["InvocationID"],
+            expected_cgroup_path=scope["ControlGroup"],
+            expected_memory_max_bytes=_CONTAINER_MEMORY_BYTES,
+            expected_cpu_quota=_CONTAINER_CPU_QUOTA_US,
+            expected_cpu_period=_CONTAINER_CPU_PERIOD_US,
+            expected_pids_max=_CONTAINER_PIDS_LIMIT,
+        )
+        durable = supervisor._sandbox_execution_get(attempt_id)
+        if durable is None or durable["phase"] != "launched" or marker.exists():
+            raise RuntimeError("payload ran before the durable running transition")
+        _write_json(
+            control / "pre-running.json",
+            {
+                "phase": durable["phase"],
+                "monitor_pid": os.getpid(),
+                "wrapper_main_pid": int(wrapper["MainPID"]),
+                "runc_client_pid": client_pid,
+                "monitor_apparmor_identity": _apparmor_identity(),
+                "attestation_digest": attestation.evidence_sha256,
+                "payload_marker_present": marker.exists(),
+            },
+        )
+        _wait_for_receipt(control, "continue-running.json")
+        durable = supervisor._sandbox_execution_get(attempt_id)
+        if durable is None or durable["phase"] != "launched" or marker.exists():
+            raise RuntimeError("journal or launch gate changed before test release")
+        running = supervisor._sandbox_execution_record_running(
+            attempt_id, claim_token, attestation=attestation, runc_handle=handle
+        )
+        if running["phase"] != "running" or marker.exists():
+            raise RuntimeError("payload escaped before the durable running transition")
+        _write_json(
+            control / "post-running.json",
+            {"phase": running["phase"], "payload_marker_present_before_gate": marker.exists()},
+        )
+        handle.release_gate()
+        _wait_for_path(marker, control / "error.json", timeout=10.0)
+        if marker.read_text(encoding="ascii") != "candidate-payload-ran\n":
+            raise RuntimeError("payload wrote unexpected content into the private workspace")
+        wait_receipt = handle.wait(timeout=15.0)
+        exited = supervisor._sandbox_execution_record_exit(attempt_id, claim_token, wait_receipt)
+        if exited["phase"] != "exited" or wait_receipt.returncode != 0:
+            raise RuntimeError("test payload did not exit cleanly")
+        delete = subprocess.run(
+            [str(runc_pin.path), "--root", str(state_root), "delete", "--force", container_id],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8.0,
+            env=oci_worker._runc_client_environment(),
+        )
+        if delete.returncode != 0:
+            raise RuntimeError("exact pinned runc state deletion failed after payload exit")
+        _write_json(
+            control / "result.json",
+            {
+                "phase": exited["phase"],
+                "payload_marker": marker.read_text(encoding="ascii"),
+                "runc_client_returncode": wait_receipt.returncode,
+                "runc_state_deleted": not (state_root / container_id).exists(),
+                "cleanup_verified_written": False,
+            },
+        )
+    except BaseException:
+        _write_json(
+            control / "error.json",
+            {
+                "traceback": traceback.format_exc(),
+                "monitor_apparmor_identity": _apparmor_identity(),
+            },
+        )
+        if handle is not None:
+            handle.close_gate()
+            process = oci_worker._runc_launch_process_for_testing(handle)
+            if process is not None and process.poll() is None:
+                try:
+                    oci_worker._kill_process_group(process)
+                except BaseException:
+                    pass
+        raise
+
+
+def _monitor_child_entry(argv: list[str]) -> None:
+    if len(argv) != 7:
+        raise SystemExit("monitor child requires seven arguments")
+    repo, rootfs, worktree, attempt_id, claim_token, execution_id, control = argv
+    _monitor_child(
+        Path(repo),
+        Path(rootfs),
+        Path(worktree),
+        attempt_id,
+        int(claim_token),
+        execution_id,
+        Path(control),
+    )
+
+
+def _systemd_command(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=sandbox_attestation._trusted_systemd_command_environment(),
+    )
+
+
+def _wait_for_quiescence(service_unit: str | None, slice_unit: str | None) -> bool:
+    safe = True
+    for unit in (service_unit, slice_unit):
+        if unit is None:
+            continue
+        try:
+            properties = ("ActiveState", "ControlGroup", "Id", "LoadState")
+            if unit.endswith(".service"):
+                properties += ("MainPID",)
+            props = _unit_properties(unit, properties)
+        except Exception:
+            return False
+        not_running = props["LoadState"] == "not-found" or props["ActiveState"] == "inactive"
+        if props["ActiveState"] == "failed":
+            not_running = not unit.endswith(".service") or props["MainPID"] == "0"
+        empty = (
+            props["LoadState"] == "not-found"
+            or (not props["ControlGroup"] and not_running)
+            or _cgroup_is_empty(props["ControlGroup"])
+        )
+        inactive = not_running
+        safe = safe and inactive and empty
+    return safe
+
+
+def _best_effort_stop_unit(systemctl: str, unit: str) -> None:
+    """Request stop even when a start client timed out after systemd accepted it."""
+
+    try:
+        _systemd_command([systemctl, "--user", "stop", unit], timeout=12.0)
+    except (OSError, subprocess.TimeoutExpired):
+        # The caller still requires an independent exact-unit quiescence proof.
+        pass
+
+
+def _stop_attempted_units_and_check_quiescence(
+    systemctl: str,
+    service_unit: str | None,
+    service_start_attempted: bool,
+    slice_unit: str | None,
+    slice_start_attempted: bool,
+) -> bool:
+    """Stop and verify each unit whose start request might have reached systemd."""
+
+    if service_start_attempted and service_unit is not None:
+        _best_effort_stop_unit(systemctl, service_unit)
+    if slice_start_attempted and slice_unit is not None:
+        _best_effort_stop_unit(systemctl, slice_unit)
+    return _wait_for_quiescence(
+        service_unit if service_start_attempted else None,
+        slice_unit if slice_start_attempted else None,
+    )
+
+
+def test_attempted_systemd_starts_are_stopped_and_checked_after_client_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_requests: list[str] = []
+    checked_units: list[tuple[str | None, str | None]] = []
+
+    def timed_out_stop(argv: list[str], timeout: float = 10.0) -> None:
+        stop_requests.append(argv[-1])
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    def quiescent(service: str | None, slice_: str | None) -> bool:
+        checked_units.append((service, slice_))
+        return True
+
+    monkeypatch.setattr(sys.modules[__name__], "_systemd_command", timed_out_stop)
+    monkeypatch.setattr(sys.modules[__name__], "_wait_for_quiescence", quiescent)
+    assert _stop_attempted_units_and_check_quiescence(
+        "/usr/bin/systemctl",
+        "acp-test.service",
+        True,
+        "acp-test.slice",
+        True,
+    )
+    assert stop_requests == ["acp-test.service", "acp-test.slice"]
+    assert checked_units == [("acp-test.service", "acp-test.slice")]
+
+
+def test_unit_preflight_allows_only_inactive_empty_implicit_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit_properties = {
+        "ActiveState": "inactive",
+        "ControlGroup": "",
+        "FragmentPath": "",
+        "LoadState": "loaded",
+    }
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_unit_properties",
+        lambda unit, properties: {name: unit_properties[name] for name in properties},
+    )
+    _assert_units_available_for_test("user-acp-test.slice")
+    with pytest.raises(pytest.fail.Exception, match="pre-existing systemd unit"):
+        _assert_units_available_for_test("acp-test.service")
+
+
+def _remove_private_test_tree(root: Path) -> None:
+    """Remove only this private fixture after making its read-only files deletable."""
+
+    root_info = root.lstat()
+    if (
+        root.parent != Path("/tmp")
+        or not root.name.startswith("acp-live-sandbox-lifecycle-")
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+    ):
+        raise RuntimeError("refusing to remove an unexpected live-test artifact root")
+
+    def fail_walk(error: OSError) -> None:
+        raise error
+
+    for directory, subdirectories, filenames in os.walk(
+        root, topdown=False, followlinks=False, onerror=fail_walk
+    ):
+        current = Path(directory)
+        for name in (*subdirectories, *filenames):
+            child = current / name
+            info = child.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            if info.st_uid != os.geteuid():
+                raise RuntimeError(
+                    f"refusing to change permissions on non-owned fixture data: {child}"
+                )
+            if stat.S_ISDIR(info.st_mode):
+                child.chmod(0o700)
+            elif stat.S_ISREG(info.st_mode):
+                child.chmod(0o600)
+        current.chmod(0o700)
+    shutil.rmtree(root)
+
+
+def _ensure_private_fixture_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(f"fixture state path is not a real directory: {path.name}")
+    if info.st_uid != os.geteuid():
+        raise RuntimeError(f"fixture state directory has an unexpected owner: {path.name}")
+    path.chmod(0o700)
+
+
+@pytest.mark.skipif(
+    not _LIVE_ENABLED,
+    reason="set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 on a disposable supported Linux host",
+)
+def test_live_monitor_journal_holds_payload_until_durable_running_transition() -> None:
+    """Exercise actual runc, systemd identities, journal transitions, and fd-3 gate."""
+
+    source_root = Path(__file__).resolve().parents[1]
+    if not sys.platform.startswith("linux") or os.geteuid() == 0:
+        pytest.fail("live monitor/journal composition requires an unprivileged Linux user")
+    if not source_root.is_relative_to(Path("/tmp")):
+        pytest.fail("run this opt-in proof from a disposable checkout beneath /tmp")
+    if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+        pytest.fail("live monitor/journal composition requires unified cgroup v2")
+    controllers = set(Path("/sys/fs/cgroup/cgroup.controllers").read_text().split())
+    if not {"cpu", "memory", "pids"}.issubset(controllers):
+        pytest.fail("cpu, memory, and pids cgroup v2 controllers are required")
+    if os.environ.get("ACP_OCI_TEST_RUNC_VERSION") != _SUPPORTED_RUNC_VERSION:
+        pytest.fail("set ACP_OCI_TEST_RUNC_VERSION=1.5.2 for this exact live proof")
+    environment = sandbox_attestation._trusted_systemd_command_environment()
+    if not (Path(environment["XDG_RUNTIME_DIR"]) / "bus").is_socket():
+        pytest.fail("private systemd user-manager socket is unavailable")
+    systemctl = str(sandbox_attestation._trusted_systemctl_executable())
+    if _systemd_command([systemctl, "--user", "show-environment"]).returncode != 0:
+        pytest.fail("active systemd user manager is required")
+    if " - cgroup2 " not in Path("/proc/self/mountinfo").read_text(encoding="ascii"):
+        pytest.fail("current host does not expose unified cgroup v2")
+
+    runc_path = Path(os.environ.get("ACP_OCI_TEST_RUNC", "/usr/bin/runc"))
+    busybox_path = Path(os.environ.get("ACP_OCI_TEST_BUSYBOX", "/usr/bin/busybox"))
+    apparmor_profile = os.environ.get("ACP_OCI_TEST_APPARMOR_PROFILE", "").strip()
+    apparmor_prefix: list[str] = []
+    if apparmor_profile:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", apparmor_profile):
+            pytest.fail("ACP_OCI_TEST_APPARMOR_PROFILE must be a simple profile name")
+        aa_exec = shutil.which("aa-exec", path=environment["PATH"])
+        if aa_exec is None:
+            pytest.fail("aa-exec is required when an AppArmor profile is requested")
+        profile_probe = _systemd_command([aa_exec, "-p", apparmor_profile, "--", "true"])
+        if profile_probe.returncode != 0:
+            pytest.fail(f"requested AppArmor profile is unavailable: {apparmor_profile}")
+        apparmor_prefix = [aa_exec, "-p", apparmor_profile, "--"]
+    systemd_run = shutil.which("systemd-run", path=environment["PATH"])
+    if systemd_run is None:
+        pytest.fail("systemd-run is required for the exact monitor-service launch")
+    run_root = Path(tempfile.mkdtemp(prefix="acp-live-sandbox-lifecycle-", dir="/tmp"))
+    run_root.chmod(0o700)
+    rootfs_source = run_root / "rootfs-source"
+    rootfs_source.mkdir(mode=0o755)
+    service_unit: str | None = None
+    slice_unit: str | None = None
+    service_start_attempted = False
+    slice_start_attempted = False
+    safe_to_remove = False
+    try:
+        for directory in ("bin", "dev", "etc", "home/agent", "proc", "run", "tmp", "workspace"):
+            (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
+        _copy_busybox_closure(busybox_path, rootfs_source)
+        repo_root = run_root / "repo"
+        repo_root.mkdir(mode=0o700)
+        repo = init_repo(repo_root)
+        _ensure_private_fixture_directory(repo / ".acp")
+        _ensure_private_fixture_directory(repo / ".acp" / "sandbox-executions")
+        rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
+        with (repo / "acp.toml").open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n[sandbox.oci]\n"
+                f"runc_executable = {json.dumps(str(runc_path.resolve(strict=True)))}\n"
+                f"runc_version = {json.dumps(_SUPPORTED_RUNC_VERSION)}\n"
+                f"rootfs_path = {json.dumps(str(rootfs_source.resolve(strict=True)))}\n"
+                f"rootfs_sha256 = {json.dumps(rootfs_manifest['rootfs_sha256'])}\n"
+                f"rootfs_closure_sha256 = {json.dumps(rootfs_manifest['closure_sha256'])}\n"
+            )
+        supervisor = GitSupervisor(repo)
+        task = make_task(supervisor, "alpha.txt", title="sandbox lifecycle integration")
+        attempt = supervisor.claim(task["id"], "sandbox-lifecycle-test")
+        pin = supervisor.config.oci_rootfs_pin
+        runc_pin = supervisor.config.oci_runc_executable
+        if (
+            pin is None
+            or runc_pin is None
+            or supervisor.config.oci_runc_version != _SUPPORTED_RUNC_VERSION
+        ):
+            pytest.fail("test config did not pin the exact rootfs and runc identities")
+        execution = supervisor._sandbox_execution_reserve(
+            attempt["id"],
+            attempt["claim_token"],
+            rootfs_digest=pin.sha256,
+            rootfs_closure_digest=pin.closure_sha256,
+            runc_executable_digest=runc_pin.sha256,
+            runtime_version=supervisor.config.oci_runc_version,
+            oci_version="1.2.1",
+        )
+        execution_root = Path(execution["bundle_path"]).parent
+        execution_root.mkdir(mode=0o700, parents=True)
+        Path(execution["bundle_path"]).mkdir(mode=0o700)
+        Path(execution["state_path"]).mkdir(mode=0o700)
+        control = run_root / "control"
+        control.mkdir(mode=0o700)
+        service_unit = sandbox_monitor_service_unit(
+            attempt["id"], attempt["claim_token"], execution["execution_id"]
+        )
+        slice_unit = sandbox_attempt_slice_unit(
+            attempt["id"], attempt["claim_token"], execution["execution_id"]
+        )
+        _assert_units_available_for_test(service_unit, slice_unit)
+        # Mark before IPC: a timeout/error can happen after systemd accepted the
+        # request, so teardown must inspect and stop this exact unit regardless.
+        slice_start_attempted = True
+        started = _systemd_command([systemctl, "--user", "start", slice_unit])
+        if started.returncode != 0:
+            pytest.fail("systemd could not start the exact execution attempt slice")
+        pythonpath = os.pathsep.join((str(source_root / "src"), str(source_root / "tests")))
+        service_command = [
+            systemd_run,
+            "--user",
+            f"--unit={service_unit}",
+            "--slice=user-acp.slice",
+            "--property=Type=exec",
+            "--property=KillMode=control-group",
+            "--property=RuntimeMaxSec=120s",
+            f"--working-directory={source_root}",
+            f"--setenv=PYTHONPATH={pythonpath}",
+            "--no-block",
+            *apparmor_prefix,
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--monitor-child",
+            str(repo),
+            str(rootfs_source),
+            str(attempt["worktree"]),
+            attempt["id"],
+            str(attempt["claim_token"]),
+            execution["execution_id"],
+            str(control),
+        ]
+        # This service runs outside the attempt slice, so its unit must be
+        # stopped and checked independently even if systemd-run times out.
+        service_start_attempted = True
+        launched = _systemd_command(service_command, timeout=12.0)
+        if launched.returncode != 0:
+            pytest.fail(f"could not start exact monitor service: {launched.stderr[-1200:]}")
+
+        pre_path = _wait_for_receipt(control, "pre-running.json")
+        pre = json.loads(pre_path.read_text(encoding="utf-8"))
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        marker = Path(durable["workspace_root_path"]) / _PAYLOAD_MARKER if durable else None
+        assert durable is not None and durable["phase"] == "launched"
+        assert pre["phase"] == "launched"
+        assert pre["monitor_pid"] == pre["wrapper_main_pid"]
+        assert pre["payload_marker_present"] is False
+        if apparmor_profile:
+            profile_stack = str(pre["monitor_apparmor_identity"]).partition(" (")[0].split("//&")
+            assert apparmor_profile in profile_stack
+        assert marker is not None and not marker.exists()
+
+        (control / "continue-running.json").write_text("release-transition\n", encoding="ascii")
+        post_path = _wait_for_receipt(control, "post-running.json")
+        post = json.loads(post_path.read_text(encoding="utf-8"))
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert post["phase"] == "running"
+        assert post["payload_marker_present_before_gate"] is False
+        assert durable is not None and durable["phase"] == "running"
+        assert marker is not None
+        _wait_for_path(marker, control / "error.json", timeout=10.0)
+        assert (
+            marker is not None and marker.read_text(encoding="ascii") == "candidate-payload-ran\n"
+        )
+        result_path = _wait_for_receipt(control, "result.json", timeout=20.0)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert result == {
+            "phase": "exited",
+            "payload_marker": "candidate-payload-ran\n",
+            "runc_client_returncode": 0,
+            "runc_state_deleted": True,
+            "cleanup_verified_written": False,
+        }
+        assert durable is not None and durable["phase"] == "exited"
+    finally:
+        safe_to_remove = _stop_attempted_units_and_check_quiescence(
+            systemctl,
+            service_unit,
+            service_start_attempted,
+            slice_unit,
+            slice_start_attempted,
+        )
+        if safe_to_remove:
+            _remove_private_test_tree(run_root)
+        else:
+            pytest.fail(f"exact test units are not quiescent; preserving artifacts at {run_root}")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--monitor-child":
+    _monitor_child_entry(sys.argv[2:])
