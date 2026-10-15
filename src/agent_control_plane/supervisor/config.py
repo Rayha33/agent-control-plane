@@ -64,6 +64,8 @@ class Config:
     trust_owner_uid: int
     attempts_root: Path | None
     min_free_bytes: int | None
+    max_active_workers: int | None
+    min_available_memory_bytes: int | None
     oci_runc_executable: Any | None
     oci_runc_version: str | None
     oci_rootfs_pin: Any | None
@@ -292,6 +294,22 @@ class ConfigMixin:
         timeout = int(supervisor.get("qc_timeout_seconds", 900))
         if lease < 10 or timeout < 1:
             raise SupervisorError("invalid_config", "lease must be >= 10 and timeout >= 1")
+        max_active_workers = supervisor.get("max_active_workers")
+        if max_active_workers is not None and (
+            type(max_active_workers) is not int or not 1 <= max_active_workers <= 65_535
+        ):
+            raise SupervisorError(
+                "invalid_config", "supervisor.max_active_workers must be an integer from 1 to 65535"
+            )
+        min_available_memory_bytes = supervisor.get("min_available_memory_bytes")
+        if min_available_memory_bytes is not None and (
+            type(min_available_memory_bytes) is not int
+            or not 1 <= min_available_memory_bytes <= 2**63 - 1
+        ):
+            raise SupervisorError(
+                "invalid_config",
+                "supervisor.min_available_memory_bytes must be a positive 64-bit integer",
+            )
         qc_commands = tuple(map(str, qc.get("commands", [])))
         integration_commands = tuple(map(str, integration.get("commands", qc.get("commands", []))))
         critic_selector = str(qc.get("critic_command", "")).strip()
@@ -470,6 +488,8 @@ class ConfigMixin:
             trust_owner_uid=trust_owner_uid,
             attempts_root=attempts_root,
             min_free_bytes=min_free_bytes,
+            max_active_workers=max_active_workers,
+            min_available_memory_bytes=min_available_memory_bytes,
             oci_runc_executable=oci_runc_executable,
             oci_runc_version=oci_runc_version,
             oci_rootfs_pin=oci_rootfs_pin,

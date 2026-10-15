@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   launch_owner_pid INTEGER,
   launch_owner_identity TEXT NOT NULL DEFAULT '',
   log_path TEXT,
+  worker_admission_policy_json TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   lease_expires_at INTEGER NOT NULL,
   created_at TEXT NOT NULL,
@@ -330,6 +331,10 @@ def migrate(connection: sqlite3.Connection) -> None:
     if "trust_bundle_json" not in attempt_columns:
         connection.execute(
             "ALTER TABLE attempts ADD COLUMN trust_bundle_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    if "worker_admission_policy_json" not in attempt_columns:
+        connection.execute(
+            "ALTER TABLE attempts ADD COLUMN worker_admission_policy_json TEXT NOT NULL DEFAULT ''"
         )
     submission_columns = _columns(connection, "submissions")
     if "qc_resume_status" not in submission_columns:
