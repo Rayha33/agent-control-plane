@@ -55,6 +55,7 @@ _LIVE_ENABLED = os.environ.get("ACP_RUN_SANDBOX_WORKER_LIFECYCLE") == "1"
 _SUPPORTED_RUNC_VERSION = "1.5.2"
 _MONITOR_SLICE_UNIT = "user-acp.slice"
 _PAYLOAD_MARKER = "lifecycle-gate-marker"
+_GIT_METADATA_MARKER = "git-metadata-absent-marker"
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -64,6 +65,14 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def _entry_is_present(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
@@ -201,8 +210,30 @@ def _monitor_child(
         if rootfs.exists():
             raise RuntimeError("reserved bundle rootfs already exists")
         shutil.copytree(rootfs_source, rootfs, symlinks=True)
+        source_git_pointer = source_worktree / ".git"
+        try:
+            source_git_pointer_mode = source_git_pointer.lstat().st_mode
+        except FileNotFoundError:
+            raise RuntimeError(
+                "attempt worktree is missing its expected .git pointer fixture"
+            ) from None
+        if not stat.S_ISREG(source_git_pointer_mode):
+            raise RuntimeError("attempt worktree .git pointer fixture is not a regular file")
+        git_pointer_text = source_git_pointer.read_text(encoding="utf-8").strip()
+        pointer_key, separator, git_directory_value = git_pointer_text.partition(": ")
+        if pointer_key != "gitdir" or not separator or not git_directory_value:
+            raise RuntimeError("attempt worktree .git pointer is malformed")
+        git_directory = Path(git_directory_value)
+        if not git_directory.is_absolute():
+            git_directory = source_worktree / git_directory
+        git_directory = git_directory.resolve(strict=True)
+        trusted_git_root = (repo / ".git").resolve(strict=True)
+        if not git_directory.is_relative_to(trusted_git_root) or not git_directory.is_dir():
+            raise RuntimeError("attempt worktree .git pointer escaped the private test repository")
         baseline = copy_snapshot(source_worktree, baseline_root)
         workspace = copy_snapshot(baseline.root, workspace_root)
+        if _entry_is_present(baseline.root / ".git") or _entry_is_present(workspace.root / ".git"):
+            raise RuntimeError("host Git pointer metadata entered a private worker snapshot")
         execution = supervisor._sandbox_execution_bind_workspace(
             attempt_id, claim_token, baseline, workspace
         )
@@ -226,12 +257,18 @@ def _monitor_child(
         scope_unit = f"acp-{container_id}.scope"
         pid_file = state_root / "init.pid"
         marker = workspace_root / _PAYLOAD_MARKER
+        git_marker = workspace_root / _GIT_METADATA_MARKER
         config = oci_worker.build_oci_worker_config(
             bundle_root,
             workspace,
             (
                 "/bin/sh",
                 "-c",
+                "set -eu; "
+                "test ! -e /workspace/.git; "
+                "test ! -L /workspace/.git; "
+                "test ! -e /workspace/.git/HEAD; "
+                f"printf 'host-git-metadata-not-visible\\n' > /workspace/{_GIT_METADATA_MARKER}; "
                 f"printf 'candidate-payload-ran\\n' > /workspace/{_PAYLOAD_MARKER}; "
                 "/bin/busybox sleep 3",
             ),
@@ -338,7 +375,12 @@ def _monitor_child(
             expected_pids_max=_CONTAINER_PIDS_LIMIT,
         )
         durable = supervisor._sandbox_execution_get(attempt_id)
-        if durable is None or durable["phase"] != "launched" or marker.exists():
+        if (
+            durable is None
+            or durable["phase"] != "launched"
+            or marker.exists()
+            or git_marker.exists()
+        ):
             raise RuntimeError("payload ran before the durable running transition")
         _write_json(
             control / "pre-running.json",
@@ -350,25 +392,49 @@ def _monitor_child(
                 "monitor_apparmor_identity": _apparmor_identity(),
                 "attestation_digest": attestation.evidence_sha256,
                 "payload_marker_present": marker.exists(),
+                "git_metadata_marker_present": git_marker.exists(),
+                "source_git_pointer_regular_file": stat.S_ISREG(source_git_pointer.lstat().st_mode),
+                "baseline_git_metadata_absent": not _entry_is_present(baseline.root / ".git"),
+                "workspace_git_metadata_absent": not _entry_is_present(workspace.root / ".git"),
             },
         )
         _wait_for_receipt(control, "continue-running.json")
         durable = supervisor._sandbox_execution_get(attempt_id)
-        if durable is None or durable["phase"] != "launched" or marker.exists():
+        if (
+            durable is None
+            or durable["phase"] != "launched"
+            or marker.exists()
+            or git_marker.exists()
+        ):
             raise RuntimeError("journal or launch gate changed before test release")
         running = supervisor._sandbox_execution_record_running(
             attempt_id, claim_token, attestation=attestation, runc_handle=handle
         )
-        if running["phase"] != "running" or marker.exists():
+        if running["phase"] != "running" or marker.exists() or git_marker.exists():
             raise RuntimeError("payload escaped before the durable running transition")
         _write_json(
             control / "post-running.json",
-            {"phase": running["phase"], "payload_marker_present_before_gate": marker.exists()},
+            {
+                "phase": running["phase"],
+                "payload_marker_present_before_gate": marker.exists(),
+                "git_metadata_marker_present_before_gate": git_marker.exists(),
+            },
         )
+        _wait_for_receipt(control, "running-observed.json")
+        durable = supervisor._sandbox_execution_get(attempt_id)
+        if (
+            durable is None
+            or durable["phase"] != "running"
+            or marker.exists()
+            or git_marker.exists()
+        ):
+            raise RuntimeError("worker gate changed before parent observed durable running state")
         handle.release_gate()
         _wait_for_path(marker, control / "error.json", timeout=10.0)
         if marker.read_text(encoding="ascii") != "candidate-payload-ran\n":
             raise RuntimeError("payload wrote unexpected content into the private workspace")
+        if git_marker.read_text(encoding="ascii") != "host-git-metadata-not-visible\n":
+            raise RuntimeError("worker did not confirm the host .git pointer was absent")
         wait_receipt = handle.wait(timeout=15.0)
         exited = supervisor._sandbox_execution_record_exit(attempt_id, claim_token, wait_receipt)
         if exited["phase"] != "exited" or wait_receipt.returncode != 0:
@@ -388,6 +454,9 @@ def _monitor_child(
             {
                 "phase": exited["phase"],
                 "payload_marker": marker.read_text(encoding="ascii"),
+                "git_metadata_absent_inside_worker": (
+                    git_marker.read_text(encoding="ascii") == "host-git-metadata-not-visible\n"
+                ),
                 "runc_client_returncode": wait_receipt.returncode,
                 "runc_state_deleted": not (state_root / container_id).exists(),
                 "cleanup_verified_written": False,
@@ -630,15 +699,15 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
     if systemd_run is None:
         pytest.fail("systemd-run is required for the exact monitor-service launch")
     run_root = Path(tempfile.mkdtemp(prefix="acp-live-sandbox-lifecycle-", dir="/tmp"))
-    run_root.chmod(0o700)
     rootfs_source = run_root / "rootfs-source"
-    rootfs_source.mkdir(mode=0o755)
     service_unit: str | None = None
     slice_unit: str | None = None
     service_start_attempted = False
     slice_start_attempted = False
     safe_to_remove = False
     try:
+        run_root.chmod(0o700)
+        rootfs_source.mkdir(mode=0o755)
         for directory in ("bin", "dev", "etc", "home/agent", "proc", "run", "tmp", "workspace"):
             (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
         _copy_busybox_closure(busybox_path, rootfs_source)
@@ -731,14 +800,22 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         pre = json.loads(pre_path.read_text(encoding="utf-8"))
         durable = supervisor._sandbox_execution_get(attempt["id"])
         marker = Path(durable["workspace_root_path"]) / _PAYLOAD_MARKER if durable else None
+        git_marker = (
+            Path(durable["workspace_root_path"]) / _GIT_METADATA_MARKER if durable else None
+        )
         assert durable is not None and durable["phase"] == "launched"
         assert pre["phase"] == "launched"
         assert pre["monitor_pid"] == pre["wrapper_main_pid"]
         assert pre["payload_marker_present"] is False
+        assert pre["git_metadata_marker_present"] is False
+        assert pre["source_git_pointer_regular_file"] is True
+        assert pre["baseline_git_metadata_absent"] is True
+        assert pre["workspace_git_metadata_absent"] is True
         if apparmor_profile:
             profile_stack = str(pre["monitor_apparmor_identity"]).partition(" (")[0].split("//&")
             assert apparmor_profile in profile_stack
         assert marker is not None and not marker.exists()
+        assert git_marker is not None and not git_marker.exists()
 
         (control / "continue-running.json").write_text("release-transition\n", encoding="ascii")
         post_path = _wait_for_receipt(control, "post-running.json")
@@ -746,11 +823,19 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         durable = supervisor._sandbox_execution_get(attempt["id"])
         assert post["phase"] == "running"
         assert post["payload_marker_present_before_gate"] is False
+        assert post["git_metadata_marker_present_before_gate"] is False
         assert durable is not None and durable["phase"] == "running"
         assert marker is not None
+        assert not marker.exists()
+        assert git_marker is not None and not git_marker.exists()
+        (control / "running-observed.json").write_text("running-state-verified\n", encoding="ascii")
         _wait_for_path(marker, control / "error.json", timeout=10.0)
         assert (
             marker is not None and marker.read_text(encoding="ascii") == "candidate-payload-ran\n"
+        )
+        assert (
+            git_marker is not None
+            and git_marker.read_text(encoding="ascii") == "host-git-metadata-not-visible\n"
         )
         result_path = _wait_for_receipt(control, "result.json", timeout=20.0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -758,6 +843,7 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         assert result == {
             "phase": "exited",
             "payload_marker": "candidate-payload-ran\n",
+            "git_metadata_absent_inside_worker": True,
             "runc_client_returncode": 0,
             "runc_state_deleted": True,
             "cleanup_verified_written": False,
