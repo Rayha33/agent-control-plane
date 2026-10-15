@@ -3537,5 +3537,5 @@ prove authoritative/external DNS rebinding behavior or resolver portability.
 These proofs do not establish provider authentication, the application
 following redirects inside the OCI worker, credential handoff, crash recovery,
 cleanup verification, result transfer, or production `run_worker()`
-integration. Task #3112 and parent task #2370 remain open, and configured OCI
-worker execution remains fail-closed.
+integration. Provider-boundary subtask #3112 is complete; parent task #2370
+remains open, and configured OCI worker execution remains fail-closed.
