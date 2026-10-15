@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   branch TEXT NOT NULL,
   worktree TEXT NOT NULL,
   worktree_root TEXT NOT NULL DEFAULT '',
+  source_repo_identity TEXT NOT NULL DEFAULT '',
   claim_token INTEGER NOT NULL,
   start_sha TEXT NOT NULL,
   latest_sha TEXT,

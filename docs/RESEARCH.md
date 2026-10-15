@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-10-06.
+Research updated: 2026-10-13.
 
 ## Verdict
 
@@ -19,7 +19,7 @@ independent acceptance mechanically enforceable across vendors.
 ## What practitioners are talking about
 
 A second research pass focused on first-hand issue reports and practitioner
-threads rather than product positioning. Nine themes recur:
+threads rather than product positioning. Ten themes recur:
 
 | Rank | Repeated challenge | Evidence | Product response |
 |---|---|---|---|
@@ -27,7 +27,7 @@ threads rather than product positioning. Nine themes recur:
 | 2 | Missing setup and teardown lifecycle | The same Zed thread asks for VM-like create/destroy hooks and automatic cleanup. [Claude Code issue #26725](https://github.com/anthropics/claude-code/issues/26725) reports stale worktrees after interrupted sessions. | Durable idempotent setup/teardown with reaper-triggered cleanup |
 | 3 | Verification is still manual or correlated | A practitioner in the Zed thread says manual verification is the largest remaining burden and that agents can encode the bug into their own tests. [Anthropic's evaluation guidance](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) recommends combining deterministic, rubric-based, and state-based evaluation. | Immutable evidence, deterministic gates, independent critic, no self-approval |
 | 4 | Operator attention becomes the bottleneck | A [multi-agent terminal discussion](https://news.ycombinator.com/item?id=47268777) describes 3–6 agents spread across terminals and asks how overlapping changes, merge timing, accountability, and traceability should work. | One durable task/attempt state model and machine-readable status |
-| 5 | Cross-session coordination remains fragile | [Claude Code issue #24798](https://github.com/anthropics/claude-code/issues/24798) asks for inter-session coordination and describes readers seeing partial files after a writer crashes. [Codex issue #23515](https://github.com/openai/codex/issues/23515) reports one worktree session being interrupted by another. | Atomic write scopes, checkpoints, fencing, and one worktree per attempt |
+| 5 | Cross-session coordination remains fragile, and isolation can target the wrong checkout | [Codex issue #38541](https://github.com/openai/codex/issues/38541) reports two sessions sharing a managed worktree and losing dirty changes from normal Git recovery; [Codex #37226](https://github.com/openai/codex/issues/37226) asks for automatic write isolation and stale-write checks. [Claude Code #64315](https://github.com/anthropics/claude-code/issues/64315), now closed as not planned after inactivity, reports `worktree` isolation created under the session repo rather than the requested target repo, after which two subagents edited the same checkout. These are individual reports, not a prevalence estimate. | Next: verify and expose attempt repository identity at write and submit boundaries, preserve the existing per-attempt worktree/resource-lease protections, and fail closed on ambiguous roots. Keep declared intent advisory and state that external writers bypassing ACP are outside its protection. |
 | 6 | Parallelism can erase its own economics | Individual reports include [202 GB of unreaped run copies](https://github.com/openai/codex/issues/35383), [128 GB memory exhaustion](https://github.com/openai/codex/issues/23749), and [subagent-linked process/RSS growth on Linux](https://github.com/openai/codex/issues/25015). These reports do not establish prevalence or a shared root cause. Trigger.dev also reports duplicated dependencies and service stacks. | ACP separately reports host filesystem headroom and offers an explicit fresh per-attempt Linux cgroup sample (task/memory counters and cumulative CPU where accounted). It does not infer agent count or provider cost. Hard resource quotas remain an explicit policy choice. |
 | 7 | Credentials cross the candidate boundary | A [Claude Code issue](https://github.com/anthropics/claude-code/issues/58173) reports a shell hook dumping GitHub, Vercel, Slack, Supabase, Anthropic, and search credentials into a transcript despite explicit prompt rules. An [MCP implementer](https://github.com/orgs/modelcontextprotocol/discussions/561) asks how a remote multi-API proxy can safely retain per-user keys without token passthrough. | Hard tool-boundary controls: minimal candidate env, scoped version handles, descriptor-only delivery, and literal-secret absence tests |
 | 8 | The reviewer can be correlated, stale, or silently changed | [Self-preference research](https://arxiv.org/abs/2410.21819) finds that model judges can favor outputs from the same model family; production guidance recommends calibration and multiple evaluation modes. | Signed reviewer provenance, policy fingerprints, explicit ratification, golden cases, provider diversity, and rejection of old-policy passes |
@@ -63,6 +63,9 @@ assignment and merge.
 These issue reports are evidence of user experience, not independently verified
 vendor root-cause analyses:
 
+- [Two Codex sessions reportedly lost uncommitted changes in a shared managed worktree](https://github.com/openai/codex/issues/38541) — the reporter says the original content was absent from the working tree and normal stash list, and remained only in an unreachable Git object.
+- [Codex request for automatic isolation and coordination of concurrent writes](https://github.com/openai/codex/issues/37226) — requests separate managed worktrees, stale-write checks, deterministic integration, and visible checkout ownership.
+- [Claude Code report of worktree isolation using the session repo instead of a requested target repo](https://github.com/anthropics/claude-code/issues/64315) — the reporter describes two agents editing one target checkout and manual stash/cherry-pick recovery; a commenter also reports stale worktrees after interrupted manual cleanup.
 - [Delayed process overwrote newer work](https://github.com/anthropics/claude-code/issues/79354)
 - [One session deleted another session's active worktree](https://github.com/anthropics/claude-code/issues/40850)
 - [Reviewer inspected the wrong worktree or diff](https://github.com/openai/codex/issues/33144)

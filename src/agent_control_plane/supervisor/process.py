@@ -504,7 +504,12 @@ class ProcessMixin:
         return None
 
     def _remove_worktree(
-        self, path: Path, delete_branch: bool, expected_branch: str | None
+        self,
+        path: Path,
+        delete_branch: bool,
+        expected_branch: str | None,
+        *,
+        source_repo_identity: str | None = None,
     ) -> bool:
         """Remove only the exact registered worktree and branch owned by the caller.
 
@@ -539,6 +544,65 @@ class ProcessMixin:
                 actual_branch = current.stdout.decode("utf-8", errors="surrogateescape").strip()
                 if (actual_branch or None) != expected_branch:
                     return False
+
+            if source_repo_identity is not None:
+                if re.fullmatch(r"acp-repo-v1:[0-9a-f]{64}", source_repo_identity) is None:
+                    return False
+                common = self._run_git_while_locked(
+                    "rev-parse", "--path-format=absolute", "--git-common-dir"
+                )
+                if common.returncode:
+                    return False
+                try:
+                    common_raw = Path(
+                        common.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
+                    )
+                    common_path = common_raw.resolve(strict=True)
+                    if not common_raw.is_absolute() or common_path != common_raw:
+                        return False
+                    common_stat = common_path.stat(follow_symlinks=False)
+                    if not stat.S_ISDIR(common_stat.st_mode):
+                        return False
+                    identity_payload = "\0".join(
+                        (
+                            "v1",
+                            str(common_path),
+                            str(common_stat.st_dev),
+                            str(common_stat.st_ino),
+                        )
+                    ).encode("utf-8")
+                    import hashlib
+
+                    current_identity = "acp-repo-v1:" + hashlib.sha256(identity_payload).hexdigest()
+                except (OSError, RuntimeError, UnicodeError, ValueError):
+                    return False
+                if current_identity != source_repo_identity:
+                    return False
+                if path.exists():
+                    worktree_common = self._run_git_while_locked(
+                        "-C",
+                        str(path),
+                        "rev-parse",
+                        "--path-format=absolute",
+                        "--git-common-dir",
+                    )
+                    if worktree_common.returncode:
+                        return False
+                    try:
+                        worktree_common_raw = Path(
+                            worktree_common.stdout.decode("utf-8", errors="surrogateescape").rstrip(
+                                "\r\n"
+                            )
+                        )
+                        worktree_common_path = worktree_common_raw.resolve(strict=True)
+                        if (
+                            not worktree_common_raw.is_absolute()
+                            or worktree_common_path != worktree_common_raw
+                            or worktree_common_path != common_path
+                        ):
+                            return False
+                    except (OSError, RuntimeError, UnicodeError, ValueError):
+                        return False
 
             removed = self._run_git_while_locked("worktree", "remove", "--force", str(path))
             if removed.returncode or path.exists() or path.is_symlink():
@@ -689,11 +753,21 @@ class ProcessMixin:
         worktree: Path,
         root: Path,
         expected_branch: str | None,
+        *,
+        source_repo_identity: str | None = None,
     ) -> str | None:
         """Read recovery HEAD only while path, repository and branch ownership hold."""
 
+        if (
+            source_repo_identity is not None
+            and re.fullmatch(r"acp-repo-v1:[0-9a-f]{64}", source_repo_identity) is None
+        ):
+            return None
         try:
             with self._git_operation_guard():
+                # Validate lexical ownership before resolve() follows a replacement path.
+                if not self._attempt_worktree_is_managed(attempt_id, worktree, root):
+                    return None
                 canonical = str(worktree.resolve(strict=False))
 
                 def owned_registration() -> bool:
@@ -737,11 +811,36 @@ class ProcessMixin:
                     worktree_common = Path(
                         common.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
                     ).resolve(strict=True)
-                    repository_common_path = Path(
+                    repository_common_raw = Path(
                         repository_common.stdout.decode("utf-8", errors="surrogateescape").rstrip(
                             "\r\n"
                         )
-                    ).resolve(strict=True)
+                    )
+                    if not repository_common_raw.is_absolute():
+                        return False
+                    repository_common_path = repository_common_raw.resolve(strict=True)
+                    if source_repo_identity is not None:
+                        try:
+                            if repository_common_path != repository_common_raw:
+                                return False
+                            metadata = repository_common_path.stat(follow_symlinks=False)
+                            if not stat.S_ISDIR(metadata.st_mode):
+                                return False
+                            payload = "\0".join(
+                                (
+                                    "v1",
+                                    str(repository_common_path),
+                                    str(metadata.st_dev),
+                                    str(metadata.st_ino),
+                                )
+                            ).encode("utf-8")
+                            import hashlib
+
+                            current_identity = "acp-repo-v1:" + hashlib.sha256(payload).hexdigest()
+                        except (OSError, RuntimeError, UnicodeError, ValueError):
+                            return False
+                        if current_identity != source_repo_identity:
+                            return False
                     return (
                         (branch_name or None) == expected_branch
                         and top_path == worktree

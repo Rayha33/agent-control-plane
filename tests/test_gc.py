@@ -81,6 +81,38 @@ def test_gc_reclaims_a_finished_task_worktree_and_branch(repo: Path) -> None:
     assert str(worktree) not in git(repo, "worktree", "list")
 
 
+def test_runtime_teardown_retry_is_idempotent_after_gc_removes_worktree(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == [attempt["id"]]
+    assert not worktree.exists()
+    assert supervisor.runtime_down(attempt["id"])["state"] == "released"
+
+
+@pytest.mark.parametrize("source_identity", ["", "acp-repo-v1:" + "0" * 64])
+def test_gc_retains_unverified_source_repository_worktree(repo: Path, source_identity: str) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER attempts_source_repo_identity_immutable")
+        connection.execute(
+            "UPDATE attempts SET source_repo_identity = ? WHERE id = ?",
+            (source_identity, attempt["id"]),
+        )
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "source_repository_identity_unverified"
+    assert worktree.exists()
+    assert attempt["branch"] in git(repo, "branch", "--list", "--format=%(refname:short)")
+
+
 def test_external_worktree_root_stays_pinned_across_config_change_and_gc(repo: Path) -> None:
     original_root = repo.parent / f"{repo.name}-external-worktrees"
     replacement_root = repo.parent / f"{repo.name}-replacement-worktrees"
@@ -131,9 +163,9 @@ def test_gc_rechecks_the_expected_branch_after_survey(repo: Path, monkeypatch) -
     unexpected_branch = "acp-unexpected-gc-branch"
     original_remove = supervisor._remove_worktree
 
-    def switch_branch_then_remove(path, delete_branch, expected_branch):
+    def switch_branch_then_remove(path, delete_branch, expected_branch, **keywords):
         git(path, "switch", "-c", unexpected_branch)
-        return original_remove(path, delete_branch, expected_branch)
+        return original_remove(path, delete_branch, expected_branch, **keywords)
 
     monkeypatch.setattr(supervisor, "_remove_worktree", switch_branch_then_remove)
 
@@ -148,6 +180,59 @@ def test_gc_rechecks_the_expected_branch_after_survey(repo: Path, monkeypatch) -
     surviving = git(repo, "branch", "--list", "--format=%(refname:short)")
     assert attempt["branch"] in surviving
     assert unexpected_branch in surviving
+
+
+def test_gc_rechecks_repository_identity_at_removal(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_root = repo.parent / f"{repo.name}-external-worktrees"
+    configure_attempt_worktree_root(repo, external_root)
+    supervisor = GitSupervisor(repo)
+    attempt = finish_a_task(supervisor)
+    worktree = Path(attempt["worktree"])
+    parked_worktree = worktree.with_name(f"{worktree.name}-parked")
+    parked_git = repo.parent / f"{repo.name}-git-original"
+    foreign_repo = tmp_path / "foreign-repository"
+    foreign_repo.mkdir()
+    git(foreign_repo, "init", "-b", "main")
+    git(foreign_repo, "config", "user.name", "ACP Test")
+    git(foreign_repo, "config", "user.email", "acp@example.test")
+    (foreign_repo / "foreign.txt").write_text("unrelated\n", encoding="utf-8")
+    git(foreign_repo, "add", "foreign.txt")
+    git(foreign_repo, "commit", "-m", "unrelated")
+    foreign_git = foreign_repo / ".git"
+    source_identity_seen: list[str | None] = []
+    original_remove = supervisor._remove_worktree
+
+    def replace_repository_then_remove(path, delete_branch, expected_branch, **keywords):
+        source_identity_seen.append(keywords.get("source_repo_identity"))
+        path.rename(parked_worktree)
+        (repo / ".git").rename(parked_git)
+        foreign_git.rename(repo / ".git")
+        try:
+            git(repo, "worktree", "add", "-b", expected_branch, str(path), "HEAD")
+            return original_remove(path, delete_branch, expected_branch, **keywords)
+        finally:
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
+                check=False,
+                capture_output=True,
+            )
+            if (repo / ".git").exists():
+                (repo / ".git").rename(foreign_git)
+            parked_git.rename(repo / ".git")
+            if parked_worktree.exists() and not path.exists():
+                parked_worktree.rename(path)
+
+    monkeypatch.setattr(supervisor, "_remove_worktree", replace_repository_then_remove)
+
+    report = supervisor.gc(older_than_seconds=0)
+
+    assert source_identity_seen == [attempt["source_repository_identity"]["fingerprint"]]
+    assert report["removed"] == []
+    assert reasons(report)[attempt["id"]] == "worktree_removal_unproven"
+    assert worktree.exists()
+    assert git(worktree, "branch", "--show-current") == attempt["branch"]
 
 
 def test_gc_never_removes_an_unregistered_directory_at_attempt_path(repo: Path) -> None:
@@ -282,12 +367,22 @@ def test_expired_recovery_keeps_last_sha_when_worktree_path_becomes_symlink(
         original_path.rename(worktree)
 
 
-def test_expired_recovery_captures_head_from_registered_attempt_worktree(repo: Path) -> None:
+def test_expired_recovery_captures_head_from_registered_attempt_worktree(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     supervisor = GitSupervisor(repo)
     created = make_task(supervisor, "alpha.txt", title="recovery commit identity")
     attempt = supervisor.claim(created["id"], "worker")
     commit_change(attempt, "alpha.txt", "committed before crash\n")
     recovered_head = git(Path(attempt["worktree"]), "rev-parse", "HEAD")
+    original_head = supervisor._attempt_worktree_head
+    observed_identities: list[str | None] = []
+
+    def recover_only_from_pinned_repository(*arguments, **keywords):
+        observed_identities.append(keywords.get("source_repo_identity"))
+        return original_head(*arguments, **keywords)
+
+    monkeypatch.setattr(supervisor, "_attempt_worktree_head", recover_only_from_pinned_repository)
 
     supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
 
@@ -296,6 +391,34 @@ def test_expired_recovery_captures_head_from_registered_attempt_worktree(repo: P
             "SELECT latest_sha FROM attempts WHERE id = ?", (attempt["id"],)
         ).fetchone()["latest_sha"]
     assert latest_sha == recovered_head
+    assert observed_identities == [
+        attempt["source_repository_identity"]["fingerprint"],
+        attempt["source_repository_identity"]["fingerprint"],
+    ]
+
+
+def test_expired_recovery_does_not_capture_head_from_legacy_unpinned_worktree(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = make_task(supervisor, "alpha.txt", title="legacy recovery identity")
+    attempt = supervisor.claim(created["id"], "worker")
+    latest_before = attempt["latest_sha"]
+    commit_change(attempt, "alpha.txt", "untrusted recovered commit\n")
+
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER attempts_source_repo_identity_immutable")
+        connection.execute(
+            "UPDATE attempts SET source_repo_identity = '' WHERE id = ?", (attempt["id"],)
+        )
+
+    supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+
+    with supervisor.connect() as connection:
+        latest_after = connection.execute(
+            "SELECT latest_sha FROM attempts WHERE id = ?", (attempt["id"],)
+        ).fetchone()["latest_sha"]
+    assert latest_after == latest_before
 
 
 def test_expired_recovery_does_not_read_head_while_launch_owner_is_live(repo: Path) -> None:

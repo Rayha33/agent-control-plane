@@ -64,6 +64,28 @@ An agent told *"beta.txt is not in the task's declared write set; declared: alph
 corrects itself in one turn. Guard is read-only — a pre-write check must never itself
 become a reason the state changed.
 
+Before resolving the stored attempt path, guard verifies the claim-time
+`source_repository_identity` fingerprint, the exact attempt-ID child of its managed
+root, Git's worktree registration, and the expected branch/common repository. Attempt
+views report the fingerprint without exposing its filesystem path (`pinned` or
+`unknown`). Legacy rows have no truthful claim-time pin and fail closed at guard,
+result import, and submission; reclaim the task to create a new attempt.
+Supervised workers repeat the identity check before process creation and again
+while candidate code is still held behind the start gate. Expired recovery only
+captures a worktree HEAD while the same pin holds. GC retains unknown or mismatched
+identities and rechecks the pin under the Git-operation lock before removing a
+worktree or its branch.
+
+Before upgrading to schema v33, use the previous ACP version to finish or drain live,
+reviewing, integrating, or runtime-owning attempts. The migration refuses to proceed
+while such a legacy attempt is present (`schema_upgrade_requires_drain`); retry after
+its worker is stopped and its runtime is released. It leaves the old identity unknown
+and never derives a claim-time pin from the current filesystem. If an older build has
+already migrated an active unpinned attempt, it remains fenced and needs operator
+recovery. Identity checks around runtime setup and teardown are point-in-time checks,
+not atomic filesystem isolation; protect worktree parents and use an OS sandbox against
+concurrent path replacement.
+
 For hook calls, the adapter first validates the payload. If it cannot extract both a
 supported writable path and a non-empty string `cwd`, it denies with
 `unreadable_hook_payload` before looking up the attempt or checking its lease. The
@@ -74,6 +96,7 @@ supervisor denials below are then checked in this order:
 | `attempt_not_found` | no such attempt |
 | `attempt_not_live` | the attempt is orphaned, submitted or quarantined |
 | `lease_expired` | the claim lease has run out; heartbeat or re-claim |
+| `attempt_worktree_identity_unverified` | the attempt path, registered branch, or pinned source repository no longer matches; runtime hooks and writes are refused |
 | `invalid_working_directory` | hook cwd is not absolute, an existing directory, or resolvable |
 | `cwd_outside_worktree` | hook cwd is outside this attempt's worktree |
 | `invalid_path` | the target path cannot be resolved |

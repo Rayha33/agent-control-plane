@@ -82,8 +82,9 @@ class WorkersMixin:
         # A journaled OCI reservation can survive a supervisor restart or a
         # configuration change. Reject it before heartbeat/log setup so an
         # unavailable executor cannot mutate that attempt while refusing it.
-        # This is only a side-effect-free preflight: _reserve_worker_launch
-        # retains the transactional check that arbitrates concurrent claims.
+        # This also checks claim/auth state before the platform gate; on Linux it
+        # verifies repository identity too. The transactional launch reservation
+        # remains authoritative for concurrent claims.
         self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
         if not sys.platform.startswith("linux"):
             raise SupervisorError(
@@ -133,6 +134,10 @@ class WorkersMixin:
                 start_read, start_write = os.pipe()
                 self._reserve_worker_launch(attempt_id, claim_token, str(log_path), credential)
                 launch_reserved = True
+                # The initial preflight does not reserve the attempt slot. Recheck
+                # after reservation so a replaced checkout cannot become the
+                # worker's cwd while a competing launch or filesystem change races.
+                self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
                 trampoline = Path(__file__).parent.with_name("worker_trampoline.py").resolve()
                 process = subprocess.Popen(
                     [
@@ -281,8 +286,10 @@ class WorkersMixin:
                     command,
                     credential,
                 )
-                # Revalidate after both monitor and command identities are
-                # durable, but before the second gate authorizes candidate code.
+                # The command is still blocked at the second gate. Revalidate the
+                # immutable repository pin now, after its process identity is
+                # durable and immediately before candidate code can execute.
+                self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
                 self._verify_attempt_trust(attempt_id)
                 os.write(start_write, b"G")
                 os.close(start_write)
@@ -428,6 +435,33 @@ class WorkersMixin:
                     "sandbox_execution_reserved",
                     "a journaled sandbox execution owns this attempt slot",
                 )
+            # Unsupported platforms never launch a worker, so reject them after
+            # the DB authorization checks without issuing Git subprocesses.
+            if not sys.platform.startswith("linux"):
+                return
+            worktree_text = attempt["worktree"]
+            worktree_root_text = attempt["worktree_root"]
+            branch = attempt["branch"]
+            source_repo_identity = attempt["source_repo_identity"]
+        if (
+            not isinstance(worktree_text, str)
+            or not isinstance(worktree_root_text, str)
+            or not worktree_root_text
+            or not isinstance(source_repo_identity, str)
+            or re.fullmatch(r"acp-repo-v1:[0-9a-f]{64}", source_repo_identity) is None
+            or self._attempt_worktree_head(
+                attempt_id,
+                Path(worktree_text),
+                Path(worktree_root_text),
+                branch,
+                source_repo_identity=source_repo_identity,
+            )
+            is None
+        ):
+            raise SupervisorError(
+                "attempt_worktree_identity_unverified",
+                "attempt worktree no longer matches its registered source repository",
+            )
 
     def _reserve_worker_launch(
         self,

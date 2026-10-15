@@ -672,15 +672,19 @@ def test_disk_headroom_preserves_trailing_spaces_in_git_common_directory(
     original_stat = Path.stat
     usage_paths: list[Path] = []
     original_run_git = supervisor._run_git_while_locked
+    common_dir_queries = 0
 
     def fake_run_git(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        nonlocal common_dir_queries
         if arguments[:2] == ("rev-parse", "--path-format=absolute"):
-            return subprocess.CompletedProcess(
-                args=list(arguments),
-                returncode=0,
-                stdout=f"{common_dir_with_space}\n".encode(),
-                stderr=b"",
-            )
+            common_dir_queries += 1
+            if common_dir_queries == 2:
+                return subprocess.CompletedProcess(
+                    args=list(arguments),
+                    returncode=0,
+                    stdout=f"{common_dir_with_space}\n".encode(),
+                    stderr=b"",
+                )
         return original_run_git(*arguments)
 
     def fake_stat(path: Path, *args, **kwargs):
@@ -796,10 +800,16 @@ def test_disk_headroom_git_directory_probe_failure_fails_closed(
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     original = supervisor._run_git_while_locked
+    common_directory_probes = 0
 
     def unavailable(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        nonlocal common_directory_probes
         if arguments[:2] == ("rev-parse", "--path-format=absolute"):
-            raise OSError("injected Git common-directory probe failure")
+            common_directory_probes += 1
+            # Claim-time source identity is probe one. Fail the subsequent
+            # disk-headroom check this regression is specifically exercising.
+            if common_directory_probes == 2:
+                raise OSError("injected Git common-directory probe failure")
         return original(*arguments)
 
     monkeypatch.setattr(supervisor, "_run_git_while_locked", unavailable)
@@ -808,6 +818,7 @@ def test_disk_headroom_git_directory_probe_failure_fails_closed(
         supervisor.claim(created["id"], "worker-git-probe-failure")
 
     assert error.value.code == "disk_headroom_unavailable"
+    assert common_directory_probes == 2
     assert supervisor.task(created["id"])["status"] == "open"
     with supervisor.connect() as connection:
         attempt = connection.execute(
@@ -2936,6 +2947,83 @@ def test_runtime_lifecycle_is_shared_with_qc_and_integration(repo: Path) -> None
     assert (repo / ".acp" / f"teardown-{attempt['id']}").read_text() == "done"
 
 
+def test_runtime_setup_refuses_a_replaced_attempt_worktree(repo: Path, tmp_path: Path) -> None:
+    foreign = tmp_path / "foreign-worktree-target"
+    foreign.mkdir()
+    write_config(repo, runtime_setup_commands=["printf ran > setup-ran"])
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    parked = worktree.with_name(f"{worktree.name}-parked")
+    (worktree / "setup-ran").unlink()
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'allocated' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    worktree.rename(parked)
+    worktree.symlink_to(foreign, target_is_directory=True)
+    try:
+        with pytest.raises(SupervisorError) as refused:
+            supervisor._runtime_up(attempt["id"])
+        assert refused.value.code == "attempt_worktree_identity_unverified"
+        assert not (foreign / "setup-ran").exists()
+    finally:
+        worktree.unlink(missing_ok=True)
+        parked.rename(worktree)
+    assert supervisor.runtime_down(attempt["id"], force=True, _allow_active=True)["state"] == (
+        "released"
+    )
+
+
+def test_runtime_teardown_refuses_a_replaced_attempt_worktree(repo: Path, tmp_path: Path) -> None:
+    foreign = tmp_path / "foreign-worktree-target"
+    foreign.mkdir()
+    write_config(repo, runtime_teardown_commands=["printf ran > teardown-ran"])
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    parked = worktree.with_name(f"{worktree.name}-parked")
+    worktree.rename(parked)
+    worktree.symlink_to(foreign, target_is_directory=True)
+    try:
+        with pytest.raises(SupervisorError) as refused:
+            supervisor.runtime_down(attempt["id"], _allow_active=True)
+        assert refused.value.code == "attempt_worktree_identity_unverified"
+        assert supervisor.runtime_environment(attempt["id"])["state"] == "ready"
+        assert not (foreign / "teardown-ran").exists()
+    finally:
+        worktree.unlink(missing_ok=True)
+        parked.rename(worktree)
+    assert supervisor.runtime_down(attempt["id"], _allow_active=True)["state"] == "released"
+    assert (worktree / "teardown-ran").read_text() == "ran"
+
+
+def test_claim_rollback_passes_the_pinned_repository_to_worktree_removal(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    expected_identity: list[str] = []
+    original_remove = supervisor._remove_worktree
+
+    def observe_remove(path, delete_branch, expected_branch, **keywords):
+        expected_identity.append(keywords.get("source_repo_identity"))
+        return original_remove(path, delete_branch, expected_branch, **keywords)
+
+    def fail_setup(_attempt_id: str) -> None:
+        raise SupervisorError("test_setup_failure", "forced setup failure")
+
+    monkeypatch.setattr(supervisor, "_remove_worktree", observe_remove)
+    monkeypatch.setattr(supervisor, "_runtime_up", fail_setup)
+    with pytest.raises(SupervisorError) as failed:
+        supervisor.claim(created["id"], "worker")
+
+    assert failed.value.code == "test_setup_failure"
+    assert len(expected_identity) == 1
+    assert expected_identity[0].startswith("acp-repo-v1:")
+
+
 def test_occupied_runtime_port_is_quarantined_until_cleanup(repo: Path) -> None:
     start, _ = two_free_ports()
     write_config(repo, runtime_ports={"APP_PORT": (start, start)})
@@ -2972,6 +3060,38 @@ def test_reaper_tears_down_expired_runtime(repo: Path) -> None:
     assert attempt["task_id"] in result["orphaned"]
     assert result["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
     assert supervisor.runtime_environment(attempt["id"])["state"] == "released"
+
+
+def test_reaper_does_not_run_teardown_in_a_replaced_attempt_worktree(
+    repo: Path, tmp_path: Path
+) -> None:
+    foreign = tmp_path / "foreign-worktree-target"
+    foreign.mkdir()
+    write_config(repo, runtime_teardown_commands=["printf ran > teardown-ran"])
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    parked = worktree.with_name(f"{worktree.name}-parked")
+    worktree.rename(parked)
+    worktree.symlink_to(foreign, target_is_directory=True)
+    try:
+        report = supervisor.reap_expired(now=attempt["lease_expires_at"])
+        assert any(
+            item["attempt_id"] == attempt["id"] and item["state"] == "cleanup_error"
+            for item in report["runtime_cleanup"]
+        )
+        assert not (foreign / "teardown-ran").exists()
+        assert worktree.is_symlink()
+    finally:
+        worktree.unlink(missing_ok=True)
+        parked.rename(worktree)
+
+    recovered = supervisor.reap_expired(now=attempt["lease_expires_at"])
+    assert any(
+        item["attempt_id"] == attempt["id"] and item["state"] == "released"
+        for item in recovered["runtime_cleanup"]
+    )
+    assert (worktree / "teardown-ran").read_text() == "ran"
 
 
 @requires_linux_worker
@@ -5793,6 +5913,60 @@ subprocess.run(["git", "commit", "-m", "contained worker"], check=True)
 
 
 @requires_linux_worker
+def test_worker_rechecks_repository_identity_before_releasing_payload_gate(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
+    worktree = Path(attempt["worktree"])
+    parked = worktree.with_name(f"{worktree.name}-parked")
+    marker = tmp_path / "payload-started"
+    foreign_repo = tmp_path / "foreign-repository"
+    foreign_repo.mkdir()
+    git(foreign_repo, "init", "-b", "main")
+    git(foreign_repo, "config", "user.name", "ACP Test")
+    git(foreign_repo, "config", "user.email", "acp-test@example.invalid")
+    (foreign_repo / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+    git(foreign_repo, "add", "foreign.txt")
+    git(foreign_repo, "commit", "-m", "foreign base")
+
+    original_record = supervisor._record_worker_command_ready
+    replaced = False
+
+    def replace_worktree_after_receipt(*arguments, **keywords):
+        nonlocal replaced
+        receipt = original_record(*arguments, **keywords)
+        if not replaced:
+            worktree.rename(parked)
+            git(foreign_repo, "worktree", "add", "-b", attempt["branch"], str(worktree), "HEAD")
+            replaced = True
+        return receipt
+
+    monkeypatch.setattr(supervisor, "_record_worker_command_ready", replace_worktree_after_receipt)
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+    ]
+
+    try:
+        with pytest.raises(SupervisorError) as error:
+            supervisor.run_worker(attempt["id"], attempt["claim_token"], command)
+    finally:
+        if replaced:
+            subprocess.run(
+                ["git", "-C", str(foreign_repo), "worktree", "remove", "--force", str(worktree)],
+                check=False,
+                capture_output=True,
+            )
+            if parked.exists() and not worktree.exists():
+                parked.rename(worktree)
+
+    assert error.value.code == "attempt_worktree_identity_unverified"
+    assert not marker.exists()
+
+
+@requires_linux_worker
 def test_worker_payload_waits_for_durable_command_identity_receipt(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6071,7 +6245,13 @@ def test_pipe_failure_does_not_leave_launch_reservation(
     supervisor = GitSupervisor(repo)
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
+    # Prove this attempt passes the new repository-identity preflight before
+    # injecting a host pipe failure. Stub only the repeated preflight inside
+    # run_worker so the fault reaches its own launch-pipe boundary, not Git's
+    # subprocess capture pipes.
+    supervisor._preflight_direct_worker_launch(attempt["id"], attempt["claim_token"], None)
     with monkeypatch.context() as patch:
+        patch.setattr(supervisor, "_preflight_direct_worker_launch", lambda *_args, **_kwargs: None)
         patch.setattr(
             "agent_control_plane.git_supervisor.os.pipe",
             lambda: (_ for _ in ()).throw(OSError("injected pipe failure")),

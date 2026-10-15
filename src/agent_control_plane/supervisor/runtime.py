@@ -138,6 +138,38 @@ class RuntimeMixin:
             )
         return runtime["environment"]
 
+    def _assert_attempt_worktree_identity(self, attempt_id: str) -> Path:
+        """Return an attempt worktree only while its immutable repository pin holds."""
+
+        with self.connect() as connection:
+            attempt = connection.execute(
+                "SELECT worktree, worktree_root, branch, source_repo_identity "
+                "FROM attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if not attempt:
+            raise SupervisorError("attempt_not_found", "attempt does not exist")
+        worktree = Path(attempt["worktree"])
+        source_identity = attempt["source_repo_identity"]
+        if (
+            not isinstance(source_identity, str)
+            or not source_identity
+            or not (worktree.exists() or worktree.is_symlink())
+            or self._attempt_worktree_head(
+                attempt_id,
+                worktree,
+                Path(attempt["worktree_root"]),
+                attempt["branch"],
+                source_repo_identity=source_identity,
+            )
+            is None
+        ):
+            raise SupervisorError(
+                "attempt_worktree_identity_unverified",
+                "runtime hooks are fenced because the attempt worktree repository identity is unverified",
+            )
+        return worktree
+
     def _run_runtime_commands(
         self,
         commands: Sequence[str],
@@ -1372,6 +1404,10 @@ class RuntimeMixin:
             return self._runtime_up_locked(attempt_id, guard_fd)
 
     def _runtime_up_locked(self, attempt_id: str, guard_fd: int) -> dict[str, Any]:
+        # Claim setup is a privileged hook boundary too: re-prove the exact
+        # registered worktree after `git worktree add`, before changing runtime
+        # state or running user-configured commands in its directory.
+        worktree = self._assert_attempt_worktree_identity(attempt_id)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1394,14 +1430,13 @@ class RuntimeMixin:
                 "supervisor",
                 {"attempt_id": attempt_id},
             )
-        attempt = self.attempt(attempt_id)
         environment = json.loads(row["env_json"])
         runtime_dir = Path(environment["ACP_RUNTIME_DIR"])
         runtime_dir.mkdir(parents=True, exist_ok=True)
         results = self._run_runtime_commands(
             self.config.runtime_setup_commands,
-            Path(attempt["worktree"]),
-            self._phase_runtime_env(environment, "setup", Path(attempt["worktree"])),
+            worktree,
+            self._phase_runtime_env(environment, "setup", worktree),
             Path(row["log_path"]),
             stop_on_failure=True,
             pass_fds=(guard_fd,),
@@ -1487,6 +1522,22 @@ class RuntimeMixin:
         _allow_active: bool,
         guard_fd: int,
     ) -> dict[str, Any]:
+        # A completed teardown is idempotent even after GC has removed the
+        # worktree. Check that durable state before requiring a path that is no
+        # longer needed; for all pending teardown, keep the identity fence ahead
+        # of hooks and filesystem use.
+        with self.connect() as connection:
+            released = connection.execute(
+                "SELECT * FROM runtime_environments WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if not released:
+                raise SupervisorError("runtime_not_found", "runtime environment is missing")
+            if released["state"] == "released":
+                return self._runtime_view(connection, released)
+
+        # Refuse direct runtime_down calls as well as reaper cleanup when a
+        # stored path has been replaced, symlinked, or predates repository pins.
+        worktree = self._assert_attempt_worktree_identity(attempt_id)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if not _sandbox_execution_cleanup_is_verified(connection, attempt_id):
@@ -1537,9 +1588,7 @@ class RuntimeMixin:
                 {"attempt_id": attempt_id, "force": force},
             )
             environment = json.loads(row["env_json"])
-        attempt = self.attempt(attempt_id)
-        worktree = Path(attempt["worktree"])
-        cwd = worktree if worktree.is_dir() else self.root
+        cwd = worktree
         results = self._run_runtime_commands(
             self.config.runtime_teardown_commands,
             cwd,
