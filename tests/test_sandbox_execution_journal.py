@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 from support import init_repo, make_task
@@ -36,6 +38,7 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
 )
+from agent_control_plane.supervisor.sandbox_monitor_receipt import SandboxMonitorReceipt
 from agent_control_plane.supervisor.sandbox_workspace import (
     ManifestEntry,
     _make_manifest,
@@ -1320,6 +1323,8 @@ def test_running_transition_rechecks_process_membership_under_gate_lock(
         ("wrapper", "MainPID"),
         ("wrapper", "InvocationID"),
         ("wrapper", "ControlGroup"),
+        ("launch_driver", "InvocationID"),
+        ("launch_driver", "ControlGroup"),
         ("slice", "InvocationID"),
         ("scope", "InvocationID"),
     ],
@@ -1374,6 +1379,13 @@ def test_running_transition_rechecks_systemd_identity_under_gate_lock(
                     "InvocationID": attestation.wrapper_invocation_id,
                     "MainPID": str(attestation.monitor_pid),
                 }
+            elif unit == attestation.launch_driver_unit:
+                values = {
+                    "ActiveState": "active",
+                    "ControlGroup": attestation.launch_driver_control_group,
+                    "Id": attestation.launch_driver_unit,
+                    "InvocationID": attestation.launch_driver_invocation_id,
+                }
             elif unit == attestation.attempt_slice_unit:
                 values = {
                     "ActiveState": "active",
@@ -1391,6 +1403,7 @@ def test_running_transition_rechecks_systemd_identity_under_gate_lock(
                 }
             unit_names = {
                 "wrapper": attestation.wrapper_unit,
+                "launch_driver": attestation.launch_driver_unit,
                 "slice": attestation.attempt_slice_unit,
                 "scope": attestation.scope_unit,
             }
@@ -1690,6 +1703,8 @@ def record_launch(
     runc_handle: oci_worker.RuncLaunchHandle | None = None,
     wrapper_unit: str | None = None,
     wrapper_cgroup_path: str | None = None,
+    monitor_start_calls: list[dict[str, Any]] | None = None,
+    monitor_start_error: Exception | None = None,
 ) -> dict:
     if runc_handle is None:
         execution = supervisor._sandbox_execution_get(attempt["id"])
@@ -1729,28 +1744,115 @@ def record_launch(
     if launch_submission is not None:
         attempt["_test_launch_submission"] = launch_submission
     slice_unit = oci_worker._oci_worker_systemd_slice(execution["container_id"])
-    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/user-acp.slice"
     wrapper_unit = wrapper_unit or journal_module._sandbox_monitor_service_unit(
         attempt["id"], attempt["claim_token"], execution["execution_id"]
     )
     slice_cgroup = common_cgroup + "/" + slice_unit
-    return supervisor._sandbox_execution_record_launch(
-        attempt["id"],
-        attempt["claim_token"],
-        monitor_pid=101,
-        monitor_identity="linux:101:1101",
-        runc_handle=runc_handle,
-        launch_submission=launch_submission,
-        wrapper_unit=wrapper_unit,
-        wrapper_invocation_id="1" * 32,
-        wrapper_cgroup_path=wrapper_cgroup_path or f"{common_cgroup}/{wrapper_unit}",
-        attempt_slice_unit=slice_unit,
-        attempt_slice_invocation_id="3" * 32,
-        attempt_slice_cgroup_path=slice_cgroup,
-        scope_unit="acp-container.scope",
-        scope_invocation_id="2" * 32,
-        cgroup_path=f"{slice_cgroup}/acp-container.scope",
+    receipt_fields = {
+        "controller_pid": 202,
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "execution_id": execution["execution_id"],
+        "unit": wrapper_unit,
+        "invocation_id": "1" * 32,
+        "control_group": wrapper_cgroup_path or f"{common_cgroup}/{wrapper_unit}",
+        "main_pid": 101,
+        "main_identity": "linux:101:1101",
+        "monitor_slice_unit": "user-acp.slice",
+        "monitor_slice_control_group": common_cgroup,
+        "attempt_slice_unit": slice_unit,
+        "attempt_slice_control_group": slice_cgroup,
+    }
+    try:
+        receipt = SandboxMonitorReceipt(**receipt_fields)
+    except ValueError:
+        # Malformed systemd receipt fixtures model a compromised producer; the
+        # launch recorder must reject them before writing the durable phase.
+        receipt = SimpleNamespace(**receipt_fields)
+    client = SimpleNamespace(
+        _receipt=receipt,
+        status=lambda: SimpleNamespace(
+            outcome="ok",
+            payload={
+                "phase": "running",
+                "scope_unit": "acp-container.scope",
+                "scope_invocation_id": "2" * 32,
+                "scope_control_group": f"{slice_cgroup}/acp-container.scope",
+            },
+        ),
     )
+
+    def start_monitor(**kwargs: Any) -> Any:
+        if monitor_start_calls is not None:
+            monitor_start_calls.append(kwargs)
+        if monitor_start_error is not None:
+            raise monitor_start_error
+        return client
+
+    with patch(
+        "agent_control_plane.supervisor.sandbox_monitor_service.start_sandbox_execution_monitor",
+        side_effect=start_monitor,
+    ):
+        return supervisor._sandbox_execution_record_launch(
+            attempt["id"],
+            attempt["claim_token"],
+            runc_handle=runc_handle,
+            launch_submission=launch_submission,
+            attempt_slice_unit=slice_unit,
+            attempt_slice_invocation_id="3" * 32,
+            attempt_slice_cgroup_path=slice_cgroup,
+            scope_unit="acp-container.scope",
+            scope_invocation_id="2" * 32,
+            cgroup_path=f"{slice_cgroup}/acp-container.scope",
+        )
+
+
+def test_launch_starts_monitor_for_exact_fenced_scope_and_uses_service_receipt(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    calls: list[dict[str, Any]] = []
+
+    launched = record_launch(supervisor, attempt, monitor_start_calls=calls)
+
+    assert len(calls) == 1
+    assert calls[0] == {
+        "state_path": execution["state_path"],
+        "expected_identity": (attempt["id"], attempt["claim_token"], execution["execution_id"]),
+        "scope_unit": "acp-container.scope",
+        "scope_invocation_id": "2" * 32,
+        "scope_control_group": launched["cgroup_path"],
+        "attempt_slice_control_group": launched["attempt_slice_cgroup_path"],
+    }
+    assert launched["monitor_pid"] == 101
+    assert launched["monitor_identity"] == "linux:101:1101"
+    assert launched["wrapper_unit"] == journal_module._sandbox_monitor_service_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    assert launched["wrapper_cgroup_path"].endswith("/" + launched["wrapper_unit"])
+
+
+def test_monitor_start_failure_keeps_launch_gate_closed_and_fences_reserved(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+
+    with pytest.raises(SupervisorError) as unavailable:
+        record_launch(
+            supervisor,
+            attempt,
+            runc_handle=handle,
+            monitor_start_error=RuntimeError("ambiguous service startup"),
+        )
+
+    assert unavailable.value.code == "sandbox_execution_monitor_unavailable"
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None and durable["phase"] == "reserved"
+    assert durable["launch_plan_binding_version"] == 0
 
 
 def test_launch_submission_is_not_retried_after_monitor_restart(repo: Path) -> None:
@@ -1879,7 +1981,7 @@ def test_launch_rejects_monitor_in_sibling_attempt_slice(repo: Path) -> None:
             wrapper_cgroup_path=sibling_monitor_path,
         )
 
-    assert invalid.value.code == "sandbox_execution_invalid"
+    assert invalid.value.code == "sandbox_execution_monitor_identity_mismatch"
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
@@ -1991,12 +2093,17 @@ def running_attestation(
     state_root_override: Path | None = None,
     pid_file_name_override: str | None = None,
     runc_executable_sha256: str | None = None,
+    launch_driver_unit_override: str | None = None,
 ):
     row = supervisor._sandbox_execution_get(attempt["id"])
     assert row is not None and row["phase"] == "launched"
     init_start = 1303
     wrapper_cgroup = row["wrapper_cgroup_path"]
     slice_cgroup = row["attempt_slice_cgroup_path"]
+    launch_driver_unit = launch_driver_unit_override or (
+        journal_module._sandbox_launch_driver_service_unit(row["execution_id"])
+    )
+    launch_driver_cgroup = f"{slice_cgroup}/{launch_driver_unit}"
     scope_cgroup = row["cgroup_path"]
     resource_limits = (
         json.loads(row["launch_plan_json"])["launch"]["resource_limits"]
@@ -2024,7 +2131,7 @@ def running_attestation(
                 row["runc_client_pid"],
                 int(row["runc_client_identity"].rsplit(":", 1)[1]),
             ),
-            f"0::{wrapper_cgroup}\n".encode("ascii"),
+            f"0::{launch_driver_cgroup}\n".encode("ascii"),
             stat(
                 row["runc_client_pid"],
                 int(row["runc_client_identity"].rsplit(":", 1)[1]),
@@ -2052,6 +2159,7 @@ def running_attestation(
         "expected_runc_client_identity": row["runc_client_identity"],
         "expected_wrapper_unit": row["wrapper_unit"],
         "expected_wrapper_invocation_id": row["wrapper_invocation_id"],
+        "expected_launch_driver_unit": launch_driver_unit,
         "expected_attempt_slice_unit": row["attempt_slice_unit"],
         "expected_attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
         "expected_scope_unit": row["scope_unit"],
@@ -2077,6 +2185,12 @@ def running_attestation(
         f"InvocationID={row['wrapper_invocation_id']}\n"
         f"MainPID={row['monitor_pid']}\n"
     ).encode("ascii")
+    launch_driver_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={launch_driver_cgroup}\n"
+        f"Id={launch_driver_unit}\n"
+        f"InvocationID={'4' * 32}\n"
+    ).encode("ascii")
     attempt_slice_properties = (
         "ActiveState=active\n"
         f"ControlGroup={slice_cgroup}\n"
@@ -2095,6 +2209,7 @@ def running_attestation(
         "pid_file": f"{init_pid}\n".encode("ascii"),
         "process_snapshots": snapshots,
         "wrapper_properties": wrapper_properties,
+        "launch_driver_properties": launch_driver_properties,
         "attempt_slice_properties": attempt_slice_properties,
         "scope_properties": scope_properties,
         "resource_control_files": resource_control_files,
@@ -2148,6 +2263,7 @@ def running_attestation(
                 return 0, runc_state.decode("utf-8")
             return 0, {
                 row["wrapper_unit"]: wrapper_properties,
+                launch_driver_unit: launch_driver_properties,
                 row["attempt_slice_unit"]: attempt_slice_properties,
                 row["scope_unit"]: scope_properties,
             }[command[-1]].decode("ascii")
@@ -2201,7 +2317,7 @@ def _live_process_snapshot(attestation, pid: int) -> ProcessSnapshot:
         ),
         attestation.runc_client_pid: (
             attestation.runc_client_identity,
-            attestation.wrapper_control_group,
+            attestation.launch_driver_control_group,
         ),
         attestation.init_pid: (attestation.init_identity, attestation.cgroup_path),
     }
@@ -3876,6 +3992,45 @@ def test_running_transition_requires_intact_attestation_bound_to_launch(
     assert running["phase"] == "running"
     assert running["init_pid"] == 303
     assert running["init_identity"] == "linux:303:1303"
+
+
+def test_running_transition_rejects_collected_receipt_for_other_launch_driver(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        receipt = running_attestation(
+            supervisor,
+            attempt,
+            launch_driver_unit_override="acp-launch-driver-other-execution.service",
+        )
+
+        assert running_attestation_is_self_consistent(receipt)
+        assert running_attestation_has_collector_provenance(receipt)
+        with pytest.raises(SupervisorError) as rejected:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=receipt,
+                runc_handle=handle,
+            )
+
+        assert rejected.value.code == "sandbox_runtime_attestation_stale"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
 
 
 def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: Path) -> None:

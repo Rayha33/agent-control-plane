@@ -28,6 +28,8 @@ _ATTEMPT_SLICE_CGROUP = (
 )
 _MONITOR_PARENT_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice"
 _WRAPPER_CGROUP = f"{_MONITOR_PARENT_CGROUP}/acp-worker.service"
+_LAUNCH_DRIVER_UNIT = "acp-launch-driver-test-execution.service"
+_LAUNCH_DRIVER_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/{_LAUNCH_DRIVER_UNIT}"
 _SCOPE_CGROUP = f"{_ATTEMPT_SLICE_CGROUP}/acp-container.scope"
 
 
@@ -55,7 +57,7 @@ def _properties(
 def _valid_observations() -> dict:
     pids = (101, 202, 303)
     starts = {101: 1101, 202: 1202, 303: 1303}
-    groups = {101: _WRAPPER_CGROUP, 202: _WRAPPER_CGROUP, 303: _SCOPE_CGROUP}
+    groups = {101: _WRAPPER_CGROUP, 202: _LAUNCH_DRIVER_CGROUP, 303: _SCOPE_CGROUP}
     return {
         "runc_state": json.dumps(
             {
@@ -81,6 +83,11 @@ def _valid_observations() -> dict:
             cgroup=_WRAPPER_CGROUP,
             main_pid=101,
         ),
+        "launch_driver_properties": _properties(
+            unit=_LAUNCH_DRIVER_UNIT,
+            invocation="4" * 32,
+            cgroup=_LAUNCH_DRIVER_CGROUP,
+        ),
         "attempt_slice_properties": _properties(
             unit=_ATTEMPT_SLICE_UNIT,
             invocation="3" * 32,
@@ -97,6 +104,7 @@ def _valid_observations() -> dict:
         "expected_runc_client_identity": "linux:202:1202",
         "expected_wrapper_unit": "acp-worker.service",
         "expected_wrapper_invocation_id": "1" * 32,
+        "expected_launch_driver_unit": _LAUNCH_DRIVER_UNIT,
         "expected_attempt_slice_unit": _ATTEMPT_SLICE_UNIT,
         "expected_attempt_slice_invocation_id": "3" * 32,
         "expected_scope_unit": "acp-container.scope",
@@ -168,6 +176,51 @@ def test_release_verifier_rereads_all_execution_processes(monkeypatch: pytest.Mo
 
     assert set(observed) == {receipt.monitor_pid, receipt.runc_client_pid, receipt.init_pid}
     assert len(observed) == 3
+
+
+def test_attestation_binds_runc_client_to_exact_launch_driver_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = _valid_observations()
+    receipt = _validate()
+    assert running_attestation_is_self_consistent(receipt)
+    assert receipt.launch_driver_unit == _LAUNCH_DRIVER_UNIT
+    assert receipt.launch_driver_invocation_id == "4" * 32
+    assert receipt.launch_driver_control_group == _LAUNCH_DRIVER_CGROUP
+
+    snapshots = observations["process_snapshots"]
+    monkeypatch.setattr(
+        sandbox_attestation, "read_linux_process_snapshot", lambda pid: snapshots[pid]
+    )
+    verify_running_runtime_process_membership(receipt)
+
+    client = snapshots[202]
+    snapshots[202] = ProcessSnapshot(
+        stat_before=client.stat_before,
+        cgroup=f"0::{_ATTEMPT_SLICE_CGROUP}/acp-launch-driver.service\n".encode("ascii"),
+        stat_after=client.stat_after,
+    )
+    with pytest.raises(
+        SupervisorError, match="live process identities or cgroup membership no longer match"
+    ) as stale:
+        verify_running_runtime_process_membership(receipt)
+    assert isinstance(stale.value.__cause__, SupervisorError)
+    assert "live execution process cgroup membership changed" in str(stale.value.__cause__)
+
+
+def test_initial_attestation_rejects_runc_client_inside_worker_attempt_slice() -> None:
+    observations = _valid_observations()
+    client = observations["process_snapshots"][202]
+    observations["process_snapshots"][202] = ProcessSnapshot(
+        stat_before=client.stat_before,
+        cgroup=f"0::{_ATTEMPT_SLICE_CGROUP}/acp-launch-driver.service\n".encode("ascii"),
+        stat_after=client.stat_after,
+    )
+
+    with pytest.raises(
+        SupervisorError, match="runc client is outside its exact launch-driver service cgroup"
+    ):
+        validate_running_runtime_attestation(**observations)
 
 
 @pytest.mark.parametrize("drift", ["pid_reuse", "moved_cgroup", "exited"])
@@ -319,7 +372,7 @@ def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, mo
     state_root, pid_file = _private_pid_file(tmp_path)
     proc_observations = {
         101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
-        202: (_proc_stat(202, "S", 1202), _WRAPPER_CGROUP.encode("ascii")),
+        202: (_proc_stat(202, "S", 1202), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
         303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
     }
 
@@ -342,6 +395,7 @@ def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, mo
         pid_file_path=pid_file,
         state_root=state_root,
         wrapper_properties=observations["wrapper_properties"],
+        launch_driver_properties=observations["launch_driver_properties"],
         attempt_slice_properties=observations["attempt_slice_properties"],
         scope_properties=observations["scope_properties"],
         expected_container_id=observations["expected_container_id"],
@@ -352,6 +406,7 @@ def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, mo
         expected_runc_client_identity=observations["expected_runc_client_identity"],
         expected_wrapper_unit=observations["expected_wrapper_unit"],
         expected_wrapper_invocation_id=observations["expected_wrapper_invocation_id"],
+        expected_launch_driver_unit=observations["expected_launch_driver_unit"],
         expected_attempt_slice_unit=observations["expected_attempt_slice_unit"],
         expected_attempt_slice_invocation_id=observations["expected_attempt_slice_invocation_id"],
         expected_scope_unit=observations["expected_scope_unit"],
@@ -371,7 +426,7 @@ def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, mo
 
 @pytest.mark.parametrize(
     "drift_unit",
-    [None, "acp-worker.service", _ATTEMPT_SLICE_UNIT, "acp-container.scope"],
+    [None, "acp-worker.service", _LAUNCH_DRIVER_UNIT, _ATTEMPT_SLICE_UNIT, "acp-container.scope"],
 )
 def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
     tmp_path, monkeypatch, drift_unit: str | None
@@ -380,7 +435,7 @@ def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
     state_root, pid_file = _private_pid_file(tmp_path)
     proc_observations = {
         101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
-        202: (_proc_stat(202, "S", 1202), _WRAPPER_CGROUP.encode("ascii")),
+        202: (_proc_stat(202, "S", 1202), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
         303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
     }
     commands: list[tuple[list[str], dict]] = []
@@ -433,6 +488,7 @@ def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
         assert kwargs.get("exec_fd") is None
         result = {
             "acp-worker.service": observations["wrapper_properties"],
+            _LAUNCH_DRIVER_UNIT: observations["launch_driver_properties"],
             _ATTEMPT_SLICE_UNIT: observations["attempt_slice_properties"],
             "acp-container.scope": observations["scope_properties"],
         }[command[-1]]
@@ -472,6 +528,7 @@ def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
             "pid_file",
             "process_snapshots",
             "wrapper_properties",
+            "launch_driver_properties",
             "attempt_slice_properties",
             "scope_properties",
             "resource_control_files",
@@ -501,14 +558,16 @@ def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
     assert running_attestation_has_collector_provenance(receipt)
-    assert len(commands) == 7
+    assert len(commands) == 9
     assert {command[-1] for command, _kwargs in commands[1:]} == {
         "acp-worker.service",
+        _LAUNCH_DRIVER_UNIT,
         _ATTEMPT_SLICE_UNIT,
         "acp-container.scope",
     }
     assert unit_read_counts == {
         "acp-worker.service": 2,
+        _LAUNCH_DRIVER_UNIT: 2,
         _ATTEMPT_SLICE_UNIT: 2,
         "acp-container.scope": 2,
     }
@@ -768,6 +827,23 @@ def test_attestation_rejects_units_outside_the_exact_attempt_slice() -> None:
     )
 
     with pytest.raises(SupervisorError, match="exact attempt slice"):
+        validate_running_runtime_attestation(**observations)
+
+
+def test_attestation_rejects_arbitrary_sibling_launcher_cgroup() -> None:
+    observations = _valid_observations()
+    sibling_driver_group = f"{_MONITOR_PARENT_CGROUP}/{_LAUNCH_DRIVER_UNIT}"
+    observations["launch_driver_properties"] = _properties(
+        unit=_LAUNCH_DRIVER_UNIT,
+        invocation="4" * 32,
+        cgroup=sibling_driver_group,
+    )
+    observations["process_snapshots"][202] = replace(
+        observations["process_snapshots"][202],
+        cgroup=f"0::{sibling_driver_group}\n".encode("ascii"),
+    )
+
+    with pytest.raises(SupervisorError, match="direct child of the exact attempt slice"):
         validate_running_runtime_attestation(**observations)
 
 

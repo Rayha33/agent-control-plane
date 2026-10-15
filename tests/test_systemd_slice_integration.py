@@ -635,6 +635,8 @@ def _attestation_for_live_units(
     container_id: str,
     wrapper_unit: str,
     wrapper: dict[str, str],
+    launch_driver_unit: str,
+    launch_driver: dict[str, str],
     attempt_slice_unit: str,
     attempt_slice: dict[str, str],
     scope_unit: str,
@@ -648,9 +650,8 @@ def _attestation_for_live_units(
     """
 
     monitor_pid = int(wrapper["MainPID"])
-    wrapper_cgroup = wrapper["ControlGroup"]
-    worker_pids = _wait_cgroup_pids(wrapper_cgroup, count=2)
-    runc_client_pid = next(pid for pid in worker_pids if pid != monitor_pid)
+    worker_pids = _wait_cgroup_pids(launch_driver["ControlGroup"], count=2)
+    runc_client_pid = next(pid for pid in worker_pids if pid != int(launch_driver["MainPID"]))
     init_pids = _wait_cgroup_pids(scope["ControlGroup"], count=1)
     init_pid = next(iter(init_pids))
     pids = (monitor_pid, runc_client_pid, init_pid)
@@ -671,6 +672,7 @@ def _attestation_for_live_units(
         pid_file=f"{init_pid}\n".encode("ascii"),
         process_snapshots=snapshots,
         wrapper_properties=_attestation_unit_bytes(wrapper, include_main_pid=True),
+        launch_driver_properties=_attestation_unit_bytes(launch_driver, include_main_pid=False),
         attempt_slice_properties=_attestation_unit_bytes(attempt_slice, include_main_pid=False),
         scope_properties=_attestation_unit_bytes(scope, include_main_pid=False),
         expected_container_id=container_id,
@@ -681,6 +683,7 @@ def _attestation_for_live_units(
         expected_runc_client_identity=identities[runc_client_pid],
         expected_wrapper_unit=wrapper_unit,
         expected_wrapper_invocation_id=wrapper["InvocationID"],
+        expected_launch_driver_unit=launch_driver_unit,
         expected_attempt_slice_unit=attempt_slice_unit,
         expected_attempt_slice_invocation_id=attempt_slice["InvocationID"],
         expected_scope_unit=scope_unit,
@@ -1092,6 +1095,7 @@ def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
     container_id = f"acp-live-systemd-{token}"
     attempt_slice_unit = _oci_worker_systemd_slice(container_id)
     wrapper_unit = f"acp-live-wrapper-{token}.service"
+    launch_driver_unit = f"acp-launch-driver-live-{token}.service"
     scope_unit = f"acp-live-scope-{token}.scope"
     bundle_path = f"/tmp/{container_id}/bundle"
     active: dict[str, dict[str, str]] = {}
@@ -1114,6 +1118,21 @@ def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
         )
         active[wrapper_unit] = _wait_active(systemctl, wrapper_unit)
         active[attempt_slice_unit] = _wait_active(systemctl, attempt_slice_unit)
+        _run(
+            [
+                systemd_run,
+                "--user",
+                f"--unit={launch_driver_unit}",
+                f"--slice={attempt_slice_unit}",
+                "--property=Type=exec",
+                "--property=KillMode=control-group",
+                "--property=RuntimeMaxSec=90s",
+                "/usr/bin/python3",
+                "-c",
+                "import subprocess; p = subprocess.Popen(['/usr/bin/sleep', '90']); p.wait()",
+            ]
+        )
+        active[launch_driver_unit] = _wait_active(systemctl, launch_driver_unit)
         scope_client = subprocess.Popen(
             [
                 systemd_run,
@@ -1136,6 +1155,8 @@ def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
             container_id=container_id,
             wrapper_unit=wrapper_unit,
             wrapper=active[wrapper_unit],
+            launch_driver_unit=launch_driver_unit,
+            launch_driver=active[launch_driver_unit],
             attempt_slice_unit=attempt_slice_unit,
             attempt_slice=active[attempt_slice_unit],
             scope_unit=scope_unit,
@@ -1155,7 +1176,7 @@ def test_live_systemd_attestation_verifier_rejects_restarted_wrapper() -> None:
         assert stale.value.code == "sandbox_runtime_attestation_stale"
     finally:
         cleanup_errors: list[str] = []
-        for unit in (scope_unit, attempt_slice_unit, wrapper_unit):
+        for unit in (scope_unit, launch_driver_unit, attempt_slice_unit, wrapper_unit):
             try:
                 subprocess.run(
                     [systemctl, "--user", "stop", unit],
@@ -1479,7 +1500,7 @@ def test_live_production_monitor_service_survives_controller_crash_and_cancels_e
     container_id = sandbox_container_id(*identity)
     attempt_slice_unit = sandbox_attempt_slice_unit(*identity)
     monitor_unit = sandbox_monitor_service_unit(*identity)
-    scope_unit = f"{container_id}.scope"
+    scope_unit = f"acp-{container_id}.scope"
     for unit in (scope_unit, monitor_unit, attempt_slice_unit):
         props = _unit_properties(systemctl, unit)
         if props.get("LoadState") == "not-found":

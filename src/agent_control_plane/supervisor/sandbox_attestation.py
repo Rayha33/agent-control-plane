@@ -62,6 +62,9 @@ class RunningRuntimeAttestation:
     wrapper_unit: str
     wrapper_invocation_id: str
     wrapper_control_group: str
+    launch_driver_unit: str
+    launch_driver_invocation_id: str
+    launch_driver_control_group: str
     attempt_slice_unit: str
     attempt_slice_invocation_id: str
     attempt_slice_control_group: str
@@ -96,6 +99,9 @@ class RunningRuntimeAttestation:
             "wrapper_unit": self.wrapper_unit,
             "wrapper_invocation_id": self.wrapper_invocation_id,
             "wrapper_control_group": self.wrapper_control_group,
+            "launch_driver_unit": self.launch_driver_unit,
+            "launch_driver_invocation_id": self.launch_driver_invocation_id,
+            "launch_driver_control_group": self.launch_driver_control_group,
             "attempt_slice_unit": self.attempt_slice_unit,
             "attempt_slice_invocation_id": self.attempt_slice_invocation_id,
             "attempt_slice_control_group": self.attempt_slice_control_group,
@@ -428,6 +434,7 @@ def collect_running_runtime_attestation(
     expected_runc_client_identity: str,
     expected_wrapper_unit: str,
     expected_wrapper_invocation_id: str,
+    expected_launch_driver_unit: str,
     expected_attempt_slice_unit: str,
     expected_attempt_slice_invocation_id: str,
     expected_scope_unit: str,
@@ -472,10 +479,13 @@ def collect_running_runtime_attestation(
     expected_bundle_path = _absolute_path(expected_bundle_path, "bundle path")
     expected_cgroup_path = _cgroup_path(expected_cgroup_path, "expected scope cgroup")
     wrapper_unit = _unit(expected_wrapper_unit, ".service", "wrapper unit")
+    launch_driver_unit = _unit(expected_launch_driver_unit, ".service", "launch driver unit")
+    if not launch_driver_unit.startswith("acp-launch-driver-"):
+        raise _invalid("launch driver unit is not in the reserved namespace")
     attempt_slice_unit = _unit(expected_attempt_slice_unit, ".slice", "attempt slice unit")
     scope_unit = _unit(expected_scope_unit, ".scope", "scope unit")
-    if len({wrapper_unit, attempt_slice_unit, scope_unit}) != 3:
-        raise _invalid("wrapper, attempt slice, and scope units must be distinct")
+    if len({wrapper_unit, launch_driver_unit, attempt_slice_unit, scope_unit}) != 4:
+        raise _invalid("monitor, launch driver, attempt slice, and scope units must be distinct")
     if attempt_slice_unit != _oci_worker_systemd_slice(container_id):
         raise _invalid("attempt slice unit does not match the exact container ID")
     _invocation(expected_wrapper_invocation_id, "wrapper invocation ID")
@@ -516,7 +526,7 @@ def collect_running_runtime_attestation(
     finally:
         os.close(runc_fd)
 
-    units = (wrapper_unit, attempt_slice_unit, scope_unit)
+    units = (wrapper_unit, launch_driver_unit, attempt_slice_unit, scope_unit)
 
     def read_unit_properties(unit: str) -> bytes:
         requested_properties = "ActiveState,ControlGroup,Id,InvocationID"
@@ -542,6 +552,7 @@ def collect_running_runtime_attestation(
         pid_file_path=pid_file_path,
         state_root=state_root_path,
         wrapper_properties=properties[wrapper_unit],
+        launch_driver_properties=properties[launch_driver_unit],
         attempt_slice_properties=properties[attempt_slice_unit],
         scope_properties=properties[scope_unit],
         expected_container_id=container_id,
@@ -552,6 +563,7 @@ def collect_running_runtime_attestation(
         expected_runc_client_identity=expected_runc_client_identity,
         expected_wrapper_unit=wrapper_unit,
         expected_wrapper_invocation_id=expected_wrapper_invocation_id,
+        expected_launch_driver_unit=launch_driver_unit,
         expected_attempt_slice_unit=attempt_slice_unit,
         expected_attempt_slice_invocation_id=expected_attempt_slice_invocation_id,
         expected_scope_unit=scope_unit,
@@ -596,6 +608,7 @@ def _collect_running_runtime_attestation_from_observations(
     pid_file_path: str | Path,
     state_root: str | Path,
     wrapper_properties: bytes,
+    launch_driver_properties: bytes,
     attempt_slice_properties: bytes,
     scope_properties: bytes,
     expected_container_id: str,
@@ -606,6 +619,7 @@ def _collect_running_runtime_attestation_from_observations(
     expected_runc_client_identity: str,
     expected_wrapper_unit: str,
     expected_wrapper_invocation_id: str,
+    expected_launch_driver_unit: str,
     expected_attempt_slice_unit: str,
     expected_attempt_slice_invocation_id: str,
     expected_scope_unit: str,
@@ -639,6 +653,7 @@ def _collect_running_runtime_attestation_from_observations(
         pid_file=pid_file,
         process_snapshots=process_snapshots,
         wrapper_properties=wrapper_properties,
+        launch_driver_properties=launch_driver_properties,
         attempt_slice_properties=attempt_slice_properties,
         scope_properties=scope_properties,
         expected_container_id=expected_container_id,
@@ -649,6 +664,7 @@ def _collect_running_runtime_attestation_from_observations(
         expected_runc_client_identity=expected_runc_client_identity,
         expected_wrapper_unit=expected_wrapper_unit,
         expected_wrapper_invocation_id=expected_wrapper_invocation_id,
+        expected_launch_driver_unit=expected_launch_driver_unit,
         expected_attempt_slice_unit=expected_attempt_slice_unit,
         expected_attempt_slice_invocation_id=expected_attempt_slice_invocation_id,
         expected_scope_unit=expected_scope_unit,
@@ -784,6 +800,16 @@ def verify_running_runtime_systemd_units(attestation: RunningRuntimeAttestation)
             True,
         ),
         (
+            attestation.launch_driver_unit,
+            {
+                "ActiveState": "active",
+                "ControlGroup": attestation.launch_driver_control_group,
+                "Id": attestation.launch_driver_unit,
+                "InvocationID": attestation.launch_driver_invocation_id,
+            },
+            False,
+        ),
+        (
             attestation.attempt_slice_unit,
             {
                 "ActiveState": "active",
@@ -847,7 +873,7 @@ def verify_running_runtime_process_membership(attestation: RunningRuntimeAttesta
         (
             attestation.runc_client_pid,
             attestation.runc_client_identity,
-            attestation.wrapper_control_group,
+            attestation.launch_driver_control_group,
         ),
         (attestation.init_pid, attestation.init_identity, attestation.cgroup_path),
     )
@@ -867,7 +893,8 @@ def verify_running_runtime_process_membership(attestation: RunningRuntimeAttesta
                 or f"linux:{pid}:{before_start}" != expected_identity
             ):
                 raise _invalid("live execution process identity changed after collection")
-            if _parse_proc_cgroup(snapshot.cgroup) != expected_cgroup:
+            actual_cgroup = _parse_proc_cgroup(snapshot.cgroup)
+            if expected_cgroup is not None and actual_cgroup != expected_cgroup:
                 raise _invalid("live execution process cgroup membership changed after collection")
     except SupervisorError as error:
         raise SupervisorError(
@@ -931,6 +958,7 @@ def validate_running_runtime_attestation(
     pid_file: bytes,
     process_snapshots: dict[int, ProcessSnapshot],
     wrapper_properties: bytes,
+    launch_driver_properties: bytes,
     attempt_slice_properties: bytes,
     scope_properties: bytes,
     expected_container_id: str,
@@ -941,6 +969,7 @@ def validate_running_runtime_attestation(
     expected_runc_client_identity: str,
     expected_wrapper_unit: str,
     expected_wrapper_invocation_id: str,
+    expected_launch_driver_unit: str,
     expected_attempt_slice_unit: str,
     expected_attempt_slice_invocation_id: str,
     expected_scope_unit: str,
@@ -983,8 +1012,13 @@ def validate_running_runtime_attestation(
         expected_runc_client_identity, runc_client_pid, "runc client identity"
     )
     wrapper_unit = _unit(expected_wrapper_unit, ".service", "wrapper unit")
+    launch_driver_unit = _unit(expected_launch_driver_unit, ".service", "launch driver unit")
+    if not launch_driver_unit.startswith("acp-launch-driver-"):
+        raise _invalid("launch driver unit is not in the reserved namespace")
     attempt_slice_unit = _unit(expected_attempt_slice_unit, ".slice", "attempt slice unit")
     scope_unit = _unit(expected_scope_unit, ".scope", "scope unit")
+    if len({wrapper_unit, launch_driver_unit, attempt_slice_unit, scope_unit}) != 4:
+        raise _invalid("monitor, launch driver, attempt slice, and scope units must be distinct")
     wrapper_invocation_id = _invocation(expected_wrapper_invocation_id, "wrapper invocation ID")
     attempt_slice_invocation_id = _invocation(
         expected_attempt_slice_invocation_id, "attempt slice invocation ID"
@@ -1005,6 +1039,7 @@ def validate_running_runtime_attestation(
         raise _invalid("runc state does not match the expected running container")
 
     wrapper = _parse_unit_properties(wrapper_properties, require_main_pid=True)
+    launch_driver = _parse_unit_properties(launch_driver_properties)
     attempt_slice = _parse_unit_properties(attempt_slice_properties)
     scope = _parse_unit_properties(scope_properties)
     if (
@@ -1012,6 +1047,8 @@ def validate_running_runtime_attestation(
         or wrapper["Id"] != wrapper_unit
         or wrapper["InvocationID"] != wrapper_invocation_id
         or wrapper.get("MainPID") != str(monitor_pid)
+        or launch_driver["ActiveState"] != "active"
+        or launch_driver["Id"] != launch_driver_unit
         or attempt_slice["ActiveState"] != "active"
         or attempt_slice["Id"] != attempt_slice_unit
         or attempt_slice["InvocationID"] != attempt_slice_invocation_id
@@ -1021,6 +1058,10 @@ def validate_running_runtime_attestation(
     ):
         raise _invalid("systemd unit state or invocation identity changed")
     wrapper_cgroup = _cgroup_path(wrapper["ControlGroup"], "wrapper cgroup")
+    launch_driver_invocation_id = _invocation(
+        launch_driver["InvocationID"], "launch driver invocation ID"
+    )
+    launch_driver_cgroup = _cgroup_path(launch_driver["ControlGroup"], "launch driver cgroup")
     attempt_slice_cgroup = _cgroup_path(attempt_slice["ControlGroup"], "attempt slice cgroup")
     scope_cgroup = _cgroup_path(scope["ControlGroup"], "scope cgroup")
     monitor_cgroup_path = PurePosixPath(wrapper_cgroup)
@@ -1034,6 +1075,8 @@ def validate_running_runtime_attestation(
         raise _invalid("trusted monitor and worker attempt slice do not have separate cgroups")
     if (
         wrapper_cgroup == scope_cgroup
+        or PurePosixPath(launch_driver_cgroup).name != launch_driver_unit
+        or PurePosixPath(launch_driver_cgroup).parent.as_posix() != attempt_slice_cgroup
         or scope_cgroup != expected_scope
         or attempt_slice_unit != _oci_worker_systemd_slice(container_id)
         or PurePosixPath(attempt_slice_cgroup).name != attempt_slice_unit
@@ -1055,9 +1098,12 @@ def validate_running_runtime_attestation(
         if before_state in {"Z", "X", "x"} or after_state in {"Z", "X", "x"}:
             raise _invalid("a required execution process is no longer live")
         actual_cgroup = _parse_proc_cgroup(snapshot.cgroup)
-        expected_process_cgroup = wrapper_cgroup if pid != expected_init_pid else scope_cgroup
-        if actual_cgroup != expected_process_cgroup:
+        if pid == monitor_pid and actual_cgroup != wrapper_cgroup:
+            raise _invalid("monitor process is outside its recorded systemd cgroup")
+        if pid == expected_init_pid and actual_cgroup != scope_cgroup:
             raise _invalid("process is outside its recorded systemd cgroup")
+        if pid == runc_client_pid and actual_cgroup != launch_driver_cgroup:
+            raise _invalid("runc client is outside its exact launch-driver service cgroup")
         identities[pid] = f"linux:{pid}:{before_start}"
 
     if (
@@ -1091,6 +1137,9 @@ def validate_running_runtime_attestation(
         "wrapper_unit": wrapper_unit,
         "wrapper_invocation_id": wrapper_invocation_id,
         "wrapper_control_group": wrapper_cgroup,
+        "launch_driver_unit": launch_driver_unit,
+        "launch_driver_invocation_id": launch_driver_invocation_id,
+        "launch_driver_control_group": launch_driver_cgroup,
         "attempt_slice_unit": attempt_slice_unit,
         "attempt_slice_invocation_id": attempt_slice_invocation_id,
         "attempt_slice_control_group": attempt_slice_cgroup,
@@ -1132,6 +1181,10 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
             or value.monitor_placement != "outside_attempt_slice"
             or value.wrapper_control_group == value.cgroup_path
             or value.attempt_slice_unit != _oci_worker_systemd_slice(value.container_id)
+            or not value.launch_driver_unit.startswith("acp-launch-driver-")
+            or PurePosixPath(value.launch_driver_control_group).name != value.launch_driver_unit
+            or PurePosixPath(value.launch_driver_control_group).parent.as_posix()
+            != value.attempt_slice_control_group
             or PurePosixPath(value.cgroup_path).name != value.scope_unit
             or PurePosixPath(value.attempt_slice_control_group).name != value.attempt_slice_unit
             or PurePosixPath(value.wrapper_control_group).is_relative_to(
@@ -1169,14 +1222,20 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
             or _cgroup_path(value.cgroup_path, "scope cgroup") != value.cgroup_path
             or _cgroup_path(value.wrapper_control_group, "wrapper cgroup")
             != value.wrapper_control_group
+            or _cgroup_path(value.launch_driver_control_group, "launch driver cgroup")
+            != value.launch_driver_control_group
             or _cgroup_path(value.attempt_slice_control_group, "attempt slice cgroup")
             != value.attempt_slice_control_group
             or _unit(value.wrapper_unit, ".service", "wrapper unit") != value.wrapper_unit
+            or _unit(value.launch_driver_unit, ".service", "launch driver unit")
+            != value.launch_driver_unit
             or _unit(value.attempt_slice_unit, ".slice", "attempt slice unit")
             != value.attempt_slice_unit
             or _unit(value.scope_unit, ".scope", "scope unit") != value.scope_unit
             or _invocation(value.wrapper_invocation_id, "wrapper invocation ID")
             != value.wrapper_invocation_id
+            or _invocation(value.launch_driver_invocation_id, "launch driver invocation ID")
+            != value.launch_driver_invocation_id
             or _invocation(value.attempt_slice_invocation_id, "attempt slice invocation ID")
             != value.attempt_slice_invocation_id
             or _invocation(value.scope_invocation_id, "scope invocation ID")

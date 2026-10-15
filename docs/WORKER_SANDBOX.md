@@ -527,43 +527,46 @@ missing-key refusal. The live test above now exercises this production recovery
 helper against a placeholder monitor; this remains an adoption primitive, not
 an integrated OCI worker path, and `run_worker()` remains fail-closed.
 
-**Production monitor service producer (2026-10-15; component, not worker
-integration).** `supervisor/sandbox_monitor_service.py` now provides
-`start_sandbox_execution_monitor()` to validate a caller-supplied exact scope
-binding and start a per-execution systemd service in `user-acp.slice`, outside
-the worker attempt slice. It persists the binding and control key under the
-execution's private monitor directory, publishes an authenticated receipt,
-and returns a status-checked IPC client. Adoption reuses the existing receipt
-and key; partial, stale, or ambiguous state refuses replacement. The service
-reports exact scope unit, InvocationID and cgroup, and cancellation stops only
-that scope before verifying its cgroup is empty. The control key is absent
-from argv, environment and receipt in the opt-in Linux integration proof.
+**Monitor producer at the launch-record boundary (2026-10-15; worker still
+disabled).** `sandbox_execution_journal._sandbox_execution_record_launch()` now
+starts or adopts `start_sandbox_execution_monitor()` only after binding the
+exact process-local runc handle, while holding the same per-execution launch
+gate lock used by the running transition and cancellation. It passes the
+reserved state directory and exact scope/slice identities, then sources the
+monitor PID, process-start identity, systemd unit, InvocationID and cgroup only
+from the authenticated typed service receipt. A status request must confirm
+the exact live scope before the journal records `launched`. Startup ambiguity
+leaves the row `reserved`, keeps the launch gate closed and retains its fences.
+The service persists its scope binding and control key in the execution's
+private monitor directory; adoption reuses the existing receipt and key, while
+partial, stale or ambiguous state refuses replacement. The control key is
+absent from argv, environment and receipt in the opt-in Linux integration
+proof.
 
 The production component, authenticated reconnect and exact-scope cancellation
 passed 134 focused tests on the disposable Ubuntu 24.04.5 ARM64 / Linux
 `6.8.0-142-generic` / systemd `255.4` guest with cgroup v2 and an active user
-manager. The proof uses a no-model `/usr/bin/sleep` scope, not an OCI worker.
+manager. The live no-model OCI fixture now exercises this producer through
+`_sandbox_execution_record_launch()` while the exact runc init gate is held;
+candidate payload writes remain absent until the durable `running` transition.
+This is a fixture-driven trusted launch-record path, not a call from
+`WorkersMixin.run_worker()`, which remains fail-closed. Journaled termination
+is covered separately by no-model unit tests with a stub monitor; the live test
+does not yet drive cancellation through `WorkersMixin.terminate_worker()`.
 Independent source QC found no key/identity boundary defect in the component,
-but correctly identified that the producer is not called by the production
-launcher and the live test calls the monitor client directly rather than
-through `WorkersMixin.terminate_worker()`. The journaled termination path is
-covered separately by no-model unit tests with a stub monitor. QC also flagged
-a same-user systemd stop-by-name time-of-check/time-of-use race as a residual
-hardening item. This does not prove launch integration, real-OCI cleanup,
-credential/egress policy, result import, or `run_worker()`; `run_worker()`
-remains fail-closed and #2370 remains open.
+and flagged a same-user systemd stop-by-name time-of-check/time-of-use race as
+a residual hardening item. This does not prove production worker integration,
+real-OCI cleanup, credential/egress policy, result import or `cleanup_verified`;
+#2370 remains open.
 
-Do not add a lazy producer call to `terminate_worker()`: the journal's wrapper
-unit is already identity-bound to the monitor service, and a separate
-supervisor entrypoint that starts after launch would not serialize with the
-payload gate. The safe integration point is the trusted launcher after exact
-scope creation and while holding the existing per-execution launch-gate lock,
-before the durable running transition and one-shot permit release. Startup
-failure must preserve the reservation and resource fences. Likewise, a
-monitor's `exited` status is not the journal's independent `cleanup_verified`
-proof; monitor retirement must follow that verifier and reconcile the exact
-unit activation. These requirements remain open work, not behavior proven by
-this component.
+Do not add a lazy producer call to `terminate_worker()`: launch recording is
+the safe integration point because it runs with the registered handle and
+exact lock after scope creation but before the durable running transition and
+one-shot permit release. `run_worker()` still has no supported OCI launch
+caller and must remain fail-closed. Likewise, a monitor's `exited` status is
+not the journal's independent `cleanup_verified` proof; monitor retirement
+must follow that verifier and reconcile the exact unit activation. Those
+worker-path and cleanup requirements remain open.
 
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the
@@ -2961,3 +2964,45 @@ restored value, no remaining ACP test units or fixture roots, and zero
 D-state processes. This run had no AppArmor profile applied to the monitor and
 is not evidence of AppArmor confinement or a production prerequisite policy.
 Keep configured OCI worker execution fail-closed.
+
+### Exact launch-driver cgroup attestation (2026-10-15)
+
+The runc client must run in the deterministic systemd service
+`acp-launch-driver-{execution_id}.service`, derived from the reserved durable
+execution ID. The service must be active with a valid invocation ID, and its
+cgroup must be a direct child of that attempt's exact slice. The runc client
+PID/start-time identity is checked in the same cgroup. This is separate from
+the monitor's wrapper service/cgroup and the container init's runc scope.
+
+The collector reads the launch-driver service identity along with the wrapper,
+attempt slice, and runc scope, then re-reads them to reject drift. The journal
+compares the collector-issued service name against the durable execution ID
+both before and while holding the launch-gate lock; it rechecks process
+membership and all four systemd identities immediately before recording the
+running transition and authorizing the one-shot gate. A valid receipt for a
+different reserved-prefix service is stale and cannot release the gate.
+
+The opt-in live runc lifecycle test passed on the disposable Ubuntu 26.04
+ARM64 / Linux 7.0.0-38 / Python 3.14.4 / systemd 259.5 / cgroup v2 guest with
+rootless runc 1.5.2 and BusyBox 1.37.0. The complete opt-in systemd slice
+integration module passed 8/8 on the same guest. SHA-256 of the exact source
+and test files copied to and run in that guest:
+
+| File | SHA-256 |
+| --- | --- |
+| `sandbox_attestation.py` | `f842834dfd47ac1bd124c36604e8124fc9f9b8e747128bc4cd6671d7f4afa9f0` |
+| `sandbox_execution_journal.py` | `cae1b00f54032fe334d50bc696c30d1fe7b0a670bde1efceca8f785e7f217c96` |
+| `sandbox_monitor_service.py` | `90f42cc0191845465d65acc3d1a6e441ca3dc85fa1b3d966466706383b4c3e20` |
+| `test_sandbox_worker_lifecycle_integration.py` | `3aa8bddfd31344d20e19ff72b4f95bf90c40de505e1c9e0c2cdaa6982514625f` |
+| `test_systemd_slice_integration.py` | `2cff01f66464fd6ad9d966fb5b9c67887f4c690a9b4edf417f1b124a481601d8` |
+
+Postflight confirmed the guest manager remained running, the temporary
+`kernel.apparmor_restrict_unprivileged_userns` change was restored to `1`, and
+no fixture roots, ACP test units, or D-state processes remained. These live
+tests prove the attested systemd/runc launch boundary and its negative cases;
+they do not qualify `run_worker()`, which remains fail-closed.
+
+This closes the arbitrary-sibling-cgroup gap for the launch client. It does
+not prove worker registration, monitor-owned cleanup, recovery after monitor
+crash, provider isolation, or end-to-end `run_worker()` acceptance; configured
+OCI worker execution remains disabled.

@@ -17,7 +17,7 @@ def _binding() -> monitor_service.SandboxMonitorScopeBinding:
     container_id = sandbox_container_id(*identity)
     attempt_slice = sandbox_attempt_slice_unit(*identity)
     attempt_cgroup = f"/user.slice/user-1000.slice/user@1000.service/user-acp.slice/{attempt_slice}"
-    scope_unit = f"{container_id}.scope"
+    scope_unit = f"acp-{container_id}.scope"
     return monitor_service.SandboxMonitorScopeBinding(
         attempt_id=identity[0],
         claim_token=identity[1],
@@ -33,12 +33,25 @@ def _binding() -> monitor_service.SandboxMonitorScopeBinding:
 def test_scope_binding_is_fenced_to_exact_attempt_slice_and_scope() -> None:
     binding = _binding()
     assert monitor_service.SandboxMonitorScopeBinding.from_dict(binding.as_dict()) == binding
+    container_id = sandbox_container_id(
+        binding.attempt_id, binding.claim_token, binding.execution_id
+    )
+    assert binding.scope_unit == f"acp-{container_id}.scope"
 
     with pytest.raises(monitor_service.SandboxMonitorServiceError):
         monitor_service.SandboxMonitorScopeBinding(
             **{
                 **binding.__dict__,
                 "scope_unit": "other-execution.scope",
+            }
+        )
+
+    with pytest.raises(monitor_service.SandboxMonitorServiceError):
+        monitor_service.SandboxMonitorScopeBinding(
+            **{
+                **binding.__dict__,
+                "scope_unit": f"{container_id}.scope",
+                "scope_control_group": f"{binding.attempt_slice_control_group}/{container_id}.scope",
             }
         )
 

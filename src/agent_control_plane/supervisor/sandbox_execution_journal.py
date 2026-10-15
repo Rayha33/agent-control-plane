@@ -263,6 +263,14 @@ def _sandbox_container_id(attempt_id: str, claim_token: int, execution_id: str) 
     return f"acp-{digest[:60]}"
 
 
+def _sandbox_launch_driver_service_unit(execution_id: str) -> str:
+    """Return the only launch-driver unit name authorized for an execution."""
+
+    if not isinstance(execution_id, str) or not _COMPONENT.fullmatch(execution_id):
+        raise SupervisorError("sandbox_execution_invalid", "execution ID is invalid")
+    return f"acp-launch-driver-{execution_id}.service"
+
+
 def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]:
     """Canonical, durable projection of a registered runc handle and reservation."""
 
@@ -1944,13 +1952,8 @@ class SandboxExecutionJournalMixin:
         attempt_id: str,
         claim_token: int,
         *,
-        monitor_pid: int,
-        monitor_identity: str,
         runc_handle: RuncLaunchHandle,
         launch_submission: _SandboxLaunchSubmission,
-        wrapper_unit: str,
-        wrapper_invocation_id: str,
-        wrapper_cgroup_path: str,
         attempt_slice_unit: str,
         attempt_slice_invocation_id: str,
         attempt_slice_cgroup_path: str,
@@ -1961,7 +1964,6 @@ class SandboxExecutionJournalMixin:
     ) -> dict[str, Any]:
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
-        monitor_pid = self._sandbox_pid(monitor_pid, "monitor_pid")
         launch_target = _runc_launch_target(runc_handle)
         if not _runc_launch_handle_is_self_consistent(runc_handle) or launch_target is None:
             raise SupervisorError(
@@ -1974,13 +1976,8 @@ class SandboxExecutionJournalMixin:
                 "diagnostic runc launches cannot be recorded as supervised attempts",
             )
         runc_client_pid = self._sandbox_pid(_runc_launch_pid(runc_handle), "runc_client_pid")
-        monitor_identity = self._sandbox_process_identity(monitor_identity, "monitor_identity")
         runc_client_identity = self._sandbox_process_identity(
             _runc_launch_process_identity(runc_handle), "runc_client_identity"
-        )
-        wrapper_unit = self._sandbox_systemd_unit(wrapper_unit, "wrapper_unit", ".service")
-        wrapper_invocation_id = self._sandbox_invocation_id(
-            wrapper_invocation_id, "wrapper_invocation_id"
         )
         attempt_slice_unit = self._sandbox_systemd_unit(
             attempt_slice_unit, "attempt_slice_unit", ".slice"
@@ -1992,30 +1989,17 @@ class SandboxExecutionJournalMixin:
         scope_invocation_id = self._sandbox_invocation_id(
             scope_invocation_id, "scope_invocation_id"
         )
-        if monitor_pid == runc_client_pid or wrapper_unit == scope_unit:
-            raise SupervisorError(
-                "sandbox_execution_invalid", "monitor, runc client, and scope identities conflict"
-            )
-        wrapper_cgroup_path = self._sandbox_text(
-            wrapper_cgroup_path, "wrapper_cgroup_path", limit=4096
-        )
         attempt_slice_cgroup_path = self._sandbox_text(
             attempt_slice_cgroup_path, "attempt_slice_cgroup_path", limit=4096
         )
         cgroup_path = self._sandbox_text(cgroup_path, "cgroup_path", limit=4096)
-        wrapper_cgroup = PurePosixPath(wrapper_cgroup_path)
         attempt_slice_cgroup = PurePosixPath(attempt_slice_cgroup_path)
         cgroup = PurePosixPath(cgroup_path)
-        cgroup_paths = (wrapper_cgroup, attempt_slice_cgroup, cgroup)
+        cgroup_paths = (attempt_slice_cgroup, cgroup)
         if (
             any(not path.is_absolute() or path.as_posix() != str(path) for path in cgroup_paths)
             or any(part in {".", ".."} for path in cgroup_paths for part in path.parts)
-            or wrapper_cgroup.name != wrapper_unit
             or attempt_slice_cgroup.name != attempt_slice_unit
-            or wrapper_cgroup == attempt_slice_cgroup
-            or wrapper_cgroup.is_relative_to(attempt_slice_cgroup)
-            or attempt_slice_cgroup.is_relative_to(wrapper_cgroup)
-            or any(_ATTEMPT_SLICE_COMPONENT.fullmatch(part) for part in wrapper_cgroup.parts)
             or cgroup.parent != attempt_slice_cgroup
             or cgroup.name != scope_unit
         ):
@@ -2037,14 +2021,6 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
         if durable_execution["claim_token"] != claim_token:
             raise SupervisorError("stale_fencing_token", "claim token is stale")
-        expected_wrapper_unit = _sandbox_monitor_service_unit(
-            attempt_id, claim_token, durable_execution["execution_id"]
-        )
-        if wrapper_unit != expected_wrapper_unit:
-            raise SupervisorError(
-                "sandbox_execution_monitor_identity_mismatch",
-                "monitor service unit is not bound to this fenced execution",
-            )
         if durable_execution["launch_plan_required"] != 1:
             raise SupervisorError(
                 "sandbox_execution_launch_plan_required",
@@ -2147,108 +2123,195 @@ class SandboxExecutionJournalMixin:
                 "sandbox_execution_launch_target_mismatch",
                 "pinned-runc launch target does not match the exact durable reservation",
             )
-        launch_plan = _sandbox_launch_plan_material(durable_execution, launch_target)
-        launch_plan["launch"]["systemd_ownership"] = {
-            "wrapper_control_group": wrapper_cgroup_path,
-            "monitor_placement": "outside_attempt_slice",
-            "attempt_slice_unit": attempt_slice_unit,
-            "attempt_slice_invocation_id": attempt_slice_invocation_id,
-            "attempt_slice_control_group": attempt_slice_cgroup_path,
-        }
-        launch_plan_json = canonical_json(launch_plan)
         launch_config_digest = launch_target.config_sha256
         launch_argv_digest = hashlib.sha256(
             canonical_json(list(launch_target.argv)).encode("utf-8")
         ).hexdigest()
-        launch_plan_digest = hashlib.sha256(launch_plan_json.encode("utf-8")).hexdigest()
         _runc_launch_handle_bind_execution(
             runc_handle, attempt_id, claim_token, durable_execution["execution_id"]
         )
-        updates = {
-            "monitor_pid": monitor_pid,
-            "monitor_identity": monitor_identity,
-            "runc_client_pid": runc_client_pid,
-            "runc_client_identity": runc_client_identity,
-            "wrapper_unit": wrapper_unit,
-            "wrapper_invocation_id": wrapper_invocation_id,
-            "wrapper_cgroup_path": wrapper_cgroup_path,
-            "attempt_slice_unit": attempt_slice_unit,
-            "attempt_slice_invocation_id": attempt_slice_invocation_id,
-            "attempt_slice_cgroup_path": attempt_slice_cgroup_path,
-            "scope_unit": scope_unit,
-            "scope_invocation_id": scope_invocation_id,
-            "cgroup_path": cgroup_path,
-            "launch_plan_binding_version": 1,
-            "launch_plan_json": launch_plan_json,
-            "launch_config_digest": launch_config_digest,
-            "launch_argv_digest": launch_argv_digest,
-            "launch_plan_digest": launch_plan_digest,
-        }
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            with _authorize_sandbox_launch_plan_write(
-                connection,
-                runc_handle,
-                attempt_id,
-                claim_token,
-                durable_execution["execution_id"],
-                launch_plan_json,
-                launch_plan_digest,
+        from .sandbox_monitor_receipt import SandboxMonitorReceipt
+        from .sandbox_monitor_service import start_sandbox_execution_monitor
+
+        expected_identity = (attempt_id, claim_token, durable_execution["execution_id"])
+        with _runc_launch_gate_lock_for_execution(*expected_identity) as locked_handle:
+            if locked_handle is not runc_handle:
+                raise SupervisorError(
+                    "sandbox_execution_launch_handle_required",
+                    "monitor startup requires the exact locked launch handle",
+                )
+            with self.connect() as connection:
+                locked_execution = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+            if (
+                locked_execution is None
+                or locked_execution["claim_token"] != claim_token
+                or locked_execution["execution_id"] != durable_execution["execution_id"]
+                or locked_execution["phase"] != "reserved"
+                or locked_execution["launch_submission_id"]
+                != durable_execution["launch_submission_id"]
+                or locked_execution["launch_submission_digest"] != submission_digest
+                or locked_execution["bundle_digest"] != durable_execution["bundle_digest"]
             ):
-                return self._sandbox_execution_transition(
+                raise SupervisorError(
+                    "sandbox_execution_transition_invalid",
+                    "reserved execution changed before trusted monitor startup; fence retained",
+                )
+            try:
+                monitor_client = start_sandbox_execution_monitor(
+                    state_path=locked_execution["state_path"],
+                    expected_identity=expected_identity,
+                    scope_unit=scope_unit,
+                    scope_invocation_id=scope_invocation_id,
+                    scope_control_group=cgroup_path,
+                    attempt_slice_control_group=attempt_slice_cgroup_path,
+                )
+                receipt = monitor_client._receipt
+                status = monitor_client.status()
+            except Exception as error:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_unavailable",
+                    "trusted monitor start or reconnect failed; launch gate remains closed and execution fences are retained",
+                ) from error
+            if type(receipt) is not SandboxMonitorReceipt:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_identity_mismatch",
+                    "monitor startup returned no typed durable service receipt",
+                )
+            monitor_identity = self._sandbox_process_identity(
+                receipt.main_identity, "monitor_identity"
+            )
+            monitor_pid = self._sandbox_pid(receipt.main_pid, "monitor_pid")
+            wrapper_unit = self._sandbox_systemd_unit(receipt.unit, "wrapper_unit", ".service")
+            wrapper_invocation_id = self._sandbox_invocation_id(
+                receipt.invocation_id, "wrapper_invocation_id"
+            )
+            wrapper_cgroup_path = self._sandbox_text(
+                receipt.control_group, "wrapper_cgroup_path", limit=4096
+            )
+            wrapper_cgroup = PurePosixPath(wrapper_cgroup_path)
+            if (
+                (receipt.attempt_id, receipt.claim_token, receipt.execution_id) != expected_identity
+                or wrapper_unit != _sandbox_monitor_service_unit(*expected_identity)
+                or wrapper_unit == scope_unit
+                or wrapper_cgroup.name != wrapper_unit
+                or wrapper_cgroup.parent != PurePosixPath(receipt.monitor_slice_control_group)
+                or wrapper_cgroup == attempt_slice_cgroup
+                or wrapper_cgroup.is_relative_to(attempt_slice_cgroup)
+                or attempt_slice_cgroup.is_relative_to(wrapper_cgroup)
+                or any(_ATTEMPT_SLICE_COMPONENT.fullmatch(part) for part in wrapper_cgroup.parts)
+                or receipt.attempt_slice_unit != attempt_slice_unit
+                or receipt.attempt_slice_control_group != attempt_slice_cgroup_path
+                or monitor_pid == runc_client_pid
+                or status.outcome != "ok"
+                or not isinstance(status.payload, dict)
+                or status.payload.get("phase") != "running"
+                or status.payload.get("scope_unit") != scope_unit
+                or status.payload.get("scope_invocation_id") != scope_invocation_id
+                or status.payload.get("scope_control_group") != cgroup_path
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_monitor_identity_mismatch",
+                    "authenticated monitor does not attest the exact fenced worker scope",
+                )
+
+            launch_plan = _sandbox_launch_plan_material(durable_execution, launch_target)
+            launch_plan["launch"]["systemd_ownership"] = {
+                "wrapper_control_group": wrapper_cgroup_path,
+                "monitor_placement": "outside_attempt_slice",
+                "attempt_slice_unit": attempt_slice_unit,
+                "attempt_slice_invocation_id": attempt_slice_invocation_id,
+                "attempt_slice_control_group": attempt_slice_cgroup_path,
+            }
+            launch_plan_json = canonical_json(launch_plan)
+            launch_plan_digest = hashlib.sha256(launch_plan_json.encode("utf-8")).hexdigest()
+            updates = {
+                "monitor_pid": monitor_pid,
+                "monitor_identity": monitor_identity,
+                "runc_client_pid": runc_client_pid,
+                "runc_client_identity": runc_client_identity,
+                "wrapper_unit": wrapper_unit,
+                "wrapper_invocation_id": wrapper_invocation_id,
+                "wrapper_cgroup_path": wrapper_cgroup_path,
+                "attempt_slice_unit": attempt_slice_unit,
+                "attempt_slice_invocation_id": attempt_slice_invocation_id,
+                "attempt_slice_cgroup_path": attempt_slice_cgroup_path,
+                "scope_unit": scope_unit,
+                "scope_invocation_id": scope_invocation_id,
+                "cgroup_path": cgroup_path,
+                "launch_plan_binding_version": 1,
+                "launch_plan_json": launch_plan_json,
+                "launch_config_digest": launch_config_digest,
+                "launch_argv_digest": launch_argv_digest,
+                "launch_plan_digest": launch_plan_digest,
+            }
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                with _authorize_sandbox_launch_plan_write(
+                    connection,
+                    runc_handle,
                     attempt_id,
                     claim_token,
-                    expected_phase="reserved",
-                    next_phase="launched",
-                    updates=updates,
-                    event_type="sandbox.execution_launched",
-                    event_payload={
-                        **updates,
-                        "launch_plan": launch_plan,
-                        "launch_target": {
-                            "mode": launch_target.launch_mode,
-                            "runc_executable_path": launch_target.runc_executable_path,
-                            "runc_executable_sha256": launch_target.runc_executable_sha256,
-                            "config_sha256": launch_target.config_sha256,
-                            "config_sha256_semantics": "sha256-exact-config-json-bytes",
-                            "argv_sha256": launch_argv_digest,
-                            "container_id": launch_target.container_id,
-                            "bundle": {
-                                "path": launch_target.bundle_path,
-                                "device": launch_target.bundle_device,
-                                "inode": launch_target.bundle_inode,
-                            },
-                            "rootfs": {
-                                "path": launch_target.rootfs_path,
-                                "device": launch_target.rootfs_device,
-                                "inode": launch_target.rootfs_inode,
-                                "sha256": launch_target.rootfs_sha256,
-                                "closure_sha256": launch_target.rootfs_closure_sha256,
-                                "snapshot": {
-                                    "device": launch_target.rootfs_snapshot_device,
-                                    "inode": launch_target.rootfs_snapshot_inode,
-                                    "sha256": launch_target.rootfs_snapshot_sha256,
-                                    "closure_sha256": launch_target.rootfs_snapshot_closure_sha256,
-                                    "entry_count": launch_target.rootfs_snapshot_entry_count,
-                                    "bytes": launch_target.rootfs_snapshot_bytes,
+                    durable_execution["execution_id"],
+                    launch_plan_json,
+                    launch_plan_digest,
+                ):
+                    return self._sandbox_execution_transition(
+                        attempt_id,
+                        claim_token,
+                        expected_phase="reserved",
+                        next_phase="launched",
+                        updates=updates,
+                        event_type="sandbox.execution_launched",
+                        event_payload={
+                            **updates,
+                            "launch_plan": launch_plan,
+                            "launch_target": {
+                                "mode": launch_target.launch_mode,
+                                "runc_executable_path": launch_target.runc_executable_path,
+                                "runc_executable_sha256": launch_target.runc_executable_sha256,
+                                "config_sha256": launch_target.config_sha256,
+                                "config_sha256_semantics": "sha256-exact-config-json-bytes",
+                                "argv_sha256": launch_argv_digest,
+                                "container_id": launch_target.container_id,
+                                "bundle": {
+                                    "path": launch_target.bundle_path,
+                                    "device": launch_target.bundle_device,
+                                    "inode": launch_target.bundle_inode,
                                 },
+                                "rootfs": {
+                                    "path": launch_target.rootfs_path,
+                                    "device": launch_target.rootfs_device,
+                                    "inode": launch_target.rootfs_inode,
+                                    "sha256": launch_target.rootfs_sha256,
+                                    "closure_sha256": launch_target.rootfs_closure_sha256,
+                                    "snapshot": {
+                                        "device": launch_target.rootfs_snapshot_device,
+                                        "inode": launch_target.rootfs_snapshot_inode,
+                                        "sha256": launch_target.rootfs_snapshot_sha256,
+                                        "closure_sha256": launch_target.rootfs_snapshot_closure_sha256,
+                                        "entry_count": launch_target.rootfs_snapshot_entry_count,
+                                        "bytes": launch_target.rootfs_snapshot_bytes,
+                                    },
+                                },
+                                "state": {
+                                    "path": launch_target.state_path,
+                                    "device": launch_target.state_device,
+                                    "inode": launch_target.state_inode,
+                                },
+                                "workspace": {
+                                    "path": launch_target.workspace_path,
+                                    "device": launch_target.workspace_device,
+                                    "inode": launch_target.workspace_inode,
+                                },
+                                "pid_file_path": launch_target.pid_file_path,
                             },
-                            "state": {
-                                "path": launch_target.state_path,
-                                "device": launch_target.state_device,
-                                "inode": launch_target.state_inode,
-                            },
-                            "workspace": {
-                                "path": launch_target.workspace_path,
-                                "device": launch_target.workspace_device,
-                                "inode": launch_target.workspace_inode,
-                            },
-                            "pid_file_path": launch_target.pid_file_path,
                         },
-                    },
-                    credential=credential,
-                    _connection=connection,
-                )
+                        credential=credential,
+                        _connection=connection,
+                    )
 
     def _sandbox_execution_record_running(
         self,
@@ -2313,6 +2376,7 @@ class SandboxExecutionJournalMixin:
             "wrapper_unit": row["wrapper_unit"],
             "wrapper_invocation_id": row["wrapper_invocation_id"],
             "wrapper_control_group": row["wrapper_cgroup_path"],
+            "launch_driver_unit": _sandbox_launch_driver_service_unit(row["execution_id"]),
             "attempt_slice_unit": row["attempt_slice_unit"],
             "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
             "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
@@ -2415,6 +2479,9 @@ class SandboxExecutionJournalMixin:
                 "wrapper_unit": locked_row["wrapper_unit"],
                 "wrapper_invocation_id": locked_row["wrapper_invocation_id"],
                 "wrapper_control_group": locked_row["wrapper_cgroup_path"],
+                "launch_driver_unit": _sandbox_launch_driver_service_unit(
+                    locked_row["execution_id"]
+                ),
                 "attempt_slice_unit": locked_row["attempt_slice_unit"],
                 "attempt_slice_invocation_id": locked_row["attempt_slice_invocation_id"],
                 "attempt_slice_control_group": locked_row["attempt_slice_cgroup_path"],

@@ -1,7 +1,8 @@
 """Opt-in live proof joining the OCI launch gate to the durable sandbox journal.
 
-All process-local launch capabilities must remain in the exact systemd monitor
-process. This test proves only the real Linux launch-to-``running`` gate; it
+The process-local runc handle must remain in the exact systemd launch-driver
+process; a separate systemd-owned service controls the exact worker scope. This
+test proves only the real Linux launch-to-``running`` gate; it
 does not wire ``run_worker``, prove crash recovery or cleanup, authorize result
 import, or write a ``cleanup_verified`` receipt.
 
@@ -42,7 +43,7 @@ from test_oci_worker_runtime import (
 
 import agent_control_plane.supervisor.oci_worker as oci_worker
 from agent_control_plane.git_supervisor import GitSupervisor
-from agent_control_plane.supervisor import sandbox_attestation
+from agent_control_plane.supervisor import sandbox_attestation, sandbox_monitor_service
 from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.sandbox_attestation import collect_running_runtime_attestation
 from agent_control_plane.supervisor.sandbox_monitor_ipc import _linux_process_identity
@@ -187,7 +188,7 @@ def _monitor_child(
     execution_id: str,
     control: Path,
 ) -> None:
-    """Perform every process-local launch and attestation step in the monitor."""
+    """Perform process-local launch work in the driver and verify its monitor service."""
 
     handle: oci_worker.RuncLaunchHandle | None = None
     try:
@@ -252,20 +253,19 @@ def _monitor_child(
             attempt_id, claim_token, baseline, workspace
         )
         container_id = execution["container_id"]
-        wrapper_unit = sandbox_monitor_service_unit(attempt_id, claim_token, execution_id)
-        wrapper = _unit_properties(
-            wrapper_unit,
+        launch_driver_unit = f"acp-launch-driver-{execution_id}.service"
+        launch_driver = _unit_properties(
+            launch_driver_unit,
             ("ActiveState", "ControlGroup", "Id", "InvocationID", "MainPID", "Slice"),
         )
         if (
-            wrapper["Id"] != wrapper_unit
-            or wrapper["ActiveState"] != "active"
-            or wrapper["Slice"] != _MONITOR_SLICE_UNIT
-            or int(wrapper["MainPID"]) != os.getpid()
-            or not wrapper["InvocationID"]
-            or not wrapper["ControlGroup"]
+            launch_driver["Id"] != launch_driver_unit
+            or launch_driver["ActiveState"] != "active"
+            or int(launch_driver["MainPID"]) != os.getpid()
+            or not launch_driver["InvocationID"]
+            or not launch_driver["ControlGroup"]
         ):
-            raise RuntimeError("child is not the exact live systemd monitor MainPID")
+            raise RuntimeError("child is not the exact live systemd launch-driver MainPID")
 
         attempt_slice_unit = oci_worker._oci_worker_systemd_slice(container_id)
         scope_unit = f"acp-{container_id}.scope"
@@ -341,24 +341,33 @@ def _monitor_child(
                 or not props["ControlGroup"]
             ):
                 raise RuntimeError(f"exact worker systemd identity is incomplete: {unit}")
-        if Path(wrapper["ControlGroup"]).is_relative_to(Path(attempt_slice["ControlGroup"])):
-            raise RuntimeError("monitor service is incorrectly inside the attempt slice")
         if Path(scope["ControlGroup"]).parent.as_posix() != attempt_slice["ControlGroup"]:
             raise RuntimeError("worker scope is not inside its exact attempt slice")
 
-        monitor_identity = _linux_process_identity(os.getpid())
-        if monitor_identity is None or _linux_process_identity(client_pid) != client_identity:
-            raise RuntimeError("monitor or runc process identity changed before launch recording")
+        try:
+            sandbox_monitor_service._validate_scope_binding(
+                expected_identity=(attempt_id, claim_token, execution_id),
+                scope_unit=scope_unit,
+                scope_invocation_id=scope["InvocationID"],
+                scope_control_group=scope["ControlGroup"],
+                attempt_slice_control_group=attempt_slice["ControlGroup"],
+            )
+        except sandbox_monitor_service.SandboxMonitorServiceError as error:
+            raise RuntimeError(
+                "live monitor scope binding rejected: "
+                f"identity={(attempt_id, claim_token, execution_id)!r}; "
+                f"scope_unit={scope_unit!r}; "
+                f"scope_invocation_id={scope['InvocationID']!r}; "
+                f"scope_control_group={scope['ControlGroup']!r}; "
+                f"attempt_slice_unit={attempt_slice_unit!r}; "
+                f"attempt_slice_control_group={attempt_slice['ControlGroup']!r}"
+            ) from error
+
         supervisor._sandbox_execution_record_launch(
             attempt_id,
             claim_token,
-            monitor_pid=os.getpid(),
-            monitor_identity=monitor_identity,
             runc_handle=handle,
             launch_submission=submission,
-            wrapper_unit=wrapper_unit,
-            wrapper_invocation_id=wrapper["InvocationID"],
-            wrapper_cgroup_path=wrapper["ControlGroup"],
             attempt_slice_unit=attempt_slice_unit,
             attempt_slice_invocation_id=attempt_slice["InvocationID"],
             attempt_slice_cgroup_path=attempt_slice["ControlGroup"],
@@ -366,28 +375,68 @@ def _monitor_child(
             scope_invocation_id=scope["InvocationID"],
             cgroup_path=scope["ControlGroup"],
         )
-        attestation = collect_running_runtime_attestation(
-            runc_executable_pin=runc_pin,
-            state_root=state_root,
-            pid_file_path=pid_file,
-            expected_container_id=container_id,
-            expected_bundle_path=str(bundle_root),
-            expected_monitor_pid=os.getpid(),
-            expected_monitor_identity=monitor_identity,
-            expected_runc_client_pid=client_pid,
-            expected_runc_client_identity=client_identity,
-            expected_wrapper_unit=wrapper_unit,
-            expected_wrapper_invocation_id=wrapper["InvocationID"],
-            expected_attempt_slice_unit=attempt_slice_unit,
-            expected_attempt_slice_invocation_id=attempt_slice["InvocationID"],
-            expected_scope_unit=scope_unit,
-            expected_scope_invocation_id=scope["InvocationID"],
-            expected_cgroup_path=scope["ControlGroup"],
-            expected_memory_max_bytes=_CONTAINER_MEMORY_BYTES,
-            expected_cpu_quota=_CONTAINER_CPU_QUOTA_US,
-            expected_cpu_period=_CONTAINER_CPU_PERIOD_US,
-            expected_pids_max=_CONTAINER_PIDS_LIMIT,
+        durable = supervisor._sandbox_execution_get(attempt_id)
+        if durable is None or durable["phase"] != "launched":
+            raise RuntimeError("trusted monitor did not durably record the launched execution")
+        wrapper_unit = durable["wrapper_unit"]
+        wrapper = _unit_properties(
+            wrapper_unit,
+            ("ActiveState", "ControlGroup", "Id", "InvocationID", "MainPID", "Slice"),
         )
+        monitor_pid = durable["monitor_pid"]
+        monitor_identity = durable["monitor_identity"]
+        if (
+            wrapper["Id"] != wrapper_unit
+            or wrapper["ActiveState"] != "active"
+            or wrapper["Slice"] != _MONITOR_SLICE_UNIT
+            or int(wrapper["MainPID"]) != monitor_pid
+            or wrapper["InvocationID"] != durable["wrapper_invocation_id"]
+            or wrapper["ControlGroup"] != durable["wrapper_cgroup_path"]
+            or _linux_process_identity(monitor_pid) != monitor_identity
+            or _linux_process_identity(client_pid) != client_identity
+            or Path(wrapper["ControlGroup"]).is_relative_to(Path(attempt_slice["ControlGroup"]))
+        ):
+            raise RuntimeError("service-owned monitor identity changed before running attestation")
+        try:
+            attestation = collect_running_runtime_attestation(
+                runc_executable_pin=runc_pin,
+                state_root=state_root,
+                pid_file_path=pid_file,
+                expected_container_id=container_id,
+                expected_bundle_path=str(bundle_root),
+                expected_monitor_pid=monitor_pid,
+                expected_monitor_identity=monitor_identity,
+                expected_runc_client_pid=client_pid,
+                expected_runc_client_identity=client_identity,
+                expected_wrapper_unit=wrapper_unit,
+                expected_wrapper_invocation_id=wrapper["InvocationID"],
+                expected_launch_driver_unit=launch_driver_unit,
+                expected_attempt_slice_unit=attempt_slice_unit,
+                expected_attempt_slice_invocation_id=attempt_slice["InvocationID"],
+                expected_scope_unit=scope_unit,
+                expected_scope_invocation_id=scope["InvocationID"],
+                expected_cgroup_path=scope["ControlGroup"],
+                expected_memory_max_bytes=_CONTAINER_MEMORY_BYTES,
+                expected_cpu_quota=_CONTAINER_CPU_QUOTA_US,
+                expected_cpu_period=_CONTAINER_CPU_PERIOD_US,
+                expected_pids_max=_CONTAINER_PIDS_LIMIT,
+            )
+        except SupervisorError as error:
+            try:
+                init_pid = int(pid_file.read_text(encoding="ascii").strip())
+                process_cgroups = {
+                    pid: sandbox_attestation.read_linux_process_snapshot(pid).cgroup.decode(
+                        "ascii", errors="replace"
+                    )
+                    for pid in (monitor_pid, client_pid, init_pid)
+                }
+            except BaseException as diagnostic_error:
+                process_cgroups = {"diagnostic_error": repr(diagnostic_error)}
+            raise RuntimeError(
+                "live runtime attestation rejected process cgroup membership: "
+                f"expected_scope={scope['ControlGroup']!r}; "
+                f"observed_process_cgroups={process_cgroups!r}"
+            ) from error
         durable = supervisor._sandbox_execution_get(attempt_id)
         if (
             durable is None
@@ -400,10 +449,10 @@ def _monitor_child(
             control / "pre-running.json",
             {
                 "phase": durable["phase"],
-                "monitor_pid": os.getpid(),
+                "monitor_pid": monitor_pid,
                 "wrapper_main_pid": int(wrapper["MainPID"]),
                 "runc_client_pid": client_pid,
-                "monitor_apparmor_identity": _apparmor_identity(),
+                "launch_driver_apparmor_identity": _apparmor_identity(),
                 "attestation_digest": attestation.evidence_sha256,
                 "payload_marker_present": marker.exists(),
                 "git_metadata_marker_present": git_marker.exists(),
@@ -512,7 +561,7 @@ def _monitor_child(
             control / "error.json",
             {
                 "traceback": traceback.format_exc(),
-                "monitor_apparmor_identity": _apparmor_identity(),
+                "launch_driver_apparmor_identity": _apparmor_identity(),
             },
         )
         if handle is not None:
@@ -742,12 +791,14 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         apparmor_prefix = [aa_exec, "-p", apparmor_profile, "--"]
     systemd_run = shutil.which("systemd-run", path=environment["PATH"])
     if systemd_run is None:
-        pytest.fail("systemd-run is required for the exact monitor-service launch")
+        pytest.fail("systemd-run is required for the exact launch-driver service")
     run_root = Path(tempfile.mkdtemp(prefix="acp-live-sandbox-lifecycle-", dir="/tmp"))
     rootfs_source = run_root / "rootfs-source"
     service_unit: str | None = None
+    monitor_unit: str | None = None
     slice_unit: str | None = None
     service_start_attempted = False
+    monitor_start_attempted = False
     slice_start_attempted = False
     safe_to_remove = False
     try:
@@ -802,13 +853,14 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         Path(execution["state_path"]).mkdir(mode=0o700)
         control = run_root / "control"
         control.mkdir(mode=0o700)
-        service_unit = sandbox_monitor_service_unit(
+        monitor_unit = sandbox_monitor_service_unit(
             attempt["id"], attempt["claim_token"], execution["execution_id"]
         )
+        service_unit = f"acp-launch-driver-{execution['execution_id']}.service"
         slice_unit = sandbox_attempt_slice_unit(
             attempt["id"], attempt["claim_token"], execution["execution_id"]
         )
-        _assert_units_available_for_test(service_unit, slice_unit)
+        _assert_units_available_for_test(service_unit, monitor_unit, slice_unit)
         # Mark before IPC: a timeout/error can happen after systemd accepted the
         # request, so teardown must inspect and stop this exact unit regardless.
         slice_start_attempted = True
@@ -820,7 +872,7 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
             systemd_run,
             "--user",
             f"--unit={service_unit}",
-            "--slice=user-acp.slice",
+            f"--slice={slice_unit}",
             "--property=Type=exec",
             "--property=KillMode=control-group",
             "--property=RuntimeMaxSec=120s",
@@ -839,9 +891,13 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
             execution["execution_id"],
             str(control),
         ]
-        # This service runs outside the attempt slice, so its unit must be
+        # The exact driver service is a child of the attempt slice and is
         # stopped and checked independently even if systemd-run times out.
         service_start_attempted = True
+        # The launch driver creates this exact per-execution monitor unit after
+        # the worker scope exists. Treat a driver timeout as an ambiguous start
+        # of both units and inspect both during isolated test teardown.
+        monitor_start_attempted = True
         launched = _systemd_command(service_command, timeout=12.0)
         if launched.returncode != 0:
             pytest.fail(f"could not start exact monitor service: {launched.stderr[-1200:]}")
@@ -862,7 +918,9 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         assert pre["baseline_git_metadata_absent"] is True
         assert pre["workspace_git_metadata_absent"] is True
         if apparmor_profile:
-            profile_stack = str(pre["monitor_apparmor_identity"]).partition(" (")[0].split("//&")
+            profile_stack = (
+                str(pre["launch_driver_apparmor_identity"]).partition(" (")[0].split("//&")
+            )
             assert apparmor_profile in profile_stack
         assert marker is not None and not marker.exists()
         assert git_marker is not None and not git_marker.exists()
@@ -931,13 +989,21 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         assert durable_after_rejection["phase"] == "exited"
         assert durable_after_rejection["result_candidate"] is None
     finally:
-        safe_to_remove = _stop_attempted_units_and_check_quiescence(
+        driver_and_slice_safe = _stop_attempted_units_and_check_quiescence(
             systemctl,
             service_unit,
             service_start_attempted,
             slice_unit,
             slice_start_attempted,
         )
+        monitor_safe = _stop_attempted_units_and_check_quiescence(
+            systemctl,
+            monitor_unit,
+            monitor_start_attempted,
+            None,
+            False,
+        )
+        safe_to_remove = driver_and_slice_safe and monitor_safe
         if safe_to_remove:
             _remove_private_test_tree(run_root)
         else:

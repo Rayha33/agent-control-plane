@@ -50,6 +50,7 @@ from .sandbox_monitor_receipt import (
 )
 
 _MONITOR_SLICE_UNIT = "user-acp.slice"
+_WORKER_SCOPE_PREFIX = "acp-"
 _BINDING_NAME = "scope-binding.json"
 _BINDING_LIMIT = 4096
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -90,6 +91,10 @@ class SandboxMonitorScopeBinding:
         except (TypeError, SandboxMonitorReceiptError) as error:
             raise SandboxMonitorServiceError("monitor execution identity is invalid") from error
         expected_slice = sandbox_attempt_slice_unit(*identity)
+        # oci_worker encodes `slice:acp:<container_id>` for runc's systemd
+        # cgroup manager, so the resulting scope has both the manager prefix
+        # and the already-prefixed container ID.
+        expected_scope_unit = f"{_WORKER_SCOPE_PREFIX}{container_id}.scope"
         if not isinstance(self.scope_control_group, str) or not isinstance(
             self.attempt_slice_control_group, str
         ):
@@ -99,7 +104,7 @@ class SandboxMonitorScopeBinding:
         if (
             not isinstance(self.scope_unit, str)
             or _SCOPE_UNIT.fullmatch(self.scope_unit) is None
-            or self.scope_unit != f"{container_id}.scope"
+            or self.scope_unit != expected_scope_unit
             or not isinstance(self.scope_invocation_id, str)
             or _INVOCATION_ID.fullmatch(self.scope_invocation_id) is None
             or self.attempt_slice_unit != expected_slice
