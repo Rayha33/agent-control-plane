@@ -4,9 +4,11 @@
 Coordination claim- and dispatch-attempt-reservation caps for task #2998.
 Report-only response parsing and opt-in one-shot HTTP adapters cover OpenAI
 Responses, Anthropic Messages, and Gemini Developer API GenerateContent.
-Provider quota handling and budget-exhaustion checkpoint recovery are not
-implemented. This document is not a provider billing cap or evidence that ACP
-meters model work.
+Provider-side quota/spend enforcement and host-authored crash-durable recovery
+from budget exhaustion are not implemented. The Coordination API can persist a
+bounded client-reported interruption checkpoint, but it is not a crash-durable
+partial-result recovery or import path. This document is not a provider billing
+cap or evidence that ACP meters model work.
 
 ## Problem
 
@@ -22,8 +24,9 @@ Current ACP controls cover only parts of that boundary:
 - Fresh runtime-resource samples can report attempt-owned cgroup task count,
   memory, and sometimes cumulative CPU. They do not count agents or measure
   tokens, billing, or model work.
-- Completion receipts and worker checkpoints provide provenance, but there is
-  not yet a budget-exhaustion path that safely preserves partial output.
+- Completion receipts and worker checkpoints provide provenance. A bounded
+  client-reported interruption checkpoint can be recorded through Coordination,
+  but it cannot recover host-authored partial output or authorize its promotion.
 - The local Git supervisor can optionally cap durable attempts per task with
   `--max-attempts`. Its serialized claim transaction prevents oversubscription
   by concurrent claimers. This counts only ACP attempt records (including
