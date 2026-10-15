@@ -3463,7 +3463,7 @@ authentication. It does not imply that the proxy inspects redirects inside TLS.
 The deterministic production-policy tests also check final IPv4/IPv6 resolver
 answers and numeric pinning. In
 `tests/test_provider_egress.py::test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup`
-(source SHA-256 `227e8ce2dafb267671b691dc20f47264127bae245b45e5fc221cdddd6e6c703c`),
+(source SHA-256 `5647402044f74644a9314dedd2ab76ff44e1abc559fef1744d0439bbd95d7be5`),
 the fake resolver returns `8.8.8.8` first and would return `127.0.0.1` if called
 again; the test asserts one absolute-host `getaddrinfo` invocation and a fake
 socket `connect()` receiving the first numeric sockaddr. This is a deterministic
@@ -3475,8 +3475,13 @@ namespaces. Its isolated `resolv.conf` and `nsswitch.conf` point `getaddrinfo`
 only at a loopback DNS fixture. Each `api.example.com` response contains the
 CNAME to `gateway.test` and, in that same DNS answer, the matching target
 record: A `8.8.8.8` for an A query or AAAA `2606:4700:4700::1111` for an AAAA
-query. The production policy returned those exact numeric pins; the guest's
-resolver stub SHA-256 was
+query. The same fixture resolves `mixed.example.com CNAME mixed-gateway.test`
+with A `8.8.8.8` and AAAA `::1`; the real guest resolver path reaches the
+production policy, which rejects that mixed answer with
+`destination_address_denied`. This proves fail-closed behavior for this
+resolver fixture, not resolver portability or packet-level completeness. The
+production policy returned the exact numeric pins for the all-public case; the
+guest's resolver stub SHA-256 was
 `6096beac5979f1791fb0a4d089735e267936a9fce82717078a12eeb499e24b38` both
 before and after the test, and no temporary fixture directories remained. The
 policy module passed 34/34 tests in this guest. The test exercises one Linux
@@ -3495,7 +3500,7 @@ worktree):
 | --- | --- |
 | `test_oci_worker_runtime.py` | `c74906a0e78ba3d34a1379eae1d52921cc26914450fe36fecdd52d09ebc1aaab` |
 | `test_provider_proxy.py` | `aff9efbdf1a7a9e261141cbc86680c454047db7bfd256a092a14420083ec5837` |
-| `test_provider_egress.py` | `227e8ce2dafb267671b691dc20f47264127bae245b45e5fc221cdddd6e6c703c` |
+| `test_provider_egress.py` | `5647402044f74644a9314dedd2ab76ff44e1abc559fef1744d0439bbd95d7be5` |
 | `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
 | `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
 

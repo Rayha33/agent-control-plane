@@ -295,34 +295,34 @@ def _run_cname_dns_child() -> int:
                     query_name = ".".join(labels).lower()
                     queries.append((query_name, query_type))
 
-                    if query_name not in {"api.example.com", "gateway.test"}:
-                        answers: list[bytes] = []
-                    else:
-                        answers = []
-                        if query_name == "api.example.com":
-                            target_name = _dns_wire_name("gateway.test")
-                            answers.append(
-                                b"\xc0\x0c"
-                                + struct.pack("!HHIH", 5, 1, 60, len(target_name))
-                                + target_name
-                            )
-                        if query_type == 1:
-                            address = ipaddress.ip_address("8.8.8.8").packed
-                        elif query_type == 28:
-                            address = ipaddress.ip_address("2606:4700:4700::1111").packed
-                        else:
-                            address = b""
-                        if address:
-                            owner = (
-                                b"\xc0\x0c"
-                                if query_name == "gateway.test"
-                                else _dns_wire_name("gateway.test")
-                            )
-                            answers.append(
-                                owner
-                                + struct.pack("!HHIH", query_type, 1, 60, len(address))
-                                + address
-                            )
+                    cname_targets = {
+                        "api.example.com": "gateway.test",
+                        "mixed.example.com": "mixed-gateway.test",
+                    }
+                    target_addresses = {
+                        "gateway.test": {1: "8.8.8.8", 28: "2606:4700:4700::1111"},
+                        "mixed-gateway.test": {1: "8.8.8.8", 28: "::1"},
+                    }
+                    target_name = cname_targets.get(query_name, query_name)
+                    answers = []
+                    if query_name in cname_targets:
+                        target_wire_name = _dns_wire_name(target_name)
+                        answers.append(
+                            b"\xc0\x0c"
+                            + struct.pack("!HHIH", 5, 1, 60, len(target_wire_name))
+                            + target_wire_name
+                        )
+                    address_text = target_addresses.get(target_name, {}).get(query_type)
+                    if address_text is not None:
+                        address = ipaddress.ip_address(address_text).packed
+                        owner = (
+                            b"\xc0\x0c"
+                            if query_name == target_name
+                            else _dns_wire_name(target_name)
+                        )
+                        answers.append(
+                            owner + struct.pack("!HHIH", query_type, 1, 60, len(address)) + address
+                        )
 
                     flags = 0x8580  # response, authoritative, recursion-desired/available
                     response = (
@@ -338,9 +338,12 @@ def _run_cname_dns_child() -> int:
         thread = threading.Thread(target=answer_dns, daemon=True)
         thread.start()
         try:
-            endpoints = ProviderEgressPolicy({"api.example.com": {443}}).resolve_connect_authority(
-                "api.example.com:443"
+            egress_policy = ProviderEgressPolicy(
+                {"api.example.com": {443}, "mixed.example.com": {443}}
             )
+            endpoints = egress_policy.resolve_connect_authority("api.example.com:443")
+            with pytest.raises(EgressPolicyError) as denied:
+                egress_policy.resolve_connect_authority("mixed.example.com:443")
         finally:
             stop.set()
             thread.join(timeout=2)
@@ -348,11 +351,22 @@ def _run_cname_dns_child() -> int:
 
         assert not errors, errors
         assert thread.is_alive() is False
-        assert {query_type for name, query_type in queries if name == "api.example.com"} >= {
-            1,
-            28,
-        }
-        assert all(name in {"api.example.com", "gateway.test"} for name, _ in queries)
+        assert denied.value.code == "destination_address_denied"
+        for queried_host in ("api.example.com", "mixed.example.com"):
+            assert {query_type for name, query_type in queries if name == queried_host} >= {
+                1,
+                28,
+            }
+        assert all(
+            name
+            in {
+                "api.example.com",
+                "gateway.test",
+                "mixed.example.com",
+                "mixed-gateway.test",
+            }
+            for name, _ in queries
+        )
         assert {(endpoint.family, endpoint.sockaddr) for endpoint in endpoints} == {
             (socket.AF_INET, ("8.8.8.8", 443)),
             (socket.AF_INET6, ("2606:4700:4700::1111", 443, 0, 0)),
