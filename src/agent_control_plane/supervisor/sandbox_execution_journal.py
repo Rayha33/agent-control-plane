@@ -36,6 +36,7 @@ from .oci_worker import (
     _register_runc_launch_submission_target,
     _revoke_runc_launch_gate_release_locked,
     _runc_client_wait_receipt_is_self_consistent,
+    _runc_execution_gate_fence,
     _runc_launch_gate_lock_for_execution,
     _runc_launch_handle_bind_execution,
     _runc_launch_handle_is_bound_to_execution,
@@ -2151,7 +2152,23 @@ class SandboxExecutionJournalMixin:
             canonical_json(list(launch_target.argv)).encode("utf-8")
         ).hexdigest()
         _runc_launch_handle_bind_execution(
-            runc_handle, attempt_id, claim_token, durable_execution["execution_id"]
+            runc_handle,
+            attempt_id,
+            claim_token,
+            durable_execution["execution_id"],
+            state_gate_identity=(
+                durable_execution["state_path"],
+                durable_execution["state_root_dev"],
+                durable_execution["state_root_ino"],
+            ),
+            gate_release_guard=lambda: self._sandbox_execution_gate_release_is_allowed(
+                attempt_id,
+                claim_token,
+                durable_execution["execution_id"],
+                state_path=durable_execution["state_path"],
+                state_device=durable_execution["state_root_dev"],
+                state_inode=durable_execution["state_root_ino"],
+            ),
         )
         from .sandbox_monitor_ipc import SandboxMonitorControlClient
         from .sandbox_monitor_receipt import SandboxMonitorReceipt
@@ -2350,6 +2367,42 @@ class SandboxExecutionJournalMixin:
                 locked_handle._monitor_client = monitor_client
             return updated
 
+    def _sandbox_execution_gate_release_is_allowed(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        *,
+        state_path: str,
+        state_device: int,
+        state_inode: int,
+    ) -> bool:
+        """Recheck the durable execution while holding its cross-process gate fence."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT status, claim_token FROM attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if (
+                row is None
+                or attempt is None
+                or row["claim_token"] != claim_token
+                or row["execution_id"] != execution_id
+                or row["state_path"] != state_path
+                or row["state_root_dev"] != state_device
+                or row["state_root_ino"] != state_inode
+                or row["phase"] != "running"
+                or row["stop_reason"]
+                or attempt["claim_token"] != claim_token
+                or attempt["status"] != "working"
+                or _sandbox_execution_launch_stop_reason(connection, row)
+            ):
+                return False
+        return True
+
     def _sandbox_execution_record_running(
         self,
         attempt_id: str,
@@ -2447,9 +2500,14 @@ class SandboxExecutionJournalMixin:
                 "sandbox_execution_launch_handle_required",
                 "running transition requires the exact registered launch handle",
             )
-        with _runc_launch_gate_lock_for_execution(
-            attempt_id, claim_token, row["execution_id"]
-        ) as locked_handle:
+        with (
+            _runc_launch_gate_lock_for_execution(
+                attempt_id, claim_token, row["execution_id"]
+            ) as locked_handle,
+            _runc_execution_gate_fence(
+                row["state_path"], row["state_root_dev"], row["state_root_ino"]
+            ),
+        ):
             if locked_handle is not runc_handle:
                 raise SupervisorError(
                     "sandbox_execution_launch_handle_required",
@@ -2468,6 +2526,9 @@ class SandboxExecutionJournalMixin:
                 locked_row is None
                 or locked_row["claim_token"] != claim_token
                 or locked_row["execution_id"] != row["execution_id"]
+                or locked_row["state_path"] != row["state_path"]
+                or locked_row["state_root_dev"] != row["state_root_dev"]
+                or locked_row["state_root_ino"] != row["state_root_ino"]
                 or locked_row["phase"] != "launched"
                 or locked_row["stop_reason"]
                 or locked_launch_stop_reason
@@ -2592,9 +2653,13 @@ class SandboxExecutionJournalMixin:
         if not row or row["claim_token"] != claim_token:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
         execution_id = row["execution_id"]
-        with _runc_launch_gate_lock_for_execution(
-            attempt_id, claim_token, execution_id
-        ) as locked_handle:
+        state_identity = (row["state_path"], row["state_root_dev"], row["state_root_ino"])
+        with (
+            _runc_launch_gate_lock_for_execution(
+                attempt_id, claim_token, execution_id
+            ) as locked_handle,
+            _runc_execution_gate_fence(*state_identity),
+        ):
             # Re-read after acquiring the release lock: this closes both the
             # launched->stopping and running->stopping races against gate open.
             with self.connect() as connection:
@@ -2610,10 +2675,10 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_transition_conflict",
                     "durable execution identity changed while requesting stop",
                 )
-            if row["phase"] in {"launched", "running", "stopping"} and locked_handle is None:
+            if (row["state_path"], row["state_root_dev"], row["state_root_ino"]) != state_identity:
                 raise SupervisorError(
-                    "sandbox_execution_monitor_unavailable",
-                    "the registered launch handle is unavailable in this process; stop state is unchanged",
+                    "sandbox_execution_gate_identity_mismatch",
+                    "durable state-root identity changed while requesting stop; fence retained",
                 )
             if row["phase"] == "stopping":
                 if row["stop_reason"] != reason:
@@ -2713,9 +2778,45 @@ class SandboxExecutionJournalMixin:
                 "sandbox_execution_wait_receipt_required",
                 "runc exit recording requires a sealed receipt issued by the pinned-runc wait handle",
             )
-        with _runc_launch_gate_lock_for_execution(
-            attempt_id, claim_token, wait_receipt.execution_id
-        ) as locked_handle:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if (
+            row is None
+            or row["claim_token"] != claim_token
+            or row["execution_id"] != wait_receipt.execution_id
+        ):
+            raise SupervisorError(
+                "sandbox_execution_wait_receipt_stale",
+                "runc wait receipt has no matching durable execution identity",
+            )
+        state_identity = (row["state_path"], row["state_root_dev"], row["state_root_ino"])
+        with (
+            _runc_launch_gate_lock_for_execution(
+                attempt_id, claim_token, wait_receipt.execution_id
+            ) as locked_handle,
+            _runc_execution_gate_fence(*state_identity),
+        ):
+            with self.connect() as connection:
+                locked_row = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+            if (
+                locked_row is None
+                or locked_row["claim_token"] != claim_token
+                or locked_row["execution_id"] != wait_receipt.execution_id
+                or (
+                    locked_row["state_path"],
+                    locked_row["state_root_dev"],
+                    locked_row["state_root_ino"],
+                )
+                != state_identity
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_gate_identity_mismatch",
+                    "execution changed before its exit receipt was committed; fence retained",
+                )
             updated = self._sandbox_execution_record_exit_under_gate_lock(
                 attempt_id, claim_token, wait_receipt, credential=credential
             )
@@ -2966,9 +3067,32 @@ class SandboxExecutionJournalMixin:
                 attempt_id, claim_token, reason
             )
         execution_id = row["execution_id"]
-        with _runc_launch_gate_lock_for_execution(
-            attempt_id, claim_token, execution_id
-        ) as locked_handle:
+        state_identity = (row["state_path"], row["state_root_dev"], row["state_root_ino"])
+        with (
+            _runc_launch_gate_lock_for_execution(
+                attempt_id, claim_token, execution_id
+            ) as locked_handle,
+            _runc_execution_gate_fence(*state_identity),
+        ):
+            with self.connect() as connection:
+                locked_row = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+            if (
+                locked_row is None
+                or locked_row["claim_token"] != claim_token
+                or locked_row["execution_id"] != execution_id
+                or (
+                    locked_row["state_path"],
+                    locked_row["state_root_dev"],
+                    locked_row["state_root_ino"],
+                )
+                != state_identity
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_gate_identity_mismatch",
+                    "execution changed before ambiguity was committed; fence retained",
+                )
             updated = self._sandbox_execution_mark_ambiguous_under_gate_lock(
                 attempt_id, claim_token, reason
             )

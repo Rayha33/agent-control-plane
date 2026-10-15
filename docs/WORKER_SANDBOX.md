@@ -746,6 +746,44 @@ production monitor owns the callback yet. They do not prove restart recovery,
 cleanup, cancellation, or worker isolation; OCI worker execution remains
 fail-closed.
 
+### Supervisor restart: public cancellation and launch-gate fencing (2026-10-15)
+
+The public `terminate_worker()` path now survives loss of the supervisor's
+process-local launch handle without falling back to a host PID. Gate release,
+the launched-to-running transition, stop intent, exit, and ambiguity transitions
+share an exclusive advisory lock on the exact private execution state
+directory. The directory must still match its durable device/inode identity,
+owner, and `0700` mode, both before and immediately after lock acquisition. A
+busy lock or identity mismatch leaves the journal unchanged. The gate writer
+re-reads the matching attempt and execution under that lock and requires
+`working` + `running` with no durable stop intent before writing `go`; therefore
+a fresh supervisor's stop intent fences a still-live parent's delayed gate
+write. Fork children close inherited lock descriptors so they cannot retain the
+kernel lock after the owning process exits. This is cooperative lifecycle
+fencing, not protection from a hostile same-UID process that can mutate the
+supervisor-owned state directory outside this API.
+
+No-model regression coverage now includes a spawned fresh `GitSupervisor`
+calling public `terminate_worker()` twice, authenticating the exact execution
+and scope, checking status, and replaying the same deterministic cancel ID.
+Separate checks prove busy-lock non-mutation, wrong-state-root rejection, and
+fork-child lock-FD cleanup. A test double models only monitor IPC in this
+public-API regression; the disposable systemd producer/reconnect/cancel test
+above remains the independent real-service evidence. Cancellation returns
+`stopping` and retains cleanup/resource fences; it does not imply the vanished
+supervisor's runc `Popen` handle was recovered or cleanup verified. Configured
+OCI `run_worker()` remains fail-closed.
+
+After this fence change, the disposable Linux/systemd production monitor test
+was rerun on Ubuntu 26.04 ARM64, Linux 7.0.0-38-generic, Python 3.14.4,
+systemd 259.5, and cgroup v2: **1 passed, 7 deselected**. Host and guest
+SHA-256 matched for all eight copied production source/test files in the
+production-monitor section below. The exact monitor fixture and unit cleanup
+passed; postflight found the user manager running, no matching ACP test units,
+and no `acp-production-monitor-*` fixture roots. That live test validates the
+monitor producer/reconnect/cancel only; fresh `terminate_worker()` recovery is
+separately covered by the spawned no-model supervisor regression above.
+
 ### Cleanup proof boundary (2026-10-11; architecture/QC decision)
 
 Do not add an observer that writes `cleanup_verified` from absence checks alone.
@@ -3064,8 +3102,8 @@ The source files copied into the guest matched the host worktree byte-for-byte:
 
 | File | SHA-256 |
 | --- | --- |
-| `oci_worker.py` | `08c9b9dfb0e8fc9fb947d5caa7cd13705c3b21a6da7315f51a8926f42b915e7e` |
-| `sandbox_execution_journal.py` | `6f76eb4d6f9efa73c3e29a1c363d2b48a8f69f5ee5a41eb85137401f5649ce7a` |
+| `oci_worker.py` | `bcd015a23f3bbd0293d6d8fc864f31e5add53bfad33c592588c3f6ce1191a90d` |
+| `sandbox_execution_journal.py` | `1e74e092d316bd4c3eac4553c25e668d521a87d042142f2e83a5a6a56f876258` |
 | `sandbox_monitor_ipc.py` | `b9147858a1cd30f04bb9273f6f26b9382970414366f929cb526525941b48fead` |
 | `sandbox_monitor_service.py` | `2bdc15107039447422c5d24f5970eb7a651d59f58f04a4d48ae511ca6aaf1058` |
 | `sandbox_monitor_lifecycle.py` | `b00dd5c714890aee467f6a2ab187ae1b12847780eaf5c004532dbd17fe4fb5db` |

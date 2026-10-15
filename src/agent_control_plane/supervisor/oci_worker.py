@@ -3439,18 +3439,40 @@ class RuncLaunchHandle:
                 raise SupervisorError(
                     "sandbox_launch_gate_closed", "OCI init launch gate is already closed"
                 )
-            _consume_runc_launch_gate_authorization(self)
-            self._gate_writer = None
-            try:
-                if os.write(descriptor, b"go\n") != 3:
-                    raise OSError("short write to the OCI init launch gate")
-            except OSError as error:
-                raise SupervisorError(
-                    "sandbox_launch_gate_failed",
-                    "OCI init launch gate could not be released",
-                ) from error
-            finally:
-                _close_runc_launch_gate_writer(descriptor)
+            record = _runc_launch_record(self)
+            if record is not None and record.execution_binding is not None:
+                if record.target.state_path is not None:
+                    identity = record.state_gate_identity
+                    if identity is None or record.gate_release_guard is None:
+                        raise SupervisorError(
+                            "sandbox_launch_gate_not_authorized",
+                            "journaled OCI gate lacks its cross-process durable-state fence",
+                        )
+                    with _runc_execution_gate_fence(*identity):
+                        if not record.gate_release_guard():
+                            raise SupervisorError(
+                                "sandbox_launch_gate_not_authorized",
+                                "durable stop intent or stale execution state fences gate release",
+                            )
+                        self._release_gate_locked(descriptor)
+                    return
+            self._release_gate_locked(descriptor)
+
+    def _release_gate_locked(self, descriptor: int) -> None:
+        """Consume the one-shot permit and write while the caller holds gate locks."""
+
+        _consume_runc_launch_gate_authorization(self)
+        self._gate_writer = None
+        try:
+            if os.write(descriptor, b"go\n") != 3:
+                raise OSError("short write to the OCI init launch gate")
+        except OSError as error:
+            raise SupervisorError(
+                "sandbox_launch_gate_failed",
+                "OCI init launch gate could not be released",
+            ) from error
+        finally:
+            _close_runc_launch_gate_writer(descriptor)
 
     def wait(self, timeout: float | None = None) -> _RuncClientWaitReceipt:
         """Reap this pinned-runc child and return its bound kernel wait receipt."""
@@ -3647,6 +3669,8 @@ class _RuncLaunchRecord:
     target: _RuncLaunchTarget
     launch_submission: Any | None = None
     execution_binding: tuple[str, int, str] | None = None
+    state_gate_identity: tuple[str, int, int] | None = None
+    gate_release_guard: Callable[[], bool] | None = field(default=None, compare=False, repr=False)
     gate_release_authorized: bool = False
     wait_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
     wait_returncode: int | None = None
@@ -3680,6 +3704,7 @@ _RUNC_WAIT_RECEIPTS: dict[
 _RUNC_WAIT_RECEIPTS_LOCK = threading.Lock()
 _RUNC_LAUNCH_FORK_GUARD = threading.Lock()
 _RUNC_LAUNCH_GATE_WRITERS: set[int] = set()
+_RUNC_EXECUTION_GATE_LOCK_FDS: set[int] = set()
 
 
 def _before_runc_launch_fork() -> None:
@@ -3714,6 +3739,112 @@ def _close_runc_launch_gate_writer(descriptor: int) -> None:
         os.close(descriptor)
 
 
+@contextmanager
+def _runc_execution_gate_fence(
+    state_path: str, state_device: int, state_inode: int
+) -> Iterator[None]:
+    """Take the exact execution's process-shared gate/stop fence.
+
+    Advisory ``flock`` on the unique, inode-pinned state directory avoids a
+    mutable lock-file path. A busy lock is fail-closed; callers can retry after
+    the active lifecycle operation completes.
+    """
+
+    try:
+        import fcntl as fcntl_module
+    except ImportError as error:
+        raise SupervisorError(
+            "sandbox_execution_gate_unavailable",
+            "this platform cannot provide the required process-shared lifecycle fence",
+        ) from error
+    if (
+        not isinstance(state_path, str)
+        or not state_path
+        or not Path(state_path).is_absolute()
+        or type(state_device) is not int
+        or type(state_inode) is not int
+        or state_device < 0
+        or state_inode <= 0
+    ):
+        raise SupervisorError(
+            "sandbox_execution_gate_identity_mismatch",
+            "durable state-root identity is invalid; lifecycle fence retained",
+        )
+    descriptor = -1
+    owner_pid = os.getpid()
+    with _RUNC_LAUNCH_FORK_GUARD:
+        try:
+            descriptor = os.open(
+                state_path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(descriptor)
+            observed = os.stat(state_path, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or stat.S_ISLNK(observed.st_mode)
+                or (opened.st_dev, opened.st_ino) != (state_device, state_inode)
+                or (observed.st_dev, observed.st_ino) != (state_device, state_inode)
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_gate_identity_mismatch",
+                    "state root no longer matches its private durable identity; lifecycle fence retained",
+                )
+            try:
+                fcntl_module.flock(descriptor, fcntl_module.LOCK_EX | fcntl_module.LOCK_NB)
+            except BlockingIOError as error:
+                raise SupervisorError(
+                    "sandbox_execution_gate_busy",
+                    "another process is changing this execution's launch gate; lifecycle fence retained",
+                ) from error
+            locked = os.fstat(descriptor)
+            path_after_lock = os.stat(state_path, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(locked.st_mode)
+                or stat.S_ISLNK(path_after_lock.st_mode)
+                or (locked.st_dev, locked.st_ino) != (state_device, state_inode)
+                or (path_after_lock.st_dev, path_after_lock.st_ino) != (state_device, state_inode)
+                or locked.st_uid != os.geteuid()
+                or stat.S_IMODE(locked.st_mode) != 0o700
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_gate_identity_mismatch",
+                    "state-root path changed while acquiring its lifecycle fence",
+                )
+            _RUNC_EXECUTION_GATE_LOCK_FDS.add(descriptor)
+        except SupervisorError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except OSError as error:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise SupervisorError(
+                "sandbox_execution_gate_unavailable",
+                "could not acquire the exact private execution gate fence",
+            ) from error
+        except BaseException:
+            if descriptor >= 0:
+                _RUNC_EXECUTION_GATE_LOCK_FDS.discard(descriptor)
+                os.close(descriptor)
+            raise
+    try:
+        yield
+    finally:
+        if os.getpid() == owner_pid:
+            with _RUNC_LAUNCH_FORK_GUARD:
+                _RUNC_EXECUTION_GATE_LOCK_FDS.discard(descriptor)
+                try:
+                    fcntl_module.flock(descriptor, fcntl_module.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+
+
 def _reset_runc_launch_state_after_fork() -> None:
     """Drop inherited launch capabilities and replace locks in the child.
 
@@ -3730,8 +3861,10 @@ def _reset_runc_launch_state_after_fork() -> None:
     global _RUNC_WAIT_RECEIPTS
     global _RUNC_LAUNCH_FORK_GUARD
     global _RUNC_LAUNCH_GATE_WRITERS
+    global _RUNC_EXECUTION_GATE_LOCK_FDS
 
     inherited_gate_writers = set(_RUNC_LAUNCH_GATE_WRITERS)
+    inherited_execution_gate_locks = set(_RUNC_EXECUTION_GATE_LOCK_FDS)
     for reference, record in tuple(_RUNC_LAUNCH_RECORDS.values()):
         object.__setattr__(record, "wait_lock", threading.Lock())
         handle = reference()
@@ -3744,7 +3877,7 @@ def _reset_runc_launch_state_after_fork() -> None:
         if descriptor is not None:
             inherited_gate_writers.add(descriptor)
 
-    for descriptor in inherited_gate_writers:
+    for descriptor in inherited_gate_writers | inherited_execution_gate_locks:
         try:
             os.close(descriptor)
         except OSError:
@@ -3758,6 +3891,7 @@ def _reset_runc_launch_state_after_fork() -> None:
     _RUNC_WAIT_RECEIPTS = {}
     _RUNC_LAUNCH_FORK_GUARD = threading.Lock()
     _RUNC_LAUNCH_GATE_WRITERS = set()
+    _RUNC_EXECUTION_GATE_LOCK_FDS = set()
 
 
 if hasattr(os, "register_at_fork"):
@@ -3776,9 +3910,10 @@ def _runc_launch_gate_lock_for_execution(
 
     The registry lock is released before waiting for the handle lock, matching
     ``release_gate``'s handle-then-registry order and avoiding lock inversion.
-    A missing handle means this process cannot synchronize with the gate. It
-    does not prove that another process has no monitor-owned handle; callers
-    that request stop must fail closed when the local handle is unavailable.
+    A missing handle means this process cannot synchronize with the local gate
+    writer. Lifecycle mutations also take the inode-pinned, process-shared state
+    directory fence; after that fence is held, the durable stop intent and
+    monitor identity—not a process-local handle—authorize recovery.
     """
 
     binding = (attempt_id, claim_token, execution_id)
@@ -3970,6 +4105,8 @@ def _record_runc_kernel_wait_status(
             target=current.target,
             launch_submission=current.launch_submission,
             execution_binding=current.execution_binding,
+            state_gate_identity=current.state_gate_identity,
+            gate_release_guard=current.gate_release_guard,
             gate_release_authorized=current.gate_release_authorized,
             wait_lock=current.wait_lock,
             wait_returncode=returncode,
@@ -4073,6 +4210,8 @@ def _authorize_runc_launch_gate_release_locked(
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
+            state_gate_identity=record.state_gate_identity,
+            gate_release_guard=record.gate_release_guard,
             gate_release_authorized=True,
             wait_lock=record.wait_lock,
             wait_returncode=record.wait_returncode,
@@ -4107,6 +4246,8 @@ def _revoke_runc_launch_gate_release_locked(
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
+            state_gate_identity=record.state_gate_identity,
+            gate_release_guard=record.gate_release_guard,
             gate_release_authorized=False,
             wait_lock=record.wait_lock,
             wait_returncode=record.wait_returncode,
@@ -4139,6 +4280,8 @@ def _consume_runc_launch_gate_authorization(handle: RuncLaunchHandle) -> None:
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
+            state_gate_identity=record.state_gate_identity,
+            gate_release_guard=record.gate_release_guard,
             gate_release_authorized=False,
             wait_lock=record.wait_lock,
             wait_returncode=record.wait_returncode,
@@ -4149,7 +4292,13 @@ def _consume_runc_launch_gate_authorization(handle: RuncLaunchHandle) -> None:
 
 
 def _runc_launch_handle_bind_execution(
-    handle: RuncLaunchHandle, attempt_id: str, claim_token: int, execution_id: str
+    handle: RuncLaunchHandle,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    *,
+    state_gate_identity: tuple[str, int, int] | None = None,
+    gate_release_guard: Callable[[], bool] | None = None,
 ) -> None:
     """Bind a prevalidated launch target once to its exact durable execution."""
 
@@ -4182,6 +4331,19 @@ def _runc_launch_handle_bind_execution(
                 "sandbox_execution_launch_handle_conflict",
                 "durable execution is already bound to another pinned-runc handle",
             )
+        if state_gate_identity is not None and (
+            state_gate_identity
+            != (
+                record.target.state_path,
+                record.target.state_device,
+                record.target.state_inode,
+            )
+            or not callable(gate_release_guard)
+        ):
+            raise SupervisorError(
+                "sandbox_execution_gate_identity_mismatch",
+                "gate fence does not match the pinned launch target",
+            )
         updated = _RuncLaunchRecord(
             process=record.process,
             pid=record.pid,
@@ -4189,6 +4351,8 @@ def _runc_launch_handle_bind_execution(
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=binding,
+            state_gate_identity=state_gate_identity or record.state_gate_identity,
+            gate_release_guard=gate_release_guard or record.gate_release_guard,
             gate_release_authorized=record.gate_release_authorized,
             wait_lock=record.wait_lock,
             wait_returncode=record.wait_returncode,

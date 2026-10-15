@@ -93,6 +93,103 @@ def _request_stop_from_fresh_process(
         result_sender.close()
 
 
+def _terminate_worker_from_fresh_supervisor(
+    repo: Path,
+    attempt_id: str,
+    expected_identity: tuple[str, int, str],
+    state_path: str,
+    scope: dict[str, str],
+    result_sender,
+) -> None:
+    """Exercise the public recovery path without a process-local launch handle."""
+
+    calls: list[tuple[str, tuple[str, int, str], str]] = []
+
+    def control_paths(**kwargs: object) -> tuple[Path, Path, Path]:
+        if (
+            kwargs.get("expected_identity") != expected_identity
+            or kwargs.get("state_path") != state_path
+        ):
+            raise AssertionError("fresh supervisor derived control paths from the wrong identity")
+        return (
+            Path("/private/control"),
+            Path("/private/control/receipt"),
+            Path("/private/runtime/socket"),
+        )
+
+    monitor_lifecycle_module.sandbox_monitor_control_paths = control_paths
+    monitor_lifecycle_module.reconnect_sandbox_monitor = lambda **kwargs: _FreshMonitorStub(
+        expected_identity, scope, calls, kwargs
+    )
+    supervisor = GitSupervisor(repo)
+    try:
+        result = supervisor.terminate_worker(attempt_id)
+    except SupervisorError as error:
+        result_sender.send(
+            (
+                "error",
+                error.code,
+                repr(error.__cause__),
+                supervisor._sandbox_execution_get(attempt_id)["phase"],
+                calls,
+            )
+        )
+    else:
+        result_sender.send(("ok", result, calls))
+    finally:
+        result_sender.close()
+
+
+class _FreshMonitorStub:
+    """Small monitor double used only by the spawned restart regression."""
+
+    def __init__(
+        self,
+        expected_identity: tuple[str, int, str],
+        scope: dict[str, str],
+        calls: list[tuple[str, tuple[str, int, str], str]],
+        reconnect_kwargs: dict[str, object],
+    ) -> None:
+        if reconnect_kwargs.get("expected_identity") != expected_identity:
+            raise AssertionError("fresh supervisor reconnected with the wrong execution identity")
+        self.expected_identity = expected_identity
+        self.scope = scope
+        self.calls = calls
+
+    def status(self):
+        self.calls.append(("status", self.expected_identity, ""))
+        return SimpleNamespace(outcome="ok", payload={"phase": "running", **self.scope})
+
+    def cancel(self, request_id: str):
+        self.calls.append(("cancel", self.expected_identity, request_id))
+        return SimpleNamespace(outcome="ok", payload={"phase": "stopping"})
+
+
+def _acquire_gate_fence_after_parent_release(
+    state_path: str,
+    state_device: int,
+    state_inode: int,
+    inherited_lock_fd: int,
+    release_receiver,
+    result_sender,
+) -> None:
+    try:
+        os.fstat(inherited_lock_fd)
+    except OSError:
+        result_sender.send("inherited-closed")
+    else:
+        result_sender.send("inherited-open")
+    release_receiver.recv()
+    try:
+        with oci_worker._runc_execution_gate_fence(state_path, state_device, state_inode):
+            result_sender.send("acquired")
+    except SupervisorError as error:
+        result_sender.send(error.code)
+    finally:
+        release_receiver.close()
+        result_sender.close()
+
+
 def _terminate_worker_from_forked_process(
     repo: Path,
     attempt_id: str,
@@ -1585,7 +1682,7 @@ def test_stop_after_running_transition_revokes_unconsumed_gate_permit(repo: Path
 
 
 @pytest.mark.parametrize("phase_before_reconnect", ["launched", "running", "stopping"])
-def test_reconnected_supervisor_without_monitor_handle_does_not_claim_stop_applied(
+def test_reconnected_supervisor_records_stop_intent_and_keeps_gate_closed(
     repo: Path, phase_before_reconnect: str
 ) -> None:
     supervisor = GitSupervisor(repo)
@@ -1606,8 +1703,8 @@ def test_reconnected_supervisor_without_monitor_handle_does_not_claim_stop_appli
                 == "stopping"
             )
 
-        # A spawned interpreter shares the SQLite journal but has no access to
-        # the monitor's process-local handle registry or gate lock.
+        # A spawned interpreter shares the durable state-root fence and SQLite
+        # journal, but has no access to the monitor's process-local handle.
         context = multiprocessing.get_context("spawn")
         result_receiver, result_sender = context.Pipe(duplex=False)
         process = context.Process(
@@ -1624,24 +1721,203 @@ def test_reconnected_supervisor_without_monitor_handle_does_not_claim_stop_appli
             process.join(timeout=10)
             assert not process.is_alive(), "fresh supervisor process did not exit"
             assert process.exitcode == 0
-            assert result == ("sandbox_execution_monitor_unavailable", phase_before_reconnect)
+            expected_phase = "launched" if phase_before_reconnect == "launched" else "stopping"
+            assert result == ("ok", expected_phase)
         finally:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
             result_receiver.close()
 
-        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == phase_before_reconnect
-        if phase_before_reconnect == "running":
-            handle.release_gate()
-            assert os.read(gate_read, 3) == b"go\n"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable is not None and durable["phase"] == expected_phase
+        if expected_phase == "launched":
+            with supervisor.connect() as connection:
+                assert (
+                    journal_module._sandbox_execution_launch_stop_reason(connection, durable)
+                    == reason
+                )
         else:
-            with pytest.raises(SupervisorError) as revoked:
-                handle.release_gate()
-            assert revoked.value.code == "sandbox_launch_gate_not_authorized"
-            os.set_blocking(gate_read, False)
-            with pytest.raises(BlockingIOError):
-                os.read(gate_read, 3)
+            assert durable["stop_reason"] == reason
+        with pytest.raises(SupervisorError) as revoked:
+            handle.release_gate()
+        assert revoked.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_public_terminate_worker_reconnects_after_supervisor_restart(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        assert record_running(supervisor, attempt)["phase"] == "running"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable is not None
+        identity = (attempt["id"], attempt["claim_token"], execution["execution_id"])
+        scope = {
+            "scope_unit": durable["scope_unit"],
+            "scope_invocation_id": durable["scope_invocation_id"],
+            "scope_control_group": durable["cgroup_path"],
+        }
+        with pytest.raises(SupervisorError) as wrong_root:
+            with oci_worker._runc_execution_gate_fence(
+                durable["state_path"],
+                durable["state_root_dev"] + 1,
+                durable["state_root_ino"],
+            ):
+                pytest.fail("mismatched state-root identity acquired a lifecycle fence")
+        assert wrong_root.value.code == "sandbox_execution_gate_identity_mismatch"
+
+        import fcntl
+
+        state_root = Path(durable["state_path"])
+        displaced_root = state_root.with_name(f"{state_root.name}.displaced-for-test")
+        original_root_identity = os.stat(state_root)
+        original_flock = fcntl.flock
+
+        def replace_state_root_after_lock(descriptor: int, operation: int) -> None:
+            original_flock(descriptor, operation)
+            if operation & fcntl.LOCK_EX:
+                state_root.rename(displaced_root)
+                state_root.mkdir(mode=0o700)
+
+        with patch("fcntl.flock", side_effect=replace_state_root_after_lock):
+            with pytest.raises(SupervisorError) as replaced_root:
+                with oci_worker._runc_execution_gate_fence(
+                    durable["state_path"],
+                    durable["state_root_dev"],
+                    durable["state_root_ino"],
+                ):
+                    pytest.fail("replaced state-root path acquired a lifecycle fence")
+        assert replaced_root.value.code == "sandbox_execution_gate_identity_mismatch"
+        state_root.rmdir()
+        displaced_root.rename(state_root)
+        restored_root_identity = os.stat(state_root)
+        assert (restored_root_identity.st_dev, restored_root_identity.st_ino) == (
+            original_root_identity.st_dev,
+            original_root_identity.st_ino,
+        )
+
+        with oci_worker._runc_execution_gate_fence(
+            durable["state_path"], durable["state_root_dev"], durable["state_root_ino"]
+        ):
+            context = multiprocessing.get_context("spawn")
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(
+                target=_request_stop_from_fresh_process,
+                args=(repo, attempt["id"], attempt["claim_token"], "concurrent-stop", sender),
+            )
+            process.start()
+            sender.close()
+            try:
+                assert receiver.poll(10), "contending supervisor did not return"
+                assert receiver.recv() == ("sandbox_execution_gate_busy", "running")
+                process.join(timeout=10)
+                assert not process.is_alive()
+                assert process.exitcode == 0
+            finally:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+                receiver.close()
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "running"
+
+        if "fork" in multiprocessing.get_all_start_methods():
+            context = multiprocessing.get_context("fork")
+            release_receiver, release_sender = context.Pipe(duplex=False)
+            acquired_receiver, acquired_sender = context.Pipe(duplex=False)
+            process = None
+            try:
+                with oci_worker._runc_execution_gate_fence(
+                    durable["state_path"],
+                    durable["state_root_dev"],
+                    durable["state_root_ino"],
+                ):
+                    process = context.Process(
+                        target=_acquire_gate_fence_after_parent_release,
+                        args=(
+                            durable["state_path"],
+                            durable["state_root_dev"],
+                            durable["state_root_ino"],
+                            next(iter(oci_worker._RUNC_EXECUTION_GATE_LOCK_FDS)),
+                            release_receiver,
+                            acquired_sender,
+                        ),
+                    )
+                    process.start()
+                    release_receiver.close()
+                    acquired_sender.close()
+                    assert acquired_receiver.poll(5), (
+                        "forked child did not report inherited fd state"
+                    )
+                    assert acquired_receiver.recv() == "inherited-closed"
+                release_sender.send(True)
+                assert acquired_receiver.poll(5), "forked child retained the inherited flock fd"
+                assert acquired_receiver.recv() == "acquired"
+                process.join(timeout=5)
+                assert process.exitcode == 0
+            finally:
+                release_sender.close()
+                acquired_receiver.close()
+                if process is not None and process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        def invoke_fresh_supervisor() -> tuple:
+            context = multiprocessing.get_context("spawn")
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(
+                target=_terminate_worker_from_fresh_supervisor,
+                args=(repo, attempt["id"], identity, durable["state_path"], scope, sender),
+            )
+            process.start()
+            sender.close()
+            try:
+                assert receiver.poll(10), "fresh supervisor did not return terminate_worker result"
+                result = receiver.recv()
+                process.join(timeout=10)
+                assert not process.is_alive(), "fresh supervisor did not exit"
+                assert process.exitcode == 0
+                return result
+            finally:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+                receiver.close()
+
+        first = invoke_fresh_supervisor()
+        second = invoke_fresh_supervisor()
+        assert first[0] == second[0] == "ok", (first, second)
+        assert first[1] == second[1]
+        result = first[1]
+        assert result["outcome"] == "ok"
+        assert result["phase"] == "stopping"
+        assert result["monitor_phase"] == "stopping"
+        assert result["stop_requested"] is True
+        assert result["cleanup_verified"] is False
+        assert first[2] == second[2]
+        expected_cancel_id = monitor_lifecycle_module.sandbox_monitor_cancel_request_id(identity)
+        assert first[2] == [
+            ("status", identity, ""),
+            ("cancel", identity, expected_cancel_id),
+        ]
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "stopping"
+        with pytest.raises(SupervisorError) as fenced:
+            handle.release_gate()
+        assert fenced.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
     finally:
         handle.close_gate()
         os.close(gate_read)
@@ -3405,7 +3681,7 @@ def test_forked_process_cannot_reuse_parent_launch_handle(
                 journal_module._sandbox_execution_launch_stop_reason(
                     connection, supervisor._sandbox_execution_get(attempt["id"])
                 )
-                is None
+                == "terminate_worker"
             )
     finally:
         if process.is_alive():
