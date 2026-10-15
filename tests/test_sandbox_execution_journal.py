@@ -26,6 +26,7 @@ from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker
 from agent_control_plane.supervisor import sandbox_attestation as sandbox_attestation_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
+from agent_control_plane.supervisor import workers as workers_module
 from agent_control_plane.supervisor.common import canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
@@ -2916,6 +2917,48 @@ def test_journal_reservation_prevents_later_direct_worker_launch(
     after = supervisor.attempt(attempt["id"])
     assert after["pid"] is None
     assert after["updated_at"] == before["updated_at"]
+
+
+def test_journaled_sandbox_termination_never_opens_registered_host_pid(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    attempt_view = supervisor._attempt_view
+
+    def registered_pid_view(connection, row):
+        view = attempt_view(connection, row)
+        view["pid"] = 4242
+        view["pid_identity"] = "linux:4242:99"
+        return view
+
+    # Journal ownership triggers correctly prevent direct PID registration;
+    # emulate a legacy/recovered view to prove the termination boundary still
+    # refuses the host-PID route if such a value is present.
+    monkeypatch.setattr(supervisor, "_attempt_view", registered_pid_view)
+
+    def host_pid_operation_must_not_run(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("journaled sandbox termination must not access or signal a host PID")
+
+    monkeypatch.setattr(
+        workers_module.os, "pidfd_open", host_pid_operation_must_not_run, raising=False
+    )
+    monkeypatch.setattr(
+        workers_module.signal,
+        "pidfd_send_signal",
+        host_pid_operation_must_not_run,
+        raising=False,
+    )
+    monkeypatch.setattr(workers_module.os, "kill", host_pid_operation_must_not_run)
+    monkeypatch.setattr(workers_module.os, "killpg", host_pid_operation_must_not_run, raising=False)
+    with pytest.raises(SupervisorError) as termination:
+        supervisor.terminate_worker(attempt["id"])
+
+    assert termination.value.code == "sandbox_execution_monitor_unavailable"
+    monkeypatch.setattr(supervisor, "_attempt_view", attempt_view)
+    assert supervisor.attempt(attempt["id"])["pid"] is None
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
 def test_journaled_result_import_and_manual_submission_fail_closed(

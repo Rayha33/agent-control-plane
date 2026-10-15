@@ -824,6 +824,16 @@ class WorkersMixin:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             self._authenticate_attempt(connection, row, credential)
             attempt = self._attempt_view(connection, row)
+        # A sandbox execution is stopped only through its monitor-owned
+        # lifecycle. Until the supervisor can reconnect to that monitor, do
+        # not let this legacy PID-only endpoint signal the host process that
+        # happens to be registered on the attempt (including a stale/reused
+        # PID after restart).
+        if self._sandbox_execution_get(attempt_id) is not None:
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "sandbox attempt termination requires the unavailable monitor-owned control path; refusing direct PID signaling",
+            )
         if not attempt["pid"]:
             raise SupervisorError("worker_not_running", "attempt has no running worker")
         if attempt["pid"] < 0:
