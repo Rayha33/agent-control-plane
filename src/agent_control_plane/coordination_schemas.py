@@ -716,6 +716,14 @@ class TaskCompleteRequest(BaseModel):
 class TaskReopenRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
 
+    @field_validator("reason")
+    @classmethod
+    def require_nonblank_reason(cls, value: str) -> str:
+        reason = value.strip()
+        if not reason:
+            raise ValueError("reason must contain non-whitespace characters")
+        return reason
+
 
 class ReapReport(BaseModel):
     blocked_interruption_task_ids: list[str]

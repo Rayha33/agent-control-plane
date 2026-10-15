@@ -2197,6 +2197,16 @@ def test_blocked_task_is_reopened_after_human_action(client, app, admin_headers)
     )
     assert heartbeat_rows(app, task["id"]) == 0
 
+    blank_reason_reopen = client.post(
+        f"/v1/tasks/{task['id']}/reopen",
+        headers=admin_headers,
+        json={"reason": " \t\n "},
+    )
+    assert blank_reason_reopen.status_code == 422
+    assert (
+        client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()["status"] == "blocked"
+    )
+
     reopened = client.post(
         f"/v1/tasks/{task['id']}/reopen",
         headers=admin_headers,
