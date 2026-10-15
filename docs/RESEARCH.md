@@ -1,6 +1,6 @@
 # Research: the missing safety layer for parallel coding agents
 
-Research updated: 2026-10-06.
+Research updated: 2026-10-14.
 
 ## Verdict
 
@@ -490,3 +490,33 @@ the attempt. If identity is absent or ambiguous it quarantines rather than
 guessing. This reduces leaked ACP-owned clones; it does not download runtimes,
 delete global Xcode caches, cap RAM/disk, or limit concurrent attempts. The
 reports motivate an adjacent platform-specific adapter, not a prevalence claim.
+
+### Selected worktree is not proof of the actual write target (2026-10-14)
+
+[Codex issue #52885](https://github.com/openai/codex/issues/52885), opened Oct 10,
+reports that on Windows a patch-editing interface wrote to the primary worktree
+even though the task selected an external Git worktree. The reporter noticed the
+mismatch before further edits and reports no data loss. The issue is open; this is
+one user report, not a prevalence estimate or an independently reproduced root
+cause. It is distinct from [Codex issue #37226](https://github.com/openai/codex/issues/37226),
+which asks for coordination between chats sharing a checkout, and
+[issue #38541](https://github.com/openai/codex/issues/38541), which reports
+uncommitted work disappearing after sessions reused the same managed worktree.
+Those are also individual reports, not prevalence data.
+
+The new failure boundary is the writer's resolved target, not merely the shell's
+cwd or the orchestrator's selected-worktree label. ACP's `checkout-exec` starts a
+foreground command in the identified checkout and serializes cooperating wrapped
+sessions, but it cannot redirect or fence a patch API that independently writes
+to another worktree. That API remains outside the current guarantee.
+
+Recommended next implementation slice: make every ACP-mediated edit carry an
+explicit checkout/worktree identity and target path to the actual write adapter.
+Resolve the target at the write boundary and compare it with the held resource
+lease before mutation; refuse when the target cannot be resolved or disagrees
+with the claimed checkout. If a writer API cannot accept or report an explicit
+target, fail closed when multiple worktrees make the destination ambiguous.
+Tests should prove that a selected external worktree alone changes, and that a
+primary-worktree fallback or mismatched target is rejected without touching
+either tree. This is a proposed follow-up, not functionality provided by
+`checkout-exec` or evidence that arbitrary same-user tools are contained.

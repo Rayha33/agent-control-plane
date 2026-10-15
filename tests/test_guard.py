@@ -18,10 +18,12 @@ from pathlib import Path
 import pytest
 from support import init_repo, make_task
 
+from agent_control_plane.checkout_identity import CheckoutWriteLease, identify_checkout
 from agent_control_plane.cli import main
 from agent_control_plane.editor_hooks import (
     DENY_EXIT_CODE,
     GUARDED_TOOLS,
+    claude_code_hooks,
     install_claude_code_hooks,
     path_from_hook_payload,
 )
@@ -441,6 +443,81 @@ def test_install_preserves_the_users_settings(tmp_path: Path) -> None:
     assert len(acp_entries) == 1
 
 
+def test_install_replaces_legacy_default_hook_when_command_changes(tmp_path: Path) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    # Literal output from the pre-marker generator (base ed526b2), plus an old
+    # custom Python-module command from the supported --command option.
+    legacy_hooks = {
+        "PreToolUse": [
+            {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [
+                    {"type": "command", "command": "acp guard --hook"},
+                    {"type": "command", "command": "my co-located user hook"},
+                    {"type": "command", "command": "my-hook acp guard --audit"},
+                    {"type": "command", "command": "acp guard --audit"},
+                ],
+            },
+            {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "python -m agent_control_plane.cli --repo /project-root-one "
+                            "guard --hook"
+                        ),
+                    }
+                ],
+            },
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "my user hook"}]},
+        ],
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": "acp guard --describe"}]},
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "python -m agent_control_plane.cli --repo /project-root-one "
+                            "guard --describe"
+                        ),
+                    }
+                ]
+            },
+            {"hooks": [{"type": "command", "command": "my session hook"}]},
+            {"hooks": [{"type": "command", "command": 'echo "acp guard is disabled"'}]},
+        ],
+    }
+    settings_path.write_text(json.dumps({"hooks": legacy_hooks}), encoding="utf-8")
+
+    first_command = "python -m agent_control_plane.cli --repo /project-root-one"
+    second_command = "python -m agent_control_plane.cli --repo /project-root-two"
+    install_claude_code_hooks(tmp_path, command=first_command, require_checkout_exec=True)
+    install_claude_code_hooks(tmp_path, command=second_command, require_checkout_exec=True)
+
+    written = json.loads(settings_path.read_text(encoding="utf-8"))
+    pre_tool_commands = [
+        hook["command"] for entry in written["hooks"]["PreToolUse"] for hook in entry["hooks"]
+    ]
+    session_start_commands = [
+        hook["command"] for entry in written["hooks"]["SessionStart"] for hook in entry["hooks"]
+    ]
+    assert pre_tool_commands.count("my user hook") == 1
+    assert pre_tool_commands.count("my co-located user hook") == 1
+    assert pre_tool_commands.count("my-hook acp guard --audit") == 1
+    assert pre_tool_commands.count("acp guard --audit") == 1
+    assert session_start_commands.count("my session hook") == 1
+    assert session_start_commands.count('echo "acp guard is disabled"') == 1
+    assert sum(command.startswith(second_command) for command in pre_tool_commands) == 1
+    assert sum(command.startswith(second_command) for command in session_start_commands) == 1
+    assert "acp guard --hook" not in pre_tool_commands
+    assert "acp guard --describe" not in session_start_commands
+    assert not any(command.startswith(first_command) for command in pre_tool_commands)
+    assert not any(command.startswith(first_command) for command in session_start_commands)
+
+
 def test_install_refuses_to_overwrite_unreadable_settings(tmp_path: Path) -> None:
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True)
@@ -452,10 +529,115 @@ def test_install_refuses_to_overwrite_unreadable_settings(tmp_path: Path) -> Non
     assert settings_path.read_text(encoding="utf-8") == "{ this is not json"
 
 
+@pytest.mark.parametrize(
+    ("contents", "error"),
+    [
+        ("[]", "JSON object"),
+        ('{"hooks": []}', "non-object 'hooks'"),
+        ('{"hooks": {"PreToolUse": "user hook"}}', "non-list hook event"),
+        ('{"hooks": {"PreToolUse": [null]}}', "non-object hook matcher entry"),
+        (
+            '{"hooks": {"PreToolUse": [{"hooks": "user hook"}]}}',
+            "non-list 'hooks' entry value",
+        ),
+        (
+            '{"hooks": {"PreToolUse": [{"hooks": [null]}]}}',
+            "non-object hook command entry",
+        ),
+    ],
+)
+def test_install_refuses_unknown_settings_shapes(tmp_path: Path, contents: str, error: str) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        install_claude_code_hooks(tmp_path)
+    assert settings_path.read_text(encoding="utf-8") == contents
+
+
 def test_install_creates_settings_when_absent(tmp_path: Path) -> None:
     result = install_claude_code_hooks(tmp_path)
     written = json.loads(Path(result["settings"]).read_text(encoding="utf-8"))
     assert written["hooks"]["PreToolUse"][0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"
+
+
+def test_install_can_require_the_session_checkout_fence(tmp_path: Path) -> None:
+    result = install_claude_code_hooks(tmp_path, require_checkout_exec=True)
+    written = json.loads(Path(result["settings"]).read_text(encoding="utf-8"))
+    command = written["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+    assert command == "acp guard --hook --require-checkout-exec || exit 2 # acp-managed-hook:v1"
+    assert result["checkout_fence"] == "required"
+
+
+@pytest.mark.parametrize("executable", ["missing", "non_executable"])
+def test_pre_tool_hook_maps_launch_failures_to_blocking_exit(
+    tmp_path: Path, executable: str
+) -> None:
+    """Claude continues on generic hook errors, so launch failures must become exit 2."""
+
+    command_path = tmp_path / "acp"
+    if executable == "non_executable":
+        command_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        command_path.chmod(0o600)
+    else:
+        command_path = tmp_path / "missing-acp"
+
+    hook_command = claude_code_hooks(str(command_path))["PreToolUse"][0]["hooks"][0]["command"]
+    result = subprocess.run(["/bin/sh", "-c", hook_command], check=False)
+
+    assert result.returncode == DENY_EXIT_CODE
+
+
+def test_hook_mode_can_require_an_active_checkout_exec_fence(
+    repo: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("ACP_CHECKOUT_FENCE_RESOURCE", raising=False)
+    monkeypatch.delenv("ACP_CHECKOUT_FENCE_TOKEN", raising=False)
+    monkeypatch.setattr(
+        GitSupervisor,
+        "guard",
+        lambda _self, _attempt, _target, cwd=None: {"allow": True, "path": _target},
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(repo / "target.txt")},
+        "cwd": str(repo),
+    }
+
+    def invoke_guard() -> int:
+        import io
+        import sys
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        return main(
+            [
+                "--repo",
+                str(repo),
+                "guard",
+                "--attempt",
+                "test-attempt",
+                "--hook",
+                "--require-checkout-exec",
+            ]
+        )
+
+    assert invoke_guard() == DENY_EXIT_CODE
+    denied = json.loads(capsys.readouterr().out)
+    assert denied["reason"] == "checkout_fence_required"
+
+    identity = identify_checkout(repo)
+    with CheckoutWriteLease.local(repo) as lease:
+        assert lease.fencing_token is not None
+        monkeypatch.setenv("ACP_CHECKOUT_FENCE_RESOURCE", identity.resource)
+        monkeypatch.setenv("ACP_CHECKOUT_FENCE_TOKEN", str(lease.fencing_token))
+        allowed = {}
+        lease.run("write", lambda: allowed.setdefault("code", invoke_guard()))
+
+    assert allowed["code"] == 0
+    assert json.loads(capsys.readouterr().out)["allow"] is True
 
 
 def test_hook_mode_fails_closed_when_the_supervisor_cannot_open(tmp_path, monkeypatch) -> None:
