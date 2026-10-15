@@ -75,14 +75,14 @@ without an authoritative rate card and its version.
 ## Provider capability examples
 
 Provider controls are not interchangeable. This snapshot was checked against
-official documentation on 2026-10-14 UTC; it is an adapter-design input, not a
+official documentation on 2026-10-15 UTC; it is an adapter-design input, not a
 guarantee that any particular account has the feature enabled.
 
 | Provider | Documented control | Boundary that ACP must preserve |
 | --- | --- | --- |
 | OpenAI API | Monthly organization/project spend limits can be set as alerts or explicitly configured with “Enforce a hard limit”; hard-limit requests return `429` after tracked spend reaches the limit. | Enforcement is not instantaneous and recorded spend can slightly exceed the configured limit. Provider usage/cost reporting does not establish that every request for one ACP task is isolated or stopped. [Spend limits](https://developers.openai.com/api/docs/guides/spend-limits) · [Usage API](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage) |
-| Anthropic Claude API | Usage reports can be filtered by workspace, model, and API key; cost reports can be filtered by workspace, model, and month. Prepaid organizations stop accepting new API calls after credits are depleted. | The documented cost report does not provide per-user attribution. A timed-out/disconnected request that was on track to succeed can still be charged. Invoiced accounts are billed monthly rather than stopped by a prepaid-credit balance. [Usage and cost reports](https://support.claude.com/en/articles/9534590-cost-and-usage-reporting-in-the-claude-console) · [API billing and credits](https://support.claude.com/en/articles/8977456-how-do-i-pay-for-my-claude-api-usage) |
-| Google Gemini API | AI Studio offers monthly project spend caps, but not for Invoiced/Offline accounts. Cloud Billing spend caps are monthly and scoped to one project plus one eligible service for first-party billing accounts. | AI Studio project caps are experimental and may lag by about ten minutes; long-running agent sessions may exceed them. Cloud spend caps use estimated gross costs and enforce faster than billing reports, but enforcement is not instantaneous and overage remains possible. Actual Cloud Billing cost details are typically available within a day and can take more than 24 hours, so they are reconciliation evidence, not an in-flight gate. Gemini Prepay's monthly auto-charge limit caps automatic reloads only; manually initiated credit purchases do not count toward it. [Gemini API billing](https://ai.google.dev/gemini-api/docs/billing) · [Cloud Billing spend caps](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) |
+| Anthropic Claude Platform and Enterprise | Claude Platform Usage reports can filter by workspace, model, month, and API key; Cost reports by workspace, model, and month. Non-default workspaces can have monthly spend caps; only the Claude Code workspace supports per-user monthly workspace limits. Separate Claude Enterprise Analytics provides per-user cost/usage on usage-based plans (seat-based plans report usage credits only), and the Enterprise Spend Limits API exposes effective monthly limits and period-to-date spend per member. | The Spend Limits API requires an Enterprise organization, usage credits, and a scoped Admin API key; its member-level controls are not a Claude Console/API per-task cap. `period_to_date_spend` may temporarily report `"0"` when unavailable, so it is informational rather than a trustworthy live stop signal. Analytics cost/usage data is typically available within four hours but can take 24 hours; an open-ended recent tail past `data_refreshed_at` is incomplete, and values may be revised until about seven days after month-end. These member/workspace/month controls do not isolate an ACP task or run. A timed-out/disconnected request that was on track to succeed can still be charged; invoiced API accounts are not stopped by prepaid-credit depletion. [Spend Limits API](https://platform.claude.com/docs/en/manage-claude/spend-limits-api) · [Analytics APIs](https://platform.claude.com/docs/en/manage-claude/analytics-api) · [Workspaces](https://platform.claude.com/docs/en/manage-claude/workspaces) · [Usage and cost reports](https://support.claude.com/en/articles/9534590-cost-and-usage-reporting-in-the-claude-console) · [API billing and credits](https://support.claude.com/en/articles/8977456-how-do-i-pay-for-my-claude-api-usage) |
+| Google Gemini API | AI Studio offers monthly project spend caps, but not for Invoiced/Offline accounts. Cloud Billing spend caps are monthly and scoped to one project plus one eligible service for first-party billing accounts. | AI Studio project caps are experimental and may lag by about ten minutes; long-running agent sessions may exceed them. Cloud spend caps use estimated gross costs and enforce faster than billing reports, but enforcement is not instantaneous and overage remains possible. Actual Cloud Billing cost details are typically available within a day and can take more than 24 hours, so they are reconciliation evidence, not an in-flight gate. Gemini Prepay's monthly auto-charge limit caps automatic reloads only; manually initiated credit purchases do not count toward it. Since May 28, 2026, all new API keys created in Google AI Studio are automatically authorization keys; Google documents that requests authenticated by authorization keys are not recorded in Cloud service-account usage metrics, so ACP must not assume that metric provides per-agent request attribution. [Gemini API billing](https://ai.google.dev/gemini-api/docs/billing) · [Gemini API keys](https://ai.google.dev/gemini-api/docs/api-key) · [Cloud Billing spend caps](https://docs.cloud.google.com/billing/docs/how-to/budgets-spend-caps) |
 
 ### Provider error and retry semantics
 
@@ -139,11 +139,16 @@ and known token-detail fields with a provider response ID, model, and
 client-observed time; provider-created time is retained when the provider
 supplies it. Anthropic's documented total input is the sum of ordinary input,
 cache-read, and cache-creation tokens; ACP retains the cache components as
-details. Gemini thinking tokens are included in normalized output and retained
-as details. Gemini `toolUsePromptTokenCount` is retained as a detail but is
-excluded from this Developer API's documented total; Vertex AI documents a
-different total-token formula that includes tool-use prompt tokens and needs a
-separate parser. Each report is `reported`, `missing`, or `invalid`; the API
+details. OpenAI Responses exposes `cached_tokens` and `cache_write_tokens` as
+input details and `reasoning_tokens` as an output detail; ACP retains and
+parent-bounds them ([Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create)).
+Gemini thinking tokens are included in normalized output and retained as
+details; `toolUsePromptTokenCount` is included in normalized input while
+remaining available as a detail. Both Gemini Developer API GenerateContent and
+Vertex AI document totals that include prompt, tool-use prompt, thoughts, and
+response candidates. ACP currently implements only the Developer API response
+adapter; matching token accounting does not imply Vertex adapter support. Each
+report is `reported`, `missing`, or `invalid`; the API
 also timestamps receipt ingestion.
 These are client-reported observations: ACP does not authenticate response
 bodies or infer billing. ACP can aggregate a bounded sample of these
@@ -343,7 +348,25 @@ from an older service process sharing the migrated database. A pre-migration
 process can still return an already-existing reservation on a read-only
 idempotency replay; that does not create a reservation, and clients must never
 send on a replay. A deliberate retry requires a new key and another available
-slot under a newly fenced claim. Slots are never released or refunded.
+slot under a newly fenced claim. Slots are never released or refunded. When
+that claim expires, the coordination reaper moves the task to `blocked` instead
+of making it automatically claimable, and reports it in
+`blocked_interruption_task_ids`. An administrator must explicitly reopen the
+task with a reason before a new claim can start; a provider quota reset alone
+does not resume it. Migration 10 installs a SQLite status-transition guard as
+well: a pre-migration reaper cannot orphan the interrupted generation, and an
+older claimant cannot automatically resume an already-orphaned generation.
+Migration 11 parks any pre-existing `orphaned` task whose interruption report
+matches its current claim fence as `blocked`, so the normal audited reopen path
+can recover it. Each migrated task transition is appended to the hash-chained audit
+log inside the same schema transaction; an audit write failure rolls the migration
+back. The current reaper may park it as `blocked`; only the audited
+`blocked` → `open` reopen followed by a fresh claim is allowed. This lifecycle
+fence does not stop an active local process or prove sandbox cleanup; those
+remain separate runtime gates. If an older reaper encounters an interrupted
+task, the database guard rejects its legacy transition and may roll back that
+reaper transaction as a whole, delaying cleanup of other expired claims until
+the upgraded reaper runs.
 Reservations retain the task and resource fencing-token snapshot that was
 checked at creation. Reservation and client-reported receipt rows survive a
 service restart; task views recompute consumed slots from those persisted rows.
@@ -429,9 +452,13 @@ must submit it with the same semantic operation/payload to a provider that
 guarantees deduplication. ACP cannot verify provider support or that the
 callback uses the key; if those conditions are not met, use `dispatch_once`
 instead. The policy requires a finite maximum of 1–10 attempts, caps each
-delay, and also caps the sum of scheduled retry delays to at most 24 hours
-(60 seconds by default). It retries only HTTP 500, 502, 503, or 504 when the
-response contains a valid `Retry-After` within both caps; every attempt uses a distinct ACP
+requested delay, and also caps cumulative retry waiting at up to 24 hours (60
+seconds by default). Each wait charges the greater of its requested
+`Retry-After` delay and the elapsed time measured monotonically around the
+wait. If a sleeper overshoots the total cap, the sequence stops before another
+provider callback; provider request time is not part of this wait-only cap. It
+retries only HTTP 500, 502, 503, or 504 when the response contains a valid
+`Retry-After` within both caps; every attempt uses a distinct ACP
 reservation/idempotency key, and each response with a confirmed receipt write
 gets its own immutable client-reported receipt. An ambiguous send or receipt failure ends the sequence
 without a confirmed receipt; its durable slot remains consumed. HTTP 429 is
@@ -582,6 +609,14 @@ Existing submission and independent-QC gates remain the only route to
 completion. This is a recovery breadcrumb, not full crash-durable result
 recovery.
 
+ACP task, attempt, and checkpoint records are separate from an interactive
+agent's conversation transcript. A chat application's restored history does
+not establish that ACP's durable task records rolled back, and ACP records do
+not automatically capture or reconstruct that transcript. Caller-supplied
+checkpoint fields may retain text, but they are not a complete or authoritative
+transcript backup. Keep checkpoints bounded to task-relevant progress and
+evidence; do not use the interruption-report API as transcript backup.
+
 Example request (the checkpoint is caller-supplied JSON and is not host-verified):
 
 ```json
@@ -648,6 +683,28 @@ promotable evidence.
   one reported rate-limit retry storm consumed 8.6 million subagent tokens in
   226 seconds without usable output; a single issue report, not a prevalence
   estimate.
+- [OpenAI Codex issue #43885](https://github.com/openai/codex/issues/43885):
+  opened 2026-09-08, this individual report describes completed post-recovery
+  conversation history appearing to roll back after a desktop restart; later
+  comments include Mac and Windows reports. A commenter alleges that the
+  source rollout log retained later messages while a derived SQLite history
+  view was stale. These are unverified user reports, not evidence of ACP data
+  loss or a confirmed product root cause.
+- [OpenAI Codex issue #53101](https://github.com/openai/codex/issues/53101):
+  opened 2026-10-11, one user reports apparent agent activity and file changes
+  after a conversation was interrupted and another agent messaged it while the
+  user was conserving quota. The reporter cannot establish whether messaging
+  restarted execution or pending work continued, and a commenter cautions that
+  quota use cannot be attributed from the report alone. This is an unverified
+  interruption-control case, not prevalence or causal proof.
+- [OpenAI Codex issue #46704](https://github.com/openai/codex/issues/46704):
+  opened 2026-09-19, one report says Codex CLI 0.155.1 allowed a depth-2
+  worker-to-leaf spawn with configured `max_depth = 1`; a separate probe with
+  `max_depth = 0` also allowed a spawn, although the reporter notes that zero's
+  intended semantics were unclear. This is bounded to the reported version and
+  environment; it does not establish current behavior across products or ACP,
+  but supports requiring evidence at the actual spawn boundary before claiming
+  a depth limit is enforced.
 - [How Do AI Agents Spend Your Money?](https://arxiv.org/abs/2604.22750):
   research on token use in evaluated coding-agent tasks; results are specific
   to its dataset and setup.
