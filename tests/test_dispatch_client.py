@@ -1161,6 +1161,35 @@ def test_explicit_retry_policy_caps_total_wait_across_the_sequence() -> None:
     assert ledger.receipts == [("attempt-1", 503, 3), ("attempt-2", 503, 3)]
 
 
+def test_explicit_retry_policy_stops_after_sleeper_overshoots_total_wait_cap() -> None:
+    ledger = FakeLedger()
+    response = FakeResponse(503, retry_after_seconds=0)
+    sends: list[None] = []
+    waits: list[float] = []
+
+    def oversleep(delay: float) -> None:
+        waits.append(delay)
+        dispatch_client_module.time.sleep(0.02)
+
+    result = _dispatch_retries(
+        ledger,
+        "total-wait-overshoot",
+        lambda _provider_idempotency_key: (sends.append(None), response)[1],
+        DispatchRetryPolicy(
+            max_attempts=3,
+            max_retry_after_seconds=0,
+            max_total_wait_seconds=0,
+        ),
+        oversleep,
+    )
+
+    assert result.response.status_code == 503
+    assert len(result.attempts) == 1
+    assert sends == [None]
+    assert waits == [0.0]
+    assert ledger.receipts == [("attempt-1", 503, 0)]
+
+
 @pytest.mark.parametrize("max_attempts", [True, 0, 11, 1.5])
 def test_dispatch_retry_policy_rejects_unbounded_or_non_integer_attempts(max_attempts) -> None:
     with pytest.raises(ValueError, match="max_attempts"):

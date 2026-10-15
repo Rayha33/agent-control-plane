@@ -491,6 +491,8 @@ class DispatchRetryPolicy:
     429 is deliberately never retried here: it can mean exhausted provider
     quota, and Retry-After may point beyond a quota reset. A retry is permitted
     only for 500/502/503/504 responses with a bounded Retry-After value.
+    The cumulative wait cap counts both each requested delay and any longer
+    observed delay; an oversleep stops the sequence before another request.
     """
 
     max_attempts: int
@@ -638,7 +640,7 @@ def dispatch_with_retries(
         raise ValueError("idempotency_key must be 1..188 visible token characters")
 
     attempts: list[DispatchResult[ResponseT]] = []
-    total_wait_seconds = 0
+    total_wait_seconds = 0.0
     for attempt_number in range(1, policy.max_attempts + 1):
         try:
             result = dispatch_once(
@@ -671,8 +673,12 @@ def dispatch_with_retries(
             or total_wait_seconds + delay > policy.max_total_wait_seconds
         ):
             break
+        wait_started_at = time.monotonic()
         wait(float(delay))
-        total_wait_seconds += delay
+        observed_wait_seconds = max(0.0, time.monotonic() - wait_started_at)
+        total_wait_seconds += max(float(delay), observed_wait_seconds)
+        if total_wait_seconds > policy.max_total_wait_seconds:
+            break
 
     return DispatchRetryResult(attempts=tuple(attempts))
 
