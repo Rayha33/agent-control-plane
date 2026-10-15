@@ -553,6 +553,18 @@ hardening item. This does not prove launch integration, real-OCI cleanup,
 credential/egress policy, result import, or `run_worker()`; `run_worker()`
 remains fail-closed and #2370 remains open.
 
+Do not add a lazy producer call to `terminate_worker()`: the journal's wrapper
+unit is already identity-bound to the monitor service, and a separate
+supervisor entrypoint that starts after launch would not serialize with the
+payload gate. The safe integration point is the trusted launcher after exact
+scope creation and while holding the existing per-execution launch-gate lock,
+before the durable running transition and one-shot permit release. Startup
+failure must preserve the reservation and resource fences. Likewise, a
+monitor's `exited` status is not the journal's independent `cleanup_verified`
+proof; monitor retirement must follow that verifier and reconcile the exact
+unit activation. These requirements remain open work, not behavior proven by
+this component.
+
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the
 supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)
