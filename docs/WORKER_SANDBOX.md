@@ -585,13 +585,40 @@ Current source-level constraints and deployment evidence:
 | Codex adapter | The repository has no pinned Codex CLI/App Server in this execution path. The current App Server docs describe stdio/Unix socket transports; WebSocket transport is marked experimental/unsupported. | Pin an exact binary/version and protocol schema, then test it inside the proven boundary without a model call. |
 | Authentication | No host Codex config, OAuth file, API key, or Git credential may be mounted into the candidate tree. | Prove a brokered/least-privilege auth path or reject the adapter; no credential material has been tested here. |
 
-Until those versions and isolation tests are available, the architecture decision
-is **NO-GO for production worker integration**. Do not set `externalSandbox`,
-do not mount host credential/config paths, and do not change the fail-closed
-`run_worker()` behavior. Remaining proof includes base/sibling/home/tmp/credential
-denials (including symlink escapes), process-visibility and socket/network
-checks, isolated Git result transfer, crash/cancel cleanup, and exact-head
-Linux CI. The current receipt codec proves none of those controls.
+**Evidence update (2026-10-15).** The primitive-level Linux boundary checks are
+now demonstrated by the opt-in
+[`test_live_rootless_runc_enforces_minimal_worker_boundary`](../tests/test_oci_worker_runtime.py),
+in a disposable Linux guest. The recorded Ubuntu 26.04 replay used test source
+SHA-256 `4942bff7abed3b4e9b65562711cb2c3847b09b766539825f4da9d718a0e34b7c`
+and `oci_worker.py` SHA-256
+`7d68fb55375ab167b73a6cf49ca86a30aa84933d7eb7ed2a9d590dafe78e8236` (PR-42
+snapshot `cedfecdaa59affb19edd68a2d8173be2b1f17b5d` with the test file
+overlaid; detailed receipt below). It audits the exact mount set and rejects
+broad `/etc` or `/usr` mounts; the compiled OCI `process.env` check asserts the
+enumerated credential/config variable names are absent (it is not a runtime
+`/proc/environ` readback). Current `oci_worker.py` also has a subsequent
+optional pre-exec submission callback; this direct probe does not supply it, so
+the callback is outside this live-runtime evidence. The payload cannot read the
+host checkout, sibling attempt, unrelated project, host-home path, synthetic
+config/credential sentinels, or host `/etc` and `/tmp` sentinels; separate
+probes deny writes to the checkout, the image's `/etc`, and host `/tmp`. It
+confirms the host Unix-socket sentinel path is absent. Absolute and relative
+symlink targets cannot be read, and the absolute host-`/tmp` symlink cannot be
+used for a write.
+The probe also checks the worker's namespace-relative `/proc` identity and
+proves loopback-only interfaces plus failure to reach a host-NIC listener. The
+markers are synthetic, not real credentials. This closes those direct-runc
+boundary checks only; it is not an exact-head hosted replay of the live probe
+and does not exercise the registered production worker lifecycle.
+
+The architecture decision remains **NO-GO for production worker integration**.
+Do not set `externalSandbox`, mount host credential/config paths, or change the
+fail-closed `run_worker()` behavior. Still open are a supervisor-owned
+`run_worker()` executor, least-privilege provider authentication and enforced
+provider egress, restart/cancellation recovery, action-bound cleanup proof,
+concurrent-attempt fencing, and validated isolated Git result transfer into
+the existing QC/submission path. Exact-head hosted CI is required for code
+changes, but it does not replace the separate live Linux boundary evidence.
 
 This choice is consistent with systemd's distinct transient service/scope
 lifecycles and unit-level cgroup controls ([`systemd-run(1)`](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html),
