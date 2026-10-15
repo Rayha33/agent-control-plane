@@ -3399,7 +3399,7 @@ provider credential/egress policy, validated result import, or production
 `run_worker()` integration; configured OCI worker execution remains
 fail-closed.
 
-### Rootless worker CONNECT through attempt-scoped proxy socket (2026-10-15; pass)
+### Rootless worker CONNECT and direct-egress denial through attempt-scoped proxy socket (2026-10-15; pass)
 
 The focused opt-in live test passed 1/1 on the disposable Lima guest
 `acp-2370-live-sandbox-20261010`: Ubuntu 26.04.1 ARM64, Linux
@@ -3422,6 +3422,21 @@ UID/GID, and cgroup checks rejected it with HTTP 403 before resolver or dial
 invocation. The recorded resolver/dial call counts contained only the worker's
 single approved CONNECT.
 
+The same live worker reported `Seccomp: 2`. Its `/proc/<pid>/net/route` and
+`ipv6_route` contained no usable route beyond loopback; this kernel emitted an
+IPv6 `::/0` sentinel on `lo` with the UAPI `RTF_REJECT` and `RTF_NONEXTHOP`
+flags, which the test accepts only as an explicit reject route. Before using
+the proxy, the worker attempted to create IPv4 and IPv6 TCP and UDP sockets;
+all four returned the configured `EPERM` and emitted required test markers.
+Blocking both UDP families prevents a direct DNS transport, while blocking TCP
+prevents direct host-loopback/service connections. No direct DNS query or host
+service connection was attempted. Before creating its proxy connection, the C
+probe enumerated `/proc/self/fd` and found no inherited socket descriptors. The
+worker's subsequent AF_UNIX CONNECT exchange succeeded. This demonstrates the
+runtime profile's direct-socket denial and a designated proxy path in this
+fixture; it does not prove the full production "only this capability" gate or
+deny unrelated Unix socket paths that are not mounted into this rootfs.
+
 Both accepted proxy channels remain tracked through teardown. The test's
 finalizer shuts down and closes them, bounded-joins every started handler, and
 fails cleanup if a handler remains alive.
@@ -3431,7 +3446,7 @@ worktree):
 
 | File | SHA-256 |
 | --- | --- |
-| `test_oci_worker_runtime.py` | `a1109a27528082cd860d1831284ef7de1d554b6c0a7e6523dbd5c64b66fa6577` |
+| `test_oci_worker_runtime.py` | `c424eabc8dc23af193a6131c4c415a6724f398af755fa82a8b15fc0db58ed5ea` |
 | `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
 | `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
 

@@ -20,6 +20,7 @@ import errno
 import fcntl
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import select
@@ -96,6 +97,81 @@ def _require_root_owned_file(path: Path, label: str) -> Path:
     ):
         pytest.fail(f"{label} must be a root-owned, non-writable, non-set-id regular file")
     return resolved
+
+
+def _assert_worker_has_no_non_loopback_routes(pid: int) -> None:
+    """Check the live worker network namespace has no route beyond loopback."""
+
+    ipv4_route_path = Path(f"/proc/{pid}/net/route")
+    ipv4_lines = ipv4_route_path.read_text(encoding="ascii").splitlines()
+    expected_ipv4_header = [
+        "Iface",
+        "Destination",
+        "Gateway",
+        "Flags",
+        "RefCnt",
+        "Use",
+        "Metric",
+        "Mask",
+        "MTU",
+        "Window",
+        "IRTT",
+    ]
+    if not ipv4_lines or ipv4_lines[0].split() != expected_ipv4_header:
+        raise AssertionError("worker IPv4 route table header was missing or malformed")
+    ipv4_loopback = ipaddress.ip_network("127.0.0.0/8")
+    for line in ipv4_lines[1:]:
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != len(expected_ipv4_header):
+            raise AssertionError("worker IPv4 route table contained a malformed row")
+        destination = ipaddress.IPv4Address(
+            int.from_bytes(bytes.fromhex(fields[1]), byteorder=sys.byteorder)
+        )
+        gateway = ipaddress.IPv4Address(
+            int.from_bytes(bytes.fromhex(fields[2]), byteorder=sys.byteorder)
+        )
+        netmask = ipaddress.IPv4Address(
+            int.from_bytes(bytes.fromhex(fields[7]), byteorder=sys.byteorder)
+        )
+        network = ipaddress.IPv4Network(f"{destination}/{netmask}", strict=False)
+        flags = int(fields[3], 16)
+        if fields[0] != "lo" or gateway != ipaddress.IPv4Address("0.0.0.0"):
+            raise AssertionError(f"worker IPv4 route escaped loopback: {line!r}")
+        if not flags & 1 or not network.subnet_of(ipv4_loopback):
+            raise AssertionError(f"worker IPv4 route was not active and loopback-only: {line!r}")
+
+    ipv6_route_path = Path(f"/proc/{pid}/net/ipv6_route")
+    ipv6_loopback = ipaddress.ip_network("::1/128")
+    for line in ipv6_route_path.read_text(encoding="ascii").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 10:
+            raise AssertionError("worker IPv6 route table contained a malformed row")
+        destination = ipaddress.IPv6Address(int(fields[0], 16))
+        prefix_length = int(fields[1], 16)
+        if not 0 <= prefix_length <= 128:
+            raise AssertionError("worker IPv6 route had an invalid prefix length")
+        network = ipaddress.IPv6Network(f"{destination}/{prefix_length}", strict=False)
+        next_hop = ipaddress.IPv6Address(int(fields[4], 16))
+        if fields[9] != "lo" or next_hop != ipaddress.IPv6Address("::"):
+            raise AssertionError(f"worker IPv6 route escaped loopback: {line!r}")
+        # Linux may expose an unusable ::/0 reject sentinel on lo when the
+        # isolated namespace has no IPv6 route. RTF_REJECT and RTF_NONEXTHOP
+        # are stable UAPI bits from linux/route.h and linux/ipv6_route.h.
+        route_flags = int(fields[8], 16)
+        reject_default = (
+            network == ipaddress.ip_network("::/0")
+            and bool(route_flags & 0x0200)
+            and bool(route_flags & 0x00200000)
+        )
+        if not network.subnet_of(ipv6_loopback) and not reject_default:
+            raise AssertionError(
+                f"worker IPv6 route was neither loopback nor a kernel reject default: "
+                f"{line!r} ({network})"
+            )
 
 
 def _copy_busybox_closure(
@@ -4117,7 +4193,10 @@ def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
         probe_source = bundle_root / "provider_socket_probe.c"
         probe_source.write_text(
             r"""#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -4133,6 +4212,60 @@ static int write_all(int fd, const char *buffer, size_t length) {
     return 0;
 }
 
+static int require_no_inherited_socket_fds(void) {
+    DIR *directory = opendir("/proc/self/fd");
+    struct dirent *entry;
+    int result = 0;
+
+    if (directory == NULL) return 1;
+    for (;;) {
+        char path[512];
+        char target[128];
+        int path_length;
+        ssize_t target_length;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0) result = 2;
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        path_length = snprintf(path, sizeof(path), "/proc/self/fd/%s", entry->d_name);
+        if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+            result = 3;
+            break;
+        }
+        errno = 0;
+        target_length = readlink(path, target, sizeof(target) - 1);
+        if (target_length < 0) {
+            if (errno == ENOENT) continue;
+            result = 4;
+            break;
+        }
+        target[target_length] = '\0';
+        if (strncmp(target, "socket:[", 8) == 0) {
+            result = 5;
+            break;
+        }
+    }
+    if (closedir(directory) != 0 && result == 0) result = 6;
+    return result;
+}
+
+static int require_seccomp_network_socket_denial(int family, int type) {
+    int fd;
+    errno = 0;
+    fd = socket(family, type, 0);
+    if (fd >= 0) {
+        close(fd);
+        return 1;
+    }
+    return errno == EPERM ? 0 : 2;
+}
+
 int main(int argc, char **argv) {
     static const char request[] =
         "CONNECT api.example.com:443 HTTP/1.1\r\n"
@@ -4140,13 +4273,50 @@ int main(int argc, char **argv) {
     static const char expected_status[] = "HTTP/1.1 200 Connection Established\r\n";
     static const char outbound[] = "client-tls-record";
     static const char inbound[] = "server-tls-record";
+    static const struct {
+        int family;
+        int type;
+        const char *marker;
+    } blocked_network_sockets[] = {
+        {AF_INET, SOCK_STREAM, "DIRECT_IPV4_TCP_DENIED\n"},
+        {AF_INET, SOCK_DGRAM, "DIRECT_DNS_IPV4_UDP_DENIED\n"},
+        {AF_INET6, SOCK_STREAM, "DIRECT_IPV6_TCP_DENIED\n"},
+        {AF_INET6, SOCK_DGRAM, "DIRECT_DNS_IPV6_UDP_DENIED\n"},
+    };
     struct sockaddr_un address = {0};
     char response[512] = {0};
+    size_t probe_index;
     size_t path_length;
     size_t received = 0;
     int fd;
 
     if (argc != 2) return 2;
+    if (require_no_inherited_socket_fds() != 0) {
+        static const char failure[] = "INHERITED_SOCKET_FD_PRESENT_OR_SCAN_FAILED\n";
+        (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
+        return 17;
+    }
+    {
+        static const char marker[] = "NO_INHERITED_SOCKET_FDS\n";
+        if (write_all(STDOUT_FILENO, marker, sizeof(marker) - 1) != 0) return 18;
+    }
+    for (probe_index = 0;
+         probe_index < sizeof(blocked_network_sockets) / sizeof(blocked_network_sockets[0]);
+         probe_index++) {
+        if (require_seccomp_network_socket_denial(
+                blocked_network_sockets[probe_index].family,
+                blocked_network_sockets[probe_index].type) != 0) {
+            static const char failure[] = "NON_UNIX_SOCKET_NOT_DENIED\n";
+            (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
+            return 12 + (int)probe_index;
+        }
+        if (write_all(
+                STDOUT_FILENO,
+                blocked_network_sockets[probe_index].marker,
+                strlen(blocked_network_sockets[probe_index].marker)) != 0) {
+            return 16;
+        }
+    }
     path_length = strlen(argv[1]);
     if (path_length == 0 || path_length >= sizeof(address.sun_path)) return 3;
     address.sun_family = AF_UNIX;
@@ -4474,6 +4644,21 @@ printf 'MOUNT_OPTIONS_OK\n'
         if worker_unified_cgroups != [attempt_cgroup_path]:
             pytest.fail("test receipt cgroup path did not match the worker procfs observation")
 
+        worker_status = Path(f"/proc/{worker_pid}/status").read_text(encoding="ascii")
+        worker_status_fields = {
+            key: value.strip()
+            for key, separator, value in (
+                line.partition(":") for line in worker_status.splitlines()
+            )
+            if separator
+        }
+        if worker_status_fields.get("Seccomp") != "2":
+            pytest.fail("live worker did not report an installed seccomp filter")
+        try:
+            _assert_worker_has_no_non_loopback_routes(worker_pid)
+        except (OSError, ValueError, AssertionError) as error:
+            pytest.fail(f"live worker network namespace had direct egress routes: {error}")
+
         test_receipt = SimpleNamespace(cgroup_path=attempt_cgroup_path)
         monkeypatch.setattr(
             provider_proxy,
@@ -4576,8 +4761,20 @@ printf 'MOUNT_OPTIONS_OK\n'
                 "rootless provider-proxy mount payload failed: "
                 f"exit={returncode}, stdout={stdout[-2048:]!r}, stderr={stderr[-2048:]!r}"
             )
-        if b"MOUNT_OPTIONS_OK\n" not in stdout or b"CONNECT_OK\n" not in stdout:
-            pytest.fail("worker did not confirm read-only mount and successful CONNECT tunnel")
+        required_worker_markers = (
+            b"MOUNT_OPTIONS_OK\n",
+            b"NO_INHERITED_SOCKET_FDS\n",
+            b"DIRECT_IPV4_TCP_DENIED\n",
+            b"DIRECT_DNS_IPV4_UDP_DENIED\n",
+            b"DIRECT_IPV6_TCP_DENIED\n",
+            b"DIRECT_DNS_IPV6_UDP_DENIED\n",
+            b"CONNECT_OK\n",
+        )
+        if any(marker not in stdout for marker in required_worker_markers):
+            pytest.fail(
+                "worker did not confirm seccomp denied direct IP/DNS sockets and the "
+                f"approved CONNECT tunnel: stdout={stdout[-2048:]!r}"
+            )
         for thread in proxy_threads:
             thread.join(timeout=4)
             if thread.is_alive():
