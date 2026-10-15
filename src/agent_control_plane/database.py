@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 10
+SERVICE_SCHEMA_VERSION = 11
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -875,6 +875,56 @@ def _guard_interrupted_task_resume(connection: sqlite3.Connection) -> None:
     )
 
 
+def _park_previously_orphaned_interrupted_tasks(connection: sqlite3.Connection) -> None:
+    """Make pre-migration interrupted orphan rows explicitly recoverable.
+
+    Migration 10 prevents an orphaned interrupted claim from being automatically
+    claimed, while the audited operator reopen path intentionally accepts only
+    ``blocked`` or ``conflicted`` tasks. Older databases may already contain an
+    ``orphaned`` row with a matching client interruption report, so park exactly
+    those rows as blocked before normal service resumes.
+    """
+    rows = connection.execute(
+        """
+        SELECT tasks.id, tasks.claim_fencing_token, tasks.version,
+               report.id AS interruption_report_id
+        FROM tasks
+        JOIN budget_interruption_reports AS report
+          ON report.task_id = tasks.id
+         AND report.claim_fencing_token = tasks.claim_fencing_token
+        WHERE tasks.status = 'orphaned'
+        ORDER BY tasks.id
+        """
+    ).fetchall()
+    for row in rows:
+        changed_at = utc_now()
+        cursor = connection.execute(
+            """
+            UPDATE tasks
+            SET status = 'blocked', owner_agent_id = NULL, claim_expires_at = NULL,
+                version = version + 1, updated_at = ?
+            WHERE id = ? AND status = 'orphaned' AND claim_fencing_token = ?
+            """,
+            (changed_at, row["id"], row["claim_fencing_token"]),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError("interrupted orphan changed during schema migration")
+        _append_audit_event(
+            connection,
+            "task.interruption_migration_parked",
+            "system",
+            {
+                "claim_fencing_token": row["claim_fencing_token"],
+                "from_status": "orphaned",
+                "interruption_report_id": row["interruption_report_id"],
+                "previous_version": row["version"],
+                "schema_version": 11,
+                "task_id": row["id"],
+                "to_status": "blocked",
+            },
+        )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -900,6 +950,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (8, _add_budget_interruption_reports),
     (9, _guard_interrupted_claim_writes),
     (10, _guard_interrupted_task_resume),
+    (11, _park_previously_orphaned_interrupted_tasks),
 )
 
 SCHEMA = """
@@ -1093,6 +1144,43 @@ def event_digest(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _append_audit_event(
+    connection: sqlite3.Connection,
+    event_type: str,
+    actor: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Append one event to the hash chain inside the caller's transaction."""
+    if not connection.in_transaction:
+        raise ValueError("audit connection must already hold a transaction")
+    event_id = str(uuid.uuid4())
+    created_at = utc_now()
+    payload_json = canonical_json(payload)
+    previous = connection.execute(
+        "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    previous_hash = previous["event_hash"] if previous else GENESIS_HASH
+    digest = event_digest(previous_hash, event_id, event_type, actor, payload_json, created_at)
+    cursor = connection.execute(
+        """
+        INSERT INTO audit_events
+            (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, event_type, actor, payload_json, previous_hash, digest, created_at),
+    )
+    return {
+        "sequence": cursor.lastrowid,
+        "event_id": event_id,
+        "event_type": event_type,
+        "actor": actor,
+        "payload": payload,
+        "previous_hash": previous_hash,
+        "event_hash": digest,
+        "created_at": created_at,
+    }
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -1200,54 +1288,11 @@ class Database:
         """
         if connection is not None and not connection.in_transaction:
             raise ValueError("audit connection must already hold a transaction")
-        event_id = str(uuid.uuid4())
-        created_at = utc_now()
-        payload_json = canonical_json(payload)
-
         context = self.connect() if connection is None else nullcontext(connection)
         with context as audit_connection:
             if connection is None:
                 audit_connection.execute("BEGIN IMMEDIATE")
-            previous = audit_connection.execute(
-                "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-            previous_hash = previous["event_hash"] if previous else GENESIS_HASH
-            digest = event_digest(
-                previous_hash,
-                event_id,
-                event_type,
-                actor,
-                payload_json,
-                created_at,
-            )
-            cursor = audit_connection.execute(
-                """
-                INSERT INTO audit_events
-                    (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    event_type,
-                    actor,
-                    payload_json,
-                    previous_hash,
-                    digest,
-                    created_at,
-                ),
-            )
-            sequence = cursor.lastrowid
-
-        return {
-            "sequence": sequence,
-            "event_id": event_id,
-            "event_type": event_type,
-            "actor": actor,
-            "payload": payload,
-            "previous_hash": previous_hash,
-            "event_hash": digest,
-            "created_at": created_at,
-        }
+            return _append_audit_event(audit_connection, event_type, actor, payload)
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.all("SELECT * FROM audit_events ORDER BY sequence DESC LIMIT ?", (limit,))
