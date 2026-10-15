@@ -27,6 +27,33 @@ retaining that gate. No `run_worker` path yet connects launch to the durable
 journal, runtime attestation, cleanup verification, or result import. This
 record does not authorize `externalSandbox` for ACP workers.
 
+## Codex adapter contract (2026-10-15; OpenAI Docs)
+
+OpenAI positions the Codex SDK for automated coding jobs and CI, and the App
+Server for custom clients that need authentication, conversation history,
+approvals, and streamed events. ACP's worker is an automated job, so the SDK is
+the default adapter to evaluate; choosing either interface does not provide
+the per-attempt isolation required here.
+
+The App Server's `sandboxPolicy.type = "externalSandbox"` explicitly tells
+Codex to skip its own sandbox because the server/command is already sandboxed.
+It is a delegation contract, not a sandbox implementation. ACP must put the
+agent process and all descendants inside its independently enforced namespace
+before opting into this mode. The App Server's `networkAccess` value is not
+packet-filter evidence. Likewise, Codex permission-profile domain rules only
+constrain command traffic when the network proxy is enabled; merely setting
+domains does not start that proxy. ACP must enforce and test provider egress at
+the outer boundary, fail closed when that policy is unavailable, and must not
+mount or copy the host's Codex auth/config directory into an attempt.
+
+The documented interface split is in [OpenAI's Codex SDK
+guide](https://learn.chatgpt.com/docs/codex-sdk) and [App Server
+guide](https://learn.chatgpt.com/docs/app-server#command-execution). The
+external-sandbox contract is described under [App Server command
+execution](https://learn.chatgpt.com/docs/app-server#command-execution); the
+network-proxy requirement is in [Agent approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security#network-isolation)
+and [Permissions](https://learn.chatgpt.com/docs/permissions).
+
 **Runtime security requalification (2026-10-10).** The implementation and prior
 live evidence were pinned to runc 1.3.5. Upstream lists `<=1.3.5`, `<=1.4.2`,
 and `<=1.5.0-rc.2` as affected by
@@ -2935,6 +2962,50 @@ integration. The OCI test does not exercise `run_worker`, monitor ownership,
 durable journal transitions, provider authentication, Git/result transfer, or
 supervisor-restart cancellation/recovery. The configured-OCI `run_worker`
 route remains fail-closed, and the broader proof gates above remain open.
+
+### Explicit host-process visibility follow-up (2026-10-15; pass)
+
+The direct-runc no-model fixture now starts a live host-only process with a
+unique command-line marker, verifies the marker through host `/proc` before
+launch, captures the candidate-visible `/proc/*/cmdline` entries inside the
+fresh PID namespace, and has the trusted test harness verify that a known
+in-container process-table control was captured, that the host marker is
+absent, and that the marked host process is still alive with the marker after
+the snapshot. Failed reads of extant `/proc` entries fail the probe; only
+entries that disappear during enumeration are skipped. The marker is not
+passed to the worker. The exact test passed twice (`1 passed` each) on the
+disposable Lima guest `acp-2370-live-sandbox-20261010` after these assertions
+were added, with the latest verbose run reporting `1 passed in 5.71s`:
+Ubuntu 26.04.1 ARM64, Linux `7.0.0-38-generic`, Python 3.14.4, systemd 259.5,
+cgroup v2, rootless runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+audited toolchain was Ubuntu BusyBox 1.37.0 from package
+`1:1.37.0-7ubuntu1` (package SHA-256
+`ce7930cba8ab534f67e64229287863ba6c8f35a28831b5d6a8b2a5b81bdc480d`); the
+fixture copied only its executable and resolved loader/library closure into
+the private rootfs.
+
+Exact hashes for the exercised source are:
+
+| File | SHA-256 |
+| --- | --- |
+| `tests/test_oci_worker_runtime.py` | `61819e11e66d24cd3540cf113cd8475a3dce44c43b641cf7a74b50862a03f861` |
+| `src/agent_control_plane/supervisor/oci_worker.py` | `bcd015a23f3bbd0293d6d8fc864f31e5add53bfad33c592588c3f6ce1191a90d` |
+| `src/agent_control_plane/supervisor/sandbox_attestation.py` | `f842834dfd47ac1bd124c36604e8124fc9f9b8e747128bc4cd6671d7f4afa9f0` |
+| `src/agent_control_plane/supervisor/sandbox_workspace.py` | `793ab9000dadd310af81867395f476bb69e7cb2e64d923f1b542277c992ce188` |
+| `src/agent_control_plane/runtime_drivers.py` | `ade6bbbec9bfdaaf3043a46e9957dba7692afd29421d3ebe9c1e70b62621c46c` |
+
+For this disposable guest only, rootless user-namespace creation required
+temporarily setting `kernel.apparmor_restrict_unprivileged_userns` from `1` to
+`0`; an exit/signal restore trap was installed first, and postflight confirmed
+the value returned to `1`. No AppArmor profile was applied, so this is not
+AppArmor-confinement evidence. The systemd user manager remained running, and
+postflight found no ACP test units, attempt fixture roots, or host marker
+process. No model, provider credential, paid inference, or NAS host was used.
+This adds explicit process-visibility evidence to the primitive-level probe
+only: it does not exercise `run_worker()`, monitor-owned cleanup, provider
+authentication/egress, crash recovery, or result import; configured OCI worker
+execution remains fail-closed.
 
 ### systemd credential handoff primitive (2026-10-11; opt-in proof only)
 

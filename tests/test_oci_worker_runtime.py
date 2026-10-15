@@ -2453,6 +2453,17 @@ if /bin/busybox cat /workspace/relative-host-tmp > /workspace/relative-link.txt;
 if /bin/busybox touch /workspace/absolute-host-tmp; then exit 44; fi
 if /bin/busybox touch {q["checkout_write"]}; then exit 45; fi
 
+# Capture candidate-visible process command lines; the host checks a unique
+# marker that exists only in a still-running process outside this PID namespace.
+: > /workspace/process-table.bin
+for process_cmdline in /proc/[0-9]*/cmdline; do
+  if /bin/busybox cat "$process_cmdline" >> /workspace/process-table.bin 2>/dev/null; then
+    printf '\\0' >> /workspace/process-table.bin
+  elif [ -e "$process_cmdline" ]; then
+    exit 55
+  fi
+done
+
 # No host network interface/default route, no inherited socket descriptor, and
 # no connection to a test-owned listener on the host's selected NIC address.
 interfaces=$(/bin/busybox sed -n '3,$s/^[[:space:]]*\\([^:]*\\):.*/\\1/p' /proc/net/dev | /bin/busybox tr -d '[:space:]')
@@ -2719,6 +2730,8 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
     listener: socket.socket | None = None
     unix_socket_listener: socket.socket | None = None
     host_unix_socket_identity: tuple[int, int] | None = None
+    host_process_marker = f"acp-host-proc-{uuid.uuid4().hex}"
+    host_process_sentinel: subprocess.Popen[bytes] | None = None
     opened_runc_descriptor: int | None = None
     runc_descriptor: int | None = None
     run_handle: oci_worker.RuncLaunchHandle | None = None
@@ -2781,6 +2794,25 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.geteuid():
             pytest.fail("host Unix-socket sentinel is not a test-owned socket")
         unix_socket_listener.listen(1)
+
+        host_process_sentinel = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, time; parent = os.getppid();\nwhile os.getppid() == parent: time.sleep(0.1)",
+                host_process_marker,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        host_process_cmdline = Path(f"/proc/{host_process_sentinel.pid}/cmdline").read_bytes()
+        if (
+            host_process_sentinel.poll() is not None
+            or host_process_marker.encode("ascii") not in host_process_cmdline
+        ):
+            pytest.fail("unique host process marker is not visible in its host cmdline")
 
         opened_runc_descriptor = oci_worker._open_verified_runc_executable(pin)
         runc_descriptor = fcntl.fcntl(opened_runc_descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
@@ -3327,6 +3359,18 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         result_fields = dict(line.split("=", 1) for line in result.splitlines())
         assert int(result_fields["network_probe_rc"]) != 0
         assert result_fields["interfaces"] == "lo"
+        process_table = (workspace / "process-table.bin").read_bytes()
+        assert b"fd-audit-ready" in process_table
+        assert host_process_marker.encode("ascii") not in process_table
+        assert host_process_sentinel is not None
+        if host_process_sentinel.poll() is not None:
+            pytest.fail("host process visibility sentinel exited before the namespace snapshot")
+        try:
+            host_process_cmdline = Path(f"/proc/{host_process_sentinel.pid}/cmdline").read_bytes()
+        except OSError as exc:
+            pytest.fail(f"host process sentinel disappeared after namespace snapshot: {exc}")
+        if host_process_marker.encode("ascii") not in host_process_cmdline:
+            pytest.fail("host process marker disappeared before namespace snapshot verification")
         if apparmor_profile is not None:
             assert result_fields["worker_apparmor"] == f"{apparmor_profile} (enforce)"
             assert (workspace / "userns-denial.txt").is_file()
@@ -3395,6 +3439,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                     ],
                     "systemd_unit": systemd_unit,
                     "isolation_result": result.strip(),
+                    "process_visibility": "unique live host-process marker absent from worker /proc",
                     "host_paths_denied": [
                         "source checkout",
                         "sibling attempt",
@@ -3404,6 +3449,7 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
                         "host /etc/os-release",
                         "host /tmp sentinel",
                         "host /tmp Unix-socket sentinel",
+                        "host process visibility via a unique live cmdline marker",
                         "absolute and relative symlink targets",
                     ],
                     "checkout_write_probe": "unique test-owned canary; removed during teardown",
@@ -3889,6 +3935,24 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             )
             if os.path.lexists(host_unix_socket):
                 cleanup_errors.append("host Unix-socket sentinel remained after cleanup")
+        if host_process_sentinel is not None:
+
+            def stop_host_process_sentinel() -> None:
+                if host_process_sentinel.poll() is None:
+                    host_process_sentinel.terminate()
+                    try:
+                        host_process_sentinel.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        host_process_sentinel.kill()
+                        host_process_sentinel.wait(timeout=3)
+                if host_process_sentinel.poll() is None:
+                    raise AssertionError("host process visibility sentinel survived cleanup")
+
+            _attempt_cleanup(
+                cleanup_errors,
+                "could not stop and reap host process visibility sentinel",
+                stop_host_process_sentinel,
+            )
         close_fd(
             "could not close pinned runc descriptor",
             runc_descriptor if runc_descriptor is not None else -1,
