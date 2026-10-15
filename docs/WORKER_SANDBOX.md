@@ -3399,13 +3399,14 @@ provider credential/egress policy, validated result import, or production
 `run_worker()` integration; configured OCI worker execution remains
 fail-closed.
 
-### Rootless worker CONNECT and direct-egress denial through attempt-scoped proxy socket (2026-10-15; pass)
+### Rootless worker CONNECT, direct-egress denial, and hidden host Unix socket (2026-10-15; pass)
 
 The focused opt-in live test passed 1/1 on the disposable Lima guest
 `acp-2370-live-sandbox-20261010`: Ubuntu 26.04.1 ARM64, Linux
 `7.0.0-38-generic`, systemd 259.5, Python 3.14.4, pytest 9.1.1, cgroup v2,
-and rootless runc 1.5.2. The runc executable was the preinstalled
-root-owned `/usr/local/bin/runc-1.5.2` release binary with SHA-256
+and rootless runc 1.5.2. The full opt-in `tests/test_oci_worker_runtime.py`
+module passed **48/48** on the same test source in 11.11s. The runc executable
+was the preinstalled root-owned `/usr/local/bin/runc-1.5.2` release binary with SHA-256
 `d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
 
 The worker connected to the attempt's mode-0600 Unix proxy socket through a
@@ -3432,10 +3433,19 @@ Blocking both UDP families prevents a direct DNS transport, while blocking TCP
 prevents direct host-loopback/service connections. No direct DNS query or host
 service connection was attempted. Before creating its proxy connection, the C
 probe enumerated `/proc/self/fd` and found no inherited socket descriptors. The
-worker's subsequent AF_UNIX CONNECT exchange succeeded. This demonstrates the
-runtime profile's direct-socket denial and a designated proxy path in this
-fixture; it does not prove the full production "only this capability" gate or
-deny unrelated Unix socket paths that are not mounted into this rootfs.
+worker's subsequent AF_UNIX CONNECT exchange succeeded. A separate live,
+mode-0600 host Unix socket was created outside the only bind-mounted socket
+directory; a host control client connected to it successfully. Inside the
+worker, the same absolute path was checked with `lstat` and `connect`; both
+returned `ENOENT` because the worker's private `/tmp` tmpfs did not expose that
+host path. The probe then completed the designated proxy CONNECT. This proves
+that this exact fixture hides an active, unmounted host socket while allowing
+the approved path. It does not prove AF_UNIX is denied (it is intentionally
+permitted for the proxy), that a future executor cannot expose another socket
+by mounting it, or the full production "only this capability" gate. This is a
+single-tenant test: its private host fixture paths and path-based teardown
+assume no concurrent same-host-UID process mutates those paths. Hostile same-UID
+filesystem isolation is not established.
 
 Both accepted proxy channels remain tracked through teardown. The test's
 finalizer shuts down and closes them, bounded-joins every started handler, and
@@ -3446,16 +3456,16 @@ worktree):
 
 | File | SHA-256 |
 | --- | --- |
-| `test_oci_worker_runtime.py` | `c424eabc8dc23af193a6131c4c415a6724f398af755fa82a8b15fc0db58ed5ea` |
+| `test_oci_worker_runtime.py` | `c74906a0e78ba3d34a1379eae1d52921cc26914450fe36fecdd52d09ebc1aaab` |
 | `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
 | `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
 
 The guest's `kernel.apparmor_restrict_unprivileged_userns` value was 1 before
 the run; it was set to 0 only for this disposable test and restored by an exit
-trap. Postflight confirmed the value was 1 again, no ACP units or runc process
-remained, no attempt root or provider socket remained, and there were no
-D-state processes. This does not prove AppArmor confinement. No real provider
-credential, provider endpoint, TLS session, model inference, or paid call was
+trap. Postflight confirmed the value was 1 again, no matching ACP units or live
+probe processes remained, and there were no attempt roots, host proxy sockets,
+or host-only socket fixtures. This does not prove AppArmor confinement. No real
+provider credential, endpoint, TLS session, model inference, or paid call was
 used. The collector-issued receipt predicates were replaced with a test-only
 receipt; process identity, peer PIDFD, UID/GID, and exact cgroup checks were
 real. This proves the live worker-to-socket CONNECT path and its same-UID peer

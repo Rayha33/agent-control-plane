@@ -4157,8 +4157,15 @@ def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
     state_root = attempt_root / "runc-state"
     socket_dir = Path("/tmp") / f"acp-proxy-{uuid.uuid4().hex[:20]}"
     socket_path = socket_dir / "provider.sock"
+    unmounted_socket_dir = Path("/tmp") / f"acp-host-only-{uuid.uuid4().hex[:20]}"
+    unmounted_socket_path = unmounted_socket_dir / "host-only.sock"
     socket_dir_identity: tuple[int, int] | None = None
+    unmounted_socket_dir_identity: tuple[int, int] | None = None
+    unmounted_socket_identity: tuple[int, int] | None = None
     listener: provider_proxy.AttemptProviderProxyListener | None = None
+    unmounted_listener: socket.socket | None = None
+    unmounted_client: socket.socket | None = None
+    unmounted_control_peer: socket.socket | None = None
     worker_channel: socket.socket | None = None
     outside_channel: socket.socket | None = None
     outside_client: socket.socket | None = None
@@ -4199,6 +4206,7 @@ def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -4266,6 +4274,30 @@ static int require_seccomp_network_socket_denial(int family, int type) {
     return errno == EPERM ? 0 : 2;
 }
 
+static int require_unmounted_host_unix_socket_is_invisible(const char *path) {
+    struct sockaddr_un address = {0};
+    struct stat info;
+    size_t path_length = strlen(path);
+    int fd;
+    int connect_error;
+
+    if (path_length == 0 || path_length >= sizeof(address.sun_path)) return 1;
+    if (lstat(path, &info) == 0) return 2;
+    if (errno != ENOENT) return 3;
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, path_length + 1);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 4;
+    if (connect(fd, (struct sockaddr *)&address,
+                offsetof(struct sockaddr_un, sun_path) + path_length + 1) == 0) {
+        close(fd);
+        return 5;
+    }
+    connect_error = errno;
+    if (close(fd) != 0) return 6;
+    return connect_error == ENOENT ? 0 : 7;
+}
+
 int main(int argc, char **argv) {
     static const char request[] =
         "CONNECT api.example.com:443 HTTP/1.1\r\n"
@@ -4290,7 +4322,7 @@ int main(int argc, char **argv) {
     size_t received = 0;
     int fd;
 
-    if (argc != 2) return 2;
+    if (argc != 3) return 2;
     if (require_no_inherited_socket_fds() != 0) {
         static const char failure[] = "INHERITED_SOCKET_FD_PRESENT_OR_SCAN_FAILED\n";
         (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
@@ -4316,6 +4348,16 @@ int main(int argc, char **argv) {
                 strlen(blocked_network_sockets[probe_index].marker)) != 0) {
             return 16;
         }
+    }
+    if (require_unmounted_host_unix_socket_is_invisible(argv[2]) != 0) {
+        static const char failure[] =
+            "UNMOUNTED_HOST_UNIX_SOCKET_VISIBLE_OR_UNEXPECTED_ERROR\n";
+        (void)write_all(STDERR_FILENO, failure, sizeof(failure) - 1);
+        return 20;
+    }
+    {
+        static const char marker[] = "UNMOUNTED_HOST_UNIX_SOCKET_NOT_VISIBLE\n";
+        if (write_all(STDOUT_FILENO, marker, sizeof(marker) - 1) != 0) return 21;
     }
     path_length = strlen(argv[1]);
     if (path_length == 0 || path_length >= sizeof(address.sun_path)) return 3;
@@ -4418,6 +4460,33 @@ int main(int argc, char **argv) {
         ):
             pytest.fail("provider socket is not a test-owned mode-0600 Unix socket")
 
+        if os.path.lexists(unmounted_socket_dir):
+            pytest.fail("unique unmounted host-socket directory collided")
+        unmounted_socket_dir.mkdir(mode=0o700)
+        unmounted_socket_dir.chmod(0o700)
+        unmounted_dir_info = unmounted_socket_dir.lstat()
+        unmounted_socket_dir_identity = (unmounted_dir_info.st_dev, unmounted_dir_info.st_ino)
+        unmounted_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        unmounted_listener.bind(str(unmounted_socket_path))
+        unmounted_socket_path.chmod(0o600)
+        unmounted_listener.listen(1)
+        unmounted_info = unmounted_socket_path.lstat()
+        unmounted_socket_identity = (unmounted_info.st_dev, unmounted_info.st_ino)
+        if (
+            not stat.S_ISSOCK(unmounted_info.st_mode)
+            or unmounted_info.st_uid != os.geteuid()
+            or stat.S_IMODE(unmounted_info.st_mode) != 0o600
+        ):
+            pytest.fail("unmounted host-socket control is not a test-owned mode-0600 socket")
+        unmounted_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        unmounted_client.settimeout(4)
+        unmounted_client.connect(str(unmounted_socket_path))
+        unmounted_control_peer, _unmounted_control_address = unmounted_listener.accept()
+        unmounted_control_peer.close()
+        unmounted_control_peer = None
+        unmounted_client.close()
+        unmounted_client = None
+
         target_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target_listener.bind(("127.0.0.1", 0))
         target_listener.listen(1)
@@ -4449,6 +4518,8 @@ int main(int argc, char **argv) {
 
         script = r"""
 set -eu
+provider_socket_path=$1
+unmounted_host_socket_path=$2
 mount_line=$(/bin/busybox grep ' /run/acp ' /proc/self/mountinfo)
 set -- $mount_line
 mount_options=$6
@@ -4465,7 +4536,7 @@ done
 if /bin/busybox touch /run/acp/worker-created >/dev/null 2>&1; then exit 63; fi
 if /bin/busybox rm -f /run/acp/provider.sock >/dev/null 2>&1; then exit 64; fi
 printf 'MOUNT_OPTIONS_OK\n'
-/bin/provider-socket-probe /run/acp/provider.sock || exit 65
+/bin/provider-socket-probe "$provider_socket_path" "$unmounted_host_socket_path" || exit 65
 """
         config = {
             "ociVersion": "1.2.0",
@@ -4474,7 +4545,14 @@ printf 'MOUNT_OPTIONS_OK\n'
             "process": {
                 "terminal": False,
                 "user": {"uid": 0, "gid": 0, "additionalGids": []},
-                "args": ["/bin/sh", "-c", script],
+                "args": [
+                    "/bin/sh",
+                    "-c",
+                    script,
+                    "provider-proxy-probe",
+                    "/run/acp/provider.sock",
+                    str(unmounted_socket_path),
+                ],
                 "env": ["PATH=/bin", "HOME=/", "LANG=C", "LC_ALL=C", "TMPDIR=/tmp"],
                 "cwd": "/",
                 "noNewPrivileges": True,
@@ -4768,6 +4846,7 @@ printf 'MOUNT_OPTIONS_OK\n'
             b"DIRECT_DNS_IPV4_UDP_DENIED\n",
             b"DIRECT_IPV6_TCP_DENIED\n",
             b"DIRECT_DNS_IPV6_UDP_DENIED\n",
+            b"UNMOUNTED_HOST_UNIX_SOCKET_NOT_VISIBLE\n",
             b"CONNECT_OK\n",
         )
         if any(marker not in stdout for marker in required_worker_markers):
@@ -4796,11 +4875,33 @@ printf 'MOUNT_OPTIONS_OK\n'
             pytest.fail("worker changed the host provider socket path or inode")
         if [entry.name for entry in socket_dir.iterdir()] != ["provider.sock"]:
             pytest.fail("worker created or removed an entry in the host provider directory")
+        unmounted_info_after = unmounted_socket_path.lstat()
+        if (
+            not stat.S_ISSOCK(unmounted_info_after.st_mode)
+            or (unmounted_info_after.st_dev, unmounted_info_after.st_ino)
+            != unmounted_socket_identity
+        ):
+            pytest.fail("worker changed the unmounted host-only socket fixture")
     finally:
         if target_connection is not None:
             target_connection.close()
         if target_listener is not None:
             target_listener.close()
+        if unmounted_listener is not None:
+            try:
+                unmounted_listener.close()
+            except OSError as error:
+                cleanup_errors.append(f"could not close unmounted host-only listener: {error}")
+        if unmounted_client is not None:
+            try:
+                unmounted_client.close()
+            except OSError as error:
+                cleanup_errors.append(f"could not close unmounted host-only client: {error}")
+        if unmounted_control_peer is not None:
+            try:
+                unmounted_control_peer.close()
+            except OSError as error:
+                cleanup_errors.append(f"could not close unmounted host-only accepted peer: {error}")
         if outside_channel is not None:
             outside_channel.close()
         if outside_client is not None:
@@ -4905,6 +5006,41 @@ printf 'MOUNT_OPTIONS_OK\n'
                 cleanup_errors.append(f"could not remove exact provider socket fixture: {error}")
         elif os.path.lexists(socket_dir):
             cleanup_errors.append(f"provider socket fixture preserved for inspection: {socket_dir}")
+
+        if not cleanup_errors and os.path.lexists(unmounted_socket_dir):
+            try:
+                current_dir = unmounted_socket_dir.lstat()
+                if (
+                    not stat.S_ISDIR(current_dir.st_mode)
+                    or (current_dir.st_dev, current_dir.st_ino) != unmounted_socket_dir_identity
+                    or current_dir.st_uid != os.geteuid()
+                    or stat.S_IMODE(current_dir.st_mode) != 0o700
+                ):
+                    raise AssertionError("unmounted host-only socket directory identity changed")
+                if os.path.lexists(unmounted_socket_path):
+                    current_socket = unmounted_socket_path.lstat()
+                    if (
+                        not stat.S_ISSOCK(current_socket.st_mode)
+                        or (current_socket.st_dev, current_socket.st_ino)
+                        != unmounted_socket_identity
+                        or current_socket.st_uid != os.geteuid()
+                        or stat.S_IMODE(current_socket.st_mode) != 0o600
+                    ):
+                        raise AssertionError("unmounted host-only socket identity changed")
+                    unmounted_socket_path.unlink()
+                if list(unmounted_socket_dir.iterdir()):
+                    raise AssertionError("unmounted host-only socket directory was not empty")
+                unmounted_socket_dir.rmdir()
+                if os.path.lexists(unmounted_socket_dir):
+                    raise AssertionError("unmounted host-only socket directory remained")
+            except Exception as error:
+                cleanup_errors.append(
+                    f"could not remove unmounted host-only socket fixture: {error}"
+                )
+        elif os.path.lexists(unmounted_socket_dir):
+            cleanup_errors.append(
+                f"unmounted host-only socket fixture preserved for inspection: {unmounted_socket_dir}"
+            )
 
         if not cleanup_errors and attempt_root.exists():
             try:
