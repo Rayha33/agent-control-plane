@@ -23,7 +23,7 @@ import struct
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .sandbox_monitor_receipt import (
@@ -41,6 +41,9 @@ _MAX_REQUESTS = 256
 _CONTROL_KEY_BYTES = 32
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SOCKET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,72}\.sock\Z")
+_SCOPE_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.scope\Z")
+_INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_SCOPE_STATUS_FIELDS = frozenset({"scope_unit", "scope_invocation_id", "scope_control_group"})
 _PHASES = frozenset(
     {"reserved", "launched", "running", "stopping", "exited", "cleanup_verified", "unknown"}
 )
@@ -214,6 +217,7 @@ def _validate_status_payload(value: Any) -> dict[str, Any]:
         "worker_pid",
         "worker_exit_code",
         "cleanup_verified",
+        *_SCOPE_STATUS_FIELDS,
     }:
         raise SandboxMonitorIPCError("monitor status has an unsupported shape")
     phase = value.get("phase")
@@ -234,6 +238,33 @@ def _validate_status_payload(value: Any) -> dict[str, Any]:
         if type(value["cleanup_verified"]) is not bool:
             raise SandboxMonitorIPCError("monitor cleanup status is invalid")
         result["cleanup_verified"] = value["cleanup_verified"]
+    present_scope_fields = _SCOPE_STATUS_FIELDS.intersection(value)
+    if present_scope_fields and present_scope_fields != _SCOPE_STATUS_FIELDS:
+        raise SandboxMonitorIPCError("monitor scope identity is incomplete")
+    if present_scope_fields:
+        scope_unit = value["scope_unit"]
+        invocation_id = value["scope_invocation_id"]
+        control_group = value["scope_control_group"]
+        path = PurePosixPath(control_group) if isinstance(control_group, str) else None
+        if (
+            not isinstance(scope_unit, str)
+            or _SCOPE_UNIT.fullmatch(scope_unit) is None
+            or not isinstance(invocation_id, str)
+            or _INVOCATION_ID.fullmatch(invocation_id) is None
+            or path is None
+            or not path.is_absolute()
+            or path.as_posix() != control_group
+            or any(part in {".", ".."} for part in path.parts)
+            or path.name != scope_unit
+        ):
+            raise SandboxMonitorIPCError("monitor scope identity is invalid")
+        result.update(
+            {
+                "scope_unit": scope_unit,
+                "scope_invocation_id": invocation_id,
+                "scope_control_group": control_group,
+            }
+        )
     if len(_canonical_json(result)) > _MAX_STATUS_BYTES:
         raise SandboxMonitorIPCError("monitor status exceeds its response bound")
     return result

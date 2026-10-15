@@ -58,6 +58,115 @@ def _worker_command_digest(command: Sequence[str]) -> str:
 class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
 
+    def _cancel_sandbox_execution_monitor(self, execution: dict[str, Any]) -> dict[str, Any]:
+        """Cancel a journaled execution only through its authenticated monitor."""
+
+        from .sandbox_monitor_ipc import SandboxMonitorIPCError
+        from .sandbox_monitor_lifecycle import (
+            reconnect_sandbox_monitor,
+            sandbox_monitor_cancel_request_id,
+            sandbox_monitor_control_paths,
+        )
+        from .sandbox_monitor_receipt import SandboxMonitorReceiptError
+
+        identity = (
+            execution["attempt_id"],
+            execution["claim_token"],
+            execution["execution_id"],
+        )
+        expected_scope = {
+            "scope_unit": execution.get("scope_unit"),
+            "scope_invocation_id": execution.get("scope_invocation_id"),
+            "scope_control_group": execution.get("cgroup_path"),
+        }
+        if any(not isinstance(value, str) or not value for value in expected_scope.values()):
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "durable scope identity is unavailable; execution and resource fences remain held",
+            )
+        try:
+            control_directory, receipt_path, socket_path = sandbox_monitor_control_paths(
+                state_path=execution["state_path"], expected_identity=identity
+            )
+            client = reconnect_sandbox_monitor(
+                receipt_path=receipt_path,
+                control_directory=control_directory,
+                socket_path=socket_path,
+                expected_identity=identity,
+            )
+            status = client.status()
+            if status.outcome != "ok":
+                raise SupervisorError(
+                    "sandbox_execution_monitor_ambiguous",
+                    "monitor status is ambiguous; execution and resource fences remain held",
+                )
+            if any(status.payload.get(key) != value for key, value in expected_scope.items()):
+                raise SupervisorError(
+                    "sandbox_execution_monitor_identity_mismatch",
+                    "monitor status does not match the journaled scope; execution and resource fences remain held",
+                )
+            phase = status.payload.get("phase")
+            if phase not in {
+                "reserved",
+                "launched",
+                "running",
+                "stopping",
+                "exited",
+                "cleanup_verified",
+            }:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_ambiguous",
+                    "monitor returned an unknown phase; execution and resource fences remain held",
+                )
+            if phase in {"exited", "cleanup_verified"}:
+                # An exit report does not satisfy the journal's independent
+                # cleanup verifier. Do not alter the durable execution phase.
+                return {
+                    "attempt_id": execution["attempt_id"],
+                    "execution_id": execution["execution_id"],
+                    "outcome": "ok",
+                    "phase": phase,
+                }
+            cancelled = client.cancel(sandbox_monitor_cancel_request_id(identity))
+        except SupervisorError as error:
+            if error.code in {
+                "sandbox_execution_monitor_ambiguous",
+                "sandbox_execution_monitor_identity_mismatch",
+            }:
+                raise
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "authenticated monitor control is unavailable; refusing host-PID signaling and retaining execution fences",
+            ) from error
+        except (SandboxMonitorIPCError, SandboxMonitorReceiptError, OSError, TimeoutError) as error:
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "authenticated monitor control is unavailable; refusing host-PID signaling and retaining execution fences",
+            ) from error
+        except Exception as error:
+            # The monitor is an authorization boundary. Unexpected failure is
+            # not permission to fall back to a PID, process group, or systemctl
+            # action in the supervisor.
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "authenticated monitor control failed; refusing host-PID signaling and retaining execution fences",
+            ) from error
+
+        if cancelled.outcome != "ok" or cancelled.payload.get("phase") not in {
+            "stopping",
+            "exited",
+        }:
+            raise SupervisorError(
+                "sandbox_execution_monitor_ambiguous",
+                "monitor cancellation is ambiguous; execution and resource fences remain held",
+            )
+        return {
+            "attempt_id": execution["attempt_id"],
+            "execution_id": execution["execution_id"],
+            "outcome": "ok",
+            "phase": cancelled.payload["phase"],
+        }
+
     def run_worker(
         self,
         attempt_id: str,
@@ -824,16 +933,13 @@ class WorkersMixin:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             self._authenticate_attempt(connection, row, credential)
             attempt = self._attempt_view(connection, row)
-        # A sandbox execution is stopped only through its monitor-owned
-        # lifecycle. Until the supervisor can reconnect to that monitor, do
-        # not let this legacy PID-only endpoint signal the host process that
-        # happens to be registered on the attempt (including a stale/reused
-        # PID after restart).
-        if self._sandbox_execution_get(attempt_id) is not None:
-            raise SupervisorError(
-                "sandbox_execution_monitor_unavailable",
-                "sandbox attempt termination requires the unavailable monitor-owned control path; refusing direct PID signaling",
-            )
+        # A sandbox execution is stopped only by its exact authenticated
+        # systemd-owned monitor. Reconnection checks the fenced identity before
+        # reading the existing key or contacting the socket; any failure keeps
+        # the execution fenced and never reaches the legacy PID path.
+        execution = self._sandbox_execution_get(attempt_id)
+        if execution is not None:
+            return self._cancel_sandbox_execution_monitor(execution)
         if not attempt["pid"]:
             raise SupervisorError("worker_not_running", "attempt has no running worker")
         if attempt["pid"] < 0:

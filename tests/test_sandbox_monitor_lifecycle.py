@@ -16,7 +16,13 @@ import agent_control_plane.supervisor.sandbox_monitor_lifecycle as lifecycle
 from agent_control_plane.supervisor.sandbox_monitor_ipc import (
     SandboxMonitorControlClient,
     SandboxMonitorControlServer,
+    SandboxMonitorIPCError,
     _linux_process_identity,
+    _validate_status_payload,
+)
+from agent_control_plane.supervisor.sandbox_monitor_lifecycle import (
+    sandbox_monitor_cancel_request_id,
+    sandbox_monitor_control_paths,
 )
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
@@ -171,7 +177,9 @@ def test_reconnect_adopts_only_existing_key_after_systemd_reconciliation(
     receipt = _receipt()
     with _private_control_dir() as directory:
         receipt_path = directory / "monitor-receipt.json"
-        socket_path = directory / "monitor.sock"
+        socket_directory = directory / "runtime"
+        socket_directory.mkdir(mode=0o700)
+        socket_path = socket_directory / "monitor.sock"
         write_sandbox_monitor_receipt(receipt_path, receipt)
         key = load_or_create_sandbox_monitor_control_key(
             directory,
@@ -194,6 +202,76 @@ def test_reconnect_adopts_only_existing_key_after_systemd_reconciliation(
             assert len(calls) == 3
         finally:
             listener.close()
+
+
+def test_execution_control_paths_are_deterministic_and_socket_is_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_directory = Path("/run/user/1000")
+    state_path = tmp_path / "state"
+    identity = ("attempt-paths", 17, "a" * 32)
+    monkeypatch.setattr(
+        lifecycle,
+        "_trusted_systemd_command_environment",
+        lambda: {"XDG_RUNTIME_DIR": str(runtime_directory)},
+    )
+
+    first = sandbox_monitor_control_paths(state_path=state_path, expected_identity=identity)
+    second = sandbox_monitor_control_paths(state_path=state_path, expected_identity=identity)
+    assert first == second
+    control_directory, receipt_path, socket_path = first
+    assert control_directory == state_path / "monitor"
+    assert receipt_path == control_directory / "monitor-receipt.json"
+    assert socket_path.parent == runtime_directory
+    assert socket_path.name.startswith("acpmon-")
+    assert len(os.fsencode(socket_path)) < 108
+    assert sandbox_monitor_cancel_request_id(identity) == sandbox_monitor_cancel_request_id(
+        identity
+    )
+    assert sandbox_monitor_cancel_request_id(identity) != sandbox_monitor_cancel_request_id(
+        (identity[0], identity[1] + 1, identity[2])
+    )
+
+
+def test_monitor_status_payload_binds_exact_scope_identity() -> None:
+    scope = {
+        "scope_unit": "acp-scope-test.scope",
+        "scope_invocation_id": "a" * 32,
+        "scope_control_group": "/user.slice/user-1000.slice/acp-scope-test.scope",
+    }
+    assert _validate_status_payload({"phase": "running", **scope}) == {
+        "phase": "running",
+        **scope,
+    }
+    with pytest.raises(SandboxMonitorIPCError, match="incomplete"):
+        _validate_status_payload({"phase": "running", "scope_unit": scope["scope_unit"]})
+    with pytest.raises(SandboxMonitorIPCError, match="invalid"):
+        _validate_status_payload(
+            {"phase": "running", **{**scope, "scope_control_group": "/other/wrong.scope"}}
+        )
+
+
+def test_reconnect_rejects_non_private_socket_parent_before_systemd_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = _receipt()
+    with _private_control_dir() as directory:
+        receipt_path = directory / "monitor-receipt.json"
+        socket_directory = directory / "runtime"
+        socket_directory.mkdir(mode=0o755)
+        socket_directory.chmod(0o755)
+        socket_path = socket_directory / "monitor.sock"
+        write_sandbox_monitor_receipt(receipt_path, receipt)
+        calls = _install_systemd_observers(monkeypatch, receipt, _properties(receipt))
+
+        with pytest.raises(SandboxMonitorReceiptError, match="socket parent"):
+            lifecycle.reconnect_sandbox_monitor(
+                receipt_path=receipt_path,
+                control_directory=directory,
+                socket_path=socket_path,
+                expected_identity=(receipt.attempt_id, receipt.claim_token, receipt.execution_id),
+            )
+        assert calls == []
 
 
 @pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="monitor IPC requires Linux")

@@ -26,6 +26,7 @@ from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker
 from agent_control_plane.supervisor import sandbox_attestation as sandbox_attestation_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
+from agent_control_plane.supervisor import sandbox_monitor_lifecycle as monitor_lifecycle_module
 from agent_control_plane.supervisor import workers as workers_module
 from agent_control_plane.supervisor.common import canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
@@ -2959,6 +2960,178 @@ def test_journaled_sandbox_termination_never_opens_registered_host_pid(
     monkeypatch.setattr(supervisor, "_attempt_view", attempt_view)
     assert supervisor.attempt(attempt["id"])["pid"] is None
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+
+def test_journaled_sandbox_termination_reuses_identity_bound_monitor_cancel_id(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    record_launch(supervisor, attempt, runc_handle=handle)
+    execution_with_scope = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution_with_scope is not None
+    cancel_ids: list[str] = []
+    reconnect_calls: list[dict[str, object]] = []
+
+    client = SimpleNamespace(
+        status=lambda: SimpleNamespace(
+            outcome="ok",
+            payload={
+                "phase": "running",
+                "scope_unit": execution_with_scope["scope_unit"],
+                "scope_invocation_id": execution_with_scope["scope_invocation_id"],
+                "scope_control_group": execution_with_scope["cgroup_path"],
+            },
+        ),
+        cancel=lambda request_id: (
+            cancel_ids.append(request_id)
+            or SimpleNamespace(outcome="ok", payload={"phase": "stopping"})
+        ),
+    )
+
+    def paths(*, state_path: str, expected_identity: tuple[str, int, str]):
+        assert state_path == execution["state_path"]
+        assert expected_identity == (
+            attempt["id"],
+            attempt["claim_token"],
+            execution["execution_id"],
+        )
+        return (
+            Path("/private/control"),
+            Path("/private/control/receipt"),
+            Path("/private/runtime/socket"),
+        )
+
+    def reconnect(**kwargs: object):
+        reconnect_calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr(monitor_lifecycle_module, "sandbox_monitor_control_paths", paths)
+    monkeypatch.setattr(monitor_lifecycle_module, "reconnect_sandbox_monitor", reconnect)
+    monkeypatch.setattr(
+        supervisor,
+        "_open_registered_pidfd",
+        lambda *_args: pytest.fail("monitor cancellation must not open a host PID"),
+    )
+
+    try:
+        first = supervisor.terminate_worker(attempt["id"])
+        second = supervisor.terminate_worker(attempt["id"])
+
+        assert first == second
+        assert first["phase"] == "stopping"
+        assert first["outcome"] == "ok"
+        assert len(reconnect_calls) == 2
+        assert cancel_ids[0] == cancel_ids[1]
+        assert len(cancel_ids[0]) == 32
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_ambiguous_monitor_cancel_keeps_sandbox_execution_fenced(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    record_launch(supervisor, attempt, runc_handle=handle)
+    execution_with_scope = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution_with_scope is not None
+    client = SimpleNamespace(
+        status=lambda: SimpleNamespace(
+            outcome="ok",
+            payload={
+                "phase": "running",
+                "scope_unit": execution_with_scope["scope_unit"],
+                "scope_invocation_id": execution_with_scope["scope_invocation_id"],
+                "scope_control_group": execution_with_scope["cgroup_path"],
+            },
+        ),
+        cancel=lambda _request_id: SimpleNamespace(outcome="unknown", payload={"phase": "unknown"}),
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "sandbox_monitor_control_paths",
+        lambda **_kwargs: (
+            Path("/private/control"),
+            Path("/private/control/receipt"),
+            Path("/private/runtime/socket"),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module, "reconnect_sandbox_monitor", lambda **_kwargs: client
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_open_registered_pidfd",
+        lambda *_args: pytest.fail("ambiguous monitor result must not fall back to a host PID"),
+    )
+
+    try:
+        with pytest.raises(SupervisorError) as termination:
+            supervisor.terminate_worker(attempt["id"])
+
+        assert termination.value.code == "sandbox_execution_monitor_ambiguous"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_monitor_for_another_scope_cannot_cancel_this_execution(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    record_launch(supervisor, attempt, runc_handle=handle)
+    execution_with_scope = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution_with_scope is not None
+    cancel_calls: list[str] = []
+    client = SimpleNamespace(
+        status=lambda: SimpleNamespace(
+            outcome="ok",
+            payload={
+                "phase": "running",
+                "scope_unit": "acp-scope-other.scope",
+                "scope_invocation_id": "c" * 32,
+                "scope_control_group": "/user.slice/user-1000.slice/acp-scope-other.scope",
+            },
+        ),
+        cancel=lambda request_id: cancel_calls.append(request_id),
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "sandbox_monitor_control_paths",
+        lambda **_kwargs: (
+            Path("/private/control"),
+            Path("/private/control/receipt"),
+            Path("/private/runtime/socket"),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module, "reconnect_sandbox_monitor", lambda **_kwargs: client
+    )
+
+    try:
+        with pytest.raises(SupervisorError) as termination:
+            supervisor.terminate_worker(attempt["id"])
+
+        assert termination.value.code == "sandbox_execution_monitor_identity_mismatch"
+        assert cancel_calls == []
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
 
 
 def test_journaled_result_import_and_manual_submission_fail_closed(

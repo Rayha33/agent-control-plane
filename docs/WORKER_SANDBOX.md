@@ -527,6 +527,32 @@ missing-key refusal. The live test above now exercises this production recovery
 helper against a placeholder monitor; this remains an adoption primitive, not
 an integrated OCI worker path, and `run_worker()` remains fail-closed.
 
+**Production monitor service producer (2026-10-15; component, not worker
+integration).** `supervisor/sandbox_monitor_service.py` now provides
+`start_sandbox_execution_monitor()` to validate a caller-supplied exact scope
+binding and start a per-execution systemd service in `user-acp.slice`, outside
+the worker attempt slice. It persists the binding and control key under the
+execution's private monitor directory, publishes an authenticated receipt,
+and returns a status-checked IPC client. Adoption reuses the existing receipt
+and key; partial, stale, or ambiguous state refuses replacement. The service
+reports exact scope unit, InvocationID and cgroup, and cancellation stops only
+that scope before verifying its cgroup is empty. The control key is absent
+from argv, environment and receipt in the opt-in Linux integration proof.
+
+The production component, authenticated reconnect and exact-scope cancellation
+passed 134 focused tests on the disposable Ubuntu 24.04.5 ARM64 / Linux
+`6.8.0-142-generic` / systemd `255.4` guest with cgroup v2 and an active user
+manager. The proof uses a no-model `/usr/bin/sleep` scope, not an OCI worker.
+Independent source QC found no key/identity boundary defect in the component,
+but correctly identified that the producer is not called by the production
+launcher and the live test calls the monitor client directly rather than
+through `WorkersMixin.terminate_worker()`. The journaled termination path is
+covered separately by no-model unit tests with a stub monitor. QC also flagged
+a same-user systemd stop-by-name time-of-check/time-of-use race as a residual
+hardening item. This does not prove launch integration, real-OCI cleanup,
+credential/egress policy, result import, or `run_worker()`; `run_worker()`
+remains fail-closed and #2370 remains open.
+
 **Per-attempt coding-agent architecture decision (2026-10-11; NO-GO to wire
 unchanged).** Do not treat the existing namespace resource driver as the
 supervised coding-agent sandbox. [`WorkersMixin.run_worker()`](../src/agent_control_plane/supervisor/workers.py)

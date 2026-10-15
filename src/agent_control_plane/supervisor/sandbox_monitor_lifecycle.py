@@ -9,6 +9,7 @@ status/cancel channel.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -23,6 +24,7 @@ from .sandbox_monitor_ipc import (
     SandboxMonitorControlClient,
     SandboxMonitorIPCError,
     _linux_process_identity,
+    _open_private_directory,
 )
 from .sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
@@ -164,6 +166,58 @@ def reconcile_sandbox_monitor(
     )
 
 
+def sandbox_monitor_control_paths(
+    *, state_path: str | Path, expected_identity: tuple[str, int, str]
+) -> tuple[Path, Path, Path]:
+    """Derive the durable monitor directory and short runtime socket path.
+
+    The execution state path is part of the immutable reservation. Keeping the
+    receipt, key, and replay ledger beneath it makes them available after a
+    supervisor restart. The Unix socket lives in the already-private systemd
+    user runtime directory because state paths can exceed ``sun_path`` limits.
+    Both locations are deterministic from the exact fenced execution identity.
+    """
+
+    try:
+        container_id = sandbox_container_id(*expected_identity)
+    except (TypeError, SandboxMonitorReceiptError) as error:
+        raise SandboxMonitorReceiptError("monitor execution identity is invalid") from error
+    state_root = Path(state_path)
+    if (
+        not state_root.is_absolute()
+        or ".." in state_root.parts
+        or str(state_root) != os.path.normpath(str(state_root))
+    ):
+        raise SandboxMonitorReceiptError("monitor state path is not canonical and absolute")
+
+    environment = _trusted_systemd_command_environment()
+    runtime_directory = Path(environment["XDG_RUNTIME_DIR"])
+    if (
+        not runtime_directory.is_absolute()
+        or ".." in runtime_directory.parts
+        or str(runtime_directory) != os.path.normpath(str(runtime_directory))
+    ):
+        raise SandboxMonitorReceiptError("trusted monitor runtime directory is not canonical")
+    control_directory = state_root / "monitor"
+    receipt_path = control_directory / "monitor-receipt.json"
+    socket_path = runtime_directory / f"acpmon-{container_id.removeprefix('acp-')}.sock"
+    if len(os.fsencode(socket_path)) >= 108:
+        raise SandboxMonitorReceiptError("derived monitor socket path exceeds the Unix limit")
+    return control_directory, receipt_path, socket_path
+
+
+def sandbox_monitor_cancel_request_id(expected_identity: tuple[str, int, str]) -> str:
+    """Return one execution-bound cancellation ID reusable after any timeout."""
+
+    try:
+        container_id = sandbox_container_id(*expected_identity)
+    except (TypeError, SandboxMonitorReceiptError) as error:
+        raise SandboxMonitorReceiptError("monitor execution identity is invalid") from error
+    return hashlib.sha256(
+        b"acp-sandbox-monitor-cancel-v1\0" + container_id.encode("ascii")
+    ).hexdigest()[:32]
+
+
 def reconnect_sandbox_monitor(
     *,
     receipt_path: str | Path,
@@ -190,10 +244,18 @@ def reconnect_sandbox_monitor(
     ):
         if not path.is_absolute() or ".." in path.parts or str(path) != os.path.normpath(str(path)):
             raise SandboxMonitorReceiptError(f"{label} is not canonical and absolute")
-    if receipt_file.parent != directory or control_socket.parent != directory:
+    if receipt_file.parent != directory:
+        raise SandboxMonitorReceiptError("monitor receipt must be in its private control directory")
+    socket_parent_fd = -1
+    try:
+        socket_parent_fd = _open_private_directory(control_socket.parent)
+    except SandboxMonitorIPCError as error:
         raise SandboxMonitorReceiptError(
-            "monitor receipt and socket must share the private control directory"
-        )
+            "monitor socket parent is not a private directory"
+        ) from error
+    finally:
+        if socket_parent_fd >= 0:
+            os.close(socket_parent_fd)
     receipt = read_sandbox_monitor_receipt(receipt_file)
     reconcile_sandbox_monitor(receipt, expected_identity=expected_identity)
     try:
@@ -216,4 +278,9 @@ def reconnect_sandbox_monitor(
         ) from error
 
 
-__all__ = ["reconcile_sandbox_monitor", "reconnect_sandbox_monitor"]
+__all__ = [
+    "reconcile_sandbox_monitor",
+    "reconnect_sandbox_monitor",
+    "sandbox_monitor_cancel_request_id",
+    "sandbox_monitor_control_paths",
+]

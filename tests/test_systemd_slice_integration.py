@@ -1,9 +1,9 @@
 """Opt-in proofs for systemd-owned monitor identity, IPC, and slice teardown.
 
 Run with ``ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1`` on a disposable Linux host
-with an active user systemd manager and cgroup v2. The control-channel case
-uses a test-only monitor service and ``/usr/bin/sleep`` scope to exercise the
-production receipt and authenticated IPC code after controller-process exit.
+with an active user systemd manager and cgroup v2. The production monitor case
+starts the in-repo service against a no-model ``/usr/bin/sleep`` scope, kills the
+starting controller, then reconnects and cancels through the durable receipt.
 It does not launch or attest the supervised OCI worker or its runc handle.
 """
 
@@ -36,9 +36,12 @@ from agent_control_plane.supervisor.sandbox_attestation import (
 from agent_control_plane.supervisor.sandbox_monitor_ipc import (
     SandboxMonitorControlClient,
     SandboxMonitorControlServer,
+    _linux_process_identity,
 )
 from agent_control_plane.supervisor.sandbox_monitor_lifecycle import (
     reconnect_sandbox_monitor,
+    sandbox_monitor_cancel_request_id,
+    sandbox_monitor_control_paths,
 )
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
@@ -50,6 +53,7 @@ from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     validate_monitor_service_reconciliation,
     write_sandbox_monitor_receipt,
 )
+from agent_control_plane.supervisor.sandbox_monitor_service import start_sandbox_execution_monitor
 
 _ENABLED = os.environ.get("ACP_RUN_SYSTEMD_SLICE_INTEGRATION") == "1"
 _WAIT_SECONDS = 8.0
@@ -132,6 +136,7 @@ def _unit_properties(systemctl: str, unit: str) -> dict[str, str]:
             "--property=ControlGroup",
             "--property=Slice",
             "--property=MainPID",
+            "--property=FragmentPath",
         ]
     )
     return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
@@ -1408,6 +1413,318 @@ def test_live_systemd_monitor_ipc_survives_controller_crash_and_cancels_exact_sc
         shutil.rmtree(control_directory)
 
 
+def _start_production_monitor_controller(
+    *,
+    state_path: Path,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    scope_unit: str,
+    scope_invocation_id: str,
+    scope_control_group: str,
+    attempt_slice_control_group: str,
+) -> None:
+    client = start_sandbox_execution_monitor(
+        state_path=state_path,
+        expected_identity=(attempt_id, claim_token, execution_id),
+        scope_unit=scope_unit,
+        scope_invocation_id=scope_invocation_id,
+        scope_control_group=scope_control_group,
+        attempt_slice_control_group=attempt_slice_control_group,
+    )
+    response = client.status()
+    if (
+        response.outcome != "ok"
+        or response.payload.get("phase") != "running"
+        or response.payload.get("scope_unit") != scope_unit
+        or response.payload.get("scope_invocation_id") != scope_invocation_id
+        or response.payload.get("scope_control_group") != scope_control_group
+    ):
+        raise RuntimeError("production monitor did not authenticate the exact running scope")
+    print("monitor-ready", flush=True)
+    time.sleep(60)
+
+
+def test_live_production_monitor_service_survives_controller_crash_and_cancels_exact_scope() -> (
+    None
+):
+    """Exercise the in-repo producer and control service against a harmless scope."""
+
+    import stat
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the production monitor test requires Linux cgroup v2")
+    systemd_run = shutil.which("systemd-run", path=_environment()["PATH"])
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemd_run is None or systemctl is None:
+        raise RuntimeError("systemd-run and systemctl are required")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+
+    token = uuid.uuid4().hex
+    attempt_id = f"production-{token[:16]}"
+    claim_token = 1
+    execution_id = token
+    identity = (attempt_id, claim_token, execution_id)
+    container_id = sandbox_container_id(*identity)
+    attempt_slice_unit = sandbox_attempt_slice_unit(*identity)
+    monitor_unit = sandbox_monitor_service_unit(*identity)
+    scope_unit = f"{container_id}.scope"
+    for unit in (scope_unit, monitor_unit, attempt_slice_unit):
+        props = _unit_properties(systemctl, unit)
+        if props.get("LoadState") == "not-found":
+            continue
+        implicit_inactive_slice = (
+            unit.endswith(".slice")
+            and props.get("LoadState") == "loaded"
+            and props.get("ActiveState") == "inactive"
+            and not props.get("ControlGroup")
+            and not props.get("FragmentPath")
+        )
+        if not implicit_inactive_slice:
+            raise RuntimeError(f"refusing to reuse a pre-existing systemd unit: {unit}")
+
+    runtime_value = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for the production monitor test")
+    fixture_root = Path(tempfile.mkdtemp(prefix="acp-production-monitor-", dir="/tmp"))
+    os.chmod(fixture_root, 0o700)
+    root_identity = fixture_root.lstat()
+    state_path = fixture_root / "state"
+    state_path.mkdir(mode=0o700)
+    control_directory, receipt_path, socket_path = sandbox_monitor_control_paths(
+        state_path=state_path,
+        expected_identity=identity,
+    )
+    scope_client: subprocess.Popen[str] | None = None
+    controller: subprocess.Popen[str] | None = None
+    active: dict[str, dict[str, str]] = {}
+    cleanup_errors: list[str] = []
+    try:
+        scope_client = subprocess.Popen(
+            [
+                systemd_run,
+                "--user",
+                "--scope",
+                f"--unit={scope_unit}",
+                f"--slice={attempt_slice_unit}",
+                "/usr/bin/sleep",
+                "45",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_environment(),
+        )
+        scope = _wait_active(systemctl, scope_unit, scope_client)
+        active[scope_unit] = scope
+        attempt_slice = _wait_active(systemctl, attempt_slice_unit)
+        active[attempt_slice_unit] = attempt_slice
+        scope_invocation_id = scope.get("InvocationID", "")
+        scope_control_group = scope.get("ControlGroup", "")
+        attempt_slice_control_group = attempt_slice.get("ControlGroup", "")
+        if (
+            not scope_invocation_id
+            or not scope_control_group
+            or not attempt_slice_control_group
+            or scope.get("Slice") != attempt_slice_unit
+            or PurePosixPath(scope_control_group).parent.as_posix() != attempt_slice_control_group
+        ):
+            raise AssertionError("test worker scope lacks exact attempt-slice identity")
+
+        controller = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--start-production-monitor",
+                str(state_path),
+                attempt_id,
+                str(claim_token),
+                execution_id,
+                scope_unit,
+                scope_invocation_id,
+                scope_control_group,
+                attempt_slice_control_group,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_environment(),
+        )
+        deadline = time.monotonic() + _WAIT_SECONDS * 2
+        while not receipt_path.is_file():
+            if controller.poll() is not None:
+                _, stderr = controller.communicate()
+                raise RuntimeError(
+                    f"production monitor controller exited {controller.returncode}: {stderr.strip()}"
+                )
+            if time.monotonic() >= deadline:
+                raise RuntimeError("production monitor did not publish its durable receipt")
+            time.sleep(0.05)
+        if controller.stdout is None:
+            raise RuntimeError("production controller has no readiness pipe")
+        with selectors.DefaultSelector() as selector:
+            selector.register(controller.stdout, selectors.EVENT_READ)
+            if not selector.select(timeout=_WAIT_SECONDS):
+                raise RuntimeError("production monitor controller did not finish authentication")
+            readiness = controller.stdout.readline().strip()
+            if readiness != "monitor-ready":
+                stdout, stderr = controller.communicate(timeout=_WAIT_SECONDS)
+                raise RuntimeError(
+                    "production monitor controller failed its status check: "
+                    f"line={readiness!r}; stdout={stdout.strip()}; stderr={stderr.strip()}"
+                )
+        receipt = read_sandbox_monitor_receipt(receipt_path)
+        if (
+            receipt.unit != monitor_unit
+            or receipt.attempt_slice_unit != attempt_slice_unit
+            or receipt.attempt_slice_control_group != attempt_slice_control_group
+        ):
+            raise AssertionError("production receipt differs from the exact launch scope")
+        key_path = control_directory / f"{container_id}.control-key"
+        key = key_path.read_bytes()
+        if (
+            key_path.stat().st_mode & 0o777 != 0o600
+            or control_directory.stat().st_mode & 0o777 != 0o700
+            or key in receipt_path.read_bytes()
+        ):
+            raise AssertionError("production monitor key or private state boundary is unsafe")
+        monitor_cmdline = Path(f"/proc/{receipt.main_pid}/cmdline").read_bytes()
+        monitor_environment = Path(f"/proc/{receipt.main_pid}/environ").read_bytes()
+        if (
+            key in monitor_cmdline
+            or key in monitor_environment
+            or b"control-key" in monitor_cmdline
+        ):
+            raise AssertionError("monitor key or key filename was exposed through process metadata")
+
+        controller.send_signal(signal.SIGKILL)
+        stdout, stderr = controller.communicate(timeout=_WAIT_SECONDS)
+        if controller.returncode != -signal.SIGKILL:
+            raise RuntimeError(
+                f"controller did not die abruptly: rc={controller.returncode}; "
+                f"stdout={stdout.strip()}; stderr={stderr.strip()}"
+            )
+        controller = None
+
+        client = reconnect_sandbox_monitor(
+            receipt_path=receipt_path,
+            control_directory=control_directory,
+            socket_path=socket_path,
+            expected_identity=identity,
+        )
+        status = client.status()
+        expected_scope = {
+            "scope_unit": scope_unit,
+            "scope_invocation_id": scope_invocation_id,
+            "scope_control_group": scope_control_group,
+        }
+        if (
+            status.outcome != "ok"
+            or status.payload.get("phase") != "running"
+            or any(status.payload.get(key) != value for key, value in expected_scope.items())
+        ):
+            raise AssertionError(f"restarted controller did not observe exact scope: {status!r}")
+        cancel_id = sandbox_monitor_cancel_request_id(identity)
+        cancelled = client.cancel(cancel_id)
+        retried = client.cancel(cancel_id)
+        if (
+            cancelled.outcome != "ok"
+            or cancelled.payload.get("phase") != "exited"
+            or any(cancelled.payload.get(key) != value for key, value in expected_scope.items())
+            or retried != cancelled
+        ):
+            raise AssertionError(
+                f"production monitor cancellation did not replay exactly: {cancelled!r}, {retried!r}"
+            )
+        scope_after = _wait_inactive(systemctl, scope_unit)
+        if scope_after.get("ActiveState") in {"active", "activating", "deactivating"}:
+            raise AssertionError("production monitor left its exact worker scope active")
+        if not _cgroup_is_empty(scope_control_group):
+            raise AssertionError("production monitor left the exact worker cgroup populated")
+        active[monitor_unit] = _wait_active(systemctl, monitor_unit)
+        if active[monitor_unit].get("InvocationID") != receipt.invocation_id:
+            raise AssertionError("production monitor service changed after controller crash")
+        if _linux_process_identity(receipt.main_pid) != receipt.main_identity:
+            raise AssertionError("production monitor process identity changed unexpectedly")
+    finally:
+        if controller is not None and controller.poll() is None:
+            controller.kill()
+            controller.communicate(timeout=_WAIT_SECONDS)
+        for unit in (scope_unit, monitor_unit, attempt_slice_unit):
+            try:
+                original = active.get(unit)
+                before_stop = _unit_properties(systemctl, unit)
+                if original is None and before_stop.get("ControlGroup"):
+                    original = before_stop
+                    active[unit] = before_stop
+                if original and before_stop.get("InvocationID") not in {
+                    original.get("InvocationID"),
+                    "",
+                }:
+                    cleanup_errors.append(f"refusing to stop changed unit activation: {unit}")
+                    continue
+                subprocess.run(
+                    [systemctl, "--user", "stop", "--", unit],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_WAIT_SECONDS,
+                    env=_environment(),
+                )
+                inactive = _wait_inactive(systemctl, unit)
+                if inactive.get("ActiveState") in {"active", "activating", "deactivating"}:
+                    cleanup_errors.append(f"{unit} remained active: {inactive}")
+                for control_group in {
+                    inactive.get("ControlGroup", ""),
+                    original.get("ControlGroup", "") if original else "",
+                } - {""}:
+                    if not _cgroup_is_empty(control_group):
+                        cleanup_errors.append(f"{unit} retained populated cgroup {control_group}")
+                if inactive.get("ActiveState") == "failed":
+                    _run([systemctl, "--user", "reset-failed", "--", unit])
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"could not verify {unit} cleanup: {error}")
+        if scope_client is not None and scope_client.poll() is None:
+            scope_client.terminate()
+            try:
+                scope_client.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                scope_client.kill()
+                scope_client.wait(timeout=2)
+        try:
+            after = fixture_root.lstat()
+            if (
+                (after.st_dev, after.st_ino) != (root_identity.st_dev, root_identity.st_ino)
+                or after.st_uid != os.geteuid()
+                or not stat.S_ISDIR(after.st_mode)
+                or stat.S_IMODE(after.st_mode) != 0o700
+            ):
+                cleanup_errors.append("production monitor fixture directory identity changed")
+        except OSError as error:
+            cleanup_errors.append(f"production monitor fixture could not be verified: {error}")
+        if cleanup_errors:
+            raise RuntimeError(
+                "production monitor integration cleanup was not verified; fixture retained at "
+                f"{fixture_root}: " + "; ".join(cleanup_errors)
+            )
+        shutil.rmtree(fixture_root)
+
+
 def test_live_systemd_loadcredential_is_read_only_and_not_environment() -> None:
     """Prove the systemd credential handoff primitive with a fake secret only."""
 
@@ -2099,7 +2416,20 @@ def test_live_systemd_loadcredential_restart_requires_source_again() -> None:
 
 if __name__ == "__main__":
     arguments = sys.argv[1:]
-    if arguments and arguments[0] == "--monitor-controller":
+    if arguments and arguments[0] == "--start-production-monitor":
+        if len(arguments) != 9:
+            raise SystemExit("start-production-monitor mode requires eight arguments")
+        _start_production_monitor_controller(
+            state_path=Path(arguments[1]),
+            attempt_id=arguments[2],
+            claim_token=int(arguments[3]),
+            execution_id=arguments[4],
+            scope_unit=arguments[5],
+            scope_invocation_id=arguments[6],
+            scope_control_group=arguments[7],
+            attempt_slice_control_group=arguments[8],
+        )
+    elif arguments and arguments[0] == "--monitor-controller":
         if len(arguments) != 10:
             raise SystemExit("monitor-controller mode requires nine arguments")
         _start_monitor_controller(
