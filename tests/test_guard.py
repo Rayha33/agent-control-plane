@@ -446,26 +446,50 @@ def test_install_preserves_the_users_settings(tmp_path: Path) -> None:
 def test_install_replaces_legacy_default_hook_when_command_changes(tmp_path: Path) -> None:
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True)
-    legacy_hooks = claude_code_hooks("acp", require_checkout_exec=True)
-    for entries in legacy_hooks.values():
-        for entry in entries:
-            for hook in entry.get("hooks", []):
-                hook["command"] = hook["command"].removesuffix(" # acp-managed-hook:v1")
-    legacy_hooks["PreToolUse"].append(
-        {"matcher": "Bash", "hooks": [{"type": "command", "command": "my user hook"}]}
-    )
-    legacy_hooks["PreToolUse"][0]["hooks"].append(
-        {"type": "command", "command": "my co-located user hook"}
-    )
-    legacy_hooks["PreToolUse"][0]["hooks"].append(
-        {"type": "command", "command": "my-hook acp guard --audit"}
-    )
-    legacy_hooks["SessionStart"].append(
-        {"hooks": [{"type": "command", "command": "my session hook"}]}
-    )
-    legacy_hooks["SessionStart"].append(
-        {"hooks": [{"type": "command", "command": 'echo "acp guard is disabled"'}]}
-    )
+    # Literal output from the pre-marker generator (base ed526b2), plus an old
+    # custom Python-module command from the supported --command option.
+    legacy_hooks = {
+        "PreToolUse": [
+            {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [
+                    {"type": "command", "command": "acp guard --hook"},
+                    {"type": "command", "command": "my co-located user hook"},
+                    {"type": "command", "command": "my-hook acp guard --audit"},
+                    {"type": "command", "command": "acp guard --audit"},
+                ],
+            },
+            {
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "python -m agent_control_plane.cli --repo /project-root-one "
+                            "guard --hook"
+                        ),
+                    }
+                ],
+            },
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "my user hook"}]},
+        ],
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": "acp guard --describe"}]},
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "python -m agent_control_plane.cli --repo /project-root-one "
+                            "guard --describe"
+                        ),
+                    }
+                ]
+            },
+            {"hooks": [{"type": "command", "command": "my session hook"}]},
+            {"hooks": [{"type": "command", "command": 'echo "acp guard is disabled"'}]},
+        ],
+    }
     settings_path.write_text(json.dumps({"hooks": legacy_hooks}), encoding="utf-8")
 
     first_command = "python -m agent_control_plane.cli --repo /project-root-one"
@@ -483,11 +507,13 @@ def test_install_replaces_legacy_default_hook_when_command_changes(tmp_path: Pat
     assert pre_tool_commands.count("my user hook") == 1
     assert pre_tool_commands.count("my co-located user hook") == 1
     assert pre_tool_commands.count("my-hook acp guard --audit") == 1
+    assert pre_tool_commands.count("acp guard --audit") == 1
     assert session_start_commands.count("my session hook") == 1
     assert session_start_commands.count('echo "acp guard is disabled"') == 1
     assert sum(command.startswith(second_command) for command in pre_tool_commands) == 1
     assert sum(command.startswith(second_command) for command in session_start_commands) == 1
-    assert "acp guard --hook --require-checkout-exec || exit 2" not in pre_tool_commands
+    assert "acp guard --hook" not in pre_tool_commands
+    assert "acp guard --describe" not in session_start_commands
     assert not any(command.startswith(first_command) for command in pre_tool_commands)
     assert not any(command.startswith(first_command) for command in session_start_commands)
 
@@ -501,6 +527,24 @@ def test_install_refuses_to_overwrite_unreadable_settings(tmp_path: Path) -> Non
         install_claude_code_hooks(tmp_path)
     # The user's file is still theirs.
     assert settings_path.read_text(encoding="utf-8") == "{ this is not json"
+
+
+@pytest.mark.parametrize(
+    ("contents", "error"),
+    [
+        ("[]", "JSON object"),
+        ('{"hooks": []}', "non-object 'hooks'"),
+        ('{"hooks": {"PreToolUse": "user hook"}}', "non-list hook event"),
+    ],
+)
+def test_install_refuses_unknown_settings_shapes(tmp_path: Path, contents: str, error: str) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        install_claude_code_hooks(tmp_path)
+    assert settings_path.read_text(encoding="utf-8") == contents
 
 
 def test_install_creates_settings_when_absent(tmp_path: Path) -> None:

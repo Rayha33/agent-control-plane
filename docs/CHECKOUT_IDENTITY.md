@@ -141,9 +141,11 @@ explicit value is refused before the child starts. Omitting the attempt ID does 
 invent one: the hook remains fail-closed and rejects writes with `missing_attempt`.
 The default, non-required hook mode is unchanged. Quote paths with shell metacharacters
 for the hook's `--command` value. Reinstalling after changing that command replaces
-ACP-managed hook entries, including legacy default `acp guard` entries, while preserving
-unrelated user hooks; this avoids a stale hook that reads attempt-worktree state and
-continues to block edits after the new state-root command is installed.
+marked ACP hooks and exact legacy `acp guard` or `python -m agent_control_plane.cli`
+hook commands while preserving unrelated user hooks. Unknown command shapes are
+preserved rather than guessed at, and malformed settings are refused unchanged. This
+avoids a recognized stale hook reading attempt-worktree state and continuing to block
+edits after the new state-root command is installed.
 
 In this mode, `checkout-exec` holds the checkout lease for the foreground Claude Code
 process and passes its attempt ID, resource, and fencing token to that process. The synchronous

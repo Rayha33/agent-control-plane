@@ -89,16 +89,14 @@ def claude_code_hooks(command: str, *, require_checkout_exec: bool = False) -> d
     }
 
 
-def _merge_hook_events(
-    existing: dict[str, Any], generated: dict[str, Any], command: str
-) -> dict[str, Any]:
+def _merge_hook_events(existing: dict[str, Any], generated: dict[str, Any]) -> dict[str, Any]:
     """Add ACP's entries to whatever hooks are already configured.
 
     A settings file is the user's, and it is normal for it to carry hooks that have
     nothing to do with ACP. Replacing the file — or even the `hooks` key — to install
     an integration would be a destructive act performed on the user's behalf, so this
-    drops only previous ACP entries (recognised by their command prefix or stable
-    command marker) and appends the current ones, leaving every other hook untouched.
+    drops only previous ACP entries (recognised by a stable marker or exact legacy
+    command shape) and appends the current ones, leaving every other hook untouched.
     """
 
     merged = dict(existing)
@@ -109,7 +107,7 @@ def _merge_hook_events(
                 kept.append(entry)
                 continue
             hooks = entry["hooks"]
-            remaining_hooks = [hook for hook in hooks if not _is_acp_hook(hook, command)]
+            remaining_hooks = [hook for hook in hooks if not _is_acp_hook(hook)]
             if len(remaining_hooks) == len(hooks):
                 kept.append(entry)
             elif remaining_hooks:
@@ -120,28 +118,42 @@ def _merge_hook_events(
     return merged
 
 
-def _is_acp_hook(hook: Any, command: str) -> bool:
+def _is_acp_hook(hook: Any) -> bool:
     if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
         return False
     hook_command = hook["command"]
-    if hook_command.startswith(f"{command} guard") or hook_command.endswith(
-        ACP_MANAGED_COMMAND_MARKER
-    ):
-        return True
-    return _is_legacy_acp_hook_command(hook_command)
+    return hook_command.endswith(ACP_MANAGED_COMMAND_MARKER) or _is_legacy_acp_hook_command(
+        hook_command
+    )
 
 
 def _is_legacy_acp_hook_command(command: str) -> bool:
-    """Recognize only hook commands emitted before the stable ACP marker existed."""
+    """Recognize exact ACP hook commands emitted before the stable marker existed.
+
+    Older releases accepted a custom command such as ``python -m
+    agent_control_plane.cli --repo /project``. Recognize that explicit module form
+    as well as the ``acp`` executable, but do not classify arbitrary user commands
+    merely because they mention ACP or start with ``acp guard``.
+    """
 
     try:
         words = shlex.split(command)
     except ValueError:
         return False
-    if not words or Path(words[0]).name != "acp":
+    if not words:
         return False
 
-    arguments = words[1:]
+    executable = Path(words[0]).name.lower()
+    if executable == "acp":
+        arguments = words[1:]
+    elif (executable == "python" or _is_versioned_python(executable)) and words[1:3] == [
+        "-m",
+        "agent_control_plane.cli",
+    ]:
+        arguments = words[3:]
+    else:
+        return False
+
     while arguments and arguments[0] != "guard":
         if arguments[0] == "--repo" and len(arguments) > 1:
             arguments = arguments[2:]
@@ -152,11 +164,19 @@ def _is_legacy_acp_hook_command(command: str) -> bool:
     if not arguments or arguments[0] != "guard":
         return False
 
-    generated_arguments = arguments[1:]
-    return generated_arguments == ["--describe"] or generated_arguments in (
-        ["--hook", "||", "exit", "2"],
-        ["--hook", "--require-checkout-exec", "||", "exit", "2"],
-    )
+    generated_arguments = tuple(arguments[1:])
+    return generated_arguments in {
+        ("--describe",),
+        ("--hook",),
+        ("--hook", "||", "exit", "2"),
+        ("--hook", "--require-checkout-exec"),
+        ("--hook", "--require-checkout-exec", "||", "exit", "2"),
+    }
+
+
+def _is_versioned_python(executable: str) -> bool:
+    suffix = executable.removeprefix("python")
+    return executable.startswith("python") and bool(suffix) and suffix.replace(".", "").isdigit()
 
 
 def install_claude_code_hooks(
@@ -171,13 +191,19 @@ def install_claude_code_hooks(
             loaded = json.loads(settings_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as error:
             raise ValueError(f"{settings_path} is not valid JSON: {error}") from error
-        if isinstance(loaded, dict):
-            settings = loaded
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{settings_path} must contain a JSON object")
+        settings = loaded
+
+    existing_hooks = settings.get("hooks", {})
+    if not isinstance(existing_hooks, dict):
+        raise ValueError(f"{settings_path} has a non-object 'hooks' value")
+    if any(not isinstance(entries, list) for entries in existing_hooks.values()):
+        raise ValueError(f"{settings_path} has a non-list hook event value")
 
     settings["hooks"] = _merge_hook_events(
-        settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {},
+        existing_hooks,
         claude_code_hooks(command, require_checkout_exec=require_checkout_exec),
-        command,
     )
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
