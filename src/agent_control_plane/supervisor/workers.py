@@ -26,7 +26,11 @@ from typing import Any
 from ..worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from ..worker_trampoline import MONITOR_MODE as MONITOR_MODE
 from .common import SupervisorError, utc_now
-from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
+from .sandbox_execution_journal import (
+    _runc_launch_gate_lock_for_execution,
+    _sandbox_execution_cleanup_is_verified,
+    _sandbox_execution_launch_stop_reason,
+)
 
 _MAX_WORKER_LOG_BYTES = 8 * 1024 * 1024
 _WORKER_LOG_TRUNCATION_MARKER = b"\n[ACP worker output truncated at 8 MiB]\n"
@@ -58,22 +62,65 @@ def _worker_command_digest(command: Sequence[str]) -> str:
 class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
 
-    def _cancel_sandbox_execution_monitor(self, execution: dict[str, Any]) -> dict[str, Any]:
+    def _cancel_sandbox_execution_monitor(
+        self, execution: dict[str, Any], *, monitor_client: Any | None = None
+    ) -> dict[str, Any]:
         """Cancel a journaled execution only through its authenticated monitor."""
 
-        from .sandbox_monitor_ipc import SandboxMonitorIPCError
+        from .sandbox_monitor_ipc import (
+            SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS,
+            SandboxMonitorControlClient,
+            SandboxMonitorIPCError,
+        )
         from .sandbox_monitor_lifecycle import (
             reconnect_sandbox_monitor,
             sandbox_monitor_cancel_request_id,
             sandbox_monitor_control_paths,
         )
-        from .sandbox_monitor_receipt import SandboxMonitorReceiptError
+        from .sandbox_monitor_receipt import SandboxMonitorReceipt, SandboxMonitorReceiptError
 
         identity = (
             execution["attempt_id"],
             execution["claim_token"],
             execution["execution_id"],
         )
+
+        def durable_stop_result(monitor_phase: str) -> dict[str, Any]:
+            durable = self._sandbox_execution_get(execution["attempt_id"])
+            with self.connect() as connection:
+                launch_stop_reason = (
+                    _sandbox_execution_launch_stop_reason(connection, durable)
+                    if durable is not None
+                    else None
+                )
+                cleanup_verified = (
+                    _sandbox_execution_cleanup_is_verified(connection, execution["attempt_id"])
+                    if durable is not None
+                    else False
+                )
+            durable_stop_reason = (
+                (durable["stop_reason"] or launch_stop_reason) if durable is not None else None
+            )
+            if (
+                durable is None
+                or durable["claim_token"] != identity[1]
+                or durable["execution_id"] != identity[2]
+                or not durable_stop_reason
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "monitor stop acknowledgement has no matching durable stop intent",
+                )
+            return {
+                "attempt_id": execution["attempt_id"],
+                "execution_id": execution["execution_id"],
+                "outcome": "stop_pending" if durable["phase"] == "launched" else "ok",
+                "phase": durable["phase"],
+                "stop_requested": True,
+                "monitor_phase": monitor_phase,
+                "cleanup_verified": cleanup_verified,
+            }
+
         expected_scope = {
             "scope_unit": execution.get("scope_unit"),
             "scope_invocation_id": execution.get("scope_invocation_id"),
@@ -85,15 +132,35 @@ class WorkersMixin:
                 "durable scope identity is unavailable; execution and resource fences remain held",
             )
         try:
-            control_directory, receipt_path, socket_path = sandbox_monitor_control_paths(
-                state_path=execution["state_path"], expected_identity=identity
-            )
-            client = reconnect_sandbox_monitor(
-                receipt_path=receipt_path,
-                control_directory=control_directory,
-                socket_path=socket_path,
-                expected_identity=identity,
-            )
+            if monitor_client is None:
+                control_directory, receipt_path, socket_path = sandbox_monitor_control_paths(
+                    state_path=execution["state_path"], expected_identity=identity
+                )
+                client = reconnect_sandbox_monitor(
+                    receipt_path=receipt_path,
+                    control_directory=control_directory,
+                    socket_path=socket_path,
+                    expected_identity=identity,
+                    timeout_seconds=SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS,
+                )
+            else:
+                receipt = getattr(monitor_client, "_receipt", None)
+                if (
+                    type(monitor_client) is not SandboxMonitorControlClient
+                    or type(receipt) is not SandboxMonitorReceipt
+                    or (
+                        receipt.attempt_id,
+                        receipt.claim_token,
+                        receipt.execution_id,
+                    )
+                    != identity
+                    or receipt.controller_pid != os.getpid()
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_monitor_identity_mismatch",
+                        "cached monitor client is not bound to this process and execution",
+                    )
+                client = monitor_client
             status = client.status()
             if status.outcome != "ok":
                 raise SupervisorError(
@@ -121,13 +188,18 @@ class WorkersMixin:
             if phase in {"exited", "cleanup_verified"}:
                 # An exit report does not satisfy the journal's independent
                 # cleanup verifier. Do not alter the durable execution phase.
-                return {
-                    "attempt_id": execution["attempt_id"],
-                    "execution_id": execution["execution_id"],
-                    "outcome": "ok",
-                    "phase": phase,
-                }
-            cancelled = client.cancel(sandbox_monitor_cancel_request_id(identity))
+                monitor_phase = phase
+            else:
+                cancelled = client.cancel(sandbox_monitor_cancel_request_id(identity))
+                if cancelled.outcome != "ok" or cancelled.payload.get("phase") not in {
+                    "stopping",
+                    "exited",
+                }:
+                    raise SupervisorError(
+                        "sandbox_execution_monitor_ambiguous",
+                        "monitor cancellation is ambiguous; execution and resource fences remain held",
+                    )
+                monitor_phase = cancelled.payload["phase"]
         except SupervisorError as error:
             if error.code in {
                 "sandbox_execution_monitor_ambiguous",
@@ -152,20 +224,7 @@ class WorkersMixin:
                 "authenticated monitor control failed; refusing host-PID signaling and retaining execution fences",
             ) from error
 
-        if cancelled.outcome != "ok" or cancelled.payload.get("phase") not in {
-            "stopping",
-            "exited",
-        }:
-            raise SupervisorError(
-                "sandbox_execution_monitor_ambiguous",
-                "monitor cancellation is ambiguous; execution and resource fences remain held",
-            )
-        return {
-            "attempt_id": execution["attempt_id"],
-            "execution_id": execution["execution_id"],
-            "outcome": "ok",
-            "phase": cancelled.payload["phase"],
-        }
+        return durable_stop_result(monitor_phase)
 
     def run_worker(
         self,
@@ -939,7 +998,66 @@ class WorkersMixin:
         # the execution fenced and never reaches the legacy PID path.
         execution = self._sandbox_execution_get(attempt_id)
         if execution is not None:
-            return self._cancel_sandbox_execution_monitor(execution)
+            if execution["phase"] in {"exited", "cleanup_reported", "cleanup_verified"}:
+                with self.connect() as connection:
+                    cleanup_verified = _sandbox_execution_cleanup_is_verified(
+                        connection, attempt_id
+                    )
+                    launch_stop_reason = _sandbox_execution_launch_stop_reason(
+                        connection, execution
+                    )
+                return {
+                    "attempt_id": attempt_id,
+                    "execution_id": execution["execution_id"],
+                    "outcome": "ok",
+                    "phase": execution["phase"],
+                    "stop_requested": bool(execution.get("stop_reason") or launch_stop_reason),
+                    "monitor_phase": None,
+                    "cleanup_verified": cleanup_verified,
+                }
+            if execution["phase"] not in {"launched", "running", "stopping"}:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_unavailable",
+                    "journaled execution has no stoppable monitor-owned scope; execution and resource fences remain held",
+                )
+            with self.connect() as connection:
+                launch_stop_reason = (
+                    _sandbox_execution_launch_stop_reason(connection, execution)
+                    if execution["phase"] == "launched"
+                    else None
+                )
+            stop_reason = execution.get("stop_reason") or launch_stop_reason or "terminate_worker"
+            self._sandbox_execution_request_stop(
+                attempt_id,
+                execution["claim_token"],
+                stop_reason,
+                credential=credential,
+            )
+            stopped_execution = self._sandbox_execution_get(attempt_id)
+            if (
+                stopped_execution is None
+                or stopped_execution["claim_token"] != execution["claim_token"]
+                or stopped_execution["execution_id"] != execution["execution_id"]
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "durable execution identity changed after recording stop intent",
+                )
+            with _runc_launch_gate_lock_for_execution(
+                attempt_id,
+                stopped_execution["claim_token"],
+                stopped_execution["execution_id"],
+            ) as locked_handle:
+                if locked_handle is not None:
+                    # Closing an unreleased init gate makes its fixed trampoline
+                    # exit on EOF; the monitor still handles exact-scope stop.
+                    locked_handle._close_gate_locked()
+                monitor_client = (
+                    locked_handle._monitor_client if locked_handle is not None else None
+                )
+            return self._cancel_sandbox_execution_monitor(
+                stopped_execution, monitor_client=monitor_client
+            )
         if not attempt["pid"]:
             raise SupervisorError("worker_not_running", "attempt has no running worker")
         if attempt["pid"] < 0:

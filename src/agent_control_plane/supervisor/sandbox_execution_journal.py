@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import stat
@@ -269,6 +270,28 @@ def _sandbox_launch_driver_service_unit(execution_id: str) -> str:
     if not isinstance(execution_id, str) or not _COMPONENT.fullmatch(execution_id):
         raise SupervisorError("sandbox_execution_invalid", "execution ID is invalid")
     return f"acp-launch-driver-{execution_id}.service"
+
+
+def _sandbox_execution_launch_stop_reason(
+    connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
+) -> str | None:
+    """Read the immutable pre-init stop intent for this exact execution."""
+
+    event = connection.execute(
+        """
+        SELECT json_extract(payload_json, '$.stop_reason') AS stop_reason
+        FROM events
+        WHERE event_type = 'sandbox.execution_stop_requested'
+          AND json_extract(payload_json, '$.phase') = 'launched'
+          AND json_extract(payload_json, '$.attempt_id') = ?
+          AND json_extract(payload_json, '$.claim_token') = ?
+          AND json_extract(payload_json, '$.execution_id') = ?
+        ORDER BY sequence
+        LIMIT 1
+        """,
+        (row["attempt_id"], row["claim_token"], row["execution_id"]),
+    ).fetchone()
+    return event["stop_reason"] if event is not None else None
 
 
 def _sandbox_launch_plan_material(execution: Any, target: Any) -> dict[str, Any]:
@@ -2130,6 +2153,7 @@ class SandboxExecutionJournalMixin:
         _runc_launch_handle_bind_execution(
             runc_handle, attempt_id, claim_token, durable_execution["execution_id"]
         )
+        from .sandbox_monitor_ipc import SandboxMonitorControlClient
         from .sandbox_monitor_receipt import SandboxMonitorReceipt
         from .sandbox_monitor_service import start_sandbox_execution_monitor
 
@@ -2258,7 +2282,7 @@ class SandboxExecutionJournalMixin:
                     launch_plan_json,
                     launch_plan_digest,
                 ):
-                    return self._sandbox_execution_transition(
+                    updated = self._sandbox_execution_transition(
                         attempt_id,
                         claim_token,
                         expected_phase="reserved",
@@ -2312,6 +2336,19 @@ class SandboxExecutionJournalMixin:
                         credential=credential,
                         _connection=connection,
                     )
+            if (
+                type(monitor_client) is SandboxMonitorControlClient
+                and monitor_client._receipt is receipt
+                and (receipt.attempt_id, receipt.claim_token, receipt.execution_id)
+                == expected_identity
+                and receipt.controller_pid == os.getpid()
+            ):
+                # The recovery path intentionally rejects the process that
+                # originally created the monitor. Retain only this exact
+                # authenticated startup client on the exact launch handle so
+                # its owner can cancel without weakening recovery checks.
+                locked_handle._monitor_client = monitor_client
+            return updated
 
     def _sandbox_execution_record_running(
         self,
@@ -2328,12 +2365,20 @@ class SandboxExecutionJournalMixin:
             row = connection.execute(
                 "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
+            launch_stop_reason = (
+                _sandbox_execution_launch_stop_reason(connection, row) if row else None
+            )
         if not row or row["claim_token"] != claim_token:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
         if row["phase"] != "launched":
             raise SupervisorError(
                 "sandbox_execution_transition_invalid",
                 f"cannot record running from phase {row['phase']}; fence retained",
+            )
+        if row["stop_reason"] or launch_stop_reason:
+            raise SupervisorError(
+                "sandbox_execution_transition_invalid",
+                "running transition is fenced by a durable stop request",
             )
         if not _sandbox_launch_plan_binding_is_self_consistent(row):
             raise SupervisorError(
@@ -2414,11 +2459,18 @@ class SandboxExecutionJournalMixin:
                 locked_row = connection.execute(
                     "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
                 ).fetchone()
+                locked_launch_stop_reason = (
+                    _sandbox_execution_launch_stop_reason(connection, locked_row)
+                    if locked_row
+                    else None
+                )
             if (
                 locked_row is None
                 or locked_row["claim_token"] != claim_token
                 or locked_row["execution_id"] != row["execution_id"]
                 or locked_row["phase"] != "launched"
+                or locked_row["stop_reason"]
+                or locked_launch_stop_reason
                 or not _sandbox_launch_plan_binding_is_self_consistent(locked_row)
             ):
                 raise SupervisorError(
@@ -2558,10 +2610,10 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_transition_conflict",
                     "durable execution identity changed while requesting stop",
                 )
-            if row["phase"] in {"running", "stopping"} and locked_handle is None:
+            if row["phase"] in {"launched", "running", "stopping"} and locked_handle is None:
                 raise SupervisorError(
                     "sandbox_execution_monitor_unavailable",
-                    "the monitor-owned launch handle is unavailable in this process; stop state is unchanged",
+                    "the registered launch handle is unavailable in this process; stop state is unchanged",
                 )
             if row["phase"] == "stopping":
                 if row["stop_reason"] != reason:
@@ -2570,6 +2622,62 @@ class SandboxExecutionJournalMixin:
                         "a different stop reason is already durable; fence retained",
                     )
                 updated = self._sandbox_execution_view(row)
+            elif row["phase"] == "launched":
+                if row["stop_reason"] and row["stop_reason"] != reason:
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "a different stop reason is already durable; fence retained",
+                    )
+                # A pre-running launch has no init PID, so it cannot enter the
+                # `stopping` phase (whose schema requires that identity). Persist
+                # intent as an append-only, hash-chained event; record_running
+                # checks it under the same gate lock before it can authorize GO.
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    attempt = self._active_attempt(
+                        connection, attempt_id, claim_token, int(time.time())
+                    )
+                    if attempt["status"] != "working":
+                        raise SupervisorError(
+                            "claim_inactive", "sandbox attempt is no longer working"
+                        )
+                    self._authenticate_attempt(connection, attempt, credential)
+                    durable_row = connection.execute(
+                        "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                    ).fetchone()
+                    if (
+                        durable_row is None
+                        or durable_row["claim_token"] != claim_token
+                        or durable_row["execution_id"] != execution_id
+                        or durable_row["phase"] != "launched"
+                    ):
+                        raise SupervisorError(
+                            "sandbox_execution_transition_conflict",
+                            "execution changed before recording pre-running stop intent",
+                        )
+                    existing_intent = _sandbox_execution_launch_stop_reason(connection, durable_row)
+                    if existing_intent and existing_intent != reason:
+                        raise SupervisorError(
+                            "sandbox_execution_transition_conflict",
+                            "a different stop reason is already durable; fence retained",
+                        )
+                    if existing_intent is None:
+                        self._event(
+                            connection,
+                            "sandbox.execution_stop_requested",
+                            attempt["agent_id"],
+                            {
+                                "attempt_id": attempt_id,
+                                "claim_token": claim_token,
+                                "execution_id": execution_id,
+                                "phase": "launched",
+                                "stop_reason": reason,
+                                "stop_pending": True,
+                            },
+                        )
+                    updated = self._sandbox_execution_view(durable_row)
+                    updated["stop_reason"] = reason
+                    updated["stop_requested"] = True
             else:
                 if row["phase"] != "running":
                     raise SupervisorError(
@@ -2618,6 +2726,9 @@ class SandboxExecutionJournalMixin:
                     claim_token,
                     wait_receipt.execution_id,
                 )
+                # The monitor key is process-local and no longer needed after
+                # the exact runc child has a durable kernel-wait receipt.
+                locked_handle._monitor_client = None
             return updated
 
     def _sandbox_execution_record_exit_under_gate_lock(

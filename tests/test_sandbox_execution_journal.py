@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import select
 import sqlite3
 import threading
 import weakref
@@ -28,6 +29,7 @@ from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker
 from agent_control_plane.supervisor import sandbox_attestation as sandbox_attestation_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
+from agent_control_plane.supervisor import sandbox_monitor_ipc as monitor_ipc_module
 from agent_control_plane.supervisor import sandbox_monitor_lifecycle as monitor_lifecycle_module
 from agent_control_plane.supervisor import workers as workers_module
 from agent_control_plane.supervisor.common import canonical_json
@@ -38,7 +40,10 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
 )
-from agent_control_plane.supervisor.sandbox_monitor_receipt import SandboxMonitorReceipt
+from agent_control_plane.supervisor.sandbox_monitor_receipt import (
+    SandboxMonitorReceipt,
+    sandbox_attempt_slice_unit,
+)
 from agent_control_plane.supervisor.sandbox_workspace import (
     ManifestEntry,
     _make_manifest,
@@ -86,6 +91,59 @@ def _request_stop_from_fresh_process(
         result_sender.send(("ok", updated["phase"]))
     finally:
         result_sender.close()
+
+
+def _terminate_worker_from_forked_process(
+    repo: Path,
+    attempt_id: str,
+    inherited_handle: oci_worker.RuncLaunchHandle,
+    inherited_record: oci_worker._RuncLaunchRecord,
+    result_sender,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    try:
+        supervisor.terminate_worker(attempt_id)
+    except SupervisorError as error:
+        global_locks = (
+            oci_worker._RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK,
+            oci_worker._RUNC_LAUNCH_RECORDS_LOCK,
+            oci_worker._RUNC_WAIT_RECEIPTS_LOCK,
+        )
+        acquired_locks = []
+        for lock in global_locks:
+            if not lock.acquire(timeout=1):
+                break
+            acquired_locks.append(lock)
+        locks_available = len(acquired_locks) == len(global_locks)
+        for lock in reversed(acquired_locks):
+            lock.release()
+        gate_lock_available = inherited_handle._gate_lock.acquire(timeout=1)
+        if gate_lock_available:
+            inherited_handle._gate_lock.release()
+        wait_lock_available = inherited_record.wait_lock.acquire(timeout=1)
+        if wait_lock_available:
+            inherited_record.wait_lock.release()
+        result_sender.send(
+            (
+                error.code,
+                inherited_handle._monitor_client is None,
+                locks_available,
+                gate_lock_available,
+                wait_lock_available,
+                inherited_handle._gate_writer is None,
+            )
+        )
+    else:
+        result_sender.send(("unexpected_success", inherited_handle._monitor_client is None))
+    finally:
+        result_sender.close()
+
+
+def _forked_child_wait_for_release(ready_sender, release_receiver) -> None:
+    ready_sender.send(True)
+    release_receiver.recv()
+    ready_sender.close()
+    release_receiver.close()
 
 
 def _retry_launch_submission_from_fresh_process(
@@ -1468,7 +1526,7 @@ def test_running_transition_rechecks_systemd_identity_under_gate_lock(
         os.close(gate_read)
 
 
-def test_stop_before_running_transition_is_rejected_without_gate_release(repo: Path) -> None:
+def test_stop_before_running_transition_is_recorded_without_gate_release(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     execution = reserve(supervisor, attempt)
@@ -1476,12 +1534,18 @@ def test_stop_before_running_transition_is_rejected_without_gate_release(repo: P
     handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
     try:
         record_launch(supervisor, attempt, runc_handle=handle)
-        with pytest.raises(SupervisorError) as not_running:
-            supervisor._sandbox_execution_request_stop(
-                attempt["id"], attempt["claim_token"], "cancel before init"
+        stopped = supervisor._sandbox_execution_request_stop(
+            attempt["id"], attempt["claim_token"], "cancel before init"
+        )
+        assert stopped["phase"] == "launched"
+        assert stopped["stop_reason"] == "cancel before init"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(connection, durable)
+                == "cancel before init"
             )
-        assert not_running.value.code == "sandbox_execution_transition_invalid"
-        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
         with pytest.raises(SupervisorError) as rejected:
             handle.release_gate()
         assert rejected.value.code == "sandbox_launch_gate_not_authorized"
@@ -1520,7 +1584,7 @@ def test_stop_after_running_transition_revokes_unconsumed_gate_permit(repo: Path
         os.close(gate_read)
 
 
-@pytest.mark.parametrize("phase_before_reconnect", ["running", "stopping"])
+@pytest.mark.parametrize("phase_before_reconnect", ["launched", "running", "stopping"])
 def test_reconnected_supervisor_without_monitor_handle_does_not_claim_stop_applied(
     repo: Path, phase_before_reconnect: str
 ) -> None:
@@ -1532,7 +1596,8 @@ def test_reconnected_supervisor_without_monitor_handle_does_not_claim_stop_appli
     reason = "cancel after supervisor reconnect"
     try:
         record_launch(supervisor, attempt, runc_handle=handle)
-        assert record_running(supervisor, attempt)["phase"] == "running"
+        if phase_before_reconnect != "launched":
+            assert record_running(supervisor, attempt)["phase"] == "running"
         if phase_before_reconnect == "stopping":
             assert (
                 supervisor._sandbox_execution_request_stop(
@@ -1577,6 +1642,67 @@ def test_reconnected_supervisor_without_monitor_handle_does_not_claim_stop_appli
             os.set_blocking(gate_read, False)
             with pytest.raises(BlockingIOError):
                 os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_stop_from_launched_revokes_gate_before_running_transition(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        receipt = running_attestation(supervisor, attempt)
+
+        stopped = supervisor._sandbox_execution_request_stop(
+            attempt["id"], attempt["claim_token"], "terminate_worker"
+        )
+        assert stopped["phase"] == "launched"
+        assert stopped["stop_reason"] == "terminate_worker"
+        with pytest.raises(SupervisorError) as rejected:
+            handle.release_gate()
+        assert rejected.value.code == "sandbox_launch_gate_not_authorized"
+        repeated = supervisor._sandbox_execution_request_stop(
+            attempt["id"], attempt["claim_token"], "terminate_worker"
+        )
+        assert repeated["phase"] == "launched"
+        assert repeated["stop_reason"] == "terminate_worker"
+        with pytest.raises(SupervisorError) as running_rejected:
+            supervisor._sandbox_execution_record_running(
+                attempt["id"],
+                attempt["claim_token"],
+                attestation=receipt,
+                runc_handle=handle,
+            )
+        assert running_rejected.value.code == "sandbox_execution_transition_invalid"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(connection, durable)
+                == "terminate_worker"
+            )
+            stop_intents = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM events
+                WHERE event_type = 'sandbox.execution_stop_requested'
+                  AND json_extract(payload_json, '$.phase') = 'launched'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.claim_token') = ?
+                  AND json_extract(payload_json, '$.execution_id') = ?
+                """,
+                (attempt["id"], attempt["claim_token"], execution["execution_id"]),
+            ).fetchone()[0]
+            assert stop_intents == 1
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
     finally:
         handle.close_gate()
         os.close(gate_read)
@@ -3078,6 +3204,256 @@ def test_journaled_sandbox_termination_never_opens_registered_host_pid(
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
+def test_journaled_termination_reuses_exact_startup_monitor_client(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    launched = record_launch(supervisor, attempt, runc_handle=handle)
+    identity = (attempt["id"], attempt["claim_token"], execution["execution_id"])
+    monitor_slice_control_group = "/user.slice/user-1000.slice/user@1000.service/user-acp.slice"
+    attempt_slice_unit = sandbox_attempt_slice_unit(*identity)
+    attempt_slice_control_group = f"{monitor_slice_control_group}/{attempt_slice_unit}"
+    receipt = SandboxMonitorReceipt(
+        controller_pid=os.getpid(),
+        attempt_id=identity[0],
+        claim_token=identity[1],
+        execution_id=identity[2],
+        unit=launched["wrapper_unit"],
+        invocation_id=launched["wrapper_invocation_id"],
+        control_group=launched["wrapper_cgroup_path"],
+        main_pid=101,
+        main_identity="linux:101:1101",
+        monitor_slice_unit="user-acp.slice",
+        monitor_slice_control_group=monitor_slice_control_group,
+        attempt_slice_unit=attempt_slice_unit,
+        attempt_slice_control_group=attempt_slice_control_group,
+    )
+    client = object.__new__(monitor_ipc_module.SandboxMonitorControlClient)
+    client._receipt = receipt
+    client.status = lambda: SimpleNamespace(
+        outcome="ok",
+        payload={
+            "phase": "running",
+            "scope_unit": launched["scope_unit"],
+            "scope_invocation_id": launched["scope_invocation_id"],
+            "scope_control_group": launched["cgroup_path"],
+        },
+    )
+    cancel_ids: list[str] = []
+    client.cancel = lambda request_id: (
+        cancel_ids.append(request_id)
+        or SimpleNamespace(outcome="ok", payload={"phase": "stopping"})
+    )
+    with handle._gate_lock:
+        handle._monitor_client = client
+
+    def reconnect_must_not_run(**_kwargs: object) -> None:
+        pytest.fail("original controller must reuse its exact startup client, not recover")
+
+    monkeypatch.setattr(
+        monitor_lifecycle_module, "reconnect_sandbox_monitor", reconnect_must_not_run
+    )
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "sandbox_monitor_control_paths",
+        lambda **_kwargs: pytest.fail("cached monitor client must not reread recovery files"),
+    )
+    try:
+        first = supervisor.terminate_worker(attempt["id"])
+        second = supervisor.terminate_worker(attempt["id"])
+
+        assert first == second
+        assert first["outcome"] == "stop_pending"
+        assert first["phase"] == "launched"
+        assert first["monitor_phase"] == "stopping"
+        assert first["stop_requested"] is True
+        assert first["cleanup_verified"] is False
+        assert len(cancel_ids) == 2 and cancel_ids[0] == cancel_ids[1]
+        assert "_monitor_client" not in repr(handle)
+        assert handle._monitor_client is client
+        assert handle._gate_writer is None
+        assert os.read(gate_read, 1) == b""
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_closed"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_journaled_termination_rejects_cached_monitor_client_for_other_execution(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    launched = record_launch(supervisor, attempt, runc_handle=handle)
+    identity = (attempt["id"], attempt["claim_token"], execution["execution_id"])
+    monitor_slice_control_group = "/user.slice/user-1000.slice/user@1000.service/user-acp.slice"
+    other_identity = (identity[0], identity[1], "00000000-0000-4000-8000-000000000001")
+    other_unit = journal_module._sandbox_monitor_service_unit(*other_identity)
+    other_slice = sandbox_attempt_slice_unit(*other_identity)
+    wrong_receipt = SandboxMonitorReceipt(
+        controller_pid=os.getpid(),
+        attempt_id=other_identity[0],
+        claim_token=other_identity[1],
+        execution_id=other_identity[2],
+        unit=other_unit,
+        invocation_id="4" * 32,
+        control_group=f"{monitor_slice_control_group}/{other_unit}",
+        main_pid=101,
+        main_identity="linux:101:1101",
+        monitor_slice_unit="user-acp.slice",
+        monitor_slice_control_group=monitor_slice_control_group,
+        attempt_slice_unit=other_slice,
+        attempt_slice_control_group=f"{monitor_slice_control_group}/{other_slice}",
+    )
+    wrong_client = object.__new__(monitor_ipc_module.SandboxMonitorControlClient)
+    wrong_client._receipt = wrong_receipt
+    with handle._gate_lock:
+        handle._monitor_client = wrong_client
+
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "reconnect_sandbox_monitor",
+        lambda **_kwargs: pytest.fail("a mismatched cached client must not fall back to recovery"),
+    )
+    try:
+        with pytest.raises(SupervisorError) as termination:
+            supervisor.terminate_worker(attempt["id"])
+
+        assert termination.value.code == "sandbox_execution_monitor_identity_mismatch"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable is not None and durable["phase"] == "launched"
+        assert handle._monitor_client is wrong_client
+        assert handle._gate_writer is None
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_closed"
+        assert launched["phase"] == "launched"
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_forked_process_cannot_reuse_parent_launch_handle(
+    repo: Path,
+) -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("fork is unavailable on this platform")
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    record_launch(supervisor, attempt, runc_handle=handle)
+    inherited_record = oci_worker._runc_launch_record(handle)
+    assert inherited_record is not None
+    inherited_client_marker = object()
+    with handle._gate_lock:
+        handle._monitor_client = inherited_client_marker
+
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_terminate_worker_from_forked_process,
+        args=(repo, attempt["id"], handle, inherited_record, sender),
+    )
+    try:
+        held_locks = (
+            oci_worker._RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK,
+            oci_worker._RUNC_LAUNCH_RECORDS_LOCK,
+            oci_worker._RUNC_WAIT_RECEIPTS_LOCK,
+            handle._gate_lock,
+            inherited_record.wait_lock,
+        )
+        for lock in held_locks:
+            lock.acquire()
+        try:
+            process.start()
+        finally:
+            for lock in reversed(held_locks):
+                lock.release()
+        sender.close()
+        assert receiver.poll(10), "forked stop attempt did not return"
+        (
+            error_code,
+            inherited_client_cleared,
+            inherited_global_locks_available,
+            inherited_gate_lock_available,
+            inherited_wait_lock_available,
+            inherited_gate_closed,
+        ) = receiver.recv()
+        process.join(10)
+        assert process.exitcode == 0
+        assert error_code == "sandbox_execution_monitor_unavailable"
+        assert inherited_client_cleared is True
+        assert inherited_global_locks_available is True
+        assert inherited_gate_lock_available is True
+        assert inherited_wait_lock_available is True
+        assert inherited_gate_closed is True
+        assert handle._monitor_client is inherited_client_marker
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(
+                    connection, supervisor._sandbox_execution_get(attempt["id"])
+                )
+                is None
+            )
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+        receiver.close()
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_fork_closes_gate_writer_created_before_handle_registration() -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("fork is unavailable on this platform")
+    gate_read, gate_write = oci_worker._create_runc_launch_gate_pipe()
+    context = multiprocessing.get_context("fork")
+    ready_receiver, ready_sender = context.Pipe(duplex=False)
+    release_receiver, release_sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_forked_child_wait_for_release,
+        args=(ready_sender, release_receiver),
+    )
+    try:
+        process.start()
+        ready_sender.close()
+        release_receiver.close()
+        assert ready_receiver.poll(5), "forked child did not reach its hold point"
+        assert ready_receiver.recv() is True
+
+        oci_worker._close_runc_launch_gate_writer(gate_write)
+        gate_write = -1
+        readable, _, _ = select.select([gate_read], [], [], 2)
+        assert readable, "forked child retained the pre-registration gate writer"
+        assert os.read(gate_read, 1) == b""
+
+        release_sender.send(True)
+        process.join(5)
+        assert process.exitcode == 0
+    finally:
+        if gate_write >= 0:
+            oci_worker._close_runc_launch_gate_writer(gate_write)
+        os.close(gate_read)
+        release_sender.close()
+        ready_receiver.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+
 def test_journaled_sandbox_termination_reuses_identity_bound_monitor_cancel_id(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3092,8 +3468,21 @@ def test_journaled_sandbox_termination_reuses_identity_bound_monitor_cancel_id(
     cancel_ids: list[str] = []
     reconnect_calls: list[dict[str, object]] = []
 
-    client = SimpleNamespace(
-        status=lambda: SimpleNamespace(
+    def status():
+        # There is no init PID yet, so the journal truthfully remains launched;
+        # the durable pre-init stop intent is carried by its hash-chained event.
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(
+                    connection, supervisor._sandbox_execution_get(attempt["id"])
+                )
+                == "terminate_worker"
+            )
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_closed"
+        return SimpleNamespace(
             outcome="ok",
             payload={
                 "phase": "running",
@@ -3101,7 +3490,10 @@ def test_journaled_sandbox_termination_reuses_identity_bound_monitor_cancel_id(
                 "scope_invocation_id": execution_with_scope["scope_invocation_id"],
                 "scope_control_group": execution_with_scope["cgroup_path"],
             },
-        ),
+        )
+
+    client = SimpleNamespace(
+        status=status,
         cancel=lambda request_id: (
             cancel_ids.append(request_id)
             or SimpleNamespace(outcome="ok", payload={"phase": "stopping"})
@@ -3138,15 +3530,61 @@ def test_journaled_sandbox_termination_reuses_identity_bound_monitor_cancel_id(
         second = supervisor.terminate_worker(attempt["id"])
 
         assert first == second
-        assert first["phase"] == "stopping"
-        assert first["outcome"] == "ok"
+        assert first["phase"] == "launched"
+        assert first["monitor_phase"] == "stopping"
+        assert first["cleanup_verified"] is False
+        assert first["outcome"] == "stop_pending"
+        assert first["stop_requested"] is True
         assert len(reconnect_calls) == 2
         assert cancel_ids[0] == cancel_ids[1]
         assert len(cancel_ids[0]) == 32
-        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(connection, durable)
+                == "terminate_worker"
+            )
+        assert os.read(gate_read, 3) == b""
     finally:
         handle.close_gate()
         os.close(gate_read)
+
+
+def test_terminal_termination_reports_durable_stop_without_fake_monitor_phase(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    record_launch(supervisor, attempt, runc_handle=handle)
+    try:
+        assert record_running(supervisor, attempt)["phase"] == "running"
+        assert (
+            supervisor._sandbox_execution_request_stop(
+                attempt["id"], attempt["claim_token"], "terminate_worker"
+            )["phase"]
+            == "stopping"
+        )
+        with handle._gate_lock:
+            handle._monitor_client = object()
+        assert record_exit(supervisor, attempt)["phase"] == "exited"
+        assert handle._monitor_client is None
+        monkeypatch.setattr(
+            supervisor,
+            "_cancel_sandbox_execution_monitor",
+            lambda _execution: pytest.fail("terminal execution must not claim a monitor query"),
+        )
+
+        result = supervisor.terminate_worker(attempt["id"])
+
+        assert result["phase"] == "exited"
+        assert result["stop_requested"] is True
+        assert result["monitor_phase"] is None
+        assert result["cleanup_verified"] is False
+    finally:
+        handle.close_gate()
 
 
 def test_ambiguous_monitor_cancel_keeps_sandbox_execution_fenced(
@@ -3195,7 +3633,16 @@ def test_ambiguous_monitor_cancel_keeps_sandbox_execution_fenced(
             supervisor.terminate_worker(attempt["id"])
 
         assert termination.value.code == "sandbox_execution_monitor_ambiguous"
-        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(connection, durable)
+                == "terminate_worker"
+            )
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_closed"
     finally:
         handle.close_gate()
         os.close(gate_read)
@@ -3244,7 +3691,16 @@ def test_monitor_for_another_scope_cannot_cancel_this_execution(
 
         assert termination.value.code == "sandbox_execution_monitor_identity_mismatch"
         assert cancel_calls == []
-        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable["phase"] == "launched"
+        with supervisor.connect() as connection:
+            assert (
+                journal_module._sandbox_execution_launch_stop_reason(connection, durable)
+                == "terminate_worker"
+            )
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_closed"
     finally:
         handle.close_gate()
         os.close(gate_read)

@@ -136,9 +136,61 @@ def test_cancel_stops_only_the_bound_scope_and_verifies_inactive_empty_state(
 
     assert response["phase"] == "exited"
     assert len(calls) == 1
-    assert calls[0][-2:] == ["--", binding.scope_unit]
-    assert "stop" in calls[0]
+    assert calls[0][-3:] == ["stop", "--", binding.scope_unit]
+    assert "--no-block" in calls[0]
     assert binding.attempt_slice_unit not in calls[0]
+
+
+def test_cancel_accepts_an_already_stopping_exact_scope_without_another_stop_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_scope_status",
+        lambda current: {
+            "phase": "stopping",
+            "scope_unit": current.scope_unit,
+            "scope_invocation_id": current.scope_invocation_id,
+            "scope_control_group": current.scope_control_group,
+        },
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: calls.append(argv) or b"",
+    )
+
+    response = monitor_service._cancel_scope(binding)
+
+    assert response["phase"] == "stopping"
+    assert calls == []
+
+
+def test_cancel_refuses_activating_scope_without_acknowledging_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    properties = {
+        "Id": binding.scope_unit,
+        "LoadState": "loaded",
+        "ActiveState": "activating",
+        "InvocationID": binding.scope_invocation_id,
+        "ControlGroup": binding.scope_control_group,
+        "Slice": binding.attempt_slice_unit,
+    }
+    monkeypatch.setattr(monitor_service, "_unit_properties", lambda *_args: properties)
+    monkeypatch.setattr(monitor_service, "_scope_population", lambda _path: 1)
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda *_args, **_kwargs: pytest.fail("unverified activation must not be acknowledged"),
+    )
+
+    assert monitor_service._scope_status(binding)["phase"] == "unknown"
+    with pytest.raises(monitor_service.SandboxMonitorServiceError):
+        monitor_service._cancel_scope(binding)
 
 
 def test_monitor_start_creates_initial_key_but_never_places_it_in_service_argv(
@@ -185,6 +237,7 @@ def test_monitor_start_creates_initial_key_but_never_places_it_in_service_argv(
         lambda *_args: {"LoadState": "not-found"},
     )
     commands: list[list[str]] = []
+    client_options: dict[str, object] = {}
     monkeypatch.setattr(
         monitor_service,
         "_run_trusted_runtime_command",
@@ -203,7 +256,11 @@ def test_monitor_start_creates_initial_key_but_never_places_it_in_service_argv(
         def status(self):
             return SimpleNamespace(outcome="ok", payload={"phase": "running"})
 
-    monkeypatch.setattr(monitor_service, "SandboxMonitorControlClient", lambda **_kwargs: Client())
+    def make_client(**kwargs):
+        client_options.update(kwargs)
+        return Client()
+
+    monkeypatch.setattr(monitor_service, "SandboxMonitorControlClient", make_client)
     client = monitor_service.start_sandbox_execution_monitor(
         state_path=state_path,
         expected_identity=identity,
@@ -214,6 +271,7 @@ def test_monitor_start_creates_initial_key_but_never_places_it_in_service_argv(
     )
 
     assert isinstance(client, Client)
+    assert client_options["timeout_seconds"] == 15.0
     assert (control_directory / "scope-binding.json").is_file()
     key_path = control_directory / f"{sandbox_container_id(*identity)}.control-key"
     assert key_path.stat().st_mode & 0o777 == 0o600

@@ -165,6 +165,68 @@ def test_monitor_client_authenticates_systemd_owned_server_and_round_trips_statu
     assert not socket_path.exists()
 
 
+def test_monitor_control_client_cannot_be_reused_from_a_forked_process(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(os, "fork"):
+        pytest.skip("fork is unavailable on this platform")
+    calls = {"status": 0, "cancel": 0}
+
+    def status() -> dict[str, object]:
+        calls["status"] += 1
+        return {"phase": "running", "worker_pid": 500}
+
+    def cancel() -> dict[str, object]:
+        calls["cancel"] += 1
+        return {"phase": "stopping", "worker_pid": 500}
+
+    server, receipt, socket_path, _private = _server(
+        tmp_path, status_provider=status, cancel_action=cancel
+    )
+    thread = _serve(server)
+    client = SandboxMonitorControlClient(
+        receipt=receipt,
+        socket_path=socket_path,
+        key=_KEY,
+        expected_uid=os.geteuid(),
+    )
+    receiver, sender = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(receiver)
+        outcomes: dict[str, str] = {}
+        for operation in ("status", "cancel"):
+            try:
+                if operation == "status":
+                    client.status()
+                else:
+                    client.cancel("f" * 32)
+            except SandboxMonitorIPCError as error:
+                outcomes[operation] = str(error)
+            else:
+                outcomes[operation] = "accepted"
+        os.write(sender, json.dumps(outcomes, sort_keys=True).encode("ascii"))
+        os.close(sender)
+        os._exit(0)
+    os.close(sender)
+    try:
+        child_outcomes = json.loads(os.read(receiver, 4096).decode("ascii"))
+        _waited_pid, status_code = os.waitpid(child_pid, 0)
+        assert os.WIFEXITED(status_code) and os.WEXITSTATUS(status_code) == 0
+        assert child_outcomes == {
+            "status": "monitor control client cannot be reused after fork",
+            "cancel": "monitor control client cannot be reused after fork",
+        }
+        assert client.status().outcome == "ok"
+        assert client.cancel("e" * 32).outcome == "ok"
+        assert calls == {"status": 1, "cancel": 1}
+    finally:
+        os.close(receiver)
+        _stop(server, thread)
+
+    assert not socket_path.exists()
+
+
 def test_server_rejects_a_second_concurrent_serving_loop(tmp_path: Path) -> None:
     server, _receipt_value, _socket_path, _private = _server(tmp_path)
     thread = _serve(server)

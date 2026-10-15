@@ -3411,6 +3411,11 @@ class RuncLaunchHandle:
 
     _gate_writer: int | None
     _bundle_path: str | None = None
+    # The authenticated monitor client is process-local launch provenance. It
+    # is attached only while this exact handle is locked, never serialized, and
+    # intentionally omitted from repr because it retains the control key.
+    _monitor_client: Any | None = field(default=None, repr=False)
+    _owner_pid: int = field(default_factory=os.getpid, repr=False)
     _gate_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -3422,6 +3427,12 @@ class RuncLaunchHandle:
     def release_gate(self) -> None:
         """Release the init gate after this launch's durable running transition."""
 
+        if self._owner_pid != os.getpid():
+            self._monitor_client = None
+            raise SupervisorError(
+                "sandbox_launch_gate_owner_mismatch",
+                "an inherited launch handle cannot release its parent process's OCI gate",
+            )
         with self._gate_lock:
             descriptor = self._gate_writer
             if descriptor is None:
@@ -3439,7 +3450,7 @@ class RuncLaunchHandle:
                     "OCI init launch gate could not be released",
                 ) from error
             finally:
-                os.close(descriptor)
+                _close_runc_launch_gate_writer(descriptor)
 
     def wait(self, timeout: float | None = None) -> _RuncClientWaitReceipt:
         """Reap this pinned-runc child and return its bound kernel wait receipt."""
@@ -3492,16 +3503,33 @@ class RuncLaunchHandle:
     def close_gate(self) -> None:
         """Close an unreleased gate so the OCI init's fixed trampoline exits."""
 
+        if self._owner_pid != os.getpid():
+            self._monitor_client = None
+            raise SupervisorError(
+                "sandbox_launch_gate_owner_mismatch",
+                "an inherited launch handle cannot close its parent process's OCI gate",
+            )
         with self._gate_lock:
-            descriptor = self._gate_writer
-            self._gate_writer = None
-            if descriptor is not None:
-                os.close(descriptor)
+            self._close_gate_locked()
+
+    def _close_gate_locked(self) -> None:
+        """Close the unreleased gate while the caller holds this handle's lock."""
+
+        if self._owner_pid != os.getpid():
+            self._monitor_client = None
+            raise SupervisorError(
+                "sandbox_launch_gate_owner_mismatch",
+                "an inherited launch handle cannot close its parent process's OCI gate",
+            )
+        descriptor = self._gate_writer
+        self._gate_writer = None
+        if descriptor is not None:
+            _close_runc_launch_gate_writer(descriptor)
 
     def __del__(self) -> None:
         try:
             self.close_gate()
-        except OSError:
+        except (OSError, SupervisorError):
             pass
 
 
@@ -3650,6 +3678,94 @@ _RUNC_WAIT_RECEIPTS: dict[
     int, tuple[weakref.ReferenceType[Any], tuple[int, str, int, str, int, str]]
 ] = {}
 _RUNC_WAIT_RECEIPTS_LOCK = threading.Lock()
+_RUNC_LAUNCH_FORK_GUARD = threading.Lock()
+_RUNC_LAUNCH_GATE_WRITERS: set[int] = set()
+
+
+def _before_runc_launch_fork() -> None:
+    """Serialize fork with gate-fd registration and close bookkeeping."""
+
+    _RUNC_LAUNCH_FORK_GUARD.acquire()
+
+
+def _after_runc_launch_fork_in_parent() -> None:
+    _RUNC_LAUNCH_FORK_GUARD.release()
+
+
+def _create_runc_launch_gate_pipe() -> tuple[int, int]:
+    """Create and track a gate writer atomically with respect to process fork."""
+
+    with _RUNC_LAUNCH_FORK_GUARD:
+        if hasattr(os, "pipe2"):
+            reader, writer = os.pipe2(os.O_CLOEXEC)
+        else:
+            reader, writer = os.pipe()
+            os.set_inheritable(reader, False)
+            os.set_inheritable(writer, False)
+        _RUNC_LAUNCH_GATE_WRITERS.add(writer)
+    return reader, writer
+
+
+def _close_runc_launch_gate_writer(descriptor: int) -> None:
+    """Close and unregister a gate writer without exposing an untracked fd."""
+
+    with _RUNC_LAUNCH_FORK_GUARD:
+        _RUNC_LAUNCH_GATE_WRITERS.discard(descriptor)
+        os.close(descriptor)
+
+
+def _reset_runc_launch_state_after_fork() -> None:
+    """Drop inherited launch capabilities and replace locks in the child.
+
+    A fork can inherit locks held by threads that do not survive in the child.
+    These registries and launch handles are process-local capabilities, so the
+    child invalidates them instead of trying to reconcile parent state.
+    """
+
+    global _RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK
+    global _RUNC_LAUNCH_SUBMISSION_TARGETS
+    global _RUNC_LAUNCH_RECORDS_LOCK
+    global _RUNC_LAUNCH_RECORDS
+    global _RUNC_WAIT_RECEIPTS_LOCK
+    global _RUNC_WAIT_RECEIPTS
+    global _RUNC_LAUNCH_FORK_GUARD
+    global _RUNC_LAUNCH_GATE_WRITERS
+
+    inherited_gate_writers = set(_RUNC_LAUNCH_GATE_WRITERS)
+    for reference, record in tuple(_RUNC_LAUNCH_RECORDS.values()):
+        object.__setattr__(record, "wait_lock", threading.Lock())
+        handle = reference()
+        if handle is None:
+            continue
+        handle._monitor_client = None
+        handle._gate_lock = threading.Lock()
+        descriptor = handle._gate_writer
+        handle._gate_writer = None
+        if descriptor is not None:
+            inherited_gate_writers.add(descriptor)
+
+    for descriptor in inherited_gate_writers:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    _RUNC_LAUNCH_SUBMISSION_TARGETS_LOCK = threading.Lock()
+    _RUNC_LAUNCH_SUBMISSION_TARGETS = {}
+    _RUNC_LAUNCH_RECORDS_LOCK = threading.RLock()
+    _RUNC_LAUNCH_RECORDS = {}
+    _RUNC_WAIT_RECEIPTS_LOCK = threading.Lock()
+    _RUNC_WAIT_RECEIPTS = {}
+    _RUNC_LAUNCH_FORK_GUARD = threading.Lock()
+    _RUNC_LAUNCH_GATE_WRITERS = set()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_runc_launch_fork,
+        after_in_parent=_after_runc_launch_fork_in_parent,
+        after_in_child=_reset_runc_launch_state_after_fork,
+    )
 
 
 @contextmanager
@@ -3671,6 +3787,9 @@ def _runc_launch_gate_lock_for_execution(
         for key, (reference, record) in tuple(_RUNC_LAUNCH_RECORDS.items()):
             handle = reference()
             if handle is None:
+                _RUNC_LAUNCH_RECORDS.pop(key, None)
+            elif handle._owner_pid != os.getpid():
+                handle._monitor_client = None
                 _RUNC_LAUNCH_RECORDS.pop(key, None)
             elif record.execution_binding == binding:
                 candidates.append(handle)
@@ -3710,7 +3829,11 @@ def _register_runc_launch_handle(
 ) -> None:
     """Keep launcher provenance in a private weak registry, not mutable fields."""
 
-    if type(handle) is not RuncLaunchHandle or type(target) is not _RuncLaunchTarget:
+    if (
+        type(handle) is not RuncLaunchHandle
+        or handle._owner_pid != os.getpid()
+        or type(target) is not _RuncLaunchTarget
+    ):
         raise SupervisorError("sandbox_runc_handle_invalid", "pinned runc handle is invalid")
     pid = getattr(process, "pid", None)
     if (
@@ -3747,6 +3870,9 @@ def _register_runc_launch_handle(
 
 def _runc_launch_record(handle: Any) -> _RuncLaunchRecord | None:
     if type(handle) is not RuncLaunchHandle:
+        return None
+    if handle._owner_pid != os.getpid():
+        handle._monitor_client = None
         return None
     with _RUNC_LAUNCH_RECORDS_LOCK:
         registered = _RUNC_LAUNCH_RECORDS.get(id(handle))
@@ -4298,7 +4424,7 @@ def _spawn_pinned_runc(
         opened_descriptor = -1
         os.close(descriptor_to_close)
         start_read, start_write = os.pipe2(os.O_CLOEXEC)
-        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        gate_read, gate_write = _create_runc_launch_gate_pipe()
         launcher_environment = {
             "HOME": runtime_environment["HOME"],
             "PATH": runtime_environment["PATH"],
@@ -4375,7 +4501,7 @@ def _spawn_pinned_runc(
             descriptor_to_close = gate_write
             gate_write = -1
             try:
-                os.close(descriptor_to_close)
+                _close_runc_launch_gate_writer(descriptor_to_close)
             except BaseException as error:
                 cleanup_error = error
         if process is not None:
@@ -5048,7 +5174,7 @@ def _spawn_pinned_runc_with_private_bundle(
         status_read, status_write = os.pipe2(os.O_CLOEXEC)
         map_ack_read, map_ack_write = os.pipe2(os.O_CLOEXEC)
         exec_ack_read, exec_ack_write = os.pipe2(os.O_CLOEXEC)
-        gate_read, gate_write = os.pipe2(os.O_CLOEXEC)
+        gate_read, gate_write = _create_runc_launch_gate_pipe()
         snapshot_socket_parent, snapshot_socket_child = socket.socketpair(
             socket.AF_UNIX,
             socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
@@ -5278,7 +5404,7 @@ def _spawn_pinned_runc_with_private_bundle(
             descriptor = gate_write
             gate_write = -1
             try:
-                os.close(descriptor)
+                _close_runc_launch_gate_writer(descriptor)
             except BaseException as error:
                 cleanup_error = error
         if process is not None:

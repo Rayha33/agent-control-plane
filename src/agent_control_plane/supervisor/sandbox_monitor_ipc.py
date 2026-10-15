@@ -2,10 +2,12 @@
 
 This module implements authenticated control messages and durable replay
 protection. It does not start workers, create or accept a runc launch handle, or
-connect the protocol to ``run_worker``. A server stores injected status/cancel
-callbacks, which may retain caller-owned state. No production worker-execution
-path invokes this protocol today. It exposes only status and cancellation, so a
-controller cannot ask it to reconstruct or start an execution from
+connect the protocol to ``run_worker``. The journal's launch-record boundary
+may retain its authenticated startup client against the exact process-local
+launch handle. A server stores injected status/cancel callbacks, which may
+retain caller-owned state. ``run_worker`` remains fail-closed and has no
+supported OCI launch caller. This protocol exposes only status and cancellation,
+so a controller cannot ask it to reconstruct or start an execution from
 caller-supplied data.
 """
 
@@ -39,6 +41,7 @@ _MAX_FRAME_BYTES = 4096
 _MAX_STATUS_BYTES = 2048
 _MAX_REQUESTS = 256
 _CONTROL_KEY_BYTES = 32
+SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS = 15.0
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SOCKET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,72}\.sock\Z")
 _SCOPE_UNIT = re.compile(r"[A-Za-z0-9_.:@\\-]+\.scope\Z")
@@ -762,10 +765,15 @@ class SandboxMonitorControlClient:
         self._key = key
         self._expected_uid = expected_uid
         self._timeout_seconds = float(timeout_seconds)
+        self._creator_pid = os.getpid()
 
     def _request(
         self, operation: str, request_id: str | None = None
     ) -> SandboxMonitorControlResponse:
+        if self._creator_pid != os.getpid():
+            # A forked child must not inherit a usable cancellation capability.
+            self._key = b""
+            raise SandboxMonitorIPCError("monitor control client cannot be reused after fork")
         request_id = secrets.token_hex(16) if request_id is None else request_id
         if not isinstance(request_id, str) or _REQUEST_ID.fullmatch(request_id) is None:
             raise SandboxMonitorIPCError(

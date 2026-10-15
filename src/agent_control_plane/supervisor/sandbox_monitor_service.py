@@ -28,6 +28,7 @@ from .sandbox_attestation import (
     _trusted_systemd_command_environment,
 )
 from .sandbox_monitor_ipc import (
+    SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS,
     SandboxMonitorControlClient,
     SandboxMonitorControlServer,
     SandboxMonitorIPCError,
@@ -446,14 +447,14 @@ def _scope_status(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
         return {"phase": "running", **identity_payload}
     if properties["ActiveState"] == "inactive" and populated == 0:
         return {"phase": "exited", **identity_payload}
-    if properties["ActiveState"] in {"deactivating", "activating"} and populated in {0, 1}:
+    if properties["ActiveState"] == "deactivating" and populated in {0, 1}:
         return {"phase": "stopping", **identity_payload}
     return {"phase": "unknown", **identity_payload}
 
 
 def _cancel_scope(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
     initial = _scope_status(binding)
-    if initial["phase"] == "exited":
+    if initial["phase"] in {"stopping", "exited"}:
         return initial
     if initial["phase"] != "running":
         raise SandboxMonitorServiceError("monitor refuses to cancel an unverified scope")
@@ -461,6 +462,7 @@ def _cancel_scope(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
         [
             str(_trusted_systemctl_executable()),
             "--user",
+            "--no-block",
             "stop",
             "--",
             binding.scope_unit,
@@ -470,13 +472,13 @@ def _cancel_scope(binding: SandboxMonitorScopeBinding) -> dict[str, Any]:
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         current = _scope_status(binding)
-        if current["phase"] == "exited":
+        if current["phase"] in {"stopping", "exited"}:
             return current
         if current["phase"] == "unknown":
             raise SandboxMonitorServiceError("scope identity changed during cancellation")
         time.sleep(0.05)
     current = _scope_status(binding)
-    if current["phase"] == "stopping":
+    if current["phase"] in {"stopping", "exited"}:
         return current
     raise SandboxMonitorServiceError("scope cancellation did not reach a verified state")
 
@@ -741,7 +743,10 @@ def start_sandbox_execution_monitor(
         socket_path=socket_path,
         key=key,
         expected_uid=os.geteuid(),
-        timeout_seconds=min(2.0, float(timeout_seconds)),
+        timeout_seconds=min(
+            30.0,
+            max(SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS, float(timeout_seconds)),
+        ),
     )
     response = client.status()
     if response.outcome != "ok" or response.payload.get("phase") != "running":

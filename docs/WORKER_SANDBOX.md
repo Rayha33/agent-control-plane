@@ -551,13 +551,50 @@ manager. The live no-model OCI fixture now exercises this producer through
 candidate payload writes remain absent until the durable `running` transition.
 This is a fixture-driven trusted launch-record path, not a call from
 `WorkersMixin.run_worker()`, which remains fail-closed. Journaled termination
-is covered separately by no-model unit tests with a stub monitor; the live test
-does not yet drive cancellation through `WorkersMixin.terminate_worker()`.
-Independent source QC found no key/identity boundary defect in the component,
-and flagged a same-user systemd stop-by-name time-of-check/time-of-use race as
-a residual hardening item. This does not prove production worker integration,
-real-OCI cleanup, credential/egress policy, result import or `cleanup_verified`;
-#2370 remains open.
+`terminate_worker()` records stop intent and revokes the one-shot launch permit
+under the registered handle's gate lock. The original controller then closes
+an unreleased init gate under that same lock so its fixed trampoline exits on
+EOF, and reuses the exact authenticated startup client; it does not run restart
+reconciliation from the client-creating PID. If the gate has already been
+released, the monitor requests `systemctl stop --no-block` for the exact scope
+and only acknowledges a freshly observed `stopping` or `exited` state.
+Reconnected controllers use the authenticated recovery path; a supervisor
+without the exact process-local handle fails closed before monitor IPC because
+it cannot serialize against that handle's gate. Monitor clients bind to their
+creating PID and reject status/cancel calls from a forked child. The fork hook
+replaces inherited launch registries and global/handle/wait locks, clears
+cached key-bearing clients, and closes copied gate writers. Gate-pipe creation
+and close bookkeeping are serialized with fork, so a child also closes a
+tracked writer in the pre-handle-registration window and cannot delay gate EOF.
+
+A launch still in phase `launched` has no init PID, so its journal phase remains
+`launched`; the pre-init stop intent is an append-only hash-chained event rather
+than the row's `stop_reason` field. The running transition checks that event
+before and under the same lock. A successful monitor acknowledgement in this
+case is reported as `stop_pending`, not as a phase change or cleanup proof.
+Ambiguous responses retain the durable stop intent and resource fences;
+results report journal phase separately from monitor phase and do not infer
+`cleanup_verified`. Terminal journal responses reflect durable stop intent in
+`stop_requested` and leave `monitor_phase` unset when no monitor query was
+made.
+
+The opt-in live no-model OCI fixture passed both
+`test_live_monitor_journal_holds_payload_until_durable_running_transition`
+branches (`release` and `terminate`) on the disposable Ubuntu 26.04 ARM64 guest
+with pinned `runc-1.5.2`, dynamic BusyBox, systemd and cgroup v2. The terminate
+branch calls `WorkersMixin.terminate_worker()` after the durable `running`
+transition but before the one-shot init-gate release; it verifies the payload
+never ran, the exact runc client exited, and the journal records exit without
+claiming `cleanup_verified`. To permit this disposable-VM test, the
+unprivileged-user-namespace AppArmor sysctl was temporarily set to `0` and
+restored to `1` afterward; this is not evidence for operation under the
+original AppArmor restriction. Monitor IPC/service unit tests also passed on
+that Linux guest. This does not prove production worker integration, real-OCI
+cleanup verification, credential/egress policy, result import or
+`cleanup_verified`; #2370 remains open. Independent review is rechecking the
+final cancellation and fork-safety diff and found no P1/P2 blocker. The
+same-user systemd stop-by-name time-of-check/time-of-use race remains a
+separate hardening item.
 
 Do not add a lazy producer call to `terminate_worker()`: launch recording is
 the safe integration point because it runs with the registered handle and
@@ -3006,3 +3043,41 @@ This closes the arbitrary-sibling-cgroup gap for the launch client. It does
 not prove worker registration, monitor-owned cleanup, recovery after monitor
 crash, provider isolation, or end-to-end `run_worker()` acceptance; configured
 OCI worker execution remains disabled.
+
+### Production monitor producer and controller reconnect (2026-10-15)
+
+The opt-in
+`test_live_production_monitor_service_survives_controller_crash_and_cancels_exact_scope`
+passed (`1 passed`) on the dedicated disposable Lima guest: Ubuntu 26.04 ARM64,
+Linux 7.0.0-38-generic, Python 3.14.4, systemd 259.5, cgroup v2, and a running
+user manager. The test started the in-repo monitor service for a unique,
+no-model `/usr/bin/sleep` scope; checked exact scope/slice invocation and cgroup
+identity plus key-file permissions and absence from the receipt, monitor
+command line, and environment; killed the starting controller; reconnected
+through the durable receipt; observed the exact running scope; canceled it;
+replayed the same cancellation ID; and verified the scope and cgroup were
+inactive/empty. The fixture's `finally` path verified the exact unit
+activations and removed its private temporary directory. No model, provider,
+paid call, or external credential was used.
+
+The source files copied into the guest matched the host worktree byte-for-byte:
+
+| File | SHA-256 |
+| --- | --- |
+| `oci_worker.py` | `08c9b9dfb0e8fc9fb947d5caa7cd13705c3b21a6da7315f51a8926f42b915e7e` |
+| `sandbox_execution_journal.py` | `6f76eb4d6f9efa73c3e29a1c363d2b48a8f69f5ee5a41eb85137401f5649ce7a` |
+| `sandbox_monitor_ipc.py` | `b9147858a1cd30f04bb9273f6f26b9382970414366f929cb526525941b48fead` |
+| `sandbox_monitor_service.py` | `2bdc15107039447422c5d24f5970eb7a651d59f58f04a4d48ae511ca6aaf1058` |
+| `sandbox_monitor_lifecycle.py` | `b00dd5c714890aee467f6a2ab187ae1b12847780eaf5c004532dbd17fe4fb5db` |
+| `sandbox_monitor_receipt.py` | `ce03104fd7132baf8c8b34e5d45421c8dd899ac7bc35a60373191b3d1810af66` |
+| `workers.py` | `4a9dc7c87c351dbbe2c62e0964627096f2f33182136d8a14bbe353cec856d92e` |
+| `test_systemd_slice_integration.py` | `2cff01f66464fd6ad9d966fb5b9c67887f4c690a9b4edf417f1b124a481601d8` |
+
+Postflight found the AppArmor user-namespace setting restored to `1`, no
+failed or active ACP units, no ACP monitor processes or sockets, and no
+`acp-production-monitor-*` fixture. This proves the in-repo monitor producer,
+authenticated durable-receipt reconnect, exact-scope cancellation, and
+idempotent cancel replay. It does not prove the supervised worker boundary,
+provider credential/egress policy, validated result import, or production
+`run_worker()` integration; configured OCI worker execution remains
+fail-closed.

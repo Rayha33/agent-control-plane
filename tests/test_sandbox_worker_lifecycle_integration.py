@@ -1,10 +1,12 @@
-"""Opt-in live proof joining the OCI launch gate to the durable sandbox journal.
+"""Opt-in live proof joining the OCI launch gate, monitor, and journal.
 
 The process-local runc handle must remain in the exact systemd launch-driver
-process; a separate systemd-owned service controls the exact worker scope. This
-test proves only the real Linux launch-to-``running`` gate; it
-does not wire ``run_worker``, prove crash recovery or cleanup, authorize result
-import, or write a ``cleanup_verified`` receipt.
+process; a separate systemd-owned service controls the exact worker scope. The
+release case proves the launch-to-``running`` gate, while the terminate case
+requests cancellation through ``WorkersMixin.terminate_worker()`` before gate
+release and checks the real monitor response. Neither case wires
+``run_worker``, proves crash recovery or cleanup, authorizes result import, or
+writes a ``cleanup_verified`` receipt.
 
 Run on a disposable supported Linux host with rootless runc 1.5.2, delegated
 cgroup v2, and an active private systemd user manager:
@@ -187,6 +189,7 @@ def _monitor_child(
     claim_token: int,
     execution_id: str,
     control: Path,
+    terminate_before_gate: bool,
 ) -> None:
     """Perform process-local launch work in the driver and verify its monitor service."""
 
@@ -492,6 +495,51 @@ def _monitor_child(
             or git_marker.exists()
         ):
             raise RuntimeError("worker gate changed before parent observed durable running state")
+        if terminate_before_gate:
+            termination = supervisor.terminate_worker(attempt_id)
+            if (
+                termination.get("outcome") != "ok"
+                or termination.get("phase") != "stopping"
+                or termination.get("monitor_phase") not in {"stopping", "exited"}
+                or termination.get("stop_requested") is not True
+                or termination.get("cleanup_verified") is not False
+            ):
+                raise RuntimeError(f"live monitor termination was not truthful: {termination!r}")
+            if marker.exists() or git_marker.exists():
+                raise RuntimeError("worker payload ran despite cancellation before gate release")
+            wait_receipt = handle.wait(timeout=15.0)
+            exited = supervisor._sandbox_execution_record_exit(
+                attempt_id, claim_token, wait_receipt
+            )
+            if exited["phase"] != "exited":
+                raise RuntimeError("cancelled runc client did not record its exact exit receipt")
+            delete = subprocess.run(
+                [str(runc_pin.path), "--root", str(state_root), "delete", "--force", container_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+                env=oci_worker._runc_client_environment(),
+            )
+            if delete.returncode != 0:
+                raise RuntimeError("exact pinned runc state deletion failed after cancellation")
+            _write_json(
+                control / "result.json",
+                {
+                    "phase": exited["phase"],
+                    "stop_outcome": termination["outcome"],
+                    "stop_journal_phase": termination["phase"],
+                    "stop_monitor_phase": termination["monitor_phase"],
+                    "stop_requested": termination["stop_requested"],
+                    "stop_cleanup_verified": termination["cleanup_verified"],
+                    "runc_client_returncode": wait_receipt.returncode,
+                    "runc_state_deleted": not (state_root / container_id).exists(),
+                    "payload_marker_absent": not marker.exists(),
+                    "git_marker_absent": not git_marker.exists(),
+                    "cleanup_verified_written": False,
+                },
+            )
+            return
         handle.release_gate()
         _wait_for_path(marker, control / "error.json", timeout=10.0)
         if marker.read_text(encoding="ascii") != "candidate-payload-ran\n":
@@ -576,9 +624,9 @@ def _monitor_child(
 
 
 def _monitor_child_entry(argv: list[str]) -> None:
-    if len(argv) != 7:
-        raise SystemExit("monitor child requires seven arguments")
-    repo, rootfs, worktree, attempt_id, claim_token, execution_id, control = argv
+    if len(argv) != 8 or argv[7] not in {"0", "1"}:
+        raise SystemExit("monitor child requires seven arguments and a 0/1 terminate mode")
+    repo, rootfs, worktree, attempt_id, claim_token, execution_id, control, terminate_mode = argv
     _monitor_child(
         Path(repo),
         Path(rootfs),
@@ -587,6 +635,7 @@ def _monitor_child_entry(argv: list[str]) -> None:
         int(claim_token),
         execution_id,
         Path(control),
+        terminate_mode == "1",
     )
 
 
@@ -751,8 +800,11 @@ def _ensure_private_fixture_directory(path: Path) -> None:
     not _LIVE_ENABLED,
     reason="set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 on a disposable supported Linux host",
 )
-def test_live_monitor_journal_holds_payload_until_durable_running_transition() -> None:
-    """Exercise actual runc, systemd identities, journal transitions, and fd-3 gate."""
+@pytest.mark.parametrize("terminate_before_gate", [False, True], ids=["release", "terminate"])
+def test_live_monitor_journal_holds_payload_until_durable_running_transition(
+    terminate_before_gate: bool,
+) -> None:
+    """Exercise actual runc, systemd identities, journal transitions, and fd-3 gate/cancel."""
 
     source_root = Path(__file__).resolve().parents[1]
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
@@ -890,6 +942,7 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
             str(attempt["claim_token"]),
             execution["execution_id"],
             str(control),
+            "1" if terminate_before_gate else "0",
         ]
         # The exact driver service is a child of the attempt slice and is
         # stopped and checked independently even if systemd-run times out.
@@ -937,39 +990,66 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         assert not marker.exists()
         assert git_marker is not None and not git_marker.exists()
         (control / "running-observed.json").write_text("running-state-verified\n", encoding="ascii")
-        _wait_for_path(marker, control / "error.json", timeout=10.0)
-        assert (
-            marker is not None and marker.read_text(encoding="ascii") == "candidate-payload-ran\n"
-        )
-        assert (
-            git_marker is not None
-            and git_marker.read_text(encoding="ascii") == "host-git-metadata-not-visible\n"
-        )
         result_path = _wait_for_receipt(control, "result.json", timeout=20.0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
         durable = supervisor._sandbox_execution_get(attempt["id"])
-        assert set(result) == {
-            "phase",
-            "payload_marker",
-            "git_metadata_absent_inside_worker",
-            "runc_client_returncode",
-            "runc_state_deleted",
-            "change_set_paths",
-            "change_set_actions",
-            "change_set_digest",
-            "undeclared_write_rejected",
-            "cleanup_verified_written",
-        }
+        if terminate_before_gate:
+            assert set(result) == {
+                "phase",
+                "stop_outcome",
+                "stop_journal_phase",
+                "stop_monitor_phase",
+                "stop_requested",
+                "stop_cleanup_verified",
+                "runc_client_returncode",
+                "runc_state_deleted",
+                "payload_marker_absent",
+                "git_marker_absent",
+                "cleanup_verified_written",
+            }
+            assert result["stop_outcome"] == "ok"
+            assert result["stop_journal_phase"] == "stopping"
+            assert result["stop_monitor_phase"] in {"stopping", "exited"}
+            assert result["stop_requested"] is True
+            assert result["stop_cleanup_verified"] is False
+            assert result["runc_state_deleted"] is True
+            assert result["payload_marker_absent"] is True
+            assert result["git_marker_absent"] is True
+            assert result["cleanup_verified_written"] is False
+            assert marker is not None and not marker.exists()
+            assert git_marker is not None and not git_marker.exists()
+        else:
+            _wait_for_path(marker, control / "error.json", timeout=10.0)
+            assert (
+                marker is not None
+                and marker.read_text(encoding="ascii") == "candidate-payload-ran\n"
+            )
+            assert (
+                git_marker is not None
+                and git_marker.read_text(encoding="ascii") == "host-git-metadata-not-visible\n"
+            )
+            assert set(result) == {
+                "phase",
+                "payload_marker",
+                "git_metadata_absent_inside_worker",
+                "runc_client_returncode",
+                "runc_state_deleted",
+                "change_set_paths",
+                "change_set_actions",
+                "change_set_digest",
+                "undeclared_write_rejected",
+                "cleanup_verified_written",
+            }
+            assert result["payload_marker"] == "candidate-payload-ran\n"
+            assert result["git_metadata_absent_inside_worker"] is True
+            assert result["runc_client_returncode"] == 0
+            assert result["runc_state_deleted"] is True
+            assert result["change_set_paths"] == sorted([_PAYLOAD_MARKER, _GIT_METADATA_MARKER])
+            assert result["change_set_actions"] == ["create", "create"]
+            assert re.fullmatch(r"[0-9a-f]{64}", result["change_set_digest"])
+            assert result["undeclared_write_rejected"] is True
+            assert result["cleanup_verified_written"] is False
         assert result["phase"] == "exited"
-        assert result["payload_marker"] == "candidate-payload-ran\n"
-        assert result["git_metadata_absent_inside_worker"] is True
-        assert result["runc_client_returncode"] == 0
-        assert result["runc_state_deleted"] is True
-        assert result["change_set_paths"] == sorted([_PAYLOAD_MARKER, _GIT_METADATA_MARKER])
-        assert result["change_set_actions"] == ["create", "create"]
-        assert re.fullmatch(r"[0-9a-f]{64}", result["change_set_digest"])
-        assert result["undeclared_write_rejected"] is True
-        assert result["cleanup_verified_written"] is False
         assert durable is not None and durable["phase"] == "exited"
         worktree = Path(attempt["worktree"])
         binding = supervisor._sandbox_execution_restore_workspace_binding(
