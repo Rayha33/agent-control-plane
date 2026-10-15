@@ -124,13 +124,15 @@ class MessagingMixin:
             }
             self._event(connection, "agent.message", attempt["agent_id"], payload)
             row = connection.execute(
-                "SELECT sequence, created_at FROM events ORDER BY sequence DESC LIMIT 1"
+                "SELECT id, sequence, created_at FROM events ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
             if row is None:
                 raise SupervisorError("message_write_failed", "message event was not recorded")
             result = {
                 "sequence": row["sequence"],
+                "event_id": row["id"],
                 "message_id": message_id,
+                "source": "acp_mediated",
                 "task_id": attempt["task_id"],
                 "attempt_id": attempt["id"],
                 "sender": attempt["agent_id"],
@@ -183,10 +185,13 @@ class MessagingMixin:
                     "event_chain_invalid",
                     "messages are withheld because the event chain is invalid",
                 )
+            event_chain_head_sequence = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events"
+            ).fetchone()["sequence"]
 
             while True:
                 rows = connection.execute(
-                    "SELECT sequence, actor, payload_json, created_at FROM events "
+                    "SELECT id, sequence, actor, payload_json, created_at FROM events "
                     "WHERE event_type = 'agent.message' AND sequence > ? "
                     "ORDER BY sequence ASC LIMIT ?",
                     (cursor, MESSAGE_SCAN_BATCH),
@@ -216,7 +221,9 @@ class MessagingMixin:
                     items.append(
                         {
                             "sequence": row["sequence"],
+                            "event_id": row["id"],
                             "message_id": payload["message_id"],
+                            "source": "acp_mediated",
                             "task_id": payload["task_id"],
                             "attempt_id": payload["attempt_id"],
                             "sender": row["actor"],
@@ -226,6 +233,9 @@ class MessagingMixin:
                             "commit_sha": payload["commit_sha"],
                             "created_at": row["created_at"],
                             "content_trust": "untrusted_agent_content",
+                            "event_chain_verified": True,
+                            "event_chain_verification_scope": "hash_chain_consistency_only",
+                            "sequence_trust": "ordering_metadata_not_hash_bound",
                         }
                     )
                     if len(items) > limit:
@@ -245,4 +255,54 @@ class MessagingMixin:
             "next_after_sequence": next_after_sequence,
             "has_more": has_more,
             "content_trust": "untrusted_agent_content",
+            "source_coverage": {
+                "contract": "acp_message_visibility_v1",
+                "as_of_event_sequence": event_chain_head_sequence,
+                "as_of_event_sequence_trust": "ordering_metadata_not_hash_bound",
+                "sources": {
+                    "acp_mediated": {
+                        "coverage": (
+                            "complete_for_source"
+                            if after_sequence == 0 and not has_more
+                            else "partial"
+                        ),
+                        "scope": (
+                            "ACP broadcasts and messages addressed to this attempt "
+                            "in this SQLite read snapshot"
+                        ),
+                        "event_chain": "verified",
+                        "event_chain_verification_scope": "hash_chain_consistency_only",
+                        "sequence_binding": "not_authenticated_by_event_hash",
+                    },
+                    "provider_reported": {
+                        "coverage": "unknown",
+                        "reason": "no documented provider metadata adapter is connected",
+                    },
+                    "opaque_external": {
+                        "coverage": "not_observable",
+                        "meaning": (
+                            "this inbox does not include provider-native or other external "
+                            "content; separate ACP worker stdout/stderr logs may retain emitted "
+                            "output, and this makes no claim about encryption, confidentiality, "
+                            "or provider access"
+                        ),
+                    },
+                    "unknown": {
+                        "coverage": "unknown",
+                        "reason": "no authoritative source contract establishes coverage",
+                    },
+                },
+                "empty_result_means": (
+                    (
+                        "no matching ACP-mediated entries in this SQLite read snapshot, "
+                        "not proof that no other communication occurred"
+                    )
+                    if after_sequence == 0
+                    else (
+                        f"no matching ACP-mediated entries after sequence cursor {after_sequence} "
+                        "in this SQLite read snapshot; earlier entries and other communication "
+                        "are outside this page"
+                    )
+                ),
+            },
         }

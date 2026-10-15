@@ -434,7 +434,12 @@ def test_cli_message_send_uses_private_credential_file_and_lists_inbox(tmp_path:
     listed = run_cli(repo, "message", "list", "--attempt", attempt["id"])
     assert listed.returncode == 0, listed.stderr
     inbox = json.loads(listed.stdout)
-    assert inbox["messages"] == [posted]
+    received = inbox["messages"][0]
+    assert received["message_id"] == posted["message_id"]
+    assert received["event_id"] == posted["event_id"]
+    assert received["source"] == posted["source"] == "acp_mediated"
+    assert received["event_chain_verified"] is True
+    assert inbox["source_coverage"]["sources"]["acp_mediated"]["event_chain"] == "verified"
     assert inbox["messages"][0]["body"] == "serializer path is the next check"
 
 

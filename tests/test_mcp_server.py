@@ -192,7 +192,17 @@ def test_inbox_is_read_only_and_labels_agent_text_untrusted(repo: Path) -> None:
 
     assert result["isError"] is False
     inbox = body(result)
-    assert inbox["messages"] == [posted]
+    assert len(inbox["messages"]) == 1
+    assert inbox["messages"][0]["message_id"] == posted["message_id"]
+    assert inbox["messages"][0]["event_id"] == posted["event_id"]
+    assert inbox["messages"][0]["source"] == "acp_mediated"
+    assert inbox["messages"][0]["event_chain_verified"] is True
+    assert inbox["source_coverage"]["sources"]["acp_mediated"]["event_chain"] == "verified"
+    assert (
+        inbox["source_coverage"]["sources"]["acp_mediated"]["sequence_binding"]
+        == "not_authenticated_by_event_hash"
+    )
+    assert inbox["source_coverage"]["sources"]["provider_reported"]["coverage"] == "unknown"
     assert inbox["content_trust"] == "untrusted_agent_content"
     assert state_fingerprint(supervisor) == before
 

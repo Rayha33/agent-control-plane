@@ -40,13 +40,31 @@ def test_messages_cross_sibling_worktrees_and_survive_worktree_removal(repo: Pat
     reader = GitSupervisor(repo, read_only=True)
     second_inbox = reader.list_messages(second["id"])
     first_inbox = reader.list_messages(first["id"])
-    assert second_inbox["messages"] == [direct]
+    assert len(second_inbox["messages"]) == 1
+    received = second_inbox["messages"][0]
+    assert received["message_id"] == direct["message_id"]
+    assert received["event_id"] == direct["event_id"]
+    assert received["source"] == direct["source"] == "acp_mediated"
+    assert received["event_chain_verified"] is True
+    assert received["event_chain_verification_scope"] == "hash_chain_consistency_only"
+    assert received["sequence_trust"] == "ordering_metadata_not_hash_bound"
     assert first_inbox["messages"] == []
     assert direct["sender"] == "worker-first"
     assert direct["task_id"] == first_task["id"]
     assert direct["attempt_id"] == first["id"]
     assert direct["commit_sha"]
     assert direct["content_trust"] == "untrusted_agent_content"
+    assert direct["event_id"]
+    assert second_inbox["source_coverage"]["as_of_event_sequence"] >= direct["sequence"]
+    assert (
+        second_inbox["source_coverage"]["as_of_event_sequence_trust"]
+        == "ordering_metadata_not_hash_bound"
+    )
+    assert (
+        second_inbox["source_coverage"]["sources"]["acp_mediated"]["coverage"]
+        == "complete_for_source"
+    )
+    assert second_inbox["source_coverage"]["sources"]["provider_reported"]["coverage"] == "unknown"
 
     broadcast = supervisor.post_message(
         first["id"],
@@ -55,13 +73,16 @@ def test_messages_cross_sibling_worktrees_and_survive_worktree_removal(repo: Pat
         kind="finding",
         credential=first_runner["credential"],
     )
-    assert [item["message_id"] for item in reader.list_messages(first["id"])["messages"]] == [
+    first_after_broadcast = reader.list_messages(first["id"])
+    second_after_broadcast = reader.list_messages(second["id"])
+    assert [item["message_id"] for item in first_after_broadcast["messages"]] == [
         broadcast["message_id"]
     ]
-    assert [item["message_id"] for item in reader.list_messages(second["id"])["messages"]] == [
+    assert [item["message_id"] for item in second_after_broadcast["messages"]] == [
         direct["message_id"],
         broadcast["message_id"],
     ]
+    assert all(item["event_chain_verified"] for item in second_after_broadcast["messages"])
 
     assert (repo / ".acp" / "control.db").is_file()
     assert not (Path(first["worktree"]) / ".acp").exists()
@@ -77,6 +98,40 @@ def test_messages_cross_sibling_worktrees_and_survive_worktree_removal(repo: Pat
         direct["message_id"],
         broadcast["message_id"],
     ]
+
+
+def test_empty_inbox_reports_only_verified_acp_source_coverage(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    runner = supervisor.enroll_runner("worker", "worker")
+    task = make_task(supervisor, "alpha.txt", title="empty inbox")
+    attempt = supervisor.claim(task["id"], "worker", credential=runner["credential"])
+
+    inbox = GitSupervisor(repo, read_only=True).list_messages(attempt["id"])
+
+    assert inbox["messages"] == []
+    coverage = inbox["source_coverage"]
+    assert coverage["contract"] == "acp_message_visibility_v1"
+    assert coverage["as_of_event_sequence"] > 0
+    assert coverage["sources"]["acp_mediated"]["coverage"] == "complete_for_source"
+    assert coverage["sources"]["acp_mediated"]["event_chain"] == "verified"
+    assert coverage["sources"]["provider_reported"]["coverage"] == "unknown"
+    assert coverage["sources"]["opaque_external"]["coverage"] == "not_observable"
+    assert coverage["sources"]["acp_mediated"]["sequence_binding"] == (
+        "not_authenticated_by_event_hash"
+    )
+    assert (
+        "worker stdout/stderr logs may retain emitted output"
+        in coverage["sources"]["opaque_external"]["meaning"]
+    )
+    assert "no claim about encryption" in coverage["sources"]["opaque_external"]["meaning"]
+    assert "not proof that no other communication occurred" in coverage["empty_result_means"]
+
+    cursor_inbox = GitSupervisor(repo, read_only=True).list_messages(
+        attempt["id"], after_sequence=coverage["as_of_event_sequence"]
+    )
+    assert cursor_inbox["messages"] == []
+    assert "after sequence cursor" in cursor_inbox["source_coverage"]["empty_result_means"]
+    assert "earlier entries" in cursor_inbox["source_coverage"]["empty_result_means"]
 
 
 def test_message_append_requires_current_worker_identity_and_fence(repo: Path) -> None:
@@ -183,11 +238,18 @@ def test_messages_are_bounded_and_paginated(repo: Path, monkeypatch: pytest.Monk
     first_page = reader.list_messages(target["id"], limit=2)
     assert [item["body"] for item in first_page["messages"]] == ["one", "two"]
     assert first_page["has_more"] is True
+    assert first_page["source_coverage"]["sources"]["acp_mediated"]["coverage"] == "partial"
     second_page = reader.list_messages(
         target["id"], after_sequence=first_page["next_after_sequence"], limit=2
     )
     assert [item["body"] for item in second_page["messages"]] == ["three"]
     assert second_page["has_more"] is False
+    assert second_page["source_coverage"]["sources"]["acp_mediated"]["coverage"] == "partial"
+    empty_cursor_page = reader.list_messages(
+        target["id"], after_sequence=second_page["next_after_sequence"], limit=2
+    )
+    assert empty_cursor_page["messages"] == []
+    assert "after sequence cursor" in empty_cursor_page["source_coverage"]["empty_result_means"]
 
     before = event_count(supervisor)
     with pytest.raises(SupervisorError) as too_large:
