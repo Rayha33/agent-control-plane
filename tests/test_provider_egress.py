@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import ipaddress
+import os
+import shutil
 import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+from contextlib import ExitStack
+from pathlib import Path
 
 import pytest
 
@@ -183,15 +193,14 @@ def test_resolver_returns_numeric_pins_only_after_validating_every_answer(
 def test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lookup_calls = 0
+    lookup_calls: list[tuple[object, ...]] = []
     connected: list[tuple[object, ...]] = []
 
-    def fake_getaddrinfo(*_args: object, **_kwargs: object) -> list[tuple[object, ...]]:
-        nonlocal lookup_calls
-        lookup_calls += 1
-        # A hypothetical later DNS response is forbidden. The socket must use
-        # the numeric endpoint already returned by the first validated lookup.
-        return [record("8.8.8.8")]
+    def fake_getaddrinfo(host: str, port: int, **kwargs: object) -> list[tuple[object, ...]]:
+        lookup_calls.append((host, port, kwargs.get("type"), kwargs.get("proto")))
+        # Simulate a rebinding answer if production resolves again. The socket
+        # must use the public numeric endpoint vetted by the first lookup.
+        return [record("8.8.8.8" if len(lookup_calls) == 1 else "127.0.0.1")]
 
     class FakeSocket:
         def __init__(self, *_args: object) -> None:
@@ -210,7 +219,185 @@ def test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup(
     monkeypatch.setattr(provider_egress.socket, "socket", FakeSocket)
     connection = policy().connect_authority("api.example.com:443")
 
-    assert lookup_calls == 1
+    assert lookup_calls == [("api.example.com.", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP)]
     assert connected == [("8.8.8.8", 443)]
     assert connection.endpoint.sockaddr == ("8.8.8.8", 443)
     assert not connection.socket.closed
+
+
+def _dns_wire_name(name: str) -> bytes:
+    return (
+        b"".join(bytes((len(label),)) + label.encode("ascii") for label in name.split(".")) + b"\0"
+    )
+
+
+def _run_cname_dns_child() -> int:
+    """Exercise getaddrinfo against a CNAME server in private mount/net namespaces."""
+    subprocess.run(["mount", "--make-rprivate", "/"], check=True, capture_output=True, timeout=3)
+    subprocess.run(["ip", "link", "set", "lo", "up"], check=True, capture_output=True, timeout=3)
+
+    temp_root = Path(os.environ["ACP_CNAME_RESOLVER_TMP"])
+    with ExitStack() as mounted:
+        resolver_config = temp_root / "resolv.conf"
+        resolver_config.write_text(
+            "nameserver 127.0.0.1\noptions attempts:1 timeout:1\n", encoding="ascii"
+        )
+        nsswitch_config = temp_root / "nsswitch.conf"
+        nss_lines = Path("/etc/nsswitch.conf").read_text(encoding="utf-8").splitlines()
+        nss_lines = [line for line in nss_lines if not line.lstrip().startswith("hosts:")]
+        nss_lines.append("hosts: files dns")
+        nsswitch_config.write_text("\n".join(nss_lines) + "\n", encoding="utf-8")
+
+        resolver_target = Path("/etc/resolv.conf").resolve(strict=True)
+        for source, target in zip(
+            (resolver_config, nsswitch_config),
+            (resolver_target, Path("/etc/nsswitch.conf")),
+            strict=True,
+        ):
+            subprocess.run(
+                ["mount", "--bind", str(source), str(target)],
+                check=True,
+                capture_output=True,
+                timeout=3,
+            )
+            mounted.callback(
+                subprocess.run,
+                ["umount", str(target)],
+                check=True,
+                capture_output=True,
+                timeout=3,
+            )
+
+        queries: list[tuple[str, int]] = []
+        errors: list[str] = []
+        stop = threading.Event()
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.bind(("127.0.0.1", 53))
+        server.settimeout(0.1)
+
+        def answer_dns() -> None:
+            try:
+                while not stop.is_set():
+                    try:
+                        packet, peer = server.recvfrom(4096)
+                    except TimeoutError:
+                        continue
+                    position = 12
+                    labels: list[str] = []
+                    while packet[position] != 0:
+                        length = packet[position]
+                        position += 1
+                        labels.append(packet[position : position + length].decode("ascii"))
+                        position += length
+                    position += 1
+                    query_type, _query_class = struct.unpack("!HH", packet[position : position + 4])
+                    question_end = position + 4
+                    query_name = ".".join(labels).lower()
+                    queries.append((query_name, query_type))
+
+                    if query_name not in {"api.example.com", "gateway.test"}:
+                        answers: list[bytes] = []
+                    else:
+                        answers = []
+                        if query_name == "api.example.com":
+                            target_name = _dns_wire_name("gateway.test")
+                            answers.append(
+                                b"\xc0\x0c"
+                                + struct.pack("!HHIH", 5, 1, 60, len(target_name))
+                                + target_name
+                            )
+                        if query_type == 1:
+                            address = ipaddress.ip_address("8.8.8.8").packed
+                        elif query_type == 28:
+                            address = ipaddress.ip_address("2606:4700:4700::1111").packed
+                        else:
+                            address = b""
+                        if address:
+                            owner = (
+                                b"\xc0\x0c"
+                                if query_name == "gateway.test"
+                                else _dns_wire_name("gateway.test")
+                            )
+                            answers.append(
+                                owner
+                                + struct.pack("!HHIH", query_type, 1, 60, len(address))
+                                + address
+                            )
+
+                    flags = 0x8580  # response, authoritative, recursion-desired/available
+                    response = (
+                        packet[:2]
+                        + struct.pack("!HHHHH", flags, 1, len(answers), 0, 0)
+                        + packet[12:question_end]
+                        + b"".join(answers)
+                    )
+                    server.sendto(response, peer)
+            except BaseException as error:
+                errors.append(f"{type(error).__name__}: {error}")
+
+        thread = threading.Thread(target=answer_dns, daemon=True)
+        thread.start()
+        try:
+            endpoints = ProviderEgressPolicy({"api.example.com": {443}}).resolve_connect_authority(
+                "api.example.com:443"
+            )
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+            server.close()
+
+        assert not errors, errors
+        assert thread.is_alive() is False
+        assert {query_type for name, query_type in queries if name == "api.example.com"} >= {
+            1,
+            28,
+        }
+        assert all(name in {"api.example.com", "gateway.test"} for name, _ in queries)
+        assert {(endpoint.family, endpoint.sockaddr) for endpoint in endpoints} == {
+            (socket.AF_INET, ("8.8.8.8", 443)),
+            (socket.AF_INET6, ("2606:4700:4700::1111", 443, 0, 0)),
+        }
+    return 0
+
+
+def test_system_resolver_follows_cname_and_policy_pins_a_and_aaaa() -> None:
+    if os.environ.get("ACP_RUN_LIVE_CNAME_DNS") != "1":
+        pytest.skip("requires explicit opt-in in a disposable root Linux guest")
+    if not sys.platform.startswith("linux") or os.geteuid() != 0:
+        pytest.skip("requires Linux root for private network and mount namespaces")
+    unshare = shutil.which("unshare")
+    if unshare is None:
+        pytest.skip("requires unshare in the disposable Linux guest")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    python_path = os.pathsep.join(
+        part for part in (str(repo_root / "src"), os.environ.get("PYTHONPATH", "")) if part
+    )
+    with tempfile.TemporaryDirectory(prefix="acp-cname-dns-") as temp_dir:
+        env = {
+            **os.environ,
+            "ACP_CNAME_RESOLVER_TMP": temp_dir,
+            "PYTHONPATH": python_path,
+        }
+        result = subprocess.run(
+            [
+                unshare,
+                "--mount",
+                "--net",
+                "--fork",
+                "--kill-child",
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--cname-dns-child",
+            ],
+            capture_output=True,
+            check=False,
+            env=env,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, f"CNAME DNS probe failed:\n{result.stdout}\n{result.stderr}"
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["--cname-dns-child"]:
+    raise SystemExit(_run_cname_dns_child())

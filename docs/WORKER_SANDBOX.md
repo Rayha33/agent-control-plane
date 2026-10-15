@@ -3460,6 +3460,30 @@ not an OCI worker process: this demonstrates the proxy/client CONNECT contract,
 not an application's redirect-follow behavior in the sandbox or provider
 authentication. It does not imply that the proxy inspects redirects inside TLS.
 
+The deterministic production-policy tests also check final IPv4/IPv6 resolver
+answers and numeric pinning. In
+`tests/test_provider_egress.py::test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup`
+(source SHA-256 `227e8ce2dafb267671b691dc20f47264127bae245b45e5fc221cdddd6e6c703c`),
+the fake resolver returns `8.8.8.8` first and would return `127.0.0.1` if called
+again; the test asserts one absolute-host `getaddrinfo` invocation and a fake
+socket `connect()` receiving the first numeric sockaddr. This is a deterministic
+no-second-lookup regression trap, not a live DNS-rebinding test.
+
+The opt-in `test_system_resolver_follows_cname_and_policy_pins_a_and_aaaa` was
+also run in this disposable guest, root-owned inside private mount and network
+namespaces. Its isolated `resolv.conf` and `nsswitch.conf` point `getaddrinfo`
+only at a loopback DNS fixture. Each `api.example.com` response contains the
+CNAME to `gateway.test` and, in that same DNS answer, the matching target
+record: A `8.8.8.8` for an A query or AAAA `2606:4700:4700::1111` for an AAAA
+query. The production policy returned those exact numeric pins; the guest's
+resolver stub SHA-256 was
+`6096beac5979f1791fb0a4d089735e267936a9fce82717078a12eeb499e24b38` both
+before and after the test, and no temporary fixture directories remained. The
+policy module passed 34/34 tests in this guest. The test exercises one Linux
+system-resolver implementation in this guest, not macOS or every resolver
+implementation, and performs no outbound DNS or provider connection. Neither
+the one-call assertion nor the fixture bounds authoritative DNS wire queries.
+
 Both accepted proxy channels remain tracked through teardown. The test's
 finalizer shuts down and closes them, bounded-joins every started handler, and
 fails cleanup if a handler remains alive.
@@ -3471,11 +3495,13 @@ worktree):
 | --- | --- |
 | `test_oci_worker_runtime.py` | `c74906a0e78ba3d34a1379eae1d52921cc26914450fe36fecdd52d09ebc1aaab` |
 | `test_provider_proxy.py` | `aff9efbdf1a7a9e261141cbc86680c454047db7bfd256a092a14420083ec5837` |
+| `test_provider_egress.py` | `227e8ce2dafb267671b691dc20f47264127bae245b45e5fc221cdddd6e6c703c` |
 | `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
 | `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
 
-The guest's `kernel.apparmor_restrict_unprivileged_userns` value was 1 before
-the run; it was set to 0 only for this disposable test and restored by an exit
+For the separate live OCI probe, the guest's
+`kernel.apparmor_restrict_unprivileged_userns` value was 1 before the run; it
+was set to 0 only for that disposable test and restored by an exit
 trap. Postflight confirmed the value was 1 again, no matching ACP units or live
 probe processes remained, and there were no attempt roots, host proxy sockets,
 or host-only socket fixtures. This does not prove AppArmor confinement. No real
@@ -3484,8 +3510,11 @@ used. The collector-issued receipt predicates were replaced with a test-only
 receipt; process identity, peer PIDFD, UID/GID, and exact cgroup checks were
 real. Together, these tests prove the live worker-to-socket CONNECT path,
 same-UID peer rejection, and the separate proxy rule requiring a new CONNECT
-for a TLS redirect target. They do not prove provider authentication, the
-application following redirects inside the OCI worker, credential handoff,
-crash recovery, cleanup verification, result transfer, or production
-`run_worker()` integration. Task #3112 and parent task #2370 remain open, and
-configured OCI worker execution remains fail-closed.
+for a TLS redirect target. Together with the host-side resolver tests, they
+also prove that the policy passes its vetted numeric sockaddr to `connect()`
+without a second system-resolver call (the socket itself is mocked). They do not
+prove live DNS rebinding behavior, resolver portability beyond the exact guest,
+provider authentication, the application following redirects inside the OCI
+worker, credential handoff, crash recovery, cleanup verification, result
+transfer, or production `run_worker()` integration. Task #3112 and parent task
+#2370 remain open, and configured OCI worker execution remains fail-closed.
