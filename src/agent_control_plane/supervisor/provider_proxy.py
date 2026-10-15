@@ -1,8 +1,9 @@
 """Single-connection HTTP CONNECT tunnelling for a trusted provider broker.
 
-This module deliberately does not bind a socket, authenticate a peer, or
-configure a worker. Its caller must provide an already-authenticated,
-attempt-scoped channel. The CONNECT authority is checked by
+This module deliberately does not bind a socket or configure a worker. It
+provides an attempt-scoped Unix peer-authorizer primitive, but the caller must
+still own listener setup, channel distribution, and worker integration. The
+CONNECT authority is checked by
 ``ProviderEgressPolicy`` before any upstream connection is made; after the
 200 response, bytes are relayed unchanged so TLS and certificate validation
 remain the worker client's responsibility.
@@ -10,18 +11,31 @@ remain the worker client's responsibility.
 
 from __future__ import annotations
 
+import os
 import selectors
 import socket
+import struct
+import sys
 import time
 from collections.abc import Callable
 
+from .common import SupervisorError
 from .provider_egress import EgressPolicyError, PinnedConnection, ProviderEgressPolicy
+from .sandbox_attestation import (
+    RunningRuntimeAttestation,
+    running_attestation_has_collector_provenance,
+    running_attestation_is_self_consistent,
+    verify_linux_process_membership,
+)
 
 _MAX_REQUEST_BYTES = 16 * 1024
 _REQUEST_TIMEOUT_SECONDS = 10.0
 _RELAY_CHUNK_BYTES = 64 * 1024
 _MAX_BUFFERED_BYTES = 1024 * 1024
 _DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
+# Linux UAPI value from include/uapi/asm-generic/socket.h. Python versions
+# that predate the constant still run on kernels that implement the option.
+_SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
 
 _Dialer = Callable[[str], PinnedConnection]
 _PeerAuthorizer = Callable[[socket.socket], bool]
@@ -29,6 +43,73 @@ _PeerAuthorizer = Callable[[socket.socket], bool]
 
 class _ConnectRequestError(ValueError):
     pass
+
+
+def _get_peer_pidfd(channel: socket.socket) -> int:
+    """Get a kernel-pinned pidfd for an AF_UNIX peer, or fail closed."""
+
+    return channel.getsockopt(socket.SOL_SOCKET, _SO_PEERPIDFD)
+
+
+def attempt_scoped_peer_authorizer(
+    attestation: RunningRuntimeAttestation,
+) -> _PeerAuthorizer:
+    """Bind CONNECT authorization to a collector-issued Linux runtime attempt.
+
+    The worker's mapped host UID/GID alone are not a boundary: another
+    same-UID host process must also fail the exact attempt-cgroup check. This
+    callback does not create or protect the listening socket itself.
+    """
+
+    def authorize_peer(channel: socket.socket) -> bool:
+        peer_credentials = getattr(socket, "SO_PEERCRED", None)
+        if (
+            not sys.platform.startswith("linux")
+            or peer_credentials is None
+            or not running_attestation_has_collector_provenance(attestation)
+            or not running_attestation_is_self_consistent(attestation)
+            or type(channel) is not socket.socket
+        ):
+            return False
+        peer_pidfd = -1
+        authorized = False
+        try:
+            if (
+                channel.family != socket.AF_UNIX
+                or channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+            ):
+                return False
+            # SO_PEERCRED supplies a numeric PID. Keep SO_PEERPIDFD open while
+            # resolving /proc/<pid>, preventing PID reuse between the kernel's
+            # peer-credential snapshot and the first procfs read.
+            candidate_pidfd = _get_peer_pidfd(channel)
+            if type(candidate_pidfd) is not int or candidate_pidfd < 0:
+                return False
+            peer_pidfd = candidate_pidfd
+            if os.get_inheritable(peer_pidfd):
+                return False
+            raw_credentials = channel.getsockopt(
+                socket.SOL_SOCKET, peer_credentials, struct.calcsize("3i")
+            )
+            peer_pid, peer_uid, peer_gid = struct.unpack("3i", raw_credentials)
+            if peer_pid <= 0 or peer_uid != os.geteuid() or peer_gid != os.getegid():
+                return False
+            verify_linux_process_membership(
+                peer_pid,
+                expected_cgroup=attestation.cgroup_path,
+            )
+            authorized = True
+        except (AttributeError, OSError, SupervisorError, struct.error, TypeError, ValueError):
+            authorized = False
+        finally:
+            if peer_pidfd >= 0:
+                try:
+                    os.close(peer_pidfd)
+                except OSError:
+                    authorized = False
+        return authorized
+
+    return authorize_peer
 
 
 def _read_connect_request(client: socket.socket) -> str:

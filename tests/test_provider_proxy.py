@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from shutil import which
@@ -20,12 +22,24 @@ from agent_control_plane.supervisor.provider_proxy import (
     _ConnectRequestError,
     _read_connect_request,
     _serve_connect_connection,
+    attempt_scoped_peer_authorizer,
     serve_connect_connection,
 )
 
 
 def _policy() -> ProviderEgressPolicy:
     return ProviderEgressPolicy({"api.example.com": {443}})
+
+
+def _require_peer_pidfd(channel: socket.socket) -> None:
+    try:
+        peer_pidfd = provider_proxy._get_peer_pidfd(channel)
+    except OSError as error:
+        pytest.skip(f"Linux kernel does not provide SO_PEERPIDFD: {error}")
+    try:
+        os.fstat(peer_pidfd)
+    finally:
+        os.close(peer_pidfd)
 
 
 def _request(authority: str = "api.example.com:443", *, headers: bytes = b"") -> bytes:
@@ -125,6 +139,202 @@ def test_peer_authorization_precedes_request_parsing_and_dial() -> None:
     thread.join(timeout=2)
     assert not thread.is_alive()
     worker.close()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(socket, "SO_PEERCRED"),
+    reason="attempt peer authorization requires Linux SO_PEERCRED",
+)
+def test_attempt_peer_authorizer_rejects_unproven_receipt() -> None:
+    worker, proxy = socket.socketpair()
+    try:
+        authorizer = attempt_scoped_peer_authorizer(SimpleNamespace(cgroup_path="/attempt.scope"))
+        assert not authorizer(proxy)
+    finally:
+        worker.close()
+        proxy.close()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(socket, "SO_PEERCRED"),
+    reason="attempt peer authorization requires Linux SO_PEERCRED",
+)
+def test_attempt_peer_authorizer_requires_peer_in_exact_attempt_cgroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_proxy, "running_attestation_has_collector_provenance", lambda _: True
+    )
+    monkeypatch.setattr(provider_proxy, "running_attestation_is_self_consistent", lambda _: True)
+    worker, proxy = socket.socketpair()
+    try:
+        _require_peer_pidfd(proxy)
+        authorizer = attempt_scoped_peer_authorizer(
+            SimpleNamespace(cgroup_path="/agent-control-plane-unreachable-test/worker.scope")
+        )
+        # The local process has the same host UID/GID as this test server, but
+        # its live cgroup is not the nominated attempt scope.
+        assert not authorizer(proxy)
+    finally:
+        worker.close()
+        proxy.close()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(socket, "SO_PEERCRED"),
+    reason="attempt peer authorization requires Linux SO_PEERCRED",
+)
+def test_attempt_peer_authorizer_holds_peer_pidfd_through_real_proc_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_proxy, "running_attestation_has_collector_provenance", lambda _: True
+    )
+    monkeypatch.setattr(provider_proxy, "running_attestation_is_self_consistent", lambda _: True)
+    observed: dict[str, object] = {}
+    unified_cgroups = []
+    for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines():
+        fields = line.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0" and fields[1] == "":
+            unified_cgroups.append(fields[2])
+    if len(unified_cgroups) != 1 or not unified_cgroups[0].startswith("/"):
+        pytest.skip("real peer verification test requires a unified cgroup v2 entry")
+    expected_cgroup = unified_cgroups[0]
+    worker, proxy = socket.socketpair()
+    opened_pidfds: list[int] = []
+    get_peer_pidfd = provider_proxy._get_peer_pidfd
+    real_verifier = provider_proxy.verify_linux_process_membership
+
+    def track_peer_pidfd(channel: socket.socket) -> int:
+        peer_pidfd = get_peer_pidfd(channel)
+        opened_pidfds.append(peer_pidfd)
+        return peer_pidfd
+
+    def verify_peer(pid: int, *, expected_cgroup: str) -> str:
+        assert len(opened_pidfds) == 1
+        # The PIDFD must remain live through the procfs identity/cgroup read.
+        os.fstat(opened_pidfds[0])
+        assert not os.get_inheritable(opened_pidfds[0])
+        fdinfo = Path(f"/proc/self/fdinfo/{opened_pidfds[0]}").read_text(encoding="ascii")
+        assert f"Pid:\t{pid}\n" in fdinfo
+        observed["pid"] = pid
+        observed["cgroup"] = expected_cgroup
+        return real_verifier(pid, expected_cgroup=expected_cgroup)
+
+    try:
+        _require_peer_pidfd(proxy)
+        monkeypatch.setattr(provider_proxy, "_get_peer_pidfd", track_peer_pidfd)
+        monkeypatch.setattr(provider_proxy, "verify_linux_process_membership", verify_peer)
+        authorizer = attempt_scoped_peer_authorizer(SimpleNamespace(cgroup_path=expected_cgroup))
+        assert authorizer(proxy)
+        assert observed["pid"] == os.getpid()
+        assert observed["cgroup"] == expected_cgroup
+        with pytest.raises(OSError):
+            os.fstat(opened_pidfds[0])
+    finally:
+        worker.close()
+        proxy.close()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(socket, "SO_PEERCRED"),
+    reason="attempt peer authorization requires Linux SO_PEERCRED",
+)
+def test_attempt_peer_authorizer_rejects_peer_reaped_after_pidfd_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_proxy, "running_attestation_has_collector_provenance", lambda _: True
+    )
+    monkeypatch.setattr(provider_proxy, "running_attestation_is_self_consistent", lambda _: True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_path = tmp_path / "peer.sock"
+    server.bind(str(server_path))
+    server.listen(1)
+    server.settimeout(5)
+    connect_script = (
+        "import socket,sys,time; "
+        "peer=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); "
+        "peer.connect(sys.argv[1]); time.sleep(30)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", connect_script, str(server_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    channel: socket.socket | None = None
+    opened_pidfds: list[int] = []
+    verified_pids: list[int] = []
+    get_peer_pidfd = provider_proxy._get_peer_pidfd
+    real_verifier = provider_proxy.verify_linux_process_membership
+
+    def acquire_then_reap(peer_channel: socket.socket) -> int:
+        peer_pidfd = get_peer_pidfd(peer_channel)
+        opened_pidfds.append(peer_pidfd)
+        child.terminate()
+        child.wait(timeout=5)
+        fdinfo = Path(f"/proc/self/fdinfo/{peer_pidfd}").read_text(encoding="ascii")
+        assert "Pid:\t-1\n" in fdinfo
+        return peer_pidfd
+
+    def track_verification(pid: int, *, expected_cgroup: str) -> str:
+        verified_pids.append(pid)
+        return real_verifier(pid, expected_cgroup=expected_cgroup)
+
+    try:
+        channel, _ = server.accept()
+        _require_peer_pidfd(channel)
+        monkeypatch.setattr(provider_proxy, "_get_peer_pidfd", acquire_then_reap)
+        monkeypatch.setattr(provider_proxy, "verify_linux_process_membership", track_verification)
+        authorizer = attempt_scoped_peer_authorizer(
+            SimpleNamespace(cgroup_path="/user.slice/attempt.scope")
+        )
+        assert not authorizer(channel)
+        assert verified_pids == [child.pid]
+        with pytest.raises(OSError):
+            os.fstat(opened_pidfds[0])
+    finally:
+        if channel is not None:
+            channel.close()
+        server.close()
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=5)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not hasattr(socket, "SO_PEERCRED"),
+    reason="attempt peer authorization requires Linux SO_PEERCRED",
+)
+def test_attempt_peer_authorizer_fails_closed_without_peer_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_proxy, "running_attestation_has_collector_provenance", lambda _: True
+    )
+    monkeypatch.setattr(provider_proxy, "running_attestation_is_self_consistent", lambda _: True)
+    process_checks: list[int] = []
+
+    def unsupported(_channel: socket.socket) -> int:
+        raise OSError("SO_PEERPIDFD is unavailable")
+
+    monkeypatch.setattr(provider_proxy, "_get_peer_pidfd", unsupported)
+    monkeypatch.setattr(
+        provider_proxy,
+        "verify_linux_process_membership",
+        lambda pid, **_kwargs: process_checks.append(pid),
+    )
+    worker, proxy = socket.socketpair()
+    try:
+        authorizer = attempt_scoped_peer_authorizer(
+            SimpleNamespace(cgroup_path="/user.slice/attempt.scope")
+        )
+        assert not authorizer(proxy)
+        assert process_checks == []
+    finally:
+        worker.close()
+        proxy.close()
 
 
 def test_disallowed_authority_is_rejected_before_dns_or_dial(

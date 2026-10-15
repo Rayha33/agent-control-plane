@@ -157,6 +157,44 @@ def read_linux_process_snapshot(pid: int) -> ProcessSnapshot:
     return ProcessSnapshot(stat_before=before, cgroup=cgroup, stat_after=after)
 
 
+def verify_linux_process_membership(
+    pid: int,
+    *,
+    expected_cgroup: str,
+    expected_identity: str | None = None,
+) -> str:
+    """Verify a live PID stayed stable while its exact unified cgroup was read.
+
+    Returns the observed Linux PID/start-time identity. Callers that received
+    an expected identity from an earlier trusted observation should pass it to
+    reject PID reuse between the observations.
+    """
+
+    pid = _pid(pid, "process PID")
+    expected_cgroup = _cgroup_path(expected_cgroup, "expected process cgroup")
+    if expected_identity is not None:
+        expected_identity = _identity(expected_identity, pid, "expected process identity")
+    snapshot = read_linux_process_snapshot(pid)
+    if type(snapshot) is not ProcessSnapshot:
+        raise _invalid("live process observation has an unexpected type")
+    before_pid, before_state, before_start = _parse_proc_stat(snapshot.stat_before)
+    after_pid, after_state, after_start = _parse_proc_stat(snapshot.stat_after)
+    if (
+        before_pid != pid
+        or after_pid != pid
+        or before_start != after_start
+        or before_state.encode("ascii") not in _LIVE_PROCESS_STATES
+        or after_state.encode("ascii") not in _LIVE_PROCESS_STATES
+    ):
+        raise _invalid("live execution process identity changed during observation")
+    identity = f"linux:{pid}:{before_start}"
+    if expected_identity is not None and identity != expected_identity:
+        raise _invalid("live execution process identity changed after collection")
+    if _parse_proc_cgroup(snapshot.cgroup) != expected_cgroup:
+        raise _invalid("live execution process cgroup membership changed after collection")
+    return identity
+
+
 def read_cgroup_resource_controls(
     cgroup_path: str,
     *,
@@ -879,23 +917,13 @@ def verify_running_runtime_process_membership(attestation: RunningRuntimeAttesta
     )
     try:
         for pid, expected_identity, expected_cgroup in expected_processes:
-            snapshot = read_linux_process_snapshot(pid)
-            if type(snapshot) is not ProcessSnapshot:
-                raise _invalid("release-time process observation has an unexpected type")
-            before_pid, before_state, before_start = _parse_proc_stat(snapshot.stat_before)
-            after_pid, after_state, after_start = _parse_proc_stat(snapshot.stat_after)
-            if (
-                before_pid != pid
-                or after_pid != pid
-                or before_start != after_start
-                or before_state.encode("ascii") not in _LIVE_PROCESS_STATES
-                or after_state.encode("ascii") not in _LIVE_PROCESS_STATES
-                or f"linux:{pid}:{before_start}" != expected_identity
-            ):
-                raise _invalid("live execution process identity changed after collection")
-            actual_cgroup = _parse_proc_cgroup(snapshot.cgroup)
-            if expected_cgroup is not None and actual_cgroup != expected_cgroup:
-                raise _invalid("live execution process cgroup membership changed after collection")
+            if expected_cgroup is None:
+                raise _invalid("release-time process cgroup is missing")
+            verify_linux_process_membership(
+                pid,
+                expected_cgroup=expected_cgroup,
+                expected_identity=expected_identity,
+            )
     except SupervisorError as error:
         raise SupervisorError(
             "sandbox_runtime_attestation_stale",

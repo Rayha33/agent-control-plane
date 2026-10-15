@@ -807,13 +807,13 @@ assertion that policy-authorized dialing uses the vetted numeric sockaddr with
 no second hostname lookup.
 
 The policy primitive alone does not prove worker reachability is restricted to
-a per-attempt proxy, same-UID socket denial, socket-FD hygiene, TLS CONNECT
-behavior, redirect handling, real DNS resolver behavior, credential delivery,
-or provider authentication. A blind HTTPS CONNECT proxy can gate only the
-requested authority and pinned IP; it cannot inspect encrypted SNI, HTTP
-`Host`, URL/path, API method, or redirects, and cannot stop exfiltration to an
-explicitly allowed provider hostname. Any redirect policy must be enforced
-when the client requests its next CONNECT.
+a per-attempt proxy, same-UID denial in a disposable worker guest, socket-FD
+hygiene, TLS CONNECT behavior, redirect handling, real DNS resolver behavior,
+credential delivery, or provider authentication. A blind HTTPS CONNECT proxy
+gates only the requested authority and pinned IP. It cannot inspect encrypted
+SNI, HTTP `Host`, URL/path, API method, or redirects, nor stop exfiltration to
+an explicitly allowed provider hostname. A redirect destination requires a
+fresh CONNECT request and its own policy decision.
 The existing systemd `LoadCredential=` evidence establishes read-only
 per-unit visibility only, not secrecy from the host UID or root. No code here
 is wired to `run_worker()`, and configured OCI worker execution remains
@@ -821,11 +821,33 @@ fail-closed.
 
 ### Provider CONNECT handler primitive (2026-10-15; socketpair/TLS unit proof)
 
-`supervisor/provider_proxy.py` adds a one-CONNECT-per-channel handler. It
-requires the caller to supply a peer-authorization callback before request
-parsing or dialing; it does not create a listener, obtain `SO_PEERCRED`, bind
-the channel to an attempt cgroup, or manage socket lifecycle. It rejects
-malformed CONNECT requests, request bodies, proxy credentials, mismatching
+`supervisor/provider_proxy.py` adds a one-CONNECT-per-channel handler and an
+`attempt_scoped_peer_authorizer()` callback factory. The factory requires a
+collector-issued, self-consistent runtime attestation; on Linux it checks the
+accepted Unix stream's `SO_PEERCRED` UID/GID against the supervisor's mapped
+host UID/GID, then verifies the peer PID's stable start identity and exact
+attempt cgroup through before/after `/proc/<pid>/stat` reads around
+`/proc/<pid>/cgroup`. Before resolving that numeric PID, it acquires Linux
+`SO_PEERPIDFD` (UAPI option 77) and holds the close-on-exec descriptor through
+the procfs check, preventing PID reuse between the `SO_PEERCRED` snapshot and
+the first `/proc` lookup. The Linux v6.5 UAPI header defines the option
+([source](https://github.com/torvalds/linux/blob/v6.5/include/uapi/asm-generic/socket.h#L128-L130));
+the kernel's coredump path documents using it to guard `/proc/<pid>` against
+PID recycling ([source](https://github.com/torvalds/linux/blob/master/fs/coredump.c)).
+Python need not expose a named constant; unsupported kernels or failed
+`getsockopt` probes deny authorization. The supervisor's `/proc` view must use
+the same PID namespace as `SO_PEERCRED`. A same-UID process outside the exact
+cgroup is denied. PID pinning does not make the cgroup observation atomic or
+prevent a process with sufficient cgroup permissions from moving after the
+check. This primitive does not bind or protect a listener, distribute its
+socket to the worker, or manage socket lifecycle. `SO_PEERCRED` and
+`SO_PEERPIDFD` identify the process that established the Unix connection, not
+a later process that receives the connected channel through `SCM_RIGHTS` or
+inherits its descriptor. Any worker integration must control channel
+distribution and clear unintended inherited descriptors before launch. The
+handler still requires the caller to install the callback before request
+parsing or dialing. It
+rejects malformed CONNECT requests, request bodies, proxy credentials, mismatching
 `Host` fields, tunnel bytes co-read with the CONNECT headers, and tunnel bytes
 already queued when a post-dial preflight runs before the 200 response. A byte
 that arrives after that check races acceptance and is relayed unchanged; the
@@ -839,11 +861,20 @@ HTTP 302 received inside TLS, and reject the client's next CONNECT to a
 non-allowlisted host before DNS or a second dial. The test injects a dial to
 its loopback TLS fixture only through a private test monkeypatch; the
 production policy still classifies a public test address, and production code
-cannot select the local target through policy configuration. These tests
-verify protocol/tunnel behavior only, not an authenticated attempt socket or
-provider-SDK compatibility. No live guest, systemd integration, credential
-handoff, or `run_worker()` integration is claimed; configured OCI execution
-remains fail-closed.
+cannot select the local target through policy configuration. Linux unit tests
+exercise real `SO_PEERCRED` and `SO_PEERPIDFD` on a same-process socketpair,
+confirm the PIDFD fdinfo PID matches `SO_PEERCRED`, run the actual `/proc`
+membership verifier while that PIDFD is open, and verify it is closed on
+return. A separate child-process test terminates and reaps the peer immediately
+after PIDFD acquisition, confirms the pinned PIDFD reports an exited process,
+and verifies that the real proc check rejects it. This does not force numeric
+PID reuse; the no-reuse claim rests on the cited kernel PIDFD semantics. The
+tests also fail closed when the option is unavailable and deny a peer whose
+cgroup differs. They do not prove an actual worker socket in a disposable
+guest, listener-path or FD hygiene, provider-SDK compatibility, credential
+delivery, or authentication.
+No live guest, systemd integration, credential handoff, or `run_worker()`
+integration is claimed; configured OCI execution remains fail-closed.
 
 ### Supervisor restart: public cancellation and launch-gate fencing (2026-10-15)
 

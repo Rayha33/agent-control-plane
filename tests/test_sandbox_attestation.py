@@ -19,6 +19,7 @@ from agent_control_plane.supervisor.sandbox_attestation import (
     running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
     validate_running_runtime_attestation,
+    verify_linux_process_membership,
     verify_running_runtime_process_membership,
 )
 
@@ -176,6 +177,56 @@ def test_release_verifier_rereads_all_execution_processes(monkeypatch: pytest.Mo
 
     assert set(observed) == {receipt.monitor_pid, receipt.runc_client_pid, receipt.init_pid}
     assert len(observed) == 3
+
+
+def test_process_membership_verifier_returns_stable_identity_for_exact_cgroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid = 404
+    snapshot = ProcessSnapshot(
+        stat_before=_proc_stat(pid, "S", 1404),
+        cgroup=f"0::{_SCOPE_CGROUP}\n".encode("ascii"),
+        stat_after=_proc_stat(pid, "S", 1404),
+    )
+    observed: list[int] = []
+
+    def read_snapshot(observed_pid: int) -> ProcessSnapshot:
+        observed.append(observed_pid)
+        return snapshot
+
+    monkeypatch.setattr(sandbox_attestation, "read_linux_process_snapshot", read_snapshot)
+
+    assert verify_linux_process_membership(pid, expected_cgroup=_SCOPE_CGROUP) == "linux:404:1404"
+    assert observed == [pid]
+
+
+@pytest.mark.parametrize("drift", ["pid_reuse", "wrong_cgroup", "exited"])
+def test_process_membership_verifier_rejects_changed_identity_or_cgroup(
+    drift: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid = 404
+    if drift == "pid_reuse":
+        snapshot = ProcessSnapshot(
+            _proc_stat(pid, "S", 1404),
+            f"0::{_SCOPE_CGROUP}\n".encode("ascii"),
+            _proc_stat(pid, "S", 9404),
+        )
+    elif drift == "wrong_cgroup":
+        snapshot = ProcessSnapshot(
+            _proc_stat(pid, "S", 1404),
+            b"0::/user.slice/foreign.scope\n",
+            _proc_stat(pid, "S", 1404),
+        )
+    else:
+        snapshot = ProcessSnapshot(
+            _proc_stat(pid, "Z", 1404),
+            f"0::{_SCOPE_CGROUP}\n".encode("ascii"),
+            _proc_stat(pid, "Z", 1404),
+        )
+    monkeypatch.setattr(sandbox_attestation, "read_linux_process_snapshot", lambda _pid: snapshot)
+
+    with pytest.raises(SupervisorError):
+        verify_linux_process_membership(pid, expected_cgroup=_SCOPE_CGROUP)
 
 
 def test_attestation_binds_runc_client_to_exact_launch_driver_service(
