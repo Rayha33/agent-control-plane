@@ -870,11 +870,58 @@ after PIDFD acquisition, confirms the pinned PIDFD reports an exited process,
 and verifies that the real proc check rejects it. This does not force numeric
 PID reuse; the no-reuse claim rests on the cited kernel PIDFD semantics. The
 tests also fail closed when the option is unavailable and deny a peer whose
-cgroup differs. They do not prove an actual worker socket in a disposable
-guest, listener-path or FD hygiene, provider-SDK compatibility, credential
-delivery, or authentication.
-No live guest, systemd integration, credential handoff, or `run_worker()`
-integration is claimed; configured OCI execution remains fail-closed.
+cgroup differs. This unit evidence alone does not prove provider-SDK
+compatibility, credential delivery, or authentication. The bounded live guest
+proof below covers one worker's socket reachability and the real peer
+authorizer, but not production listener lifecycle, descriptor hygiene, or
+provider protocol behavior.
+
+### Rootless per-attempt provider socket-directory feasibility (2026-10-15; direct-runc guest probe)
+
+The opt-in `test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
+passed 1/1 in the disposable `acp-2370-live-sandbox-20261010` Lima VZ guest:
+Ubuntu 26.04.1 LTS, aarch64, Linux 7.0.0-38-generic, host UID/GID 501:1000,
+unified cgroup v2, and an active user systemd manager. It used the exact,
+root-owned `/usr/local/bin/runc-1.5.2` binary
+(`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`), BusyBox
+1.37.0 (`c2f279d1d5640a0f327890d41cad594c0f059f3fed3f96dd72fdcc4f5e18ec02`),
+and a static Unix-socket probe client built by the root-owned GCC 15.2.0 compiler
+(`5b06a5b85cab901e2af3e8f351a6d4e8e6a93af24797bd8c01e5391ac6b4e63b`). The
+BusyBox binary is static. Both the provider-mount probe and the existing
+`test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1 (2/2
+combined) from test source SHA-256
+`5e5dcf8a5b1945b4c91f26427f02e3db7298b00b3676f3af435daec6fbd707b7`.
+Opting in requires a trusted C compiler (`ACP_OCI_TEST_CC`, default `cc`) to
+build that small static probe; BusyBox in this guest does not provide `nc -U`.
+
+The test manually assembled a minimal OCI bundle and launched it with rootless
+runc; it did not call the production worker executor or use a provider
+credential. It mounted a dedicated mode-0700 host directory containing only a
+mode-0600 Unix socket at `/run/acp` with `ro,nosuid,nodev,noexec`, then inspected
+the live mountinfo record. The worker could connect and exchange the test-only
+`probe`/`proxy-ok` messages but could not create or unlink entries. The host
+accepted peer `SO_PEERCRED`, acquired the matching `SO_PEERPIDFD`, checked the
+live peer against the exact systemd attempt cgroup, and authorized it through
+`attempt_scoped_peer_authorizer()`. A same-UID host process outside that cgroup
+was denied. The test invokes authorization immediately after accept, before
+reading the worker's queued probe bytes, but does not call the production
+CONNECT handler. For this isolated primitive test only, the two
+collector-attestation predicates were replaced with one test-owned receipt whose
+cgroup path was checked against the worker's procfs observation and exact
+systemd scope.
+
+The guest's `kernel.apparmor_restrict_unprivileged_userns` setting was changed
+from `1` to `0` only for the test and restored by an exit trap; postflight read
+it as `1`. The test finalizer and independent postflight found no remaining
+runc state, process, attempt scope/cgroup, attempt directory, or provider
+socket directory. This establishes feasibility for the tested direct-runc
+mount and peer-authorization primitives only. It does not qualify a default
+AppArmor profile, production listener setup/distribution/teardown, the
+production CONNECT handler's before-parse/before-dial ordering, inherited or
+SCM_RIGHTS descriptor hygiene, HTTPS CONNECT, real DNS or provider egress,
+provider authentication, credential delivery, `cleanup_verified`, restart or
+cancellation recovery, result import, or registered `run_worker()` execution.
+Configured OCI worker execution remains fail-closed.
 
 ### Supervisor restart: public cancellation and launch-gate fencing (2026-10-15)
 

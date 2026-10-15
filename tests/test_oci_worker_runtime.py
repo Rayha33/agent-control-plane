@@ -27,6 +27,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -35,11 +36,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from shlex import quote as shell_quote
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import agent_control_plane.supervisor.oci_worker as oci_worker
+import agent_control_plane.supervisor.provider_proxy as provider_proxy
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
     read_linux_process_snapshot,
@@ -93,7 +96,9 @@ def _require_root_owned_file(path: Path, label: str) -> Path:
     return resolved
 
 
-def _copy_busybox_closure(busybox: Path, rootfs: Path) -> tuple[str, set[str]]:
+def _copy_busybox_closure(
+    busybox: Path, rootfs: Path, *, allow_static: bool = False
+) -> tuple[str, set[str]]:
     """Copy BusyBox plus its dynamic-loader closure, never host directories."""
 
     busybox = _require_root_owned_file(busybox, "BusyBox")
@@ -108,7 +113,11 @@ def _copy_busybox_closure(busybox: Path, rootfs: Path) -> tuple[str, set[str]]:
         timeout=5,
         env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
     )
-    if completed.returncode != 0 or "not found" in completed.stdout:
+    ldd_output = f"{completed.stdout}\n{completed.stderr}"
+    is_static = completed.returncode != 0 and "not a dynamic executable" in ldd_output
+    if (
+        completed.returncode != 0 and not (allow_static and is_static)
+    ) or "not found" in ldd_output:
         pytest.fail("trusted BusyBox dependency closure could not be resolved with ldd")
 
     applets_result = subprocess.run(
@@ -128,7 +137,7 @@ def _copy_busybox_closure(busybox: Path, rootfs: Path) -> tuple[str, set[str]]:
         pytest.fail(f"BusyBox is missing required test applets: {sorted(missing_applets)}")
 
     dependencies: set[str] = set()
-    for line in completed.stdout.splitlines():
+    for line in () if is_static else completed.stdout.splitlines():
         if "=> not found" in line:
             pytest.fail("BusyBox has an unresolved dynamic dependency")
         for token in line.replace("=>", " ").split():
@@ -2630,7 +2639,9 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
         (rootfs / relative).mkdir(parents=True, exist_ok=True, mode=0o755)
     (rootfs / "home" / "agent").chmod(0o700)
     busybox_version, applets = _copy_busybox_closure(
-        Path(os.environ.get("ACP_OCI_TEST_BUSYBOX", "/usr/bin/busybox")), rootfs
+        Path(os.environ.get("ACP_OCI_TEST_BUSYBOX", "/usr/bin/busybox")),
+        rootfs,
+        allow_static=True,
     )
 
     workspace_source = attempt_root / "workspace-source"
@@ -3978,4 +3989,622 @@ def test_live_rootless_runc_enforces_minimal_worker_boundary(
             )
             raise AssertionError(
                 "live OCI cleanup verification failed: " + "; ".join(cleanup_errors) + prior
+            )
+
+
+@pytest.mark.skipif(not _LIVE_TEST_ENABLED, reason=_LIVE_TEST_REASON)
+def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove a rootless worker can connect through, but not mutate, a socket-dir mount.
+
+    This is a runtime primitive probe, not the production launch path. The
+    collector-issued attestation predicates are replaced with one exact
+    test-only receipt so the real peer-PIDFD, UID/GID, and cgroup checks can be
+    exercised against this live rootless container.
+    """
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("the live provider-socket mount proof requires Linux")
+    if os.geteuid() == 0:
+        pytest.fail("the live provider-socket mount proof must run as an unprivileged host user")
+    if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+        pytest.fail("the live provider-socket mount proof requires unified cgroup v2")
+    if not hasattr(socket, "SO_PEERCRED"):
+        pytest.skip("the live provider-socket mount proof requires SO_PEERCRED")
+    user_manager_code, _ = _run_user_systemctl(["is-active", "default.target"])
+    if user_manager_code != 0:
+        pytest.fail("the live provider-socket mount proof requires an active user manager")
+
+    tmp_path = tmp_path.resolve()
+    if not tmp_path.is_relative_to(Path("/tmp")):
+        pytest.fail(
+            "the live provider-socket proof must use a private temporary directory below /tmp"
+        )
+    repo_root = Path(__file__).resolve().parents[1]
+    if not repo_root.is_relative_to(Path("/tmp")):
+        pytest.fail("the live provider-socket proof must run from a disposable checkout below /tmp")
+    expected_version = os.environ.get("ACP_OCI_TEST_RUNC_VERSION")
+    if not expected_version:
+        pytest.fail("set ACP_OCI_TEST_RUNC_VERSION to the exact approved runc release")
+    pin = oci_worker._pin_trusted_runc_executable(
+        Path(os.environ.get("ACP_OCI_TEST_RUNC", "/usr/bin/runc")), repo_root
+    )
+    observed_version = oci_worker._probe_trusted_runc_version(pin, expected_version)
+    if observed_version != expected_version:
+        pytest.fail("runc version probe disagreed with the explicit integration-test pin")
+
+    launch_submitted = False
+    runtime_cleanup_verified = True
+    attempt_root = tmp_path / "provider-proxy-attempt"
+    if os.path.lexists(attempt_root):
+        pytest.fail("unique provider-proxy attempt path already exists")
+    attempt_root.mkdir(mode=0o700)
+    attempt_root.chmod(0o700)
+    attempt_root_info = attempt_root.lstat()
+    if (
+        not stat.S_ISDIR(attempt_root_info.st_mode)
+        or attempt_root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(attempt_root_info.st_mode) != 0o700
+    ):
+        pytest.fail("provider-proxy attempt root is not test-owned and private")
+    attempt_root_identity = (attempt_root_info.st_dev, attempt_root_info.st_ino)
+
+    def remove_exact_attempt_root_if_safe() -> None:
+        if not runtime_cleanup_verified or not os.path.lexists(attempt_root):
+            return
+        current_root = attempt_root.lstat()
+        if (
+            not stat.S_ISDIR(current_root.st_mode)
+            or (current_root.st_dev, current_root.st_ino) != attempt_root_identity
+            or current_root.st_uid != os.geteuid()
+            or stat.S_IMODE(current_root.st_mode) != 0o700
+        ):
+            raise AssertionError("provider-proxy attempt-root identity changed in finalizer")
+        if any(entry.name not in {"bundle", "runc-state"} for entry in attempt_root.iterdir()):
+            raise AssertionError("provider-proxy attempt root contains an unknown finalizer entry")
+        shutil.rmtree(attempt_root)
+        if os.path.lexists(attempt_root):
+            raise AssertionError("provider-proxy attempt root remained after finalizer cleanup")
+
+    request.addfinalizer(remove_exact_attempt_root_if_safe)
+
+    container_id = f"acp-proxy-{uuid.uuid4().hex}"
+    bundle_root = attempt_root / "bundle"
+    rootfs = bundle_root / "rootfs"
+    state_root = attempt_root / "runc-state"
+    socket_dir = Path("/tmp") / f"acp-proxy-{uuid.uuid4().hex[:20]}"
+    socket_path = socket_dir / "provider.sock"
+    socket_dir_identity: tuple[int, int] | None = None
+    listener: socket.socket | None = None
+    worker_channel: socket.socket | None = None
+    outside_channel: socket.socket | None = None
+    outside_client: socket.socket | None = None
+    socket_identity: tuple[int, int] | None = None
+    runc_descriptor = -1
+    runc_process: subprocess.Popen[bytes] | None = None
+    cleanup_errors: list[str] = []
+
+    try:
+        bundle_root.mkdir(mode=0o700)
+        rootfs.mkdir(mode=0o755)
+        state_root.mkdir(mode=0o700)
+        for relative in ("bin", "dev", "proc", "run/acp", "tmp"):
+            (rootfs / relative).mkdir(parents=True, exist_ok=True, mode=0o755)
+        busybox_version, busybox_applets = _copy_busybox_closure(
+            Path(os.environ.get("ACP_OCI_TEST_BUSYBOX", "/usr/bin/busybox")),
+            rootfs,
+            allow_static=True,
+        )
+        if "rm" not in busybox_applets:
+            pytest.fail("trusted BusyBox is missing the rm applet required by the read-only probe")
+
+        compiler_value = os.environ.get("ACP_OCI_TEST_CC") or shutil.which("cc")
+        if compiler_value is None:
+            pytest.fail("a trusted C compiler is required for the Unix-socket probe client")
+        compiler = _require_root_owned_file(Path(compiler_value), "C compiler")
+        probe_source = bundle_root / "provider_socket_probe.c"
+        probe_source.write_text(
+            r"""#define _GNU_SOURCE
+#include <stddef.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static int write_all(int fd, const char *buffer, size_t length) {
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t written = write(fd, buffer + offset, length - offset);
+        if (written <= 0) return 1;
+        offset += (size_t)written;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    static const char request[] = "probe\n";
+    static const char expected[] = "proxy-ok\n";
+    struct sockaddr_un address = {0};
+    char response[sizeof(expected) - 1];
+    size_t path_length;
+    size_t received = 0;
+    int fd;
+
+    if (argc != 2) return 2;
+    path_length = strlen(argv[1]);
+    if (path_length == 0 || path_length >= sizeof(address.sun_path)) return 3;
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, argv[1], path_length + 1);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 4;
+    if (connect(fd, (struct sockaddr *)&address,
+                offsetof(struct sockaddr_un, sun_path) + path_length + 1) != 0) {
+        close(fd);
+        return 5;
+    }
+    if (write_all(fd, request, sizeof(request) - 1) != 0) {
+        close(fd);
+        return 6;
+    }
+    while (received < sizeof(response)) {
+        ssize_t count = read(fd, response + received, sizeof(response) - received);
+        if (count <= 0) {
+            close(fd);
+            return 7;
+        }
+        received += (size_t)count;
+    }
+    close(fd);
+    if (memcmp(response, expected, sizeof(response)) != 0) return 8;
+    return write_all(STDOUT_FILENO, "CONNECT_OK\n", 11);
+}
+""",
+            encoding="ascii",
+        )
+        probe_binary = rootfs / "bin" / "provider-socket-probe"
+        compiler_result = subprocess.run(
+            [
+                str(compiler),
+                "-static",
+                "-O2",
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-o",
+                str(probe_binary),
+                str(probe_source),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=_runc_environment(),
+        )
+        if compiler_result.returncode != 0:
+            pytest.fail(
+                "trusted compiler could not build the static Unix-socket probe client: "
+                f"{compiler_result.stderr[-2048:]}"
+            )
+        probe_binary.chmod(0o755)
+        probe_info = probe_binary.lstat()
+        if (
+            not stat.S_ISREG(probe_info.st_mode)
+            or probe_info.st_uid != os.geteuid()
+            or stat.S_IMODE(probe_info.st_mode) != 0o755
+            or probe_info.st_mode & (stat.S_ISUID | stat.S_ISGID)
+        ):
+            pytest.fail("Unix-socket probe binary is not a test-owned non-set-id executable")
+
+        if os.path.lexists(socket_dir) or len(os.fsencode(socket_path)) >= 108:
+            pytest.fail(
+                "unique provider socket directory collided or exceeded the AF_UNIX path limit"
+            )
+        socket_dir.mkdir(mode=0o700)
+        socket_dir.chmod(0o700)
+        socket_dir_info = socket_dir.lstat()
+        socket_dir_identity = (socket_dir_info.st_dev, socket_dir_info.st_ino)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        listener.listen(2)
+        listener.settimeout(10)
+        socket_info = socket_path.lstat()
+        socket_identity = (socket_info.st_dev, socket_info.st_ino)
+        if (
+            not stat.S_ISSOCK(socket_info.st_mode)
+            or socket_info.st_uid != os.geteuid()
+            or stat.S_IMODE(socket_info.st_mode) != 0o600
+        ):
+            pytest.fail("provider socket is not a test-owned mode-0600 Unix socket")
+
+        script = r"""
+set -eu
+mount_line=$(/bin/busybox grep ' /run/acp ' /proc/self/mountinfo)
+set -- $mount_line
+mount_options=$6
+case ",$mount_options," in
+  *",ro,"*) ;;
+  *) printf 'read-only mount option missing from %s: %s\n' "$mount_options" "$mount_line" >&2; exit 61 ;;
+esac
+for option in nosuid nodev noexec; do
+  case ",$mount_options," in
+    *",$option,"*) ;;
+    *) printf 'mount option %s missing from %s: %s\n' "$option" "$mount_options" "$mount_line" >&2; exit 62 ;;
+  esac
+done
+if /bin/busybox touch /run/acp/worker-created >/dev/null 2>&1; then exit 63; fi
+if /bin/busybox rm -f /run/acp/provider.sock >/dev/null 2>&1; then exit 64; fi
+printf 'MOUNT_OPTIONS_OK\n'
+/bin/provider-socket-probe /run/acp/provider.sock || exit 65
+"""
+        config = {
+            "ociVersion": "1.2.0",
+            "hostname": "acp-provider-proxy-probe",
+            "root": {"path": "rootfs", "readonly": True},
+            "process": {
+                "terminal": False,
+                "user": {"uid": 0, "gid": 0, "additionalGids": []},
+                "args": ["/bin/sh", "-c", script],
+                "env": ["PATH=/bin", "HOME=/", "LANG=C", "LC_ALL=C", "TMPDIR=/tmp"],
+                "cwd": "/",
+                "noNewPrivileges": True,
+                "capabilities": {
+                    "bounding": [],
+                    "effective": [],
+                    "inheritable": [],
+                    "permitted": [],
+                    "ambient": [],
+                },
+            },
+            "mounts": [
+                {
+                    "destination": "/proc",
+                    "type": "proc",
+                    "source": "proc",
+                    "options": ["nosuid", "nodev", "noexec", "ro"],
+                },
+                {
+                    "destination": "/dev",
+                    "type": "tmpfs",
+                    "source": "tmpfs",
+                    "options": ["nosuid", "noexec", "mode=0755", "size=1m", "nr_inodes=64"],
+                },
+                {
+                    "destination": "/tmp",
+                    "type": "tmpfs",
+                    "source": "tmpfs",
+                    "options": ["nosuid", "nodev", "mode=1777", "size=1m"],
+                },
+                {
+                    "destination": "/run/acp",
+                    "type": "bind",
+                    "source": str(socket_dir),
+                    "options": ["bind", "ro", "nosuid", "nodev", "noexec"],
+                },
+            ],
+            "linux": {
+                "uidMappings": [{"containerID": 0, "hostID": os.geteuid(), "size": 1}],
+                "gidMappings": [{"containerID": 0, "hostID": os.getegid(), "size": 1}],
+                "namespaces": [
+                    {"type": namespace}
+                    for namespace in ("user", "pid", "mount", "ipc", "uts", "cgroup", "network")
+                ],
+                "resources": {
+                    "memory": {"limit": _CONTAINER_MEMORY_BYTES},
+                    "cpu": {"quota": _CONTAINER_CPU_QUOTA_US, "period": _CONTAINER_CPU_PERIOD_US},
+                    "pids": {"limit": _CONTAINER_PIDS_LIMIT},
+                    "devices": [{"allow": False, "access": "rwm"}],
+                },
+                "seccomp": oci_worker._worker_seccomp_profile(),
+                "cgroupsPath": oci_worker._oci_worker_cgroups_path(container_id),
+                "rootfsPropagation": "rprivate",
+                "maskedPaths": [
+                    "/proc/kcore",
+                    "/proc/keys",
+                    "/proc/latency_stats",
+                    "/proc/timer_stats",
+                ],
+                "readonlyPaths": ["/proc/sys", "/proc/sysrq-trigger"],
+            },
+        }
+        config_path = bundle_root / "config.json"
+        config_path.write_bytes(oci_worker._canonical_oci_worker_config(config))
+        config_path.chmod(0o600)
+        pin_path = pin.path
+        runc_argv = [
+            str(pin_path),
+            "--root",
+            str(state_root),
+            "--systemd-cgroup",
+            "run",
+            "--bundle",
+            str(bundle_root),
+            "--pid-file",
+            str(state_root / "container.pid"),
+            "--keep",
+            container_id,
+        ]
+        runc_descriptor = oci_worker._open_verified_runc_executable(pin)
+        launcher = (
+            "import json,os,sys; fd=int(sys.argv[1]); "
+            "argv=json.loads(sys.argv[2]); os.set_inheritable(fd,False); "
+            "os.execve(fd,argv,os.environ)"
+        )
+        runtime_cleanup_verified = False
+        runc_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                launcher,
+                str(runc_descriptor),
+                json.dumps(runc_argv),
+            ],
+            cwd="/",
+            env=_runc_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(runc_descriptor,),
+            start_new_session=True,
+        )
+        launch_submitted = True
+
+        worker_connect_deadline = time.monotonic() + 60
+        while True:
+            if runc_process.poll() is not None:
+                stdout, stderr = runc_process.communicate(timeout=1)
+                pytest.fail(
+                    "rootless runc exited before the worker connected: "
+                    f"exit={runc_process.returncode}, stdout={stdout[-2048:]!r}, "
+                    f"stderr={stderr[-2048:]!r}"
+                )
+            remaining = worker_connect_deadline - time.monotonic()
+            if remaining <= 0:
+                pytest.fail("rootless worker did not connect to the provider socket within 60s")
+            listener.settimeout(min(1.0, remaining))
+            try:
+                worker_channel, _ = listener.accept()
+                break
+            except TimeoutError:
+                continue
+        worker_channel.settimeout(4)
+        state_code, state_output = _safe_run_pinned_runc(
+            pin, runc_descriptor, state_root, ["state", container_id]
+        )
+        if state_code != 0:
+            pytest.fail(f"could not read exact provider-probe runc state: {state_output}")
+        state = json.loads(state_output)
+        if state.get("id") != container_id or state.get("status") != "running":
+            pytest.fail("runc state did not identify the exact live provider-probe attempt")
+
+        worker_pid, worker_uid, worker_gid = struct.unpack(
+            "3i", worker_channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        )
+        if worker_pid <= 0 or worker_uid != os.geteuid() or worker_gid != os.getegid():
+            pytest.fail("rootless worker peer credentials did not match its mapped host identity")
+        pinned_peer_pidfd = provider_proxy._get_peer_pidfd(worker_channel)
+        try:
+            if os.get_inheritable(pinned_peer_pidfd):
+                pytest.fail("SO_PEERPIDFD did not return a close-on-exec descriptor")
+            fdinfo = Path(f"/proc/self/fdinfo/{pinned_peer_pidfd}").read_text(encoding="ascii")
+            if f"Pid:\t{worker_pid}\n" not in fdinfo:
+                pytest.fail("SO_PEERPIDFD did not pin the SO_PEERCRED worker PID")
+        finally:
+            os.close(pinned_peer_pidfd)
+
+        systemd_unit = f"acp-{container_id}.scope"
+        attempt_cgroup = _systemd_control_group(systemd_unit)
+        if attempt_cgroup is None:
+            pytest.fail("exact rootless worker scope did not expose its ControlGroup")
+        worker_snapshot = read_linux_process_snapshot(worker_pid)
+        worker_cgroup = _snapshot_cgroup_path(worker_snapshot)
+        if worker_cgroup.resolve(strict=True) != attempt_cgroup.resolve(strict=True):
+            pytest.fail("worker peer cgroup did not match the exact runc systemd scope")
+        cgroup_root = Path("/sys/fs/cgroup").resolve(strict=True)
+        attempt_cgroup_path = (
+            "/" + attempt_cgroup.resolve(strict=True).relative_to(cgroup_root).as_posix()
+        )
+        worker_cgroup_rows = worker_snapshot.cgroup.decode("ascii").splitlines()
+        worker_unified_cgroups = [
+            row.split(":", 2)[2] for row in worker_cgroup_rows if row.startswith("0::")
+        ]
+        if worker_unified_cgroups != [attempt_cgroup_path]:
+            pytest.fail("test receipt cgroup path did not match the worker procfs observation")
+
+        test_receipt = SimpleNamespace(cgroup_path=attempt_cgroup_path)
+        monkeypatch.setattr(
+            provider_proxy,
+            "running_attestation_has_collector_provenance",
+            lambda value: value is test_receipt,
+        )
+        monkeypatch.setattr(
+            provider_proxy,
+            "running_attestation_is_self_consistent",
+            lambda value: value is test_receipt,
+        )
+        authorize = provider_proxy.attempt_scoped_peer_authorizer(test_receipt)
+        if not authorize(worker_channel):
+            pytest.fail("attempt authorizer rejected the live rootless worker peer")
+
+        worker_request = bytearray()
+        while b"\n" not in worker_request and len(worker_request) < 128:
+            chunk = worker_channel.recv(128 - len(worker_request))
+            if not chunk:
+                break
+            worker_request.extend(chunk)
+        if bytes(worker_request) != b"probe\n":
+            pytest.fail(f"worker did not send the expected proxy probe: {bytes(worker_request)!r}")
+
+        outside_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        outside_client.settimeout(4)
+        outside_client.connect(str(socket_path))
+        outside_channel, _ = listener.accept()
+        outside_pid, outside_uid, outside_gid = struct.unpack(
+            "3i", outside_channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        )
+        if (outside_pid, outside_uid, outside_gid) != (os.getpid(), os.geteuid(), os.getegid()):
+            pytest.fail("same-UID outside peer credentials did not match the test process")
+        outside_cgroup = _snapshot_cgroup_path(read_linux_process_snapshot(outside_pid))
+        if outside_cgroup.resolve(strict=True) == attempt_cgroup.resolve(strict=True):
+            pytest.fail("same-UID negative peer unexpectedly shared the worker attempt cgroup")
+        if authorize(outside_channel):
+            pytest.fail("same-UID peer outside the attempt cgroup was authorized")
+        outside_channel.close()
+        outside_channel = None
+        outside_client.close()
+        outside_client = None
+
+        worker_channel.sendall(b"proxy-ok\n")
+        worker_channel.shutdown(socket.SHUT_WR)
+        worker_channel.close()
+        worker_channel = None
+        returncode = runc_process.wait(timeout=12)
+        stdout, stderr = runc_process.communicate(timeout=1)
+        if returncode != 0:
+            pytest.fail(
+                "rootless provider-proxy mount payload failed: "
+                f"exit={returncode}, stdout={stdout[-2048:]!r}, stderr={stderr[-2048:]!r}"
+            )
+        if b"MOUNT_OPTIONS_OK\n" not in stdout or b"CONNECT_OK\n" not in stdout:
+            pytest.fail("worker did not confirm read-only mount and successful socket exchange")
+        if busybox_version == "":
+            pytest.fail("BusyBox version evidence is empty")
+
+        socket_info_after = socket_path.lstat()
+        if (
+            not stat.S_ISSOCK(socket_info_after.st_mode)
+            or (socket_info_after.st_dev, socket_info_after.st_ino) != socket_identity
+        ):
+            pytest.fail("worker changed the host provider socket path or inode")
+        if [entry.name for entry in socket_dir.iterdir()] != ["provider.sock"]:
+            pytest.fail("worker created or removed an entry in the host provider directory")
+    finally:
+        if outside_channel is not None:
+            outside_channel.close()
+        if outside_client is not None:
+            outside_client.close()
+        if runc_process is not None and runc_process.poll() is None:
+            try:
+                _kill_runc_group(runc_process)
+            except Exception as error:
+                cleanup_errors.append(f"could not terminate exact runc client group: {error}")
+        if runc_process is not None:
+            try:
+                runc_process.wait(timeout=3)
+                if runc_process.stdout is not None:
+                    runc_process.stdout.close()
+                if runc_process.stderr is not None:
+                    runc_process.stderr.close()
+            except Exception as error:
+                cleanup_errors.append(f"could not reap exact runc client: {error}")
+
+        if launch_submitted and runc_descriptor >= 0:
+            _safe_run_pinned_runc(
+                pin, runc_descriptor, state_root, ["kill", "--all", container_id, "KILL"]
+            )
+            _safe_run_pinned_runc(
+                pin, runc_descriptor, state_root, ["delete", "--force", container_id]
+            )
+            list_code, list_output = _safe_run_pinned_runc(
+                pin, runc_descriptor, state_root, ["list", "--format", "json"]
+            )
+            if list_code != 0:
+                cleanup_errors.append(f"could not verify exact runc state absence: {list_output}")
+            else:
+                try:
+                    remaining = json.loads(list_output)
+                except json.JSONDecodeError as error:
+                    cleanup_errors.append(f"could not parse runc state listing: {error}")
+                else:
+                    if remaining is None:
+                        remaining = []
+                    if not isinstance(remaining, list) or remaining:
+                        cleanup_errors.append(
+                            f"unexpected provider-probe runc state remained: {remaining!r}"
+                        )
+            try:
+                _wait_for_worker_scope_absent(container_id)
+                slice_unit = oci_worker._oci_worker_systemd_slice(container_id)
+                slice_cgroup = _systemd_control_group(slice_unit)
+                if slice_cgroup is not None:
+                    _stop_exact_systemd_slice_after_pre_stop_scan(slice_unit, slice_cgroup)
+            except Exception as error:
+                cleanup_errors.append(
+                    f"could not verify exact provider-probe cgroup cleanup: {error}"
+                )
+
+        if worker_channel is not None:
+            worker_channel.close()
+        if listener is not None:
+            listener.close()
+
+        if runc_descriptor >= 0:
+            try:
+                os.close(runc_descriptor)
+            except OSError as error:
+                cleanup_errors.append(f"could not close pinned runc descriptor: {error}")
+
+        if not cleanup_errors:
+            runtime_cleanup_verified = True
+        if not cleanup_errors and socket_dir.exists():
+            try:
+                current_dir = socket_dir.lstat()
+                if (
+                    not stat.S_ISDIR(current_dir.st_mode)
+                    or (current_dir.st_dev, current_dir.st_ino) != socket_dir_identity
+                    or current_dir.st_uid != os.geteuid()
+                    or stat.S_IMODE(current_dir.st_mode) != 0o700
+                ):
+                    raise AssertionError("provider socket directory identity changed")
+                if socket_identity is None:
+                    if os.path.lexists(socket_path):
+                        raise AssertionError("unrecorded provider socket appeared before cleanup")
+                else:
+                    current_socket = socket_path.lstat()
+                    if (
+                        not stat.S_ISSOCK(current_socket.st_mode)
+                        or (current_socket.st_dev, current_socket.st_ino) != socket_identity
+                        or current_socket.st_uid != os.geteuid()
+                    ):
+                        raise AssertionError("provider socket identity changed before unlink")
+                    socket_path.unlink()
+                if list(socket_dir.iterdir()):
+                    raise AssertionError("provider socket directory was not empty after unlink")
+                socket_dir.rmdir()
+                if os.path.lexists(socket_dir):
+                    raise AssertionError("provider socket directory remained after cleanup")
+            except Exception as error:
+                cleanup_errors.append(f"could not remove exact provider socket fixture: {error}")
+        elif os.path.lexists(socket_dir):
+            cleanup_errors.append(f"provider socket fixture preserved for inspection: {socket_dir}")
+
+        if not cleanup_errors and attempt_root.exists():
+            try:
+                current_root = attempt_root.lstat()
+                if (
+                    not stat.S_ISDIR(current_root.st_mode)
+                    or (current_root.st_dev, current_root.st_ino) != attempt_root_identity
+                    or current_root.st_uid != os.geteuid()
+                    or stat.S_IMODE(current_root.st_mode) != 0o700
+                ):
+                    raise AssertionError("provider-proxy attempt-root identity changed")
+                if {entry.name for entry in attempt_root.iterdir()} != {"bundle", "runc-state"}:
+                    raise AssertionError("provider-proxy attempt root contains unexpected entries")
+                shutil.rmtree(attempt_root)
+                if os.path.lexists(attempt_root):
+                    raise AssertionError("provider-proxy attempt root remained after cleanup")
+            except Exception as error:
+                cleanup_errors.append(
+                    f"could not remove exact provider-proxy attempt root: {error}"
+                )
+        if cleanup_errors:
+            raise AssertionError(
+                "provider-proxy live-test cleanup failed: " + "; ".join(cleanup_errors)
             )
