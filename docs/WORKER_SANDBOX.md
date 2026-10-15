@@ -773,6 +773,52 @@ production monitor owns the callback yet. They do not prove restart recovery,
 cleanup, cancellation, or worker isolation; OCI worker execution remains
 fail-closed.
 
+### Provider egress destination-policy primitive (2026-10-15; unit proof only)
+
+`supervisor/provider_egress.py` adds a provider-neutral exact host/port policy
+and destination resolver for a future supervisor-owned HTTPS CONNECT proxy.
+It accepts ASCII DNS names (including caller-supplied A-labels), rejects
+Unicode U-label input rather than applying IDNA2003 folding, accepts a single
+trailing dot, and rejects IP-literal authorities. Exact allowlist matching
+precedes an absolute-name system-resolver invocation. Every address returned
+by that resolver is classified; a mixed public and forbidden result fails as a
+whole. Private, loopback, link-local, multicast, reserved, unspecified,
+IPv4-mapped IPv6, and other non-global addresses are rejected. The policy-owned
+`connect_authority()` path resolves and classifies before dialing the numeric
+socket address, without a second hostname lookup. The original hostname is
+retained for the eventual worker client's TLS SNI and certificate validation.
+The public dial API accepts an authority, not a caller-supplied pin; its
+private helper is trusted process code, not an isolation boundary against other
+code running inside the same supervisor process.
+
+The explicit special-use network snapshot follows the [IANA IPv4 registry](https://www.iana.org/assignments/iana-ipv4-special-registry)
+and [IANA IPv6 registry](https://www.iana.org/assignments/iana-ipv6-special-registry),
+both last updated 2025-10-09. It deliberately rejects all listed special-use
+blocks, including a small number the registry marks globally reachable. Review
+and refresh the snapshot when the registries change; `ipaddress.is_global`
+alone is not sufficient for this deny policy.
+
+The 33 focused tests passed with `uv run --frozen pytest -q
+tests/test_provider_egress.py`; Ruff check and format checks passed. They cover
+authority normalization and exact matching, invalid policy, bounded port
+parsing, empty and mixed resolver results, special-use address rejection,
+A/AAAA pin construction, the trailing-dot resolver argument, and a fake-socket
+assertion that policy-authorized dialing uses the vetted numeric sockaddr with
+no second hostname lookup.
+
+This is not a proxy implementation or a live network/guest test. It does not
+prove worker reachability is restricted to a per-attempt proxy, same-UID socket
+denial, socket-FD hygiene, TLS CONNECT behavior, redirect handling, real DNS
+resolver behavior, credential delivery, or provider authentication. A blind
+HTTPS CONNECT proxy can gate only the requested authority and pinned IP; it
+cannot inspect encrypted SNI, HTTP `Host`, URL/path, API method, or redirects,
+and cannot stop exfiltration to an explicitly allowed provider hostname. Any
+redirect policy must be enforced when the client requests its next CONNECT.
+The existing systemd `LoadCredential=` evidence establishes read-only
+per-unit visibility only, not secrecy from the host UID or root. No code here
+is wired to `run_worker()`, and configured OCI worker execution remains
+fail-closed.
+
 ### Supervisor restart: public cancellation and launch-gate fencing (2026-10-15)
 
 The public `terminate_worker()` path now survives loss of the supervisor's
