@@ -3463,11 +3463,17 @@ authentication. It does not imply that the proxy inspects redirects inside TLS.
 The deterministic production-policy tests also check final IPv4/IPv6 resolver
 answers and numeric pinning. In
 `tests/test_provider_egress.py::test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup`
-(source SHA-256 `5647402044f74644a9314dedd2ab76ff44e1abc559fef1744d0439bbd95d7be5`),
+(source SHA-256 `077ef4d1c984d4503fea32fb0522fb90fcbf3cda618ec803451c2973879dfd19`),
 the fake resolver returns `8.8.8.8` first and would return `127.0.0.1` if called
 again; the test asserts one absolute-host `getaddrinfo` invocation and a fake
 socket `connect()` receiving the first numeric sockaddr. This is a deterministic
 no-second-lookup regression trap, not a live DNS-rebinding test.
+The companion
+`test_connect_fallback_uses_only_prevalidated_numeric_pins` test makes the
+first fake socket fail, then verifies the next attempt uses the previously
+validated IPv6 sockaddr, closes the failed socket, and does not invoke the
+resolver again (whose hypothetical next answer is loopback). Both tests use
+fake sockets and prove no provider connection or network reachability.
 
 The opt-in `test_system_resolver_follows_cname_and_policy_pins_a_and_aaaa` was
 also run in this disposable guest, root-owned inside private mount and network
@@ -3484,7 +3490,7 @@ production policy returned the exact numeric pins for the all-public case; the
 guest's resolver stub SHA-256 was
 `6096beac5979f1791fb0a4d089735e267936a9fce82717078a12eeb499e24b38` both
 before and after the test, and no temporary fixture directories remained. The
-policy module passed 34/34 tests in this guest. The test exercises one Linux
+policy module passed 35/35 tests in this guest. The test exercises one Linux
 system-resolver implementation in this guest, not macOS or every resolver
 implementation, and performs no outbound DNS or provider connection. Neither
 the one-call assertion nor the fixture bounds authoritative DNS wire queries.
@@ -3500,7 +3506,7 @@ worktree):
 | --- | --- |
 | `test_oci_worker_runtime.py` | `c74906a0e78ba3d34a1379eae1d52921cc26914450fe36fecdd52d09ebc1aaab` |
 | `test_provider_proxy.py` | `aff9efbdf1a7a9e261141cbc86680c454047db7bfd256a092a14420083ec5837` |
-| `test_provider_egress.py` | `5647402044f74644a9314dedd2ab76ff44e1abc559fef1744d0439bbd95d7be5` |
+| `test_provider_egress.py` | `077ef4d1c984d4503fea32fb0522fb90fcbf3cda618ec803451c2973879dfd19` |
 | `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
 | `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
 

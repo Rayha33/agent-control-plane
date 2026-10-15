@@ -225,6 +225,49 @@ def test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup(
     assert not connection.socket.closed
 
 
+def test_connect_fallback_uses_only_prevalidated_numeric_pins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lookup_calls: list[tuple[object, ...]] = []
+    connected: list[tuple[int, tuple[object, ...]]] = []
+    sockets: list[FakeSocket] = []
+
+    def fake_getaddrinfo(host: str, port: int, **kwargs: object) -> list[tuple[object, ...]]:
+        lookup_calls.append((host, port, kwargs.get("type"), kwargs.get("proto")))
+        if len(lookup_calls) == 1:
+            return [record("8.8.8.8"), record("2606:4700:4700::1111")]
+        return [record("127.0.0.1")]
+
+    class FakeSocket:
+        def __init__(self, family: int, *_args: object) -> None:
+            self.family = family
+            self.closed = False
+            sockets.append(self)
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def connect(self, address: tuple[object, ...]) -> None:
+            connected.append((self.family, address))
+            if address[0] == "8.8.8.8":
+                raise OSError("simulated first-address dial failure")
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(provider_egress.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(provider_egress.socket, "socket", FakeSocket)
+    connection = policy().connect_authority("api.example.com:443")
+
+    assert lookup_calls == [("api.example.com.", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP)]
+    assert connected == [
+        (socket.AF_INET, ("8.8.8.8", 443)),
+        (socket.AF_INET6, ("2606:4700:4700::1111", 443, 0, 0)),
+    ]
+    assert connection.endpoint.sockaddr == ("2606:4700:4700::1111", 443, 0, 0)
+    assert [connection.closed for connection in sockets] == [True, False]
+
+
 def _dns_wire_name(name: str) -> bytes:
     return (
         b"".join(bytes((len(label),)) + label.encode("ascii") for label in name.split(".")) + b"\0"
