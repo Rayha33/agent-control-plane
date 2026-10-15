@@ -43,13 +43,14 @@ from test_oci_worker_runtime import (
 import agent_control_plane.supervisor.oci_worker as oci_worker
 from agent_control_plane.git_supervisor import GitSupervisor
 from agent_control_plane.supervisor import sandbox_attestation
+from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.sandbox_attestation import collect_running_runtime_attestation
 from agent_control_plane.supervisor.sandbox_monitor_ipc import _linux_process_identity
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     sandbox_attempt_slice_unit,
     sandbox_monitor_service_unit,
 )
-from agent_control_plane.supervisor.sandbox_workspace import copy_snapshot
+from agent_control_plane.supervisor.sandbox_workspace import collect_changes, copy_snapshot
 
 _LIVE_ENABLED = os.environ.get("ACP_RUN_SANDBOX_WORKER_LIFECYCLE") == "1"
 _SUPPORTED_RUNC_VERSION = "1.5.2"
@@ -73,6 +74,19 @@ def _entry_is_present(path: Path) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
+def _persisted_write_set_rules(
+    supervisor: GitSupervisor, attempt_id: str
+) -> list[tuple[str, bool, bool]]:
+    with supervisor.connect() as connection:
+        attempt = connection.execute(
+            "SELECT task_id FROM attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if attempt is None:
+            raise RuntimeError("test attempt disappeared before output collection")
+        task = supervisor._task_row(connection, attempt["task_id"])
+        return supervisor._write_set_rules(task, supervisor._case_sensitive_paths(connection))
 
 
 def _unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
@@ -439,6 +453,33 @@ def _monitor_child(
         exited = supervisor._sandbox_execution_record_exit(attempt_id, claim_token, wait_receipt)
         if exited["phase"] != "exited" or wait_receipt.returncode != 0:
             raise RuntimeError("test payload did not exit cleanly")
+        write_set_rules = _persisted_write_set_rules(supervisor, attempt_id)
+        change_set = collect_changes(
+            baseline.manifest, workspace.root, write_set_rules=write_set_rules
+        )
+        if {
+            change.path: change.content for change in change_set.changes if change.kind == "file"
+        } != {
+            _PAYLOAD_MARKER: b"candidate-payload-ran\n",
+            _GIT_METADATA_MARKER: b"host-git-metadata-not-visible\n",
+        }:
+            raise RuntimeError("host change collection did not capture the exact declared output")
+        undeclared_probe = workspace.root / "undeclared-output-probe"
+        if _entry_is_present(undeclared_probe):
+            raise RuntimeError("undeclared-write probe path already exists")
+        try:
+            undeclared_probe.write_bytes(b"must-not-be-authorized\n")
+            try:
+                collect_changes(baseline.manifest, workspace.root, write_set_rules=write_set_rules)
+            except SupervisorError as error:
+                if error.code != "undeclared_write":
+                    raise
+            else:
+                raise RuntimeError("host change collector accepted an undeclared output")
+        finally:
+            undeclared_probe.unlink(missing_ok=True)
+        if _entry_is_present(undeclared_probe):
+            raise RuntimeError("undeclared-write probe remained in the private workspace")
         delete = subprocess.run(
             [str(runc_pin.path), "--root", str(state_root), "delete", "--force", container_id],
             check=False,
@@ -459,6 +500,10 @@ def _monitor_child(
                 ),
                 "runc_client_returncode": wait_receipt.returncode,
                 "runc_state_deleted": not (state_root / container_id).exists(),
+                "change_set_paths": [change.path for change in change_set.changes],
+                "change_set_actions": [change.action for change in change_set.changes],
+                "change_set_digest": change_set.digest,
+                "undeclared_write_rejected": True,
                 "cleanup_verified_written": False,
             },
         )
@@ -727,7 +772,12 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
                 f"rootfs_closure_sha256 = {json.dumps(rootfs_manifest['closure_sha256'])}\n"
             )
         supervisor = GitSupervisor(repo)
-        task = make_task(supervisor, "alpha.txt", title="sandbox lifecycle integration")
+        task = make_task(
+            supervisor,
+            _PAYLOAD_MARKER,
+            _GIT_METADATA_MARKER,
+            title="sandbox lifecycle integration",
+        )
         attempt = supervisor.claim(task["id"], "sandbox-lifecycle-test")
         pin = supervisor.config.oci_rootfs_pin
         runc_pin = supervisor.config.oci_runc_executable
@@ -840,15 +890,46 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition() -
         result_path = _wait_for_receipt(control, "result.json", timeout=20.0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
         durable = supervisor._sandbox_execution_get(attempt["id"])
-        assert result == {
-            "phase": "exited",
-            "payload_marker": "candidate-payload-ran\n",
-            "git_metadata_absent_inside_worker": True,
-            "runc_client_returncode": 0,
-            "runc_state_deleted": True,
-            "cleanup_verified_written": False,
+        assert set(result) == {
+            "phase",
+            "payload_marker",
+            "git_metadata_absent_inside_worker",
+            "runc_client_returncode",
+            "runc_state_deleted",
+            "change_set_paths",
+            "change_set_actions",
+            "change_set_digest",
+            "undeclared_write_rejected",
+            "cleanup_verified_written",
         }
+        assert result["phase"] == "exited"
+        assert result["payload_marker"] == "candidate-payload-ran\n"
+        assert result["git_metadata_absent_inside_worker"] is True
+        assert result["runc_client_returncode"] == 0
+        assert result["runc_state_deleted"] is True
+        assert result["change_set_paths"] == sorted([_PAYLOAD_MARKER, _GIT_METADATA_MARKER])
+        assert result["change_set_actions"] == ["create", "create"]
+        assert re.fullmatch(r"[0-9a-f]{64}", result["change_set_digest"])
+        assert result["undeclared_write_rejected"] is True
+        assert result["cleanup_verified_written"] is False
         assert durable is not None and durable["phase"] == "exited"
+        worktree = Path(attempt["worktree"])
+        binding = supervisor._sandbox_execution_restore_workspace_binding(
+            attempt["id"], attempt["claim_token"]
+        )
+        source_after = copy_snapshot(worktree, control / "registered-source-after")
+        assert source_after.manifest == binding["baseline"].manifest
+        assert not _entry_is_present(worktree / _PAYLOAD_MARKER)
+        assert not _entry_is_present(worktree / _GIT_METADATA_MARKER)
+        with pytest.raises(SupervisorError) as unverified_result:
+            supervisor._sandbox_execution_capture_result_candidate(
+                attempt["id"], attempt["claim_token"]
+            )
+        assert unverified_result.value.code == "sandbox_result_evidence_unverified"
+        durable_after_rejection = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable_after_rejection is not None
+        assert durable_after_rejection["phase"] == "exited"
+        assert durable_after_rejection["result_candidate"] is None
     finally:
         safe_to_remove = _stop_attempted_units_and_check_quiescence(
             systemctl,

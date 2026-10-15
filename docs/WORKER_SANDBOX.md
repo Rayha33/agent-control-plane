@@ -2851,3 +2851,37 @@ transport/lifecycle primitive: ACP's production monitor still does not use
 `LoadCredential=`, and this does not isolate credentials from other trusted
 processes under the same host UID, prove provider authentication, or wire the
 monitor into `run_worker()`. Keep configured OCI worker execution fail-closed.
+
+### No-model sandbox output collection gate (2026-10-15; opt-in proof only)
+
+The exact test source SHA-256
+`be106719ac42c9f87f187072b570513e888ca63098253f17bce56d2b2ceedc5e`
+passed the complete `test_sandbox_worker_lifecycle_integration.py`
+module (3/3) on the dedicated disposable Lima guest: Ubuntu 26.04 ARM64,
+kernel 7.0.0-38-generic, Python 3.14.4, systemd 259.5, cgroup v2, BusyBox
+1.37.0, and rootless runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`).
+No model, provider, or credential was used.
+
+The worker checked that `/workspace/.git` and its HEAD were absent,
+then wrote two disposable result paths declared by the persisted task. The
+host collector derived its write-set matcher from that persisted task,
+validated the exact output bytes, and produced a bounded change-set digest. A
+separate undeclared-output probe was rejected with `undeclared_write` and
+removed. After the run, a fresh safe snapshot of the registered source
+worktree matched the baseline manifest for all non-root-`.git` entries. The
+journal remained at `exited`; after candidate capture was rejected with
+`sandbox_result_evidence_unverified` because trusted cleanup had not been
+recorded, a second journal read confirmed phase `exited` and no stored result
+candidate. `cleanup_verified_written` remains false. This demonstrates
+bounded output scanning and preserves the import fence; it does not
+demonstrate successful result import, `run_worker()`, monitor-owned cleanup
+verification, cancellation/restart recovery, or provider credentials/egress.
+
+The guest's `kernel.apparmor_restrict_unprivileged_userns` was 1 and
+initially denied namespace creation. For this disposable test only, it was
+temporarily set to 0 and restored to 1 by an exit trap; postflight confirmed the
+restored value, no remaining ACP test units or fixture roots, and zero
+D-state processes. This run had no AppArmor profile applied to the monitor and
+is not evidence of AppArmor confinement or a production prerequisite policy.
+Keep configured OCI worker execution fail-closed.
