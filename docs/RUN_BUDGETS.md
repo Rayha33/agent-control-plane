@@ -690,6 +690,21 @@ promotable evidence.
   source rollout log retained later messages while a derived SQLite history
   view was stale. These are unverified user reports, not evidence of ACP data
   loss or a confirmed product root cause.
+- [OpenAI Codex issue #53101](https://github.com/openai/codex/issues/53101):
+  opened 2026-10-11, one user reports apparent agent activity and file changes
+  after a conversation was interrupted and another agent messaged it while the
+  user was conserving quota. The reporter cannot establish whether messaging
+  restarted execution or pending work continued, and a commenter cautions that
+  quota use cannot be attributed from the report alone. This is an unverified
+  interruption-control case, not prevalence or causal proof.
+- [OpenAI Codex issue #46704](https://github.com/openai/codex/issues/46704):
+  opened 2026-09-19, one report says Codex CLI 0.155.1 allowed a depth-2
+  worker-to-leaf spawn with configured `max_depth = 1`; a separate probe with
+  `max_depth = 0` also allowed a spawn, although the reporter notes that zero's
+  intended semantics were unclear. This is bounded to the reported version and
+  environment; it does not establish current behavior across products or ACP,
+  but supports requiring evidence at the actual spawn boundary before claiming
+  a depth limit is enforced.
 - [How Do AI Agents Spend Your Money?](https://arxiv.org/abs/2604.22750):
   research on token use in evaluated coding-agent tasks; results are specific
   to its dataset and setup.
