@@ -4078,7 +4078,7 @@ def test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only(
     socket_dir = Path("/tmp") / f"acp-proxy-{uuid.uuid4().hex[:20]}"
     socket_path = socket_dir / "provider.sock"
     socket_dir_identity: tuple[int, int] | None = None
-    listener: socket.socket | None = None
+    listener: provider_proxy.AttemptProviderProxyListener | None = None
     worker_channel: socket.socket | None = None
     outside_channel: socket.socket | None = None
     outside_client: socket.socket | None = None
@@ -4199,25 +4199,20 @@ int main(int argc, char **argv) {
         ):
             pytest.fail("Unix-socket probe binary is not a test-owned non-set-id executable")
 
-        if os.path.lexists(socket_dir) or len(os.fsencode(socket_path)) >= 108:
-            pytest.fail(
-                "unique provider socket directory collided or exceeded the AF_UNIX path limit"
-            )
+        if os.path.lexists(socket_dir):
+            pytest.fail("unique provider socket directory collided")
         socket_dir.mkdir(mode=0o700)
         socket_dir.chmod(0o700)
         socket_dir_info = socket_dir.lstat()
         socket_dir_identity = (socket_dir_info.st_dev, socket_dir_info.st_ino)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(str(socket_path))
-        os.chmod(socket_path, 0o600)
-        listener.listen(2)
-        listener.settimeout(10)
+        listener = provider_proxy.AttemptProviderProxyListener(socket_dir, backlog=2)
         socket_info = socket_path.lstat()
-        socket_identity = (socket_info.st_dev, socket_info.st_ino)
+        socket_identity = listener.identity
         if (
             not stat.S_ISSOCK(socket_info.st_mode)
             or socket_info.st_uid != os.geteuid()
             or stat.S_IMODE(socket_info.st_mode) != 0o600
+            or (socket_info.st_dev, socket_info.st_ino) != socket_identity
         ):
             pytest.fail("provider socket is not a test-owned mode-0600 Unix socket")
 
@@ -4368,10 +4363,10 @@ printf 'MOUNT_OPTIONS_OK\n'
             remaining = worker_connect_deadline - time.monotonic()
             if remaining <= 0:
                 pytest.fail("rootless worker did not connect to the provider socket within 60s")
-            listener.settimeout(min(1.0, remaining))
             try:
-                worker_channel, _ = listener.accept()
-                break
+                worker_channel = listener.accept(timeout=min(1.0, remaining))
+                if worker_channel is not None:
+                    break
             except TimeoutError:
                 continue
         worker_channel.settimeout(4)
@@ -4445,7 +4440,9 @@ printf 'MOUNT_OPTIONS_OK\n'
         outside_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         outside_client.settimeout(4)
         outside_client.connect(str(socket_path))
-        outside_channel, _ = listener.accept()
+        outside_channel = listener.accept(timeout=4)
+        if outside_channel is None:
+            pytest.fail("same-UID negative peer did not reach the attempt listener")
         outside_pid, outside_uid, outside_gid = struct.unpack(
             "3i", outside_channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         )
@@ -4543,7 +4540,10 @@ printf 'MOUNT_OPTIONS_OK\n'
         if worker_channel is not None:
             worker_channel.close()
         if listener is not None:
-            listener.close()
+            try:
+                listener.close()
+            except Exception as error:
+                cleanup_errors.append(f"could not close exact provider listener: {error}")
 
         if runc_descriptor >= 0:
             try:
@@ -4563,18 +4563,8 @@ printf 'MOUNT_OPTIONS_OK\n'
                     or stat.S_IMODE(current_dir.st_mode) != 0o700
                 ):
                     raise AssertionError("provider socket directory identity changed")
-                if socket_identity is None:
-                    if os.path.lexists(socket_path):
-                        raise AssertionError("unrecorded provider socket appeared before cleanup")
-                else:
-                    current_socket = socket_path.lstat()
-                    if (
-                        not stat.S_ISSOCK(current_socket.st_mode)
-                        or (current_socket.st_dev, current_socket.st_ino) != socket_identity
-                        or current_socket.st_uid != os.geteuid()
-                    ):
-                        raise AssertionError("provider socket identity changed before unlink")
-                    socket_path.unlink()
+                if os.path.lexists(socket_path):
+                    raise AssertionError("provider listener did not remove its exact socket entry")
                 if list(socket_dir.iterdir()):
                     raise AssertionError("provider socket directory was not empty after unlink")
                 socket_dir.rmdir()

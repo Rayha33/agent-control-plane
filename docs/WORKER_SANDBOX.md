@@ -890,22 +890,31 @@ and a static Unix-socket probe client built by the root-owned GCC 15.2.0 compile
 BusyBox binary is static. Both the provider-mount probe and the existing
 `test_live_rootless_runc_enforces_minimal_worker_boundary` passed 1/1 (2/2
 combined) from test source SHA-256
-`5e5dcf8a5b1945b4c91f26427f02e3db7298b00b3676f3af435daec6fbd707b7`.
+`69c6b1f708e0fb9007ea0018ea0424556cf6eeb4fc28aeffa8e1a4b8526ea42c` and
+listener source SHA-256
+`c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead`.
 Opting in requires a trusted C compiler (`ACP_OCI_TEST_CC`, default `cc`) to
 build that small static probe; BusyBox in this guest does not provide `nc -U`.
 
 The test manually assembled a minimal OCI bundle and launched it with rootless
 runc; it did not call the production worker executor or use a provider
-credential. It mounted a dedicated mode-0700 host directory containing only a
-mode-0600 Unix socket at `/run/acp` with `ro,nosuid,nodev,noexec`, then inspected
-the live mountinfo record. The worker could connect and exchange the test-only
+credential. `AttemptProviderProxyListener` validated the caller-created empty
+mode-0700 attempt directory, required trusted non-untrusted-writable parents
+(allowing sticky directories), bound a mode-0600 Unix socket, and retained its
+device/inode identity for exact cleanup. This primitive assumes exclusive
+ownership of the attempt directory; it does not defend against concurrent
+same-UID filesystem mutation, which this live test does not exercise. The test
+mounted that dedicated host directory at `/run/acp` with
+`ro,nosuid,nodev,noexec`, then inspected the live mountinfo record. The worker
+could connect and exchange the test-only
 `probe`/`proxy-ok` messages but could not create or unlink entries. The host
 accepted peer `SO_PEERCRED`, acquired the matching `SO_PEERPIDFD`, checked the
 live peer against the exact systemd attempt cgroup, and authorized it through
 `attempt_scoped_peer_authorizer()`. A same-UID host process outside that cgroup
 was denied. The test invokes authorization immediately after accept, before
 reading the worker's queued probe bytes, but does not call the production
-CONNECT handler. For this isolated primitive test only, the two
+CONNECT handler. Accepted-channel handling and the full listener lifecycle
+remain caller-owned. For this isolated primitive test only, the two
 collector-attestation predicates were replaced with one test-owned receipt whose
 cgroup path was checked against the worker's procfs observation and exact
 systemd scope.
@@ -915,9 +924,10 @@ from `1` to `0` only for the test and restored by an exit trap; postflight read
 it as `1`. The test finalizer and independent postflight found no remaining
 runc state, process, attempt scope/cgroup, attempt directory, or provider
 socket directory. This establishes feasibility for the tested direct-runc
-mount and peer-authorization primitives only. It does not qualify a default
-AppArmor profile, production listener setup/distribution/teardown, the
-production CONNECT handler's before-parse/before-dial ordering, inherited or
+mount, exact-socket listener setup/cleanup, and peer-authorization primitives
+only. It does not qualify a default AppArmor profile, supervisor-to-worker
+lifecycle orchestration, mount setup/teardown, listener concurrency or recovery,
+the production CONNECT handler's before-parse/before-dial ordering, inherited or
 SCM_RIGHTS descriptor hygiene, HTTPS CONNECT, real DNS or provider egress,
 provider authentication, credential delivery, `cleanup_verified`, restart or
 cancellation recovery, result import, or registered `run_worker()` execution.

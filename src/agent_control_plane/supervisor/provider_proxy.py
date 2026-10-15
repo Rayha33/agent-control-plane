@@ -1,8 +1,8 @@
 """Single-connection HTTP CONNECT tunnelling for a trusted provider broker.
 
-This module deliberately does not bind a socket or configure a worker. It
-provides an attempt-scoped Unix peer-authorizer primitive, but the caller must
-still own listener setup, channel distribution, and worker integration. The
+This module provides attempt-scoped Unix listener and peer-authorizer
+primitives, but the caller must still own their lifecycle, channel distribution,
+and worker integration. The
 CONNECT authority is checked by
 ``ProviderEgressPolicy`` before any upstream connection is made; after the
 200 response, bytes are relayed unchanged so TLS and certificate validation
@@ -11,13 +11,16 @@ remain the worker client's responsibility.
 
 from __future__ import annotations
 
+import math
 import os
 import selectors
 import socket
+import stat
 import struct
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from .common import SupervisorError
 from .provider_egress import EgressPolicyError, PinnedConnection, ProviderEgressPolicy
@@ -33,6 +36,8 @@ _REQUEST_TIMEOUT_SECONDS = 10.0
 _RELAY_CHUNK_BYTES = 64 * 1024
 _MAX_BUFFERED_BYTES = 1024 * 1024
 _DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
+# Use the narrower sockaddr_un.sun_path size across Linux and Darwin.
+_MAX_UNIX_SOCKET_PATH_BYTES = 103
 # Linux UAPI value from include/uapi/asm-generic/socket.h. Python versions
 # that predate the constant still run on kernels that implement the option.
 _SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
@@ -110,6 +115,286 @@ def attempt_scoped_peer_authorizer(
         return authorized
 
     return authorize_peer
+
+
+class AttemptProviderProxyListener:
+    """Own one attempt-directory Unix listener and its exact socket entry.
+
+    The caller must create a fresh mode-0700 directory and must authorize each
+    accepted stream before reading it (normally with
+    :func:`attempt_scoped_peer_authorizer` and
+    :func:`serve_connect_connection`). This object owns bind/listen and safe
+    inode-checked unlink under an exclusive-directory-owner assumption. Every
+    parent must be owned by root or the current euid and not group/world writable,
+    except sticky directories. It does not defend against concurrent same-UID
+    mutation. It does not create a thread, mount the directory, configure a
+    worker, or provide a lifecycle outside the caller's attempt.
+    """
+
+    socket_name = "provider.sock"
+
+    def __init__(self, directory: Path, *, backlog: int = 16) -> None:
+        if type(backlog) is not int or backlog < 1:
+            raise SupervisorError(
+                "provider_proxy_backlog_invalid", "listener backlog must be positive"
+            )
+        if not isinstance(directory, (str, Path)):
+            raise SupervisorError(
+                "provider_proxy_directory_invalid", "listener directory is invalid"
+            )
+        path = Path(directory)
+        if not path.is_absolute():
+            raise SupervisorError(
+                "provider_proxy_directory_invalid", "listener directory must be absolute"
+            )
+        try:
+            raw_info = path.lstat()
+        except OSError as error:
+            raise SupervisorError(
+                "provider_proxy_directory_invalid", "listener directory is unavailable"
+            ) from error
+        if stat.S_ISLNK(raw_info.st_mode):
+            raise SupervisorError(
+                "provider_proxy_directory_unsafe", "listener directory is a symlink"
+            )
+        try:
+            canonical_path = path.resolve(strict=True)
+            directory_info = canonical_path.lstat()
+        except OSError as error:
+            raise SupervisorError(
+                "provider_proxy_directory_invalid", "listener directory is unavailable"
+            ) from error
+        if (
+            canonical_path != path
+            or not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_info.st_mode) != 0o700
+        ):
+            raise SupervisorError(
+                "provider_proxy_directory_unsafe",
+                "listener directory must be canonical, test-owned, and mode 0700",
+            )
+        if not self._parent_chain_is_trusted(canonical_path):
+            raise SupervisorError(
+                "provider_proxy_parent_unsafe",
+                "listener directory parents must be trusted and not untrusted-writable",
+            )
+
+        socket_path = canonical_path / self.socket_name
+        if len(os.fsencode(socket_path)) >= _MAX_UNIX_SOCKET_PATH_BYTES:
+            raise SupervisorError(
+                "provider_proxy_path_too_long", "Unix listener path exceeds the portable limit"
+            )
+        if os.path.lexists(socket_path):
+            raise SupervisorError(
+                "provider_proxy_socket_exists", "listener refuses to replace an existing path"
+            )
+        try:
+            with os.scandir(canonical_path) as entries:
+                if next(entries, None) is not None:
+                    raise SupervisorError(
+                        "provider_proxy_directory_not_empty",
+                        "listener directory must be empty before binding",
+                    )
+        except OSError as error:
+            raise SupervisorError(
+                "provider_proxy_directory_invalid", "listener directory cannot be inspected"
+            ) from error
+
+        listener: socket.socket | None = None
+        bound = False
+        socket_identity: tuple[int, int] | None = None
+        try:
+            socket_type = socket.SOCK_STREAM | getattr(socket, "SOCK_CLOEXEC", 0)
+            listener = socket.socket(socket.AF_UNIX, socket_type)
+            if os.get_inheritable(listener.fileno()):
+                raise SupervisorError(
+                    "provider_proxy_fd_inheritable", "listener descriptor is inheritable"
+                )
+            listener.bind(str(socket_path))
+            bound = True
+            bound_info = socket_path.lstat()
+            socket_identity = (bound_info.st_dev, bound_info.st_ino)
+            os.chmod(socket_path, 0o600)
+            socket_info = socket_path.lstat()
+            if (
+                not stat.S_ISSOCK(socket_info.st_mode)
+                or socket_info.st_uid != os.geteuid()
+                or stat.S_IMODE(socket_info.st_mode) != 0o600
+                or (socket_info.st_dev, socket_info.st_ino) != socket_identity
+            ):
+                raise SupervisorError(
+                    "provider_proxy_socket_unsafe", "bound socket identity or permissions changed"
+                )
+            current_directory = canonical_path.lstat()
+            if not stat.S_ISDIR(current_directory.st_mode) or (
+                current_directory.st_dev,
+                current_directory.st_ino,
+            ) != (directory_info.st_dev, directory_info.st_ino):
+                raise SupervisorError(
+                    "provider_proxy_directory_changed", "listener directory identity changed"
+                )
+            listener.listen(backlog)
+        except BaseException as error:
+            cleanup_error: BaseException | None = None
+            if listener is not None:
+                try:
+                    listener.close()
+                except BaseException as close_error:
+                    cleanup_error = close_error
+            if bound and (
+                socket_identity is None
+                or not self._unlink_if_exact(
+                    socket_path, canonical_path, directory_info, socket_identity
+                )
+            ):
+                cleanup_error = error
+            if cleanup_error is not None:
+                raise SupervisorError(
+                    "provider_proxy_socket_cleanup_unverified",
+                    "failed setup left socket cleanup unverified",
+                ) from cleanup_error
+            raise
+
+        self.directory = canonical_path
+        self.path = socket_path
+        self.identity = socket_identity
+        self._directory_identity = (directory_info.st_dev, directory_info.st_ino)
+        self._listener = listener
+        self._closed = False
+        self._close_error: SupervisorError | None = None
+
+    @staticmethod
+    def _parent_chain_is_trusted(directory: Path) -> bool:
+        """Reject writable ancestors that could let another UID rename the path."""
+        for parent in directory.parents:
+            try:
+                info = parent.lstat()
+            except OSError:
+                return False
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.geteuid()}:
+                return False
+            mode = stat.S_IMODE(info.st_mode)
+            if mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+                return False
+        return True
+
+    @staticmethod
+    def _unlink_if_exact(
+        socket_path: Path,
+        directory: Path,
+        directory_info: os.stat_result,
+        socket_identity: tuple[int, int],
+    ) -> bool:
+        """Remove only a matching socket, assuming no concurrent same-UID mutation."""
+        try:
+            current_directory = directory.lstat()
+        except OSError:
+            return False
+        if (
+            not stat.S_ISDIR(current_directory.st_mode)
+            or (current_directory.st_dev, current_directory.st_ino)
+            != (directory_info.st_dev, directory_info.st_ino)
+            or current_directory.st_uid != os.geteuid()
+            or stat.S_IMODE(current_directory.st_mode) != 0o700
+        ):
+            return False
+        try:
+            current_socket = socket_path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if (
+            stat.S_ISSOCK(current_socket.st_mode)
+            and current_socket.st_uid == os.geteuid()
+            and (current_socket.st_dev, current_socket.st_ino) == socket_identity
+        ):
+            try:
+                socket_path.unlink()
+            except OSError:
+                return False
+            return True
+        return False
+
+    def accept(self, *, timeout: float) -> socket.socket | None:
+        """Accept one stream, or return ``None`` when the bounded wait expires.
+
+        Only one caller may accept at a time. The returned stream remains the
+        caller's responsibility and must be authorized before request bytes are
+        read.
+        """
+        if self._closed:
+            raise SupervisorError("provider_proxy_closed", "listener is closed")
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            raise SupervisorError(
+                "provider_proxy_timeout_invalid", "accept timeout must be positive"
+            )
+        try:
+            timeout_seconds = float(timeout)
+        except (OverflowError, ValueError):
+            timeout_seconds = math.inf
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise SupervisorError(
+                "provider_proxy_timeout_invalid", "accept timeout must be finite and positive"
+            )
+        self._listener.settimeout(timeout_seconds)
+        try:
+            client, _address = self._listener.accept()
+        except TimeoutError:
+            return None
+        if os.get_inheritable(client.fileno()):
+            client.close()
+            raise SupervisorError(
+                "provider_proxy_fd_inheritable", "accepted descriptor is inheritable"
+            )
+        return client
+
+    def close(self) -> None:
+        """Close the listener and unlink only its recorded socket inode."""
+        if self._closed:
+            if self._close_error is not None:
+                raise self._close_error
+            return
+        self._closed = True
+        try:
+            self._listener.close()
+        except BaseException as error:
+            self._close_error = SupervisorError(
+                "provider_proxy_listener_close_unverified",
+                "listener descriptor close is unverified",
+            )
+            raise self._close_error from error
+        try:
+            current_directory = self.directory.lstat()
+            if (
+                not stat.S_ISDIR(current_directory.st_mode)
+                or (current_directory.st_dev, current_directory.st_ino) != self._directory_identity
+                or current_directory.st_uid != os.geteuid()
+                or stat.S_IMODE(current_directory.st_mode) != 0o700
+            ):
+                raise SupervisorError(
+                    "provider_proxy_directory_changed", "listener directory identity changed"
+                )
+            current_socket = self.path.lstat()
+            if (
+                not stat.S_ISSOCK(current_socket.st_mode)
+                or current_socket.st_uid != os.geteuid()
+                or stat.S_IMODE(current_socket.st_mode) != 0o600
+                or (current_socket.st_dev, current_socket.st_ino) != self.identity
+            ):
+                raise SupervisorError(
+                    "provider_proxy_socket_changed", "listener socket identity changed"
+                )
+            self.path.unlink()
+        except OSError as error:
+            self._close_error = SupervisorError(
+                "provider_proxy_socket_cleanup_unverified", "listener socket cleanup is unverified"
+            )
+            raise self._close_error from error
+        except SupervisorError as error:
+            self._close_error = error
+            raise
 
 
 def _read_connect_request(client: socket.socket) -> str:

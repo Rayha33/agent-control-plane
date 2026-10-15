@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import socket
 import ssl
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from shutil import which
@@ -13,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_control_plane.supervisor import provider_egress, provider_proxy
+from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.provider_egress import (
     PinnedConnection,
     PinnedEndpoint,
@@ -63,6 +66,15 @@ def _read_response_headers(client: socket.socket) -> bytes:
             break
         response.extend(chunk)
     return bytes(response)
+
+
+@pytest.fixture
+def private_attempt_directory() -> Path:
+    with tempfile.TemporaryDirectory(prefix="acp-proxy-", dir="/tmp") as root:
+        directory = Path(root) / "attempt"
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+        yield directory.resolve()
 
 
 def _start_handler(
@@ -139,6 +151,190 @@ def test_peer_authorization_precedes_request_parsing_and_dial() -> None:
     thread.join(timeout=2)
     assert not thread.is_alive()
     worker.close()
+
+
+def test_attempt_proxy_listener_owns_private_socket_and_exact_cleanup(
+    private_attempt_directory: Path,
+) -> None:
+    directory = private_attempt_directory
+    listener = provider_proxy.AttemptProviderProxyListener(directory)
+    assert listener.directory == directory
+    assert listener.path == directory / "provider.sock"
+    socket_info = listener.path.lstat()
+    assert stat.S_ISSOCK(socket_info.st_mode)
+    assert socket_info.st_uid == os.geteuid()
+    assert stat.S_IMODE(socket_info.st_mode) == 0o600
+    assert (socket_info.st_dev, socket_info.st_ino) == listener.identity
+
+    assert listener.accept(timeout=0.01) is None
+    for invalid_timeout in (0, float("nan"), float("inf"), 10**1000):
+        with pytest.raises(SupervisorError, match="timeout"):
+            listener.accept(timeout=invalid_timeout)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    accepted: socket.socket | None = None
+    try:
+        client.connect(str(listener.path))
+        accepted = listener.accept(timeout=1)
+        assert accepted is not None
+        assert not os.get_inheritable(accepted.fileno())
+    finally:
+        if accepted is not None:
+            accepted.close()
+        client.close()
+
+    listener.close()
+    assert not os.path.lexists(listener.path)
+    assert directory.is_dir()
+    with pytest.raises(SupervisorError, match="listener is closed"):
+        listener.accept(timeout=0.1)
+
+
+def test_attempt_proxy_listener_refuses_existing_path_without_replacing_it(
+    private_attempt_directory: Path,
+) -> None:
+    directory = private_attempt_directory
+    socket_path = directory / "provider.sock"
+    socket_path.write_text("preserve", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="refuses to replace"):
+        provider_proxy.AttemptProviderProxyListener(directory)
+
+    assert socket_path.read_text(encoding="ascii") == "preserve"
+
+
+def test_attempt_proxy_listener_requires_empty_directory(
+    private_attempt_directory: Path,
+) -> None:
+    sibling = private_attempt_directory / "worker-visible.txt"
+    sibling.write_text("must not be mounted", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="directory must be empty"):
+        provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+
+    assert sibling.read_text(encoding="ascii") == "must not be mounted"
+
+
+def test_attempt_proxy_listener_rejects_writable_non_sticky_parent(
+    private_attempt_directory: Path,
+) -> None:
+    parent = private_attempt_directory.parent
+    parent.chmod(0o770)
+    try:
+        with pytest.raises(SupervisorError, match="parents must be trusted"):
+            provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    finally:
+        parent.chmod(0o700)
+
+
+def test_attempt_proxy_listener_setup_failure_cleans_bound_socket(
+    private_attempt_directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_socket = socket.socket
+
+    class FailingListenSocket(original_socket):
+        def listen(self, backlog: int = 0) -> None:
+            raise OSError("injected listen failure")
+
+    monkeypatch.setattr(provider_proxy.socket, "socket", FailingListenSocket)
+    with pytest.raises(OSError, match="injected listen failure"):
+        provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+
+    assert not os.path.lexists(private_attempt_directory / "provider.sock")
+
+
+def test_attempt_proxy_listener_reports_unverified_setup_cleanup(
+    private_attempt_directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_socket = socket.socket
+
+    class FailingListenSocket(original_socket):
+        def listen(self, backlog: int = 0) -> None:
+            raise OSError("injected listen failure")
+
+    monkeypatch.setattr(provider_proxy.socket, "socket", FailingListenSocket)
+    monkeypatch.setattr(
+        provider_proxy.AttemptProviderProxyListener,
+        "_unlink_if_exact",
+        staticmethod(lambda *_args: False),
+    )
+    socket_path = private_attempt_directory / "provider.sock"
+    try:
+        with pytest.raises(SupervisorError, match="cleanup unverified"):
+            provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    finally:
+        if os.path.lexists(socket_path):
+            socket_path.unlink()
+
+
+def test_attempt_proxy_listener_requires_canonical_private_directory(
+    private_attempt_directory: Path,
+) -> None:
+    directory = private_attempt_directory
+    directory.chmod(0o710)
+    with pytest.raises(SupervisorError, match="mode 0700"):
+        provider_proxy.AttemptProviderProxyListener(directory)
+
+    directory.chmod(0o700)
+    alias = directory.parent / "attempt-alias"
+    alias.symlink_to(directory, target_is_directory=True)
+    with pytest.raises(SupervisorError, match="is a symlink"):
+        provider_proxy.AttemptProviderProxyListener(alias)
+
+
+def test_attempt_proxy_listener_preserves_replaced_path_on_close(
+    private_attempt_directory: Path,
+) -> None:
+    directory = private_attempt_directory
+    listener = provider_proxy.AttemptProviderProxyListener(directory)
+    socket_path = listener.path
+    socket_path.unlink()
+    socket_path.write_text("not the listener", encoding="ascii")
+
+    with pytest.raises(SupervisorError, match="socket identity changed"):
+        listener.close()
+
+    assert socket_path.read_text(encoding="ascii") == "not the listener"
+
+
+def test_attempt_proxy_listener_does_not_call_missing_directory_cleaned(
+    private_attempt_directory: Path,
+) -> None:
+    listener = provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    directory_info = private_attempt_directory.lstat()
+    listener.close()
+    private_attempt_directory.rmdir()
+
+    assert not listener._unlink_if_exact(
+        listener.path, listener.directory, directory_info, listener.identity
+    )
+
+
+def test_attempt_proxy_listener_caches_descriptor_close_failure(
+    private_attempt_directory: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_socket = socket.socket
+
+    class FailingCloseSocket(original_socket):
+        def close(self) -> None:
+            raise OSError("injected close failure")
+
+    monkeypatch.setattr(provider_proxy.socket, "socket", FailingCloseSocket)
+    listener = provider_proxy.AttemptProviderProxyListener(private_attempt_directory)
+    socket_path = listener.path
+    socket_identity = listener.identity
+    try:
+        for _ in range(2):
+            with pytest.raises(SupervisorError, match="descriptor close is unverified"):
+                listener.close()
+        info = socket_path.lstat()
+        assert (info.st_dev, info.st_ino) == socket_identity
+    finally:
+        descriptor = listener._listener.detach()
+        os.close(descriptor)
+        if os.path.lexists(socket_path):
+            current = socket_path.lstat()
+            if (current.st_dev, current.st_ino) == socket_identity:
+                socket_path.unlink()
 
 
 @pytest.mark.skipif(
