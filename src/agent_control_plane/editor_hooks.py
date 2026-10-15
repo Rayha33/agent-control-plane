@@ -198,8 +198,17 @@ def install_claude_code_hooks(
     existing_hooks = settings.get("hooks", {})
     if not isinstance(existing_hooks, dict):
         raise ValueError(f"{settings_path} has a non-object 'hooks' value")
-    if any(not isinstance(entries, list) for entries in existing_hooks.values()):
-        raise ValueError(f"{settings_path} has a non-list hook event value")
+    for entries in existing_hooks.values():
+        if not isinstance(entries, list):
+            raise ValueError(f"{settings_path} has a non-list hook event value")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(f"{settings_path} has a non-object hook matcher entry")
+            configured_hooks = entry.get("hooks")
+            if not isinstance(configured_hooks, list):
+                raise ValueError(f"{settings_path} has a non-list 'hooks' entry value")
+            if any(not isinstance(hook, dict) for hook in configured_hooks):
+                raise ValueError(f"{settings_path} has a non-object hook command entry")
 
     settings["hooks"] = _merge_hook_events(
         existing_hooks,

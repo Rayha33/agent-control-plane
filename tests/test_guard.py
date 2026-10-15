@@ -535,6 +535,15 @@ def test_install_refuses_to_overwrite_unreadable_settings(tmp_path: Path) -> Non
         ("[]", "JSON object"),
         ('{"hooks": []}', "non-object 'hooks'"),
         ('{"hooks": {"PreToolUse": "user hook"}}', "non-list hook event"),
+        ('{"hooks": {"PreToolUse": [null]}}', "non-object hook matcher entry"),
+        (
+            '{"hooks": {"PreToolUse": [{"hooks": "user hook"}]}}',
+            "non-list 'hooks' entry value",
+        ),
+        (
+            '{"hooks": {"PreToolUse": [{"hooks": [null]}]}}',
+            "non-object hook command entry",
+        ),
     ],
 )
 def test_install_refuses_unknown_settings_shapes(tmp_path: Path, contents: str, error: str) -> None:
