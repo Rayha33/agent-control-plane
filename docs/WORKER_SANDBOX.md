@@ -3463,7 +3463,7 @@ authentication. It does not imply that the proxy inspects redirects inside TLS.
 The deterministic production-policy tests also check final IPv4/IPv6 resolver
 answers and numeric pinning. In
 `tests/test_provider_egress.py::test_connect_uses_vetted_numeric_sockaddr_without_second_dns_lookup`
-(source SHA-256 `077ef4d1c984d4503fea32fb0522fb90fcbf3cda618ec803451c2973879dfd19`),
+(source SHA-256 `1d384fba0ebb116cb2e19c466e67bde1a3922f94ad9f2569fbe00891c4fec042`),
 the fake resolver returns `8.8.8.8` first and would return `127.0.0.1` if called
 again; the test asserts one absolute-host `getaddrinfo` invocation and a fake
 socket `connect()` receiving the first numeric sockaddr. This is a deterministic
@@ -3486,7 +3486,15 @@ with A `8.8.8.8` and AAAA `::1`; the real guest resolver path reaches the
 production policy, which rejects that mixed answer with
 `destination_address_denied`. This proves fail-closed behavior for this
 resolver fixture, not resolver portability or packet-level completeness. The
-production policy returned the exact numeric pins for the all-public case; the
+same fixture returns public A/AAAA answers on the first
+`rotating.example.com` lookup and `127.0.0.1`/`::1` on the next lookup, with
+zero TTL. The first production-policy `connect_authority` uses only the vetted
+`8.8.8.8` sockaddr through a fake socket; a second call rejects the changed
+answer before constructing another socket. The test confirms two queries per
+address family and performs no provider connection. This demonstrates a
+controlled answer-change case through this guest's system resolver, not
+external or authoritative DNS rebinding behavior. The production policy
+returned the exact numeric pins for the all-public case; the
 guest's resolver stub SHA-256 was
 `6096beac5979f1791fb0a4d089735e267936a9fce82717078a12eeb499e24b38` both
 before and after the test, and no temporary fixture directories remained. The
@@ -3506,7 +3514,7 @@ worktree):
 | --- | --- |
 | `test_oci_worker_runtime.py` | `c74906a0e78ba3d34a1379eae1d52921cc26914450fe36fecdd52d09ebc1aaab` |
 | `test_provider_proxy.py` | `aff9efbdf1a7a9e261141cbc86680c454047db7bfd256a092a14420083ec5837` |
-| `test_provider_egress.py` | `077ef4d1c984d4503fea32fb0522fb90fcbf3cda618ec803451c2973879dfd19` |
+| `test_provider_egress.py` | `1d384fba0ebb116cb2e19c466e67bde1a3922f94ad9f2569fbe00891c4fec042` |
 | `provider_proxy.py` | `c12e86847058a9082be3f9381050467e8bfabb33bfffa76e535681733e988ead` |
 | `provider_egress.py` | `72ffe5cca88a24ba298c3d68a684e35ace711f53c4e0b8faaef929b2f56e8009` |
 
@@ -3523,9 +3531,11 @@ real. Together, these tests prove the live worker-to-socket CONNECT path,
 same-UID peer rejection, and the separate proxy rule requiring a new CONNECT
 for a TLS redirect target. Together with the host-side resolver tests, they
 also prove that the policy passes its vetted numeric sockaddr to `connect()`
-without a second system-resolver call (the socket itself is mocked). They do not
-prove live DNS rebinding behavior, resolver portability beyond the exact guest,
-provider authentication, the application following redirects inside the OCI
-worker, credential handoff, crash recovery, cleanup verification, result
-transfer, or production `run_worker()` integration. Task #3112 and parent task
-#2370 remain open, and configured OCI worker execution remains fail-closed.
+without a second system-resolver call (the socket itself is mocked). The
+rotating-answer case is limited to this controlled guest resolver and does not
+prove authoritative/external DNS rebinding behavior or resolver portability.
+These proofs do not establish provider authentication, the application
+following redirects inside the OCI worker, credential handoff, crash recovery,
+cleanup verification, result transfer, or production `run_worker()`
+integration. Task #3112 and parent task #2370 remain open, and configured OCI
+worker execution remains fail-closed.

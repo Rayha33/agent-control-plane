@@ -312,6 +312,8 @@ def _run_cname_dns_child() -> int:
             )
 
         queries: list[tuple[str, int]] = []
+        query_counts: dict[tuple[str, int], int] = {}
+        rebind_phase = 0
         errors: list[str] = []
         stop = threading.Event()
         server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -337,6 +339,8 @@ def _run_cname_dns_child() -> int:
                     question_end = position + 4
                     query_name = ".".join(labels).lower()
                     queries.append((query_name, query_type))
+                    query_key = (query_name, query_type)
+                    query_counts[query_key] = query_counts.get(query_key, 0) + 1
 
                     cname_targets = {
                         "api.example.com": "gateway.test",
@@ -345,6 +349,12 @@ def _run_cname_dns_child() -> int:
                     target_addresses = {
                         "gateway.test": {1: "8.8.8.8", 28: "2606:4700:4700::1111"},
                         "mixed-gateway.test": {1: "8.8.8.8", 28: "::1"},
+                    }
+                    rotating_addresses = {
+                        "rotating.example.com": {
+                            1: ("8.8.8.8", "127.0.0.1"),
+                            28: ("2606:4700:4700::1111", "::1"),
+                        }
                     }
                     target_name = cname_targets.get(query_name, query_name)
                     answers = []
@@ -355,16 +365,25 @@ def _run_cname_dns_child() -> int:
                             + struct.pack("!HHIH", 5, 1, 60, len(target_wire_name))
                             + target_wire_name
                         )
-                    address_text = target_addresses.get(target_name, {}).get(query_type)
+                    rotating = rotating_addresses.get(query_name)
+                    if rotating is not None:
+                        address_versions = rotating.get(query_type, ())
+                        response_index = min(rebind_phase, len(address_versions) - 1)
+                        address_text = (
+                            address_versions[response_index] if address_versions else None
+                        )
+                    else:
+                        address_text = target_addresses.get(target_name, {}).get(query_type)
                     if address_text is not None:
                         address = ipaddress.ip_address(address_text).packed
+                        ttl = 0 if rotating is not None else 60
                         owner = (
                             b"\xc0\x0c"
                             if query_name == target_name
                             else _dns_wire_name(target_name)
                         )
                         answers.append(
-                            owner + struct.pack("!HHIH", query_type, 1, 60, len(address)) + address
+                            owner + struct.pack("!HHIH", query_type, 1, ttl, len(address)) + address
                         )
 
                     flags = 0x8580  # response, authoritative, recursion-desired/available
@@ -382,11 +401,46 @@ def _run_cname_dns_child() -> int:
         thread.start()
         try:
             egress_policy = ProviderEgressPolicy(
-                {"api.example.com": {443}, "mixed.example.com": {443}}
+                {
+                    "api.example.com": {443},
+                    "mixed.example.com": {443},
+                    "rotating.example.com": {443},
+                }
             )
             endpoints = egress_policy.resolve_connect_authority("api.example.com:443")
             with pytest.raises(EgressPolicyError) as denied:
                 egress_policy.resolve_connect_authority("mixed.example.com:443")
+
+            dialed: list[tuple[int, tuple[object, ...]]] = []
+            fake_sockets: list[object] = []
+
+            class FakeSocket:
+                def __init__(self, family: int, *_args: object) -> None:
+                    self.family = family
+                    self.closed = False
+                    fake_sockets.append(self)
+
+                def settimeout(self, _timeout: float) -> None:
+                    pass
+
+                def connect(self, address: tuple[object, ...]) -> None:
+                    dialed.append((self.family, address))
+
+                def close(self) -> None:
+                    self.closed = True
+
+            real_socket_factory = socket.socket
+            first_connection = None
+            try:
+                socket.socket = FakeSocket
+                first_connection = egress_policy.connect_authority("rotating.example.com:443")
+                rebind_phase = 1
+                with pytest.raises(EgressPolicyError) as rebound:
+                    egress_policy.connect_authority("rotating.example.com:443")
+            finally:
+                socket.socket = real_socket_factory
+                if first_connection is not None:
+                    first_connection.socket.close()
         finally:
             stop.set()
             thread.join(timeout=2)
@@ -395,11 +449,16 @@ def _run_cname_dns_child() -> int:
         assert not errors, errors
         assert thread.is_alive() is False
         assert denied.value.code == "destination_address_denied"
+        assert rebound.value.code == "destination_address_denied"
+        assert dialed == [(socket.AF_INET, ("8.8.8.8", 443))]
+        assert len(fake_sockets) == 1
         for queried_host in ("api.example.com", "mixed.example.com"):
             assert {query_type for name, query_type in queries if name == queried_host} >= {
                 1,
                 28,
             }
+        for query_type in (1, 28):
+            assert query_counts[("rotating.example.com", query_type)] >= 2
         assert all(
             name
             in {
@@ -407,6 +466,7 @@ def _run_cname_dns_child() -> int:
                 "gateway.test",
                 "mixed.example.com",
                 "mixed-gateway.test",
+                "rotating.example.com",
             }
             for name, _ in queries
         )
