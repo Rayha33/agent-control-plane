@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sys
@@ -165,9 +166,11 @@ class ClientTestOpener:
     def __init__(self, client) -> None:
         self.client = client
         self.payloads: list[dict[str, object]] = []
+        self.requests: list[tuple[Request, float]] = []
 
     def open(self, request: Request, timeout: float) -> FakeApiResponse:
         assert timeout > 0
+        self.requests.append((request, timeout))
         response = self.client.request(
             request.get_method(),
             request.full_url,
@@ -1551,6 +1554,173 @@ def test_http_adapter_and_dispatch_once_integrate_with_reference_api(client, adm
     receipt = opener.payloads[1]["receipt"]
     assert receipt["http_status_code"] == 429
     assert receipt["retry_after_seconds"] == 30
+
+    interruption_request = {
+        "claim_fencing_token": claim["task"]["claim_fencing_token"],
+        "resource_fencing_tokens": resource_fencing_tokens,
+        "reason": "retry_exhausted",
+        "summary": "Stopped after the provider returned a bounded retry response.",
+        "checkpoint": {"phase": "tests", "next_step": "wait for a fresh claim"},
+        "dispatch_attempt_ids": [result.dispatch_attempt_id],
+    }
+    interruption = ledger.record_budget_interruption_report(
+        task_id=task["id"], request=interruption_request
+    )
+    replay = ledger.record_budget_interruption_report(
+        task_id=task["id"], request=interruption_request
+    )
+
+    report = interruption["report"]
+    assert interruption["created"] is True
+    assert replay["created"] is False
+    assert replay["report"]["id"] == report["id"]
+    assert report["status"] == "partial"
+    assert report["source"] == "client_reported"
+    assert report["promotable"] is False
+    assert report["dispatch_attempt_ids"] == [result.dispatch_attempt_id]
+    assert report["dispatch_attempts"][0]["id"] == result.dispatch_attempt_id
+    assert report["dispatch_attempts"][0]["receipt"]["dispatch_attempt_id"] == (
+        result.dispatch_attempt_id
+    )
+    assert len(report["checkpoint_sha256"]) == 64
+    assert opener.requests[3][0].full_url.endswith(f"/v1/tasks/{task['id']}/interruption-reports")
+    assert opener.requests[3][0].get_method() == "POST"
+    assert json.loads(opener.requests[3][0].data) == interruption_request
+    assert opener.payloads[3]["created"] is True
+    assert opener.payloads[4]["created"] is False
+
+    final_task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert final_task_view["latest_interruption_report"]["promotable"] is False
+    assert final_task_view["latest_submission"] is None
+
+
+def test_interruption_http_adapter_rejects_secret_shaped_checkpoint_before_send() -> None:
+    opener = FakeApiOpener()
+    ledger = CoordinationHttpDispatchLedger(
+        base_url="http://127.0.0.1", bearer_token="test-token", opener=opener
+    )
+    secret = "SENTINEL_SECRET_SHOULD_NOT_ECHO_92f84e16"
+    request = {
+        "claim_fencing_token": 7,
+        "resource_fencing_tokens": {"repo:file:src/app.py": 11},
+        "reason": "unknown",
+        "summary": "Stopped before submission.",
+        "checkpoint": {"clientSecret": secret},
+        "dispatch_attempt_ids": [],
+    }
+
+    with pytest.raises(ValueError) as rejected:
+        ledger.record_budget_interruption_report(task_id="task-1", request=request)
+
+    assert secret not in str(rejected.value)
+    assert opener.requests == []
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_attempt",
+        "receipt_id",
+        "created_integer",
+        "report_claim_boolean",
+        "report_resource_boolean",
+        "attempt_claim_boolean",
+        "attempt_resource_boolean",
+        "promotable_integer",
+        "receipt_status_boolean",
+        "receipt_retry_after_boolean",
+    ],
+)
+def test_interruption_http_adapter_rejects_malformed_attempt_binding_and_types(corruption) -> None:
+    checkpoint = {"phase": "tests"}
+    checkpoint_json = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"))
+    resource_tokens = {"repo:file:src/app.py": 11}
+    request = {
+        "claim_fencing_token": 7,
+        "resource_fencing_tokens": resource_tokens,
+        "reason": "retry_exhausted",
+        "summary": "Stopped before submission.",
+        "checkpoint": checkpoint,
+        "dispatch_attempt_ids": ["attempt-1"],
+    }
+    receipt = {
+        "dispatch_attempt_id": "attempt-1",
+        "source": "client_reported",
+        "http_status_code": 429,
+        "retry_after_seconds": 30,
+        "received_at": "2026-10-15T00:00:00Z",
+        "provider_usage": {
+            "status": "unsupported",
+            "unit": None,
+            "source": None,
+            "scope": "provider calls and provider-internal fan-out",
+            "observed_at": None,
+            "freshness": "unknown",
+            "enforcement_point": None,
+            "reason": "no authenticated provider meter or request gate are wired to this supervisor",
+        },
+    }
+    attempt = {
+        "id": "attempt-1",
+        "task_id": "task-1",
+        "agent_id": "agent-1",
+        "claim_fencing_token": 7,
+        "resource_fencing_tokens": resource_tokens,
+        "idempotency_key": "attempt-key",
+        "status": "reported",
+        "created_at": "2026-10-15T00:00:00Z",
+        "receipt": receipt,
+    }
+    if corruption == "receipt_id":
+        attempt["receipt"] = {**receipt, "dispatch_attempt_id": "other-attempt"}
+    if corruption == "attempt_claim_boolean":
+        attempt["claim_fencing_token"] = True
+    if corruption == "attempt_resource_boolean":
+        attempt["resource_fencing_tokens"] = {"repo:file:src/app.py": True}
+    if corruption == "receipt_status_boolean":
+        attempt["receipt"] = {**receipt, "http_status_code": True}
+    if corruption == "receipt_retry_after_boolean":
+        attempt["receipt"] = {**receipt, "retry_after_seconds": True}
+    report = {
+        "id": "report-1",
+        "task_id": "task-1",
+        "agent_id": "agent-1",
+        "claim_fencing_token": 7,
+        "resource_fencing_tokens": resource_tokens,
+        "interruption_status": "interrupted",
+        "status": "partial",
+        "source": "client_reported",
+        "reason": "retry_exhausted",
+        "summary": request["summary"],
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": hashlib.sha256(checkpoint_json.encode()).hexdigest(),
+        "checkpoint_integrity": "valid",
+        "resource_fencing_tokens_integrity": "valid",
+        "dispatch_attempt_ids": ["attempt-1"],
+        "dispatch_attempts": [] if corruption == "missing_attempt" else [attempt],
+        "dispatch_attempts_integrity": "valid",
+        "received_at": "2026-10-15T00:00:00Z",
+        "promotable": False,
+    }
+    if corruption == "report_claim_boolean":
+        report["claim_fencing_token"] = True
+    if corruption == "report_resource_boolean":
+        report["resource_fencing_tokens"] = {"repo:file:src/app.py": True}
+    if corruption == "promotable_integer":
+        report["promotable"] = 0
+    response_payload = {
+        "report": report,
+        "created": 1 if corruption == "created_integer" else True,
+    }
+    opener = FakeApiOpener(FakeApiResponse(201, response_payload))
+    ledger = CoordinationHttpDispatchLedger(
+        base_url="http://127.0.0.1", bearer_token="test-token", opener=opener
+    )
+
+    with pytest.raises(dispatch_client_module.DispatchLedgerProtocolError):
+        ledger.record_budget_interruption_report(task_id="task-1", request=request)
+
+    assert len(opener.requests) == 1
 
 
 def test_bounded_retry_sequence_integrates_with_reference_api(client, admin_headers) -> None:

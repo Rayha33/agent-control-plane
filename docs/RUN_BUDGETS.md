@@ -596,6 +596,14 @@ An exact repeat for the same claim returns the existing report; a different
 payload for that claim conflicts. Expired claims can replay an already-created
 report idempotently but cannot create a new one.
 
+Python clients using `CoordinationHttpDispatchLedger` can call
+`record_budget_interruption_report` to validate and send this request once.
+The adapter verifies the returned task and claim/resource fences, echoed
+checkpoint and digest, and every linked attempt/receipt ID and fence before it
+returns the report. This protects the caller from a malformed or misbound API
+response; it does not upgrade client-reported content into host-verified or
+promotable evidence.
+
 ## Delivery gates
 
 1. Local per-task and descendant-attempt caps and cooperative public API

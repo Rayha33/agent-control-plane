@@ -226,6 +226,120 @@ class CoordinationHttpDispatchLedger:
         if returned_attempt_id != dispatch_attempt_id or type(created) is not bool:
             raise DispatchLedgerProtocolError()
 
+    def record_budget_interruption_report(
+        self, *, task_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Record and verify one bounded, client-reported interruption checkpoint.
+
+        This is a one-shot cooperative API call. A successful response is still
+        client testimony, not a host-verified checkpoint or promotable result.
+        """
+        import hashlib
+
+        from .coordination_schemas import (
+            BudgetInterruptionReportCreate,
+            BudgetInterruptionReportResult,
+        )
+
+        try:
+            request_model = BudgetInterruptionReportCreate.model_validate(request)
+        except Exception:
+            # Validation details may quote the caller's checkpoint. Keep them
+            # out of logs and exceptions, especially for rejected secret-shaped
+            # values.
+            raise ValueError("invalid interruption report request") from None
+        request_payload = request_model.model_dump(mode="json")
+        payload = self._post_json(
+            f"/v1/tasks/{quote(task_id, safe='')}/interruption-reports",
+            request_payload,
+            expected_status=201,
+        )
+
+        def has_exact_int_values(value: object) -> bool:
+            return isinstance(value, dict) and all(
+                type(key) is str and type(item) is int for key, item in value.items()
+            )
+
+        raw_report = payload.get("report")
+        if (
+            type(payload.get("created")) is not bool
+            or not isinstance(raw_report, dict)
+            or type(raw_report.get("claim_fencing_token")) is not int
+            or not has_exact_int_values(raw_report.get("resource_fencing_tokens"))
+            or not isinstance(raw_report.get("dispatch_attempts"), list)
+            or raw_report.get("promotable") is not False
+        ):
+            raise DispatchLedgerProtocolError()
+        raw_attempts = raw_report["dispatch_attempts"]
+        for raw_attempt in raw_attempts:
+            if (
+                not isinstance(raw_attempt, dict)
+                or type(raw_attempt.get("claim_fencing_token")) is not int
+                or not has_exact_int_values(raw_attempt.get("resource_fencing_tokens"))
+            ):
+                raise DispatchLedgerProtocolError()
+            raw_receipt = raw_attempt.get("receipt")
+            if raw_receipt is not None:
+                if not isinstance(raw_receipt, dict):
+                    raise DispatchLedgerProtocolError()
+                raw_status = raw_receipt.get("http_status_code")
+                raw_retry_after = raw_receipt.get("retry_after_seconds")
+                if (
+                    type(raw_status) is not int
+                    or not 100 <= raw_status <= 599
+                    or (
+                        raw_retry_after is not None
+                        and (type(raw_retry_after) is not int or not 0 <= raw_retry_after <= 86_400)
+                    )
+                ):
+                    raise DispatchLedgerProtocolError()
+        try:
+            result = BudgetInterruptionReportResult.model_validate(payload)
+        except Exception:
+            raise DispatchLedgerProtocolError() from None
+
+        report = result.report
+        checkpoint_json = json.dumps(
+            request_payload["checkpoint"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        expected_checkpoint_sha256 = hashlib.sha256(checkpoint_json.encode("utf-8")).hexdigest()
+        if (
+            report.task_id != task_id
+            or report.claim_fencing_token != request_payload["claim_fencing_token"]
+            or report.resource_fencing_tokens != request_payload["resource_fencing_tokens"]
+            or report.reason != request_payload["reason"]
+            or report.summary != request_payload["summary"]
+            or report.checkpoint != request_payload["checkpoint"]
+            or report.checkpoint_sha256 != expected_checkpoint_sha256
+            or report.checkpoint_integrity != "valid"
+            or report.resource_fencing_tokens_integrity != "valid"
+            or report.dispatch_attempt_ids != request_payload["dispatch_attempt_ids"]
+            or report.dispatch_attempts_integrity != "valid"
+            or len(report.dispatch_attempts) != len(request_payload["dispatch_attempt_ids"])
+        ):
+            raise DispatchLedgerProtocolError()
+
+        for expected_id, attempt in zip(
+            request_payload["dispatch_attempt_ids"], report.dispatch_attempts, strict=True
+        ):
+            receipt = attempt.receipt
+            if (
+                attempt.id != expected_id
+                or attempt.task_id != task_id
+                or attempt.claim_fencing_token != request_payload["claim_fencing_token"]
+                or attempt.resource_fencing_tokens != request_payload["resource_fencing_tokens"]
+                or attempt.status != "reported"
+                or receipt is None
+                or receipt.dispatch_attempt_id != expected_id
+                or receipt.source != "client_reported"
+            ):
+                raise DispatchLedgerProtocolError()
+
+        return result.model_dump(mode="json")
+
     def _post_json(
         self, path: str, payload: Mapping[str, Any], *, expected_status: int
     ) -> dict[str, Any]:

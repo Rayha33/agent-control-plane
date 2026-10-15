@@ -263,6 +263,7 @@
     ],
     "class:CoordinationHttpDispatchLedger": [
       "_post_json",
+      "record_budget_interruption_report",
       "record_dispatch_attempt_receipt",
       "reserve_dispatch_attempt"
     ],
