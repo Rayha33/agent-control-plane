@@ -633,3 +633,90 @@ QC import handoff.
 This narrow composition does not enable provider workers, prove provider
 egress or full host-path/Git isolation, or eliminate the parent #2370
 acceptance gates. The default `run_worker()` refusal remains mandatory.
+
+### Registered-worker host-path probe
+
+`ACP_LIVE_ISOLATION_PROBES=1` extends the same no-model registered-worker run on
+a disposable Linux VM. It requires
+`ACP_LIVE_ISOLATION_DISPOSABLE_HOST` to equal the VM's exact current hostname,
+an active rootless systemd/runc setup, and passwordless `sudo`. The fixture
+creates unique synthetic sentinels in host `/etc`, `/usr/local/share`, the host
+home, `~/.config`, `~/.ssh`, host `/tmp`, the test harness checkout, the
+registered task's base checkout, a real sibling Git worktree in the same
+`.acp/worktrees` attempts root as the claimed attempt, and an unrelated project.
+The `/etc` and `/usr/local/share` sentinels are created
+and removed by exact inode and content through `sudo`. When both worker units
+are quiescent and every fixture still has its recorded identity, the finalizer
+removes fixtures even if an assertion failed; if quiescence or exact cleanup
+cannot be proved, it preserves the test tree and fails. Sentinel candidate
+paths are registered before creation; the helper removes a partially written
+sentinel on ordinary post-create exceptions using the open inode identity. If
+the helper exits or times out before returning an identity and leaves an
+artifact, the finalizer preserves and reports that path (and does not remove a
+containing sibling worktree). Token-specific `/tmp`
+and `/home/agent` scratch probes are removed only when they are regular files
+owned by the test user with the exact expected content and unchanged inode;
+unexpected artifacts are preserved and reported. The worker must not read
+those sentinels or create adjacent write probes. The payload creates an
+absolute symlink inside its workspace to the host config sentinel, attempts to
+read through it, and removes it; it also tries a `..`-based canonical-path
+traversal. The live payload checks
+the test controller PID is absent from its private procfs, host Unix socket
+paths are not visible, `/tmp` and `/home/agent` are tmpfs, the rootfs is
+read-only, `/usr` is absent, `/workspace` is writable, and a direct IPv4 TCP
+socket is denied by the worker's seccomp policy. Run it with:
+
+```sh
+ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc-1.5.2 \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_LIVE_ISOLATION_PROBES=1 \
+ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1 \
+ACP_LIVE_ISOLATION_DISPOSABLE_HOST="$(hostname)" \
+uv run --extra dev pytest -q tests/test_sandbox_worker_lifecycle_integration.py
+```
+
+The import assertion requires the complete imported commit path set to equal
+the two expected worker outputs; the probe script is already in the task base
+commit. The hostname variable is an operator self-attestation, not automatic
+VM detection.
+
+This is targeted evidence for this pinned BusyBox rootfs, Linux kernel, and
+runc 1.5.2 configuration—not proof against every same-UID host actor, every
+kernel/runtime, provider authentication, or approved provider egress. Neither
+test enables production `run_worker()` or closes parent task #2370.
+
+### Provider-proxy primitive live probe
+
+The separate live test
+`live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only` exercises
+the attempt-bound provider-proxy socket under rootless runc. It requires the
+same pinned runc, BusyBox, and compiler as the proxy test setup:
+
+```sh
+ACP_RUN_OCI_INTEGRATION=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc-1.5.2 \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_OCI_TEST_BUSYBOX=/usr/bin/busybox \
+ACP_OCI_TEST_CC=/usr/bin/cc \
+PYTHONPATH=src \
+uv run --extra dev pytest -q tests/test_oci_worker_runtime.py \
+  -k live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only
+```
+
+On 2026-10-16 this passed on a disposable Debian 12 ARM64 VM running kernel
+`6.12.95+deb12-cloud-arm64`, systemd 252.39, runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`), and
+BusyBox 1.35.0. Debian's [Bookworm Backports cloud kernel package](https://packages.debian.org/bookworm-backports/kernel/linux-image-cloud-arm64)
+provided the newer kernel. The same probe first failed closed on kernel
+`6.1.0-53-cloud-arm64` because the kernel returned `Protocol not available`
+for `SO_PEERPIDFD`; the security check was not weakened or given a fallback.
+
+This proxy test uses a test-only attestation receipt and redirects resolver and
+dial operations to local TCP fixtures. It verifies the kernel/runtime proxy
+primitive and attempt binding; it does **not** prove real provider
+authentication, provider credentials, or controlled external provider egress.
+The registered worker host-path probe separately passed on the same upgraded
+VM, including cleanup and exact two-path result import (`launch-driver-marker`
+and `launch-driver-started`). These are narrow, reproducible environment
+results, not a claim that all parent #2370 acceptance gates are closed.

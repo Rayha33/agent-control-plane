@@ -69,6 +69,7 @@ import multiprocessing
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -117,6 +118,242 @@ _SUPPORTED_RUNC_VERSION = "1.5.2"
 _MONITOR_SLICE_UNIT = "user-acp.slice"
 _PAYLOAD_MARKER = "lifecycle-gate-marker"
 _GIT_METADATA_MARKER = "git-metadata-absent-marker"
+
+_LIVE_HOST_SENTINEL_HELPER = r"""
+import json
+import os
+import stat
+import sys
+
+mode, raw_path, raw_token, *identity = sys.argv[1:]
+path = os.fsencode(raw_path)
+token = bytes.fromhex(raw_token)
+if mode in {"create", "create-fail-after-open"}:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o644,
+    )
+    try:
+        created = os.fstat(descriptor)
+        try:
+            os.fchmod(descriptor, 0o644)
+            if mode == "create-fail-after-open":
+                raise OSError("injected post-create write failure")
+            if mode == "create-fail-after-partial-write":
+                partial_size = max(1, len(token) // 2)
+                os.write(descriptor, token[:partial_size])
+                raise OSError("injected mid-write failure")
+            offset = 0
+            while offset < len(token):
+                offset += os.write(descriptor, token[offset:])
+            os.fsync(descriptor)
+            info = os.fstat(descriptor)
+            print(json.dumps({"device": info.st_dev, "inode": info.st_ino}), flush=True)
+        except BaseException:
+            try:
+                current = os.lstat(path)
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino)
+                ):
+                    read_descriptor = os.open(
+                        path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    try:
+                        opened = os.fstat(read_descriptor)
+                        content = bytearray()
+                        while chunk := os.read(read_descriptor, 4096):
+                            content.extend(chunk)
+                    finally:
+                        os.close(read_descriptor)
+                    current = os.lstat(path)
+                    if (
+                        stat.S_ISREG(current.st_mode)
+                        and (opened.st_dev, opened.st_ino)
+                        == (created.st_dev, created.st_ino)
+                        and (current.st_dev, current.st_ino)
+                        == (created.st_dev, created.st_ino)
+                        and len(content) <= len(token)
+                        and bytes(content) == token[: len(content)]
+                    ):
+                        os.unlink(path)
+            except OSError:
+                # The parent records this exact candidate before creation and
+                # will preserve/report any artifact not returned with identity.
+                pass
+            raise
+    finally:
+        os.close(descriptor)
+elif mode == "remove":
+    expected_device, expected_inode = (int(value) for value in identity)
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or (info.st_dev, info.st_ino) != (expected_device, expected_inode)
+    ):
+        raise SystemExit("sentinel identity changed; preserving it")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        content = bytearray()
+        while chunk := os.read(descriptor, 4096):
+            content.extend(chunk)
+    finally:
+        os.close(descriptor)
+    if (
+        (opened.st_dev, opened.st_ino) != (expected_device, expected_inode)
+        or bytes(content) != token
+    ):
+        raise SystemExit("sentinel content or opened identity changed; preserving it")
+    os.unlink(path)
+else:
+    raise SystemExit("invalid sentinel helper operation")
+"""
+
+
+def _live_isolation_sentinel(
+    path: Path, token: bytes, *, privileged: bool = False
+) -> tuple[int, int]:
+    executable = ["sudo", "-n", sys.executable] if privileged else [sys.executable]
+    completed = subprocess.run(
+        [*executable, "-c", _LIVE_HOST_SENTINEL_HELPER, "create", str(path), token.hex()],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    identity = json.loads(completed.stdout)
+    return int(identity["device"]), int(identity["inode"])
+
+
+def _remove_live_isolation_sentinel(
+    path: Path,
+    token: bytes,
+    identity: tuple[int, int],
+    *,
+    privileged: bool = False,
+) -> None:
+    executable = ["sudo", "-n", sys.executable] if privileged else [sys.executable]
+    subprocess.run(
+        [
+            *executable,
+            "-c",
+            _LIVE_HOST_SENTINEL_HELPER,
+            "remove",
+            str(path),
+            token.hex(),
+            str(identity[0]),
+            str(identity[1]),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def _remove_live_isolation_write_probe(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_size != 0 or info.st_uid != os.geteuid():
+        raise AssertionError(f"unexpected worker write-probe artifact preserved: {path}")
+    path.unlink()
+
+
+def _remove_live_isolation_scratch(path: Path, expected_content: bytes) -> None:
+    """Remove only a token-specific scratch file created by the live probe."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_size != len(expected_content)
+    ):
+        raise AssertionError(f"unexpected worker scratch artifact preserved: {path}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        content = bytearray()
+        while chunk := os.read(descriptor, 4096):
+            content.extend(chunk)
+    finally:
+        os.close(descriptor)
+    current = path.lstat()
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+        or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+        or bytes(content) != expected_content
+    ):
+        raise AssertionError(f"worker scratch identity or content changed; preserving it: {path}")
+    path.unlink()
+
+
+def test_live_isolation_scratch_cleanup_removes_exact_probe_file(tmp_path: Path) -> None:
+    path = tmp_path / "acp-live-worker-tmp-test"
+    expected_content = b"acp-live-scratch-test"
+    path.write_bytes(expected_content)
+
+    _remove_live_isolation_scratch(path, expected_content)
+
+    assert not path.exists()
+
+
+def test_live_isolation_scratch_cleanup_preserves_unexpected_file(tmp_path: Path) -> None:
+    path = tmp_path / "acp-live-worker-tmp-test"
+    path.write_bytes(b"not the probe payload")
+
+    with pytest.raises(AssertionError, match="identity or content changed"):
+        _remove_live_isolation_scratch(path, b"acp-live-scratch-test")
+
+    assert path.read_bytes() == b"not the probe payload"
+
+
+def test_live_isolation_scratch_cleanup_preserves_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "user-data"
+    target.write_bytes(b"preserve")
+    path = tmp_path / "acp-live-worker-tmp-test"
+    path.symlink_to(target)
+
+    with pytest.raises(AssertionError, match="unexpected worker scratch artifact"):
+        _remove_live_isolation_scratch(path, b"acp-live-scratch-test")
+
+    assert path.is_symlink()
+    assert target.read_bytes() == b"preserve"
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("create-fail-after-open", "create-fail-after-partial-write"),
+)
+def test_live_isolation_sentinel_creation_cleans_up_after_post_create_failure(
+    tmp_path: Path, failure_mode: str
+) -> None:
+    path = tmp_path / "acp-live-sentinel-test"
+    token = b"synthetic sentinel payload"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _LIVE_HOST_SENTINEL_HELPER,
+            failure_mode,
+            str(path),
+            token.hex(),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
+    assert not path.exists()
 
 
 def _terminate_worker_from_fresh_process(
@@ -1656,9 +1893,43 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     if " - cgroup2 " not in Path("/proc/self/mountinfo").read_text(encoding="ascii"):
         pytest.fail("current host does not expose unified cgroup v2")
 
+    isolation_probes = os.environ.get("ACP_LIVE_ISOLATION_PROBES") == "1"
+    if isolation_probes:
+        if os.getpid() <= _CONTAINER_PIDS_LIMIT:
+            pytest.fail("host controller PID must exceed the worker PID limit for this probe")
+        if os.environ.get("ACP_LIVE_ISOLATION_DISPOSABLE_HOST") != socket.gethostname():
+            pytest.fail(
+                "set ACP_LIVE_ISOLATION_DISPOSABLE_HOST to this exact disposable VM hostname"
+            )
+        root_preflight = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, text=True, timeout=10
+        )
+        if root_preflight.returncode != 0:
+            pytest.fail("isolation sentinel proof requires passwordless sudo on its disposable VM")
+        if not stat.S_ISDIR(Path("/etc").lstat().st_mode):
+            pytest.fail("isolation sentinel proof requires a real /etc directory")
+        if not stat.S_ISDIR(Path("/usr/local/share").lstat().st_mode):
+            pytest.fail("isolation sentinel proof requires the existing /usr/local/share directory")
+
     runc_path = Path(os.environ.get("ACP_OCI_TEST_RUNC", "/usr/bin/runc"))
     busybox_path = Path(os.environ.get("ACP_OCI_TEST_BUSYBOX", "/usr/bin/busybox"))
     run_root = Path(tempfile.mkdtemp(prefix="acp-live-launch-driver-", dir="/tmp"))
+    isolation_token = os.urandom(12).hex()
+    isolation_secret = f"synthetic ACP containment sentinel {isolation_token}".encode("ascii")
+    isolation_sentinels: dict[str, tuple[Path, bytes, tuple[int, int], bool]] = {}
+    isolation_sentinel_candidates: list[tuple[Path, bytes, bool]] = []
+    isolation_write_probes: list[Path] = []
+    isolation_created_directories: list[tuple[Path, tuple[int, int]]] = []
+    isolation_sibling_root: Path | None = None
+    isolation_sibling_identity: tuple[int, int] | None = None
+    isolation_socket: socket.socket | None = None
+    isolation_socket_path: Path | None = None
+    isolation_socket_identity: tuple[int, int] | None = None
+    isolation_tmp_scratch_path = Path("/tmp") / f"acp-live-worker-tmp-{isolation_token}"
+    isolation_home_scratch_path = Path("/home/agent") / f"acp-live-worker-home-{isolation_token}"
+    isolation_scratch_content = f"acp-live-scratch-{isolation_token}".encode("ascii")
+    isolation_link_name = f".acp-live-path-escape-{isolation_token}"
+    isolation_script_name = f".acp-live-isolation-probe-{isolation_token}.sh"
     rootfs_source = run_root / "rootfs-source"
     service_log_path = run_root / "launch-driver-service.log"
     service_unit: str | None = None
@@ -1683,10 +1954,211 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             "workspace",
         ):
             (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
-        _copy_busybox_closure(busybox_path, rootfs_source)
+        _busybox_version, busybox_applets = _copy_busybox_closure(busybox_path, rootfs_source)
+        if isolation_probes and "rm" not in busybox_applets:
+            pytest.fail("trusted BusyBox lacks rm for the temporary workspace symlink probe")
         repo_root = run_root / "repo"
         repo_root.mkdir(mode=0o700)
         repo = init_repo(repo_root)
+        if isolation_probes:
+            host_home = Path.home().resolve(strict=True)
+            home_config = host_home / ".config"
+            home_ssh = host_home / ".ssh"
+            for directory in (home_config, home_ssh):
+                if not directory.exists():
+                    directory.mkdir(mode=0o700)
+                    info = directory.lstat()
+                    isolation_created_directories.append((directory, (info.st_dev, info.st_ino)))
+                elif not stat.S_ISDIR(directory.lstat().st_mode):
+                    pytest.fail(f"isolation sentinel parent is not a directory: {directory}")
+            # The worker's claimed attempt is created under repo/.acp/worktrees;
+            # put this real sibling there so the probe covers the actual managed root.
+            isolation_sibling_root = (
+                repo / ".acp" / "worktrees" / f"acp-live-sibling-{isolation_token}"
+            )
+            _ensure_private_fixture_directory(isolation_sibling_root.parent)
+            if os.path.lexists(isolation_sibling_root):
+                pytest.fail("unique sibling-worktree sentinel directory already exists")
+            unrelated_root = run_root / "unrelated-project"
+            unrelated_root.mkdir(mode=0o700)
+            isolation_socket_path = run_root / "host-only-control.sock"
+            if os.path.lexists(isolation_socket_path):
+                pytest.fail("unique host-only socket path already exists")
+            isolation_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            isolation_socket.bind(str(isolation_socket_path))
+            isolation_socket.listen(1)
+            socket_info = isolation_socket_path.lstat()
+            isolation_socket_identity = (socket_info.st_dev, socket_info.st_ino)
+
+            sentinel_paths = {
+                "host_etc": Path("/etc") / f"acp-live-{isolation_token}.sentinel",
+                "host_usr": Path("/usr/local/share") / f"acp-live-{isolation_token}.sentinel",
+                "host_home": host_home / f"acp-live-{isolation_token}.sentinel",
+                "host_config": home_config / f"acp-live-{isolation_token}.sentinel",
+                "host_credential": home_ssh / f"acp-live-{isolation_token}.key",
+                "host_tmp": run_root / "host-temp-sentinel",
+                "harness_checkout": source_root / f".acp-live-{isolation_token}-harness",
+                "task_base_checkout": repo / f".acp-live-{isolation_token}-base",
+                "sibling_worktree": isolation_sibling_root / f".acp-live-{isolation_token}-sibling",
+                "unrelated_project": unrelated_root / "project-sentinel",
+            }
+            privileged_sentinels = {"host_etc", "host_usr"}
+            for name, path in sentinel_paths.items():
+                sidecar = Path(f"{path}.write-probe")
+                if os.path.lexists(sidecar):
+                    pytest.fail("unique isolation write-probe path already exists")
+                isolation_write_probes.append(sidecar)
+                if name == "sibling_worktree":
+                    continue
+                privileged = name in privileged_sentinels
+                isolation_sentinel_candidates.append((path, isolation_secret, privileged))
+                identity = _live_isolation_sentinel(
+                    path,
+                    isolation_secret,
+                    privileged=privileged,
+                )
+                isolation_sentinels[name] = (
+                    path,
+                    isolation_secret,
+                    identity,
+                    privileged,
+                )
+            if os.path.lexists(isolation_tmp_scratch_path) or os.path.lexists(
+                isolation_home_scratch_path
+            ):
+                pytest.fail("unique isolation scratch path already exists")
+            probe_lines = [
+                "set -eu",
+                "printf 'production-driver-started\\n' > /workspace/launch-driver-started",
+                "exec 2>> /workspace/launch-driver-started",
+            ]
+            for label, command in (
+                ("toolchain", "/bin/busybox test -x /bin/busybox"),
+                ("workspace-writable", "/bin/busybox test -w /workspace"),
+                ("workspace-has-no-git", "/bin/busybox test ! -e /workspace/.git"),
+                ("workspace-has-no-git-head", "/bin/busybox test ! -e /workspace/.git/HEAD"),
+                ("host-usr-absent", "/bin/busybox test ! -e /usr"),
+                (
+                    "rootfs-read-only",
+                    "if /bin/busybox touch "
+                    f"/etc/acp-live-{isolation_token}-write-probe 2>/dev/null; then exit 67; fi",
+                ),
+                (
+                    "tmp-is-tmpfs",
+                    "/bin/busybox grep -F ' /tmp ' /proc/self/mountinfo | "
+                    "/bin/busybox grep -F ' - tmpfs tmpfs ' >/dev/null",
+                ),
+                (
+                    "agent-home-is-tmpfs",
+                    "/bin/busybox grep -F ' /home/agent ' /proc/self/mountinfo | "
+                    "/bin/busybox grep -F ' - tmpfs tmpfs ' >/dev/null",
+                ),
+            ):
+                probe_lines.extend(
+                    (
+                        command,
+                        f"/bin/busybox printf 'probe-ok:{label}\\n' "
+                        ">> /workspace/launch-driver-started",
+                    )
+                )
+            for name, path in sentinel_paths.items():
+                quoted_path = shlex.quote(str(path))
+                quoted_write_probe = shlex.quote(f"{path}.write-probe")
+                probe_lines.extend(
+                    (
+                        f"if /bin/busybox test -e {quoted_path}; then exit 61; fi",
+                        f"if /bin/busybox test -r {quoted_path}; then exit 62; fi",
+                        f"if /bin/busybox touch {quoted_write_probe} 2>/dev/null; then exit 63; fi",
+                        "/bin/busybox printf "
+                        f"'probe-ok:sentinel-{name}\\n' >> /workspace/launch-driver-started",
+                    )
+                )
+            escape_link = f"/workspace/{isolation_link_name}"
+            quoted_escape_link = shlex.quote(escape_link)
+            quoted_canonical_escape = shlex.quote(
+                "/workspace/../../" + str(isolation_sentinels["host_home"][0]).lstrip("/")
+            )
+            quoted_host_socket = shlex.quote(str(isolation_socket_path))
+            quoted_systemd_socket = shlex.quote(str(Path(environment["XDG_RUNTIME_DIR"]) / "bus"))
+            probe_lines.extend(
+                (
+                    "/bin/busybox ln -s "
+                    f"{shlex.quote(str(isolation_sentinels['host_config'][0]))} "
+                    f"{shlex.quote(f'/workspace/{isolation_link_name}')}",
+                    f"/bin/busybox test -L {quoted_escape_link}",
+                    f"if /bin/busybox cat {quoted_escape_link} >/dev/null 2>&1; then exit 64; fi",
+                    f"/bin/busybox rm {quoted_escape_link}",
+                    "/bin/busybox printf 'probe-ok:workspace-symlink-escape\\n' "
+                    ">> /workspace/launch-driver-started",
+                    "if /bin/busybox cat "
+                    f"{quoted_canonical_escape} >/dev/null 2>&1; then exit 65; fi",
+                    "/bin/busybox printf 'probe-ok:canonical-path-escape\\n' "
+                    ">> /workspace/launch-driver-started",
+                    "/bin/busybox test ! -e " + shlex.quote(f"/proc/{os.getpid()}"),
+                    f"/bin/busybox test ! -S {quoted_host_socket}",
+                    f"/bin/busybox test ! -S {quoted_systemd_socket}",
+                    "/bin/busybox printf 'probe-ok:proc-and-host-sockets\\n' "
+                    ">> /workspace/launch-driver-started",
+                    "/bin/busybox printf "
+                    f"{shlex.quote(isolation_scratch_content.decode('ascii'))} > "
+                    f"{shlex.quote(f'/tmp/{isolation_tmp_scratch_path.name}')}",
+                    "/bin/busybox printf "
+                    f"{shlex.quote(isolation_scratch_content.decode('ascii'))} > "
+                    f"{shlex.quote(f'/home/agent/{isolation_home_scratch_path.name}')}",
+                    "network_error=$(/bin/busybox nc -w 1 192.0.2.1 443 </dev/null 2>&1) || true",
+                    "case \"$network_error\" in *'Operation not permitted'*|*'Permission denied'*) ;; *) exit 66 ;; esac",
+                    "/bin/busybox printf 'probe-ok:direct-ip-denied\\n' "
+                    ">> /workspace/launch-driver-started",
+                    "/bin/busybox printf 'probe-ok:workspace-scratch\\n' "
+                    ">> /workspace/launch-driver-started",
+                    "printf 'production-driver-ran\\ncontainment-probes-passed\\n' "
+                    "> /workspace/launch-driver-marker",
+                )
+            )
+            (repo / isolation_script_name).write_text(
+                "\n".join(probe_lines) + "\n", encoding="ascii"
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "add", "--", isolation_script_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "fixture: host-path isolation probe"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(isolation_sibling_root),
+                    "HEAD",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            sibling_info = isolation_sibling_root.lstat()
+            isolation_sibling_identity = (sibling_info.st_dev, sibling_info.st_ino)
+            sibling_sentinel_path = sentinel_paths["sibling_worktree"]
+            isolation_sentinel_candidates.append((sibling_sentinel_path, isolation_secret, False))
+            sibling_identity = _live_isolation_sentinel(sibling_sentinel_path, isolation_secret)
+            isolation_sentinels["sibling_worktree"] = (
+                sibling_sentinel_path,
+                isolation_secret,
+                sibling_identity,
+                False,
+            )
         if os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1":
             config_path = repo / "acp.toml"
             config_text = config_path.read_text(encoding="utf-8")
@@ -1739,6 +2211,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         ):
             pytest.fail("test config did not pin the exact rootfs and runc identities")
         source_worktree = Path(attempt["worktree"])
+        if isolation_probes:
+            assert isolation_sibling_root is not None
+            assert source_worktree.parent.resolve(
+                strict=True
+            ) == isolation_sibling_root.parent.resolve(strict=True)
+            assert source_worktree != isolation_sibling_root
         execution: dict[str, Any] | None = None
         identity: tuple[str, int, str] | None = None
 
@@ -1780,17 +2258,24 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             or crash_after_monitor_acceptance
             or crash_before_monitor_start
         )
+        if isolation_probes and (
+            cancel_after_start or timeout_after_start or crash_driver_service_before_receipt
+        ):
+            pytest.fail("live isolation probes require natural worker completion")
         monitor_acceptance_marker = run_root / "monitor-handoff-crash.json"
         payload_sleep_seconds = 30 if cancel_after_start or timeout_after_start else 1
         sandbox_timeout_seconds = 1 if timeout_after_start else 30
-        payload_command = (
-            "/bin/busybox",
-            "sh",
-            "-c",
-            "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
-            f"/bin/busybox sleep {payload_sleep_seconds} && "
-            "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
-        )
+        if isolation_probes:
+            payload_command = ("/bin/busybox", "sh", f"/workspace/{isolation_script_name}")
+        else:
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+                f"/bin/busybox sleep {payload_sleep_seconds} && "
+                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
+            )
         context = multiprocessing.get_context("spawn")
         producer_result_receiver, producer_result_sender = context.Pipe(duplex=False)
         producer_controller = context.Process(
@@ -1853,9 +2338,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             "launch producer survived simulated controller loss"
         )
         if producer_result[0] not in {"ok", "manager_accepted"}:
-            service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
+            service_log = (
+                service_log_path.read_text(encoding="utf-8", errors="replace")
+                if service_log_path.exists()
+                else ""
+            )
             assert runner["credential"] not in service_log
-            service_detail = service_log[-12_000:] or "<launch-driver service log is empty>"
+            service_detail = service_log[-12_000:] or "<launch-driver service log was not created>"
             raise AssertionError(
                 f"production launch-driver startup failed: {producer_result}; "
                 f"service log tail:\n{service_detail}"
@@ -2432,6 +2921,31 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
         assert runner["credential"] not in service_log
         assert durable is not None and durable["phase"] == "cleanup_reported", service_log
+        if isolation_probes and durable["runc_exit_code"] != 0:
+            probe_marker = Path(durable["workspace_root_path"]) / "launch-driver-started"
+            probe_detail = (
+                probe_marker.read_text(encoding="ascii", errors="replace")
+                if probe_marker.exists()
+                else "<worker did not create its probe marker>"
+            )
+            pytest.fail(
+                f"registered worker isolation probe exited {durable['runc_exit_code']}: "
+                f"{probe_detail}; service log tail:\n{service_log[-4000:]}"
+            )
+        if isolation_probes:
+            visible_write_probes = [
+                str(path) for path in isolation_write_probes if os.path.lexists(path)
+            ]
+            assert not visible_write_probes, (
+                "worker created a write probe outside its assigned workspace: "
+                f"{visible_write_probes}"
+            )
+            assert not os.path.lexists(isolation_tmp_scratch_path), (
+                "worker /tmp scratch leaked into the host /tmp directory"
+            )
+            assert not os.path.lexists(isolation_home_scratch_path), (
+                "worker /home/agent scratch leaked into the host filesystem"
+            )
         if not cancel_after_start and not timeout_after_start:
             assert durable["runc_exit_code"] == 0
         else:
@@ -2469,7 +2983,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert _entry_is_present(Path(durable["workspace_root_path"]) / "launch-driver-started")
             assert not _entry_is_present(marker)
         else:
-            assert marker.read_text(encoding="ascii") == "production-driver-ran\n"
+            expected_marker = "production-driver-ran\n"
+            if isolation_probes:
+                expected_marker += "containment-probes-passed\n"
+                assert not os.path.lexists(isolation_tmp_scratch_path)
+                assert not os.path.lexists(isolation_home_scratch_path)
+                assert all(not os.path.lexists(path) for path in isolation_write_probes)
+            assert marker.read_text(encoding="ascii") == expected_marker
         assert not _entry_is_present(source_worktree / "launch-driver-marker")
         with supervisor.connect() as connection:
             events = connection.execute(
@@ -2563,14 +3083,23 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert (
                 git_text("rev-parse", f"{imported_submission['commit_sha']}^") == task["base_sha"]
             )
+            imported_paths = git_text(
+                "diff",
+                "--name-only",
+                "--no-renames",
+                task["base_sha"],
+                imported_submission["commit_sha"],
+            ).splitlines()
+            assert imported_paths == ["launch-driver-marker", "launch-driver-started"]
             assert (
                 git_text("show", f"{imported_submission['commit_sha']}:launch-driver-started")
-                == "production-driver-started"
+                == (Path(verified_before_import["workspace_root_path"]) / "launch-driver-started")
+                .read_text(encoding="ascii")
+                .strip()
             )
-            assert (
-                git_text("show", f"{imported_submission['commit_sha']}:launch-driver-marker")
-                == "production-driver-ran"
-            )
+            assert git_text(
+                "show", f"{imported_submission['commit_sha']}:launch-driver-marker"
+            ) == expected_marker.rstrip("\n")
             assert (
                 subprocess.run(
                     ["git", "-C", str(source_worktree), "status", "--porcelain=v1"],
@@ -2829,6 +3358,101 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             )
         safe_to_remove = driver_safe and monitor_safe
         if safe_to_remove:
+            isolation_cleanup_errors: list[str] = []
+            if isolation_socket is not None:
+                isolation_socket.close()
+                isolation_socket = None
+            for path in isolation_write_probes:
+                try:
+                    _remove_live_isolation_write_probe(path)
+                except BaseException as error:
+                    isolation_cleanup_errors.append(f"{path}: {error}")
+            for path in (isolation_tmp_scratch_path, isolation_home_scratch_path):
+                try:
+                    _remove_live_isolation_scratch(path, isolation_scratch_content)
+                except BaseException as error:
+                    isolation_cleanup_errors.append(f"{path}: {error}")
+            for path, token, identity, privileged in isolation_sentinels.values():
+                try:
+                    _remove_live_isolation_sentinel(path, token, identity, privileged=privileged)
+                except BaseException as error:
+                    isolation_cleanup_errors.append(f"{path}: {error}")
+            registered_sentinel_paths = {item[0] for item in isolation_sentinels.values()}
+            unregistered_sentinel_paths: list[Path] = []
+            for path, _token, _privileged in isolation_sentinel_candidates:
+                if path not in registered_sentinel_paths and os.path.lexists(path):
+                    unregistered_sentinel_paths.append(path)
+                    isolation_cleanup_errors.append(
+                        f"{path}: sentinel creation did not return an identity; preserving artifact"
+                    )
+            if isolation_socket_path is not None and os.path.lexists(isolation_socket_path):
+                try:
+                    socket_info = isolation_socket_path.lstat()
+                    if (
+                        not stat.S_ISSOCK(socket_info.st_mode)
+                        or isolation_socket_identity is None
+                        or (socket_info.st_dev, socket_info.st_ino) != isolation_socket_identity
+                    ):
+                        raise AssertionError("host-only socket identity changed")
+                    isolation_socket_path.unlink()
+                except BaseException as error:
+                    isolation_cleanup_errors.append(f"{isolation_socket_path}: {error}")
+            sibling_has_remaining_sentinel = isolation_sibling_root is not None and any(
+                path.is_relative_to(isolation_sibling_root) and os.path.lexists(path)
+                for path, _token, _privileged in isolation_sentinel_candidates
+            )
+            if (
+                isolation_sibling_root is not None
+                and os.path.lexists(isolation_sibling_root)
+                and not sibling_has_remaining_sentinel
+            ):
+                try:
+                    sibling_info = isolation_sibling_root.lstat()
+                    if (
+                        not stat.S_ISDIR(sibling_info.st_mode)
+                        or isolation_sibling_identity is None
+                        or (sibling_info.st_dev, sibling_info.st_ino) != isolation_sibling_identity
+                    ):
+                        raise AssertionError("sibling-worktree sentinel directory changed")
+                    sibling_status = subprocess.run(
+                        ["git", "-C", str(isolation_sibling_root), "status", "--porcelain=v1"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    ).stdout
+                    if sibling_status:
+                        raise AssertionError("sibling worktree has unexpected changes")
+                    subprocess.run(
+                        ["git", "-C", str(repo), "worktree", "remove", str(isolation_sibling_root)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if os.path.lexists(isolation_sibling_root):
+                        raise AssertionError("sibling worktree removal left its exact path behind")
+                except BaseException as error:
+                    isolation_cleanup_errors.append(f"{isolation_sibling_root}: {error}")
+            for directory, identity in reversed(isolation_created_directories):
+                if not os.path.lexists(directory):
+                    continue
+                try:
+                    info = directory.lstat()
+                    if (
+                        not stat.S_ISDIR(info.st_mode)
+                        or (info.st_dev, info.st_ino) != identity
+                        or any(directory.iterdir())
+                    ):
+                        raise AssertionError("test-created config directory changed or is nonempty")
+                    directory.rmdir()
+                except BaseException as error:
+                    isolation_cleanup_errors.append(f"{directory}: {error}")
+            if isolation_cleanup_errors:
+                pytest.fail(
+                    "isolation fixtures were not removed exactly; preserving the test tree at "
+                    f"{run_root}: " + "; ".join(isolation_cleanup_errors)
+                )
             _remove_private_test_tree(run_root)
         else:
             pytest.fail(
