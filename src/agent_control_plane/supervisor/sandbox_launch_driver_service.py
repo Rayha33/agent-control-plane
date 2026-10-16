@@ -33,6 +33,7 @@ from .sandbox_attestation import (
     collect_running_runtime_attestation,
 )
 from .sandbox_execution_journal import (
+    _sandbox_execution_launch_stop_reason,
     _sandbox_launch_driver_service_unit,
     _sandbox_launch_driver_start_digest,
 )
@@ -1268,6 +1269,56 @@ def _request_timeout_stop_and_cancel_monitor(
     supervisor._cancel_sandbox_execution_monitor(stopping, monitor_client=monitor_client)
 
 
+def _request_driver_failure_stop_and_cancel_monitor(
+    supervisor: GitSupervisor,
+    expected_identity: tuple[str, int, str],
+    *,
+    credential: str | None,
+    monitor_client: Any | None,
+) -> None:
+    """Persist failure stop intent before authenticated monitor cancellation."""
+
+    attempt_id, claim_token, execution_id = expected_identity
+    try:
+        supervisor._sandbox_execution_request_stop(
+            attempt_id,
+            claim_token,
+            "launch_driver_failure",
+            credential=credential,
+        )
+    except SupervisorError as error:
+        if error.code != "sandbox_execution_transition_conflict":
+            raise
+        # A timeout or user cancellation may already own this exact execution.
+        # The subsequent read must prove that durable intent before it is adopted.
+    stopping = supervisor._sandbox_execution_get(attempt_id)
+    with supervisor.connect() as connection:
+        launch_stop_reason = (
+            _sandbox_execution_launch_stop_reason(connection, stopping)
+            if stopping is not None and stopping["phase"] == "launched"
+            else None
+        )
+    durable_reason = (
+        (stopping.get("stop_reason") or launch_stop_reason) if stopping is not None else None
+    )
+    if (
+        stopping is None
+        or (
+            stopping.get("attempt_id"),
+            stopping.get("claim_token"),
+            stopping.get("execution_id"),
+        )
+        != expected_identity
+        or stopping.get("phase") not in {"launched", "stopping"}
+        or not durable_reason
+    ):
+        raise SupervisorError(
+            "sandbox_execution_transition_conflict",
+            "launch-driver cancellation lacks an exact durable stop intent; fences remain held",
+        )
+    supervisor._cancel_sandbox_execution_monitor(stopping, monitor_client=monitor_client)
+
+
 def _execute_pinned_request(
     supervisor: GitSupervisor,
     expected_identity: tuple[str, int, str],
@@ -1475,13 +1526,24 @@ def _execute_pinned_request(
             try:
                 current = supervisor._sandbox_execution_get(attempt_id)
                 if current is not None and current["phase"] in {"launched", "running", "stopping"}:
-                    supervisor._cancel_sandbox_execution_monitor(
-                        current, monitor_client=handle._monitor_client
+                    _request_driver_failure_stop_and_cancel_monitor(
+                        supervisor,
+                        (attempt_id, claim_token, execution_id),
+                        credential=credential,
+                        monitor_client=handle._monitor_client,
                     )
                     wait_receipt = handle.wait(timeout=15.0)
-                    supervisor._sandbox_execution_record_exit(
-                        attempt_id, claim_token, wait_receipt, credential=credential
-                    )
+                    after_cancel = supervisor._sandbox_execution_get(attempt_id)
+                    if after_cancel is not None and after_cancel["phase"] in {
+                        "running",
+                        "stopping",
+                    }:
+                        supervisor._sandbox_execution_record_exit(
+                            attempt_id, claim_token, wait_receipt, credential=credential
+                        )
+                    # A launched-only row has no trusted init identity. The
+                    # launcher's wait receipt cannot prove container-init
+                    # absence, so keep that execution fenced for recovery.
             except BaseException:
                 # Keep the durable execution and resource fences when exact
                 # monitor cancellation or runc wait evidence is unavailable.

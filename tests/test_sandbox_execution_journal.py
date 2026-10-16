@@ -2928,8 +2928,9 @@ def test_launch_starts_monitor_for_exact_fenced_scope_and_uses_service_receipt(
     assert launched["wrapper_cgroup_path"].endswith("/" + launched["wrapper_unit"])
 
 
+@pytest.mark.parametrize("failure_point", ["timeout", "post-launch-exception"])
 def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_keeps_fence(
-    monkeypatch: pytest.MonkeyPatch, repo: Path
+    monkeypatch: pytest.MonkeyPatch, repo: Path, failure_point: str
 ) -> None:
     """Exercise admitted registered orchestration without systemd, runc, or model calls."""
 
@@ -2963,9 +2964,9 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
         exact_handle: oci_worker.RuncLaunchHandle, timeout: float | None = None
     ) -> Any:
         wait_calls.append(timeout)
-        if timeout is not None:
+        if timeout == request["timeout_seconds"]:
             raise subprocess.TimeoutExpired("pinned-runc", timeout)
-        return original_wait(exact_handle)
+        return original_wait(exact_handle, timeout)
 
     monkeypatch.setattr(oci_worker.RuncLaunchHandle, "wait", timeout_once)
     fake_config = object()
@@ -3075,7 +3076,12 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
 
     monkeypatch.setattr(oci_worker, "spawn_pinned_runc", fake_spawn)
 
+    class InjectedDriverFailure(RuntimeError):
+        pass
+
     def fake_attestation(**_kwargs: Any) -> Any:
+        if failure_point == "post-launch-exception":
+            raise InjectedDriverFailure("injected post-launch attestation failure")
         attestation = running_attestation(supervisor, attempt)
         monkeypatch.setattr(
             journal_module, "verify_running_runtime_resource_controls", lambda _a: None
@@ -3094,7 +3100,7 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
         pass
 
     cleanup_calls: list[tuple[Any, ...]] = []
-    cancellation_calls: list[tuple[str, int, str, str]] = []
+    cancellation_calls: list[tuple[str, int, str, str, str | None]] = []
     cancelled_clients: list[Any] = []
     request_stop = supervisor._sandbox_execution_request_stop
 
@@ -3112,22 +3118,49 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
             "sandbox_execution_transition_conflict", "user cancellation won the stop race"
         )
 
+    def request_stop_with_timeout_race(
+        attempt_id: str, claim_token: int, reason: str, *, credential: str | None
+    ) -> dict[str, Any]:
+        if reason == "execution_timeout":
+            return user_cancel_wins(attempt_id, claim_token, reason, credential=credential)
+        return request_stop(attempt_id, claim_token, reason, credential=credential)
+
     def cancel_exact_monitor(
         stopping: dict[str, Any], *, monitor_client: Any | None = None
     ) -> None:
+        durable_stop_reason = stopping.get("stop_reason")
+        if stopping["phase"] == "launched":
+            with supervisor.connect() as connection:
+                durable_stop_reason = journal_module._sandbox_execution_launch_stop_reason(
+                    connection, stopping
+                )
         cancellation_calls.append(
             (
                 stopping["attempt_id"],
                 stopping["claim_token"],
                 stopping["execution_id"],
-                stopping["stop_reason"],
+                stopping["phase"],
+                durable_stop_reason,
             )
         )
         cancelled_clients.append(monitor_client)
-        assert stopping["phase"] == "stopping"
+        assert stopping["phase"] == ("stopping" if failure_point == "timeout" else "launched")
 
-    monkeypatch.setattr(supervisor, "_sandbox_execution_request_stop", user_cancel_wins)
+    monkeypatch.setattr(
+        supervisor, "_sandbox_execution_request_stop", request_stop_with_timeout_race
+    )
     monkeypatch.setattr(supervisor, "_cancel_sandbox_execution_monitor", cancel_exact_monitor)
+    record_exit_errors: list[BaseException] = []
+    record_exit = supervisor._sandbox_execution_record_exit
+
+    def trace_record_exit(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return record_exit(*args, **kwargs)
+        except BaseException as error:
+            record_exit_errors.append(error)
+            raise
+
+    monkeypatch.setattr(supervisor, "_sandbox_execution_record_exit", trace_record_exit)
 
     def stop_before_cleanup(*args: Any, **kwargs: Any) -> None:
         cleanup_calls.append((*args, kwargs))
@@ -3194,7 +3227,10 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
 
     try:
         payload_thread.start()
-        with pytest.raises(CleanupBoundaryReached):
+        expected_error = (
+            CleanupBoundaryReached if failure_point == "timeout" else InjectedDriverFailure
+        )
+        with pytest.raises(expected_error):
             launch_driver_service._run_driver(
                 repo=repo,
                 expected_identity=identity,
@@ -3211,19 +3247,41 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
             payload_thread.join(timeout=2)
 
     assert not payload_thread.is_alive()
-    assert gate_observations == [(b"go\n", "running")]
-    assert wait_calls == [2.0, None]
-    assert cancellation_calls == [
-        (attempt["id"], attempt["claim_token"], execution["execution_id"], "attempt cancellation")
-    ]
+    assert record_exit_errors == [], [repr(error) for error in record_exit_errors]
+    if failure_point == "timeout":
+        assert gate_observations == [(b"go\n", "running")]
+        assert wait_calls == [2.0, None]
+        assert cancellation_calls == [
+            (
+                attempt["id"],
+                attempt["claim_token"],
+                execution["execution_id"],
+                "stopping",
+                "attempt cancellation",
+            )
+        ]
+    else:
+        assert gate_observations == [(b"", "launched")]
+        assert wait_calls == [15.0]
+        assert cancellation_calls == [
+            (
+                attempt["id"],
+                attempt["claim_token"],
+                execution["execution_id"],
+                "launched",
+                "launch_driver_failure",
+            )
+        ]
     assert len(monitor_clients) == 1 and cancelled_clients == monitor_clients
-    assert len(cleanup_calls) == 1
+    assert len(cleanup_calls) == (1 if failure_point == "timeout" else 0)
     assert spawn_calls == [target]
     assert not request_path.exists(), "redeemed request must be consumed before execution"
     durable = supervisor._sandbox_execution_get(attempt["id"])
-    assert durable is not None and durable["phase"] == "ambiguous"
+    expected_phase = "ambiguous" if failure_point == "timeout" else "launched"
+    assert durable is not None and durable["phase"] == expected_phase
     assert durable["cleanup_verification_json"] == "{}"
-    assert durable["failure_reason"] == "cleanup evidence unavailable"
+    if failure_point == "timeout":
+        assert durable["failure_reason"] == "cleanup evidence unavailable"
     with pytest.raises(launch_driver_service.SandboxLaunchDriverServiceError):
         launch_driver_service._run_driver(
             repo=repo,
@@ -3240,9 +3298,14 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
             "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?", (attempt["id"],)
         ).fetchall()
     assert runtime is not None and runtime["state"] != "released"
-    assert leases and all(lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH for lease in leases), (
-        "ambiguous cleanup evidence must leave resource fences quarantined"
-    )
+    if failure_point == "timeout":
+        assert leases and all(
+            lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH for lease in leases
+        ), "ambiguous cleanup evidence must leave resource fences quarantined"
+    else:
+        assert leases and all(lease["lease_expires_at"] > int(time.time()) for lease in leases), (
+            "unattested launch must retain active resource leases"
+        )
 
 
 def test_launch_monitor_start_holds_process_shared_lifecycle_fence(repo: Path) -> None:
