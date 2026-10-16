@@ -63,8 +63,10 @@ defect; the correction passed the four exact-head Ubuntu/macOS × Python 3.11/3.
 jobs for `0ce4dc4`. The producer-loss/no-replay increment then passed all four
 jobs in [exact-head run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
 on code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`.
-The manager-acceptance crash increment is not represented by that older CI
-run; exact-head hosted CI is pending for the current change.
+The manager-acceptance crash increment at code-bearing commit
+`e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head hosted CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380):
+all four Ubuntu/macOS × Python 3.11/3.12 jobs passed.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
 socket beneath the verified private runtime directory. OCI `run_worker()` and
@@ -254,7 +256,8 @@ with runc 1.3.5; Ruff format and lint also passed. The replay covered
 The full repository workflow passed on macOS/Python 3.12.8 after this handshake
 change: 1,161 tests passed, 57 platform/runtime-gated tests skipped, Ruff format
 and lint passed, and `uv build` produced both wheel and source distribution.
-Independent exact-hash QC and the hosted GitHub Actions matrix remain pending.
+At the time of this 2026-10-06 replay, independent exact-hash QC and the
+hosted GitHub Actions matrix had not yet run for this source snapshot.
 
 A subsequent exact-hash review found a P1 gap: the launch binding did not carry
 the operator's rootfs tree/closure pins from config compilation to spawn, so a
@@ -727,7 +730,10 @@ read-only at `/workspace`, provides a separate writable `/work`, and currently
 bind-mounts host `/usr`, `/bin`, `/sbin`, and `/lib*` read-only. It now creates
 a minimal fixed `/etc/os-release` instead of mounting host `/etc` (2026-10-11;
 structural tests added and a disposable Ubuntu 26.04 guest probe passed;
-exact-head hosted CI and target-host qualification remain pending). The
+exact-head hosted CI for that revision was pending at the time, while later
+code-bearing commit `e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380);
+target-host qualification remains pending). The
 remaining broad host `/usr` and toolchain exposure, read-only workspace, and
 lack of private Git metadata still fail the coding-agent contract. Reuse is
 rejected until those gaps are closed and measured.
@@ -1137,9 +1143,12 @@ and attempt with the attempt expiry, then unowned with expiry zero; the runtime
 was `released` and its allocation row was gone.
 
 The obsolete direct-monitor live fixture is skipped until it is rebuilt around
-exact launch-driver redemption. Crash-recovery/ABA injection and exact-head
-hosted CI remain pending. Result import and `run_worker()` remain out of scope
-and fail-closed.
+exact launch-driver redemption. Crash-recovery/ABA injection remains pending.
+At this live-probe revision, exact-head hosted CI was pending; the later
+manager-acceptance increment at code-bearing commit
+`e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380).
+Result import and `run_worker()` remain out of scope and fail-closed.
 
 **Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
 systemd documents that `ExecStopPost=` also runs after unexpected service exit.
@@ -2350,7 +2359,8 @@ driver's private-tmpfs mount sequence. Cgroup paths from the unit are checked
 for traversal and resolved
 beneath the cgroup-v2 root before their process list is read.
 
-**Follow-up hardening (2026-10-11; live probe passed, hosted CI pending).**
+**Follow-up hardening (2026-10-11; live probe passed; hosted CI was pending at
+that revision).**
 `NamespaceRuntimeDriver` no longer bind-mounts host `/etc`; it generates a
 fixed, read-only `/etc/os-release` inside the private root. The structural test
 rejects reintroduction of `/etc` into the host bind loop. The opt-in Linux test
@@ -2369,8 +2379,10 @@ changes). Postflight found zero `acp-ns-it` units and zero test
 worktree fixtures. The first attempt surfaced the guest's `/usr/bin/chroot`
 layout; the final pass exercised the driver's adaptive default without a
 test-only path override. Local full pytest passed (1,377 passed, 78 expected
-platform/opt-in skips); Ruff format/check and package build passed. Exact-head
-hosted CI remains pending. The generated `/etc` also omits resolver and CA
+platform/opt-in skips); Ruff format/check and package build passed. A later
+code-bearing commit `e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380).
+The generated `/etc` also omits resolver and CA
 configuration: `egress=allow` does not guarantee DNS name resolution or HTTPS
 certificate validation. Broad `/usr` exposure and all registered-worker/Git,
 credential, egress, monitor, and cleanup integration gaps remain open.
@@ -2380,8 +2392,11 @@ live run proves that the resource driver could host and clean up a generic
 no-model payload in that measured guest. At that tested revision, host
 `/etc/os-release` was readable. The 2026-10-11 source follow-up above removes
 that broad bind, and its opt-in probe passed the generated-identity and
-representative-file checks described above. Exact-head hosted CI remains
-pending. The read-only coding workspace and other gaps still disqualify this
+representative-file checks described above. At that follow-up revision,
+exact-head hosted CI was still pending; later code-bearing commit
+`e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380).
+The read-only coding workspace and other gaps still disqualify this
 driver as the worker boundary.
 It does not exercise ACP's registered `run_worker` reservation, worker PID,
 cancel/recovery, Git transfer, or validated result import; it is not acceptance

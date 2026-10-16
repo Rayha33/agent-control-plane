@@ -315,8 +315,10 @@ pytest harness or `GitSupervisor`, a systemd user-manager restart/logout/reboot,
 result import, provider access, or `run_worker()` enablement. Postflight found
 only the same two pre-existing failed launch-driver units, no running runc
 processes, and no matching live fixture directories; those pre-existing units
-were left untouched. The exact-head CI run cited above predates this increment;
-hosted CI for the current change is still pending.
+were left untouched. Code-bearing commit
+`e5f664f538996738cd310c482c778d08f9ee0440` passed
+[exact-head hosted CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380):
+all four Ubuntu/macOS × Python 3.11/3.12 jobs passed.
 
 All three live modes used no model, provider credential, network egress, or paid call.
 Postflight found no running ACP test units, pinned-runc process, or
@@ -338,10 +340,12 @@ this guest. It still does not prove full supervisor-daemon restart recovery,
 manager restart/logout/reboot recovery, every crash-during-handoff window,
 result import, provider access, or `run_worker()` enablement. Exact-head hosted
 CI run 38884017803 passed all four Ubuntu/macOS × Python 3.11/3.12 jobs for
-code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`; hosted CI for
-the current increment is pending. The older direct-monitor lifecycle fixture
-is explicitly skipped because it predates exact launch-driver redemption; it
-must be rebuilt around the production start API before it can be re-enabled.
+code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`. The later
+manager-acceptance increment at `e5f664f538996738cd310c482c778d08f9ee0440`
+also passed all four jobs in exact-head CI run 38888249380. The older
+direct-monitor lifecycle fixture is explicitly skipped because it predates
+exact launch-driver redemption; it must be rebuilt around the production start
+API before it can be re-enabled.
 
 The exact source and integration-test files below were SHA-256 matched between
 this worktree and the disposable guest before the passing run:
