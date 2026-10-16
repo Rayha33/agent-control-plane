@@ -5,10 +5,23 @@ draft that assigned process-local launch ownership to the out-of-slice monitor.
 Independent review of the earlier draft was **NO-GO**. The corrected ownership
 decision received independent **GO** on 2026-10-16 for the two-service topology
 and supervisor-owned final cleanup verification (reviewed ADR SHA-256
-`8be47037cdf9ecc807621892ea18ed8123857449a967fbcbe3d3df7fd00aae55`). This is
-architecture approval only, not implementation or lifecycle acceptance. No
-production integration is authorized by this document. Configured OCI
-`run_worker()` still fails closed with `sandbox_executor_unavailable`.
+`8be47037cdf9ecc807621892ea18ed8123857449a967fbcbe3d3df7fd00aae55`). A
+production launch-driver producer and exact pinned-runc delete-action receipt
+are now implemented and passed an opt-in disposable Debian/systemd test. This
+is not full lifecycle acceptance: the fresh-process cancellation path also
+passed its opt-in disposable Debian/systemd test. The supervisor-owned cleanup
+verifier, schema-33 write-once verification receipt, and reaper retry path are
+implemented; unit and mocked SQLite integration tests pass. Post-stop verifier
+now rejects cgroup paths unless mountinfo maps `/sys/fs/cgroup` to the complete
+cgroup-v2 hierarchy, and safely removes only the execution-derived monitor
+socket from the private runtime directory. Natural completion and fresh-process
+cancellation both passed the opt-in production-launcher test with these live
+Linux/systemd observations (`cleanup_verified`, one pass per mode). Exact-head
+hosted CI is still pending, and result import is not connected to the worker.
+`cleanup_verified` certifies resource cleanup, not worker success; every result
+consumer continues to require runc exit code 0. Configured OCI
+`run_worker()` still fails closed with
+`sandbox_executor_unavailable`.
 
 ## Decision
 
@@ -18,15 +31,17 @@ Use two systemd-owned services for each exact execution tuple
 - The `acp-launch-driver-<execution_id>.service` runs **inside the exact attempt
   slice**. It owns launch-plan redemption, the one-shot launch submission,
   process-local `RuncLaunchHandle`, the local init gate, collection of trusted
-  runtime evidence, the durable `running` transition, cancellation execution,
-  runc wait/reap, and an unverified cleanup report.
+  runtime evidence, the durable `running` transition, runc wait/reap after the
+  monitor stops the exact worker scope, and an unverified cleanup report.
 - The authenticated recovery monitor service runs **outside the attempt
-  slice**. It owns only its authenticated status/cancel endpoint and durable
-  request ledger and service receipt. It is the sole authenticated status/cancel
-  IPC endpoint; status is sourced from the exact driver's response
-  and durable journal, and cancellation is forwarded with replay-safe IPC. It
-  never executes runc operations, signals a host PID, reconstructs or receives
-  the launch handle, collector-issued attestation object, or gate permit.
+  slice**. It owns its authenticated status/cancel endpoint, durable request
+  ledger, and service receipt. It validates cancellation against the exact
+  journaled worker scope and stops only that scope; it does not own or receive
+  the process-local launch handle, collector-issued attestation object, gate
+  permit, or runc wait/reap authority, and it never falls back to host-PID
+  signaling. It remains serving after a terminal response; the supervisor's
+  cleanup verifier performs exact unit retirement after the driver's
+  unverified report is durable.
 - The ACP supervisor/recovery verifier is the **only owner** of the final
   `cleanup_verified` transition and fence release. It acts only after both
   services have exited, validates the driver's unverified cleanup report, and
@@ -68,11 +83,29 @@ either process-local capability would invalidate that contract.
 
 ## Lifecycle and failure contract
 
-1. The supervisor reserves the exact execution tuple and immutable launch plan,
-   then durably records one at-most-once driver-start intent before requesting
-   systemd activation. It starts the recovery monitor outside the attempt slice
-   and the launch-driver inside the exact attempt slice. An uncertain start is
-   adopted by exact unit/invocation and tuple; it is never retried blindly.
+1. The supervisor reserves the exact execution tuple and immutable launch
+   inputs, then durably records one at-most-once driver-start intent before an
+   out-of-slice producer requests systemd activation of the launch-driver inside
+   the exact attempt slice. Redemption alone does not transfer ownership: the
+   producer waits while the journal remains `reserved`. Activation is
+   synchronous with `Type=exec` so systemd consumes its one-shot credential FD
+   before the producer closes it; `--no-block` is unsafe for this handoff.
+   Once the exact worker
+   scope exists, the launch-driver starts the recovery monitor outside the
+   attempt slice; one journal transition commits the scope, monitor receipt,
+   and launch plan. The recorder holds the inode-pinned process-shared
+   execution fence across monitor activation, authenticated receipt/status
+   checks, and the durable `launched` commit. The producer returns only after
+   that durable handoff. If the driver exits first or the producer is
+   interrupted before handoff, the producer must win durable revocation before
+   stopping any exact service. If the shared fence is busy, it waits for the
+   serialized journal outcome: a committed handoff is adopted; a committed
+   revocation permits exact driver/monitor/slice reconciliation. It must not
+   infer quiescence from a momentary `not-found` read or return while the row
+   remains reserved and another owner still holds the fence. Because the
+   producer does not own the process-local runc handle or wait receipt,
+   revoked executions remain ambiguous and fenced; this is containment, not
+   cleanup proof. An uncertain start is never replayed blindly.
 2. The launch-driver proves that its own `MainPID`, kernel start identity,
    `InvocationID`, unit name, and `ControlGroup` match the exact active service
    directly beneath the recorded attempt slice. It redeems the single-use
@@ -90,23 +123,25 @@ either process-local capability would invalidate that contract.
    that journal commit succeeds may that handle release its one-shot gate.
    Collection, transition, or cancellation races fail closed under the existing
    gate/journal fences.
-4. A fresh supervisor authenticates to the recovery monitor. The monitor
-   routes status/cancel over authenticated, replay-safe IPC to the exact
-   driver. The driver serializes cancellation against gate release, revokes an
-   unreleased gate, and stops only the exact worker scope; it never falls back
-   to host-PID signaling. It waits/reaps with its local handle, performs
+4. A fresh supervisor first validates the runner credential and durably records
+   stop intent under the execution fence. It then reconnects to the exact
+   recovery monitor, authenticates the IPC request, and asks it to stop only the
+   bound worker scope. The monitor never signals a host PID. The launch-driver
+   retains the local handle, waits/reaps the exact runc client, performs
    container deletion, and writes only the journal's unverified cleanup report.
-   A scope-empty observation or systemd `Result=success` is not a substitute
-   for the kernel wait receipt. After durably recording the terminal replay
-   response and observing the exact driver activation stopped, the recovery
-   monitor closes its endpoint and exits; it cannot attest its own absence.
-5. After both exact service activations are absent, the ACP supervisor/recovery
-   verifier independently checks the persisted wait receipt and cleanup
-   report, runc-client and container-init start identities, exact monitor and
-   driver invocation/PID identities, worker-scope and attempt-slice identities,
-   and empty cgroups for all four units. It also reads back runc state/container
-   absence and private bundle/state removal. Only this verifier may add the
-   final verified observations and advance `cleanup_reported` to
+   A scope-empty observation or systemd `Result=success` is not a substitute for
+   the kernel wait receipt. The monitor continues serving beyond the cancel
+   response. The supervisor's cleanup verifier stops or reconciles the exact
+   recorded monitor, driver, and scope activations after the driver's
+   unverified report is durable.
+5. The ACP supervisor/recovery verifier stops or reconciles the exact recorded
+   service activations, then independently checks the persisted wait receipt
+   and cleanup report, runc-client and container-init start identities, exact
+   monitor and driver invocation/PID identities, worker-scope and attempt-slice
+   identities, and empty cgroups for all four units. It also reads back runc
+   state/container absence and removes only the inode-bound private bundle and
+   state trees. A second post-removal systemd/process/cgroup observation is
+   required before the write-once receipt advances `cleanup_reported` to
    `cleanup_verified`. Missing or conflicting evidence remains fenced and
    prohibits result import. If the driver dies before its
    wait receipt or unverified report is durable, the monitor cannot fabricate
@@ -127,10 +162,27 @@ attempt-slice invocation, and cgroup match. Launch submission and the
 `running` attestation must match it again. The SQL-scoped write capability binds
 the complete receipt, including its redemption timestamp. The launch-submission
 gate also recollects and compares the live service/slice activation immediately
-before consuming the sole runc submission. This is still a journal/collector
-primitive only: no production caller starts a launch-driver service, and exact
-unit adoption/reconciliation and the live lifecycle remain unimplemented. It
-is not evidence that a worker can be launched.
+before consuming the sole runc submission.
+
+Schema 32 adds a scoped SQL write guard for a v3 cleanup report's process-local
+pinned-runc delete receipt. The launch-driver owns the handle, gate, attestation,
+kernel wait/reap, and exact `runc --root <state> delete --force <container>` action;
+the receipt binds the command digest, pinned executable digest/version, exact
+execution tuple, driver identity, command result, and immediate runc-state
+absence. This action report remains explicitly `unverified`. It cannot prove
+that the driver/monitor units, processes, cgroups, bundle, or state root are
+absent after both services exit, and it cannot advance `cleanup_verified` or
+authorize import.
+
+Schema 33 adds a separate write-once verification receipt. Its SQL write guard
+accepts the transition only with a process-local capability registered by the
+supervisor-owned verifier, bound to the exact cleanup-report digest and current
+execution tuple. Recovery can retry an eligible `cleanup_reported` row from the
+reaper; failed or unavailable observations leave the attempt fenced. The
+positive reaper retry/fence-release regression now drives the real verifier
+with deterministic OS observations and a runtime-teardown double. The live
+Linux/systemd lifecycle results below verify cleanup after natural exit and
+cancellation, but do not exercise live reaper recovery.
 
 The independent review of the prior ADR found a blocking mismatch: it placed the
 handle-owning monitor outside the attempt slice and proposed migrating attestation
@@ -139,7 +191,8 @@ of the corrected decision returned **GO** on 2026-10-16 after assigning final
 cleanup verification and fence release only to the supervisor/recovery verifier,
 which waits for both services to exit and independently verifies exact
 identities and absence evidence. That review was limited to architecture; the
-production lifecycle and cleanup verifier remain unimplemented.
+verifier implementation and mocked integration are additional source-level
+evidence, not live lifecycle acceptance.
 
 A separate `StartTransientUnit(PIDs=...)` experiment passed live on 2026-10-16
 in disposable Ubuntu 26.04.1 ARM64 / Linux `7.0.0-38` / systemd 259.5 / cgroup
@@ -176,8 +229,68 @@ Postflight found no matching ACP service/scope units and no
 `acp-production-monitor-*` fixture roots. This is a current live regression for
 the monitor only. It does **not** exercise a launch-driver producer, journal
 redemption in a service process, pinned-runc submission, same-process `running`
-transition, monitor-to-driver cancellation, or supervisor-owned cleanup
-verification; the integrated lifecycle remains unimplemented.
+transition, fresh-process cancellation of the exact worker scope, or
+supervisor-owned cleanup verification; the integrated lifecycle remains
+unimplemented.
+
+### Current-branch launch-driver and fresh-process cancellation (2026-10-16; live cleanup verification pass)
+
+The opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in
+both natural-completion and `ACP_LIVE_CANCEL_AFTER_START=1` modes on the
+disposable Debian 12 / Linux 6.1 ARM64 guest with systemd 252.39, cgroup v2,
+rootless pinned runc 1.5.2
+(`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`), and
+BusyBox 1.35.0. Each mode reported `1 passed`.
+Natural completion started the exact driver service, ran a bounded no-model
+payload, observed the same-process `running` transition and kernel wait/reap,
+executed pinned `runc delete --force`, verified the container-state entry
+absent immediately after deletion, then passed the independent post-stop
+verifier and persisted `cleanup_verified`.
+
+The cancellation mode waited for the bounded payload's start marker, rejected
+a wrong runner credential before monitor contact, then used a spawned fresh
+controller process with the enrolled credential. That process reconnected to
+the live monitor exactly once; a test hook made any legacy host-PID path fail.
+The monitor stopped only the journal-bound worker scope. The launch-driver
+waited/reaped with a nonzero task exit and persisted its exact v3 delete
+receipt; the independent verifier then observed cleanup and wrote
+`cleanup_verified`. The start marker existed and the payload completion marker
+did not. A direct result-eligibility check still rejected the nonzero exit.
+Both modes used no model, provider credential, network egress, or paid call.
+Postflight found no matching active service/slice, payload process, or
+`acp-live-launch-driver-*` fixture root.
+
+Host and guest SHA-256 matched for every listed production/test source at both
+runs. This proves the tested cancellation request, separate pinned-runc action
+receipt, exact process/unit/cgroup/state/path absence checks, and
+`cleanup_verified` transition on this guest. It does not prove crash recovery,
+exact-head hosted CI, result import, provider access, or `run_worker()`
+enablement. The older direct-monitor lifecycle fixture is explicitly skipped
+because it predates exact launch-driver redemption; it must be rebuilt around
+the production start API before it can be re-enabled.
+
+The exact source and integration-test files below were SHA-256 matched between
+this worktree and the disposable guest before the passing run:
+
+| File | SHA-256 |
+| --- | --- |
+| `git_supervisor.py` | `138cbe89018d748728c9c97d95b91f129c1548260cb4211b442d64f510729f7d` |
+| `oci_worker.py` | `2451885b35f3e3646537df2972504206dd5db7cc0c9834cd7af2117dc0f7a2ec` |
+| `sandbox_execution_journal.py` | `4b40be3eb4e6502b9be807f99e500d2d9c6692318eeabab4e67d65d44d2914eb` |
+| `sandbox_cleanup_verifier.py` | `c9feadb387dc6e325716975a933c14ea37ccfb1fdeeb422473a7cd232abe3553` |
+| `sandbox_launch_driver_service.py` | `f7deb8d2fe6f36b4e9281a61e72e7e33cc400212627186d2a7d6c96273815b67` |
+| `sandbox_monitor_service.py` | `c27fe68d764bfde7067195d64bee1a9056c5b73356849161b60ece9c76a4197a` |
+| `store.py` | `c712b56ee1155db9b89c9321bc6bf90d7f581ab5a8ead41cb9e125c4744b977a` |
+| `test_sandbox_worker_lifecycle_integration.py` | `0ead598dce07d2c1952e126fd197372abb36114a1fa3153937e86bcebaaedab5` |
+
+The live run closed a systemd-252-specific startup defect: `systemd-run
+--no-block` returned before `LoadCredential=` consumed its `/proc/<pid>/fd/`
+source, so the producer closed the descriptor before the service could read
+it. A disposable synthetic-credential probe reproduced the failed unit; the
+same probe with synchronous `Type=exec` reached `ExecStart` successfully. The
+producer now keeps the descriptor open through that exec boundary. This fixes
+credential delivery but does not expand the lifecycle proof above.
 
 The local cleanup regression uses a real held child and injected kill/first-wait
 failures; it verifies EOF exits 126 and an unverified scope binding preserves
@@ -186,24 +299,19 @@ driver cleanup evidence.
 
 ## Required implementation and proof
 
-Current production code does not implement this decision. In particular,
-`start_sandbox_execution_monitor()` still starts after a worker scope is live;
-there is no launch-driver service producer that starts before execution; the
-new redemption collector and journal path have no production caller; and the
-existing handle/attestation/running flow is not yet owned by the launch-driver
-service. The journal intentionally has no production `cleanup_verified`
-writer; a separately authorized, exact-identity verifier is required after
-both services exit. The existing `run_worker()` refusal must remain unchanged.
-
-Implement the driver-start intent and redemption around the existing
-one-shot launch-submission journal without serializing a `RuncLaunchHandle`,
-collector-issued attestation object, or gate permit. Bind every service,
-process, cgroup, and receipt to the exact execution tuple. Keep init blocked
-until trusted collection and the same-process durable `running` transition
-succeed. Route fresh-supervisor cancellation only through authenticated
-monitor-to-driver IPC. If the driver exits before kernel wait/reap and
-cleanup evidence are durable, keep the execution fenced and reject result
-import.
+The production launch-driver now starts before the runc submission and owns the
+process-local handle/attestation/running/wait path plus exact pinned-runc delete
+action. The authenticated fresh-process cancellation path is implemented and
+passed the live disposable-systemd test above as supervisor → monitor → exact
+worker scope. Exact launch-driver adoption/reconciliation, monitor retirement,
+and the supervisor-owned post-stop verifier are implemented in source. The
+verifier serializes against the execution owner, requires the durable delete
+action and kernel-wait receipts, then checks exact process/unit/invocation/cgroup,
+container, and path identities before writing `cleanup_verified`. Natural and
+cancelled runs both passed the live verifier on the disposable Debian guest;
+hosted exact-head CI remains pending. If any evidence is incomplete or the
+driver dies before action/wait receipts are durable, keep the execution fenced.
+The existing `run_worker()` refusal must remain unchanged.
 
 The opt-in disposable Linux/systemd test must use the real pinned launcher for
 a bounded no-model payload and prove exact two-service placement, one driver

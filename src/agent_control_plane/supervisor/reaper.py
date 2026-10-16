@@ -996,6 +996,36 @@ class ReaperMixin:
         cleanup_attempts: set[str] = set()
         workers_to_stop: list[tuple[str, int, str]] = []
         task_cleanups: dict[str, str] = {}
+        # Cleanup verification performs bounded systemd/proc/cgroup inspection
+        # and may remove the exact recorded private trees.  Run it before the
+        # write transaction so a crashed verifier can be retried on the next
+        # reap without holding SQLite's global writer lock during OS checks.
+        with self.connect() as connection:
+            pending_verification = connection.execute(
+                """
+                SELECT execution.attempt_id, execution.claim_token
+                FROM sandbox_executions AS execution
+                JOIN attempts AS attempt ON attempt.id = execution.attempt_id
+                WHERE execution.phase = 'cleanup_reported'
+                  AND (
+                    (attempt.status IN ('provisioning', 'working')
+                     AND attempt.lease_expires_at <= ?)
+                    OR attempt.status = 'terminating'
+                  )
+                ORDER BY execution.attempt_id
+                """,
+                (epoch,),
+            ).fetchall()
+        for pending in pending_verification:
+            try:
+                self._sandbox_execution_verify_cleanup(
+                    pending["attempt_id"], pending["claim_token"]
+                )
+            except (OSError, subprocess.SubprocessError, SupervisorError):
+                # The transactional pass below keeps the attempt quarantined
+                # and all resources fenced unless the durable receipt exists.
+                # A later reap retries the exact row under its inode fence.
+                continue
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempts = connection.execute(

@@ -5,9 +5,13 @@ import json
 import multiprocessing
 import os
 import select
+import socket
 import sqlite3
+import tempfile
 import threading
+import time
 import weakref
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -28,7 +32,9 @@ from agent_control_plane.git_supervisor import (
 from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker
 from agent_control_plane.supervisor import sandbox_attestation as sandbox_attestation_module
+from agent_control_plane.supervisor import sandbox_cleanup_verifier as verifier_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
+from agent_control_plane.supervisor import sandbox_launch_driver_service as launch_driver_service
 from agent_control_plane.supervisor import sandbox_monitor_ipc as monitor_ipc_module
 from agent_control_plane.supervisor import sandbox_monitor_lifecycle as monitor_lifecycle_module
 from agent_control_plane.supervisor import workers as workers_module
@@ -43,6 +49,8 @@ from agent_control_plane.supervisor.sandbox_attestation import (
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     SandboxMonitorReceipt,
     sandbox_attempt_slice_unit,
+    sandbox_container_id,
+    sandbox_monitor_service_unit,
 )
 from agent_control_plane.supervisor.sandbox_workspace import (
     ManifestEntry,
@@ -72,6 +80,14 @@ def _record_launch_monitor_for_thread(**kwargs: Any) -> Any:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     return init_repo(tmp_path)
+
+
+def _execution_gate_identity(row: Any) -> tuple[str, int, int]:
+    return (
+        str(Path(row["bundle_path"]).parent),
+        row["execution_root_dev"],
+        row["execution_root_ino"],
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -104,6 +120,199 @@ def _request_stop_from_fresh_process(
     else:
         result_sender.send(("ok", updated["phase"]))
     finally:
+        result_sender.close()
+
+
+def _hold_execution_gate_fence(
+    execution_root_path: str,
+    execution_root_device: int,
+    execution_root_inode: int,
+    release_receiver,
+    result_sender,
+) -> None:
+    """Hold the real process-shared execution fence for cancellation-race tests."""
+
+    try:
+        with oci_worker._runc_execution_gate_fence(
+            execution_root_path, execution_root_device, execution_root_inode
+        ):
+            result_sender.send("held")
+            release_receiver.recv()
+        result_sender.send("released")
+    except BaseException as error:
+        result_sender.send(("error", type(error).__name__, str(error)))
+    finally:
+        release_receiver.close()
+        result_sender.close()
+
+
+def _revoke_launch_start_after_gate_acquire(
+    repo: Path,
+    execution: dict[str, Any],
+    attempt_slice: str,
+    intent_values: dict[str, Any],
+    release_gate: Any,
+    gate_sender,
+    result_sender,
+) -> None:
+    """Pause the real producer after it owns the gate, before revoke commit."""
+
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    supervisor = GitSupervisor(repo)
+    intent = SimpleNamespace(**intent_values)
+    original_mark_ambiguous = supervisor._sandbox_execution_mark_ambiguous_under_gate_lock
+    unit_reads: list[str] = []
+    stops: list[list[str]] = []
+
+    def missing_unit(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
+        unit_reads.append(unit)
+        values = {
+            "ActiveState": "inactive",
+            "ControlGroup": "",
+            "Id": unit,
+            "InvocationID": "",
+            "Job": "",
+            "LoadState": "not-found",
+            "MainPID": "0",
+            "Slice": "",
+            "SubState": "dead",
+        }
+        return {name: values[name] for name in properties}
+
+    def unexpected_stop(command: list[str], *, environment: dict[str, str]) -> bytes:
+        del environment
+        stops.append(command)
+        raise AssertionError("quiescent exact units must not be stopped")
+
+    def pause_before_commit(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        gate_sender.send("revocation owns process-shared gate")
+        if not release_gate.wait(10):
+            raise AssertionError("test barrier did not release exact revocation")
+        return original_mark_ambiguous(*args, **kwargs)
+
+    supervisor._sandbox_execution_mark_ambiguous_under_gate_lock = pause_before_commit
+    service._unit_properties = missing_unit
+    service._trusted_systemctl_executable = lambda: Path("/usr/bin/systemctl")
+    service._trusted_systemd_command_environment = lambda: {"PATH": "/usr/bin"}
+    service._run_trusted_runtime_command = unexpected_stop
+    try:
+        adopted = service._stop_and_reconcile_exact_start(
+            supervisor,
+            execution=execution,
+            intent=intent,
+            attempt_slice=attempt_slice,
+            reason="cross-process revoke won launch handoff barrier",
+            credential=None,
+        )
+        result_sender.send(("ok", adopted, unit_reads, stops))
+    except BaseException as error:
+        result_sender.send(("error", type(error).__name__, getattr(error, "code", None)))
+    finally:
+        gate_sender.close()
+        result_sender.close()
+
+
+def _reconcile_timeout_from_fresh_process(
+    repo: Path,
+    execution: dict[str, Any],
+    intent_values: dict[str, Any],
+    attempt_slice: str,
+    event_sender,
+    result_sender,
+) -> None:
+    """Race a fresh producer against a process that owns the handoff fence."""
+
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    supervisor = GitSupervisor(repo)
+    intent = SimpleNamespace(**intent_values)
+    unit_reads: list[str] = []
+    stops: list[list[str]] = []
+    original_revoke = supervisor._sandbox_execution_revoke_launch_driver_start
+    busy_reported = False
+
+    def trace_revoke(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal busy_reported
+        try:
+            return original_revoke(*args, **kwargs)
+        except SupervisorError as error:
+            if error.code == "sandbox_execution_gate_busy" and not busy_reported:
+                busy_reported = True
+                event_sender.send("busy")
+            raise
+
+    def unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
+        unit_reads.append(unit)
+        event_sender.send(f"read:{unit}")
+        monitor = sandbox_monitor_service_unit(
+            intent.attempt_id, intent.claim_token, intent.execution_id
+        )
+        if unit == intent.service_unit:
+            values = {
+                "ActiveState": "active",
+                "ControlGroup": f"/user.slice/user-acp.slice/{attempt_slice}/{unit}",
+                "Id": unit,
+                "InvocationID": "2" * 32,
+                "Job": "",
+                "LoadState": "loaded",
+                "MainPID": "1234",
+                "Slice": attempt_slice,
+                "SubState": "running",
+            }
+        elif unit == monitor:
+            values = {
+                "ActiveState": "inactive",
+                "ControlGroup": "",
+                "Id": unit,
+                "InvocationID": "",
+                "Job": "",
+                "LoadState": "not-found",
+                "MainPID": "0",
+                "Slice": "",
+                "SubState": "dead",
+            }
+        else:
+            assert unit == attempt_slice
+            values = {
+                "ActiveState": "active",
+                "ControlGroup": f"/user.slice/user-acp.slice/{unit}",
+                "Id": unit,
+                "InvocationID": "3" * 32,
+                "Job": "",
+                "LoadState": "loaded",
+                "MainPID": "0",
+                "Slice": "user-acp.slice",
+                "SubState": "active",
+            }
+        assert set(properties).issubset(values)
+        return {name: values[name] for name in properties}
+
+    def systemd_command(command: list[str], *, environment: dict[str, str]) -> bytes:
+        del environment
+        stops.append(command)
+        event_sender.send(f"stop:{command[-1]}")
+        return b""
+
+    supervisor._sandbox_execution_revoke_launch_driver_start = trace_revoke
+    service._unit_properties = unit_properties
+    service._trusted_systemctl_executable = lambda: Path("/usr/bin/systemctl")
+    service._trusted_systemd_command_environment = lambda: {"PATH": "/usr/bin"}
+    service._run_trusted_runtime_command = systemd_command
+    try:
+        adopted = service._stop_and_reconcile_exact_start(
+            supervisor,
+            execution=execution,
+            intent=intent,
+            attempt_slice=attempt_slice,
+            reason="startup timeout raced with monitor handoff",
+            credential=None,
+        )
+        result_sender.send(("ok", adopted, unit_reads, stops))
+    except BaseException as error:
+        result_sender.send(("error", type(error).__name__, str(error), unit_reads, stops))
+    finally:
+        event_sender.close()
         result_sender.close()
 
 
@@ -180,9 +389,9 @@ class _FreshMonitorStub:
 
 
 def _acquire_gate_fence_after_parent_release(
-    state_path: str,
-    state_device: int,
-    state_inode: int,
+    execution_root_path: str,
+    execution_root_device: int,
+    execution_root_inode: int,
     inherited_lock_fd: int,
     release_receiver,
     result_sender,
@@ -195,7 +404,9 @@ def _acquire_gate_fence_after_parent_release(
         result_sender.send("inherited-open")
     release_receiver.recv()
     try:
-        with oci_worker._runc_execution_gate_fence(state_path, state_device, state_inode):
+        with oci_worker._runc_execution_gate_fence(
+            execution_root_path, execution_root_device, execution_root_inode
+        ):
             result_sender.send("acquired")
     except SupervisorError as error:
         result_sender.send(error.code)
@@ -513,7 +724,7 @@ def redeem_test_launch_driver_start(
             )
         else:
             intent = supervisor._sandbox_execution_authorize_launch_driver_start(
-                attempt["id"], attempt["claim_token"]
+                attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
             )
     redemption = collect_test_launch_driver_redemption(supervisor, attempt)
     updated = supervisor._sandbox_execution_redeem_launch_driver_start(
@@ -1303,6 +1514,7 @@ def test_concurrent_launch_plan_binding_has_one_durable_winner(repo: Path) -> No
         "sandbox_execution_transition_invalid",
         "sandbox_execution_launch_submission_exists",
         "sandbox_launch_driver_start_ambiguous",
+        "sandbox_launch_driver_redemption_ambiguous",
     }
     durable = supervisor._sandbox_execution_get(attempt["id"])
     assert durable["phase"] == "launched"
@@ -2121,46 +2333,42 @@ def test_public_terminate_worker_reconnects_after_supervisor_restart(
         }
         with pytest.raises(SupervisorError) as wrong_root:
             with oci_worker._runc_execution_gate_fence(
-                durable["state_path"],
-                durable["state_root_dev"] + 1,
-                durable["state_root_ino"],
+                _execution_gate_identity(durable)[0],
+                durable["execution_root_dev"] + 1,
+                durable["execution_root_ino"],
             ):
-                pytest.fail("mismatched state-root identity acquired a lifecycle fence")
+                pytest.fail("mismatched execution-root identity acquired a lifecycle fence")
         assert wrong_root.value.code == "sandbox_execution_gate_identity_mismatch"
 
         import fcntl
 
-        state_root = Path(durable["state_path"])
-        displaced_root = state_root.with_name(f"{state_root.name}.displaced-for-test")
-        original_root_identity = os.stat(state_root)
+        execution_root = Path(durable["bundle_path"]).parent
+        displaced_root = execution_root.with_name(f"{execution_root.name}.displaced-for-test")
+        original_root_identity = os.stat(execution_root)
         original_flock = fcntl.flock
 
         def replace_state_root_after_lock(descriptor: int, operation: int) -> None:
             original_flock(descriptor, operation)
             if operation & fcntl.LOCK_EX:
-                state_root.rename(displaced_root)
-                state_root.mkdir(mode=0o700)
+                execution_root.rename(displaced_root)
+                execution_root.mkdir(mode=0o700)
 
         with patch("fcntl.flock", side_effect=replace_state_root_after_lock):
             with pytest.raises(SupervisorError) as replaced_root:
                 with oci_worker._runc_execution_gate_fence(
-                    durable["state_path"],
-                    durable["state_root_dev"],
-                    durable["state_root_ino"],
+                    *_execution_gate_identity(durable),
                 ):
-                    pytest.fail("replaced state-root path acquired a lifecycle fence")
+                    pytest.fail("replaced execution-root path acquired a lifecycle fence")
         assert replaced_root.value.code == "sandbox_execution_gate_identity_mismatch"
-        state_root.rmdir()
-        displaced_root.rename(state_root)
-        restored_root_identity = os.stat(state_root)
+        execution_root.rmdir()
+        displaced_root.rename(execution_root)
+        restored_root_identity = os.stat(execution_root)
         assert (restored_root_identity.st_dev, restored_root_identity.st_ino) == (
             original_root_identity.st_dev,
             original_root_identity.st_ino,
         )
 
-        with oci_worker._runc_execution_gate_fence(
-            durable["state_path"], durable["state_root_dev"], durable["state_root_ino"]
-        ):
+        with oci_worker._runc_execution_gate_fence(*_execution_gate_identity(durable)):
             context = multiprocessing.get_context("spawn")
             receiver, sender = context.Pipe(duplex=False)
             process = context.Process(
@@ -2189,16 +2397,12 @@ def test_public_terminate_worker_reconnects_after_supervisor_restart(
             process = None
             try:
                 with oci_worker._runc_execution_gate_fence(
-                    durable["state_path"],
-                    durable["state_root_dev"],
-                    durable["state_root_ino"],
+                    *_execution_gate_identity(durable),
                 ):
                     process = context.Process(
                         target=_acquire_gate_fence_after_parent_release,
                         args=(
-                            durable["state_path"],
-                            durable["state_root_dev"],
-                            durable["state_root_ino"],
+                            *_execution_gate_identity(durable),
                             next(iter(oci_worker._RUNC_EXECUTION_GATE_LOCK_FDS)),
                             release_receiver,
                             acquired_sender,
@@ -2459,6 +2663,7 @@ def record_launch(
     wrapper_cgroup_path: str | None = None,
     monitor_start_calls: list[dict[str, Any]] | None = None,
     monitor_start_error: Exception | None = None,
+    monitor_start_hook: Callable[[dict[str, Any]], None] | None = None,
     patch_monitor_starter: bool = True,
 ) -> dict:
     if runc_handle is None:
@@ -2537,6 +2742,8 @@ def record_launch(
     def start_monitor(**kwargs: Any) -> Any:
         if monitor_start_calls is not None:
             monitor_start_calls.append(kwargs)
+        if monitor_start_hook is not None:
+            monitor_start_hook(kwargs)
         if monitor_start_error is not None:
             raise monitor_start_error
         return client
@@ -2598,6 +2805,208 @@ def test_launch_starts_monitor_for_exact_fenced_scope_and_uses_service_receipt(
         attempt["id"], attempt["claim_token"], execution["execution_id"]
     )
     assert launched["wrapper_cgroup_path"].endswith("/" + launched["wrapper_unit"])
+
+
+def test_launch_monitor_start_holds_process_shared_lifecycle_fence(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    observed_busy: list[str] = []
+
+    def inspect_fence(_kwargs: dict[str, Any]) -> None:
+        with pytest.raises(SupervisorError) as busy:
+            with oci_worker._runc_execution_gate_fence(
+                *_execution_gate_identity(execution),
+            ):
+                pass
+        observed_busy.append(busy.value.code)
+
+    launched = record_launch(supervisor, attempt, monitor_start_hook=inspect_fence)
+
+    assert observed_busy == ["sandbox_execution_gate_busy"]
+    assert launched["phase"] == "launched"
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None and durable["phase"] == "launched"
+
+
+def test_timeout_waits_for_cross_process_monitor_handoff_then_adopts(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "launch-driver-monitor-handoff-race.txt")
+    execution = reserve(supervisor, attempt)
+    intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
+    )
+    redeem_test_launch_driver_start(supervisor, attempt, intent=intent)
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None and execution["phase"] == "reserved"
+    attempt_slice = sandbox_attempt_slice_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    intent_values = {
+        "attempt_id": intent.attempt_id,
+        "claim_token": intent.claim_token,
+        "execution_id": intent.execution_id,
+        "start_id": intent.start_id,
+        "start_digest": intent.start_digest,
+        "service_unit": intent.service_unit,
+    }
+    monitor_entered = threading.Event()
+    release_monitor = threading.Event()
+
+    def pause_monitor_start(_kwargs: dict[str, Any]) -> None:
+        monitor_entered.set()
+        if not release_monitor.wait(10):
+            raise AssertionError("test barrier did not release monitor startup")
+
+    context = multiprocessing.get_context("spawn")
+    event_receiver, event_sender = context.Pipe(duplex=False)
+    result_receiver, result_sender = context.Pipe(duplex=False)
+    producer = context.Process(
+        target=_reconcile_timeout_from_fresh_process,
+        args=(repo, execution, intent_values, attempt_slice, event_sender, result_sender),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        launch = pool.submit(
+            record_launch,
+            supervisor,
+            attempt,
+            monitor_start_hook=pause_monitor_start,
+        )
+        producer_started = False
+        try:
+            assert monitor_entered.wait(5), "record_launch did not reach the held monitor start"
+            producer.start()
+            producer_started = True
+            event_sender.close()
+            result_sender.close()
+            assert event_receiver.poll(5), "fresh producer did not encounter the held process fence"
+            assert event_receiver.recv() == "busy"
+            assert not event_receiver.poll(0.2), (
+                "fresh producer inspected or stopped units while monitor handoff owned the fence"
+            )
+
+            release_monitor.set()
+            launched = launch.result(timeout=5)
+            assert launched["phase"] == "launched"
+            assert result_receiver.poll(10), "fresh producer did not finish handoff reconciliation"
+            result = result_receiver.recv()
+            producer.join(timeout=5)
+            assert not producer.is_alive()
+            assert producer.exitcode == 0
+            assert result == ("ok", True, [], [])
+            if event_receiver.poll(0.1):
+                with pytest.raises(EOFError):
+                    event_receiver.recv()
+            durable = supervisor._sandbox_execution_get(attempt["id"])
+            assert durable is not None and durable["phase"] == "launched"
+        finally:
+            release_monitor.set()
+            if producer_started and producer.is_alive():
+                producer.join(timeout=5)
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=5)
+            event_receiver.close()
+            result_receiver.close()
+            if not event_sender.closed:
+                event_sender.close()
+            if not result_sender.closed:
+                result_sender.close()
+
+
+def test_cross_process_revoke_wins_launch_barrier_and_prevents_monitor_start(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "launch-driver-revoke-wins-race.txt")
+    execution = reserve(supervisor, attempt)
+    intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
+    )
+    redeem_test_launch_driver_start(supervisor, attempt, intent=intent)
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None and execution["phase"] == "reserved"
+    attempt_slice = sandbox_attempt_slice_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    monitor_unit = sandbox_monitor_service_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    intent_values = {
+        "attempt_id": intent.attempt_id,
+        "claim_token": intent.claim_token,
+        "execution_id": intent.execution_id,
+        "start_id": intent.start_id,
+        "start_digest": intent.start_digest,
+        "service_unit": intent.service_unit,
+    }
+
+    context = multiprocessing.get_context("spawn")
+    release_gate = context.Event()
+    gate_receiver, gate_sender = context.Pipe(duplex=False)
+    result_receiver, result_sender = context.Pipe(duplex=False)
+    revoker = context.Process(
+        target=_revoke_launch_start_after_gate_acquire,
+        args=(
+            repo,
+            execution,
+            attempt_slice,
+            intent_values,
+            release_gate,
+            gate_sender,
+            result_sender,
+        ),
+    )
+    revoker_started = False
+    try:
+        revoker.start()
+        revoker_started = True
+        gate_sender.close()
+        result_sender.close()
+        assert gate_receiver.poll(10), "fresh revoker did not acquire the lifecycle gate"
+        assert gate_receiver.recv() == "revocation owns process-shared gate"
+
+        monitor_start_calls: list[dict[str, Any]] = []
+        with pytest.raises(SupervisorError) as busy:
+            record_launch(supervisor, attempt, monitor_start_calls=monitor_start_calls)
+        assert busy.value.code == "sandbox_execution_gate_busy"
+        assert monitor_start_calls == []
+
+        release_gate.set()
+        assert result_receiver.poll(10), "fresh revoker did not durably commit revocation"
+        assert result_receiver.recv() == (
+            "ok",
+            False,
+            [intent.service_unit, monitor_unit, attempt_slice],
+            [],
+        )
+        revoker.join(timeout=5)
+        assert not revoker.is_alive()
+        assert revoker.exitcode == 0
+    finally:
+        release_gate.set()
+        if revoker_started and revoker.is_alive():
+            revoker.join(timeout=5)
+            if revoker.is_alive():
+                revoker.terminate()
+                revoker.join(timeout=5)
+        gate_receiver.close()
+        result_receiver.close()
+        if not gate_sender.closed:
+            gate_sender.close()
+        if not result_sender.closed:
+            result_sender.close()
+
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None and durable["phase"] == "ambiguous"
+
+    with pytest.raises(SupervisorError) as refused:
+        record_launch(supervisor, attempt, monitor_start_calls=monitor_start_calls)
+    assert refused.value.code == "sandbox_execution_transition_invalid"
+    assert monitor_start_calls == []
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None and durable["phase"] == "ambiguous"
 
 
 def test_monitor_start_failure_keeps_launch_gate_closed_and_fences_reserved(repo: Path) -> None:
@@ -3117,22 +3526,416 @@ def cleanup_receipt(supervisor: GitSupervisor, attempt_id: str) -> dict:
     return supervisor._sandbox_cleanup_receipt(row)
 
 
+def configure_cleanup_verifier_os_observations(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    execution: dict,
+    attempt: dict,
+    row: dict,
+) -> Path:
+    """Provide deterministic Linux/systemd observations to the real verifier."""
+
+    monkeypatch.setattr(verifier_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        verifier_module, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
+    )
+    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir="/private/tmp")
+    request.addfinalizer(runtime_context.cleanup)
+    runtime_environment = {"XDG_RUNTIME_DIR": runtime_context.name}
+    monkeypatch.setattr(
+        verifier_module,
+        "_trusted_systemd_command_environment",
+        lambda: runtime_environment,
+    )
+    monkeypatch.setattr(
+        verifier_module.sandbox_monitor_lifecycle,
+        "_trusted_systemd_command_environment",
+        lambda: runtime_environment,
+    )
+    monkeypatch.setattr(verifier_module, "_process_identity_is_absent", lambda *_args: True)
+    monkeypatch.setattr(verifier_module, "_cgroup_tree_is_unpopulated", lambda _path: True)
+    monkeypatch.setattr(verifier_module, "_assert_no_mounts_below", lambda _paths: None)
+    monkeypatch.setattr(
+        verifier_module,
+        "_verifier_process_identity",
+        lambda: f"linux:{os.getpid()}:1",
+    )
+
+    def unit_properties(_systemctl, _environment, unit, _properties):
+        expected = {
+            row["wrapper_unit"]: (row["wrapper_invocation_id"], row["wrapper_cgroup_path"]),
+            row["launch_driver_unit"]: (
+                row["launch_driver_invocation_id"],
+                row["launch_driver_cgroup_path"],
+            ),
+            row["scope_unit"]: (row["scope_invocation_id"], row["cgroup_path"]),
+            row["attempt_slice_unit"]: (
+                row["attempt_slice_invocation_id"],
+                row["attempt_slice_cgroup_path"],
+            ),
+        }
+        invocation_id, control_group = expected[unit]
+        return {
+            "Id": unit,
+            "LoadState": "loaded",
+            "ActiveState": "active" if unit == row["attempt_slice_unit"] else "inactive",
+            "InvocationID": invocation_id,
+            "ControlGroup": control_group,
+            "MainPID": "0",
+        }
+
+    monkeypatch.setattr(
+        verifier_module.sandbox_monitor_lifecycle,
+        "_read_unit_properties",
+        unit_properties,
+    )
+    _, _, monitor_socket = verifier_module.sandbox_monitor_lifecycle.sandbox_monitor_control_paths(
+        state_path=execution["state_path"],
+        expected_identity=(attempt["id"], attempt["claim_token"], execution["execution_id"]),
+    )
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(monitor_socket))
+    listener.close()
+    return monitor_socket
+
+
+def test_independent_cleanup_verifier_commits_separate_receipt_and_removes_bound_trees(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "independent-cleanup-verifier.txt")
+    execution = reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+    record_exit(supervisor, attempt)
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    pin = supervisor.config.oci_runc_executable
+    assert row is not None and pin is not None and row["phase"] == "exited"
+    action_payload = journal_module._sandbox_cleanup_action_payload_for_row(
+        row, executable_path=str(pin.path)
+    )
+    action = oci_worker._RuncCleanupActionReceipt(
+        attempt_id=row["attempt_id"],
+        claim_token=row["claim_token"],
+        execution_id=row["execution_id"],
+        container_id=row["container_id"],
+        state_root=row["state_path"],
+        state_root_device=row["state_root_dev"],
+        state_root_inode=row["state_root_ino"],
+        executable_path=str(pin.path),
+        executable_digest=pin.sha256,
+        runtime_version=row["runtime_version"],
+        argv=tuple(action_payload["argv"]),
+        argv_digest=action_payload["argv_sha256"],
+        actor_pid=row["launch_driver_pid"],
+        actor_identity=row["launch_driver_identity"],
+        returncode=0,
+        state_entry_absent=True,
+    )
+    oci_worker._register_runc_cleanup_action_receipt(action)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], runc_delete_receipt=action
+    )
+
+    monitor_socket = configure_cleanup_verifier_os_observations(
+        monkeypatch, request, execution, attempt, row
+    )
+
+    remove_exact_tree = verifier_module._remove_exact_tree_at
+    failed_state_removal = False
+
+    def fail_state_removal_once(parent_fd, name, **kwargs):
+        nonlocal failed_state_removal
+        if name == "state" and not failed_state_removal:
+            failed_state_removal = True
+            raise SupervisorError(
+                "sandbox_cleanup_verification_unknown", "synthetic partial cleanup failure"
+            )
+        return remove_exact_tree(parent_fd, name, **kwargs)
+
+    monkeypatch.setattr(verifier_module, "_remove_exact_tree_at", fail_state_removal_once)
+    with pytest.raises(SupervisorError, match="synthetic partial cleanup failure"):
+        supervisor._sandbox_execution_verify_cleanup(attempt["id"], attempt["claim_token"])
+    pending = supervisor._sandbox_execution_get(attempt["id"])
+    assert pending is not None and pending["phase"] == "cleanup_reported"
+    assert not Path(execution["bundle_path"]).exists()
+    assert Path(execution["state_path"]).is_dir()
+    assert monitor_socket.exists()
+
+    monkeypatch.setattr(verifier_module, "_remove_exact_tree_at", remove_exact_tree)
+    verified = supervisor._sandbox_execution_verify_cleanup(attempt["id"], attempt["claim_token"])
+
+    assert verified["phase"] == "cleanup_verified"
+    assert verified["cleanup_verification"]["version"] == 1
+    assert verified["cleanup_verification"]["observations"]["paths"]["monitor_socket"]["absent"]
+    assert Path(execution["bundle_path"]).exists() is False
+    assert Path(execution["state_path"]).exists() is False
+    assert Path(execution["baseline_root_path"]).is_dir()
+    assert Path(execution["workspace_root_path"]).is_dir()
+    with supervisor.connect() as connection:
+        persisted = connection.execute(
+            "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+    assert (
+        persisted is not None
+        and journal_module._sandbox_cleanup_verification_is_self_consistent(persisted)
+    )
+
+
+def test_reaper_retries_cleanup_verification_before_releasing_attempt_fence(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "reaper-cleanup-verifier.txt")
+    execution = reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    record_running(supervisor, attempt)
+    record_exit(supervisor, attempt)
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    pin = supervisor.config.oci_runc_executable
+    assert row is not None and pin is not None and row["phase"] == "exited"
+    action_payload = journal_module._sandbox_cleanup_action_payload_for_row(
+        row, executable_path=str(pin.path)
+    )
+    action = oci_worker._RuncCleanupActionReceipt(
+        attempt_id=row["attempt_id"],
+        claim_token=row["claim_token"],
+        execution_id=row["execution_id"],
+        container_id=row["container_id"],
+        state_root=row["state_path"],
+        state_root_device=row["state_root_dev"],
+        state_root_inode=row["state_root_ino"],
+        executable_path=str(pin.path),
+        executable_digest=pin.sha256,
+        runtime_version=row["runtime_version"],
+        argv=tuple(action_payload["argv"]),
+        argv_digest=action_payload["argv_sha256"],
+        actor_pid=row["launch_driver_pid"],
+        actor_identity=row["launch_driver_identity"],
+        returncode=0,
+        state_entry_absent=True,
+    )
+    oci_worker._register_runc_cleanup_action_receipt(action)
+    supervisor._sandbox_execution_record_cleanup_report(
+        attempt["id"], attempt["claim_token"], runc_delete_receipt=action
+    )
+    pending = supervisor._sandbox_execution_get(attempt["id"])
+    assert pending is not None and pending["phase"] == "cleanup_reported"
+    configure_cleanup_verifier_os_observations(monkeypatch, request, execution, attempt, pending)
+    with supervisor.connect() as connection:
+        lease_before = connection.execute(
+            "SELECT resource FROM resource_leases WHERE task_id = ? AND attempt_id = ?",
+            (attempt["task_id"], attempt["id"]),
+        ).fetchone()
+    assert lease_before is not None
+
+    verify_calls: list[tuple[str, int]] = []
+    verify_cleanup = supervisor._sandbox_execution_verify_cleanup
+
+    def record_verification(attempt_id: str, claim_token: int) -> dict:
+        verify_calls.append((attempt_id, claim_token))
+        return verify_cleanup(attempt_id, claim_token)
+
+    monkeypatch.setattr(supervisor, "_sandbox_execution_verify_cleanup", record_verification)
+
+    def release_runtime(attempt_id: str, force: bool, _allow_active: bool, guard_fd: int) -> dict:
+        assert force is True and guard_fd >= 0
+        with supervisor.connect() as connection:
+            assert journal_module._sandbox_execution_cleanup_is_verified(connection, attempt_id)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM runtime_allocations WHERE attempt_id = ?", (attempt_id,)
+            )
+            connection.execute(
+                "UPDATE runtime_environments SET state = 'released', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (journal_module.utc_now(), attempt_id),
+            )
+        return {"attempt_id": attempt_id, "state": "released"}
+
+    monkeypatch.setattr(supervisor, "_runtime_down_locked", release_runtime)
+
+    result = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+
+    assert verify_calls == [(attempt["id"], attempt["claim_token"])]
+    assert result["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
+    assert result["orphaned"] == [attempt["task_id"]]
+    verified = supervisor._sandbox_execution_get(attempt["id"])
+    assert verified is not None and verified["phase"] == "cleanup_verified"
+    assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
+    assert supervisor.task(attempt["task_id"])["status"] == "orphaned"
+    with supervisor.connect() as connection:
+        lease = connection.execute(
+            "SELECT task_id, attempt_id, lease_expires_at FROM resource_leases WHERE resource = ?",
+            (lease_before["resource"],),
+        ).fetchone()
+        runtime = connection.execute(
+            "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        allocation = connection.execute(
+            "SELECT 1 FROM runtime_allocations WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert lease is not None and lease["task_id"] is None and lease["attempt_id"] is None
+    assert lease["lease_expires_at"] == 0
+    assert runtime is not None and runtime["state"] == "released"
+    assert allocation is None
+
+
+@pytest.mark.parametrize("mutation", ["top_level_version", "action_version"])
+def test_cleanup_action_receipt_rejects_integer_float_equivalence(
+    repo: Path, mutation: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    pin = supervisor.config.oci_runc_executable
+    assert row is not None and pin is not None
+
+    valid = supervisor._sandbox_cleanup_receipt(row)
+    valid["version"] = 3
+    valid["action"] = journal_module._sandbox_cleanup_action_payload_for_row(
+        row, executable_path=str(pin.path)
+    )
+    assert supervisor._sandbox_cleanup_receipt_v3_is_self_consistent(row, canonical_json(valid))
+
+    forged = json.loads(canonical_json(valid))
+    if mutation == "top_level_version":
+        forged["version"] = 3.0
+    else:
+        forged["action"]["version"] = 1.0
+    encoded = canonical_json(forged)
+    assert canonical_json(json.loads(encoded)) == encoded
+    assert not supervisor._sandbox_cleanup_receipt_v3_is_self_consistent(row, encoded)
+
+
 def synthesize_cleanup_verified_for_downstream_test(
     supervisor: GitSupervisor, attempt_id: str
 ) -> None:
-    """Bypass the unavailable verifier only to exercise post-cleanup consumers."""
+    """Forge test-only structure to exercise downstream consumers, never verifier evidence."""
 
     row = supervisor._sandbox_execution_get(attempt_id)
     assert row is not None and row["phase"] == "cleanup_reported"
+    container_id = sandbox_container_id(row["attempt_id"], row["claim_token"], row["execution_id"])
     Path(row["bundle_path"]).rmdir()
     Path(row["state_path"]).rmdir()
+    pin = supervisor.config.oci_runc_executable
+    assert pin is not None
+    synthetic_report = supervisor._sandbox_cleanup_receipt(row)
+    synthetic_report["version"] = 3
+    synthetic_report["action"] = journal_module._sandbox_cleanup_action_payload_for_row(
+        row, executable_path=str(pin.path)
+    )
+    cleanup_receipt_json = canonical_json(synthetic_report)
+    report_digest = hashlib.sha256(cleanup_receipt_json.encode("utf-8")).hexdigest()
+
+    def unit_snapshot(unit: str, invocation_id: str, control_group: str) -> dict[str, str]:
+        return {
+            "id": unit,
+            "load_state": "loaded",
+            "active_state": "inactive",
+            "invocation_id": invocation_id,
+            "control_group": control_group,
+            "main_pid": "0",
+        }
+
+    verification_json = canonical_json(
+        {
+            "version": 1,
+            "attempt_id": row["attempt_id"],
+            "claim_token": row["claim_token"],
+            "execution_id": row["execution_id"],
+            "cleanup_report_sha256": report_digest,
+            "verified_at": "synthetic-test-only",
+            "verifier": {"pid": 1, "identity": "linux:1:1"},
+            "observations": {
+                "units": {
+                    "monitor": unit_snapshot(
+                        row["wrapper_unit"],
+                        row["wrapper_invocation_id"],
+                        row["wrapper_cgroup_path"],
+                    ),
+                    "launch_driver": unit_snapshot(
+                        row["launch_driver_unit"],
+                        row["launch_driver_invocation_id"],
+                        row["launch_driver_cgroup_path"],
+                    ),
+                    "scope": unit_snapshot(
+                        row["scope_unit"], row["scope_invocation_id"], row["cgroup_path"]
+                    ),
+                    "attempt_slice": unit_snapshot(
+                        row["attempt_slice_unit"],
+                        row["attempt_slice_invocation_id"],
+                        row["attempt_slice_cgroup_path"],
+                    ),
+                },
+                "processes": {
+                    "monitor_identity_absent": {
+                        "pid": row["monitor_pid"],
+                        "identity": row["monitor_identity"],
+                        "absent": True,
+                    },
+                    "launch_driver_identity_absent": {
+                        "pid": row["launch_driver_pid"],
+                        "identity": row["launch_driver_identity"],
+                        "absent": True,
+                    },
+                    "runc_client_identity_absent": {
+                        "pid": row["runc_client_pid"],
+                        "identity": row["runc_client_identity"],
+                        "absent": True,
+                    },
+                    "container_init_identity_absent": {
+                        "pid": row["init_pid"],
+                        "identity": row["init_identity"],
+                        "absent": True,
+                    },
+                },
+                "cgroups": {
+                    path: True
+                    for path in {
+                        row["wrapper_cgroup_path"],
+                        row["launch_driver_cgroup_path"],
+                        row["cgroup_path"],
+                        row["attempt_slice_cgroup_path"],
+                    }
+                },
+                "paths": {
+                    "runc_state_entry_absent": True,
+                    "bundle_absent": True,
+                    "state_root_absent": True,
+                    "execution_root": {
+                        "path": str(Path(row["bundle_path"]).parent),
+                        "device": row["execution_root_dev"],
+                        "inode": row["execution_root_ino"],
+                    },
+                    "monitor_socket": {
+                        "path": f"/run/user/1000/acpmon-{container_id.removeprefix('acp-')}.sock",
+                        "parent_device": 1,
+                        "parent_inode": 2,
+                        "socket_device": None,
+                        "socket_inode": None,
+                        "removed": False,
+                        "absent": True,
+                    },
+                },
+            },
+        }
+    )
     with supervisor.connect() as connection:
-        # Production has no cleanup_verified writer. Dropping this guard is
-        # strictly test-only and is not evidence of cleanup verification.
+        # Drop the production-only writer guards; this fabricated JSON is
+        # intentionally not issued by the supervisor verifier capability.
         connection.execute("DROP TRIGGER sandbox_execution_phase_transition")
+        connection.execute("DROP TRIGGER sandbox_cleanup_verification_write_once")
+        connection.execute("DROP TRIGGER sandbox_execution_cleanup_action_receipt_guard")
+        connection.execute("DROP TRIGGER sandbox_execution_evidence_immutable")
+        connection.execute("DROP TRIGGER sandbox_execution_evidence_phase_guard")
         connection.execute(
-            "UPDATE sandbox_executions SET phase = 'cleanup_verified' WHERE attempt_id = ?",
-            (attempt_id,),
+            "UPDATE sandbox_executions SET phase = 'cleanup_verified', "
+            "cleanup_receipt_json = ?, cleanup_verification_json = ? WHERE attempt_id = ?",
+            (cleanup_receipt_json, verification_json, attempt_id),
         )
         connection.commit()
 
@@ -3156,7 +3959,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 31
+    assert SCHEMA_VERSION == 33
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -3254,7 +4057,7 @@ def test_launch_driver_start_intent_is_exact_and_one_shot(repo: Path) -> None:
     execution = reserve(supervisor, attempt)
 
     intent = supervisor._sandbox_execution_authorize_launch_driver_start(
-        attempt["id"], attempt["claim_token"]
+        attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
     )
     durable = supervisor._sandbox_execution_get(attempt["id"])
     assert durable is not None
@@ -3297,7 +4100,7 @@ def test_launch_driver_start_intent_is_exact_and_one_shot(repo: Path) -> None:
     restarted = GitSupervisor(repo)
     with pytest.raises(SupervisorError) as duplicate:
         restarted._sandbox_execution_authorize_launch_driver_start(
-            attempt["id"], attempt["claim_token"]
+            attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
         )
     assert duplicate.value.code == "sandbox_launch_driver_start_ambiguous"
     after_restart = restarted._sandbox_execution_get(attempt["id"])
@@ -3317,6 +4120,216 @@ def test_launch_driver_start_intent_is_exact_and_one_shot(repo: Path) -> None:
             )
 
 
+def test_launch_driver_timeout_revokes_exact_start_and_quarantines(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "launch-driver-revocation.txt")
+    execution = reserve(supervisor, attempt)
+    intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
+    )
+
+    with pytest.raises(SupervisorError) as mismatch:
+        supervisor._sandbox_execution_revoke_launch_driver_start(
+            attempt["id"],
+            attempt["claim_token"],
+            execution_id=execution["execution_id"],
+            start_id=intent.start_id,
+            start_digest="f" * 64,
+            service_unit=intent.service_unit,
+            reason="startup timeout",
+        )
+    assert mismatch.value.code == "sandbox_launch_driver_start_mismatch"
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
+
+    revoked = supervisor._sandbox_execution_revoke_launch_driver_start(
+        attempt["id"],
+        attempt["claim_token"],
+        execution_id=execution["execution_id"],
+        start_id=intent.start_id,
+        start_digest=intent.start_digest,
+        service_unit=intent.service_unit,
+        reason="launch-driver did not redeem before timeout",
+    )
+
+    assert revoked["phase"] == "ambiguous"
+    assert revoked["failure_reason"] == "launch-driver did not redeem before timeout"
+    assert supervisor.attempt(attempt["id"])["status"] == "terminating"
+    assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
+    assert supervisor.task(attempt["task_id"])["status"] == "cleanup_pending"
+    with pytest.raises(SupervisorError) as late_redemption:
+        redeem_test_launch_driver_start(supervisor, attempt)
+    assert late_redemption.value.code == "claim_inactive"
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+    assert durable["phase"] == "ambiguous"
+    assert durable["launch_driver_start_redeemed_at"] == ""
+    assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_launch_driver_timeout_retries_real_fence_before_stopping_exact_units(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "launch-driver-fence-race.txt")
+    execution = reserve(supervisor, attempt)
+    intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
+    )
+    attempt_slice = sandbox_attempt_slice_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    monitor_unit = sandbox_monitor_service_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+
+    context = multiprocessing.get_context("spawn")
+    held_receiver, held_sender = context.Pipe(duplex=False)
+    release_receiver, release_sender = context.Pipe(duplex=False)
+    fence_holder = context.Process(
+        target=_hold_execution_gate_fence,
+        args=(
+            *_execution_gate_identity(execution),
+            release_receiver,
+            held_sender,
+        ),
+    )
+    fence_holder.start()
+    held_sender.close()
+    release_receiver.close()
+    events: list[str] = []
+    stopped: set[str] = set()
+    fence_release_requested = False
+    release_ack_received = False
+    service_cgroup = f"/user.slice/user-acp.slice/{attempt_slice}/{intent.service_unit}"
+    slice_cgroup = f"/user.slice/user-acp.slice/{attempt_slice}"
+
+    def unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
+        assert fence_release_requested, (
+            "unit state was inspected before the lifecycle fence cleared"
+        )
+        active = unit not in stopped
+        if unit == intent.service_unit:
+            values = {
+                "ActiveState": "active" if active else "inactive",
+                "ControlGroup": service_cgroup if active else "",
+                "Id": intent.service_unit,
+                "InvocationID": "2" * 32,
+                "Job": "",
+                "LoadState": "loaded",
+                "MainPID": "1234" if active else "0",
+                "Slice": attempt_slice,
+                "SubState": "running" if active else "dead",
+            }
+        elif unit == monitor_unit:
+            values = {
+                "ActiveState": "inactive",
+                "ControlGroup": "",
+                "Id": monitor_unit,
+                "InvocationID": "",
+                "Job": "",
+                "LoadState": "not-found",
+                "MainPID": "0",
+                "Slice": "",
+                "SubState": "dead",
+            }
+        else:
+            assert unit == attempt_slice
+            values = {
+                "ActiveState": "active" if active else "inactive",
+                "ControlGroup": slice_cgroup if active else "",
+                "Id": attempt_slice,
+                "InvocationID": "3" * 32,
+                "Job": "",
+                "LoadState": "loaded",
+                "MainPID": "0",
+                "Slice": "user-acp.slice",
+                "SubState": "active" if active else "dead",
+            }
+        assert set(properties).issubset(values)
+        return {key: values[key] for key in properties}
+
+    original_revoke = supervisor._sandbox_execution_revoke_launch_driver_start
+
+    def trace_revoke(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            result = original_revoke(*args, **kwargs)
+        except SupervisorError as error:
+            events.append(f"revoke:{error.code}")
+            raise
+        events.append("revoke:committed")
+        return result
+
+    def systemd_command(command: list[str], *, environment: dict[str, str]) -> bytes:
+        del environment
+        assert command == ["/usr/bin/systemctl", "--user", "stop", "--", command[-1]]
+        unit = command[-1]
+        assert unit in {intent.service_unit, attempt_slice}
+        stopped.add(unit)
+        events.append(f"stop:{unit}")
+        return b""
+
+    original_sleep = time.sleep
+
+    def release_fence_during_retry(seconds: float) -> None:
+        nonlocal fence_release_requested, release_ack_received
+        if not fence_release_requested:
+            fence_release_requested = True
+            release_sender.send(True)
+            assert held_receiver.poll(5), "lifecycle fence holder did not release after the barrier"
+            assert held_receiver.recv() == "released"
+            release_ack_received = True
+            return
+        original_sleep(seconds)
+
+    monkeypatch.setattr(supervisor, "_sandbox_execution_revoke_launch_driver_start", trace_revoke)
+    monkeypatch.setattr(launch_driver_service, "_unit_properties", unit_properties)
+    monkeypatch.setattr(
+        launch_driver_service,
+        "_trusted_systemctl_executable",
+        lambda: Path("/usr/bin/systemctl"),
+    )
+    monkeypatch.setattr(
+        launch_driver_service,
+        "_trusted_systemd_command_environment",
+        lambda: {"PATH": "/usr/bin"},
+    )
+    monkeypatch.setattr(launch_driver_service, "_run_trusted_runtime_command", systemd_command)
+    monkeypatch.setattr(launch_driver_service.time, "sleep", release_fence_during_retry)
+    try:
+        assert held_receiver.poll(5), "competing lifecycle process did not acquire the real fence"
+        assert held_receiver.recv() == "held"
+        launch_driver_service._stop_and_reconcile_exact_start(
+            supervisor,
+            execution=execution,
+            intent=intent,
+            attempt_slice=attempt_slice,
+            reason="startup timeout raced with gate release",
+            credential=None,
+        )
+        assert events == [
+            "revoke:sandbox_execution_gate_busy",
+            "revoke:committed",
+            f"stop:{intent.service_unit}",
+            f"stop:{attempt_slice}",
+        ]
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable is not None
+        assert durable["phase"] == "ambiguous"
+        assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
+        assert supervisor.verify_event_chain()["ok"] is True
+    finally:
+        if fence_holder.is_alive() and not fence_release_requested:
+            release_sender.send(True)
+        fence_holder.join(timeout=5)
+        assert not fence_holder.is_alive(), "competing lifecycle process did not release its fence"
+        assert fence_holder.exitcode == 0
+        if not release_ack_received:
+            assert held_receiver.poll(0.1)
+            assert held_receiver.recv() == "released"
+        release_sender.close()
+        held_receiver.close()
+
+
 def test_launch_driver_redemption_is_exact_and_one_shot(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     first_attempt = claimed(supervisor, "redemption-first.txt")
@@ -3325,7 +4338,9 @@ def test_launch_driver_redemption_is_exact_and_one_shot(repo: Path) -> None:
     reserve(supervisor, second_attempt)
 
     first_intent = supervisor._sandbox_execution_authorize_launch_driver_start(
-        first_attempt["id"], first_attempt["claim_token"]
+        first_attempt["id"],
+        first_attempt["claim_token"],
+        launch_request_digest="e" * 64,
     )
     first_row = supervisor._sandbox_execution_get(first_attempt["id"])
     assert first_row is not None
@@ -3397,7 +4412,7 @@ def test_launch_submission_requires_redeemed_driver_activation(repo: Path) -> No
     attempt = claimed(supervisor, "redemption-required.txt")
     execution = reserve(supervisor, attempt)
     intent = supervisor._sandbox_execution_authorize_launch_driver_start(
-        attempt["id"], attempt["claim_token"]
+        attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
     )
 
     with pytest.raises(SupervisorError) as missing:
@@ -4642,6 +5657,33 @@ def test_journaled_result_import_and_manual_submission_fail_closed(
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "reserved"
 
 
+def test_cleanup_verified_nonzero_exit_is_not_result_eligible() -> None:
+    row = {"phase": "cleanup_verified", "runc_exit_code": 137}
+    connection = SimpleNamespace(execute=lambda *_args: SimpleNamespace(fetchone=lambda: row))
+
+    with pytest.raises(SupervisorError) as rejected:
+        journal_module._require_sandbox_execution_result_eligible(connection, "cancelled-attempt")
+
+    assert rejected.value.code == "sandbox_result_unverified"
+
+
+def test_nonzero_cleanup_verified_execution_cannot_match_import_candidate() -> None:
+    row = {"phase": "cleanup_verified", "runc_exit_code": 137}
+    connection = SimpleNamespace(execute=lambda *_args: SimpleNamespace(fetchone=lambda: row))
+
+    with pytest.raises(SupervisorError) as rejected:
+        GitSupervisor._sandbox_execution_require_result_candidate_matches(
+            SimpleNamespace(),
+            connection,
+            "cancelled-attempt",
+            baseline_digest="a" * 64,
+            import_digest="b" * 64,
+            change_digest="c" * 64,
+        )
+
+    assert rejected.value.code == "sandbox_result_evidence_unverified"
+
+
 def test_journaled_sandbox_never_aliases_into_direct_worker_result_receipts(
     repo: Path,
     tmp_path_factory: pytest.TempPathFactory,
@@ -5111,6 +6153,9 @@ def test_exit_evidence_cannot_be_stamped_before_kernel_wait(repo: Path) -> None:
             ("acp_sandbox_launch_plan_authorized", 7),
             ("acp_sandbox_launch_submission_authorized", 5),
             ("acp_sandbox_reservation_authorized", 5),
+            ("acp_sandbox_cleanup_action_authorized", 4),
+            ("acp_sandbox_cleanup_report_authorized", 4),
+            ("acp_sandbox_cleanup_verification_authorized", 4),
         ):
             raw_connection.create_function(function_name, argument_count, lambda *_: 0)
         raw_connection.create_function(
@@ -5307,6 +6352,8 @@ def test_workspace_restore_and_launch_reject_replaced_private_runtime_paths(
         record_launch(supervisor, attempt)
     assert launch.value.code in {
         "sandbox_private_path_invalid",
+        "sandbox_execution_gate_unavailable",
+        "sandbox_execution_gate_identity_mismatch",
         "invalid_snapshot",
         "unsafe_workspace_root",
     }
@@ -5437,7 +6484,9 @@ def test_running_transition_rejects_collected_receipt_for_other_launch_driver(
         os.close(gate_read)
 
 
-def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: Path) -> None:
+def test_reaper_retries_cleanup_verification_but_legacy_receipt_stays_fenced(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
@@ -5469,6 +6518,17 @@ def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: P
     )
     assert row["phase"] == "cleanup_reported"
 
+    retry_calls: list[tuple[str, int]] = []
+
+    def reject_legacy_report(attempt_id: str, claim_token: int) -> None:
+        retry_calls.append((attempt_id, claim_token))
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unavailable",
+            "legacy cleanup receipt cannot satisfy the independent verifier",
+        )
+
+    monkeypatch.setattr(supervisor, "_sandbox_execution_verify_cleanup", reject_legacy_report)
+
     with supervisor.connect() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="phase_transition_invalid"):
             connection.execute(
@@ -5492,6 +6552,7 @@ def test_reported_cleanup_is_not_verification_and_cannot_release_attempt(repo: P
     assert teardown.value.code == "sandbox_cleanup_unverified"
 
     result = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+    assert retry_calls == [(attempt["id"], attempt["claim_token"])]
     assert result["terminated_workers"] == []
     assert result["runtime_cleanup"] == []
     assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
@@ -5760,6 +6821,7 @@ def test_sandbox_import_uses_distinct_source_and_recovers_published_ref(
         assert len(imported["sandbox_cleanup_receipt_digest"]) == 64
 
     reopened = GitSupervisor(repo)
+    configure_test_sandbox_pins(reopened)
     expected_cleanup_digest = imported["sandbox_cleanup_receipt_digest"]
     with reopened.connect() as connection:
         connection.execute("DROP TRIGGER result_import_source_identity_immutable")

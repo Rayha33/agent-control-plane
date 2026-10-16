@@ -35,6 +35,7 @@ from .oci_worker import (
     _private_directory,
     _register_runc_launch_submission_target,
     _revoke_runc_launch_gate_release_locked,
+    _runc_cleanup_action_receipt_is_self_consistent,
     _runc_client_wait_receipt_is_self_consistent,
     _runc_execution_gate_fence,
     _runc_launch_gate_lock_for_execution,
@@ -73,6 +74,9 @@ from .sandbox_workspace import Snapshot as _Snapshot
 from .sandbox_workspace import _snapshot_origin as _snapshot_origin
 from .sandbox_workspace import collect_changes as _collect_changes
 from .store import (
+    _authorize_sandbox_cleanup_action_write,
+    _authorize_sandbox_cleanup_report_write,
+    _authorize_sandbox_cleanup_verification_write,
     _authorize_sandbox_exit_receipt_write,
     _authorize_sandbox_launch_driver_redemption_write,
     _authorize_sandbox_launch_driver_start_write,
@@ -163,6 +167,7 @@ _TRANSITION_FIELDS = {
     ),
     ("running", "stopping"): frozenset({"stop_reason"}),
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
+    ("cleanup_reported", "cleanup_verified"): frozenset({"cleanup_verification_json"}),
 }
 
 
@@ -187,6 +192,67 @@ class _SandboxLaunchDriverStartIntent:
     start_id: str
     start_digest: str
     service_unit: str
+
+
+@dataclass(eq=False, frozen=True, slots=True, weakref_slot=True)
+class _SandboxCleanupVerificationReceipt:
+    """Process-local authority issued only after independent post-stop checks."""
+
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    cleanup_report_sha256: str
+    encoded: str
+
+
+_SANDBOX_CLEANUP_VERIFICATION_RECEIPTS: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[_SandboxCleanupVerificationReceipt],
+        tuple[str, int, str, str, str],
+    ],
+] = {}
+_SANDBOX_CLEANUP_VERIFICATION_RECEIPTS_LOCK = threading.Lock()
+
+
+def _register_sandbox_cleanup_verification_receipt(
+    receipt: _SandboxCleanupVerificationReceipt,
+) -> None:
+    key = id(receipt)
+    fields = (
+        receipt.attempt_id,
+        receipt.claim_token,
+        receipt.execution_id,
+        receipt.cleanup_report_sha256,
+        receipt.encoded,
+    )
+
+    def discard(reference: weakref.ReferenceType[_SandboxCleanupVerificationReceipt]) -> None:
+        with _SANDBOX_CLEANUP_VERIFICATION_RECEIPTS_LOCK:
+            current = _SANDBOX_CLEANUP_VERIFICATION_RECEIPTS.get(key)
+            if current is not None and current[0] is reference:
+                _SANDBOX_CLEANUP_VERIFICATION_RECEIPTS.pop(key, None)
+
+    reference = weakref.ref(receipt, discard)
+    with _SANDBOX_CLEANUP_VERIFICATION_RECEIPTS_LOCK:
+        _SANDBOX_CLEANUP_VERIFICATION_RECEIPTS[key] = (reference, fields)
+
+
+def _sandbox_cleanup_verification_receipt_is_self_consistent(receipt: Any) -> bool:
+    if type(receipt) is not _SandboxCleanupVerificationReceipt:
+        return False
+    with _SANDBOX_CLEANUP_VERIFICATION_RECEIPTS_LOCK:
+        registered = _SANDBOX_CLEANUP_VERIFICATION_RECEIPTS.get(id(receipt))
+        if registered is None or registered[0]() is not receipt:
+            return False
+        expected = registered[1]
+    return (
+        receipt.attempt_id,
+        receipt.claim_token,
+        receipt.execution_id,
+        receipt.cleanup_report_sha256,
+        receipt.encoded,
+    ) == expected and _DIGEST.fullmatch(receipt.cleanup_report_sha256) is not None
 
 
 _SANDBOX_LAUNCH_DRIVER_START_INTENTS: dict[
@@ -386,14 +452,28 @@ def _sandbox_launch_driver_service_unit(execution_id: str) -> str:
     return f"acp-launch-driver-{execution_id}.service"
 
 
-def _sandbox_launch_driver_start_digest(row: Any, service_unit: str) -> str:
-    """Bind a start intent to the exact tuple, service name, and private roots."""
+def _sandbox_launch_driver_start_digest(
+    row: Any,
+    service_unit: str,
+    *,
+    launch_request_digest: str,
+) -> str:
+    """Bind a start intent to the exact tuple, service, roots, and launch request."""
+
+    if (
+        not isinstance(launch_request_digest, str)
+        or _DIGEST.fullmatch(launch_request_digest) is None
+    ):
+        raise SupervisorError(
+            "sandbox_launch_driver_request_invalid", "launch-driver request digest is invalid"
+        )
 
     payload = {
         "attempt_id": row["attempt_id"],
         "claim_token": row["claim_token"],
         "execution_id": row["execution_id"],
         "service_unit": service_unit,
+        "launch_request_digest": launch_request_digest,
         "container_id": row["container_id"],
         "bundle_digest": row["bundle_digest"],
         "rootfs_digest": row["rootfs_digest"],
@@ -782,6 +862,40 @@ _LEGACY_CLEANUP_OBSERVATIONS = {
 }
 
 
+def _sandbox_cleanup_action_payload_for_row(row: Any, *, executable_path: str) -> dict[str, Any]:
+    argv = [
+        executable_path,
+        "--root",
+        row["state_path"],
+        "delete",
+        "--force",
+        row["container_id"],
+    ]
+    return {
+        "version": 1,
+        "operation": "runc-delete-force",
+        "argv": argv,
+        "argv_sha256": hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest(),
+        "executable_sha256": row["runc_executable_digest"],
+        "runtime_version": row["runtime_version"],
+        "state_root": {
+            "path": row["state_path"],
+            "device": row["state_root_dev"],
+            "inode": row["state_root_ino"],
+        },
+        "actor": {
+            "pid": row["launch_driver_pid"],
+            "identity": row["launch_driver_identity"],
+            "unit": row["launch_driver_unit"],
+            "invocation_id": row["launch_driver_invocation_id"],
+            "control_group": row["launch_driver_cgroup_path"],
+        },
+        "returncode": 0,
+        "waited_by": "pinned_runtime_guardian",
+        "state_entry_absent_immediately_after_delete": True,
+    }
+
+
 def _private_directory_identity(path: Path, label: str) -> tuple[int, int]:
     """Capture one private directory inode without accepting a symlink root."""
 
@@ -817,6 +931,29 @@ def _require_private_path_absent(path: Path, label: str) -> None:
     )
 
 
+def _sandbox_execution_gate_identity(row: Any) -> tuple[str, int, int]:
+    """Return the persistent execution-root inode used by every lifecycle fence."""
+
+    bundle_path = row["bundle_path"]
+    execution_root = Path(bundle_path).parent if isinstance(bundle_path, str) else None
+    device = row["execution_root_dev"]
+    inode = row["execution_root_ino"]
+    if (
+        execution_root is None
+        or not execution_root.is_absolute()
+        or Path(bundle_path) != execution_root / "bundle"
+        or type(device) is not int
+        or device < 0
+        or type(inode) is not int
+        or inode <= 0
+    ):
+        raise SupervisorError(
+            "sandbox_execution_gate_identity_mismatch",
+            "durable execution-root identity is missing or noncanonical; lifecycle fence retained",
+        )
+    return str(execution_root), device, inode
+
+
 def _sandbox_execution_cleanup_is_verified(connection: Any, attempt_id: str) -> bool:
     """Old/direct attempts have no journal; journaled attempts require verification."""
 
@@ -824,7 +961,19 @@ def _sandbox_execution_cleanup_is_verified(connection: Any, attempt_id: str) -> 
         "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
     ).fetchone()
     return row is None or (
-        row["phase"] == "cleanup_verified" and _sandbox_launch_plan_binding_is_self_consistent(row)
+        row["phase"] == "cleanup_verified"
+        and _sandbox_launch_plan_binding_is_self_consistent(row)
+        and _sandbox_cleanup_verification_is_self_consistent(row)
+    )
+
+
+def _sandbox_cleanup_verification_is_self_consistent(row: Any) -> bool:
+    """Validate persisted verifier evidence after the issuing process exits."""
+
+    from .sandbox_cleanup_verifier import _sandbox_cleanup_verification_json_is_self_consistent
+
+    return _sandbox_cleanup_verification_json_is_self_consistent(
+        row, row["cleanup_verification_json"]
     )
 
 
@@ -838,6 +987,7 @@ def _require_sandbox_execution_result_eligible(connection: Any, attempt_id: str)
         row["phase"] == "cleanup_verified"
         and row["runc_exit_code"] == 0
         and _sandbox_launch_plan_binding_is_self_consistent(row)
+        and _sandbox_cleanup_verification_is_self_consistent(row)
     ):
         raise SupervisorError(
             "sandbox_result_unverified",
@@ -1381,6 +1531,11 @@ class SandboxExecutionJournalMixin:
                 "execution root identity no longer matches the durable journal",
             )
         if row["phase"] == "cleanup_verified":
+            if not _sandbox_cleanup_verification_is_self_consistent(row):
+                raise SupervisorError(
+                    "sandbox_cleanup_verification_invalid",
+                    "workspace restore requires an exact independently verified cleanup receipt",
+                )
             _require_private_path_absent(Path(row["bundle_path"]), "bundle root")
             _require_private_path_absent(Path(row["state_path"]), "runc state root")
         else:
@@ -1498,6 +1653,7 @@ class SandboxExecutionJournalMixin:
                 execution is None
                 or execution["execution_id"] != binding["execution_id"]
                 or execution["phase"] != "cleanup_verified"
+                or not _sandbox_cleanup_verification_is_self_consistent(execution)
                 or execution["runc_exit_code"] != 0
                 or execution["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or execution["baseline_root_path"] != str(baseline_root)
@@ -1546,6 +1702,7 @@ class SandboxExecutionJournalMixin:
                 )
             if (
                 row["phase"] != "cleanup_verified"
+                or not _sandbox_cleanup_verification_is_self_consistent(row)
                 or row["runc_exit_code"] != 0
                 or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
                 or row["workspace_binding_version"] != 1
@@ -1576,7 +1733,7 @@ class SandboxExecutionJournalMixin:
                 canonical_json(self._sandbox_cleanup_receipt(row)),
                 canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row)),
                 canonical_json(self._sandbox_cleanup_receipt_v1(row)),
-            }:
+            } and not self._sandbox_cleanup_receipt_v3_is_self_consistent(row, cleanup_json):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
                     "cleanup report is not the exact unverified journal receipt",
@@ -1715,7 +1872,7 @@ class SandboxExecutionJournalMixin:
             canonical_json(self._sandbox_cleanup_receipt(row)),
             canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row)),
             canonical_json(self._sandbox_cleanup_receipt_v1(row)),
-        }:
+        } and not self._sandbox_cleanup_receipt_v3_is_self_consistent(row, cleanup_json):
             raise SupervisorError(
                 "sandbox_cleanup_report_invalid",
                 "verified execution does not retain its exact journaled cleanup report",
@@ -1741,6 +1898,17 @@ class SandboxExecutionJournalMixin:
         ).fetchone()
         if row is None:
             return
+        if (
+            row["phase"] != "cleanup_verified"
+            or type(row["runc_exit_code"]) is not int
+            or row["runc_exit_code"] != 0
+            or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
+            or not _sandbox_cleanup_verification_is_self_consistent(row)
+        ):
+            raise SupervisorError(
+                "sandbox_result_evidence_unverified",
+                "sandbox import candidate requires a successful exit and exact cleanup proof",
+            )
         if row["result_candidate_version"] != 1 or not row["result_candidate_json"]:
             raise SupervisorError(
                 "sandbox_result_evidence_missing", "sandbox import has no captured result candidate"
@@ -1866,6 +2034,8 @@ class SandboxExecutionJournalMixin:
         credential: str | None = None,
         _connection: sqlite3.Connection | None = None,
         running_attestation: RunningRuntimeAttestation | None = None,
+        _cleanup_action_receipt: Any | None = None,
+        _cleanup_verification_receipt: Any | None = None,
     ) -> dict[str, Any]:
         allowed_fields = _TRANSITION_FIELDS.get((expected_phase, next_phase))
         if (
@@ -1876,6 +2046,26 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_transition_invalid",
                 f"transition {expected_phase} -> {next_phase} is not available in this journal slice",
+            )
+        if _cleanup_action_receipt is not None and (
+            (expected_phase, next_phase) != ("exited", "cleanup_reported")
+            or set(updates) != {"cleanup_receipt_json"}
+        ):
+            raise SupervisorError(
+                "sandbox_cleanup_action_invalid",
+                "pinned-runc cleanup action can authorize only its exact report transition",
+            )
+        if _cleanup_verification_receipt is not None and (
+            (expected_phase, next_phase) != ("cleanup_reported", "cleanup_verified")
+            or set(updates) != {"cleanup_verification_json"}
+            or not _sandbox_cleanup_verification_receipt_is_self_consistent(
+                _cleanup_verification_receipt
+            )
+            or updates["cleanup_verification_json"] != _cleanup_verification_receipt.encoded
+        ):
+            raise SupervisorError(
+                "sandbox_cleanup_verification_required",
+                "only the registered independent verifier can finalize cleanup",
             )
         if (expected_phase, next_phase) == (
             "launched",
@@ -1891,10 +2081,21 @@ class SandboxExecutionJournalMixin:
         with connection_context as connection:
             if _connection is None:
                 connection.execute("BEGIN IMMEDIATE")
-            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
-            if attempt["status"] != "working":
-                raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
-            self._authenticate_attempt(connection, attempt, credential)
+            if _cleanup_verification_receipt is not None:
+                attempt = connection.execute(
+                    "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                if attempt is None or attempt["claim_token"] != claim_token:
+                    raise SupervisorError(
+                        "stale_fencing_token", "cleanup verifier claim token is stale"
+                    )
+            else:
+                attempt = self._active_attempt(
+                    connection, attempt_id, claim_token, int(time.time())
+                )
+                if attempt["status"] != "working":
+                    raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+                self._authenticate_attempt(connection, attempt, credential)
             row = connection.execute(
                 "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
@@ -1907,6 +2108,21 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_transition_invalid",
                     f"expected phase {expected_phase}, found {row['phase']}; fence retained",
                 )
+            if _cleanup_verification_receipt is not None:
+                from .sandbox_cleanup_verifier import (
+                    _sandbox_cleanup_verification_json_is_self_consistent,
+                )
+
+                candidate = dict(row)
+                candidate.update(updates)
+                candidate["phase"] = next_phase
+                if not _sandbox_cleanup_verification_json_is_self_consistent(
+                    candidate, updates["cleanup_verification_json"]
+                ):
+                    raise SupervisorError(
+                        "sandbox_cleanup_verification_required",
+                        "verifier receipt does not bind to the exact durable cleanup report",
+                    )
             if expected_phase == "reserved" and next_phase == "launched":
                 if row["launch_plan_required"] != 1:
                     raise SupervisorError(
@@ -1977,7 +2193,39 @@ class SandboxExecutionJournalMixin:
                 claim_token,
                 expected_phase,
             )
-            changed = connection.execute(statement, parameters).rowcount
+            if event_type == "sandbox.execution_cleanup_verified":
+                with _authorize_sandbox_cleanup_verification_write(
+                    connection,
+                    _cleanup_verification_receipt,
+                    updates["cleanup_verification_json"],
+                ):
+                    changed = connection.execute(statement, parameters).rowcount
+            elif event_type == "sandbox.execution_cleanup_reported":
+                with _authorize_sandbox_cleanup_report_write(
+                    connection,
+                    attempt_id,
+                    claim_token,
+                    row["execution_id"],
+                    updates["cleanup_receipt_json"],
+                ):
+                    if _cleanup_action_receipt is not None:
+                        with _authorize_sandbox_cleanup_action_write(
+                            connection,
+                            _cleanup_action_receipt,
+                            updates["cleanup_receipt_json"],
+                        ):
+                            changed = connection.execute(statement, parameters).rowcount
+                    else:
+                        changed = connection.execute(statement, parameters).rowcount
+            elif _cleanup_action_receipt is not None:
+                with _authorize_sandbox_cleanup_action_write(
+                    connection,
+                    _cleanup_action_receipt,
+                    updates["cleanup_receipt_json"],
+                ):
+                    changed = connection.execute(statement, parameters).rowcount
+            else:
+                changed = connection.execute(statement, parameters).rowcount
             if changed != 1:
                 raise SupervisorError(
                     "sandbox_execution_transition_conflict",
@@ -2005,6 +2253,7 @@ class SandboxExecutionJournalMixin:
         attempt_id: str,
         claim_token: int,
         *,
+        launch_request_digest: str,
         credential: str | None = None,
     ) -> _SandboxLaunchDriverStartIntent:
         """Commit the sole driver-service start intent before systemd activation.
@@ -2070,7 +2319,9 @@ class SandboxExecutionJournalMixin:
 
             service_unit = _sandbox_launch_driver_service_unit(row["execution_id"])
             start_id = uuid.uuid4().hex
-            start_digest = _sandbox_launch_driver_start_digest(row, service_unit)
+            start_digest = _sandbox_launch_driver_start_digest(
+                row, service_unit, launch_request_digest=launch_request_digest
+            )
             intent = _SandboxLaunchDriverStartIntent(
                 attempt_id=attempt_id,
                 claim_token=claim_token,
@@ -2124,6 +2375,7 @@ class SandboxExecutionJournalMixin:
                         "start_id": start_id,
                         "start_digest": start_digest,
                         "service_unit": service_unit,
+                        "launch_request_digest": launch_request_digest,
                         "boundary": "before_systemd_activation",
                     },
                 )
@@ -2692,18 +2944,14 @@ class SandboxExecutionJournalMixin:
             attempt_id,
             claim_token,
             durable_execution["execution_id"],
-            state_gate_identity=(
-                durable_execution["state_path"],
-                durable_execution["state_root_dev"],
-                durable_execution["state_root_ino"],
-            ),
+            execution_gate_identity=_sandbox_execution_gate_identity(durable_execution),
             gate_release_guard=lambda: self._sandbox_execution_gate_release_is_allowed(
                 attempt_id,
                 claim_token,
                 durable_execution["execution_id"],
-                state_path=durable_execution["state_path"],
-                state_device=durable_execution["state_root_dev"],
-                state_inode=durable_execution["state_root_ino"],
+                execution_root_path=_sandbox_execution_gate_identity(durable_execution)[0],
+                execution_root_device=durable_execution["execution_root_dev"],
+                execution_root_inode=durable_execution["execution_root_ino"],
             ),
         )
         from .sandbox_monitor_ipc import SandboxMonitorControlClient
@@ -2711,7 +2959,11 @@ class SandboxExecutionJournalMixin:
         from .sandbox_monitor_service import start_sandbox_execution_monitor
 
         expected_identity = (attempt_id, claim_token, durable_execution["execution_id"])
-        with _runc_launch_gate_lock_for_execution(*expected_identity) as locked_handle:
+        execution_gate_identity = _sandbox_execution_gate_identity(durable_execution)
+        with (
+            _runc_launch_gate_lock_for_execution(*expected_identity) as locked_handle,
+            _runc_execution_gate_fence(*execution_gate_identity),
+        ):
             if locked_handle is not runc_handle:
                 raise SupervisorError(
                     "sandbox_execution_launch_handle_required",
@@ -2909,9 +3161,9 @@ class SandboxExecutionJournalMixin:
         claim_token: int,
         execution_id: str,
         *,
-        state_path: str,
-        state_device: int,
-        state_inode: int,
+        execution_root_path: str,
+        execution_root_device: int,
+        execution_root_inode: int,
     ) -> bool:
         """Recheck the durable execution while holding its cross-process gate fence."""
 
@@ -2927,9 +3179,8 @@ class SandboxExecutionJournalMixin:
                 or attempt is None
                 or row["claim_token"] != claim_token
                 or row["execution_id"] != execution_id
-                or row["state_path"] != state_path
-                or row["state_root_dev"] != state_device
-                or row["state_root_ino"] != state_inode
+                or _sandbox_execution_gate_identity(row)
+                != (execution_root_path, execution_root_device, execution_root_inode)
                 or row["phase"] != "running"
                 or row["stop_reason"]
                 or attempt["claim_token"] != claim_token
@@ -3048,9 +3299,7 @@ class SandboxExecutionJournalMixin:
             _runc_launch_gate_lock_for_execution(
                 attempt_id, claim_token, row["execution_id"]
             ) as locked_handle,
-            _runc_execution_gate_fence(
-                row["state_path"], row["state_root_dev"], row["state_root_ino"]
-            ),
+            _runc_execution_gate_fence(*_sandbox_execution_gate_identity(row)),
         ):
             if locked_handle is not runc_handle:
                 raise SupervisorError(
@@ -3309,7 +3558,7 @@ class SandboxExecutionJournalMixin:
             _runc_launch_gate_lock_for_execution(
                 attempt_id, claim_token, execution_id
             ) as locked_handle,
-            _runc_execution_gate_fence(*state_identity),
+            _runc_execution_gate_fence(*_sandbox_execution_gate_identity(row)),
         ):
             # Re-read after acquiring the release lock: this closes both the
             # launched->stopping and running->stopping races against gate open.
@@ -3447,7 +3696,7 @@ class SandboxExecutionJournalMixin:
             _runc_launch_gate_lock_for_execution(
                 attempt_id, claim_token, wait_receipt.execution_id
             ) as locked_handle,
-            _runc_execution_gate_fence(*state_identity),
+            _runc_execution_gate_fence(*_sandbox_execution_gate_identity(row)),
         ):
             with self.connect() as connection:
                 locked_row = connection.execute(
@@ -3589,8 +3838,9 @@ class SandboxExecutionJournalMixin:
         self,
         attempt_id: str,
         claim_token: int,
-        receipt: dict[str, Any],
+        receipt: dict[str, Any] | None = None,
         *,
+        runc_delete_receipt: Any | None = None,
         credential: str | None = None,
     ) -> dict[str, Any]:
         self._sandbox_validate_attempt_id(attempt_id)
@@ -3601,6 +3851,13 @@ class SandboxExecutionJournalMixin:
             ).fetchone()
         if not row or row["claim_token"] != claim_token:
             raise SupervisorError("sandbox_execution_not_found", "execution reservation is missing")
+        action_payload = None
+        if runc_delete_receipt is not None:
+            action_payload = self._sandbox_cleanup_action_payload(row, runc_delete_receipt)
+        expected = self._sandbox_cleanup_receipt(row, action_payload=action_payload)
+        expected_encoded = canonical_json(expected)
+        if receipt is None and runc_delete_receipt is not None:
+            receipt = expected
         if not isinstance(receipt, dict):
             raise SupervisorError(
                 "sandbox_cleanup_report_invalid",
@@ -3609,17 +3866,14 @@ class SandboxExecutionJournalMixin:
         encoded = canonical_json(receipt)
         if len(encoded.encode("utf-8")) > 64 * 1024:
             raise SupervisorError("sandbox_cleanup_report_invalid", "cleanup report is too large")
-        expected = self._sandbox_cleanup_receipt(row)
-        expected_encoded = canonical_json(expected)
         if row["phase"] == "cleanup_reported":
             persisted = row["cleanup_receipt_json"]
             legacy_v2_encoded = canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row))
             legacy_encoded = canonical_json(self._sandbox_cleanup_receipt_v1(row))
-            if encoded == persisted and persisted in {
-                expected_encoded,
-                legacy_v2_encoded,
-                legacy_encoded,
-            }:
+            if encoded == persisted and (
+                persisted in {expected_encoded, legacy_v2_encoded, legacy_encoded}
+                or self._sandbox_cleanup_receipt_v3_is_self_consistent(row, persisted)
+            ):
                 return self._sandbox_execution_view(row)
             if encoded != expected_encoded:
                 raise SupervisorError(
@@ -3642,13 +3896,111 @@ class SandboxExecutionJournalMixin:
             next_phase="cleanup_reported",
             updates={"cleanup_receipt_json": encoded},
             event_type="sandbox.execution_cleanup_reported",
-            event_payload={"receipt_sha256": hashlib.sha256(encoded.encode()).hexdigest()},
+            event_payload={
+                "receipt_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+                "cleanup_action_sha256": (
+                    action_payload["argv_sha256"] if action_payload is not None else ""
+                ),
+            },
             credential=credential,
+            _cleanup_action_receipt=runc_delete_receipt,
         )
 
-    def _sandbox_cleanup_receipt(self, row: Any) -> dict[str, Any]:
-        return {
-            "version": 2,
+    def _sandbox_execution_verify_cleanup(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        *,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Independently observe post-stop cleanup before enabling result consumers."""
+
+        from .sandbox_cleanup_verifier import verify_sandbox_execution_cleanup
+
+        return verify_sandbox_execution_cleanup(
+            self, attempt_id, claim_token, credential=credential
+        )
+
+    def _sandbox_cleanup_action_payload(self, row: Any, receipt: Any) -> dict[str, Any]:
+        if not _runc_cleanup_action_receipt_is_self_consistent(receipt):
+            raise SupervisorError(
+                "sandbox_cleanup_action_required",
+                "cleanup report requires the registered exact pinned-runc delete receipt",
+            )
+        pin = self.config.oci_runc_executable
+        if pin is None or pin.sha256 != row["runc_executable_digest"]:
+            raise SupervisorError(
+                "sandbox_cleanup_action_invalid", "configured pinned-runc identity changed"
+            )
+        expected = _sandbox_cleanup_action_payload_for_row(row, executable_path=str(pin.path))
+        actual = {
+            "attempt_id": receipt.attempt_id,
+            "claim_token": receipt.claim_token,
+            "execution_id": receipt.execution_id,
+            "container_id": receipt.container_id,
+            "state_root": receipt.state_root,
+            "state_root_device": receipt.state_root_device,
+            "state_root_inode": receipt.state_root_inode,
+            "executable_path": receipt.executable_path,
+            "executable_digest": receipt.executable_digest,
+            "runtime_version": receipt.runtime_version,
+            "argv": list(receipt.argv),
+            "argv_digest": receipt.argv_digest,
+            "actor_pid": receipt.actor_pid,
+            "actor_identity": receipt.actor_identity,
+            "returncode": receipt.returncode,
+            "state_entry_absent": receipt.state_entry_absent,
+        }
+        expected_receipt = {
+            "attempt_id": row["attempt_id"],
+            "claim_token": row["claim_token"],
+            "execution_id": row["execution_id"],
+            "container_id": row["container_id"],
+            "state_root": row["state_path"],
+            "state_root_device": row["state_root_dev"],
+            "state_root_inode": row["state_root_ino"],
+            "executable_path": str(pin.path),
+            "executable_digest": row["runc_executable_digest"],
+            "runtime_version": row["runtime_version"],
+            "argv": expected["argv"],
+            "argv_digest": expected["argv_sha256"],
+            "actor_pid": row["launch_driver_pid"],
+            "actor_identity": row["launch_driver_identity"],
+            "returncode": 0,
+            "state_entry_absent": True,
+        }
+        if actual != expected_receipt:
+            raise SupervisorError(
+                "sandbox_cleanup_action_mismatch",
+                "pinned-runc delete receipt does not match the exact durable execution",
+            )
+        return expected
+
+    def _sandbox_cleanup_receipt_v3_is_self_consistent(self, row: Any, encoded: str) -> bool:
+        pin = self.config.oci_runc_executable
+        if pin is None or pin.sha256 != row["runc_executable_digest"]:
+            return False
+        try:
+            candidate = json.loads(encoded)
+            if canonical_json(candidate) != encoded:
+                return False
+            expected = self._sandbox_cleanup_receipt(row)
+            expected["version"] = 3
+            expected["action"] = _sandbox_cleanup_action_payload_for_row(
+                row, executable_path=str(pin.path)
+            )
+            # Python considers numerically equal JSON values interchangeable
+            # (for example 3.0 == 3). Compare canonical encodings so receipt
+            # provenance also enforces exact JSON number types at every depth.
+            return canonical_json(candidate) == canonical_json(expected)
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return False
+
+    def _sandbox_cleanup_receipt(
+        self, row: Any, *, action_payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        receipt = {
+            "version": 3 if action_payload is not None else 2,
             "verification_status": "unverified",
             "attempt_id": row["attempt_id"],
             "claim_token": row["claim_token"],
@@ -3682,6 +4034,9 @@ class SandboxExecutionJournalMixin:
             "paths": {"bundle": row["bundle_path"], "state": row["state_path"]},
             "observations": dict(_CLEANUP_OBSERVATIONS),
         }
+        if action_payload is not None:
+            receipt["action"] = action_payload
+        return receipt
 
     def _sandbox_cleanup_receipt_v1(self, row: Any) -> dict[str, Any]:
         """Reconstruct the historical receipt solely for immutable replay checks."""
@@ -3723,7 +4078,7 @@ class SandboxExecutionJournalMixin:
             _runc_launch_gate_lock_for_execution(
                 attempt_id, claim_token, execution_id
             ) as locked_handle,
-            _runc_execution_gate_fence(*state_identity),
+            _runc_execution_gate_fence(*_sandbox_execution_gate_identity(row)),
         ):
             with self.connect() as connection:
                 locked_row = connection.execute(
@@ -3753,11 +4108,83 @@ class SandboxExecutionJournalMixin:
                 )
             return updated
 
+    def _sandbox_execution_revoke_launch_driver_start(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        *,
+        execution_id: str,
+        start_id: str,
+        start_digest: str,
+        service_unit: str,
+        reason: str,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically revoke one exact launch-driver activation and quarantine it.
+
+        Redemption and runc submission both require the durable ``reserved``
+        phase. The transaction below serializes against both operations; after
+        it commits neither operation can authorize a later gate release. The
+        service controller must still reconcile this exact unit, and ambiguity
+        deliberately retains every attempt and runtime fence.
+        """
+
+        attempt_id = self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        execution_id = self._sandbox_text(execution_id, "execution_id")
+        start_id = self._sandbox_text(start_id, "launch_driver_start_id", limit=32)
+        start_digest = self._sandbox_text(start_digest, "launch_driver_start_digest", limit=64)
+        service_unit = self._sandbox_systemd_unit(
+            service_unit, "launch_driver_start_unit", ".service"
+        )
+        reason = self._sandbox_text(reason, "ambiguity_reason", limit=512)
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", start_id) is None
+            or re.fullmatch(r"[0-9a-f]{64}", start_digest) is None
+            or service_unit != _sandbox_launch_driver_service_unit(execution_id)
+        ):
+            raise SupervisorError(
+                "sandbox_launch_driver_start_mismatch",
+                "revocation does not identify one exact durable start intent",
+            )
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if row is None or row["claim_token"] != claim_token or row["execution_id"] != execution_id:
+            raise SupervisorError(
+                "sandbox_launch_driver_start_mismatch",
+                "revocation execution identity is stale",
+            )
+        with (
+            _runc_launch_gate_lock_for_execution(
+                attempt_id, claim_token, execution_id
+            ) as locked_handle,
+            _runc_execution_gate_fence(*_sandbox_execution_gate_identity(row)),
+        ):
+            updated = self._sandbox_execution_mark_ambiguous_under_gate_lock(
+                attempt_id,
+                claim_token,
+                reason,
+                credential=credential,
+                expected_phase="reserved",
+                expected_launch_driver_start=(start_id, start_digest, service_unit),
+            )
+            if locked_handle is not None:
+                _revoke_runc_launch_gate_release_locked(
+                    locked_handle, attempt_id, claim_token, execution_id
+                )
+            return updated
+
     def _sandbox_execution_mark_ambiguous_under_gate_lock(
         self,
         attempt_id: str,
         claim_token: int,
         reason: str,
+        *,
+        credential: str | None = None,
+        expected_phase: str | None = None,
+        expected_launch_driver_start: tuple[str, str, str] | None = None,
     ) -> dict[str, Any]:
         """Quarantine an unresolved execution and extend all attempt resource fences."""
 
@@ -3778,6 +4205,28 @@ class SandboxExecutionJournalMixin:
                 )
             if attempt["claim_token"] != claim_token or row["claim_token"] != claim_token:
                 raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
+            if credential is not None:
+                self._authenticate_attempt(connection, attempt, credential)
+            if expected_phase is not None and row["phase"] not in {
+                expected_phase,
+                "ambiguous",
+            }:
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    f"expected phase {expected_phase} or ambiguous, found {row['phase']}; fence retained",
+                )
+            if expected_launch_driver_start is not None:
+                start_id, start_digest, service_unit = expected_launch_driver_start
+                if (
+                    row["launch_driver_start_id"] != start_id
+                    or row["launch_driver_start_digest"] != start_digest
+                    or row["launch_driver_start_unit"] != service_unit
+                    or service_unit != _sandbox_launch_driver_service_unit(row["execution_id"])
+                ):
+                    raise SupervisorError(
+                        "sandbox_launch_driver_start_mismatch",
+                        "revocation does not match the durable one-shot start intent",
+                    )
             task = connection.execute(
                 "SELECT current_attempt_id FROM tasks WHERE id = ?", (attempt["task_id"],)
             ).fetchone()
@@ -3855,6 +4304,11 @@ class SandboxExecutionJournalMixin:
             value["cleanup_receipt"] = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
             value["cleanup_receipt"] = {"state": "unavailable"}
+        raw_verification = value.get("cleanup_verification_json", "{}")
+        try:
+            value["cleanup_verification"] = json.loads(raw_verification)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value["cleanup_verification"] = {"state": "unavailable"}
         raw_candidate = value.pop("result_candidate_json", "")
         try:
             value["result_candidate"] = json.loads(raw_candidate) if raw_candidate else None

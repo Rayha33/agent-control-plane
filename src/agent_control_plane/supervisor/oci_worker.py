@@ -51,10 +51,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from .common import SupervisorError
+from .common import SupervisorError, canonical_json
 from .sandbox_workspace import Snapshot, read_snapshot_files
 
 _CONTAINER_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
+_SHA256_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _APPARMOR_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _MIN_MEMORY_BYTES = 16 * 1024 * 1024
 _MAX_PIDS = 65_536
@@ -3442,11 +3443,11 @@ class RuncLaunchHandle:
             record = _runc_launch_record(self)
             if record is not None and record.execution_binding is not None:
                 if record.target.state_path is not None:
-                    identity = record.state_gate_identity
+                    identity = record.execution_gate_identity
                     if identity is None or record.gate_release_guard is None:
                         raise SupervisorError(
                             "sandbox_launch_gate_not_authorized",
-                            "journaled OCI gate lacks its cross-process durable-state fence",
+                            "journaled OCI gate lacks its cross-process execution-root fence",
                         )
                     with _runc_execution_gate_fence(*identity):
                         if not record.gate_release_guard():
@@ -3669,7 +3670,7 @@ class _RuncLaunchRecord:
     target: _RuncLaunchTarget
     launch_submission: Any | None = None
     execution_binding: tuple[str, int, str] | None = None
-    state_gate_identity: tuple[str, int, int] | None = None
+    execution_gate_identity: tuple[str, int, int] | None = None
     gate_release_guard: Callable[[], bool] | None = field(default=None, compare=False, repr=False)
     gate_release_authorized: bool = False
     wait_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
@@ -3694,6 +3695,28 @@ class _RuncClientWaitReceipt:
     execution_id: str
 
 
+@dataclass(eq=False, frozen=True, slots=True, weakref_slot=True)
+class _RuncCleanupActionReceipt:
+    """Exact pinned-runc delete action, registered only after bounded wait."""
+
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    container_id: str
+    state_root: str
+    state_root_device: int
+    state_root_inode: int
+    executable_path: str
+    executable_digest: str
+    runtime_version: str
+    argv: tuple[str, ...]
+    argv_digest: str
+    actor_pid: int
+    actor_identity: str
+    returncode: int
+    state_entry_absent: bool
+
+
 _RUNC_LAUNCH_RECORDS: dict[
     int, tuple[weakref.ReferenceType[RuncLaunchHandle], _RuncLaunchRecord]
 ] = {}
@@ -3702,6 +3725,8 @@ _RUNC_WAIT_RECEIPTS: dict[
     int, tuple[weakref.ReferenceType[Any], tuple[int, str, int, str, int, str]]
 ] = {}
 _RUNC_WAIT_RECEIPTS_LOCK = threading.Lock()
+_RUNC_CLEANUP_ACTION_RECEIPTS: dict[int, tuple[weakref.ReferenceType[Any], tuple[Any, ...]]] = {}
+_RUNC_CLEANUP_ACTION_RECEIPTS_LOCK = threading.Lock()
 _RUNC_LAUNCH_FORK_GUARD = threading.Lock()
 _RUNC_LAUNCH_GATE_WRITERS: set[int] = set()
 _RUNC_EXECUTION_GATE_LOCK_FDS: set[int] = set()
@@ -3741,13 +3766,13 @@ def _close_runc_launch_gate_writer(descriptor: int) -> None:
 
 @contextmanager
 def _runc_execution_gate_fence(
-    state_path: str, state_device: int, state_inode: int
+    execution_root_path: str, execution_root_device: int, execution_root_inode: int
 ) -> Iterator[None]:
     """Take the exact execution's process-shared gate/stop fence.
 
-    Advisory ``flock`` on the unique, inode-pinned state directory avoids a
-    mutable lock-file path. A busy lock is fail-closed; callers can retry after
-    the active lifecycle operation completes.
+    Advisory ``flock`` on the unique, inode-pinned execution root remains valid
+    after the private runc bundle and state trees are removed. A busy lock is
+    fail-closed; callers can retry after the active lifecycle operation completes.
     """
 
     try:
@@ -3758,42 +3783,43 @@ def _runc_execution_gate_fence(
             "this platform cannot provide the required process-shared lifecycle fence",
         ) from error
     if (
-        not isinstance(state_path, str)
-        or not state_path
-        or not Path(state_path).is_absolute()
-        or type(state_device) is not int
-        or type(state_inode) is not int
-        or state_device < 0
-        or state_inode <= 0
+        not isinstance(execution_root_path, str)
+        or not execution_root_path
+        or not Path(execution_root_path).is_absolute()
+        or type(execution_root_device) is not int
+        or type(execution_root_inode) is not int
+        or execution_root_device < 0
+        or execution_root_inode <= 0
     ):
         raise SupervisorError(
             "sandbox_execution_gate_identity_mismatch",
-            "durable state-root identity is invalid; lifecycle fence retained",
+            "durable execution-root identity is invalid; lifecycle fence retained",
         )
     descriptor = -1
     owner_pid = os.getpid()
     with _RUNC_LAUNCH_FORK_GUARD:
         try:
             descriptor = os.open(
-                state_path,
+                execution_root_path,
                 os.O_RDONLY
                 | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0),
             )
             opened = os.fstat(descriptor)
-            observed = os.stat(state_path, follow_symlinks=False)
+            observed = os.stat(execution_root_path, follow_symlinks=False)
             if (
                 not stat.S_ISDIR(opened.st_mode)
                 or stat.S_ISLNK(observed.st_mode)
-                or (opened.st_dev, opened.st_ino) != (state_device, state_inode)
-                or (observed.st_dev, observed.st_ino) != (state_device, state_inode)
+                or (opened.st_dev, opened.st_ino) != (execution_root_device, execution_root_inode)
+                or (observed.st_dev, observed.st_ino)
+                != (execution_root_device, execution_root_inode)
                 or opened.st_uid != os.geteuid()
                 or stat.S_IMODE(opened.st_mode) != 0o700
             ):
                 raise SupervisorError(
                     "sandbox_execution_gate_identity_mismatch",
-                    "state root no longer matches its private durable identity; lifecycle fence retained",
+                    "execution root no longer matches its durable identity; lifecycle fence retained",
                 )
             try:
                 fcntl_module.flock(descriptor, fcntl_module.LOCK_EX | fcntl_module.LOCK_NB)
@@ -3803,18 +3829,19 @@ def _runc_execution_gate_fence(
                     "another process is changing this execution's launch gate; lifecycle fence retained",
                 ) from error
             locked = os.fstat(descriptor)
-            path_after_lock = os.stat(state_path, follow_symlinks=False)
+            path_after_lock = os.stat(execution_root_path, follow_symlinks=False)
             if (
                 not stat.S_ISDIR(locked.st_mode)
                 or stat.S_ISLNK(path_after_lock.st_mode)
-                or (locked.st_dev, locked.st_ino) != (state_device, state_inode)
-                or (path_after_lock.st_dev, path_after_lock.st_ino) != (state_device, state_inode)
+                or (locked.st_dev, locked.st_ino) != (execution_root_device, execution_root_inode)
+                or (path_after_lock.st_dev, path_after_lock.st_ino)
+                != (execution_root_device, execution_root_inode)
                 or locked.st_uid != os.geteuid()
                 or stat.S_IMODE(locked.st_mode) != 0o700
             ):
                 raise SupervisorError(
                     "sandbox_execution_gate_identity_mismatch",
-                    "state-root path changed while acquiring its lifecycle fence",
+                    "execution-root path changed while acquiring its lifecycle fence",
                 )
             _RUNC_EXECUTION_GATE_LOCK_FDS.add(descriptor)
         except SupervisorError:
@@ -3859,6 +3886,8 @@ def _reset_runc_launch_state_after_fork() -> None:
     global _RUNC_LAUNCH_RECORDS
     global _RUNC_WAIT_RECEIPTS_LOCK
     global _RUNC_WAIT_RECEIPTS
+    global _RUNC_CLEANUP_ACTION_RECEIPTS_LOCK
+    global _RUNC_CLEANUP_ACTION_RECEIPTS
     global _RUNC_LAUNCH_FORK_GUARD
     global _RUNC_LAUNCH_GATE_WRITERS
     global _RUNC_EXECUTION_GATE_LOCK_FDS
@@ -3889,6 +3918,8 @@ def _reset_runc_launch_state_after_fork() -> None:
     _RUNC_LAUNCH_RECORDS = {}
     _RUNC_WAIT_RECEIPTS_LOCK = threading.Lock()
     _RUNC_WAIT_RECEIPTS = {}
+    _RUNC_CLEANUP_ACTION_RECEIPTS_LOCK = threading.Lock()
+    _RUNC_CLEANUP_ACTION_RECEIPTS = {}
     _RUNC_LAUNCH_FORK_GUARD = threading.Lock()
     _RUNC_LAUNCH_GATE_WRITERS = set()
     _RUNC_EXECUTION_GATE_LOCK_FDS = set()
@@ -4105,7 +4136,7 @@ def _record_runc_kernel_wait_status(
             target=current.target,
             launch_submission=current.launch_submission,
             execution_binding=current.execution_binding,
-            state_gate_identity=current.state_gate_identity,
+            execution_gate_identity=current.execution_gate_identity,
             gate_release_guard=current.gate_release_guard,
             gate_release_authorized=current.gate_release_authorized,
             wait_lock=current.wait_lock,
@@ -4210,7 +4241,7 @@ def _authorize_runc_launch_gate_release_locked(
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
-            state_gate_identity=record.state_gate_identity,
+            execution_gate_identity=record.execution_gate_identity,
             gate_release_guard=record.gate_release_guard,
             gate_release_authorized=True,
             wait_lock=record.wait_lock,
@@ -4246,7 +4277,7 @@ def _revoke_runc_launch_gate_release_locked(
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
-            state_gate_identity=record.state_gate_identity,
+            execution_gate_identity=record.execution_gate_identity,
             gate_release_guard=record.gate_release_guard,
             gate_release_authorized=False,
             wait_lock=record.wait_lock,
@@ -4280,7 +4311,7 @@ def _consume_runc_launch_gate_authorization(handle: RuncLaunchHandle) -> None:
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=record.execution_binding,
-            state_gate_identity=record.state_gate_identity,
+            execution_gate_identity=record.execution_gate_identity,
             gate_release_guard=record.gate_release_guard,
             gate_release_authorized=False,
             wait_lock=record.wait_lock,
@@ -4297,7 +4328,7 @@ def _runc_launch_handle_bind_execution(
     claim_token: int,
     execution_id: str,
     *,
-    state_gate_identity: tuple[str, int, int] | None = None,
+    execution_gate_identity: tuple[str, int, int] | None = None,
     gate_release_guard: Callable[[], bool] | None = None,
 ) -> None:
     """Bind a prevalidated launch target once to its exact durable execution."""
@@ -4331,13 +4362,17 @@ def _runc_launch_handle_bind_execution(
                 "sandbox_execution_launch_handle_conflict",
                 "durable execution is already bound to another pinned-runc handle",
             )
-        if state_gate_identity is not None and (
-            state_gate_identity
-            != (
-                record.target.state_path,
-                record.target.state_device,
-                record.target.state_inode,
-            )
+        expected_execution_root = (
+            str(Path(record.target.bundle_path).parent)
+            if record.target.bundle_path is not None
+            else None
+        )
+        if execution_gate_identity is not None and (
+            execution_gate_identity[0] != expected_execution_root
+            or type(execution_gate_identity[1]) is not int
+            or execution_gate_identity[1] < 0
+            or type(execution_gate_identity[2]) is not int
+            or execution_gate_identity[2] <= 0
             or not callable(gate_release_guard)
         ):
             raise SupervisorError(
@@ -4351,7 +4386,7 @@ def _runc_launch_handle_bind_execution(
             target=record.target,
             launch_submission=record.launch_submission,
             execution_binding=binding,
-            state_gate_identity=state_gate_identity or record.state_gate_identity,
+            execution_gate_identity=execution_gate_identity or record.execution_gate_identity,
             gate_release_guard=gate_release_guard or record.gate_release_guard,
             gate_release_authorized=record.gate_release_authorized,
             wait_lock=record.wait_lock,
@@ -4432,6 +4467,208 @@ def _runc_client_wait_receipt_is_self_consistent(receipt: Any) -> bool:
         and receipt.claim_token > 0
         and isinstance(receipt.execution_id, str)
         and bool(receipt.execution_id)
+    )
+
+
+def _delete_pinned_runc_container(
+    pin: _TrustedRuncExecutable,
+    *,
+    expected_version: str,
+    state_root: str | Path,
+    expected_state_device: int,
+    expected_state_inode: int,
+    container_id: str,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+) -> _RuncCleanupActionReceipt:
+    """Run one exact pinned ``runc delete --force`` and retain its wait provenance.
+
+    The returned process-local capability is created only after the bounded
+    command has been reaped successfully and the exact container-state entry is
+    absent. It is action evidence only; a later supervisor must still verify
+    systemd/process/cgroup and private-path absence after both services exit.
+    """
+
+    if (
+        not isinstance(expected_version, str)
+        or not _is_runc_release_version(expected_version)
+        or not isinstance(container_id, str)
+        or _CONTAINER_ID.fullmatch(container_id) is None
+        or not isinstance(attempt_id, str)
+        or not attempt_id
+        or type(claim_token) is not int
+        or claim_token <= 0
+        or not isinstance(execution_id, str)
+        or not execution_id
+        or type(expected_state_device) is not int
+        or expected_state_device < 0
+        or type(expected_state_inode) is not int
+        or expected_state_inode <= 0
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_action_invalid", "pinned runc cleanup identity is invalid"
+        )
+    if not _supports_runc_fd_exec():
+        raise SupervisorError(
+            "sandbox_cleanup_action_unavailable",
+            "pinned runc cleanup requires Linux fd-based executable invocation",
+        )
+    canonical_state = _private_directory(
+        state_root, code="sandbox_private_path_invalid", label="sandbox state root"
+    )
+    try:
+        root_info = canonical_state.lstat()
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_private_path_invalid", "sandbox state root is unavailable"
+        ) from error
+    if (root_info.st_dev, root_info.st_ino) != (expected_state_device, expected_state_inode):
+        raise SupervisorError(
+            "sandbox_private_path_conflict", "sandbox state root identity changed"
+        )
+    try:
+        container_info = (canonical_state / container_id).lstat()
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_cleanup_action_invalid", "runc state entry is unavailable before deletion"
+        ) from error
+    if not stat.S_ISDIR(container_info.st_mode):
+        raise SupervisorError(
+            "sandbox_cleanup_action_invalid", "runc state entry is not a real directory"
+        )
+
+    executable_fd = _open_verified_runc_executable(pin)
+    actor_pid = os.getpid()
+    actor_identity = _runc_client_process_identity(actor_pid)
+    argv = [str(pin.path), "--root", str(canonical_state), "delete", "--force", container_id]
+    argv_digest = hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest()
+    try:
+        if not actor_identity:
+            raise SupervisorError(
+                "sandbox_cleanup_action_invalid", "launch-driver process identity is unavailable"
+            )
+        try:
+            returncode, _stdout = _run_bounded_command(
+                argv,
+                cwd="/",
+                env=_runc_client_environment(),
+                timeout_seconds=8.0,
+                max_output_bytes=8192,
+                pass_fds=(executable_fd,),
+                exec_fd=executable_fd,
+            )
+        except (
+            OSError,
+            TimeoutError,
+            ValueError,
+            UnicodeDecodeError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            raise SupervisorError(
+                "sandbox_cleanup_action_failed", "pinned runc delete did not complete safely"
+            ) from error
+    finally:
+        os.close(executable_fd)
+    if returncode != 0 or _runc_client_process_identity(actor_pid) != actor_identity:
+        raise SupervisorError(
+            "sandbox_cleanup_action_failed", "pinned runc delete failed or actor identity changed"
+        )
+    try:
+        current_root = canonical_state.lstat()
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_private_path_invalid", "sandbox state root disappeared during deletion"
+        ) from error
+    if (current_root.st_dev, current_root.st_ino) != (
+        expected_state_device,
+        expected_state_inode,
+    ):
+        raise SupervisorError(
+            "sandbox_private_path_conflict", "sandbox state root changed during deletion"
+        )
+    try:
+        (canonical_state / container_id).lstat()
+    except FileNotFoundError:
+        state_entry_absent = True
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_cleanup_action_unverified", "runc state absence could not be read safely"
+        ) from error
+    else:
+        state_entry_absent = False
+    if not state_entry_absent:
+        raise SupervisorError(
+            "sandbox_cleanup_action_unverified", "runc state entry remains after delete"
+        )
+
+    receipt = _RuncCleanupActionReceipt(
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+        container_id=container_id,
+        state_root=str(canonical_state),
+        state_root_device=expected_state_device,
+        state_root_inode=expected_state_inode,
+        executable_path=str(pin.path),
+        executable_digest=pin.sha256,
+        runtime_version=expected_version,
+        argv=tuple(argv),
+        argv_digest=argv_digest,
+        actor_pid=actor_pid,
+        actor_identity=actor_identity,
+        returncode=returncode,
+        state_entry_absent=state_entry_absent,
+    )
+    _register_runc_cleanup_action_receipt(receipt)
+    return receipt
+
+
+def _register_runc_cleanup_action_receipt(receipt: _RuncCleanupActionReceipt) -> None:
+    key = id(receipt)
+    contents = tuple(
+        getattr(receipt, field) for field in _RuncCleanupActionReceipt.__dataclass_fields__
+    )
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        with _RUNC_CLEANUP_ACTION_RECEIPTS_LOCK:
+            current = _RUNC_CLEANUP_ACTION_RECEIPTS.get(key)
+            if current is not None and current[0] is reference:
+                _RUNC_CLEANUP_ACTION_RECEIPTS.pop(key, None)
+
+    reference = weakref.ref(receipt, discard)
+    with _RUNC_CLEANUP_ACTION_RECEIPTS_LOCK:
+        _RUNC_CLEANUP_ACTION_RECEIPTS[key] = (reference, contents)
+
+
+def _runc_cleanup_action_receipt_is_self_consistent(receipt: Any) -> bool:
+    if type(receipt) is not _RuncCleanupActionReceipt:
+        return False
+    with _RUNC_CLEANUP_ACTION_RECEIPTS_LOCK:
+        registered = _RUNC_CLEANUP_ACTION_RECEIPTS.get(id(receipt))
+        if registered is None or registered[0]() is not receipt:
+            return False
+        expected = registered[1]
+    actual = tuple(
+        getattr(receipt, field) for field in _RuncCleanupActionReceipt.__dataclass_fields__
+    )
+    return (
+        actual == expected
+        and receipt.returncode == 0
+        and receipt.state_entry_absent is True
+        and len(receipt.argv) == 6
+        and receipt.argv[0] == receipt.executable_path
+        and receipt.argv[1] == "--root"
+        and receipt.argv[2] == receipt.state_root
+        and receipt.argv[3:] == ("delete", "--force", receipt.container_id)
+        and hashlib.sha256(canonical_json(list(receipt.argv)).encode("utf-8")).hexdigest()
+        == receipt.argv_digest
+        and receipt.actor_pid > 0
+        and receipt.actor_identity.startswith(f"linux:{receipt.actor_pid}:")
+        and receipt.actor_identity.rsplit(":", 1)[-1].isdecimal()
+        and _SHA256_DIGEST.fullmatch(receipt.executable_digest) is not None
+        and _SHA256_DIGEST.fullmatch(receipt.argv_digest) is not None
+        and _is_runc_release_version(receipt.runtime_version)
     )
 
 

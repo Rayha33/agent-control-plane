@@ -368,25 +368,30 @@ def read_cgroup_resource_controls(
 
 
 def _require_cgroup2_mount(root: str) -> None:
-    """Fail closed unless mountinfo identifies the fixed root as cgroup v2."""
+    """Fail closed unless the root exposes the complete cgroup-v2 hierarchy."""
 
     raw = _read_proc_file("/proc/self/mountinfo")
     expected = os.fsencode(root)
-    matching_filesystems: list[bytes] = []
+    matching_mounts: list[tuple[bytes, bytes]] = []
     for line in raw.splitlines():
         before, separator, after = line.partition(b" - ")
         fields = before.split()
         filesystem = after.split()[:1]
         if not separator or len(fields) < 5 or not filesystem:
             continue
+        mount_root = re.sub(
+            rb"\\([0-7]{3})",
+            lambda match: bytes((int(match.group(1), 8),)),
+            fields[3],
+        )
         mountpoint = re.sub(
             rb"\\([0-7]{3})",
             lambda match: bytes((int(match.group(1), 8),)),
             fields[4],
         )
         if mountpoint == expected:
-            matching_filesystems.append(filesystem[0])
-    if not matching_filesystems or any(value != b"cgroup2" for value in matching_filesystems):
+            matching_mounts.append((mount_root, filesystem[0]))
+    if matching_mounts != [(b"/", b"cgroup2")]:
         raise _invalid("fixed cgroup root is not mounted as cgroup v2")
 
 

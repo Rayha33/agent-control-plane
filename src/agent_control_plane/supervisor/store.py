@@ -153,6 +153,15 @@ _SANDBOX_LAUNCH_DRIVER_START_AUTHORIZATION: ContextVar[
 _SANDBOX_LAUNCH_DRIVER_REDEMPTION_AUTHORIZATION: ContextVar[tuple[int, tuple[Any, ...]] | None] = (
     ContextVar("acp_sandbox_launch_driver_redemption_authorization", default=None)
 )
+_SANDBOX_CLEANUP_ACTION_AUTHORIZATION: ContextVar[tuple[int, tuple[str, int, str, str]] | None] = (
+    ContextVar("acp_sandbox_cleanup_action_authorization", default=None)
+)
+_SANDBOX_CLEANUP_REPORT_AUTHORIZATION: ContextVar[tuple[int, tuple[str, int, str, str]] | None] = (
+    ContextVar("acp_sandbox_cleanup_report_authorization", default=None)
+)
+_SANDBOX_CLEANUP_VERIFICATION_AUTHORIZATION: ContextVar[
+    tuple[int, tuple[str, int, str, str]] | None
+] = ContextVar("acp_sandbox_cleanup_verification_authorization", default=None)
 _SANDBOX_RESERVATION_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str]] | None
 ] = ContextVar("acp_sandbox_reservation_authorization", default=None)
@@ -459,6 +468,168 @@ def _sandbox_launch_driver_redemption_authorized_for(connection: sqlite3.Connect
 
 
 @contextmanager
+def _authorize_sandbox_cleanup_action_write(
+    connection: sqlite3.Connection, receipt: Any, cleanup_receipt_json: str
+) -> Iterator[None]:
+    """Scope one cleanup-report write to a registered exact pinned-runc delete."""
+
+    from .oci_worker import _runc_cleanup_action_receipt_is_self_consistent
+
+    if (
+        not _runc_cleanup_action_receipt_is_self_consistent(receipt)
+        or not isinstance(cleanup_receipt_json, str)
+        or not cleanup_receipt_json
+        or len(cleanup_receipt_json.encode("utf-8")) > 64 * 1024
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_action_required",
+            "cleanup report requires the exact registered pinned-runc delete receipt",
+        )
+    fields = (
+        receipt.attempt_id,
+        receipt.claim_token,
+        receipt.execution_id,
+        cleanup_receipt_json,
+    )
+    token = _SANDBOX_CLEANUP_ACTION_AUTHORIZATION.set(
+        (_store_connection_identity(connection), fields)
+    )
+    try:
+        yield
+    finally:
+        _SANDBOX_CLEANUP_ACTION_AUTHORIZATION.reset(token)
+
+
+def _sandbox_cleanup_action_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        cleanup_receipt_json: str,
+    ) -> int:
+        authorization = _SANDBOX_CLEANUP_ACTION_AUTHORIZATION.get()
+        expected = (attempt_id, claim_token, execution_id, cleanup_receipt_json)
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
+
+
+@contextmanager
+def _authorize_sandbox_cleanup_report_write(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    cleanup_receipt_json: str,
+) -> Iterator[None]:
+    """Scope one validated unverified cleanup report to its exact journal row."""
+
+    if (
+        not isinstance(cleanup_receipt_json, str)
+        or not cleanup_receipt_json
+        or len(cleanup_receipt_json.encode("utf-8")) > 64 * 1024
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_report_invalid", "cleanup report is not bounded text"
+        )
+    fields = (attempt_id, claim_token, execution_id, cleanup_receipt_json)
+    token = _SANDBOX_CLEANUP_REPORT_AUTHORIZATION.set(
+        (_store_connection_identity(connection), fields)
+    )
+    try:
+        yield
+    finally:
+        _SANDBOX_CLEANUP_REPORT_AUTHORIZATION.reset(token)
+
+
+def _sandbox_cleanup_report_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        cleanup_receipt_json: str,
+    ) -> int:
+        authorization = _SANDBOX_CLEANUP_REPORT_AUTHORIZATION.get()
+        expected = (attempt_id, claim_token, execution_id, cleanup_receipt_json)
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
+
+
+@contextmanager
+def _authorize_sandbox_cleanup_verification_write(
+    connection: sqlite3.Connection, receipt: Any, cleanup_verification_json: str
+) -> Iterator[None]:
+    """Scope the final phase write to a registered independent-verifier receipt."""
+
+    from .sandbox_execution_journal import (
+        _sandbox_cleanup_verification_receipt_is_self_consistent,
+    )
+
+    if (
+        not _sandbox_cleanup_verification_receipt_is_self_consistent(receipt)
+        or not isinstance(cleanup_verification_json, str)
+        or not cleanup_verification_json
+        or len(cleanup_verification_json.encode("utf-8")) > 64 * 1024
+        or cleanup_verification_json != receipt.encoded
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_verification_required",
+            "cleanup verification requires the exact registered post-stop receipt",
+        )
+    fields = (
+        receipt.attempt_id,
+        receipt.claim_token,
+        receipt.execution_id,
+        cleanup_verification_json,
+    )
+    token = _SANDBOX_CLEANUP_VERIFICATION_AUTHORIZATION.set(
+        (_store_connection_identity(connection), fields)
+    )
+    try:
+        yield
+    finally:
+        _SANDBOX_CLEANUP_VERIFICATION_AUTHORIZATION.reset(token)
+
+
+def _sandbox_cleanup_verification_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        cleanup_verification_json: str,
+    ) -> int:
+        authorization = _SANDBOX_CLEANUP_VERIFICATION_AUTHORIZATION.get()
+        expected = (
+            attempt_id,
+            claim_token,
+            execution_id,
+            cleanup_verification_json,
+        )
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
+
+
+@contextmanager
 def _authorize_sandbox_reservation_write(
     connection: sqlite3.Connection,
     attempt_id: str,
@@ -558,6 +729,21 @@ class StoreMixin:
                 _sandbox_launch_driver_redemption_authorized_for(raw_connection),
             )
             raw_connection.create_function(
+                "acp_sandbox_cleanup_action_authorized",
+                4,
+                _sandbox_cleanup_action_authorized_for(raw_connection),
+            )
+            raw_connection.create_function(
+                "acp_sandbox_cleanup_report_authorized",
+                4,
+                _sandbox_cleanup_report_authorized_for(raw_connection),
+            )
+            raw_connection.create_function(
+                "acp_sandbox_cleanup_verification_authorized",
+                4,
+                _sandbox_cleanup_verification_authorized_for(raw_connection),
+            )
+            raw_connection.create_function(
                 "acp_sandbox_reservation_authorized",
                 5,
                 _sandbox_reservation_authorized_for(raw_connection),
@@ -600,6 +786,21 @@ class StoreMixin:
             "acp_sandbox_launch_driver_redemption_authorized",
             14,
             _sandbox_launch_driver_redemption_authorized_for(raw_connection),
+        )
+        raw_connection.create_function(
+            "acp_sandbox_cleanup_action_authorized",
+            4,
+            _sandbox_cleanup_action_authorized_for(raw_connection),
+        )
+        raw_connection.create_function(
+            "acp_sandbox_cleanup_report_authorized",
+            4,
+            _sandbox_cleanup_report_authorized_for(raw_connection),
+        )
+        raw_connection.create_function(
+            "acp_sandbox_cleanup_verification_authorized",
+            4,
+            _sandbox_cleanup_verification_authorized_for(raw_connection),
         )
         raw_connection.create_function(
             "acp_sandbox_reservation_authorized",

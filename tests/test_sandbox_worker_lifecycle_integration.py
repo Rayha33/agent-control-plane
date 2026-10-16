@@ -1,25 +1,37 @@
-"""Opt-in live proof joining the OCI launch gate, monitor, and journal.
+"""Opt-in Linux/systemd proofs for OCI launch-driver and monitor components.
 
 The process-local runc handle must remain in the exact systemd launch-driver
 process; a separate systemd-owned service controls the exact worker scope. The
-release case proves the launch-to-``running`` gate, while the terminate case
-requests cancellation through ``WorkersMixin.terminate_worker()`` before gate
-release and checks the real monitor response. Neither case wires
-``run_worker``, proves crash recovery or cleanup, authorizes result import, or
-writes a ``cleanup_verified`` receipt.
+default branch proves launch-to-``running``, natural completion, and
+supervisor-owned cleanup verification. The `ACP_LIVE_CANCEL_AFTER_START=1`
+branch requests cancellation through `WorkersMixin.terminate_worker()` from a
+fresh supervisor and checks the real monitor response before the same
+independent cleanup proof. Neither branch wires ``run_worker``, proves crash
+recovery, or authorizes result import.
 
-Run on a disposable supported Linux host with rootless runc 1.5.2, delegated
-cgroup v2, and an active private systemd user manager:
+The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
+runc from a monitor-owned service and cannot satisfy the current launch-driver
+redemption contract. The production launch-driver test remains opt-in. Its
+default branch verifies natural completion; setting
+`ACP_LIVE_CANCEL_AFTER_START=1` runs the same fixture with a long payload and
+verifies cancellation from a fresh supervisor. Run on a disposable supported
+Linux host with rootless runc 1.5.2, delegated cgroup v2, and an active private
+systemd user manager:
 
     ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
     ACP_OCI_TEST_RUNC=/usr/bin/runc \
     ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
     uv run --extra dev pytest -q tests/test_sandbox_worker_lifecycle_integration.py
+
+For the fresh-supervisor cancellation branch, add:
+
+    ACP_LIVE_CANCEL_AFTER_START=1
 """
 
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import posixpath
 import re
@@ -32,6 +44,7 @@ import time
 import traceback
 from pathlib import Path, PurePosixPath
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from support import init_repo, make_task
@@ -45,7 +58,15 @@ from test_oci_worker_runtime import (
 
 import agent_control_plane.supervisor.oci_worker as oci_worker
 from agent_control_plane.git_supervisor import GitSupervisor
-from agent_control_plane.supervisor import sandbox_attestation, sandbox_monitor_service
+from agent_control_plane.supervisor import (
+    sandbox_attestation,
+    sandbox_launch_driver_service,
+    sandbox_monitor_lifecycle,
+    sandbox_monitor_service,
+)
+from agent_control_plane.supervisor import (
+    sandbox_execution_journal as journal_module,
+)
 from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.sandbox_attestation import collect_running_runtime_attestation
 from agent_control_plane.supervisor.sandbox_monitor_ipc import _linux_process_identity
@@ -60,6 +81,42 @@ _SUPPORTED_RUNC_VERSION = "1.5.2"
 _MONITOR_SLICE_UNIT = "user-acp.slice"
 _PAYLOAD_MARKER = "lifecycle-gate-marker"
 _GIT_METADATA_MARKER = "git-metadata-absent-marker"
+
+
+def _terminate_worker_from_fresh_process(
+    repo: Path, attempt_id: str, credential: str, result_sender
+) -> None:
+    """Cancel through a genuinely fresh supervisor with no launch-handle registry."""
+
+    from agent_control_plane.supervisor import sandbox_monitor_lifecycle
+
+    supervisor = GitSupervisor(repo)
+    reconnect_calls = 0
+    legacy_pid_calls = 0
+    original_reconnect = sandbox_monitor_lifecycle.reconnect_sandbox_monitor
+
+    def record_reconnect(**kwargs: Any):
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        return original_reconnect(**kwargs)
+
+    def reject_legacy_pid(*_args: Any, **_kwargs: Any):
+        nonlocal legacy_pid_calls
+        legacy_pid_calls += 1
+        raise AssertionError("fresh sandbox cancellation used the legacy PID path")
+
+    sandbox_monitor_lifecycle.reconnect_sandbox_monitor = record_reconnect
+    supervisor._open_registered_pidfd = reject_legacy_pid
+    try:
+        termination = supervisor.terminate_worker(attempt_id, credential=credential)
+        result_sender.send(("ok", os.getpid(), termination, reconnect_calls, legacy_pid_calls))
+    except SupervisorError as error:
+        result_sender.send(("supervisor-error", error.code, reconnect_calls, legacy_pid_calls))
+    except BaseException as error:
+        result_sender.send(("error", type(error).__name__, reconnect_calls, legacy_pid_calls))
+    finally:
+        sandbox_monitor_lifecycle.reconnect_sandbox_monitor = original_reconnect
+        result_sender.close()
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -685,6 +742,42 @@ def _best_effort_stop_unit(systemctl: str, unit: str) -> None:
         pass
 
 
+def _reset_transient_service_after_quiescence(systemctl: str, service_unit: str) -> bool:
+    """Unload only the exact test-owned transient service after proving it is inert."""
+
+    try:
+        properties = _unit_properties(
+            service_unit, ("ActiveState", "ControlGroup", "LoadState", "MainPID")
+        )
+        if properties["LoadState"] == "not-found":
+            return (
+                properties["ActiveState"] == "inactive"
+                and not properties["ControlGroup"]
+                and properties["MainPID"] == "0"
+            )
+        if (
+            properties["LoadState"] != "loaded"
+            or properties["ActiveState"] not in {"inactive", "failed"}
+            or properties["ControlGroup"]
+            or properties["MainPID"] != "0"
+        ):
+            return False
+        reset = _systemd_command([systemctl, "--user", "reset-failed", service_unit], timeout=12.0)
+        if reset.returncode != 0:
+            return False
+        properties = _unit_properties(
+            service_unit, ("ActiveState", "ControlGroup", "LoadState", "MainPID")
+        )
+    except Exception:
+        return False
+    return (
+        properties["LoadState"] == "not-found"
+        and properties["ActiveState"] == "inactive"
+        and not properties["ControlGroup"]
+        and properties["MainPID"] == "0"
+    )
+
+
 def _stop_attempted_units_and_check_quiescence(
     systemctl: str,
     service_unit: str | None,
@@ -698,10 +791,15 @@ def _stop_attempted_units_and_check_quiescence(
         _best_effort_stop_unit(systemctl, service_unit)
     if slice_start_attempted and slice_unit is not None:
         _best_effort_stop_unit(systemctl, slice_unit)
-    return _wait_for_quiescence(
+    quiescent = _wait_for_quiescence(
         service_unit if service_start_attempted else None,
         slice_unit if slice_start_attempted else None,
     )
+    if not quiescent:
+        return False
+    if service_start_attempted and service_unit is not None:
+        return _reset_transient_service_after_quiescence(systemctl, service_unit)
+    return True
 
 
 def test_attempted_systemd_starts_are_stopped_and_checked_after_client_timeouts(
@@ -709,6 +807,7 @@ def test_attempted_systemd_starts_are_stopped_and_checked_after_client_timeouts(
 ) -> None:
     stop_requests: list[str] = []
     checked_units: list[tuple[str | None, str | None]] = []
+    reset_units: list[str] = []
 
     def timed_out_stop(argv: list[str], timeout: float = 10.0) -> None:
         stop_requests.append(argv[-1])
@@ -718,8 +817,17 @@ def test_attempted_systemd_starts_are_stopped_and_checked_after_client_timeouts(
         checked_units.append((service, slice_))
         return True
 
+    def reset_after_quiescence(systemctl: str, service: str) -> bool:
+        reset_units.append(service)
+        return True
+
     monkeypatch.setattr(sys.modules[__name__], "_systemd_command", timed_out_stop)
     monkeypatch.setattr(sys.modules[__name__], "_wait_for_quiescence", quiescent)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_reset_transient_service_after_quiescence",
+        reset_after_quiescence,
+    )
     assert _stop_attempted_units_and_check_quiescence(
         "/usr/bin/systemctl",
         "acp-test.service",
@@ -729,6 +837,58 @@ def test_attempted_systemd_starts_are_stopped_and_checked_after_client_timeouts(
     )
     assert stop_requests == ["acp-test.service", "acp-test.slice"]
     assert checked_units == [("acp-test.service", "acp-test.slice")]
+    assert reset_units == ["acp-test.service"]
+
+
+def test_reset_transient_service_requires_exact_unit_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def command(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+        commands.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    properties = {
+        "ActiveState": "inactive",
+        "ControlGroup": "",
+        "LoadState": "not-found",
+        "MainPID": "0",
+    }
+    monkeypatch.setattr(sys.modules[__name__], "_systemd_command", command)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_unit_properties",
+        lambda unit, requested: {name: properties[name] for name in requested},
+    )
+
+    assert _reset_transient_service_after_quiescence("/usr/bin/systemctl", "acp-test.service")
+    assert commands == []
+
+    properties["LoadState"] = "loaded"
+    properties["ActiveState"] = "failed"
+    properties["MainPID"] = "0"
+    queue = [
+        dict(properties),
+        {
+            "ActiveState": "inactive",
+            "ControlGroup": "",
+            "LoadState": "not-found",
+            "MainPID": "0",
+        },
+    ]
+
+    def queued_properties(unit: str, requested: tuple[str, ...]) -> dict[str, str]:
+        current = queue.pop(0)
+        return {name: current[name] for name in requested}
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_unit_properties",
+        queued_properties,
+    )
+    assert _reset_transient_service_after_quiescence("/usr/bin/systemctl", "acp-test.service")
+    assert commands == [["/usr/bin/systemctl", "--user", "reset-failed", "acp-test.service"]]
 
 
 def test_unit_preflight_allows_only_inactive_empty_implicit_slices(
@@ -756,7 +916,7 @@ def _remove_private_test_tree(root: Path) -> None:
     root_info = root.lstat()
     if (
         root.parent != Path("/tmp")
-        or not root.name.startswith("acp-live-sandbox-lifecycle-")
+        or not root.name.startswith(("acp-live-sandbox-lifecycle-", "acp-live-launch-driver-"))
         or not stat.S_ISDIR(root_info.st_mode)
         or root_info.st_uid != os.geteuid()
     ):
@@ -796,15 +956,17 @@ def _ensure_private_fixture_directory(path: Path) -> None:
     path.chmod(0o700)
 
 
-@pytest.mark.skipif(
-    not _LIVE_ENABLED,
-    reason="set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 on a disposable supported Linux host",
+@pytest.mark.skip(
+    reason=(
+        "superseded: direct monitor-owned launch violates exact launch-driver redemption; "
+        "rebuild this harness on start_sandbox_launch_driver before re-enabling"
+    )
 )
 @pytest.mark.parametrize("terminate_before_gate", [False, True], ids=["release", "terminate"])
 def test_live_monitor_journal_holds_payload_until_durable_running_transition(
     terminate_before_gate: bool,
 ) -> None:
-    """Exercise actual runc, systemd identities, journal transitions, and fd-3 gate/cancel."""
+    """Deprecated harness; see the explicit skip reason and current producer proof."""
 
     source_root = Path(__file__).resolve().parents[1]
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
@@ -1088,6 +1250,359 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition(
             _remove_private_test_tree(run_root)
         else:
             pytest.fail(f"exact test units are not quiescent; preserving artifacts at {run_root}")
+
+
+@pytest.mark.skipif(
+    not _LIVE_ENABLED,
+    reason="set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 on a disposable supported Linux host",
+)
+def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
+    """Use the production systemd producer for a bounded run or fresh-controller cancel."""
+
+    source_root = Path(__file__).resolve().parents[1]
+    if not sys.platform.startswith("linux") or os.geteuid() == 0:
+        pytest.fail("live launch-driver proof requires an unprivileged Linux user")
+    if not source_root.is_relative_to(Path("/tmp")):
+        pytest.fail("run this opt-in proof from a disposable checkout beneath /tmp")
+    if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+        pytest.fail("live launch-driver proof requires unified cgroup v2")
+    controllers = set(Path("/sys/fs/cgroup/cgroup.controllers").read_text().split())
+    if not {"cpu", "memory", "pids"}.issubset(controllers):
+        pytest.fail("cpu, memory, and pids cgroup v2 controllers are required")
+    if os.environ.get("ACP_OCI_TEST_RUNC_VERSION") != _SUPPORTED_RUNC_VERSION:
+        pytest.fail("set ACP_OCI_TEST_RUNC_VERSION=1.5.2 for this exact live proof")
+    environment = sandbox_attestation._trusted_systemd_command_environment()
+    if not (Path(environment["XDG_RUNTIME_DIR"]) / "bus").is_socket():
+        pytest.fail("private systemd user-manager socket is unavailable")
+    systemctl = str(sandbox_attestation._trusted_systemctl_executable())
+    if _systemd_command([systemctl, "--user", "show-environment"]).returncode != 0:
+        pytest.fail("active systemd user manager is required")
+    if " - cgroup2 " not in Path("/proc/self/mountinfo").read_text(encoding="ascii"):
+        pytest.fail("current host does not expose unified cgroup v2")
+
+    runc_path = Path(os.environ.get("ACP_OCI_TEST_RUNC", "/usr/bin/runc"))
+    busybox_path = Path(os.environ.get("ACP_OCI_TEST_BUSYBOX", "/usr/bin/busybox"))
+    run_root = Path(tempfile.mkdtemp(prefix="acp-live-launch-driver-", dir="/tmp"))
+    rootfs_source = run_root / "rootfs-source"
+    service_log_path = run_root / "launch-driver-service.log"
+    service_unit: str | None = None
+    monitor_unit: str | None = None
+    slice_unit: str | None = None
+    service_start_attempted = False
+    monitor_start_attempted = False
+    slice_start_attempted = False
+    safe_to_remove = False
+    try:
+        run_root.chmod(0o700)
+        rootfs_source.mkdir(mode=0o755)
+        for directory in (
+            "bin",
+            "dev",
+            "etc",
+            "home/agent",
+            "proc",
+            "run",
+            "tmp",
+            "workspace",
+        ):
+            (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
+        _copy_busybox_closure(busybox_path, rootfs_source)
+        repo_root = run_root / "repo"
+        repo_root.mkdir(mode=0o700)
+        repo = init_repo(repo_root)
+        rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
+        with (repo / "acp.toml").open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n[sandbox.oci]\n"
+                f"runc_executable = {json.dumps(str(runc_path.resolve(strict=True)))}\n"
+                f"runc_version = {json.dumps(_SUPPORTED_RUNC_VERSION)}\n"
+                f"rootfs_path = {json.dumps(str(rootfs_source.resolve(strict=True)))}\n"
+                f"rootfs_sha256 = {json.dumps(rootfs_manifest['rootfs_sha256'])}\n"
+                f"rootfs_closure_sha256 = {json.dumps(rootfs_manifest['closure_sha256'])}\n"
+            )
+        supervisor = GitSupervisor(repo)
+        runner = supervisor.enroll_runner("sandbox-launch-driver-test", "worker")
+        task = make_task(supervisor, "launch-driver-marker", title="launch-driver producer test")
+        attempt = supervisor.claim(
+            task["id"],
+            "sandbox-launch-driver-test",
+            credential=runner["credential"],
+        )
+        rootfs_pin = supervisor.config.oci_rootfs_pin
+        runc_pin = supervisor.config.oci_runc_executable
+        if (
+            rootfs_pin is None
+            or runc_pin is None
+            or supervisor.config.oci_runc_version != _SUPPORTED_RUNC_VERSION
+        ):
+            pytest.fail("test config did not pin the exact rootfs and runc identities")
+        execution = supervisor._sandbox_execution_reserve(
+            attempt["id"],
+            attempt["claim_token"],
+            rootfs_digest=rootfs_pin.sha256,
+            rootfs_closure_digest=rootfs_pin.closure_sha256,
+            runc_executable_digest=runc_pin.sha256,
+            runtime_version=supervisor.config.oci_runc_version,
+            oci_version="1.2.1",
+            credential=runner["credential"],
+        )
+        execution_root = Path(execution["bundle_path"]).parent
+        execution_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        bundle_root = Path(execution["bundle_path"])
+        state_root = Path(execution["state_path"])
+        bundle_root.mkdir(mode=0o700)
+        state_root.mkdir(mode=0o700)
+        shutil.copytree(rootfs_source, bundle_root / "rootfs", symlinks=True)
+        source_worktree = Path(attempt["worktree"])
+        baseline = copy_snapshot(source_worktree, execution_root / "baseline")
+        workspace = copy_snapshot(baseline.root, execution_root / "workspace")
+        assert not _entry_is_present(workspace.root / ".git")
+        supervisor._sandbox_execution_bind_workspace(
+            attempt["id"],
+            attempt["claim_token"],
+            baseline,
+            workspace,
+            credential=runner["credential"],
+        )
+
+        identity = (attempt["id"], attempt["claim_token"], execution["execution_id"])
+        service_unit = f"acp-launch-driver-{execution['execution_id']}.service"
+        monitor_unit = sandbox_monitor_service_unit(*identity)
+        slice_unit = sandbox_attempt_slice_unit(*identity)
+        _assert_units_available_for_test(service_unit, monitor_unit, slice_unit)
+        service_start_attempted = True
+        slice_start_attempted = True
+        monitor_start_attempted = True
+        original_command_runner = sandbox_launch_driver_service._run_trusted_runtime_command
+
+        def capture_driver_service_output(
+            command: list[str], *, environment: dict[str, str]
+        ) -> bytes:
+            if Path(command[0]).name == "systemd-run":
+                command = list(command)
+                insertion = command.index("--working-directory")
+                command[insertion:insertion] = [
+                    f"--property=StandardOutput=append:{service_log_path}",
+                    f"--property=StandardError=append:{service_log_path}",
+                ]
+            return original_command_runner(command, environment=environment)
+
+        cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
+        payload_sleep_seconds = 30 if cancel_after_start else 1
+        payload_command = (
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+            f"/bin/busybox sleep {payload_sleep_seconds} && "
+            "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
+        )
+        with patch.object(
+            sandbox_launch_driver_service,
+            "_run_trusted_runtime_command",
+            capture_driver_service_output,
+        ):
+            try:
+                receipt = sandbox_launch_driver_service.start_sandbox_launch_driver(
+                    supervisor,
+                    expected_identity=identity,
+                    command=payload_command,
+                    memory_max_bytes=_CONTAINER_MEMORY_BYTES,
+                    cpu_quota=_CONTAINER_CPU_QUOTA_US,
+                    cpu_period=_CONTAINER_CPU_PERIOD_US,
+                    pids_max=_CONTAINER_PIDS_LIMIT,
+                    timeout_seconds=30,
+                    credential=runner["credential"],
+                )
+            except Exception as startup_error:
+                service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
+                assert runner["credential"] not in service_log
+                service_detail = service_log[-12_000:] or "<launch-driver service log is empty>"
+                raise AssertionError(
+                    f"production launch-driver startup failed: {startup_error}; "
+                    f"service log tail:\n{service_detail}"
+                ) from startup_error
+        if cancel_after_start:
+            running_deadline = time.monotonic() + 30
+            durable = supervisor._sandbox_execution_get(attempt["id"])
+            while (
+                durable is not None
+                and durable["phase"] != "running"
+                and time.monotonic() < running_deadline
+            ):
+                time.sleep(0.05)
+                durable = supervisor._sandbox_execution_get(attempt["id"])
+            assert durable is not None and durable["phase"] == "running"
+            started_marker = Path(durable["workspace_root_path"]) / "launch-driver-started"
+            started_deadline = time.monotonic() + 5
+            while not _entry_is_present(started_marker) and time.monotonic() < started_deadline:
+                time.sleep(0.05)
+            assert _entry_is_present(started_marker), "bounded payload never entered its command"
+
+            wrong_credential_supervisor = GitSupervisor(repo)
+            with patch.object(
+                sandbox_monitor_lifecycle,
+                "reconnect_sandbox_monitor",
+                side_effect=AssertionError("invalid runner credential reached the monitor"),
+            ) as reconnect:
+                with pytest.raises(SupervisorError) as rejected:
+                    wrong_credential_supervisor.terminate_worker(
+                        attempt["id"], credential="not-the-enrolled-runner-credential"
+                    )
+                assert rejected.value.code == "runner_authentication_failed"
+                reconnect.assert_not_called()
+
+            context = multiprocessing.get_context("spawn")
+            result_receiver, result_sender = context.Pipe(duplex=False)
+            fresh_controller = context.Process(
+                target=_terminate_worker_from_fresh_process,
+                args=(repo, attempt["id"], runner["credential"], result_sender),
+            )
+            fresh_controller.start()
+            result_sender.close()
+            assert result_receiver.poll(20), "fresh controller did not receive a monitor response"
+            termination_result = result_receiver.recv()
+            fresh_controller.join(timeout=5)
+            assert not fresh_controller.is_alive()
+            assert fresh_controller.exitcode == 0
+            result_receiver.close()
+            assert termination_result[0] == "ok", termination_result
+            assert termination_result[1] != receipt.driver_pid
+            termination = termination_result[2]
+            assert termination_result[3:] == (1, 0)
+            assert termination["attempt_id"] == attempt["id"]
+            assert termination["execution_id"] == execution["execution_id"]
+            assert termination["stop_requested"] is True
+            assert termination["cleanup_verified"] is False
+            assert termination["monitor_phase"] in {"stopping", "exited"}
+
+        deadline = time.monotonic() + 30
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        while (
+            durable is not None
+            and durable["phase"] != "cleanup_reported"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+            durable = supervisor._sandbox_execution_get(attempt["id"])
+        service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
+        assert runner["credential"] not in service_log
+        assert durable is not None and durable["phase"] == "cleanup_reported", service_log
+        if not cancel_after_start:
+            assert durable["runc_exit_code"] == 0
+        else:
+            assert type(durable["runc_exit_code"]) is int
+            assert durable["runc_exit_code"] != 0
+        assert receipt.service_unit == service_unit
+        assert receipt.driver_pid == durable["launch_driver_pid"]
+        assert receipt.driver_identity == durable["launch_driver_identity"]
+        assert receipt.invocation_id == durable["launch_driver_invocation_id"]
+        assert receipt.control_group == durable["launch_driver_cgroup_path"]
+        assert receipt.control_group == (f"{durable['attempt_slice_cgroup_path']}/{service_unit}")
+        assert durable["wrapper_cgroup_path"] != durable["attempt_slice_cgroup_path"]
+        assert not Path(durable["wrapper_cgroup_path"]).is_relative_to(
+            Path(durable["attempt_slice_cgroup_path"])
+        )
+        assert (
+            Path(durable["cgroup_path"]).parent.as_posix() == durable["attempt_slice_cgroup_path"]
+        )
+        marker = Path(durable["workspace_root_path"]) / "launch-driver-marker"
+        if cancel_after_start:
+            assert _entry_is_present(Path(durable["workspace_root_path"]) / "launch-driver-started")
+            assert not _entry_is_present(marker)
+        else:
+            assert marker.read_text(encoding="ascii") == "production-driver-ran\n"
+        assert not _entry_is_present(source_worktree / "launch-driver-marker")
+        with supervisor.connect() as connection:
+            events = connection.execute(
+                "SELECT sequence, event_type FROM events "
+                "WHERE json_extract(payload_json, '$.execution_id') = ? "
+                "AND event_type IN (?, ?, ?, ?, ?, ?) ORDER BY sequence",
+                (
+                    execution["execution_id"],
+                    "sandbox.execution_launch_submission_authorized",
+                    "sandbox.execution_launched",
+                    "sandbox.execution_running",
+                    "sandbox.execution_stop_requested",
+                    "sandbox.execution_exited",
+                    "sandbox.execution_cleanup_reported",
+                ),
+            ).fetchall()
+        expected_events = [
+            "sandbox.execution_launch_submission_authorized",
+            "sandbox.execution_launched",
+            "sandbox.execution_running",
+        ]
+        if cancel_after_start:
+            expected_events.append("sandbox.execution_stop_requested")
+        expected_events.extend(["sandbox.execution_exited", "sandbox.execution_cleanup_reported"])
+        assert [row["event_type"] for row in events] == expected_events
+        assert len({row["sequence"] for row in events}) == len(expected_events)
+        with supervisor.connect() as connection:
+            event_bodies = "\n".join(
+                row[0]
+                for row in connection.execute(
+                    "SELECT payload_json FROM events "
+                    "WHERE json_extract(payload_json, '$.attempt_id') = ?",
+                    (attempt["id"],),
+                )
+            )
+        assert runner["credential"] not in event_bodies
+        assert runner["credential"].encode("utf-8") not in Path(supervisor.db_path).read_bytes()
+        assert not (Path(execution["state_path"]) / "launch-driver-request.json").exists()
+        assert durable["phase"] == "cleanup_reported"
+        assert durable["cleanup_receipt"]["version"] == 3
+        assert durable["cleanup_receipt"]["verification_status"] == "unverified"
+        action = durable["cleanup_receipt"]["action"]
+        assert action["operation"] == "runc-delete-force"
+        assert action["argv"] == [
+            str(runc_pin.path),
+            "--root",
+            str(state_root),
+            "delete",
+            "--force",
+            execution["container_id"],
+        ]
+        assert action["actor"]["pid"] == durable["launch_driver_pid"]
+        assert action["actor"]["identity"] == durable["launch_driver_identity"]
+        assert action["returncode"] == 0
+        assert action["state_entry_absent_immediately_after_delete"] is True
+        assert not (state_root / execution["container_id"]).exists()
+
+        verified = supervisor._sandbox_execution_verify_cleanup(
+            attempt["id"], attempt["claim_token"]
+        )
+        assert verified["phase"] == "cleanup_verified"
+        if cancel_after_start:
+            assert verified["runc_exit_code"] != 0
+            with supervisor.connect() as connection:
+                with pytest.raises(SupervisorError) as result_rejected:
+                    journal_module._require_sandbox_execution_result_eligible(
+                        connection, attempt["id"]
+                    )
+            assert result_rejected.value.code == "sandbox_result_unverified"
+        observations = verified["cleanup_verification"]["observations"]
+        assert all(item["absent"] for item in observations["processes"].values())
+        assert all(observations["cgroups"].values())
+        assert observations["paths"]["runc_state_entry_absent"] is True
+        assert observations["paths"]["monitor_socket"]["absent"] is True
+        assert not Path(durable["bundle_path"]).exists()
+        assert not state_root.exists()
+    finally:
+        driver_safe = _stop_attempted_units_and_check_quiescence(
+            systemctl, service_unit, service_start_attempted, slice_unit, slice_start_attempted
+        )
+        monitor_safe = _stop_attempted_units_and_check_quiescence(
+            systemctl, monitor_unit, monitor_start_attempted, None, False
+        )
+        safe_to_remove = driver_safe and monitor_safe
+        if safe_to_remove:
+            _remove_private_test_tree(run_root)
+        else:
+            pytest.fail(
+                "exact production-driver test units are not quiescent; preserving "
+                f"artifacts at {run_root}"
+            )
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--monitor-child":

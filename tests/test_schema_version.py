@@ -319,7 +319,7 @@ def test_v29_launch_driver_identity_migration_is_idempotent_and_authorization_ga
 
 
 def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
-    assert SCHEMA_VERSION == 31
+    assert SCHEMA_VERSION == 33
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -375,7 +375,7 @@ def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
 
 
 def test_v31_launch_driver_redemption_migration_is_idempotent_and_fences_submission() -> None:
-    assert SCHEMA_VERSION == 31
+    assert SCHEMA_VERSION == 33
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -438,6 +438,60 @@ def test_v31_launch_driver_redemption_migration_is_idempotent_and_fences_submiss
                 "UPDATE sandbox_executions SET phase = 'launched' WHERE attempt_id = ?",
                 ("attempt",),
             )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "encoded_receipt",
+    [
+        '{"version":3}',
+        '{"version":3.0}',
+        '{"version":3e0}',
+        '{"version":"3"}',
+        '{"version":true}',
+        '{"version":null}',
+        '{"version":2}',
+        "not-json",
+    ],
+)
+def test_v32_cleanup_report_migration_requires_scoped_provenance(
+    encoded_receipt: str,
+) -> None:
+    assert SCHEMA_VERSION == 33
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE sandbox_executions (attempt_id TEXT, claim_token INTEGER, "
+            "execution_id TEXT, phase TEXT, cleanup_receipt_json TEXT NOT NULL DEFAULT '{}')"
+        )
+        connection.execute(
+            "INSERT INTO sandbox_executions "
+            "(attempt_id, claim_token, execution_id, phase) "
+            "VALUES ('attempt', 1, 'execution', 'exited')"
+        )
+        migration = dict(MIGRATIONS)[32]
+        migration(connection)
+        migration(connection)
+        connection.create_function("acp_sandbox_cleanup_action_authorized", 4, lambda *_fields: 0)
+        connection.create_function("acp_sandbox_cleanup_report_authorized", 4, lambda *_fields: 0)
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="sandbox_execution_cleanup_receipt_provenance_required",
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'cleanup_reported', "
+                "cleanup_receipt_json = ? WHERE attempt_id = 'attempt'",
+                (encoded_receipt,),
+            )
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'sandbox_execution_cleanup_action_receipt_guard'"
+        ).fetchone()
+        assert trigger is not None
+        assert "acp_sandbox_cleanup_action_authorized" in trigger[0]
+        assert "acp_sandbox_cleanup_report_authorized" in trigger[0]
     finally:
         connection.close()
 

@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 33
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -2218,6 +2218,143 @@ def _add_sandbox_launch_driver_start_redemption(connection: sqlite3.Connection) 
     )
 
 
+def _require_pinned_runc_cleanup_action_receipt(connection: sqlite3.Connection) -> None:
+    """Require process-local provenance for every new cleanup report.
+
+    Historical v1/v2 reports remain readable for migration/replay compatibility.
+    New v2 reports are only unverified journal records and require the exact
+    journal-writer capability. A v3 report additionally requires a registered
+    exact pinned-runc delete receipt scoped to its canonical payload.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns or "cleanup_receipt_json" not in columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before cleanup action provenance migration"
+        )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_cleanup_action_receipt_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_cleanup_action_receipt_guard
+        BEFORE UPDATE OF cleanup_receipt_json, phase ON sandbox_executions
+        WHEN OLD.phase = 'exited' AND NEW.phase = 'cleanup_reported'
+          AND (OLD.cleanup_receipt_json IS NOT NEW.cleanup_receipt_json
+            OR OLD.phase IS NOT NEW.phase)
+          AND NOT (
+            CASE
+              WHEN json_valid(NEW.cleanup_receipt_json) THEN
+                CASE
+                  WHEN json_type(NEW.cleanup_receipt_json, '$.version')
+                        IN ('integer', 'real')
+                    AND json_extract(NEW.cleanup_receipt_json, '$.version') = 3
+                  THEN acp_sandbox_cleanup_action_authorized(
+                    OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+                    NEW.cleanup_receipt_json
+                  ) = 1
+                  ELSE acp_sandbox_cleanup_report_authorized(
+                    OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+                    NEW.cleanup_receipt_json
+                  ) = 1
+                END
+              ELSE acp_sandbox_cleanup_report_authorized(
+                OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+                NEW.cleanup_receipt_json
+              ) = 1
+            END
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_cleanup_receipt_provenance_required');
+        END
+        """
+    )
+
+
+def _require_independent_sandbox_cleanup_verification(connection: sqlite3.Connection) -> None:
+    """Guard the only transition that can certify final sandbox cleanup.
+
+    The journal's cleanup action receipt is explicitly unverified. This migration
+    adds a separate write-once verifier receipt and makes its process-local
+    authorization mandatory for ``cleanup_reported -> cleanup_verified``.
+    Historical rows remain readable and receive the empty sentinel.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before independent cleanup verification migration"
+        )
+    if "cleanup_verification_json" not in columns:
+        connection.execute(
+            "ALTER TABLE sandbox_executions ADD COLUMN cleanup_verification_json "
+            "TEXT NOT NULL DEFAULT '{}'"
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_phase_transition")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_phase_transition
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase != NEW.phase AND NOT (
+          (OLD.phase = 'reserved' AND NEW.phase IN ('launched', 'ambiguous'))
+          OR (OLD.phase = 'launched' AND NEW.phase IN ('running', 'stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'running' AND NEW.phase IN ('stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'stopping' AND NEW.phase IN ('exited', 'ambiguous'))
+          OR (OLD.phase = 'exited' AND NEW.phase IN ('cleanup_reported', 'ambiguous'))
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'ambiguous')
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_verified'
+            AND OLD.cleanup_verification_json = '{}'
+            AND NEW.cleanup_verification_json != '{}'
+            AND length(NEW.cleanup_verification_json) <= 65536
+            AND json_valid(NEW.cleanup_verification_json)
+            AND json_type(NEW.cleanup_verification_json, '$.version') = 'integer'
+            AND json_extract(NEW.cleanup_verification_json, '$.version') = 1
+            AND acp_sandbox_cleanup_verification_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.cleanup_verification_json
+            ) = 1)
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_phase_transition_invalid');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_cleanup_verification_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_cleanup_verification_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.cleanup_verification_json != '{}'
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_cleanup_verification_must_be_written_after_observation');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_cleanup_verification_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_cleanup_verification_write_once
+        BEFORE UPDATE OF cleanup_verification_json ON sandbox_executions
+        WHEN OLD.cleanup_verification_json IS NOT NEW.cleanup_verification_json
+          AND NOT (
+            OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_verified'
+            AND OLD.cleanup_verification_json = '{}'
+            AND NEW.cleanup_verification_json != '{}'
+            AND length(NEW.cleanup_verification_json) <= 65536
+            AND json_valid(NEW.cleanup_verification_json)
+            AND json_type(NEW.cleanup_verification_json, '$.version') = 'integer'
+            AND json_extract(NEW.cleanup_verification_json, '$.version') = 1
+            AND acp_sandbox_cleanup_verification_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.cleanup_verification_json
+            ) = 1
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_cleanup_verification_provenance_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -2249,6 +2386,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     (29, _add_sandbox_launch_driver_process_identity),
     (30, _add_sandbox_launch_driver_start_intent),
     (31, _add_sandbox_launch_driver_start_redemption),
+    (32, _require_pinned_runc_cleanup_action_receipt),
+    (33, _require_independent_sandbox_cleanup_verification),
 )
 
 

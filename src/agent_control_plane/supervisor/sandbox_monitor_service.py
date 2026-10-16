@@ -2,9 +2,10 @@
 
 This starts a per-execution monitor service outside the worker slice after a
 trusted launcher has durably recorded the exact scope identity. It owns status
-and cancellation of that one scope and survives supervisor exit. It does not
-launch candidate code, recover a missing control key, or enable ``run_worker``.
-The separate launch-driver producer is not yet integrated.
+and cancellation of that one scope and survives supervisor exit. The separate
+in-slice launch-driver owns candidate launch, its process-local handle, and
+wait/reap/cleanup after the scope is stopped. Neither service enables
+``run_worker`` or recovers a missing control key.
 """
 
 from __future__ import annotations

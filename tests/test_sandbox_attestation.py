@@ -698,16 +698,25 @@ def test_cgroup_resource_reader_rejects_symlinked_control_file(
 
 
 @pytest.mark.parametrize(
-    ("filesystem", "accepted"),
-    [(b"cgroup2", True), (b"cgroup", False)],
+    ("mount_root", "filesystem", "accepted"),
+    [
+        (b"/", b"cgroup2", True),
+        (b"/", b"cgroup", False),
+        (b"/delegated", b"cgroup2", False),
+    ],
 )
 def test_cgroup_root_mount_must_be_cgroup_v2(
-    monkeypatch: pytest.MonkeyPatch, filesystem: bytes, accepted: bool
+    monkeypatch: pytest.MonkeyPatch,
+    mount_root: bytes,
+    filesystem: bytes,
+    accepted: bool,
 ) -> None:
     monkeypatch.setattr(
         sandbox_attestation,
         "_read_proc_file",
-        lambda _path: b"36 25 0:32 / /sys/fs/cgroup rw - " + filesystem + b" cgroup rw\n",
+        lambda _path: (
+            b"36 25 0:32 " + mount_root + b" /sys/fs/cgroup rw - " + filesystem + b" cgroup rw\n"
+        ),
     )
 
     if accepted:

@@ -27,6 +27,30 @@ retaining that gate. No `run_worker` path yet connects launch to the durable
 journal, runtime attestation, cleanup verification, or result import. This
 record does not authorize `externalSandbox` for ACP workers.
 
+**Cleanup-verification update (2026-10-16):** The supervisor-owned verifier is
+now implemented in source and wired into reaper recovery for eligible
+`cleanup_reported` attempts. Schema 33 stores a separate write-once receipt;
+the verifier checks the exact service invocations, process identities, cgroup
+trees, runc state entry, mount table, and inode-bound private paths, then
+rechecks process/cgroup/systemd state after deleting only the recorded bundle
+and state trees. Unit tests and a mocked OS/SQLite integration test pass. The
+exact production-launcher integration also passed in both natural-completion
+and fresh-supervisor cancellation modes on disposable Debian 12 ARM64 / Linux
+6.1 / systemd 252.39 with cgroup v2 and pinned runc 1.5.2; each run reached
+`cleanup_verified` after live process, unit, invocation, cgroup, runc-state,
+private-path, and monitor-socket checks. The cancelled run's nonzero runc exit
+remains ineligible for result import. A positive `reap_expired()` regression now
+calls the real cleanup verifier and proves successful terminal resource-fence
+release using deterministic mocked OS observations and a runtime-teardown
+double; live reaper recovery itself remains untested. Exact-head hosted CI is
+still pending.
+Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
+mount-root mapping, and cleanup removes only the exact execution-bound monitor
+socket beneath the verified private runtime directory. OCI `run_worker()` and
+result import remain unintegrated and fail-closed. This current status supersedes older statements below that no
+verifier implementation or reaper retry path exists; historical run results
+remain scoped to the source hashes actually tested.
+
 **Current launch ownership decision (2026-10-16):** Use the two-service
 topology in [`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): the exact
 launch-driver service sits inside the attempt slice and owns the process-local
@@ -40,9 +64,15 @@ The PIDs attachment helper is an unselected experiment only; it does not itself
 prove or retain the private launcher's exec gate, which remains a caller
 precondition. Independent review gave the revised two-service ownership ADR
 **GO** on 2026-10-16; this is decision-level approval, not implementation or
-lifecycle acceptance. Production launch-driver producer, monitor-to-driver IPC,
-and end-to-end lifecycle proof remain pending; OCI worker execution stays
-fail-closed.
+lifecycle acceptance. The production launch-driver producer, bounded
+pinned-runc path, and fresh-process cancellation branch have disposable
+Debian/systemd evidence. The supervisor-owned cleanup verifier has now passed
+live OS observations for both natural completion and cancellation; the
+automatic reaper retry and fence release have source plus mocked OS/SQLite
+regression coverage; live reaper recovery remains untested. Exact-head hosted
+CI is still pending, including its reaper recovery path.
+Full end-to-end lifecycle proof and `run_worker()` integration remain pending;
+OCI worker execution stays fail-closed.
 
 ## Codex adapter contract (2026-10-15; OpenAI Docs)
 
@@ -1007,16 +1037,15 @@ separately covered by the spawned no-model supervisor regression above.
 ### Cleanup proof boundary (2026-10-11; architecture/QC decision)
 
 Do not add an observer that writes `cleanup_verified` from absence checks alone.
-The current `cleanup_reported` receipt is an identity-bound template: its
-observations are null, and it contains no trusted receipt for the exact pinned
-`runc delete` invocation or its exit. `runc --root` selects the runtime state
+The current cleanup observations are still null; an action receipt is not a
+post-stop absence proof. `runc --root` selects the runtime state
 store, while `runc state` and `runc list` are read commands; absence from a later query does
 not prove which actor performed deletion or that no actor can recreate state
 before the journal commit. The command semantics are documented by upstream
 [runc](https://github.com/opencontainers/runc/blob/main/man/runc.8.md) and
 [runc-delete](https://github.com/opencontainers/runc/blob/main/man/runc-delete.8.md).
 Bind the delete action, kernel wait result, and post-delete observations to the
-same fenced monitor execution; no observation-only receipt may release the
+same fenced launch-driver execution; no observation-only receipt may release the
 attempt fence.
 
 Systemd absence checks must also be conjunctive. `systemctl show` can succeed
@@ -1041,10 +1070,48 @@ after the monitor has durably recorded its exact delete/wait outcome and can no
 longer launch, stop, or recreate execution resources for that fencing epoch.
 Serialize final verification and the immutable proof-digest journal transition
 against that owner; inject crashes and state/unit ABA changes between delete,
-observation, and commit. Until this owner/serialization path exists, keep
-`cleanup_verified` transitions guarded and OCI `run_worker` fail-closed. This
-decision deliberately does not add a cleanup collector: a typed snapshot would
-not solve the missing action provenance or close the probe-to-commit race.
+observation, and commit. The supervisor-owned verifier now provides this
+owner/serialization path and has passed a live disposable-systemd cleanup run.
+Keep OCI `run_worker` fail-closed: cleanup proof is not worker integration.
+This decision does not treat an absence snapshot as sufficient; action
+provenance and owner serialization are both required to close the
+probe-to-commit race.
+
+### Pinned-runc delete action, cancellation, and cleanup verification (2026-10-16)
+
+The production launch-driver now waits for the exact pinned-runc client to be
+reaped, then invokes the verified executable by held FD with the exact
+`--root <state> delete --force <container>` arguments. It records a v3
+`cleanup_reported` receipt only after bounded command wait succeeds and the
+container-state entry is immediately observed absent. Schema 32 scopes this
+receipt write to a process-local capability bound to the exact execution tuple,
+driver identity, executable digest/version, argv digest, and state-root inode.
+The report remains `verification_status=unverified`; the final observation
+fields remain null. It does not release fences or authorize result import.
+
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in
+both natural-completion and `ACP_LIVE_CANCEL_AFTER_START=1` modes (`1 passed`
+each) on disposable Debian 12 ARM64, Linux 6.1.0-53, systemd 252.39, Python
+3.11.2, cgroup v2, rootless pinned runc 1.5.2, and BusyBox 1.35.0. The
+cancellation mode used a spawned fresh controller (no process-local handle
+registry): an invalid runner credential was rejected before monitor contact,
+then the real reconnect path authenticated once, rejected any legacy PID
+fallback, and stopped the exact journal-bound scope. The driver waited/reaped
+and wrote `cleanup_reported`; the payload start marker existed and its
+completion marker did not. The independent verifier then checked process,
+unit/invocation, cgroup, runc-state, private-path, and monitor-socket absence
+and advanced the execution to `cleanup_verified`. Cancellation produced a
+nonzero runc exit, which remains ineligible for result import. No model/provider
+credential, network egress, or paid call was used. Host and guest hashes
+matched for the production/test sources listed in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md). Postflight found no active
+matching services or attempt slices, payload process, or
+`acp-live-launch-driver-*` fixture root.
+
+The obsolete direct-monitor live fixture is skipped until it is rebuilt around
+exact launch-driver redemption. Crash-recovery/ABA injection and exact-head
+hosted CI remain pending. Result import and `run_worker()` remain out of scope
+and fail-closed.
 
 **Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
 systemd documents that `ExecStopPost=` also runs after unexpected service exit.
@@ -1054,7 +1121,7 @@ the hook under `<unit-cgroup>/.control`; systemd may place delegated hooks there
 Only after the hook and wait returned
 did `systemctl show` report `LoadState=not-found`, `ActiveState=inactive`,
 `MainPID=0`, and empty `ControlGroup` and `InvocationID`. Thus `ExecStopPost=`
-cannot certify that its own unit or cgroup is absent. The monitor main process
+cannot certify that its own unit or cgroup is absent. The launch-driver process
 must durably persist an immutable receipt for its pinned `runc delete` action
 and wait result before exiting. A finalizer must run after the complete stop
 job (including any `ExecStopPost=`) returns, verify the pre-bound unit/process
@@ -1348,11 +1415,15 @@ records `cleanup_verified`.
 This is only a fail-closed hold: the reaper does not stop a live container or
 perform cancellation/restart recovery for this journal-only slice. Ambiguous
 journal state moves the attempt to quarantine and extends its resource fences.
-No application method currently writes `cleanup_verified`, so this work cannot
-enable or complete an OCI worker sandbox; attempts with such journal rows remain
-intentionally fenced pending separate executor, targeted-stop, recovery, and
-verifier work. The legacy `attempts.pid` slot remains reserved for direct workers;
-a future sandbox monitor must use a distinct journal-backed registration path.
+At the time this historical entry was written no application method wrote
+`cleanup_verified`. Later updates at the top of this document add the
+supervisor-owned writer and record live Linux/systemd cleanup-verifier runs.
+The positive reaper retry/fence-release path has deterministic mocked
+OS/SQLite coverage, but no live end-to-end reaper recovery or exact-head hosted
+CI result is claimed here.
+OCI worker execution remains fail-closed pending that acceptance and separate
+worker-path integration. The legacy `attempts.pid` slot remains reserved for
+direct workers; sandbox supervision uses a distinct journal-backed path.
 Result import, import recovery, and submission also fail closed for a journaled
 attempt unless the recorded runc exit code is zero and cleanup is independently
 verified. A caller-supplied cleanup report is not sufficient; legacy attempts
@@ -1408,14 +1479,16 @@ workspace and again before persisting the candidate; `cleanup_reported` alone
 is rejected without writing a receipt. This closes the supported-API path that
 could run while cleanup was still unverified and a surviving process might
 still mutate the workspace. Schema 27 migrates the write-once SQLite trigger
-to enforce the same `cleanup_verified` phase. There is still no production writer for
-`cleanup_verified`, so production candidate capture remains unavailable. Tests
-that exercise downstream capture/import deliberately synthesize that phase by
-dropping the transition trigger and remove the private bundle/state directories;
-they are not verifier, monitor, or live-runtime evidence. A future verifier
-must establish durable workspace quiescence and bind its own immutable proof
-digest to candidate/import evidence before this gate can become reachable in
-production. The unkeyed cleanup-report digest remains insufficient for that
+to enforce the same `cleanup_verified` phase. At this historical point, no
+production writer existed. The supervisor-owned verifier is now implemented
+and source-tested, but production candidate capture remains unavailable until
+live Linux/systemd and exact-head hosted CI acceptance, plus worker-path
+integration. Tests that exercise downstream capture/import deliberately
+synthesize that phase by dropping the transition trigger and remove the private
+bundle/state directories; they are not verifier, monitor, or live-runtime
+evidence. Live acceptance must establish durable workspace quiescence and bind
+its immutable proof digest to candidate/import evidence before this gate can be
+considered production-ready. The unkeyed cleanup-report digest remains insufficient for that
 purpose.
 
 For journaled sandbox attempts, import, recovery, and submission require a
