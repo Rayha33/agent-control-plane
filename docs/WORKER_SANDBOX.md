@@ -54,8 +54,9 @@ separate positive reaper regression continues to cover failed verification
 with deterministic mocked OS
 observations. Run 38875452816 exposed the `/private/tmp` cross-platform fixture
 defect; the correction passed the four exact-head Ubuntu/macOS × Python 3.11/3.12
-jobs for `0ce4dc4`. This incremental producer-loss change still needs its own
-exact-head hosted CI run.
+jobs for `0ce4dc4`. The producer-loss/no-replay increment then passed all four
+jobs in [exact-head run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
+on code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
 socket beneath the verified private runtime directory. OCI `run_worker()` and
@@ -83,7 +84,9 @@ live natural-completion and cancellation runs both exercise automatic reaper
 verification and runtime/fence release after a synthetic lease expiry, with
 the reaper running in a fresh spawned supervisor process. The test harness
 itself is not restarted, and there is no full supervisor-daemon restart proof.
-Exact-head hosted CI for the incremental producer-loss change remains pending.
+Exact-head hosted CI run 38884017803 passed all four Ubuntu/macOS × Python
+3.11/3.12 jobs for code-bearing commit
+`2383221c1a84cf52c08f42043465baea2ed4d487`.
 Full end-to-end lifecycle proof and `run_worker()` integration remain pending;
 OCI worker execution stays fail-closed.
 

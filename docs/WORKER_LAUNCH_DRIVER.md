@@ -22,7 +22,9 @@ process that exits abruptly after the durable handoff receipt; fresh spawned
 supervisor processes perform cancellation (when requested) and reaping. The
 original pytest harness remains alive, so this proves producer-process loss
 after handoff—not a full supervisor-daemon restart or a crash during handoff.
-Full passing exact-head hosted CI is still pending, and result import is not
+The code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487` passed
+[exact-head hosted CI run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
+with all four Ubuntu/macOS × Python 3.11/3.12 jobs green. Result import is not
 connected to the worker.
 `cleanup_verified` certifies resource cleanup, not worker success; every result
 consumer continues to require runc exit code 0. Configured OCI
@@ -304,10 +306,12 @@ action receipt, exact process/unit/cgroup/state/path absence checks, and
 fresh-process reaper-driven `cleanup_verified` plus runtime/fence release on
 this guest. It does not prove full supervisor-daemon restart recovery, manager
 restart/logout/reboot recovery, crash during handoff, result import, provider
-access, or `run_worker()` enablement. Exact-head hosted CI remains pending. The
-older direct-monitor lifecycle fixture is explicitly skipped because it
-predates exact launch-driver redemption; it must be rebuilt around
-the production start API before it can be re-enabled.
+access, or `run_worker()` enablement. Exact-head hosted CI run 38884017803
+passed all four Ubuntu/macOS × Python 3.11/3.12 jobs for code-bearing commit
+`2383221c1a84cf52c08f42043465baea2ed4d487`. The older direct-monitor lifecycle
+fixture is explicitly skipped because it predates exact launch-driver
+redemption; it must be rebuilt around the production start API before it can
+be re-enabled.
 
 The exact source and integration-test files below were SHA-256 matched between
 this worktree and the disposable guest before the passing run:
@@ -349,9 +353,12 @@ and the supervisor-owned post-stop verifier are implemented in source. The
 verifier serializes against the execution owner, requires the durable delete
 action and kernel-wait receipts, then checks exact process/unit/invocation/cgroup,
 container, and path identities before writing `cleanup_verified`. Natural and
-cancelled runs both passed the live verifier on the disposable Debian guest;
-hosted exact-head CI remains pending. If any evidence is incomplete or the
-driver dies before action/wait receipts are durable, keep the execution fenced.
+cancelled runs both passed the live verifier on the disposable Debian guest.
+The 2026-10-16 producer-loss/no-replay increment passed exact-head hosted CI on
+code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`; this does not
+replace the separate live lifecycle evidence. If any evidence is incomplete or
+the driver dies before action/wait receipts are durable, keep the execution
+fenced.
 The existing `run_worker()` refusal must remain unchanged.
 
 The opt-in disposable Linux/systemd test must use the real pinned launcher for
