@@ -1469,10 +1469,11 @@ supervisor-owned writer and record live Linux/systemd cleanup-verifier runs.
 The positive reaper retry/fence-release path has deterministic mocked
 OS/SQLite coverage. At the time this historical entry was written there was no
 live end-to-end reaper recovery result; the later pinned-runc launch-driver
-section above records the 2026-10-16 live reaper proof. Exact-head hosted CI
-remains a separate gate.
-OCI worker execution remains fail-closed pending that acceptance and separate
-worker-path integration. The legacy `attempts.pid` slot remains reserved for
+section above records the 2026-10-16 live reaper proof. At the time this
+historical entry was written, exact-head hosted CI remained a separate gate;
+the passing 2026-10-16 runs are recorded above. OCI worker execution remains
+fail-closed pending registered worker-path integration and the other open
+#2370 gates. The legacy `attempts.pid` slot remains reserved for
 direct workers; sandbox supervision uses a distinct journal-backed path.
 Result import, import recovery, and submission also fail closed for a journaled
 attempt unless the recorded runc exit code is zero and cleanup is independently
