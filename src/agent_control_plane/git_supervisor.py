@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1965,6 +1965,83 @@ def _add_sandbox_launch_driver_process_identity(connection: sqlite3.Connection) 
     )
 
 
+def _add_sandbox_launch_driver_start_intent(connection: sqlite3.Connection) -> None:
+    """Persist one pre-activation intent for the exact launch-driver service.
+
+    The marker is write-once and deliberately distinct from the later runc
+    submission. If systemd activation has an uncertain outcome, a controller
+    must reconcile the exact unit or retain the execution fence; it cannot
+    manufacture a second start intent.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-driver start-intent migration"
+        )
+    additions = (
+        ("launch_driver_start_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_at", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_unit", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_launch_driver_start_insert_guard",
+        "sandbox_launch_driver_start_write_once",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_start_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_driver_start_id != ''
+          OR NEW.launch_driver_start_digest != ''
+          OR NEW.launch_driver_start_at != ''
+          OR NEW.launch_driver_start_unit != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_start_must_follow_reservation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_start_write_once
+        BEFORE UPDATE OF launch_driver_start_id, launch_driver_start_digest,
+          launch_driver_start_at, launch_driver_start_unit ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND OLD.launch_driver_start_id = ''
+          AND OLD.launch_driver_start_digest = ''
+          AND OLD.launch_driver_start_at = ''
+          AND OLD.launch_driver_start_unit = ''
+          AND OLD.launch_submission_id = ''
+          AND OLD.launch_plan_required = 1
+          AND OLD.workspace_binding_version = 1
+          AND OLD.private_path_binding_version = 1
+          AND length(NEW.launch_driver_start_id) = 32
+          AND NEW.launch_driver_start_id NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_driver_start_digest) = 64
+          AND NEW.launch_driver_start_digest NOT GLOB '*[^0-9a-f]*'
+          AND length(NEW.launch_driver_start_at) BETWEEN 1 AND 64
+          AND NEW.launch_driver_start_unit = 'acp-launch-driver-' || OLD.execution_id || '.service'
+          AND acp_sandbox_launch_driver_start_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            NEW.launch_driver_start_id, NEW.launch_driver_start_digest,
+            NEW.launch_driver_start_unit
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_start_must_be_authorized_once');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1994,6 +2071,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (27, _require_verified_cleanup_before_candidate_capture),
     (28, _add_sandbox_launch_submission_receipt),
     (29, _add_sandbox_launch_driver_process_identity),
+    (30, _add_sandbox_launch_driver_start_intent),
 )
 
 

@@ -69,6 +69,7 @@ from .sandbox_workspace import _snapshot_origin as _snapshot_origin
 from .sandbox_workspace import collect_changes as _collect_changes
 from .store import (
     _authorize_sandbox_exit_receipt_write,
+    _authorize_sandbox_launch_driver_start_write,
     _authorize_sandbox_launch_plan_write,
     _authorize_sandbox_launch_submission_write,
     _authorize_sandbox_reservation_write,
@@ -168,6 +169,76 @@ class _SandboxLaunchSubmission:
     execution_id: str
     submission_id: str
     submission_digest: str
+
+
+@dataclass(eq=False, frozen=True, slots=True, weakref_slot=True)
+class _SandboxLaunchDriverStartIntent:
+    """Process-local capability for one durable pre-activation driver intent."""
+
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    start_id: str
+    start_digest: str
+    service_unit: str
+
+
+_SANDBOX_LAUNCH_DRIVER_START_INTENTS: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[_SandboxLaunchDriverStartIntent],
+        tuple[str, int, str, str, str, str],
+    ],
+] = {}
+_SANDBOX_LAUNCH_DRIVER_START_INTENTS_LOCK = threading.Lock()
+
+
+def _register_sandbox_launch_driver_start_intent(
+    intent: _SandboxLaunchDriverStartIntent,
+) -> None:
+    key = id(intent)
+    fields = (
+        intent.attempt_id,
+        intent.claim_token,
+        intent.execution_id,
+        intent.start_id,
+        intent.start_digest,
+        intent.service_unit,
+    )
+
+    def discard(reference: weakref.ReferenceType[_SandboxLaunchDriverStartIntent]) -> None:
+        with _SANDBOX_LAUNCH_DRIVER_START_INTENTS_LOCK:
+            current = _SANDBOX_LAUNCH_DRIVER_START_INTENTS.get(key)
+            if current is not None and current[0] is reference:
+                _SANDBOX_LAUNCH_DRIVER_START_INTENTS.pop(key, None)
+
+    reference = weakref.ref(intent, discard)
+    with _SANDBOX_LAUNCH_DRIVER_START_INTENTS_LOCK:
+        _SANDBOX_LAUNCH_DRIVER_START_INTENTS[key] = (reference, fields)
+
+
+def _sandbox_launch_driver_start_intent_is_self_consistent(
+    intent: Any,
+    *,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    start_digest: str,
+    service_unit: str,
+) -> bool:
+    if type(intent) is not _SandboxLaunchDriverStartIntent:
+        return False
+    expected = (
+        attempt_id,
+        claim_token,
+        execution_id,
+        intent.start_id,
+        start_digest,
+        service_unit,
+    )
+    with _SANDBOX_LAUNCH_DRIVER_START_INTENTS_LOCK:
+        registered = _SANDBOX_LAUNCH_DRIVER_START_INTENTS.get(id(intent))
+        return registered is not None and registered[0]() is intent and registered[1] == expected
 
 
 _SANDBOX_LAUNCH_SUBMISSIONS: dict[
@@ -307,6 +378,38 @@ def _sandbox_launch_driver_service_unit(execution_id: str) -> str:
     if not isinstance(execution_id, str) or not _COMPONENT.fullmatch(execution_id):
         raise SupervisorError("sandbox_execution_invalid", "execution ID is invalid")
     return f"acp-launch-driver-{execution_id}.service"
+
+
+def _sandbox_launch_driver_start_digest(row: Any, service_unit: str) -> str:
+    """Bind a start intent to the exact tuple, service name, and private roots."""
+
+    payload = {
+        "attempt_id": row["attempt_id"],
+        "claim_token": row["claim_token"],
+        "execution_id": row["execution_id"],
+        "service_unit": service_unit,
+        "container_id": row["container_id"],
+        "bundle_digest": row["bundle_digest"],
+        "rootfs_digest": row["rootfs_digest"],
+        "rootfs_closure_digest": row["rootfs_closure_digest"],
+        "runc_executable_digest": row["runc_executable_digest"],
+        "bundle": {
+            "path": row["bundle_path"],
+            "device": row["bundle_root_dev"],
+            "inode": row["bundle_root_ino"],
+        },
+        "state": {
+            "path": row["state_path"],
+            "device": row["state_root_dev"],
+            "inode": row["state_root_ino"],
+        },
+        "workspace": {
+            "path": row["workspace_root_path"],
+            "device": row["workspace_root_dev"],
+            "inode": row["workspace_root_ino"],
+        },
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def _sandbox_execution_launch_stop_reason(
@@ -1890,6 +1993,141 @@ class SandboxExecutionJournalMixin:
                 "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
             ).fetchone()
         return self._sandbox_execution_view(updated)
+
+    def _sandbox_execution_authorize_launch_driver_start(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        *,
+        credential: str | None = None,
+    ) -> _SandboxLaunchDriverStartIntent:
+        """Commit the sole driver-service start intent before systemd activation.
+
+        A repeated call is not a retry: the first caller may have crossed the
+        systemd boundary before losing its response. Until an exact adoption
+        path exists, that outcome must remain fenced rather than creating a
+        second driver activation.
+        """
+
+        attempt_id = self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if attempt["status"] != "working":
+                raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+            self._authenticate_attempt(connection, attempt, credential)
+            if attempt["pid"] is not None or attempt["launch_owner_pid"] is not None:
+                raise SupervisorError(
+                    "worker_already_running",
+                    "launch-driver start cannot be authorized beside a direct worker",
+                )
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise SupervisorError("sandbox_execution_not_found", "execution was not reserved")
+            if row["claim_token"] != claim_token:
+                raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
+            if row["phase"] != "reserved":
+                raise SupervisorError(
+                    "sandbox_execution_transition_invalid",
+                    f"expected phase reserved, found {row['phase']}; fence retained",
+                )
+            if any(
+                row[name]
+                for name in (
+                    "launch_driver_start_id",
+                    "launch_driver_start_digest",
+                    "launch_driver_start_at",
+                    "launch_driver_start_unit",
+                )
+            ):
+                raise SupervisorError(
+                    "sandbox_launch_driver_start_ambiguous",
+                    "this execution already consumed its only launch-driver start intent; reconcile the exact unit or retain its fence",
+                )
+            if (
+                row["launch_plan_required"] != 1
+                or row["workspace_binding_version"] != 1
+                or row["private_path_binding_version"] != 1
+            ):
+                raise SupervisorError(
+                    "sandbox_launch_driver_start_unprepared",
+                    "launch-driver start requires pinned runtime, workspace, and private path bindings",
+                )
+            if row["launch_submission_id"] or row["launch_submission_at"]:
+                raise SupervisorError(
+                    "sandbox_execution_launch_submission_exists",
+                    "runc launch submission already exists before launch-driver activation",
+                )
+
+            service_unit = _sandbox_launch_driver_service_unit(row["execution_id"])
+            start_id = uuid.uuid4().hex
+            start_digest = _sandbox_launch_driver_start_digest(row, service_unit)
+            intent = _SandboxLaunchDriverStartIntent(
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                execution_id=row["execution_id"],
+                start_id=start_id,
+                start_digest=start_digest,
+                service_unit=service_unit,
+            )
+            _register_sandbox_launch_driver_start_intent(intent)
+            stamp = utc_now()
+            try:
+                with _authorize_sandbox_launch_driver_start_write(
+                    connection,
+                    attempt_id,
+                    claim_token,
+                    row["execution_id"],
+                    start_id,
+                    start_digest,
+                    service_unit,
+                ):
+                    changed = connection.execute(
+                        "UPDATE sandbox_executions SET launch_driver_start_id = ?, "
+                        "launch_driver_start_digest = ?, launch_driver_start_at = ?, "
+                        "launch_driver_start_unit = ?, updated_at = ? "
+                        "WHERE attempt_id = ? AND claim_token = ? AND phase = 'reserved' "
+                        "AND launch_driver_start_id = '' AND launch_driver_start_digest = '' "
+                        "AND launch_driver_start_at = '' AND launch_driver_start_unit = ''",
+                        (
+                            start_id,
+                            start_digest,
+                            stamp,
+                            service_unit,
+                            stamp,
+                            attempt_id,
+                            claim_token,
+                        ),
+                    ).rowcount
+                if changed != 1:
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "launch-driver start intent changed concurrently; attempt fence retained",
+                    )
+                self._event(
+                    connection,
+                    "sandbox.execution_launch_driver_start_authorized",
+                    attempt["agent_id"],
+                    {
+                        "attempt_id": attempt_id,
+                        "claim_token": claim_token,
+                        "execution_id": row["execution_id"],
+                        "start_id": start_id,
+                        "start_digest": start_digest,
+                        "service_unit": service_unit,
+                        "boundary": "before_systemd_activation",
+                    },
+                )
+            except BaseException:
+                with _SANDBOX_LAUNCH_DRIVER_START_INTENTS_LOCK:
+                    registered = _SANDBOX_LAUNCH_DRIVER_START_INTENTS.get(id(intent))
+                    if registered is not None and registered[0]() is intent:
+                        _SANDBOX_LAUNCH_DRIVER_START_INTENTS.pop(id(intent), None)
+                raise
+        return intent
 
     def _sandbox_execution_authorize_launch_submission(
         self,

@@ -114,6 +114,16 @@ either process-local capability would invalidate that contract.
 
 ## Evidence and non-evidence
 
+Schema 30 now provides a journal primitive for recording exactly one
+launch-driver service start intent before systemd activation. The write-once
+receipt binds the attempt/claim/execution tuple, derived driver unit, pinned
+runtime, and inode-bound private bundle/state/workspace roots. A repeated call
+returns an ambiguity error and cannot mint a second intent. This is only the
+durable pre-activation marker: the production systemd producer, exact unit
+adoption/reconciliation, driver-side redemption, and live lifecycle remain
+unimplemented. No current caller starts a launch-driver service from this
+receipt, so it is not evidence that a worker can be launched.
+
 The independent review of the prior ADR found a blocking mismatch: it placed the
 handle-owning monitor outside the attempt slice and proposed migrating attestation
 from the exact launch-driver service to a runc-client scope. Independent review

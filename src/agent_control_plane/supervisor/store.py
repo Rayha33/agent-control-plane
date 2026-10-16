@@ -147,6 +147,9 @@ _SANDBOX_LAUNCH_PLAN_AUTHORIZATION: ContextVar[
 _SANDBOX_LAUNCH_SUBMISSION_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str]] | None
 ] = ContextVar("acp_sandbox_launch_submission_authorization", default=None)
+_SANDBOX_LAUNCH_DRIVER_START_AUTHORIZATION: ContextVar[
+    tuple[int, tuple[str, int, str, str, str, str]] | None
+] = ContextVar("acp_sandbox_launch_driver_start_authorization", default=None)
 _SANDBOX_RESERVATION_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str]] | None
 ] = ContextVar("acp_sandbox_reservation_authorization", default=None)
@@ -350,6 +353,57 @@ def _sandbox_launch_submission_authorized_for(connection: sqlite3.Connection):
 
 
 @contextmanager
+def _authorize_sandbox_launch_driver_start_write(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+    claim_token: int,
+    execution_id: str,
+    start_id: str,
+    start_digest: str,
+    service_unit: str,
+) -> Iterator[None]:
+    """Scope the one-shot systemd launch-driver intent to one execution tuple."""
+
+    fields = (attempt_id, claim_token, execution_id, start_id, start_digest, service_unit)
+    token = _SANDBOX_LAUNCH_DRIVER_START_AUTHORIZATION.set(
+        (_store_connection_identity(connection), fields)
+    )
+    try:
+        yield
+    finally:
+        _SANDBOX_LAUNCH_DRIVER_START_AUTHORIZATION.reset(token)
+
+
+def _sandbox_launch_driver_start_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        start_id: str,
+        start_digest: str,
+        service_unit: str,
+    ) -> int:
+        authorization = _SANDBOX_LAUNCH_DRIVER_START_AUTHORIZATION.get()
+        expected = (
+            attempt_id,
+            claim_token,
+            execution_id,
+            start_id,
+            start_digest,
+            service_unit,
+        )
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == expected
+        )
+
+    return authorized
+
+
+@contextmanager
 def _authorize_sandbox_reservation_write(
     connection: sqlite3.Connection,
     attempt_id: str,
@@ -439,6 +493,11 @@ class StoreMixin:
                 _sandbox_launch_submission_authorized_for(raw_connection),
             )
             raw_connection.create_function(
+                "acp_sandbox_launch_driver_start_authorized",
+                6,
+                _sandbox_launch_driver_start_authorized_for(raw_connection),
+            )
+            raw_connection.create_function(
                 "acp_sandbox_reservation_authorized",
                 5,
                 _sandbox_reservation_authorized_for(raw_connection),
@@ -471,6 +530,11 @@ class StoreMixin:
             "acp_sandbox_launch_submission_authorized",
             5,
             _sandbox_launch_submission_authorized_for(raw_connection),
+        )
+        raw_connection.create_function(
+            "acp_sandbox_launch_driver_start_authorized",
+            6,
+            _sandbox_launch_driver_start_authorized_for(raw_connection),
         )
         raw_connection.create_function(
             "acp_sandbox_reservation_authorized",

@@ -3048,7 +3048,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 29
+    assert SCHEMA_VERSION == 30
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -3063,6 +3063,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     assert row["container_id"] == journal_module._sandbox_container_id(
         row["attempt_id"], row["claim_token"], row["execution_id"]
     )
+
     assert row["runtime_version"] == "1.3.5"
     assert row["oci_version"] == "1.2.1"
     assert row["rootfs_digest"] == supervisor.config.oci_rootfs_pin.sha256
@@ -3137,6 +3138,75 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
                 "DELETE FROM sandbox_executions WHERE attempt_id = ?", (attempt["id"],)
             )
     assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_launch_driver_start_intent_is_exact_and_one_shot(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+
+    intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        attempt["id"], attempt["claim_token"]
+    )
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+    assert durable["phase"] == "reserved"
+    assert intent.attempt_id == attempt["id"]
+    assert intent.claim_token == attempt["claim_token"]
+    assert intent.execution_id == execution["execution_id"]
+    assert intent.service_unit == f"acp-launch-driver-{execution['execution_id']}.service"
+    assert intent.start_id == durable["launch_driver_start_id"]
+    assert intent.start_digest == durable["launch_driver_start_digest"]
+    assert durable["launch_driver_start_at"]
+    assert durable["launch_driver_start_unit"] == intent.service_unit
+    assert durable["launch_submission_id"] == ""
+    expected = {
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "execution_id": execution["execution_id"],
+        "start_digest": durable["launch_driver_start_digest"],
+        "service_unit": intent.service_unit,
+    }
+    assert journal_module._sandbox_launch_driver_start_intent_is_self_consistent(intent, **expected)
+    for mismatch in (
+        {"attempt_id": "other-attempt"},
+        {"claim_token": attempt["claim_token"] + 1},
+        {"execution_id": "other-execution"},
+        {"start_digest": "f" * 64},
+        {"service_unit": "acp-launch-driver-other.service"},
+    ):
+        assert not journal_module._sandbox_launch_driver_start_intent_is_self_consistent(
+            intent, **(expected | mismatch)
+        )
+    assert not journal_module._sandbox_launch_driver_start_intent_is_self_consistent(
+        object(),
+        **expected,
+    )
+
+    # A fresh controller cannot turn an uncertain systemd response into a new
+    # activation attempt. Until exact unit adoption is implemented, it fails
+    # closed and leaves the original durable start marker intact.
+    restarted = GitSupervisor(repo)
+    with pytest.raises(SupervisorError) as duplicate:
+        restarted._sandbox_execution_authorize_launch_driver_start(
+            attempt["id"], attempt["claim_token"]
+        )
+    assert duplicate.value.code == "sandbox_launch_driver_start_ambiguous"
+    after_restart = restarted._sandbox_execution_get(attempt["id"])
+    assert after_restart is not None
+    assert after_restart["launch_driver_start_id"] == intent.start_id
+    assert after_restart["launch_driver_start_digest"] == intent.start_digest
+
+    # SQL callers cannot replace or clear the one-shot marker outside the
+    # journal's connection-scoped authorization context.
+    with pytest.raises(
+        sqlite3.IntegrityError, match="sandbox_launch_driver_start_must_be_authorized_once"
+    ):
+        with restarted.connect() as connection:
+            connection.execute(
+                "UPDATE sandbox_executions SET launch_driver_start_id = ? WHERE attempt_id = ?",
+                ("f" * 32, attempt["id"]),
+            )
 
 
 def test_v15_to_v16_migration_adds_non_authorizing_candidate_fields() -> None:
@@ -3540,6 +3610,8 @@ def test_v21_rows_migrate_unattested_and_remain_fail_closed(repo: Path, phase: s
     # caller-supplied digest was a trusted config/argv binding.
     with supervisor.connect() as connection:
         for trigger in (
+            "sandbox_launch_driver_start_insert_guard",
+            "sandbox_launch_driver_start_write_once",
             "sandbox_launch_plan_insert_guard",
             "sandbox_launch_plan_required_immutable",
             "sandbox_launch_plan_write_once",

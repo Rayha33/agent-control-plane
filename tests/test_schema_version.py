@@ -318,6 +318,62 @@ def test_v29_launch_driver_identity_migration_is_idempotent_and_authorization_ga
         connection.close()
 
 
+def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
+    assert SCHEMA_VERSION == 30
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE sandbox_executions ("
+            "attempt_id TEXT, claim_token INTEGER, execution_id TEXT, phase TEXT NOT NULL, "
+            "launch_submission_id TEXT NOT NULL DEFAULT '', "
+            "launch_plan_required INTEGER NOT NULL DEFAULT 1, "
+            "workspace_binding_version INTEGER NOT NULL DEFAULT 1, "
+            "private_path_binding_version INTEGER NOT NULL DEFAULT 1)"
+        )
+        connection.execute(
+            "INSERT INTO sandbox_executions "
+            "(attempt_id, claim_token, execution_id, phase) "
+            "VALUES ('legacy', 1, 'legacy-execution', 'reserved')"
+        )
+        migration = dict(MIGRATIONS)[30]
+        migration(connection)
+        migration(connection)
+
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")
+        }
+        assert {
+            "launch_driver_start_id",
+            "launch_driver_start_digest",
+            "launch_driver_start_at",
+            "launch_driver_start_unit",
+        } <= columns
+        legacy = connection.execute("SELECT * FROM sandbox_executions").fetchone()
+        assert legacy["launch_driver_start_id"] == ""
+        assert legacy["launch_driver_start_digest"] == ""
+        assert legacy["launch_driver_start_at"] == ""
+        assert legacy["launch_driver_start_unit"] == ""
+
+        connection.create_function("acp_sandbox_launch_driver_start_authorized", 6, lambda *_: 0)
+        with pytest.raises(
+            sqlite3.IntegrityError, match="sandbox_launch_driver_start_must_be_authorized_once"
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET launch_driver_start_id = ?, "
+                "launch_driver_start_digest = ?, launch_driver_start_at = ?, "
+                "launch_driver_start_unit = ? WHERE attempt_id = 'legacy'",
+                (
+                    "a" * 32,
+                    "b" * 64,
+                    "2026-10-16T00:00:00Z",
+                    "acp-launch-driver-legacy-execution.service",
+                ),
+            )
+    finally:
+        connection.close()
+
+
 def test_v7_read_only_open_requires_qc_latest_index_migration(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     with supervisor.connect() as connection:
