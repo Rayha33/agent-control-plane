@@ -1042,7 +1042,8 @@ def _attestation_for_live_units(
     runc_client_pid = next(pid for pid in worker_pids if pid != int(launch_driver["MainPID"]))
     init_pids = _wait_cgroup_pids(scope["ControlGroup"], count=1)
     init_pid = next(iter(init_pids))
-    pids = (monitor_pid, runc_client_pid, init_pid)
+    launch_driver_pid = int(launch_driver["MainPID"])
+    pids = (monitor_pid, launch_driver_pid, runc_client_pid, init_pid)
     snapshots = {pid: read_linux_process_snapshot(pid) for pid in pids}
     identities = {
         pid: f"linux:{pid}:{_parse_proc_stat(snapshot.stat_before)[2]}"
@@ -1060,7 +1061,7 @@ def _attestation_for_live_units(
         pid_file=f"{init_pid}\n".encode("ascii"),
         process_snapshots=snapshots,
         wrapper_properties=_attestation_unit_bytes(wrapper, include_main_pid=True),
-        launch_driver_properties=_attestation_unit_bytes(launch_driver, include_main_pid=False),
+        launch_driver_properties=_attestation_unit_bytes(launch_driver, include_main_pid=True),
         attempt_slice_properties=_attestation_unit_bytes(attempt_slice, include_main_pid=False),
         scope_properties=_attestation_unit_bytes(scope, include_main_pid=False),
         expected_container_id=container_id,

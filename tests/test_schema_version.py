@@ -268,6 +268,56 @@ def test_v26_attempt_slice_identity_migration_is_idempotent_and_fail_closed() ->
     connection.close()
 
 
+def test_v29_launch_driver_identity_migration_is_idempotent_and_authorization_gated() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE sandbox_executions (attempt_id TEXT, claim_token INTEGER, "
+            "execution_id TEXT, phase TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO sandbox_executions VALUES ('legacy', 1, 'legacy-execution', 'running')"
+        )
+        migration = dict(MIGRATIONS)[29]
+        migration(connection)
+        migration(connection)
+
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")
+        }
+        assert {
+            "launch_driver_pid",
+            "launch_driver_identity",
+            "launch_driver_unit",
+            "launch_driver_invocation_id",
+            "launch_driver_cgroup_path",
+        }.issubset(columns)
+        legacy = connection.execute("SELECT * FROM sandbox_executions").fetchone()
+        assert legacy["phase"] == "running"
+        assert legacy["launch_driver_pid"] is None
+        assert legacy["launch_driver_identity"] == ""
+
+        connection.create_function("acp_sandbox_running_attestation_authorized", 8, lambda *_: 0)
+        connection.execute(
+            "INSERT INTO sandbox_executions "
+            "(attempt_id, claim_token, execution_id, phase) "
+            "VALUES ('attempt', 2, 'execution', 'launched')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="collector_receipt"):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'running', launch_driver_pid = 123, "
+                "launch_driver_identity = 'linux:123:456', "
+                "launch_driver_unit = 'acp-launch-driver-test.service', "
+                "launch_driver_invocation_id = ?, "
+                "launch_driver_cgroup_path = '/user.slice/attempt/driver.service' "
+                "WHERE phase = 'launched'",
+                ("a" * 32,),
+            )
+    finally:
+        connection.close()
+
+
 def test_v7_read_only_open_requires_qc_latest_index_migration(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     with supervisor.connect() as connection:

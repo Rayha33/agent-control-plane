@@ -1232,6 +1232,25 @@ def test_public_gate_release_requires_exact_durable_running_transition(repo: Pat
 
         running = record_running(supervisor, attempt)
         assert running["phase"] == "running"
+        assert running["launch_driver_pid"] == os.getpid()
+        assert running["launch_driver_identity"].startswith(f"linux:{os.getpid()}:")
+        assert running["launch_driver_unit"] == journal_module._sandbox_launch_driver_service_unit(
+            running["execution_id"]
+        )
+        assert running["launch_driver_invocation_id"] == "4" * 32
+        assert running["launch_driver_cgroup_path"] == (
+            f"{running['attempt_slice_cgroup_path']}/{running['launch_driver_unit']}"
+        )
+        with supervisor.connect() as connection:
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="sandbox_execution_driver_identity_requires_collector_receipt",
+            ):
+                connection.execute(
+                    "UPDATE sandbox_executions SET launch_driver_pid = launch_driver_pid "
+                    "WHERE attempt_id = ?",
+                    (attempt["id"],),
+                )
         handle.release_gate()
         assert os.read(gate_read, 3) == b"go\n"
     finally:
@@ -1272,6 +1291,198 @@ def test_running_transition_rejects_caller_constructed_receipt_before_gate_relea
     finally:
         handle.close_gate()
         os.close(gate_read)
+
+
+def test_direct_sql_cannot_use_collector_receipt_without_validated_running_path(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    gate_read, gate_write = os.pipe()
+    handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt)
+        assert running_attestation_has_collector_provenance(attestation)
+        with supervisor.connect() as connection:
+            cursor = connection.execute("SELECT 1")
+            with pytest.raises(AttributeError):
+                object.__getattribute__(connection, "_StoreConnection__raw")
+            with pytest.raises(AttributeError):
+                object.__getattribute__(cursor, "_StoreCursor__raw")
+            with connection as nested_connection:
+                assert nested_connection is connection
+            with pytest.raises(AttributeError, match="row_factory is reserved"):
+                connection.row_factory = lambda cursor, row: cursor.connection
+            with pytest.raises(TypeError, match="custom cursor factories"):
+                connection.cursor(factory=lambda raw: raw)
+            with pytest.raises(AttributeError, match="raw store connections are private"):
+                assert connection.execute("SELECT 1").connection is not None
+            with pytest.raises(AttributeError, match="raw store connections are private"):
+                assert connection.cursor().connection is not None
+            with pytest.raises(TypeError):
+                sqlite3.Connection.create_function(
+                    connection,
+                    "acp_sandbox_running_attestation_authorized",
+                    8,
+                    lambda *_: 1,
+                )
+            with pytest.raises(AttributeError, match="reserved by the store"):
+                connection.create_function(
+                    "acp_sandbox_running_attestation_authorized", 8, lambda *_: 1
+                )
+            with pytest.raises(AttributeError, match="reserved by the store"):
+                connection.create_aggregate("acp_sandbox_running_attestation_authorized", 8, object)
+            with pytest.raises(AttributeError, match="reserved by the store"):
+                connection.create_window_function(
+                    "acp_sandbox_running_attestation_authorized", 8, object
+                )
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="sandbox_execution_driver_identity_requires_collector_receipt",
+            ):
+                connection.execute(
+                    "UPDATE sandbox_executions SET phase = 'running', init_pid = ?, "
+                    "init_identity = ?, launch_driver_pid = ?, launch_driver_identity = ?, "
+                    "launch_driver_unit = ?, launch_driver_invocation_id = ?, "
+                    "launch_driver_cgroup_path = ? WHERE attempt_id = ?",
+                    (
+                        attestation.init_pid,
+                        attestation.init_identity,
+                        attestation.launch_driver_pid,
+                        attestation.launch_driver_identity,
+                        attestation.launch_driver_unit,
+                        attestation.launch_driver_invocation_id,
+                        attestation.launch_driver_control_group,
+                        attempt["id"],
+                    ),
+                )
+
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+        os.set_blocking(gate_read, False)
+        with pytest.raises(BlockingIOError):
+            os.read(gate_read, 3)
+    finally:
+        handle.close_gate()
+        os.close(gate_read)
+
+
+def test_transition_helper_cannot_authorize_caller_constructed_driver_identity(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    try:
+        record_launch(supervisor, attempt, runc_handle=handle)
+        attestation = running_attestation(supervisor, attempt, register_collected=False)
+        updates = {
+            "init_pid": attestation.init_pid,
+            "init_identity": attestation.init_identity,
+            "launch_driver_pid": attestation.launch_driver_pid,
+            "launch_driver_identity": attestation.launch_driver_identity,
+            "launch_driver_unit": attestation.launch_driver_unit,
+            "launch_driver_invocation_id": attestation.launch_driver_invocation_id,
+            "launch_driver_cgroup_path": attestation.launch_driver_control_group,
+        }
+        with pytest.raises(SupervisorError) as rejected:
+            supervisor._sandbox_execution_transition(
+                attempt["id"],
+                attempt["claim_token"],
+                expected_phase="launched",
+                next_phase="running",
+                updates=updates,
+                event_type="sandbox.execution_running",
+                event_payload={"attestation": attestation.audit_payload()},
+                running_attestation=attestation,
+            )
+
+        assert rejected.value.code == "sandbox_runtime_attestation_invalid"
+        assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+    finally:
+        handle.close_gate()
+
+
+def test_transition_helper_rejects_collector_receipt_from_another_execution(
+    repo: Path,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    source = claimed(supervisor, "receipt-source.txt")
+    source_execution = reserve(supervisor, source)
+    source_handle = _test_runc_handle(target=_test_runc_target(source_execution))
+    record_launch(supervisor, source, runc_handle=source_handle)
+
+    target = claimed(supervisor, "receipt-target.txt")
+    target_execution = reserve(supervisor, target)
+    target_handle = _test_runc_handle(target=_test_runc_target(target_execution))
+    record_launch(supervisor, target, runc_handle=target_handle)
+    try:
+        attestation = running_attestation(supervisor, source)
+        assert running_attestation_has_collector_provenance(attestation)
+        updates = {
+            "init_pid": attestation.init_pid,
+            "init_identity": attestation.init_identity,
+            "launch_driver_pid": attestation.launch_driver_pid,
+            "launch_driver_identity": attestation.launch_driver_identity,
+            "launch_driver_unit": attestation.launch_driver_unit,
+            "launch_driver_invocation_id": attestation.launch_driver_invocation_id,
+            "launch_driver_cgroup_path": attestation.launch_driver_control_group,
+        }
+
+        with pytest.raises(SupervisorError) as rejected:
+            supervisor._sandbox_execution_transition(
+                target["id"],
+                target["claim_token"],
+                expected_phase="launched",
+                next_phase="running",
+                updates=updates,
+                event_type="sandbox.execution_running",
+                event_payload={"attestation": attestation.audit_payload()},
+                running_attestation=attestation,
+            )
+
+        assert rejected.value.code == "sandbox_runtime_attestation_invalid"
+        target_row = supervisor._sandbox_execution_get(target["id"])
+        assert target_row["phase"] == "launched"
+        assert target_row["launch_driver_pid"] is None
+
+        target_attestation = running_attestation(supervisor, target)
+        assert running_attestation_has_collector_provenance(target_attestation)
+        with pytest.raises(SupervisorError) as direct_rejected:
+            supervisor._sandbox_execution_transition(
+                target["id"],
+                target["claim_token"],
+                expected_phase="launched",
+                next_phase="running",
+                updates={
+                    "init_pid": target_attestation.init_pid,
+                    "init_identity": target_attestation.init_identity,
+                    "launch_driver_pid": target_attestation.launch_driver_pid,
+                    "launch_driver_identity": target_attestation.launch_driver_identity,
+                    "launch_driver_unit": target_attestation.launch_driver_unit,
+                    "launch_driver_invocation_id": (target_attestation.launch_driver_invocation_id),
+                    "launch_driver_cgroup_path": (target_attestation.launch_driver_control_group),
+                },
+                event_type="sandbox.execution_running",
+                event_payload={"attestation": target_attestation.audit_payload()},
+                running_attestation=target_attestation,
+            )
+        assert direct_rejected.value.code == "sandbox_runtime_attestation_invalid"
+        assert supervisor._sandbox_execution_get(target["id"])["phase"] == "launched"
+        with pytest.raises(SupervisorError) as gate_rejected:
+            target_handle.release_gate()
+        assert gate_rejected.value.code == "sandbox_launch_gate_not_authorized"
+    finally:
+        source_handle.close_gate()
+        target_handle.close_gate()
 
 
 @pytest.mark.parametrize("mismatch", ["state_root", "pid_file", "runc_executable"])
@@ -1498,6 +1709,7 @@ def test_running_transition_rechecks_process_membership_under_gate_lock(
         ("wrapper", "MainPID"),
         ("wrapper", "InvocationID"),
         ("wrapper", "ControlGroup"),
+        ("launch_driver", "MainPID"),
         ("launch_driver", "InvocationID"),
         ("launch_driver", "ControlGroup"),
         ("slice", "InvocationID"),
@@ -1560,6 +1772,7 @@ def test_running_transition_rechecks_systemd_identity_under_gate_lock(
                     "ControlGroup": attestation.launch_driver_control_group,
                     "Id": attestation.launch_driver_unit,
                     "InvocationID": attestation.launch_driver_invocation_id,
+                    "MainPID": str(attestation.launch_driver_pid),
                 }
             elif unit == attestation.attempt_slice_unit:
                 values = {
@@ -1588,7 +1801,12 @@ def test_running_transition_rechecks_systemd_identity_under_gate_lock(
                 and unit == unit_names[changed_unit]
             ):
                 if changed_property == "MainPID":
-                    values[changed_property] = str(attestation.monitor_pid + 1)
+                    pid = (
+                        attestation.launch_driver_pid
+                        if changed_unit == "launch_driver"
+                        else attestation.monitor_pid
+                    )
+                    values[changed_property] = str(pid + 1)
                 elif changed_property == "InvocationID":
                     values[changed_property] = "f" * 32
                 elif changed_property == "ControlGroup":
@@ -2012,19 +2230,17 @@ def test_stop_cannot_commit_between_running_and_gate_authorization(
     execution = reserve(supervisor, attempt)
     gate_read, gate_write = os.pipe()
     handle = _test_runc_handle(target=_test_runc_target(execution), gate_writer=gate_write)
-    original_transition = GitSupervisor._sandbox_execution_transition
+    original_gate_authorization = journal_module._authorize_runc_launch_gate_release_locked
     running_commit_finished = threading.Event()
     allow_running_transition_to_return = threading.Event()
     stop_started = threading.Event()
     stop_finished = threading.Event()
     results: dict[str, object] = {}
 
-    def pause_after_running_commit(self, *args, **kwargs):
-        updated = original_transition(self, *args, **kwargs)
-        if kwargs.get("expected_phase") == "launched" and kwargs.get("next_phase") == "running":
-            running_commit_finished.set()
-            assert allow_running_transition_to_return.wait(timeout=3)
-        return updated
+    def pause_before_gate_authorization(*args, **kwargs):
+        running_commit_finished.set()
+        assert allow_running_transition_to_return.wait(timeout=3)
+        return original_gate_authorization(*args, **kwargs)
 
     def run_running_transition() -> None:
         try:
@@ -2043,7 +2259,11 @@ def test_stop_cannot_commit_between_running_and_gate_authorization(
         finally:
             stop_finished.set()
 
-    monkeypatch.setattr(GitSupervisor, "_sandbox_execution_transition", pause_after_running_commit)
+    monkeypatch.setattr(
+        journal_module,
+        "_authorize_runc_launch_gate_release_locked",
+        pause_before_gate_authorization,
+    )
     try:
         record_launch(supervisor, attempt, runc_handle=handle)
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -2535,6 +2755,7 @@ def running_attestation(
     row = supervisor._sandbox_execution_get(attempt["id"])
     assert row is not None and row["phase"] == "launched"
     init_start = 1303
+    launch_driver_pid = os.getpid()
     wrapper_cgroup = row["wrapper_cgroup_path"]
     slice_cgroup = row["attempt_slice_cgroup_path"]
     launch_driver_unit = launch_driver_unit_override or (
@@ -2573,6 +2794,11 @@ def running_attestation(
                 row["runc_client_pid"],
                 int(row["runc_client_identity"].rsplit(":", 1)[1]),
             ),
+        ),
+        launch_driver_pid: ProcessSnapshot(
+            stat(launch_driver_pid, 1404),
+            f"0::{launch_driver_cgroup}\n".encode("ascii"),
+            stat(launch_driver_pid, 1404),
         ),
         init_pid: ProcessSnapshot(
             stat(init_pid, init_start),
@@ -2627,6 +2853,7 @@ def running_attestation(
         f"ControlGroup={launch_driver_cgroup}\n"
         f"Id={launch_driver_unit}\n"
         f"InvocationID={'4' * 32}\n"
+        f"MainPID={launch_driver_pid}\n"
     ).encode("ascii")
     attempt_slice_properties = (
         "ActiveState=active\n"
@@ -2752,6 +2979,10 @@ def _live_process_snapshot(attestation, pid: int) -> ProcessSnapshot:
             attestation.monitor_identity,
             attestation.wrapper_control_group,
         ),
+        attestation.launch_driver_pid: (
+            attestation.launch_driver_identity,
+            attestation.launch_driver_control_group,
+        ),
         attestation.runc_client_pid: (
             attestation.runc_client_identity,
             attestation.launch_driver_control_group,
@@ -2817,7 +3048,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 28
+    assert SCHEMA_VERSION == 29
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -4491,18 +4722,47 @@ def test_exit_evidence_cannot_be_stamped_before_kernel_wait(repo: Path) -> None:
     record_launch(supervisor, attempt)
 
     with supervisor.connect() as connection:
+        row = connection.execute(
+            "SELECT execution_id, attempt_slice_cgroup_path FROM sandbox_executions "
+            "WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        driver_unit = journal_module._sandbox_launch_driver_service_unit(row["execution_id"])
+    # Use a separate, deliberately unprotected test connection to isolate this
+    # trigger from the public store facade's callback-registration boundary.
+    with sqlite3.connect(supervisor.db_path) as raw_connection:
+        for function_name, argument_count in (
+            ("acp_sandbox_exit_receipt_authorized", 6),
+            ("acp_sandbox_launch_plan_authorized", 7),
+            ("acp_sandbox_launch_submission_authorized", 5),
+            ("acp_sandbox_reservation_authorized", 5),
+        ):
+            raw_connection.create_function(function_name, argument_count, lambda *_: 0)
+        raw_connection.create_function(
+            "acp_sandbox_running_attestation_authorized",
+            8,
+            lambda *_: 1,
+        )
         with pytest.raises(
             sqlite3.IntegrityError,
             match="sandbox_execution_exit_evidence_write_requires_exit",
         ):
-            connection.execute(
+            raw_connection.execute(
                 """
                 UPDATE sandbox_executions
                 SET phase = 'running', init_pid = 4242, init_identity = 'synthetic-start',
-                    runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+                    runc_exit_evidence_source = 'runc_client_kernel_waitpid',
+                    launch_driver_pid = 4243, launch_driver_identity = 'linux:4243:1303',
+                    launch_driver_unit = ?, launch_driver_invocation_id = ?,
+                    launch_driver_cgroup_path = ?
                 WHERE attempt_id = ?
                 """,
-                (attempt["id"],),
+                (
+                    driver_unit,
+                    "a" * 32,
+                    f"{row['attempt_slice_cgroup_path']}/{driver_unit}",
+                    attempt["id"],
+                ),
             )
 
     still_launched = supervisor._sandbox_execution_get(attempt["id"])

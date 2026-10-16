@@ -56,9 +56,14 @@ def _properties(
 
 
 def _valid_observations() -> dict:
-    pids = (101, 202, 303)
-    starts = {101: 1101, 202: 1202, 303: 1303}
-    groups = {101: _WRAPPER_CGROUP, 202: _LAUNCH_DRIVER_CGROUP, 303: _SCOPE_CGROUP}
+    pids = (101, 202, 303, 404)
+    starts = {101: 1101, 202: 1202, 303: 1303, 404: 1404}
+    groups = {
+        101: _WRAPPER_CGROUP,
+        202: _LAUNCH_DRIVER_CGROUP,
+        303: _SCOPE_CGROUP,
+        404: _LAUNCH_DRIVER_CGROUP,
+    }
     return {
         "runc_state": json.dumps(
             {
@@ -88,6 +93,7 @@ def _valid_observations() -> dict:
             unit=_LAUNCH_DRIVER_UNIT,
             invocation="4" * 32,
             cgroup=_LAUNCH_DRIVER_CGROUP,
+            main_pid=404,
         ),
         "attempt_slice_properties": _properties(
             unit=_ATTEMPT_SLICE_UNIT,
@@ -175,8 +181,13 @@ def test_release_verifier_rereads_all_execution_processes(monkeypatch: pytest.Mo
     monkeypatch.setattr(sandbox_attestation, "read_linux_process_snapshot", read_snapshot)
     verify_running_runtime_process_membership(receipt)
 
-    assert set(observed) == {receipt.monitor_pid, receipt.runc_client_pid, receipt.init_pid}
-    assert len(observed) == 3
+    assert set(observed) == {
+        receipt.monitor_pid,
+        receipt.launch_driver_pid,
+        receipt.runc_client_pid,
+        receipt.init_pid,
+    }
+    assert len(observed) == 4
 
 
 def test_process_membership_verifier_returns_stable_identity_for_exact_cgroup(
@@ -236,6 +247,8 @@ def test_attestation_binds_runc_client_to_exact_launch_driver_service(
     receipt = _validate()
     assert running_attestation_is_self_consistent(receipt)
     assert receipt.launch_driver_unit == _LAUNCH_DRIVER_UNIT
+    assert receipt.launch_driver_pid == 404
+    assert receipt.launch_driver_identity == "linux:404:1404"
     assert receipt.launch_driver_invocation_id == "4" * 32
     assert receipt.launch_driver_control_group == _LAUNCH_DRIVER_CGROUP
 
@@ -425,6 +438,7 @@ def test_observation_normalization_cannot_mint_collector_provenance(tmp_path, mo
         101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
         202: (_proc_stat(202, "S", 1202), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
         303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
+        404: (_proc_stat(404, "S", 1404), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
     }
 
     monkeypatch.setattr(sandbox_attestation.sys, "platform", "linux")
@@ -488,6 +502,7 @@ def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
         101: (_proc_stat(101, "S", 1101), _WRAPPER_CGROUP.encode("ascii")),
         202: (_proc_stat(202, "S", 1202), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
         303: (_proc_stat(303, "S", 1303), _SCOPE_CGROUP.encode("ascii")),
+        404: (_proc_stat(404, "S", 1404), _LAUNCH_DRIVER_CGROUP.encode("ascii")),
     }
     commands: list[tuple[list[str], dict]] = []
     unit_read_counts: dict[str, int] = {}
@@ -532,7 +547,7 @@ def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
             "--no-pager",
         ]
         expected_properties = "ActiveState,ControlGroup,Id,InvocationID"
-        if command[-1] == "acp-worker.service":
+        if command[-1] in {"acp-worker.service", _LAUNCH_DRIVER_UNIT}:
             expected_properties += ",MainPID"
         assert command[4] == f"--property={expected_properties}"
         assert command[5] == "--"
@@ -608,6 +623,8 @@ def test_trusted_collector_reads_stable_pinned_runc_and_systemd_units(
 
     assert receipt.init_pid == 303
     assert receipt.init_identity == "linux:303:1303"
+    assert receipt.launch_driver_pid == 404
+    assert receipt.launch_driver_identity == "linux:404:1404"
     assert running_attestation_has_collector_provenance(receipt)
     assert len(commands) == 9
     assert {command[-1] for command, _kwargs in commands[1:]} == {
@@ -740,7 +757,7 @@ def test_runtime_attestation_rejects_cgroup_control_mismatch(name: str, value: b
 
 
 def test_unkeyed_digest_checks_consistency_but_not_receipt_provenance() -> None:
-    forged = replace(_validate(), init_pid=404, init_identity="linux:404:9999")
+    forged = replace(_validate(), init_pid=505, init_identity="linux:505:9999")
     payload = forged.audit_payload()
     payload.pop("evidence_sha256")
     recomputed = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
@@ -888,6 +905,7 @@ def test_attestation_rejects_arbitrary_sibling_launcher_cgroup() -> None:
         unit=_LAUNCH_DRIVER_UNIT,
         invocation="4" * 32,
         cgroup=sibling_driver_group,
+        main_pid=404,
     )
     observations["process_snapshots"][202] = replace(
         observations["process_snapshots"][202],

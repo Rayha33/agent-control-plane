@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -1877,6 +1877,94 @@ def _add_sandbox_launch_submission_receipt(connection: sqlite3.Connection) -> No
     )
 
 
+def _add_sandbox_launch_driver_process_identity(connection: sqlite3.Connection) -> None:
+    """Persist the exact launch-driver service MainPID and start identity.
+
+    Existing rows are deliberately not backfilled: a later cleanup verifier must
+    fail closed when a running execution predates this collector evidence.
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-driver identity migration"
+        )
+    additions = (
+        ("launch_driver_pid", "INTEGER"),
+        ("launch_driver_identity", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_unit", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_execution_driver_identity_insert_guard",
+        "sandbox_execution_driver_identity_write_once",
+        "sandbox_execution_running_requires_driver_identity",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_driver_identity_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_driver_pid IS NOT NULL
+          OR NEW.launch_driver_identity != ''
+          OR NEW.launch_driver_unit != ''
+          OR NEW.launch_driver_invocation_id != ''
+          OR NEW.launch_driver_cgroup_path != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_identity_must_follow_running_attestation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_driver_identity_write_once
+        BEFORE UPDATE OF launch_driver_pid, launch_driver_identity, launch_driver_unit,
+          launch_driver_invocation_id, launch_driver_cgroup_path ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'launched' AND NEW.phase = 'running'
+          AND OLD.launch_driver_pid IS NULL AND OLD.launch_driver_identity = ''
+          AND OLD.launch_driver_unit = '' AND OLD.launch_driver_invocation_id = ''
+          AND OLD.launch_driver_cgroup_path = ''
+          AND NEW.launch_driver_pid IS NOT NULL AND NEW.launch_driver_pid > 0
+          AND NEW.launch_driver_identity LIKE ('linux:' || NEW.launch_driver_pid || ':%')
+          AND NEW.launch_driver_unit LIKE 'acp-launch-driver-%.service'
+          AND length(NEW.launch_driver_invocation_id) = 32
+          AND NEW.launch_driver_invocation_id NOT GLOB '*[^0-9a-f]*'
+          AND substr(NEW.launch_driver_cgroup_path, 1, 1) = '/'
+          AND acp_sandbox_running_attestation_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            NEW.launch_driver_pid, NEW.launch_driver_identity, NEW.launch_driver_unit,
+            NEW.launch_driver_invocation_id, NEW.launch_driver_cgroup_path
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_identity_requires_collector_receipt');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_running_requires_driver_identity
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'launched' AND NEW.phase = 'running'
+          AND (
+            NEW.launch_driver_pid IS NULL OR NEW.launch_driver_pid <= 0
+            OR NEW.launch_driver_identity = '' OR NEW.launch_driver_unit = ''
+            OR NEW.launch_driver_invocation_id = '' OR NEW.launch_driver_cgroup_path = ''
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_running_requires_driver_identity');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -1905,6 +1993,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (26, _add_sandbox_attempt_slice_identity),
     (27, _require_verified_cleanup_before_candidate_capture),
     (28, _add_sandbox_launch_submission_receipt),
+    (29, _add_sandbox_launch_driver_process_identity),
 )
 
 

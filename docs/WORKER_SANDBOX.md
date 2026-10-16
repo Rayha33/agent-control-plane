@@ -269,14 +269,21 @@ ACP-managed SQLite connections unless the journal activates the exact
 process-local capability for the registered runc handle. This is an
 application-integrity guard, not a security boundary against a privileged
 process with arbitrary write access to the SQLite database file: such a process
-can register a same-named SQLite function or remove/replace the triggers.
-Database-file writers are outside this slice's threat model. Migrated rows
-retain empty plan fields and an unattested marker; they cannot be advanced
-through a new launch, running, or successful exit transition and cannot
-authorize result import. This binds the
+can register a same-named SQLite function or remove/replace the triggers. The
+supervisor process and its Python modules are also trusted; arbitrary Python
+running inside that process can reach private store internals and is outside this
+guard's threat model. The connection facade is an application-integrity guard,
+not an in-process Python sandbox. Direct database-file writers are outside this
+slice's threat model. Migrated rows retain empty plan fields and an unattested
+marker; they cannot be advanced through a new launch, running, or successful
+exit transition and cannot authorize result import. This binds the
 caller-supplied bundle digest to observed launch inputs but does not independently
-prove the semantic correctness of that caller claim. The configured `run_worker`
-path remains fail-closed and this is not runtime isolation evidence.
+prove the semantic correctness of that caller claim. The OCI task-worker path is
+not yet integrated into `run_worker()`: when `sandbox.oci` is configured,
+`run_worker()` fails closed; without it, the existing host-process path can run
+with Linux child-subreaper containment but does not have OCI mount, environment,
+or file-descriptor isolation. This launch-driver slice is not runtime-isolation
+evidence for all task execution.
 
 This remains an implementation slice, not a complete security claim. On
 2026-10-05, two opt-in no-model tests passed on NAS Linux 6.18.15 with runc
@@ -3344,7 +3351,7 @@ D-state processes. This run had no AppArmor profile applied to the monitor and
 is not evidence of AppArmor confinement or a production prerequisite policy.
 Keep configured OCI worker execution fail-closed.
 
-### Launch-driver-service cgroup attestation (2026-10-15; current source contract)
+### Launch-driver-service cgroup attestation (2026-10-16; current source contract)
 
 The current two-service architecture places the runc client in the deterministic systemd service
 `acp-launch-driver-{execution_id}.service`, derived from the reserved durable
@@ -3360,6 +3367,18 @@ both before and while holding the launch-gate lock; it rechecks process
 membership and all four systemd identities immediately before recording the
 running transition and authorizing the one-shot gate. A valid receipt for a
 different reserved-prefix service is stale and cannot release the gate.
+
+Schema 29 durably records the launch driver's PID and kernel start identity,
+unit, systemd invocation ID, and exact cgroup path on the `launched -> running`
+transition. The fields are write-once and must be complete before the phase can
+become `running`; the generic transition helper rejects that phase change.
+`record_running()` holds the launch-gate lock while rechecking live resource,
+process-membership, and systemd identities, then opens the SQLite transaction to
+recheck durable row and receipt bindings before writing the phase and event. It
+authorizes the one-shot gate only after that transaction commits. Legacy rows
+are not backfilled and do not become qualified by migration alone. These are
+durable process-local integrity checks, not proof that `run_worker()` currently
+launches all task code inside the OCI boundary described here.
 
 The opt-in live runc lifecycle test passed on the disposable Ubuntu 26.04
 ARM64 / Linux 7.0.0-38 / Python 3.14.4 / systemd 259.5 / cgroup v2 guest with

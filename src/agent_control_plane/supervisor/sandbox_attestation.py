@@ -59,6 +59,8 @@ class RunningRuntimeAttestation:
     monitor_identity: str
     runc_client_pid: int
     runc_client_identity: str
+    launch_driver_pid: int
+    launch_driver_identity: str
     wrapper_unit: str
     wrapper_invocation_id: str
     wrapper_control_group: str
@@ -96,6 +98,8 @@ class RunningRuntimeAttestation:
             "monitor_identity": self.monitor_identity,
             "runc_client_pid": self.runc_client_pid,
             "runc_client_identity": self.runc_client_identity,
+            "launch_driver_pid": self.launch_driver_pid,
+            "launch_driver_identity": self.launch_driver_identity,
             "wrapper_unit": self.wrapper_unit,
             "wrapper_invocation_id": self.wrapper_invocation_id,
             "wrapper_control_group": self.wrapper_control_group,
@@ -568,7 +572,7 @@ def collect_running_runtime_attestation(
 
     def read_unit_properties(unit: str) -> bytes:
         requested_properties = "ActiveState,ControlGroup,Id,InvocationID"
-        if unit == wrapper_unit:
+        if unit in {wrapper_unit, launch_driver_unit}:
             requested_properties += ",MainPID"
         return _run_trusted_runtime_command(
             [
@@ -677,13 +681,22 @@ def _collect_running_runtime_attestation_from_observations(
 
     pid_file = read_private_runc_pid_file(pid_file_path, state_root)
     init_pid = _parse_pid_file(pid_file)
+    launch_driver_properties_parsed = _parse_unit_properties(
+        launch_driver_properties, require_main_pid=True
+    )
+    launch_driver_pid = _parse_main_pid(
+        launch_driver_properties_parsed["MainPID"], "launch driver MainPID"
+    )
     pids = (
         _pid(expected_monitor_pid, "monitor PID"),
+        launch_driver_pid,
         _pid(expected_runc_client_pid, "runc client PID"),
         init_pid,
     )
-    if len(set(pids)) != 3:
-        raise _invalid("monitor, runc client, and container init PIDs must be distinct")
+    if len(set(pids)) != 4:
+        raise _invalid(
+            "monitor, launch driver, runc client, and container init PIDs must be distinct"
+        )
     process_snapshots = {pid: read_linux_process_snapshot(pid) for pid in pids}
     resource_control_files = read_cgroup_resource_controls(expected_cgroup_path)
     return validate_running_runtime_attestation(
@@ -844,8 +857,9 @@ def verify_running_runtime_systemd_units(attestation: RunningRuntimeAttestation)
                 "ControlGroup": attestation.launch_driver_control_group,
                 "Id": attestation.launch_driver_unit,
                 "InvocationID": attestation.launch_driver_invocation_id,
+                "MainPID": str(attestation.launch_driver_pid),
             },
-            False,
+            True,
         ),
         (
             attestation.attempt_slice_unit,
@@ -908,6 +922,11 @@ def verify_running_runtime_process_membership(attestation: RunningRuntimeAttesta
         raise _invalid("release-time process verification requires a self-consistent receipt")
     expected_processes = (
         (attestation.monitor_pid, attestation.monitor_identity, attestation.wrapper_control_group),
+        (
+            attestation.launch_driver_pid,
+            attestation.launch_driver_identity,
+            attestation.launch_driver_control_group,
+        ),
         (
             attestation.runc_client_pid,
             attestation.runc_client_identity,
@@ -1033,8 +1052,6 @@ def validate_running_runtime_attestation(
     monitor_pid = _pid(expected_monitor_pid, "monitor PID")
     runc_client_pid = _pid(expected_runc_client_pid, "runc client PID")
     expected_init_pid = _pid(_parse_pid_file(pid_file), "container init PID")
-    if len({monitor_pid, runc_client_pid, expected_init_pid}) != 3:
-        raise _invalid("monitor, runc client, and container init PIDs must be distinct")
     monitor_identity = _identity(expected_monitor_identity, monitor_pid, "monitor identity")
     runc_client_identity = _identity(
         expected_runc_client_identity, runc_client_pid, "runc client identity"
@@ -1067,7 +1084,7 @@ def validate_running_runtime_attestation(
         raise _invalid("runc state does not match the expected running container")
 
     wrapper = _parse_unit_properties(wrapper_properties, require_main_pid=True)
-    launch_driver = _parse_unit_properties(launch_driver_properties)
+    launch_driver = _parse_unit_properties(launch_driver_properties, require_main_pid=True)
     attempt_slice = _parse_unit_properties(attempt_slice_properties)
     scope = _parse_unit_properties(scope_properties)
     if (
@@ -1089,6 +1106,11 @@ def validate_running_runtime_attestation(
     launch_driver_invocation_id = _invocation(
         launch_driver["InvocationID"], "launch driver invocation ID"
     )
+    launch_driver_pid = _parse_main_pid(launch_driver["MainPID"], "launch driver MainPID")
+    if len({monitor_pid, launch_driver_pid, runc_client_pid, expected_init_pid}) != 4:
+        raise _invalid(
+            "monitor, launch driver, runc client, and container init PIDs must be distinct"
+        )
     launch_driver_cgroup = _cgroup_path(launch_driver["ControlGroup"], "launch driver cgroup")
     attempt_slice_cgroup = _cgroup_path(attempt_slice["ControlGroup"], "attempt slice cgroup")
     scope_cgroup = _cgroup_path(scope["ControlGroup"], "scope cgroup")
@@ -1112,7 +1134,7 @@ def validate_running_runtime_attestation(
     ):
         raise _invalid("scope is not a direct child of the exact attempt slice")
 
-    expected_pids = {monitor_pid, runc_client_pid, expected_init_pid}
+    expected_pids = {monitor_pid, launch_driver_pid, runc_client_pid, expected_init_pid}
     if set(process_snapshots) != expected_pids:
         raise _invalid("process observations do not cover the exact execution PIDs")
     identities: dict[int, str] = {}
@@ -1128,6 +1150,8 @@ def validate_running_runtime_attestation(
         actual_cgroup = _parse_proc_cgroup(snapshot.cgroup)
         if pid == monitor_pid and actual_cgroup != wrapper_cgroup:
             raise _invalid("monitor process is outside its recorded systemd cgroup")
+        if pid == launch_driver_pid and actual_cgroup != launch_driver_cgroup:
+            raise _invalid("launch driver process is outside its exact systemd service cgroup")
         if pid == expected_init_pid and actual_cgroup != scope_cgroup:
             raise _invalid("process is outside its recorded systemd cgroup")
         if pid == runc_client_pid and actual_cgroup != launch_driver_cgroup:
@@ -1162,6 +1186,8 @@ def validate_running_runtime_attestation(
         "monitor_identity": monitor_identity,
         "runc_client_pid": runc_client_pid,
         "runc_client_identity": runc_client_identity,
+        "launch_driver_pid": launch_driver_pid,
+        "launch_driver_identity": identities[launch_driver_pid],
         "wrapper_unit": wrapper_unit,
         "wrapper_invocation_id": wrapper_invocation_id,
         "wrapper_control_group": wrapper_cgroup,
@@ -1205,7 +1231,15 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
                 )
             )
             or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", value.container_id)
-            or len({value.monitor_pid, value.runc_client_pid, value.init_pid}) != 3
+            or len(
+                {
+                    value.monitor_pid,
+                    value.launch_driver_pid,
+                    value.runc_client_pid,
+                    value.init_pid,
+                }
+            )
+            != 4
             or value.monitor_placement != "outside_attempt_slice"
             or value.wrapper_control_group == value.cgroup_path
             or value.attempt_slice_unit != _oci_worker_systemd_slice(value.container_id)
@@ -1238,10 +1272,17 @@ def running_attestation_is_self_consistent(value: Any) -> bool:
         )
         if (
             _pid(value.monitor_pid, "monitor PID") != value.monitor_pid
+            or _pid(value.launch_driver_pid, "launch driver PID") != value.launch_driver_pid
             or _pid(value.runc_client_pid, "runc client PID") != value.runc_client_pid
             or _pid(value.init_pid, "init PID") != value.init_pid
             or _identity(value.monitor_identity, value.monitor_pid, "monitor identity")
             != value.monitor_identity
+            or _identity(
+                value.launch_driver_identity,
+                value.launch_driver_pid,
+                "launch driver identity",
+            )
+            != value.launch_driver_identity
             or _identity(value.runc_client_identity, value.runc_client_pid, "runc client identity")
             != value.runc_client_identity
             or _identity(value.init_identity, value.init_pid, "init identity")
@@ -1364,7 +1405,15 @@ def _parse_unit_properties(raw: bytes, *, require_main_pid: bool = False) -> dic
         expected.add("MainPID")
     if set(properties) != expected:
         raise _invalid("systemd properties are incomplete or unexpected")
+    if require_main_pid:
+        _parse_main_pid(properties["MainPID"], "systemd MainPID")
     return properties
+
+
+def _parse_main_pid(value: Any, field: str) -> int:
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        raise _invalid(f"{field} is invalid")
+    return _pid(int(value), field)
 
 
 def _identity(value: Any, pid: int, field: str) -> str:

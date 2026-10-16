@@ -72,7 +72,33 @@ from .store import (
     _authorize_sandbox_launch_plan_write,
     _authorize_sandbox_launch_submission_write,
     _authorize_sandbox_reservation_write,
+    _store_raw_connection_for_running_transition,
 )
+
+
+def _sandbox_running_attestation_expected_for_row(row: Any) -> dict[str, Any]:
+    launch_driver_unit = _sandbox_launch_driver_service_unit(row["execution_id"])
+    return {
+        "monitor_placement": "outside_attempt_slice",
+        "container_id": row["container_id"],
+        "bundle_path": row["bundle_path"],
+        "monitor_pid": row["monitor_pid"],
+        "monitor_identity": row["monitor_identity"],
+        "runc_client_pid": row["runc_client_pid"],
+        "runc_client_identity": row["runc_client_identity"],
+        "launch_driver_unit": launch_driver_unit,
+        "launch_driver_control_group": (f"{row['attempt_slice_cgroup_path']}/{launch_driver_unit}"),
+        "wrapper_unit": row["wrapper_unit"],
+        "wrapper_invocation_id": row["wrapper_invocation_id"],
+        "wrapper_control_group": row["wrapper_cgroup_path"],
+        "attempt_slice_unit": row["attempt_slice_unit"],
+        "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
+        "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
+        "scope_unit": row["scope_unit"],
+        "scope_invocation_id": row["scope_invocation_id"],
+        "cgroup_path": row["cgroup_path"],
+    }
+
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
@@ -117,7 +143,17 @@ _TRANSITION_FIELDS = {
             "launch_plan_digest",
         }
     ),
-    ("launched", "running"): frozenset({"init_pid", "init_identity"}),
+    ("launched", "running"): frozenset(
+        {
+            "init_pid",
+            "init_identity",
+            "launch_driver_pid",
+            "launch_driver_identity",
+            "launch_driver_unit",
+            "launch_driver_invocation_id",
+            "launch_driver_cgroup_path",
+        }
+    ),
     ("running", "stopping"): frozenset({"stop_reason"}),
     ("exited", "cleanup_reported"): frozenset({"cleanup_receipt_json"}),
 }
@@ -1720,6 +1756,7 @@ class SandboxExecutionJournalMixin:
         event_payload: dict[str, Any],
         credential: str | None = None,
         _connection: sqlite3.Connection | None = None,
+        running_attestation: RunningRuntimeAttestation | None = None,
     ) -> dict[str, Any]:
         allowed_fields = _TRANSITION_FIELDS.get((expected_phase, next_phase))
         if (
@@ -1730,6 +1767,14 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_transition_invalid",
                 f"transition {expected_phase} -> {next_phase} is not available in this journal slice",
+            )
+        if (expected_phase, next_phase) == (
+            "launched",
+            "running",
+        ) or running_attestation is not None:
+            raise SupervisorError(
+                "sandbox_runtime_attestation_invalid",
+                "running transitions are available only through the fully validated runtime path",
             )
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
@@ -1811,18 +1856,19 @@ class SandboxExecutionJournalMixin:
                         "launch transition requires the durable pre-runc submission latch",
                     )
             fields = ", ".join(f"{name} = ?" for name in updates)
-            changed = connection.execute(
+            statement = (
                 f"UPDATE sandbox_executions SET {fields}, phase = ?, updated_at = ? "
-                "WHERE attempt_id = ? AND claim_token = ? AND phase = ?",
-                (
-                    *updates.values(),
-                    next_phase,
-                    utc_now(),
-                    attempt_id,
-                    claim_token,
-                    expected_phase,
-                ),
-            ).rowcount
+                "WHERE attempt_id = ? AND claim_token = ? AND phase = ?"
+            )
+            parameters = (
+                *updates.values(),
+                next_phase,
+                utc_now(),
+                attempt_id,
+                claim_token,
+                expected_phase,
+            )
+            changed = connection.execute(statement, parameters).rowcount
             if changed != 1:
                 raise SupervisorError(
                     "sandbox_execution_transition_conflict",
@@ -2451,6 +2497,11 @@ class SandboxExecutionJournalMixin:
                 "sandbox_runtime_attestation_invalid",
                 "running transition requires the exact self-consistent collector-issued receipt",
             )
+        if attestation.launch_driver_pid != os.getpid():
+            raise SupervisorError(
+                "sandbox_runtime_attestation_stale",
+                "running transition must be recorded by the exact launch-driver service MainPID",
+            )
         expected_resource_limits = launch_plan["launch"]["resource_limits"]
         attested_resource_limits = {
             "memory_max_bytes": attestation.memory_max_bytes,
@@ -2463,25 +2514,7 @@ class SandboxExecutionJournalMixin:
                 "sandbox_runtime_attestation_stale",
                 "cgroup resource readback does not match the durable OCI launch policy",
             )
-        expected = {
-            "monitor_placement": "outside_attempt_slice",
-            "container_id": row["container_id"],
-            "bundle_path": row["bundle_path"],
-            "monitor_pid": row["monitor_pid"],
-            "monitor_identity": row["monitor_identity"],
-            "runc_client_pid": row["runc_client_pid"],
-            "runc_client_identity": row["runc_client_identity"],
-            "wrapper_unit": row["wrapper_unit"],
-            "wrapper_invocation_id": row["wrapper_invocation_id"],
-            "wrapper_control_group": row["wrapper_cgroup_path"],
-            "launch_driver_unit": _sandbox_launch_driver_service_unit(row["execution_id"]),
-            "attempt_slice_unit": row["attempt_slice_unit"],
-            "attempt_slice_invocation_id": row["attempt_slice_invocation_id"],
-            "attempt_slice_control_group": row["attempt_slice_cgroup_path"],
-            "scope_unit": row["scope_unit"],
-            "scope_invocation_id": row["scope_invocation_id"],
-            "cgroup_path": row["cgroup_path"],
-        }
+        expected = _sandbox_running_attestation_expected_for_row(row)
         if any(getattr(attestation, key) != value for key, value in expected.items()):
             raise SupervisorError(
                 "sandbox_runtime_attestation_stale",
@@ -2489,7 +2522,11 @@ class SandboxExecutionJournalMixin:
             )
         init_pid = self._sandbox_pid(attestation.init_pid, "init_pid")
         init_identity = self._sandbox_process_identity(attestation.init_identity, "init_identity")
-        if init_pid in {row["monitor_pid"], row["runc_client_pid"]}:
+        if init_pid in {
+            row["monitor_pid"],
+            row["runc_client_pid"],
+            attestation.launch_driver_pid,
+        }:
             raise SupervisorError(
                 "sandbox_execution_invalid", "container init must have a distinct host PID"
             )
@@ -2581,27 +2618,7 @@ class SandboxExecutionJournalMixin:
                     "sandbox_runtime_attestation_stale",
                     "durable runc state root identity changed before gate release",
                 )
-            locked_expected = {
-                "monitor_placement": "outside_attempt_slice",
-                "container_id": locked_row["container_id"],
-                "bundle_path": locked_row["bundle_path"],
-                "monitor_pid": locked_row["monitor_pid"],
-                "monitor_identity": locked_row["monitor_identity"],
-                "runc_client_pid": locked_row["runc_client_pid"],
-                "runc_client_identity": locked_row["runc_client_identity"],
-                "wrapper_unit": locked_row["wrapper_unit"],
-                "wrapper_invocation_id": locked_row["wrapper_invocation_id"],
-                "wrapper_control_group": locked_row["wrapper_cgroup_path"],
-                "launch_driver_unit": _sandbox_launch_driver_service_unit(
-                    locked_row["execution_id"]
-                ),
-                "attempt_slice_unit": locked_row["attempt_slice_unit"],
-                "attempt_slice_invocation_id": locked_row["attempt_slice_invocation_id"],
-                "attempt_slice_control_group": locked_row["attempt_slice_cgroup_path"],
-                "scope_unit": locked_row["scope_unit"],
-                "scope_invocation_id": locked_row["scope_invocation_id"],
-                "cgroup_path": locked_row["cgroup_path"],
-            }
+            locked_expected = _sandbox_running_attestation_expected_for_row(locked_row)
             if any(getattr(attestation, key) != value for key, value in locked_expected.items()):
                 raise SupervisorError(
                     "sandbox_runtime_attestation_stale",
@@ -2620,20 +2637,121 @@ class SandboxExecutionJournalMixin:
             verify_running_runtime_resource_controls(attestation)
             verify_running_runtime_process_membership(attestation)
             verify_running_runtime_systemd_units(attestation)
-            updated = self._sandbox_execution_transition(
-                attempt_id,
-                claim_token,
-                expected_phase="launched",
-                next_phase="running",
-                updates={"init_pid": init_pid, "init_identity": init_identity},
-                event_type="sandbox.execution_running",
-                event_payload={"attestation": attestation.audit_payload()},
-                credential=credential,
-            )
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                active_attempt = self._active_attempt(
+                    connection, attempt_id, claim_token, int(time.time())
+                )
+                if active_attempt["status"] != "working":
+                    raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+                self._authenticate_attempt(connection, active_attempt, credential)
+                current_row = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+                current_stop_reason = (
+                    _sandbox_execution_launch_stop_reason(connection, current_row)
+                    if current_row
+                    else None
+                )
+                if current_row is None:
+                    raise SupervisorError(
+                        "sandbox_execution_not_found", "execution was not reserved"
+                    )
+                if current_row["claim_token"] != claim_token:
+                    raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
+                if current_row["phase"] != "launched":
+                    raise SupervisorError(
+                        "sandbox_execution_transition_invalid",
+                        f"cannot record running from phase {current_row['phase']}; fence retained",
+                    )
+                if (
+                    current_row["stop_reason"]
+                    or current_stop_reason
+                    or current_row["execution_id"] != locked_row["execution_id"]
+                    or current_row["launch_plan_digest"] != locked_row["launch_plan_digest"]
+                    or current_row["launch_plan_json"] != locked_row["launch_plan_json"]
+                    or not _sandbox_launch_plan_binding_is_self_consistent(current_row)
+                    or any(
+                        getattr(attestation, key) != value
+                        for key, value in _sandbox_running_attestation_expected_for_row(
+                            current_row
+                        ).items()
+                    )
+                ):
+                    raise SupervisorError(
+                        "sandbox_runtime_attestation_stale",
+                        "durable launch identities changed before the running transition",
+                    )
+                running_updates = {
+                    "init_pid": init_pid,
+                    "init_identity": init_identity,
+                    "launch_driver_pid": attestation.launch_driver_pid,
+                    "launch_driver_identity": attestation.launch_driver_identity,
+                    "launch_driver_unit": attestation.launch_driver_unit,
+                    "launch_driver_invocation_id": attestation.launch_driver_invocation_id,
+                    "launch_driver_cgroup_path": attestation.launch_driver_control_group,
+                }
+                assignments = ", ".join(f"{name} = ?" for name in running_updates)
+                expected_authorization = (
+                    attempt_id,
+                    claim_token,
+                    current_row["execution_id"],
+                    attestation.launch_driver_pid,
+                    attestation.launch_driver_identity,
+                    attestation.launch_driver_unit,
+                    attestation.launch_driver_invocation_id,
+                    attestation.launch_driver_control_group,
+                )
+
+                def authorize_running_attestation(*fields: Any) -> int:
+                    return int(fields == expected_authorization)
+
+                # The public store facade deliberately withholds SQLite callback
+                # registration. Install this exact-row grant on its private backing
+                # connection only after every launch and attestation check above.
+                raw_connection = _store_raw_connection_for_running_transition(connection)
+                sqlite3.Connection.create_function(
+                    raw_connection,
+                    "acp_sandbox_running_attestation_authorized",
+                    8,
+                    authorize_running_attestation,
+                )
+                changed = connection.execute(
+                    f"UPDATE sandbox_executions SET {assignments}, phase = 'running', "
+                    "updated_at = ? WHERE attempt_id = ? AND claim_token = ? "
+                    "AND execution_id = ? AND phase = 'launched'",
+                    (
+                        *running_updates.values(),
+                        utc_now(),
+                        attempt_id,
+                        claim_token,
+                        current_row["execution_id"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "execution journal changed concurrently; attempt fence retained",
+                    )
+                self._event(
+                    connection,
+                    "sandbox.execution_running",
+                    active_attempt["agent_id"],
+                    {
+                        "attempt_id": attempt_id,
+                        "claim_token": claim_token,
+                        "execution_id": current_row["execution_id"],
+                        "phase": "running",
+                        "attestation": attestation.audit_payload(),
+                    },
+                )
+                updated = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
             _authorize_runc_launch_gate_release_locked(
                 locked_handle, attempt_id, claim_token, row["execution_id"]
             )
-            return updated
+            return self._sandbox_execution_view(updated)
 
     def _sandbox_execution_request_stop(
         self,
