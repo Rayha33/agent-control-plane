@@ -16,8 +16,9 @@ default branch verifies natural completion; setting
 verifies cancellation from a fresh supervisor. Setting
 `ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1` exits the producer after successful
 `systemd-run` return but before receipt propagation, then verifies a fresh
-producer cannot replay the launch. The crash mode cannot be combined with
-cancellation. Run on a disposable supported Linux host with rootless runc 1.5.2,
+producer cannot replay the launch. Crash modes are mutually exclusive with
+cancellation and with one another. Run on a disposable supported Linux host
+with rootless runc 1.5.2,
 delegated cgroup v2, and an active private systemd user manager:
 
     ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
@@ -37,6 +38,11 @@ For the live crash after the recovery monitor is accepted but before the
 launch-driver records that receipt, add:
 
     ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE=1
+
+For a driver crash after the gated runc scope exists but before monitor
+activation is requested, add:
+
+    ACP_LIVE_CRASH_BEFORE_MONITOR_START=1
 """
 
 from __future__ import annotations
@@ -146,8 +152,9 @@ def _start_launch_driver_then_crash_controller(
     result_sender,
     crash_after_manager_acceptance: bool = False,
     monitor_acceptance_crash_marker: Path | None = None,
+    crash_before_monitor_start: bool = False,
 ) -> None:
-    """Exit the producer after manager acceptance or committed durable handoff."""
+    """Exit the launch-driver service at the selected monitor-handoff crash point."""
 
     original_runner = sandbox_launch_driver_service._run_trusted_runtime_command
 
@@ -177,7 +184,8 @@ from agent_control_plane.supervisor import oci_worker, sandbox_launch_driver_ser
 from agent_control_plane.supervisor import sandbox_monitor_ipc, sandbox_monitor_service
 
 marker = Path(sys.argv[1])
-driver_args = sys.argv[2:]
+crash_phase = sys.argv[2]
+driver_args = sys.argv[3:]
 captured = {}
 original_record_launch = GitSupervisor._sandbox_execution_record_launch
 
@@ -190,17 +198,29 @@ def capture_launch_handle(self, *args, **kwargs):
 GitSupervisor._sandbox_execution_record_launch = capture_launch_handle
 original_monitor_start = sandbox_monitor_service.start_sandbox_execution_monitor
 
-def crash_after_monitor_acceptance(*args, **kwargs):
-    client = original_monitor_start(*args, **kwargs)
-    receipt = client._receipt
+def write_crash_marker(kwargs, receipt):
     identity = kwargs["expected_identity"]
     attempt_slice = sandbox_launch_driver_service.sandbox_attempt_slice_unit(*identity)
     driver_unit = f"acp-launch-driver-{identity[2]}.service"
+    monitor_unit = sandbox_launch_driver_service.sandbox_monitor_service_unit(*identity)
     properties = sandbox_launch_driver_service._unit_properties(
         driver_unit,
         ("ActiveState", "ControlGroup", "Id", "InvocationID", "MainPID", "Slice"),
     )
+    monitor_value = None
+    if receipt is not None:
+        monitor_value = {
+            "unit": receipt.unit,
+            "invocation_id": receipt.invocation_id,
+            "pid": receipt.main_pid,
+            "identity": receipt.main_identity,
+            "control_group": receipt.control_group,
+            "attempt_id": receipt.attempt_id,
+            "claim_token": receipt.claim_token,
+            "execution_id": receipt.execution_id,
+        }
     value = {
+        "crash_phase": crash_phase,
         "identity": list(identity),
         "driver": {
             "unit": driver_unit,
@@ -212,16 +232,8 @@ def crash_after_monitor_acceptance(*args, **kwargs):
             "slice": properties["Slice"],
             "main_pid": int(properties["MainPID"]),
         },
-        "monitor": {
-            "unit": receipt.unit,
-            "invocation_id": receipt.invocation_id,
-            "pid": receipt.main_pid,
-            "identity": receipt.main_identity,
-            "control_group": receipt.control_group,
-            "attempt_id": receipt.attempt_id,
-            "claim_token": receipt.claim_token,
-            "execution_id": receipt.execution_id,
-        },
+        "monitor_unit": monitor_unit,
+        "monitor": monitor_value,
         "attempt_slice": attempt_slice,
         "attempt_slice_control_group": kwargs["attempt_slice_control_group"],
         "scope": {
@@ -235,7 +247,15 @@ def crash_after_monitor_acceptance(*args, **kwargs):
     marker.write_text(json.dumps(value, sort_keys=True), encoding="ascii")
     os._exit(74)
 
-sandbox_monitor_service.start_sandbox_execution_monitor = crash_after_monitor_acceptance
+def crash_at_monitor_start(*args, **kwargs):
+    if crash_phase == "before_monitor_start":
+        write_crash_marker(kwargs, None)
+    client = original_monitor_start(*args, **kwargs)
+    if crash_phase != "after_monitor_acceptance":
+        raise AssertionError("unknown live monitor crash phase")
+    write_crash_marker(kwargs, client._receipt)
+
+sandbox_monitor_service.start_sandbox_execution_monitor = crash_at_monitor_start
 raise SystemExit(sandbox_launch_driver_service.main(driver_args))
 """
                 argv[module_flag - 1 :] = [
@@ -243,6 +263,9 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                     "-c",
                     wrapper,
                     str(monitor_acceptance_crash_marker),
+                    "before_monitor_start"
+                    if crash_before_monitor_start
+                    else "after_monitor_acceptance",
                     *driver_args,
                 ]
         result = original_runner(argv, environment=environment)
@@ -1670,17 +1693,25 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         crash_after_monitor_acceptance = (
             os.environ.get("ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE") == "1"
         )
+        crash_before_monitor_start = os.environ.get("ACP_LIVE_CRASH_BEFORE_MONITOR_START") == "1"
         if (
             sum(
-                (cancel_after_start, crash_after_manager_acceptance, crash_after_monitor_acceptance)
+                (
+                    cancel_after_start,
+                    crash_after_manager_acceptance,
+                    crash_after_monitor_acceptance,
+                    crash_before_monitor_start,
+                )
             )
             > 1
         ):
             pytest.fail("live cancellation and crash-injection modes are mutually exclusive")
         crash_driver_service_before_receipt = (
-            crash_after_manager_acceptance or crash_after_monitor_acceptance
+            crash_after_manager_acceptance
+            or crash_after_monitor_acceptance
+            or crash_before_monitor_start
         )
-        monitor_acceptance_marker = run_root / "monitor-accepted.json"
+        monitor_acceptance_marker = run_root / "monitor-handoff-crash.json"
         payload_sleep_seconds = 30 if cancel_after_start else 1
         payload_command = (
             "/bin/busybox",
@@ -1707,7 +1738,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 service_log_path,
                 producer_result_sender,
                 crash_driver_service_before_receipt,
-                monitor_acceptance_marker if crash_after_monitor_acceptance else None,
+                monitor_acceptance_marker
+                if crash_after_monitor_acceptance or crash_before_monitor_start
+                else None,
+                crash_before_monitor_start,
             ),
         )
         producer_controller.start()
@@ -1743,9 +1777,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             assert producer_receipt["attempt_id"] == identity[0]
             assert producer_receipt["claim_token"] == identity[1]
             assert producer_receipt["execution_id"] == identity[2]
-        if crash_after_monitor_acceptance:
-            _wait_for_receipt(run_root, "monitor-accepted.json", timeout=40.0)
+        if crash_after_monitor_acceptance or crash_before_monitor_start:
+            _wait_for_receipt(run_root, "monitor-handoff-crash.json", timeout=40.0)
             accepted = json.loads(monitor_acceptance_marker.read_text(encoding="ascii"))
+            expected_crash_phase = (
+                "before_monitor_start" if crash_before_monitor_start else "after_monitor_acceptance"
+            )
+            assert accepted["crash_phase"] == expected_crash_phase
             assert accepted["identity"] == list(identity)
             driver = accepted["driver"]
             monitor = accepted["monitor"]
@@ -1762,19 +1800,24 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 == accepted["attempt_slice_control_group"]
             )
             assert accepted["attempt_slice"] == slice_unit
-            assert monitor["unit"] == monitor_unit
-            assert (
-                monitor["attempt_id"],
-                monitor["claim_token"],
-                monitor["execution_id"],
-            ) == identity
-            assert monitor["pid"] > 0
-            assert monitor["identity"].startswith(f"linux:{monitor['pid']}:")
-            assert re.fullmatch(r"[0-9a-f]{32}", monitor["invocation_id"])
-            assert monitor["control_group"]
-            assert not PurePosixPath(monitor["control_group"]).is_relative_to(
-                PurePosixPath(accepted["attempt_slice_control_group"])
-            )
+            assert accepted["monitor_unit"] == monitor_unit
+            if crash_before_monitor_start:
+                assert monitor is None
+            else:
+                assert monitor is not None
+                assert monitor["unit"] == monitor_unit
+                assert (
+                    monitor["attempt_id"],
+                    monitor["claim_token"],
+                    monitor["execution_id"],
+                ) == identity
+                assert monitor["pid"] > 0
+                assert monitor["identity"].startswith(f"linux:{monitor['pid']}:")
+                assert re.fullmatch(r"[0-9a-f]{32}", monitor["invocation_id"])
+                assert monitor["control_group"]
+                assert not PurePosixPath(monitor["control_group"]).is_relative_to(
+                    PurePosixPath(accepted["attempt_slice_control_group"])
+                )
             assert scope["unit"] == f"acp-{execution['container_id']}.scope"
             assert re.fullmatch(r"[0-9a-f]{32}", scope["invocation_id"])
             assert (
@@ -1836,12 +1879,19 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                     "Slice",
                 ),
             )
-            assert monitor_before_recovery["ActiveState"] == "active"
-            assert monitor_before_recovery["LoadState"] == "loaded"
             assert monitor_before_recovery["Id"] == monitor_unit
-            assert monitor_before_recovery["MainPID"] == str(monitor["pid"])
-            assert monitor_before_recovery["InvocationID"] == monitor["invocation_id"]
-            assert monitor_before_recovery["ControlGroup"] == monitor["control_group"]
+            if crash_before_monitor_start:
+                assert monitor_before_recovery["ActiveState"] == "inactive"
+                assert monitor_before_recovery["LoadState"] == "not-found"
+                assert monitor_before_recovery["MainPID"] == "0"
+                assert not monitor_before_recovery["InvocationID"]
+                assert not monitor_before_recovery["ControlGroup"]
+            else:
+                assert monitor_before_recovery["ActiveState"] == "active"
+                assert monitor_before_recovery["LoadState"] == "loaded"
+                assert monitor_before_recovery["MainPID"] == str(monitor["pid"])
+                assert monitor_before_recovery["InvocationID"] == monitor["invocation_id"]
+                assert monitor_before_recovery["ControlGroup"] == monitor["control_group"]
             attempt_slice_before_recovery = _unit_properties(
                 slice_unit, ("ActiveState", "ControlGroup", "Id", "LoadState")
             )
@@ -1938,12 +1988,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             assert recovery.exitcode == 0
             recovery_receiver.close()
             assert recovery_result[0] == "ok", recovery_result
-            assert recovery_result[1] not in {
+            recovery_excluded_pids = {
                 controller_pid,
                 driver["pid"],
-                monitor["pid"],
                 accepted["runc_client_pid"],
             }
+            if monitor is not None:
+                recovery_excluded_pids.add(monitor["pid"])
+            assert recovery_result[1] not in recovery_excluded_pids
             assert recovery_result[2] is False
 
             for unit in (service_unit, monitor_unit):
@@ -1955,6 +2007,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 assert props["ActiveState"] in {"inactive", "failed"}
                 assert props["MainPID"] == "0"
                 assert not props["ControlGroup"]
+                if crash_before_monitor_start and unit == monitor_unit:
+                    assert props["LoadState"] == "not-found"
+                    assert props["ActiveState"] == "inactive"
             scope_after_recovery = _unit_properties(
                 scope["unit"], ("ActiveState", "ControlGroup", "Id", "LoadState")
             )
@@ -1969,11 +2024,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             assert slice_props["ActiveState"] in {"inactive", "failed"}
             assert slice_props["LoadState"] in {"loaded", "not-found"}
             assert not slice_props["ControlGroup"]
-            for observed_pid, observed_identity in (
+            observed_processes = [
                 (driver["pid"], driver["identity"]),
-                (monitor["pid"], monitor["identity"]),
                 (accepted["runc_client_pid"], accepted["runc_client_identity"]),
-            ):
+            ]
+            if monitor is not None:
+                observed_processes.append((monitor["pid"], monitor["identity"]))
+            for observed_pid, observed_identity in observed_processes:
                 try:
                     current_identity = _linux_process_identity(observed_pid)
                 except sandbox_monitor_ipc.SandboxMonitorIPCError:

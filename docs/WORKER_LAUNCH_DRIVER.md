@@ -28,10 +28,11 @@ windows and daemon restart remain unproven.
 The journal suite also now has a spawned-process regression for launch-driver
 death after the recovery-monitor starter reports acceptance but before the
 durable `launched` receipt commits; that test uses synthetic systemd
-observations and is not live manager evidence. A distinct opt-in live
-systemd-252 mode now exercises that same monitor-accepted/pre-receipt crash
-window against real manager and runc processes; it proves fail-closed
-containment, not successful cleanup or restart recovery.
+observations and is not live manager evidence. Distinct opt-in live
+systemd-252 modes now exercise both a crash before monitor activation and a
+crash after monitor acceptance but before the receipt commits, against real
+manager and runc processes. They prove fail-closed containment, not successful
+cleanup or restart recovery.
 The code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487` passed
 [exact-head hosted CI run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
 with all four Ubuntu/macOS × Python 3.11/3.12 jobs green. Result import is not
@@ -327,6 +328,32 @@ were left untouched. Code-bearing commit
 [exact-head hosted CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380):
 all four Ubuntu/macOS × Python 3.11/3.12 jobs passed.
 
+### Live driver crash before recovery-monitor activation (2026-10-16)
+
+The opt-in `ACP_LIVE_CRASH_BEFORE_MONITOR_START=1` mode passed 1/1 on the
+disposable Debian 12 ARM64 / Linux 6.1 / systemd 252.39 guest, with cgroup v2,
+Python 3.11.2, pytest 9.1.1, and pinned rootless runc 1.5.2. After the real
+launch-driver starts the pinned runc client and creates its exact gated worker
+scope, a test hook exits the driver immediately before calling the production
+recovery-monitor starter.
+The marker proves the exact driver, attempt slice, runc-client, and scope
+identities at that point; the monitor unit remains `not-found` before recovery.
+
+A fresh `GitSupervisor` runs the production exact-start reconciliation and
+proves that it accepts the absent monitor as quiescent, then retires only the
+bound driver, scope, and attempt slice. The test asserts the monitor unit stays
+`not-found` and inactive after reconciliation as well. The execution remains
+`ambiguous`, cleanup verification is absent, result capture is blocked, fences
+remain held, and a fresh retry is rejected before a second `systemd-run`
+submission. As in the post-monitor crash case, the closed gate may reap the
+runc client and make the scope inactive before reconciliation; the test
+verifies exact scope identity while active and requires no cgroup/process
+afterward. This does not prove cleanup verification, fence release, monitor
+recovery (no monitor was started), supervisor/user-manager restart, result
+import, provider access, or `run_worker()` enablement. No model, provider
+credential, outbound network call, or paid inference was used. This mode used
+the exact host/guest test-module hash recorded in the following subsection.
+
 ### Live monitor-accepted, pre-receipt launch-driver crash (2026-10-16)
 
 The opt-in `ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE=1` mode passed 1/1 on the
@@ -352,8 +379,8 @@ systemd version the closed gate's EOF could reap the blocked runc client and
 make the scope inactive before reconciliation; the test checks exact identity
 when it is still active and requires absence afterward.
 
-The exact host/guest test-module SHA-256 was
-`17a1a927d4058419fbe896cfba654dbdd6b35914db8aff8fe58bf42ea4aac6cf`.
+The exact host/guest test-module SHA-256 for both live crash modes was
+`07a3c8c4a08b0f46e05c1e13d532798d8ffa8a3a0719cac87f1e04d61e437533`.
 Postflight found no matching fixture root, no running runc process, and no new
 live ACP launch-driver units. The two pre-existing failed transient units were
 left untouched. No model, provider credential, outbound network call, or paid

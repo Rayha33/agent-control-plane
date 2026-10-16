@@ -3531,14 +3531,17 @@ they do not qualify `run_worker()`, which remains fail-closed.
 
 This records the current attestation contract and closes the arbitrary-sibling-
 cgroup gap for the launch client. Separate live production-launch-driver tests
-now exercise the real start API, including one crash after monitor acceptance
-but before the durable `launched` receipt. That crash case verifies the exact
-monitor unit/process/cgroup becomes quiescent as part of fail-closed
-containment; it does not establish general or reaper-driven monitor cleanup,
-recovery after arbitrary driver crashes, worker registration through
-`run_worker()`, provider isolation, or end-to-end `run_worker()` acceptance.
-Configured OCI worker execution remains disabled; the crash case keeps cleanup
-verification absent and fences retained (see
+exercise the real start API at two crash points: after the gated runc scope
+exists but before monitor activation, and after monitor acceptance but before
+the durable `launched` receipt. The first proves the monitor unit remains
+`not-found` before and after fresh reconciliation; the second verifies the
+exact monitor unit/process/cgroup becomes quiescent as part of fail-closed
+containment. These cases do not establish
+general or reaper-driven monitor cleanup, recovery after arbitrary driver
+crashes, worker registration through `run_worker()`, provider isolation, or
+end-to-end `run_worker()` acceptance. Configured OCI worker execution remains
+disabled; both crash cases keep cleanup verification absent and fences
+retained (see
 [WORKER_LAUNCH_DRIVER.md](WORKER_LAUNCH_DRIVER.md#live-monitor-accepted-pre-receipt-launch-driver-crash-2026-10-16)).
 
 ### Production monitor producer and controller reconnect (2026-10-15)
