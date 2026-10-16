@@ -15,6 +15,7 @@ from agent_control_plane.supervisor.sandbox_launch_driver_service import (
     SandboxLaunchDriverServiceError,
     _read_request,
     _read_service_runner_credential,
+    _request_timeout_stop_and_cancel_monitor,
     _validate_request,
     _write_request,
     start_sandbox_launch_driver,
@@ -99,6 +100,108 @@ def test_request_is_canonical_private_and_bound_to_the_execution(tmp_path: Path)
         _write_request(path, request)
     with pytest.raises(SandboxLaunchDriverServiceError, match="mismatched"):
         _read_request(path, ("attempt-1", 8, "execution-1"))
+
+
+def test_timeout_records_exact_stop_intent_before_monitor_cancel() -> None:
+    events: list[tuple[object, ...]] = []
+    credential = "runner-secret"
+    stopping = {
+        "attempt_id": _IDENTITY[0],
+        "claim_token": _IDENTITY[1],
+        "execution_id": _IDENTITY[2],
+        "phase": "stopping",
+        "stop_reason": "execution_timeout",
+    }
+
+    class SupervisorStub:
+        def _sandbox_execution_request_stop(
+            self, attempt_id: str, claim_token: int, reason: str, *, credential: str | None
+        ) -> dict[str, object]:
+            events.append(("request_stop", attempt_id, claim_token, reason, credential))
+            return stopping
+
+        def _cancel_sandbox_execution_monitor(self, execution: dict[str, object]) -> None:
+            events.append(("cancel_monitor", execution))
+
+    _request_timeout_stop_and_cancel_monitor(
+        SupervisorStub(),
+        _IDENTITY,
+        credential=credential,  # type: ignore[arg-type]
+    )
+
+    assert events == [
+        ("request_stop", *_IDENTITY[:2], "execution_timeout", credential),
+        ("cancel_monitor", stopping),
+    ]
+
+
+def test_timeout_adopts_existing_exact_stop_reason_after_cancel_race() -> None:
+    events: list[tuple[object, ...]] = []
+    stopping = {
+        "attempt_id": _IDENTITY[0],
+        "claim_token": _IDENTITY[1],
+        "execution_id": _IDENTITY[2],
+        "phase": "stopping",
+        "stop_reason": "terminate_worker",
+    }
+
+    class SupervisorStub:
+        def _sandbox_execution_request_stop(
+            self, _attempt_id: str, _claim_token: int, _reason: str, *, credential: str | None
+        ) -> dict[str, object]:
+            raise SupervisorError(
+                "sandbox_execution_transition_conflict", "another stop reason already won"
+            )
+
+        def _sandbox_execution_get(self, attempt_id: str) -> dict[str, object] | None:
+            assert attempt_id == _IDENTITY[0]
+            return stopping
+
+        def _cancel_sandbox_execution_monitor(self, execution: dict[str, object]) -> None:
+            events.append(("cancel_monitor", execution))
+
+    _request_timeout_stop_and_cancel_monitor(
+        SupervisorStub(),
+        _IDENTITY,
+        credential="runner-secret",  # type: ignore[arg-type]
+    )
+
+    assert events == [("cancel_monitor", stopping)]
+
+
+def test_timeout_conflict_cannot_cancel_a_different_execution() -> None:
+    events: list[dict[str, object]] = []
+    unrelated = {
+        "attempt_id": _IDENTITY[0],
+        "claim_token": _IDENTITY[1],
+        "execution_id": "another-execution",
+        "phase": "stopping",
+        "stop_reason": "terminate_worker",
+    }
+
+    class SupervisorStub:
+        def _sandbox_execution_request_stop(
+            self, _attempt_id: str, _claim_token: int, _reason: str, *, credential: str | None
+        ) -> dict[str, object]:
+            raise SupervisorError(
+                "sandbox_execution_transition_conflict", "another stop reason already won"
+            )
+
+        def _sandbox_execution_get(self, attempt_id: str) -> dict[str, object] | None:
+            assert attempt_id == _IDENTITY[0]
+            return unrelated
+
+        def _cancel_sandbox_execution_monitor(self, execution: dict[str, object]) -> None:
+            events.append(execution)
+
+    with pytest.raises(SupervisorError, match="another stop reason already won"):
+        _request_timeout_stop_and_cancel_monitor(
+            SupervisorStub(),
+            _IDENTITY,
+            credential="runner-secret",  # type: ignore[arg-type]
+        )
+
+    assert events == []
 
 
 def test_start_intent_digest_binds_exact_request_content() -> None:

@@ -379,16 +379,22 @@ systemd version the closed gate's EOF could reap the blocked runc client and
 make the scope inactive before reconciliation; the test checks exact identity
 when it is still active and requires absence afterward.
 
-The exact host/guest test-module SHA-256 for both live crash modes was
-`07a3c8c4a08b0f46e05c1e13d532798d8ffa8a3a0719cac87f1e04d61e437533`.
-Postflight found no matching fixture root, no running runc process, and no new
-live ACP launch-driver units. The two pre-existing failed transient units were
-left untouched. No model, provider credential, outbound network call, or paid
-inference was used. This is live evidence for one handoff crash window and
-fail-closed containment only: it does not prove successful runc wait/delete,
+Before adding timeout coverage, the exact host/guest test-module SHA-256 was
+`07a3c8c4a08b0f46e05c1e13d532798d8ffa8a3a0719cac87f1e04d61e437533`. That
+version was exercised in five opt-in live modes on the disposable guest:
+natural completion, fresh-process cancellation, manager-accepted/pre-receipt
+crash, monitor-accepted/pre-receipt crash, and pre-monitor-start crash. Each
+mode passed 1/1. Postflight after the five-mode run found no matching fixture
+root, active ACP launch-driver unit, running runc process, or D-state process;
+the two pre-existing failed transient units were left untouched. No model,
+provider credential, outbound network call, or paid inference was used. The
+crash mode in this subsection proves one handoff crash window and fail-closed
+containment only; it does not prove successful runc wait/delete,
 `cleanup_verified`, fence release, every crash window, restart of the pytest
 harness or supervisor daemon, systemd user-manager restart/logout/reboot,
-result import, provider access, or `run_worker()` enablement.
+result import, provider access, or `run_worker()` enablement. The newly added
+launch-driver timeout mode has not yet been run live; it remains pending exact
+host/guest hash and postflight evidence.
 
 ### Spawned journal crash during monitor handoff (2026-10-16; synthetic systemd)
 

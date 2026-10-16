@@ -1216,6 +1216,52 @@ def _run_driver(
     _execute_pinned_request(supervisor, expected_identity, request, credential=credential)
 
 
+def _request_timeout_stop_and_cancel_monitor(
+    supervisor: GitSupervisor,
+    expected_identity: tuple[str, int, str],
+    *,
+    credential: str | None,
+) -> None:
+    """Persist timeout intent before asking the exact monitor to stop the scope."""
+
+    attempt_id, claim_token, execution_id = expected_identity
+    try:
+        stopping = supervisor._sandbox_execution_request_stop(
+            attempt_id,
+            claim_token,
+            "execution_timeout",
+            credential=credential,
+        )
+    except SupervisorError as error:
+        if error.code != "sandbox_execution_transition_conflict":
+            raise
+        # A user cancellation may have won the stop-intent race. Adopt only
+        # that exact durable stopping execution; never replace its reason.
+        stopping = supervisor._sandbox_execution_get(attempt_id)
+        if (
+            stopping is None
+            or (
+                stopping.get("attempt_id"),
+                stopping.get("claim_token"),
+                stopping.get("execution_id"),
+            )
+            != expected_identity
+            or stopping.get("phase") != "stopping"
+            or not stopping.get("stop_reason")
+        ):
+            raise
+    if (
+        stopping.get("attempt_id"),
+        stopping.get("claim_token"),
+        stopping.get("execution_id"),
+    ) != expected_identity:
+        raise SupervisorError(
+            "sandbox_execution_transition_conflict",
+            "timeout stop intent returned a different execution identity; fences remain held",
+        )
+    supervisor._cancel_sandbox_execution_monitor(stopping)
+
+
 def _execute_pinned_request(
     supervisor: GitSupervisor,
     expected_identity: tuple[str, int, str],
@@ -1387,7 +1433,11 @@ def _execute_pinned_request(
         try:
             wait_receipt = handle.wait(timeout=float(request["timeout_seconds"]))
         except subprocess.TimeoutExpired:
-            supervisor._cancel_sandbox_execution_monitor(running)
+            _request_timeout_stop_and_cancel_monitor(
+                supervisor,
+                expected_identity,
+                credential=credential,
+            )
             wait_receipt = handle.wait()
         supervisor._sandbox_execution_record_exit(
             attempt_id, claim_token, wait_receipt, credential=credential

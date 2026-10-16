@@ -3,10 +3,11 @@
 The process-local runc handle must remain in the exact systemd launch-driver
 process; a separate systemd-owned service controls the exact worker scope. The
 default branch proves launch-to-``running``, natural completion, and
-reaper-driven cleanup verification/runtime release. The production producer
-runs in a short-lived process that exits abruptly after durable handoff; fresh
-supervisor processes then cancel (when requested) and reap the exact execution.
-Neither branch wires ``run_worker`` or authorizes result import.
+reaper-driven cleanup verification/runtime release. Opt-in branches also cover
+fresh-supervisor cancellation and launch-driver timeout. The production
+producer runs in a short-lived process that exits abruptly after durable
+handoff; fresh supervisor processes cancel (when requested) and reap the exact
+execution. None of these branches wires ``run_worker`` or authorizes result import.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -14,10 +15,13 @@ redemption contract. The production launch-driver test remains opt-in. Its
 default branch verifies natural completion; setting
 `ACP_LIVE_CANCEL_AFTER_START=1` runs the same fixture with a long payload and
 verifies cancellation from a fresh supervisor. Setting
+`ACP_LIVE_TIMEOUT_AFTER_START=1` uses a one-second driver timeout with a long
+payload and verifies automatic stop-intent recording, monitor cancellation,
+and cleanup verification. Setting
 `ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1` exits the producer after successful
 `systemd-run` return but before receipt propagation, then verifies a fresh
 producer cannot replay the launch. Crash modes are mutually exclusive with
-cancellation and with one another. Run on a disposable supported Linux host
+cancellation, timeout, and one another. Run on a disposable supported Linux host
 with rootless runc 1.5.2,
 delegated cgroup v2, and an active private systemd user manager:
 
@@ -29,6 +33,10 @@ delegated cgroup v2, and an active private systemd user manager:
 For the fresh-supervisor cancellation branch, add:
 
     ACP_LIVE_CANCEL_AFTER_START=1
+
+For the launch-driver timeout branch, add:
+
+    ACP_LIVE_TIMEOUT_AFTER_START=1
 
 For the manager-accepted/pre-receipt crash branch, add:
 
@@ -1560,7 +1568,7 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition(
     reason="set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 on a disposable supported Linux host",
 )
 def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
-    """Use the production launcher and reaper for completion or fresh-controller cancel."""
+    """Use the production launcher and reaper for completion, cancel, or timeout."""
 
     source_root = Path(__file__).resolve().parents[1]
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
@@ -1687,6 +1695,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         monitor_start_attempted = True
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
+        timeout_after_start = os.environ.get("ACP_LIVE_TIMEOUT_AFTER_START") == "1"
         crash_after_manager_acceptance = (
             os.environ.get("ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE") == "1"
         )
@@ -1698,6 +1707,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             sum(
                 (
                     cancel_after_start,
+                    timeout_after_start,
                     crash_after_manager_acceptance,
                     crash_after_monitor_acceptance,
                     crash_before_monitor_start,
@@ -1705,14 +1715,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             )
             > 1
         ):
-            pytest.fail("live cancellation and crash-injection modes are mutually exclusive")
+            pytest.fail("live cancel, timeout, and crash-injection modes are mutually exclusive")
         crash_driver_service_before_receipt = (
             crash_after_manager_acceptance
             or crash_after_monitor_acceptance
             or crash_before_monitor_start
         )
         monitor_acceptance_marker = run_root / "monitor-handoff-crash.json"
-        payload_sleep_seconds = 30 if cancel_after_start else 1
+        payload_sleep_seconds = 30 if cancel_after_start or timeout_after_start else 1
+        sandbox_timeout_seconds = 1 if timeout_after_start else 30
         payload_command = (
             "/bin/busybox",
             "sh",
@@ -1733,7 +1744,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 _CONTAINER_CPU_QUOTA_US,
                 _CONTAINER_CPU_PERIOD_US,
                 _CONTAINER_PIDS_LIMIT,
-                30,
+                sandbox_timeout_seconds,
                 runner["credential"],
                 service_log_path,
                 producer_result_sender,
@@ -2123,7 +2134,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                     _CONTAINER_CPU_QUOTA_US,
                     _CONTAINER_CPU_PERIOD_US,
                     _CONTAINER_PIDS_LIMIT,
-                    30,
+                    sandbox_timeout_seconds,
                     runner["credential"],
                     retry_sender,
                 ),
@@ -2224,7 +2235,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 _CONTAINER_CPU_QUOTA_US,
                 _CONTAINER_CPU_PERIOD_US,
                 _CONTAINER_PIDS_LIMIT,
-                30,
+                sandbox_timeout_seconds,
                 runner["credential"],
                 retry_sender,
             ),
@@ -2324,7 +2335,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
         assert runner["credential"] not in service_log
         assert durable is not None and durable["phase"] == "cleanup_reported", service_log
-        if not cancel_after_start:
+        if not cancel_after_start and not timeout_after_start:
             assert durable["runc_exit_code"] == 0
         else:
             assert type(durable["runc_exit_code"]) is int
@@ -2356,7 +2367,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             Path(durable["cgroup_path"]).parent.as_posix() == durable["attempt_slice_cgroup_path"]
         )
         marker = Path(durable["workspace_root_path"]) / "launch-driver-marker"
-        if cancel_after_start:
+        if cancel_after_start or timeout_after_start:
             assert _entry_is_present(Path(durable["workspace_root_path"]) / "launch-driver-started")
             assert not _entry_is_present(marker)
         else:
@@ -2382,7 +2393,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             "sandbox.execution_launched",
             "sandbox.execution_running",
         ]
-        if cancel_after_start:
+        if cancel_after_start or timeout_after_start:
             expected_events.append("sandbox.execution_stop_requested")
         expected_events.extend(["sandbox.execution_exited", "sandbox.execution_cleanup_reported"])
         assert [row["event_type"] for row in events] == expected_events
@@ -2486,8 +2497,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         verified = supervisor._sandbox_execution_get(attempt["id"])
         assert verified is not None
         assert verified["phase"] == "cleanup_verified"
-        if cancel_after_start:
+        if cancel_after_start or timeout_after_start:
             assert verified["runc_exit_code"] != 0
+            if timeout_after_start:
+                assert verified["stop_reason"] == "execution_timeout"
             with supervisor.connect() as connection:
                 with pytest.raises(SupervisorError) as result_rejected:
                     journal_module._require_sandbox_execution_result_eligible(
