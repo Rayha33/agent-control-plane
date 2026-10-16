@@ -149,19 +149,35 @@ At that run, `sandbox_monitor_service.py` SHA-256 was
 `7fff5fb9fc086f81b1b945493b982443598585cbb01242a9aa274ee21b1b4f30` and the
 test SHA-256 was
 `c7a4031866c4297716f29757b5476f42fe304648f2fe51982dda385e02912a67`. The
-current helper SHA-256 is
-`3954ba738a64a7e849d22b0e329e9c6b314a999fa0c854443238b494f7ff5d4f` and the
-current test SHA-256 is
-`2797b52f3227501f1c75504ec6a1fe93e6547b723e8389dc03348fdc1bdafe27`; neither
-current revision was included in that live run. The current helper was not
-rerun live, and the current test was not rerun after its local-only edit. This
-experiment proves only that the earlier helper revision could attach a blocked
-PID to a transient scope; it is **not part of the selected launch-driver
-architecture** and does not prove monitor/driver integration. The helper also
-does not itself prove or retain the private launcher's exec gate: a caller must
-hold that gate across the call. Calling the helper for the production runc
-client would violate the current attestation requirement that the client remain
-in the exact launch-driver service cgroup.
+PIDs-scope experiment exercised only those historical hashes; the test case has
+not been rerun at current hashes. It proves only that the earlier helper
+revision could attach a blocked PID to a transient scope; it is **not part of
+the selected launch-driver architecture** and does not prove monitor/driver
+integration. The helper also does not itself prove or retain the private
+launcher's exec gate: a caller must hold that gate across the call. Calling the
+helper for the production runc client would violate the current attestation
+requirement that the client remain in the exact launch-driver service cgroup.
+
+### Current-branch production monitor baseline (2026-10-16; pass, monitor only)
+
+At commit `89c114e277963745c497a95025a2ca30e0257667`, the opt-in
+`test_live_production_monitor_service_survives_controller_crash_and_cancels_exact_scope`
+passed on the disposable `acp-2370-live-sandbox-20261010` Lima guest: Ubuntu
+26.04.1 ARM64, Linux `7.0.0-38-generic`, Python 3.14.4, systemd 259.5, and cgroup
+v2. The test ran the existing monitor producer against a harmless `/usr/bin/sleep`
+scope; no model, provider credential, or network egress was used. Host and guest
+SHA-256 matched for the test module (`88d9b9fef49261a1921a766f11b54a1f7714cd5a75115c35eb64cb651753cef5`),
+`sandbox_monitor_service.py` (`3954ba738a64a7e849d22b0e329e9c6b314a999fa0c854443238b494f7ff5d4f`),
+`sandbox_monitor_ipc.py` (`b9147858a1cd30f04bb9273f6f26b9382970414366f929cb526525941b48fead`),
+`sandbox_monitor_lifecycle.py` (`b00dd5c714890aee467f6a2ab187ae1b12847780eaf5c004532dbd17fe4fb5db`),
+`sandbox_monitor_receipt.py` (`ce03104fd7132baf8c8b34e5d45421c8dd899ac7bc35a60373191b3d1810af66`),
+and `sandbox_attestation.py` (`de275b7c7a808d7ea78be8f683efc02b2fa671ef60a5c394ff6971ea50acb0bf`).
+Postflight found no matching ACP service/scope units and no
+`acp-production-monitor-*` fixture roots. This is a current live regression for
+the monitor only. It does **not** exercise a launch-driver producer, journal
+redemption in a service process, pinned-runc submission, same-process `running`
+transition, monitor-to-driver cancellation, or supervisor-owned cleanup
+verification; the integrated lifecycle remains unimplemented.
 
 The local cleanup regression uses a real held child and injected kill/first-wait
 failures; it verifies EOF exits 126 and an unverified scope binding preserves
