@@ -1403,11 +1403,26 @@ def test_open_runc_fd_rejects_inode_replaced_after_initial_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pin = pinned_runc(tmp_path)
+    # Resolve a regular system binary: some Linux images make /bin/echo itself
+    # a symlink, which O_NOFOLLOW correctly refuses before the inode check.
+    replacement = next(
+        (
+            candidate.resolve()
+            for candidate in (Path("/usr/bin/sleep"), Path("/bin/sleep"))
+            if candidate.is_file()
+        ),
+        None,
+    )
+    assert replacement is not None
+    replacement_info = replacement.stat()
+    assert stat.S_ISREG(replacement_info.st_mode)
+    assert replacement_info.st_uid == 0
+    assert (replacement_info.st_dev, replacement_info.st_ino) != (pin.device, pin.inode)
     real_open = os.open
 
     def replaced_open(path, flags, *args, **kwargs):
         if Path(path) == pin.path:
-            return real_open("/bin/echo", flags, *args, **kwargs)
+            return real_open(replacement, flags, *args, **kwargs)
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(oci_worker, "_verify_trusted_runc_executable", lambda _pin: pin.path)
