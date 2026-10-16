@@ -2970,6 +2970,86 @@ def test_reaper_tears_down_expired_runtime(repo: Path) -> None:
     assert supervisor.runtime_environment(attempt["id"])["state"] == "released"
 
 
+def test_quarantined_cleanup_finalizes_without_registered_worker_identity(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox-only attempt")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET status = 'terminating', termination_target_status = 'quarantined' "
+            "WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = 'blocked' "
+            "WHERE id = ?",
+            (created["id"],),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    monkeypatch.setattr(
+        workers_module,
+        "_sandbox_execution_cleanup_is_verified",
+        lambda _connection, _attempt_id: True,
+    )
+
+    assert supervisor._finalize_registered_worker_cleanup(attempt["id"]) == "quarantined"
+
+    finalized = supervisor.attempt(attempt["id"])
+    assert finalized["status"] == "quarantined"
+    assert finalized["pid"] is None
+    assert finalized["pid_identity"] == ""
+    assert finalized["termination_proof"] == ""
+    assert finalized["termination_target_status"] == ""
+
+
+@pytest.mark.parametrize(
+    ("launch_owner_column", "launch_owner_value"),
+    (("launch_owner_pid", 424242), ("launch_owner_identity", "linux:424242:9")),
+)
+def test_quarantined_cleanup_retains_unproven_launch_owner_without_worker_pid(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_owner_column: str,
+    launch_owner_value: int | str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox-only attempt with launch owner")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET status = 'terminating', termination_target_status = 'quarantined', "
+            f"{launch_owner_column} = ? WHERE id = ?",
+            (launch_owner_value, attempt["id"]),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = 'blocked' "
+            "WHERE id = ?",
+            (created["id"],),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    monkeypatch.setattr(
+        workers_module,
+        "_sandbox_execution_cleanup_is_verified",
+        lambda _connection, _attempt_id: True,
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._finalize_registered_worker_cleanup(attempt["id"])
+
+    assert error.value.code == "worker_cleanup_unproven"
+    retained = supervisor.attempt(attempt["id"])
+    assert retained["status"] == "terminating"
+    assert retained[launch_owner_column] == launch_owner_value
+
+
 @requires_linux_worker
 def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> None:
     start, _ = two_free_ports()

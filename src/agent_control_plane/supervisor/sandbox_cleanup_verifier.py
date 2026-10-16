@@ -295,7 +295,7 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
                 not in (
                     {"inactive", "not-found", "active"}
                     if name == "attempt_slice"
-                    else {"inactive", "not-found"}
+                    else {"inactive", "not-found", "failed"}
                 )
                 or snapshot.get("load_state") not in {"loaded", "not-found"}
                 or snapshot.get("main_pid") != "0"
@@ -387,7 +387,7 @@ def _unit_snapshot(
     systemctl: Path,
     environment: dict[str, str],
 ) -> dict[str, str]:
-    """Stop only the recorded activation, then require an inactive exact unit."""
+    """Stop only the recorded activation, then require its process to be absent."""
 
     def read() -> dict[str, str]:
         try:
@@ -419,14 +419,19 @@ def _unit_snapshot(
         return _normalized_unit_snapshot(properties, unit)
 
     if not exact_identity(properties):
-        # An already stopped unit may retain the exact invocation/cgroup, but a
-        # different activation or residual MainPID is never treated as absent.
+        # A stopped service may lose its ControlGroup while systemd retains its
+        # failed InvocationID. Accept that only for this exact failed activation;
+        # a different activation or residual MainPID is never treated as absent.
+        state = properties.get("ActiveState")
+        stopped_identity_matches = state == "inactive" or (
+            state == "failed" and properties.get("InvocationID") == invocation_id
+        )
         if (
             properties.get("Id") != unit
             or properties.get("InvocationID") not in {"", invocation_id}
             or properties.get("ControlGroup") not in {"", control_group}
             or properties.get("MainPID") != "0"
-            or properties.get("ActiveState") != "inactive"
+            or not stopped_identity_matches
         ):
             raise SupervisorError(
                 "sandbox_cleanup_verification_unknown", "systemd unit changed identity"
@@ -434,7 +439,10 @@ def _unit_snapshot(
         return _normalized_unit_snapshot(properties, unit)
 
     if main_pid is not None and properties.get("MainPID") != str(main_pid):
-        if properties.get("ActiveState") != "inactive" or properties.get("MainPID") != "0":
+        if (
+            properties.get("ActiveState") not in {"inactive", "failed"}
+            or properties.get("MainPID") != "0"
+        ):
             raise SupervisorError(
                 "sandbox_cleanup_verification_unknown",
                 "systemd MainPID differs from recorded process",
@@ -473,7 +481,10 @@ def _unit_snapshot(
             raise SupervisorError(
                 "sandbox_cleanup_verification_unknown", "systemd unit was replaced during stop"
             )
-        if properties.get("ActiveState") == "inactive" and properties.get("MainPID") == "0":
+        if (
+            properties.get("ActiveState") in {"inactive", "failed"}
+            and properties.get("MainPID") == "0"
+        ):
             return _normalized_unit_snapshot(properties, unit)
         if main_pid is not None and properties.get("MainPID") != str(main_pid):
             raise SupervisorError(
@@ -500,6 +511,7 @@ def _normalized_unit_snapshot(
         else {
             "inactive",
             "not-found",
+            "failed",
         }
     )
     if active_state not in allowed_states or main_pid != "0":

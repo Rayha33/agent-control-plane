@@ -181,6 +181,18 @@ def test_persisted_verification_receipt_is_bound_to_exact_cleanup_report(exit_co
         row, canonical_json(forged)
     )
 
+    failed_service = json.loads(proof)
+    failed_service["observations"]["units"]["launch_driver"]["active_state"] = "failed"
+    assert verifier._sandbox_cleanup_verification_json_is_self_consistent(
+        row, canonical_json(failed_service)
+    )
+
+    failed_slice = json.loads(proof)
+    failed_slice["observations"]["units"]["attempt_slice"]["active_state"] = "failed"
+    assert not verifier._sandbox_cleanup_verification_json_is_self_consistent(
+        row, canonical_json(failed_slice)
+    )
+
 
 @pytest.mark.parametrize("bad_returncode", [False, 0.0])
 def test_persisted_verification_rejects_noninteger_cleanup_returncode(
@@ -316,6 +328,88 @@ def test_mismatched_active_systemd_invocation_is_never_stopped(monkeypatch) -> N
             invocation_id="a" * 32,
             control_group="/user.slice/worker.scope",
             main_pid=None,
+            stop_if_active=True,
+            systemctl=Path("/usr/bin/systemctl"),
+            environment={},
+        )
+    assert stop_calls == []
+
+
+def test_failed_exact_systemd_invocation_is_recorded_as_stopped(monkeypatch) -> None:
+    stop_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        verifier.sandbox_monitor_lifecycle,
+        "_read_unit_properties",
+        lambda *_args: {
+            "Id": "driver.service",
+            "LoadState": "loaded",
+            "ActiveState": "failed",
+            "InvocationID": "a" * 32,
+            "ControlGroup": "",
+            "MainPID": "0",
+        },
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: stop_calls.append(argv) or b"",
+    )
+
+    snapshot = verifier._unit_snapshot(
+        "driver.service",
+        invocation_id="a" * 32,
+        control_group="/user.slice/driver.service",
+        main_pid=42,
+        stop_if_active=True,
+        systemctl=Path("/usr/bin/systemctl"),
+        environment={},
+    )
+
+    assert snapshot["active_state"] == "failed"
+    assert snapshot["invocation_id"] == "a" * 32
+    assert snapshot["control_group"] == ""
+    assert snapshot["main_pid"] == "0"
+    assert stop_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("InvocationID", "b" * 32),
+        ("ControlGroup", "/user.slice/replacement.service"),
+        ("MainPID", "42"),
+    ],
+)
+def test_failed_systemd_unit_rejects_replacement_identity_or_live_process(
+    monkeypatch, field: str, value: str
+) -> None:
+    properties = {
+        "Id": "driver.service",
+        "LoadState": "loaded",
+        "ActiveState": "failed",
+        "InvocationID": "a" * 32,
+        "ControlGroup": "",
+        "MainPID": "0",
+    }
+    properties[field] = value
+    stop_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        verifier.sandbox_monitor_lifecycle,
+        "_read_unit_properties",
+        lambda *_args: properties,
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: stop_calls.append(argv) or b"",
+    )
+
+    with pytest.raises(SupervisorError, match="unit changed identity"):
+        verifier._unit_snapshot(
+            "driver.service",
+            invocation_id="a" * 32,
+            control_group="/user.slice/driver.service",
+            main_pid=42,
             stop_if_active=True,
             systemctl=Path("/usr/bin/systemctl"),
             environment={},

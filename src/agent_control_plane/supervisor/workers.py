@@ -819,7 +819,20 @@ class WorkersMixin:
                 "SELECT state FROM runtime_environments WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()
-            if not attempt["termination_proof"] or not runtime or runtime["state"] != "released":
+            # Sandbox-only attempts have no separate registered worker PID to
+            # prove dead; a registered PID still requires explicit proof.
+            worker_identity_unproven = (
+                attempt["pid"] is not None and not attempt["termination_proof"]
+            ) or (
+                attempt["pid"] is None
+                and (
+                    attempt["pid_identity"]
+                    or attempt["termination_proof"]
+                    or attempt["launch_owner_pid"] is not None
+                    or attempt["launch_owner_identity"]
+                )
+            )
+            if worker_identity_unproven or not runtime or runtime["state"] != "released":
                 raise SupervisorError(
                     "worker_cleanup_unproven",
                     "worker identity and runtime cleanup are not both proven",

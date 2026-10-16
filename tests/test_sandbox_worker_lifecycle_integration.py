@@ -21,10 +21,14 @@ verifies cancellation from a fresh supervisor. Setting
 `ACP_LIVE_TIMEOUT_AFTER_START=1` uses a one-second driver timeout with a long
 payload and verifies automatic stop-intent recording, monitor cancellation,
 and cleanup verification. Setting
+`ACP_LIVE_LEASE_EXPIRY_AFTER_STOP=1` records a durable stop, expires the exact
+fixture attempt, runs the production reaper in a fresh process, and verifies
+lease-loss quarantine, launch-driver monitor cancellation, pinned-runc deletion,
+and retained resource fences until independent cleanup verification. Setting
 `ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1` exits the producer after successful
 `systemd-run` return but before receipt propagation, then verifies a fresh
-producer cannot replay the launch. Crash modes are mutually exclusive with
-cancellation, timeout, and one another. Run on a disposable supported Linux host
+producer cannot replay the launch. Crash, cancellation, timeout, and lease-expiry
+modes are mutually exclusive. Run on a disposable supported Linux host
 with rootless runc 1.5.2,
 delegated cgroup v2, and an active private systemd user manager:
 
@@ -40,6 +44,10 @@ For the fresh-supervisor cancellation branch, add:
 For the launch-driver timeout branch, add:
 
     ACP_LIVE_TIMEOUT_AFTER_START=1
+
+For the durable-stop / lease-expiry race branch, add:
+
+    ACP_LIVE_LEASE_EXPIRY_AFTER_STOP=1
 
 For the manager-accepted/pre-receipt crash branch, add:
 
@@ -104,7 +112,7 @@ from agent_control_plane.supervisor import (
 from agent_control_plane.supervisor import (
     sandbox_execution_journal as journal_module,
 )
-from agent_control_plane.supervisor.common import SupervisorError
+from agent_control_plane.supervisor.common import SupervisorError, utc_now
 from agent_control_plane.supervisor.sandbox_attestation import collect_running_runtime_attestation
 from agent_control_plane.supervisor.sandbox_monitor_ipc import _linux_process_identity
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
@@ -669,6 +677,26 @@ def _reap_expired_from_fresh_process(
         result_sender.send(("ok", os.getpid(), reaped, before, after))
     except BaseException as error:
         result_sender.send(("error", type(error).__name__))
+    finally:
+        result_sender.close()
+
+
+def _verify_sandbox_cleanup_from_fresh_process(
+    repo: Path,
+    attempt_id: str,
+    claim_token: int,
+    result_sender,
+) -> None:
+    """Run the production cleanup verifier outside both driver and reaper processes."""
+
+    try:
+        supervisor = GitSupervisor(repo)
+        verified = supervisor._sandbox_execution_verify_cleanup(attempt_id, claim_token)
+        result_sender.send(("ok", os.getpid(), verified["phase"]))
+    except SupervisorError as error:
+        result_sender.send(("supervisor-error", os.getpid(), error.code, str(error)))
+    except BaseException as error:
+        result_sender.send(("error", os.getpid(), type(error).__name__, str(error)))
     finally:
         result_sender.close()
 
@@ -1853,7 +1881,7 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition(
 def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Use the production launcher and reaper for completion, cancel, or timeout."""
+    """Use the production launcher and reaper across completion and failure paths."""
 
     source_root = Path(__file__).resolve().parents[1]
     from agent_control_plane.supervisor import sandbox_launch_driver_service as launch_service
@@ -2222,6 +2250,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         timeout_after_start = os.environ.get("ACP_LIVE_TIMEOUT_AFTER_START") == "1"
+        lease_expiry_after_stop = os.environ.get("ACP_LIVE_LEASE_EXPIRY_AFTER_STOP") == "1"
         crash_after_manager_acceptance = (
             os.environ.get("ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE") == "1"
         )
@@ -2235,6 +2264,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 (
                     cancel_after_start,
                     timeout_after_start,
+                    lease_expiry_after_stop,
                     crash_after_manager_acceptance,
                     crash_after_monitor_acceptance,
                     crash_before_monitor_start,
@@ -2242,11 +2272,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             )
             > 1
         ):
-            pytest.fail("live cancel, timeout, and crash-injection modes are mutually exclusive")
+            pytest.fail(
+                "live cancel, timeout, lease-expiry, and crash-injection modes are mutually exclusive"
+            )
         if import_result_after_cleanup and any(
             (
                 cancel_after_start,
                 timeout_after_start,
+                lease_expiry_after_stop,
                 crash_after_manager_acceptance,
                 crash_after_monitor_acceptance,
                 crash_before_monitor_start,
@@ -2259,11 +2292,16 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             or crash_before_monitor_start
         )
         if isolation_probes and (
-            cancel_after_start or timeout_after_start or crash_driver_service_before_receipt
+            cancel_after_start
+            or timeout_after_start
+            or lease_expiry_after_stop
+            or crash_driver_service_before_receipt
         ):
             pytest.fail("live isolation probes require natural worker completion")
         monitor_acceptance_marker = run_root / "monitor-handoff-crash.json"
-        payload_sleep_seconds = 30 if cancel_after_start or timeout_after_start else 1
+        payload_sleep_seconds = (
+            30 if cancel_after_start or timeout_after_start or lease_expiry_after_stop else 1
+        )
         sandbox_timeout_seconds = 1 if timeout_after_start else 30
         if isolation_probes:
             payload_command = ("/bin/busybox", "sh", f"/workspace/{isolation_script_name}")
@@ -2846,7 +2884,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             )
             == start_identity_before_retry
         )
-        if cancel_after_start:
+        if cancel_after_start or lease_expiry_after_stop:
             running_deadline = time.monotonic() + 30
             durable = supervisor._sandbox_execution_get(attempt["id"])
             while (
@@ -2863,51 +2901,98 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 time.sleep(0.05)
             assert _entry_is_present(started_marker), "bounded payload never entered its command"
 
-            # Cross the deliberately short ten-second claim lease while the
-            # payload remains active; both fresh cancellation and normal exit
-            # depend on the execution owner renewing the exact attempt.
-            time.sleep(12)
-            renewed_attempt = supervisor.attempt(attempt["id"])
-            assert renewed_attempt["status"] == "working"
-            assert renewed_attempt["lease_expires_at"] > initial_lease_expires_at
-            assert renewed_attempt["lease_expires_at"] > int(time.time())
+            if cancel_after_start:
+                # Cross the deliberately short ten-second claim lease while the
+                # payload remains active; both fresh cancellation and normal exit
+                # depend on the execution owner renewing the exact attempt.
+                time.sleep(12)
+                renewed_attempt = supervisor.attempt(attempt["id"])
+                assert renewed_attempt["status"] == "working"
+                assert renewed_attempt["lease_expires_at"] > initial_lease_expires_at
+                assert renewed_attempt["lease_expires_at"] > int(time.time())
 
-            wrong_credential_supervisor = GitSupervisor(repo)
-            with patch.object(
-                sandbox_monitor_lifecycle,
-                "reconnect_sandbox_monitor",
-                side_effect=AssertionError("invalid runner credential reached the monitor"),
-            ) as reconnect:
-                with pytest.raises(SupervisorError) as rejected:
-                    wrong_credential_supervisor.terminate_worker(
-                        attempt["id"], credential="not-the-enrolled-runner-credential"
-                    )
-                assert rejected.value.code == "runner_authentication_failed"
-                reconnect.assert_not_called()
+                wrong_credential_supervisor = GitSupervisor(repo)
+                with patch.object(
+                    sandbox_monitor_lifecycle,
+                    "reconnect_sandbox_monitor",
+                    side_effect=AssertionError("invalid runner credential reached the monitor"),
+                ) as reconnect:
+                    with pytest.raises(SupervisorError) as rejected:
+                        wrong_credential_supervisor.terminate_worker(
+                            attempt["id"], credential="not-the-enrolled-runner-credential"
+                        )
+                    assert rejected.value.code == "runner_authentication_failed"
+                    reconnect.assert_not_called()
 
-            result_receiver, result_sender = context.Pipe(duplex=False)
-            fresh_controller = context.Process(
-                target=_terminate_worker_from_fresh_process,
-                args=(repo, attempt["id"], runner["credential"], result_sender),
-            )
-            fresh_controller.start()
-            child_processes.append(fresh_controller)
-            result_sender.close()
-            assert result_receiver.poll(20), "fresh controller did not receive a monitor response"
-            termination_result = result_receiver.recv()
-            fresh_controller.join(timeout=5)
-            assert not fresh_controller.is_alive()
-            assert fresh_controller.exitcode == 0
-            result_receiver.close()
-            assert termination_result[0] == "ok", termination_result
-            assert termination_result[1] not in {driver_pid, controller_pid}
-            termination = termination_result[2]
-            assert termination_result[3:] == (1, 0)
-            assert termination["attempt_id"] == attempt["id"]
-            assert termination["execution_id"] == execution["execution_id"]
-            assert termination["stop_requested"] is True
-            assert termination["cleanup_verified"] is False
-            assert termination["monitor_phase"] in {"stopping", "exited"}
+                result_receiver, result_sender = context.Pipe(duplex=False)
+                fresh_controller = context.Process(
+                    target=_terminate_worker_from_fresh_process,
+                    args=(repo, attempt["id"], runner["credential"], result_sender),
+                )
+                fresh_controller.start()
+                child_processes.append(fresh_controller)
+                result_sender.close()
+                assert result_receiver.poll(20), (
+                    "fresh controller did not receive a monitor response"
+                )
+                termination_result = result_receiver.recv()
+                fresh_controller.join(timeout=5)
+                assert not fresh_controller.is_alive()
+                assert fresh_controller.exitcode == 0
+                result_receiver.close()
+                assert termination_result[0] == "ok", termination_result
+                assert termination_result[1] not in {driver_pid, controller_pid}
+                termination = termination_result[2]
+                assert termination_result[3:] == (1, 0)
+                assert termination["attempt_id"] == attempt["id"]
+                assert termination["execution_id"] == execution["execution_id"]
+                assert termination["stop_requested"] is True
+                assert termination["cleanup_verified"] is False
+                assert termination["monitor_phase"] in {"stopping", "exited"}
+            else:
+                stopped = supervisor._sandbox_execution_request_stop(
+                    attempt["id"],
+                    attempt["claim_token"],
+                    "live test: durable stop before attempt lease expiry",
+                    credential=runner["credential"],
+                )
+                assert stopped["phase"] == "stopping"
+                assert stopped["stop_reason"] == (
+                    "live test: durable stop before attempt lease expiry"
+                )
+                with supervisor.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    expired = connection.execute(
+                        "UPDATE attempts SET lease_expires_at = 0, updated_at = ? "
+                        "WHERE id = ? AND claim_token = ? AND status = 'working'",
+                        (utc_now(), attempt["id"], attempt["claim_token"]),
+                    ).rowcount
+                assert expired == 1, "the exact working fixture attempt was not expired"
+
+                reap_receiver, reap_sender = context.Pipe(duplex=False)
+                lease_loss_reaper = context.Process(
+                    target=_reap_expired_from_fresh_process,
+                    args=(repo, int(time.time()), reap_sender),
+                )
+                lease_loss_reaper.start()
+                child_processes.append(lease_loss_reaper)
+                reap_sender.close()
+                assert reap_receiver.poll(30), "fresh reaper did not quarantine the expired attempt"
+                lease_loss_result = reap_receiver.recv()
+                lease_loss_reaper.join(timeout=5)
+                assert not lease_loss_reaper.is_alive()
+                assert lease_loss_reaper.exitcode == 0
+                reap_receiver.close()
+                assert lease_loss_result[0] == "ok", lease_loss_result
+                assert lease_loss_result[1] not in {controller_pid, driver_pid}
+                assert lease_loss_result[2]["orphaned"] == []
+                assert lease_loss_result[2]["runtime_cleanup"] == []
+                expired_attempt = supervisor.attempt(attempt["id"])
+                expired_task = supervisor.task(task["id"])
+                assert expired_attempt["status"] == "terminating"
+                assert expired_attempt["termination_target_status"] == "quarantined"
+                assert expired_task["status"] == "cleanup_pending"
+                assert expired_task["cleanup_target_status"] == "blocked"
 
         deadline = time.monotonic() + 30
         durable = supervisor._sandbox_execution_get(attempt["id"])
@@ -2946,7 +3031,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert not os.path.lexists(isolation_home_scratch_path), (
                 "worker /home/agent scratch leaked into the host filesystem"
             )
-        if not cancel_after_start and not timeout_after_start:
+        if not cancel_after_start and not timeout_after_start and not lease_expiry_after_stop:
             assert durable["runc_exit_code"] == 0
         else:
             assert type(durable["runc_exit_code"]) is int
@@ -2979,7 +3064,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             Path(durable["cgroup_path"]).parent.as_posix() == durable["attempt_slice_cgroup_path"]
         )
         marker = Path(durable["workspace_root_path"]) / "launch-driver-marker"
-        if cancel_after_start or timeout_after_start:
+        if cancel_after_start or timeout_after_start or lease_expiry_after_stop:
             assert _entry_is_present(Path(durable["workspace_root_path"]) / "launch-driver-started")
             assert not _entry_is_present(marker)
         else:
@@ -3011,7 +3096,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             "sandbox.execution_launched",
             "sandbox.execution_running",
         ]
-        if cancel_after_start or timeout_after_start:
+        if cancel_after_start or timeout_after_start or lease_expiry_after_stop:
             expected_events.append("sandbox.execution_stop_requested")
         expected_events.extend(["sandbox.execution_exited", "sandbox.execution_cleanup_reported"])
         assert [row["event_type"] for row in events] == expected_events
@@ -3131,6 +3216,23 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert imported_row["worker_identity"] == ""
             assert imported_row["worker_exit_receipt_json"] == ""
 
+        if lease_expiry_after_stop:
+            # cleanup_reported is committed before the systemd service exits.
+            # Let that exact invocation quiesce before the independent reaper
+            # verifies its absence; never treat a still-running cleanup actor as
+            # independent teardown proof.
+            assert service_unit is not None
+            driver_exit_deadline = time.monotonic() + 10
+            driver_after_cleanup = _unit_properties(service_unit, ("ActiveState", "MainPID"))
+            while time.monotonic() < driver_exit_deadline and (
+                driver_after_cleanup["MainPID"] != "0"
+                or driver_after_cleanup["ActiveState"] not in {"failed", "inactive"}
+            ):
+                time.sleep(0.05)
+                driver_after_cleanup = _unit_properties(service_unit, ("ActiveState", "MainPID"))
+            assert driver_after_cleanup["MainPID"] == "0"
+            assert driver_after_cleanup["ActiveState"] in {"failed", "inactive"}
+
         with supervisor.connect() as connection:
             lease_before_rows = connection.execute(
                 "SELECT resource, task_id, attempt_id, lease_expires_at "
@@ -3151,7 +3253,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert len(lease_before) == 2
         assert len({row["lease_expires_at"] for row in lease_before.values()}) == 1
         expected_lease_expiry = next(iter(lease_before.values()))["lease_expires_at"]
-        if imported_submission is None:
+        if lease_expiry_after_stop:
+            assert attempt_after_execution["status"] == "terminating"
+            assert attempt_after_execution["termination_target_status"] == "quarantined"
+            assert supervisor.task(task["id"])["cleanup_target_status"] == "blocked"
+            for lease in lease_before.values():
+                assert lease["task_id"] == task["id"]
+                assert lease["attempt_id"] == attempt["id"]
+                assert lease["lease_expires_at"] == journal_module.CLEANUP_FENCE_EPOCH
+        elif imported_submission is None:
             for lease in lease_before.values():
                 assert lease["task_id"] == task["id"]
                 assert lease["attempt_id"] == attempt["id"]
@@ -3189,7 +3299,93 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert reap_result[0] == "ok", reap_result
         assert reap_result[1] not in {controller_pid, driver_pid}
         reaped = reap_result[2]
-        if imported_submission is None:
+        if lease_expiry_after_stop:
+            if not reaped["runtime_cleanup"]:
+                # If the first bounded reaper pass leaves cleanup unverified,
+                # keep the attempt quarantined while a separate fresh process
+                # runs the exact production verifier; then let a fresh reaper
+                # release runtime resources while preserving the blocked task.
+                pending_verification = supervisor._sandbox_execution_get(attempt["id"])
+                assert pending_verification is not None
+                assert pending_verification["phase"] == "cleanup_reported"
+                verify_receiver, verify_sender = context.Pipe(duplex=False)
+                cleanup_verifier = context.Process(
+                    target=_verify_sandbox_cleanup_from_fresh_process,
+                    args=(repo, attempt["id"], attempt["claim_token"], verify_sender),
+                )
+                cleanup_verifier.start()
+                child_processes.append(cleanup_verifier)
+                verify_sender.close()
+                assert verify_receiver.poll(30), (
+                    "fresh cleanup verifier did not finish exact lease-loss verification"
+                )
+                verify_result = verify_receiver.recv()
+                cleanup_verifier.join(timeout=5)
+                assert not cleanup_verifier.is_alive()
+                assert cleanup_verifier.exitcode == 0
+                verify_receiver.close()
+                if verify_result[0] != "ok":
+                    verify_durable = supervisor._sandbox_execution_get(attempt["id"])
+                    assert verify_durable is not None
+                    unit_names = {
+                        "monitor": verify_durable["wrapper_unit"],
+                        "launch_driver": verify_durable["launch_driver_unit"],
+                        "scope": verify_durable["scope_unit"],
+                        "attempt_slice": verify_durable["attempt_slice_unit"],
+                    }
+                    unit_diagnostics = {
+                        name: _unit_properties(
+                            unit,
+                            (
+                                "ActiveState",
+                                "ControlGroup",
+                                "Id",
+                                "InvocationID",
+                                "LoadState",
+                            )
+                            + (() if name in {"scope", "attempt_slice"} else ("MainPID",)),
+                        )
+                        for name, unit in unit_names.items()
+                    }
+                    pytest.fail(
+                        f"fresh cleanup verification failed: {verify_result}; "
+                        f"exact unit state={unit_diagnostics!r}"
+                    )
+                assert verify_result[1] not in {controller_pid, driver_pid}
+                assert verify_result[2] == "cleanup_verified"
+
+                retry_receiver, retry_sender = context.Pipe(duplex=False)
+                retry_reaper = context.Process(
+                    target=_reap_expired_from_fresh_process,
+                    args=(repo, attempt_after_execution["lease_expires_at"] + 1, retry_sender),
+                )
+                retry_reaper.start()
+                child_processes.append(retry_reaper)
+                retry_sender.close()
+                assert retry_receiver.poll(30), (
+                    "fresh reaper did not resume cleanup after independent verification"
+                )
+                retry_result = retry_receiver.recv()
+                retry_reaper.join(timeout=5)
+                assert not retry_reaper.is_alive()
+                assert retry_reaper.exitcode == 0
+                retry_receiver.close()
+                assert retry_result[0] == "ok", retry_result
+                assert retry_result[1] not in {controller_pid, driver_pid}
+                reaped = retry_result[2]
+
+            assert reaped["orphaned"] == []
+            assert {"attempt_id": attempt["id"], "state": "released"} in reaped["runtime_cleanup"]
+            assert {
+                "task_id": task["id"],
+                "attempt_id": attempt["id"],
+                "state": "released",
+            } in reaped["runtime_cleanup"]
+            assert supervisor.attempt(attempt["id"])["status"] == "quarantined"
+            assert supervisor.attempt(attempt["id"])["termination_target_status"] == ""
+            assert supervisor.task(task["id"])["status"] == "blocked"
+            assert supervisor.task(task["id"])["cleanup_target_status"] == ""
+        elif imported_submission is None:
             assert reaped["orphaned"] == [task["id"]]
             assert reaped["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
             assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
@@ -3230,7 +3426,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         lease_after = {row["resource"]: row for row in lease_after_rows}
         assert set(lease_after) == set(lease_before)
         assert runtime_after is not None
-        if imported_submission is None:
+        if lease_expiry_after_stop:
+            for lease in lease_after.values():
+                assert lease["task_id"] is None
+                assert lease["attempt_id"] is None
+                assert lease["lease_expires_at"] == 0
+            assert runtime_after["state"] == "released"
+            assert allocations_after == []
+        elif imported_submission is None:
             for resource, lease in lease_after.items():
                 assert lease["task_id"] is None
                 assert lease["attempt_id"] is None
@@ -3322,10 +3525,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         verified = supervisor._sandbox_execution_get(attempt["id"])
         assert verified is not None
         assert verified["phase"] == "cleanup_verified"
-        if cancel_after_start or timeout_after_start:
+        if cancel_after_start or timeout_after_start or lease_expiry_after_stop:
             assert verified["runc_exit_code"] != 0
             if timeout_after_start:
                 assert verified["stop_reason"] == "execution_timeout"
+            if lease_expiry_after_stop:
+                assert verified["stop_reason"] == (
+                    "live test: durable stop before attempt lease expiry"
+                )
+                assert verified["failure_reason"] == (
+                    launch_service._LAUNCH_DRIVER_LEASE_LOSS_REASON
+                )
             with supervisor.connect() as connection:
                 with pytest.raises(SupervisorError) as result_rejected:
                     journal_module._require_sandbox_execution_result_eligible(
@@ -3333,6 +3543,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     )
             assert result_rejected.value.code == "sandbox_result_unverified"
         observations = verified["cleanup_verification"]["observations"]
+        if lease_expiry_after_stop:
+            assert observations["units"]["launch_driver"]["active_state"] in {
+                "failed",
+                "inactive",
+                "not-found",
+            }
         assert all(item["absent"] for item in observations["processes"].values())
         assert all(observations["cgroups"].values())
         assert observations["paths"]["runc_state_entry_absent"] is True
