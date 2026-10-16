@@ -1206,7 +1206,12 @@ temporarily changed from 1 to 0 to permit rootless user namespaces and restored
 to 1 by an exit trap; this run does not prove AppArmor confinement with that
 restriction enabled. It also does not wire this path into `run_worker()`,
 authorize a provider worker, or prove provider egress policy. Exact-head hosted
-CI for this follow-on test change remains a separate gate.
+CI for code-bearing commit
+`0a5583a79322bf52a29282a6c05a59710be655ac` passed run
+[38935890202](https://github.com/Rayha33/agent-control-plane/actions/runs/38935890202):
+all four Ubuntu/macOS × Python 3.11/3.12 jobs passed. The run includes the
+follow-on test change; it does not change the lifecycle or isolation limits
+above.
 
 **Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
 systemd documents that `ExecStopPost=` also runs after unexpected service exit.

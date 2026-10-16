@@ -577,3 +577,43 @@ Parent task #2370 remains open until workspace isolation, provider
 authentication/egress, validated result transfer, and all independent safety
 gates pass. This ADR does not enable OCI in `run_worker()` or weaken the macOS
 execution path.
+
+## Supervisor composition boundary (2026-10-16; task #3268)
+
+The current launch-driver/journal lifecycle is not yet a registered worker API.
+`WorkersMixin.run_worker()` first validates a non-empty command and computes its
+digest, then returns `sandbox_executor_unavailable` when OCI is configured,
+before heartbeat, reservation, or host `Popen`; without OCI configuration, it
+uses its separate direct-host process path subject to the existing reservation
+preflight and Linux containment guard. In source,
+the sandbox reservation and workspace-binding methods have no production
+caller, and `start_sandbox_launch_driver()` has no supervisor caller. The live
+integration test creates a real task and claimed attempt, but manually invokes
+those preparation steps and the launch-driver service instead of calling
+`run_worker()`.
+
+The durable ownership boundaries that a caller must compose are:
+
+- The supervisor owns the registered attempt tuple and must create the
+  host-minted baseline and disjoint mutable workspace before launch. The
+  sandbox test confirms `.git` is absent from the copied worker tree, but that
+  alone does not prove the complete host-path isolation gate.
+- The launch-driver service owns the process-local runc handle, gate,
+  attestation, wait/reap, and unverified cleanup report; the out-of-slice
+  monitor owns authenticated stop/status IPC. The supervisor-owned verifier
+  alone records `cleanup_verified`; the reaper consumes that proof to release
+  runtime and leases/fences. These owners cannot be collapsed into the
+  direct-worker PID fields or host-PID cleanup.
+- Result import is a separate supervisor call after verified cleanup. It
+  rejects an attempt that aliases a direct worker PID, captures a write-once
+  candidate, and produces a `pending_qc` submission. The live test calls this
+  explicitly; the launch-driver does not import results itself.
+
+Therefore the next composition must provide a single attempt-scoped owner for
+preparation, launch, cancellation/recovery, wait/reap, verified cleanup, and
+the existing QC import handoff. It must not store the launch-driver PID as if
+it were a direct worker PID or permit both launch strategies for one attempt.
+Until that owner exists and is independently exercised on a disposable Linux
+host, no production caller is wired and the default `run_worker()` refusal
+remains mandatory. Provider authentication/egress and full workspace/Git
+isolation remain separate parent #2370 gates.
