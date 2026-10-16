@@ -1530,23 +1530,35 @@ is rejected without writing a receipt. This closes the supported-API path that
 could run while cleanup was still unverified and a surviving process might
 still mutate the workspace. Schema 27 migrates the write-once SQLite trigger
 to enforce the same `cleanup_verified` phase. At this historical point, no
-production writer existed. The supervisor-owned verifier is now implemented
-and source-tested, but production candidate capture remains unavailable until
-live Linux/systemd and exact-head hosted CI acceptance, plus worker-path
-integration. Tests that exercise downstream capture/import deliberately
-synthesize that phase by dropping the transition trigger and remove the private
-bundle/state directories; they are not verifier, monitor, or live-runtime
-evidence. Live acceptance must establish durable workspace quiescence and bind
-its immutable proof digest to candidate/import evidence before this gate can be
-considered production-ready. The unkeyed cleanup-report digest remains insufficient for that
-purpose.
+production writer existed. The supervisor-owned cleanup verifier/writer and
+exact launch-driver lifecycle were later exercised on disposable Debian
+12/systemd and accepted for #3142 on 2026-10-16: six distinct completion,
+timeout, cancellation, and crash-window modes are recorded in
+[WORKER_LAUNCH_DRIVER.md](WORKER_LAUNCH_DRIVER.md#live-monitor-accepted-pre-receipt-launch-driver-crash-2026-10-16).
+The code-bearing commit `29758f8f1455167877397334279a2df8e58d282f` passed
+exact-head CI run
+[38923445474](https://github.com/Rayha33/agent-control-plane/actions/runs/38923445474),
+and documentation head `47425327a85663e352da478e6880b75b66b40fe6` passed all
+four Ubuntu/macOS × Python 3.11/3.12 jobs in
+[run 38926750661](https://github.com/Rayha33/agent-control-plane/actions/runs/38926750661).
+This closes the verifier's live-Linux/CI gate for the launch-driver lifecycle;
+it does not establish a registered coding-worker result-import path. The
+downstream candidate/import tests below still synthesize `cleanup_verified` by
+dropping the transition trigger and remove the private bundle/state
+directories. They intentionally test import logic, not verifier provenance,
+live result capture/import, or registered `run_worker()` integration. The
+unkeyed cleanup-report digest alone remains insufficient; configured OCI
+`run_worker()` remains fail-closed.
 
 For journaled sandbox attempts, import, recovery, and submission require a
 matching candidate receipt in addition to the existing `cleanup_verified` gate.
-This schema adds no trusted cleanup verifier and no sandbox result-import route,
-so a journaled candidate still cannot create or submit a result. Direct-worker
-behavior remains unchanged. Same-UID raw database writers, workspace path
-races, and runtime cleanup are not proved safe by this receipt.
+At this historical schema-16 stage, neither a trusted cleanup verifier nor a
+sandbox result-import route existed, so a journaled candidate could not create
+or submit a result. The later schema-19 import route and 2026-10-16 verifier
+acceptance are recorded below; their end-to-end integration into a registered
+coding-worker path remains incomplete. Direct-worker behavior remains
+unchanged. Same-UID raw database writers, workspace path races, and runtime
+cleanup are not proved safe by the candidate receipt alone.
 
 **Runtime content-identity slice (schema 17; still not an executor).** New
 execution reservations now require the configured rootfs tree digest, the
@@ -1599,13 +1611,14 @@ source binding, candidate digests, and the `cleanup_verified` eligibility gate.
 For a `cleanup_verified` row, workspace restore additionally requires the
 private bundle and runc state directories to be absent while the recorded
 execution-root identity and workspace/baseline bindings still match. The
-cleanup-report digest identifies the journaled report; it is not proof that the
-report is trusted or verified. No trusted cleanup verifier or production writer
-for `cleanup_verified` exists yet, so the new route still fails closed for real
-executions and `run_worker` remains fail-closed for configured OCI. The route's
-success/recovery test constructs synthetic already-verified journal state only
-to cover downstream import logic; it is not cleanup-verifier or live-runtime
-evidence.
+cleanup-report digest identifies the journaled report; it is not proof that
+the report is trusted or verified. A supervisor-owned verifier/writer now
+provides that separate evidence and passed the live launch-driver cleanup,
+fence-release, and exact-head CI gates for #3142. The new import route has not
+yet been exercised end to end from a registered supervised coding worker:
+its success/recovery test constructs synthetic already-verified journal state
+only to cover downstream import logic. It is not live result-capture/import
+evidence, and configured OCI `run_worker()` remains fail-closed.
 
 **Runtime-attestation validator and partial host collector (2026-10-04; still
 no launcher).** The `sandbox_attestation` module binds bounded observations into

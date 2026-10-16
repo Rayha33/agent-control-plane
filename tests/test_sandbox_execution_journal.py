@@ -7595,8 +7595,8 @@ def test_sandbox_import_uses_distinct_source_and_recovers_published_ref(
     )
 
     # Exercise downstream import only with a synthetic already-verified
-    # journal state. No production method writes cleanup_verified, so this is
-    # not cleanup-verifier or live-runtime evidence.
+    # journal state. The separate live launch-driver test exercises the
+    # production cleanup verifier; this test is not live result-import evidence.
     synthesize_cleanup_verified_for_downstream_test(supervisor, attempt["id"])
     supervisor._sandbox_execution_capture_result_candidate(attempt["id"], attempt["claim_token"])
     with supervisor.connect() as connection:
