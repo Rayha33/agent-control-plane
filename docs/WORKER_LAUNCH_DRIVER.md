@@ -17,8 +17,11 @@ cgroup-v2 hierarchy, and safely removes only the execution-derived monitor
 socket from the private runtime directory. Natural completion and
 fresh-process cancellation both passed the opt-in production-launcher test
 through the real `reap_expired()` path (`cleanup_verified` and runtime/fence
-release, one pass per mode). The reaper receives a synthetic lease expiry in
-the same controller process; no controller crash or restart is simulated.
+release, one pass per mode). Each run now starts the real producer in a spawned
+process that exits abruptly after the durable handoff receipt; fresh spawned
+supervisor processes perform cancellation (when requested) and reaping. The
+original pytest harness remains alive, so this proves producer-process loss
+after handoff—not a full supervisor-daemon restart or a crash during handoff.
 Full passing exact-head hosted CI is still pending, and result import is not
 connected to the worker.
 `cleanup_verified` certifies resource cleanup, not worker success; every result
@@ -185,8 +188,8 @@ reaper; failed or unavailable observations leave the attempt fenced. The
 positive reaper retry/fence-release regression now drives the real verifier
 with deterministic OS observations and a runtime-teardown double. The live
 Linux/systemd lifecycle results below additionally exercise reaper-driven
-verification and runtime/fence release after natural exit and cancellation, in
-the same controller process rather than after a crash/restart.
+verification and runtime/fence release after natural exit and cancellation,
+after the producer process has exited and in a fresh supervisor process.
 
 The independent review of the prior ADR found a blocking mismatch: it placed the
 handle-owning monitor outside the attempt slice and proposed migrating attestation
@@ -237,7 +240,7 @@ transition, fresh-process cancellation of the exact worker scope, or
 supervisor-owned cleanup verification; the integrated lifecycle remains
 unimplemented.
 
-### Current-branch launch-driver and fresh-process cancellation (2026-10-16; live reaper cleanup/fence-release pass)
+### Current-branch producer-process loss and fresh-supervisor recovery (2026-10-16; live reaper cleanup/fence-release pass)
 
 The opt-in
 `test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in
@@ -268,20 +271,42 @@ receipt; `reap_expired()` then observed cleanup and wrote `cleanup_verified`
 before releasing the runtime and terminal fence. The start marker existed and
 the payload completion marker did not. A direct result-eligibility check still
 rejected the nonzero exit.
+In both modes, the real launch API ran inside a spawned producer process. After
+the durable receipt returned, that process sent the exact receipt fields to the
+test harness and exited via `os._exit(73)`; the test asserted the producer PID
+and exit code. This is abrupt producer-process loss after committed handoff,
+not a crash during the handoff itself. Cancellation mode then used another
+spawned process for `terminate_worker()`, and both modes used a separate fresh
+spawned process for the real `reap_expired()` call. The original pytest harness
+and its `GitSupervisor` stayed alive throughout; there was no systemd user
+manager restart or full supervisor-daemon restart.
+
+After producer loss, both modes also started a fresh producer with the same
+launch request. The test blocked any `systemd-run` submission and observed
+`SandboxLaunchDriverServiceError`, zero second-start calls, and unchanged
+durable start ID, digest, invocation ID, and driver PID. This is live no-replay
+evidence after committed handoff; ambiguous pre-handoff recovery remains
+covered by separate journal/producer tests.
+
 Both modes used no model, provider credential, network egress, or paid call.
-Postflight found no matching active service/slice, payload process, or
+Postflight found no running ACP test units, pinned-runc process, or
 `acp-live-launch-driver-*` fixture root. Two pre-existing failed transient
 launch-driver units had `MainPID=0` and empty cgroups; they were not changed or
-removed.
+removed. On a failure path, the harness joins every spawned controller child
+before teardown; if a child remains alive after 30 seconds, it fails without
+stopping units or deleting the fixture, leaving the fixture and units in place
+for manual recovery on the disposable guest.
 
 Host and guest SHA-256 matched for every listed production/test source at both
-runs. This proves the tested cancellation request, separate pinned-runc action
-receipt, exact process/unit/cgroup/state/path absence checks, and
-reaper-driven `cleanup_verified` plus runtime/fence release on this guest. The
-lease expiry is injected in the same controller process, so it does not prove
-controller crash/restart recovery. Exact-head hosted CI, result import, provider
-access, and `run_worker()` enablement remain unproven. The older direct-monitor lifecycle fixture is explicitly skipped
-because it predates exact launch-driver redemption; it must be rebuilt around
+runs, including the updated test module hash below. This proves the tested
+post-handoff producer-process loss, cancellation request, separate pinned-runc
+action receipt, exact process/unit/cgroup/state/path absence checks, and
+fresh-process reaper-driven `cleanup_verified` plus runtime/fence release on
+this guest. It does not prove full supervisor-daemon restart recovery, manager
+restart/logout/reboot recovery, crash during handoff, result import, provider
+access, or `run_worker()` enablement. Exact-head hosted CI remains pending. The
+older direct-monitor lifecycle fixture is explicitly skipped because it
+predates exact launch-driver redemption; it must be rebuilt around
 the production start API before it can be re-enabled.
 
 The exact source and integration-test files below were SHA-256 matched between
@@ -298,7 +323,7 @@ this worktree and the disposable guest before the passing run:
 | `sandbox_launch_driver_service.py` | `f7deb8d2fe6f36b4e9281a61e72e7e33cc400212627186d2a7d6c96273815b67` |
 | `sandbox_monitor_service.py` | `c27fe68d764bfde7067195d64bee1a9056c5b73356849161b60ece9c76a4197a` |
 | `store.py` | `c712b56ee1155db9b89c9321bc6bf90d7f581ab5a8ead41cb9e125c4744b977a` |
-| `test_sandbox_worker_lifecycle_integration.py` | `661dd1cede3a1f8acb51f361bc3a09bc2c75d403a5617de00b7c125e77943387` |
+| `test_sandbox_worker_lifecycle_integration.py` | `b3764e287f2a00dfceead1ffdfed6ef6538e2e5ac9e1ff77c65c8c245e1a3df5` |
 
 The live run closed a systemd-252-specific startup defect: `systemd-run
 --no-block` returned before `LoadCredential=` consumed its `/proc/<pid>/fd/`

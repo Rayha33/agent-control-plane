@@ -42,12 +42,20 @@ synthetically expired lease; the reaper invokes the real verifier, reaches
 `cleanup_verified`, releases the runtime, and orphans the terminal attempt and
 resource fence. Both runs passed live process, unit, invocation, cgroup,
 runc-state, private-path, and monitor-socket checks. The cancelled run's
-nonzero runc exit remains ineligible for result import. This exercises
-reaper-driven recovery in the same controller process, not controller crash or
-restart. The separate positive reaper regression continues to cover failed
-verification with deterministic mocked OS observations. Full passing exact-head
-hosted CI remains pending: run 38875452816 exposed the `/private/tmp`
-cross-platform test-fixture defect, and the fix requires a new exact-head run.
+nonzero runc exit remains ineligible for result import. The updated proof runs
+the producer in a spawned process that exits via `os._exit(73)` after the
+durable handoff receipt; fresh spawned supervisor processes then cancel (when
+requested) and run the real reaper. In both modes, a fresh producer retry of the
+same launch request was rejected before `systemd-run`; the durable start ID,
+digest, invocation ID, and driver PID remained unchanged. The original pytest
+harness remains alive, so this proves producer-process loss/no-replay after
+handoff, not crash-during-handoff or a full supervisor-daemon restart. The
+separate positive reaper regression continues to cover failed verification
+with deterministic mocked OS
+observations. Run 38875452816 exposed the `/private/tmp` cross-platform fixture
+defect; the correction passed the four exact-head Ubuntu/macOS × Python 3.11/3.12
+jobs for `0ce4dc4`. This incremental producer-loss change still needs its own
+exact-head hosted CI run.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
 socket beneath the verified private runtime directory. OCI `run_worker()` and
@@ -69,12 +77,13 @@ prove or retain the private launcher's exec gate, which remains a caller
 precondition. Independent review gave the revised two-service ownership ADR
 **GO** on 2026-10-16; this is decision-level approval, not implementation or
 lifecycle acceptance. The production launch-driver producer, bounded
-pinned-runc path, and fresh-process cancellation branch have disposable
-Debian/systemd evidence. The live natural-completion and cancellation runs both
-now exercise automatic reaper verification and runtime/fence release after a
-synthetic lease expiry. This runs in the same controller process and does not
-simulate controller crash/restart. Full passing exact-head hosted CI remains
-pending for the corrected cross-platform test fixtures.
+pinned-runc path, producer-process loss/no-replay after durable handoff, and
+fresh-process cancellation branch have disposable Debian/systemd evidence. The
+live natural-completion and cancellation runs both exercise automatic reaper
+verification and runtime/fence release after a synthetic lease expiry, with
+the reaper running in a fresh spawned supervisor process. The test harness
+itself is not restarted, and there is no full supervisor-daemon restart proof.
+Exact-head hosted CI for the incremental producer-loss change remains pending.
 Full end-to-end lifecycle proof and `run_worker()` integration remain pending;
 OCI worker execution stays fail-closed.
 

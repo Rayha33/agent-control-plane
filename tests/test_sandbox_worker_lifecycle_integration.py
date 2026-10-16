@@ -3,13 +3,10 @@
 The process-local runc handle must remain in the exact systemd launch-driver
 process; a separate systemd-owned service controls the exact worker scope. The
 default branch proves launch-to-``running``, natural completion, and
-reaper-driven cleanup verification/runtime release. The
-`ACP_LIVE_CANCEL_AFTER_START=1`
-branch requests cancellation through `WorkersMixin.terminate_worker()` from a
-fresh supervisor and checks the real monitor response before the same
-reaper path. The reaper receives an expired lease in the same controller
-process; this does not simulate controller crash or restart. Neither branch
-wires ``run_worker`` or authorizes result import.
+reaper-driven cleanup verification/runtime release. The production producer
+runs in a short-lived process that exits abruptly after durable handoff; fresh
+supervisor processes then cancel (when requested) and reap the exact execution.
+Neither branch wires ``run_worker`` or authorizes result import.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -119,6 +116,137 @@ def _terminate_worker_from_fresh_process(
         result_sender.send(("error", type(error).__name__, reconnect_calls, legacy_pid_calls))
     finally:
         sandbox_monitor_lifecycle.reconnect_sandbox_monitor = original_reconnect
+        result_sender.close()
+
+
+def _start_launch_driver_then_crash_controller(
+    repo: Path,
+    expected_identity: tuple[str, int, str],
+    command: tuple[str, ...],
+    memory_max_bytes: int,
+    cpu_quota: int,
+    cpu_period: int,
+    pids_max: int,
+    timeout_seconds: int,
+    credential: str,
+    service_log_path: Path,
+    result_sender,
+) -> None:
+    """Run the real producer, then abruptly exit after it commits handoff."""
+
+    original_runner = sandbox_launch_driver_service._run_trusted_runtime_command
+
+    def capture_driver_service_output(argv: list[str], *, environment: dict[str, str]) -> bytes:
+        if Path(argv[0]).name == "systemd-run":
+            argv = list(argv)
+            insertion = argv.index("--working-directory")
+            argv[insertion:insertion] = [
+                f"--property=StandardOutput=append:{service_log_path}",
+                f"--property=StandardError=append:{service_log_path}",
+            ]
+        return original_runner(argv, environment=environment)
+
+    exit_code = 73
+    try:
+        with patch.object(
+            sandbox_launch_driver_service,
+            "_run_trusted_runtime_command",
+            capture_driver_service_output,
+        ):
+            receipt = sandbox_launch_driver_service.start_sandbox_launch_driver(
+                GitSupervisor(repo),
+                expected_identity=expected_identity,
+                command=command,
+                memory_max_bytes=memory_max_bytes,
+                cpu_quota=cpu_quota,
+                cpu_period=cpu_period,
+                pids_max=pids_max,
+                timeout_seconds=timeout_seconds,
+                credential=credential,
+            )
+        result_sender.send(
+            (
+                "ok",
+                os.getpid(),
+                {
+                    "attempt_id": receipt.attempt_id,
+                    "claim_token": receipt.claim_token,
+                    "execution_id": receipt.execution_id,
+                    "service_unit": receipt.service_unit,
+                    "invocation_id": receipt.invocation_id,
+                    "driver_pid": receipt.driver_pid,
+                    "driver_identity": receipt.driver_identity,
+                    "control_group": receipt.control_group,
+                },
+            )
+        )
+    except BaseException as error:
+        exit_code = 1
+        result_sender.send(("error", type(error).__name__))
+    finally:
+        result_sender.close()
+    # Abruptly lose the producer after the one-shot handoff. The independent
+    # user manager retains the launch-driver service and its process-local handle.
+    os._exit(exit_code)
+
+
+def _retry_launch_driver_without_replay_from_fresh_process(
+    repo: Path,
+    expected_identity: tuple[str, int, str],
+    command: tuple[str, ...],
+    memory_max_bytes: int,
+    cpu_quota: int,
+    cpu_period: int,
+    pids_max: int,
+    timeout_seconds: int,
+    credential: str,
+    result_sender,
+) -> None:
+    """Prove a fresh producer cannot submit a second systemd start."""
+
+    original_runner = sandbox_launch_driver_service._run_trusted_runtime_command
+    start_submissions: list[tuple[str, ...]] = []
+
+    def refuse_second_start(argv: list[str], *, environment: dict[str, str]) -> bytes:
+        if Path(argv[0]).name == "systemd-run":
+            start_submissions.append(tuple(argv))
+            raise RuntimeError("duplicate launch-driver activation blocked by test")
+        return original_runner(argv, environment=environment)
+
+    try:
+        with patch.object(
+            sandbox_launch_driver_service,
+            "_run_trusted_runtime_command",
+            refuse_second_start,
+        ):
+            sandbox_launch_driver_service.start_sandbox_launch_driver(
+                GitSupervisor(repo),
+                expected_identity=expected_identity,
+                command=command,
+                memory_max_bytes=memory_max_bytes,
+                cpu_quota=cpu_quota,
+                cpu_period=cpu_period,
+                pids_max=pids_max,
+                timeout_seconds=timeout_seconds,
+                credential=credential,
+            )
+        result_sender.send(("accepted", os.getpid(), len(start_submissions)))
+    except sandbox_launch_driver_service.SandboxLaunchDriverServiceError as error:
+        result_sender.send(("rejected", os.getpid(), type(error).__name__, len(start_submissions)))
+    except BaseException as error:
+        result_sender.send(("error", os.getpid(), type(error).__name__, len(start_submissions)))
+    finally:
+        result_sender.close()
+
+
+def _reap_expired_from_fresh_process(repo: Path, now: int, result_sender) -> None:
+    """Run the real reaper in a new supervisor process after producer loss."""
+
+    try:
+        result_sender.send(("ok", os.getpid(), GitSupervisor(repo).reap_expired(now=now)))
+    except BaseException as error:
+        result_sender.send(("error", type(error).__name__))
+    finally:
         result_sender.close()
 
 
@@ -1295,6 +1423,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
     monitor_start_attempted = False
     slice_start_attempted = False
     safe_to_remove = False
+    child_processes: list[multiprocessing.Process] = []
     try:
         run_root.chmod(0o700)
         rootfs_source.mkdir(mode=0o755)
@@ -1384,19 +1513,6 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         service_start_attempted = True
         slice_start_attempted = True
         monitor_start_attempted = True
-        original_command_runner = sandbox_launch_driver_service._run_trusted_runtime_command
-
-        def capture_driver_service_output(
-            command: list[str], *, environment: dict[str, str]
-        ) -> bytes:
-            if Path(command[0]).name == "systemd-run":
-                command = list(command)
-                insertion = command.index("--working-directory")
-                command[insertion:insertion] = [
-                    f"--property=StandardOutput=append:{service_log_path}",
-                    f"--property=StandardError=append:{service_log_path}",
-                ]
-            return original_command_runner(command, environment=environment)
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         payload_sleep_seconds = 30 if cancel_after_start else 1
@@ -1408,31 +1524,116 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             f"/bin/busybox sleep {payload_sleep_seconds} && "
             "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
         )
-        with patch.object(
-            sandbox_launch_driver_service,
-            "_run_trusted_runtime_command",
-            capture_driver_service_output,
+        context = multiprocessing.get_context("spawn")
+        producer_result_receiver, producer_result_sender = context.Pipe(duplex=False)
+        producer_controller = context.Process(
+            target=_start_launch_driver_then_crash_controller,
+            args=(
+                repo,
+                identity,
+                payload_command,
+                _CONTAINER_MEMORY_BYTES,
+                _CONTAINER_CPU_QUOTA_US,
+                _CONTAINER_CPU_PERIOD_US,
+                _CONTAINER_PIDS_LIMIT,
+                30,
+                runner["credential"],
+                service_log_path,
+                producer_result_sender,
+            ),
+        )
+        producer_controller.start()
+        child_processes.append(producer_controller)
+        producer_result_sender.close()
+        assert producer_result_receiver.poll(35), "launch producer did not report its handoff"
+        producer_result = producer_result_receiver.recv()
+        producer_controller.join(timeout=5)
+        assert not producer_controller.is_alive(), (
+            "launch producer survived simulated controller loss"
+        )
+        producer_exit = 73 if producer_result[0] == "ok" else 1
+        assert producer_controller.exitcode == producer_exit
+        producer_result_receiver.close()
+        if producer_result[0] != "ok":
+            service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
+            assert runner["credential"] not in service_log
+            service_detail = service_log[-12_000:] or "<launch-driver service log is empty>"
+            raise AssertionError(
+                f"production launch-driver startup failed: {producer_result}; "
+                f"service log tail:\n{service_detail}"
+            )
+        controller_pid, receipt = producer_result[1:]
+        assert receipt["attempt_id"] == identity[0]
+        assert receipt["claim_token"] == identity[1]
+        assert receipt["execution_id"] == identity[2]
+        launch_receipt_deadline = time.monotonic() + 30
+        durable_before_retry = supervisor._sandbox_execution_get(attempt["id"])
+        while (
+            durable_before_retry is not None
+            and (
+                durable_before_retry["launch_driver_invocation_id"] != receipt["invocation_id"]
+                or durable_before_retry["launch_driver_pid"] != receipt["driver_pid"]
+            )
+            and time.monotonic() < launch_receipt_deadline
         ):
-            try:
-                receipt = sandbox_launch_driver_service.start_sandbox_launch_driver(
-                    supervisor,
-                    expected_identity=identity,
-                    command=payload_command,
-                    memory_max_bytes=_CONTAINER_MEMORY_BYTES,
-                    cpu_quota=_CONTAINER_CPU_QUOTA_US,
-                    cpu_period=_CONTAINER_CPU_PERIOD_US,
-                    pids_max=_CONTAINER_PIDS_LIMIT,
-                    timeout_seconds=30,
-                    credential=runner["credential"],
+            time.sleep(0.05)
+            durable_before_retry = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable_before_retry is not None
+        assert durable_before_retry["launch_driver_invocation_id"] == receipt["invocation_id"]
+        assert durable_before_retry["launch_driver_pid"] == receipt["driver_pid"]
+        assert durable_before_retry["phase"] != "reserved"
+        start_identity_before_retry = tuple(
+            durable_before_retry[field]
+            for field in (
+                "launch_driver_start_id",
+                "launch_driver_start_digest",
+                "launch_driver_invocation_id",
+                "launch_driver_pid",
+            )
+        )
+        retry_receiver, retry_sender = context.Pipe(duplex=False)
+        retry_controller = context.Process(
+            target=_retry_launch_driver_without_replay_from_fresh_process,
+            args=(
+                repo,
+                identity,
+                payload_command,
+                _CONTAINER_MEMORY_BYTES,
+                _CONTAINER_CPU_QUOTA_US,
+                _CONTAINER_CPU_PERIOD_US,
+                _CONTAINER_PIDS_LIMIT,
+                30,
+                runner["credential"],
+                retry_sender,
+            ),
+        )
+        retry_controller.start()
+        child_processes.append(retry_controller)
+        retry_sender.close()
+        assert retry_receiver.poll(20), "fresh retry controller did not reject the duplicate start"
+        retry_result = retry_receiver.recv()
+        retry_controller.join(timeout=5)
+        assert not retry_controller.is_alive()
+        assert retry_controller.exitcode == 0
+        retry_receiver.close()
+        assert retry_result[0] == "rejected", retry_result
+        assert retry_result[1] not in {os.getpid(), controller_pid, receipt["driver_pid"]}
+        assert retry_result[2] == "SandboxLaunchDriverServiceError"
+        assert retry_result[3] == 0, "fresh retry reached systemd-run and risked replay"
+        durable_after_retry = supervisor._sandbox_execution_get(attempt["id"])
+        assert durable_after_retry is not None
+        assert (
+            tuple(
+                durable_after_retry[field]
+                for field in (
+                    "launch_driver_start_id",
+                    "launch_driver_start_digest",
+                    "launch_driver_invocation_id",
+                    "launch_driver_pid",
                 )
-            except Exception as startup_error:
-                service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
-                assert runner["credential"] not in service_log
-                service_detail = service_log[-12_000:] or "<launch-driver service log is empty>"
-                raise AssertionError(
-                    f"production launch-driver startup failed: {startup_error}; "
-                    f"service log tail:\n{service_detail}"
-                ) from startup_error
+            )
+            == start_identity_before_retry
+        )
         if cancel_after_start:
             running_deadline = time.monotonic() + 30
             durable = supervisor._sandbox_execution_get(attempt["id"])
@@ -1463,13 +1664,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 assert rejected.value.code == "runner_authentication_failed"
                 reconnect.assert_not_called()
 
-            context = multiprocessing.get_context("spawn")
             result_receiver, result_sender = context.Pipe(duplex=False)
             fresh_controller = context.Process(
                 target=_terminate_worker_from_fresh_process,
                 args=(repo, attempt["id"], runner["credential"], result_sender),
             )
             fresh_controller.start()
+            child_processes.append(fresh_controller)
             result_sender.close()
             assert result_receiver.poll(20), "fresh controller did not receive a monitor response"
             termination_result = result_receiver.recv()
@@ -1478,7 +1679,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             assert fresh_controller.exitcode == 0
             result_receiver.close()
             assert termination_result[0] == "ok", termination_result
-            assert termination_result[1] != receipt.driver_pid
+            assert termination_result[1] not in {receipt["driver_pid"], controller_pid}
             termination = termination_result[2]
             assert termination_result[3:] == (1, 0)
             assert termination["attempt_id"] == attempt["id"]
@@ -1504,12 +1705,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         else:
             assert type(durable["runc_exit_code"]) is int
             assert durable["runc_exit_code"] != 0
-        assert receipt.service_unit == service_unit
-        assert receipt.driver_pid == durable["launch_driver_pid"]
-        assert receipt.driver_identity == durable["launch_driver_identity"]
-        assert receipt.invocation_id == durable["launch_driver_invocation_id"]
-        assert receipt.control_group == durable["launch_driver_cgroup_path"]
-        assert receipt.control_group == (f"{durable['attempt_slice_cgroup_path']}/{service_unit}")
+        assert receipt["service_unit"] == service_unit
+        assert receipt["driver_pid"] == durable["launch_driver_pid"]
+        assert receipt["driver_identity"] == durable["launch_driver_identity"]
+        assert receipt["invocation_id"] == durable["launch_driver_invocation_id"]
+        assert receipt["control_group"] == durable["launch_driver_cgroup_path"]
+        assert receipt["control_group"] == (
+            f"{durable['attempt_slice_cgroup_path']}/{service_unit}"
+        )
         assert durable["wrapper_cgroup_path"] != durable["attempt_slice_cgroup_path"]
         assert not Path(durable["wrapper_cgroup_path"]).is_relative_to(
             Path(durable["attempt_slice_cgroup_path"])
@@ -1604,7 +1807,23 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             (row["pool_name"], row["value"], row["lease_expires_at"]) for row in allocations_before
         ] == [("LAUNCH_DRIVER_TEST_PORT", runtime_test_port, attempt["lease_expires_at"])]
 
-        reaped = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+        reap_receiver, reap_sender = context.Pipe(duplex=False)
+        fresh_reaper = context.Process(
+            target=_reap_expired_from_fresh_process,
+            args=(repo, attempt["lease_expires_at"] + 1, reap_sender),
+        )
+        fresh_reaper.start()
+        child_processes.append(fresh_reaper)
+        reap_sender.close()
+        assert reap_receiver.poll(30), "fresh supervisor did not finish the real reaper"
+        reap_result = reap_receiver.recv()
+        fresh_reaper.join(timeout=5)
+        assert not fresh_reaper.is_alive()
+        assert fresh_reaper.exitcode == 0
+        reap_receiver.close()
+        assert reap_result[0] == "ok", reap_result
+        assert reap_result[1] not in {controller_pid, receipt["driver_pid"]}
+        reaped = reap_result[2]
         assert reaped["orphaned"] == [task["id"]]
         assert reaped["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
         assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
@@ -1648,6 +1867,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         assert not Path(durable["bundle_path"]).exists()
         assert not state_root.exists()
     finally:
+        for child in child_processes:
+            child.join(timeout=30)
+        live_children = [child.pid for child in child_processes if child.is_alive()]
+        if live_children:
+            pytest.fail(
+                "controller child processes are not quiescent; preserving the exact "
+                f"fixture and service state at {run_root}; pids={live_children}"
+            )
         driver_safe = _stop_attempted_units_and_check_quiescence(
             systemctl, service_unit, service_start_attempted, slice_unit, slice_start_attempted
         )
