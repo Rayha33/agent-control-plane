@@ -20,8 +20,11 @@ through the real `reap_expired()` path (`cleanup_verified` and runtime/fence
 release, one pass per mode). Each run now starts the real producer in a spawned
 process that exits abruptly after the durable handoff receipt; fresh spawned
 supervisor processes perform cancellation (when requested) and reaping. The
-original pytest harness remains alive, so this proves producer-process loss
-after handoff—not a full supervisor-daemon restart or a crash during handoff.
+original pytest harness remains alive, so those runs prove producer-process
+loss after handoff—not a full supervisor-daemon restart. A separate
+manager-acceptance crash mode now proves the specific interruption after
+successful `systemd-run` return and before receipt propagation; broader crash
+windows and daemon restart remain unproven.
 The code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487` passed
 [exact-head hosted CI run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
 with all four Ubuntu/macOS × Python 3.11/3.12 jobs green. Result import is not
@@ -290,7 +293,32 @@ durable start ID, digest, invocation ID, and driver PID. This is live no-replay
 evidence after committed handoff; ambiguous pre-handoff recovery remains
 covered by separate journal/producer tests.
 
-Both modes used no model, provider credential, network egress, or paid call.
+### Manager-accepted, pre-receipt producer crash (2026-10-16)
+
+The opt-in `ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1` mode passed 1/1 on the
+same disposable Debian 12 ARM64 / Linux 6.1 / systemd 252.39 guest, with cgroup
+v2 and pinned rootless runc 1.5.2. The producer calls the real `systemd-run`
+with the launcher's `Type=exec` behavior; once the command returns
+successfully, a test hook reports manager acceptance and terminates that
+producer with `os._exit(74)` before receipt propagation. The test waits for the
+durable launch identity, then retries from a fresh producer. The retry is
+rejected with `SandboxLaunchDriverServiceError` before any `systemd-run` call;
+the second-submission count remains zero, and the durable start ID, digest,
+unit invocation ID, driver PID, process identity, and cgroup path are unchanged.
+The same exact test module was also rerun in natural-completion and
+fresh-process cancellation modes (1/1 each). Its host and guest SHA-256 was
+`9c9cfe950f937e5317c1461022dbc561804852f5bc09c20eb3d88f25c4f0ad1c`.
+
+This proves the specific manager-accepted/pre-receipt interruption point. It
+does not prove all possible interruptions during handoff, a restart of the
+pytest harness or `GitSupervisor`, a systemd user-manager restart/logout/reboot,
+result import, provider access, or `run_worker()` enablement. Postflight found
+only the same two pre-existing failed launch-driver units, no running runc
+processes, and no matching live fixture directories; those pre-existing units
+were left untouched. The exact-head CI run cited above predates this increment;
+hosted CI for the current change is still pending.
+
+All three live modes used no model, provider credential, network egress, or paid call.
 Postflight found no running ACP test units, pinned-runc process, or
 `acp-live-launch-driver-*` fixture root. Two pre-existing failed transient
 launch-driver units had `MainPID=0` and empty cgroups; they were not changed or
@@ -299,19 +327,21 @@ before teardown; if a child remains alive after 30 seconds, it fails without
 stopping units or deleting the fixture, leaving the fixture and units in place
 for manual recovery on the disposable guest.
 
-Host and guest SHA-256 matched for every listed production/test source at both
-runs, including the updated test module hash below. This proves the tested
-post-handoff producer-process loss, cancellation request, separate pinned-runc
+The table below records hashes for the earlier post-handoff natural/cancel
+runs. The manager-acceptance crash increment above separately records the
+exact current test-module hash. This proves the tested post-handoff
+producer-process loss, manager-accepted/pre-receipt crash, cancellation
+request, separate pinned-runc
 action receipt, exact process/unit/cgroup/state/path absence checks, and
 fresh-process reaper-driven `cleanup_verified` plus runtime/fence release on
-this guest. It does not prove full supervisor-daemon restart recovery, manager
-restart/logout/reboot recovery, crash during handoff, result import, provider
-access, or `run_worker()` enablement. Exact-head hosted CI run 38884017803
-passed all four Ubuntu/macOS × Python 3.11/3.12 jobs for code-bearing commit
-`2383221c1a84cf52c08f42043465baea2ed4d487`. The older direct-monitor lifecycle
-fixture is explicitly skipped because it predates exact launch-driver
-redemption; it must be rebuilt around the production start API before it can
-be re-enabled.
+this guest. It still does not prove full supervisor-daemon restart recovery,
+manager restart/logout/reboot recovery, every crash-during-handoff window,
+result import, provider access, or `run_worker()` enablement. Exact-head hosted
+CI run 38884017803 passed all four Ubuntu/macOS × Python 3.11/3.12 jobs for
+code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`; hosted CI for
+the current increment is pending. The older direct-monitor lifecycle fixture
+is explicitly skipped because it predates exact launch-driver redemption; it
+must be rebuilt around the production start API before it can be re-enabled.
 
 The exact source and integration-test files below were SHA-256 matched between
 this worktree and the disposable guest before the passing run:

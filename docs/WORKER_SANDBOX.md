@@ -48,15 +48,23 @@ durable handoff receipt; fresh spawned supervisor processes then cancel (when
 requested) and run the real reaper. In both modes, a fresh producer retry of the
 same launch request was rejected before `systemd-run`; the durable start ID,
 digest, invocation ID, and driver PID remained unchanged. The original pytest
-harness remains alive, so this proves producer-process loss/no-replay after
-handoff, not crash-during-handoff or a full supervisor-daemon restart. The
-separate positive reaper regression continues to cover failed verification
-with deterministic mocked OS
+harness remains alive. A separate opt-in manager-acceptance crash mode now
+exits the producer immediately after successful `systemd-run` return and before
+receipt propagation; on the same Debian 12/systemd 252.39 guest, it passed
+1/1, as did re-runs of natural completion and fresh-process cancellation (1/1
+each). A fresh producer retry was rejected before `systemd-run`, with zero
+second submissions and the durable start ID, digest, unit invocation, PID,
+process identity, and cgroup path unchanged. This proves the specific
+manager-accepted/pre-receipt crash boundary, not every possible handoff
+interruption or a full supervisor-daemon restart. The separate positive reaper
+regression continues to cover failed verification with deterministic mocked OS
 observations. Run 38875452816 exposed the `/private/tmp` cross-platform fixture
 defect; the correction passed the four exact-head Ubuntu/macOS × Python 3.11/3.12
 jobs for `0ce4dc4`. The producer-loss/no-replay increment then passed all four
 jobs in [exact-head run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
 on code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487`.
+The manager-acceptance crash increment is not represented by that older CI
+run; exact-head hosted CI is pending for the current change.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
 socket beneath the verified private runtime directory. OCI `run_worker()` and

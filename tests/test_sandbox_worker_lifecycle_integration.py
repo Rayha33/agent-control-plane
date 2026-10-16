@@ -13,9 +13,12 @@ runc from a monitor-owned service and cannot satisfy the current launch-driver
 redemption contract. The production launch-driver test remains opt-in. Its
 default branch verifies natural completion; setting
 `ACP_LIVE_CANCEL_AFTER_START=1` runs the same fixture with a long payload and
-verifies cancellation from a fresh supervisor. Run on a disposable supported
-Linux host with rootless runc 1.5.2, delegated cgroup v2, and an active private
-systemd user manager:
+verifies cancellation from a fresh supervisor. Setting
+`ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1` exits the producer after successful
+`systemd-run` return but before receipt propagation, then verifies a fresh
+producer cannot replay the launch. The crash mode cannot be combined with
+cancellation. Run on a disposable supported Linux host with rootless runc 1.5.2,
+delegated cgroup v2, and an active private systemd user manager:
 
     ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
     ACP_OCI_TEST_RUNC=/usr/bin/runc \
@@ -25,6 +28,10 @@ systemd user manager:
 For the fresh-supervisor cancellation branch, add:
 
     ACP_LIVE_CANCEL_AFTER_START=1
+
+For the manager-accepted/pre-receipt crash branch, add:
+
+    ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1
 """
 
 from __future__ import annotations
@@ -131,8 +138,9 @@ def _start_launch_driver_then_crash_controller(
     credential: str,
     service_log_path: Path,
     result_sender,
+    crash_after_manager_acceptance: bool = False,
 ) -> None:
-    """Run the real producer, then abruptly exit after it commits handoff."""
+    """Exit the producer after manager acceptance or committed durable handoff."""
 
     original_runner = sandbox_launch_driver_service._run_trusted_runtime_command
 
@@ -144,7 +152,15 @@ def _start_launch_driver_then_crash_controller(
                 f"--property=StandardOutput=append:{service_log_path}",
                 f"--property=StandardError=append:{service_log_path}",
             ]
-        return original_runner(argv, environment=environment)
+        result = original_runner(argv, environment=environment)
+        if crash_after_manager_acceptance and Path(argv[0]).name == "systemd-run":
+            # Type=exec returns only after systemd accepts the unit and crosses
+            # ExecStart. Lose the producer before it can observe or persist the
+            # service receipt; the durable intent must prevent a duplicate start.
+            result_sender.send(("manager_accepted", os.getpid()))
+            result_sender.close()
+            os._exit(74)
+        return result
 
     exit_code = 73
     try:
@@ -1515,6 +1531,11 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         monitor_start_attempted = True
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
+        crash_after_manager_acceptance = (
+            os.environ.get("ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE") == "1"
+        )
+        if cancel_after_start and crash_after_manager_acceptance:
+            pytest.fail("manager-acceptance crash mode cannot be combined with cancellation")
         payload_sleep_seconds = 30 if cancel_after_start else 1
         payload_command = (
             "/bin/busybox",
@@ -1540,6 +1561,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 runner["credential"],
                 service_log_path,
                 producer_result_sender,
+                crash_after_manager_acceptance,
             ),
         )
         producer_controller.start()
@@ -1551,10 +1573,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         assert not producer_controller.is_alive(), (
             "launch producer survived simulated controller loss"
         )
-        producer_exit = 73 if producer_result[0] == "ok" else 1
-        assert producer_controller.exitcode == producer_exit
-        producer_result_receiver.close()
-        if producer_result[0] != "ok":
+        if producer_result[0] not in {"ok", "manager_accepted"}:
             service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
             assert runner["credential"] not in service_log
             service_detail = service_log[-12_000:] or "<launch-driver service log is empty>"
@@ -1562,26 +1581,53 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 f"production launch-driver startup failed: {producer_result}; "
                 f"service log tail:\n{service_detail}"
             )
-        controller_pid, receipt = producer_result[1:]
-        assert receipt["attempt_id"] == identity[0]
-        assert receipt["claim_token"] == identity[1]
-        assert receipt["execution_id"] == identity[2]
+        if crash_after_manager_acceptance:
+            assert producer_result[0] == "manager_accepted", producer_result
+            producer_exit = 74
+        else:
+            assert producer_result[0] == "ok", producer_result
+            producer_exit = 73
+        assert producer_controller.exitcode == producer_exit
+        producer_result_receiver.close()
+        if producer_result[0] == "manager_accepted":
+            controller_pid = producer_result[1]
+            producer_receipt = None
+        else:
+            controller_pid, producer_receipt = producer_result[1:]
+            assert producer_receipt["attempt_id"] == identity[0]
+            assert producer_receipt["claim_token"] == identity[1]
+            assert producer_receipt["execution_id"] == identity[2]
         launch_receipt_deadline = time.monotonic() + 30
         durable_before_retry = supervisor._sandbox_execution_get(attempt["id"])
-        while (
-            durable_before_retry is not None
-            and (
-                durable_before_retry["launch_driver_invocation_id"] != receipt["invocation_id"]
-                or durable_before_retry["launch_driver_pid"] != receipt["driver_pid"]
+        while time.monotonic() < launch_receipt_deadline and (
+            durable_before_retry is None
+            or durable_before_retry["phase"] == "reserved"
+            or not durable_before_retry["launch_driver_invocation_id"]
+            or not durable_before_retry["launch_driver_pid"]
+            or (
+                producer_receipt is not None
+                and (
+                    durable_before_retry["launch_driver_invocation_id"]
+                    != producer_receipt["invocation_id"]
+                    or durable_before_retry["launch_driver_pid"] != producer_receipt["driver_pid"]
+                )
             )
-            and time.monotonic() < launch_receipt_deadline
         ):
             time.sleep(0.05)
             durable_before_retry = supervisor._sandbox_execution_get(attempt["id"])
         assert durable_before_retry is not None
-        assert durable_before_retry["launch_driver_invocation_id"] == receipt["invocation_id"]
-        assert durable_before_retry["launch_driver_pid"] == receipt["driver_pid"]
         assert durable_before_retry["phase"] != "reserved"
+        assert durable_before_retry["launch_driver_start_id"]
+        assert durable_before_retry["launch_driver_start_digest"]
+        assert durable_before_retry["launch_driver_invocation_id"]
+        assert durable_before_retry["launch_driver_pid"]
+        if producer_receipt is not None:
+            assert (
+                durable_before_retry["launch_driver_invocation_id"]
+                == producer_receipt["invocation_id"]
+            )
+            assert durable_before_retry["launch_driver_pid"] == producer_receipt["driver_pid"]
+        driver_pid = durable_before_retry["launch_driver_pid"]
         start_identity_before_retry = tuple(
             durable_before_retry[field]
             for field in (
@@ -1589,6 +1635,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 "launch_driver_start_digest",
                 "launch_driver_invocation_id",
                 "launch_driver_pid",
+                "launch_driver_identity",
+                "launch_driver_cgroup_path",
             )
         )
         retry_receiver, retry_sender = context.Pipe(duplex=False)
@@ -1617,7 +1665,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         assert retry_controller.exitcode == 0
         retry_receiver.close()
         assert retry_result[0] == "rejected", retry_result
-        assert retry_result[1] not in {os.getpid(), controller_pid, receipt["driver_pid"]}
+        assert retry_result[1] not in {os.getpid(), controller_pid, driver_pid}
         assert retry_result[2] == "SandboxLaunchDriverServiceError"
         assert retry_result[3] == 0, "fresh retry reached systemd-run and risked replay"
         durable_after_retry = supervisor._sandbox_execution_get(attempt["id"])
@@ -1630,6 +1678,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                     "launch_driver_start_digest",
                     "launch_driver_invocation_id",
                     "launch_driver_pid",
+                    "launch_driver_identity",
+                    "launch_driver_cgroup_path",
                 )
             )
             == start_identity_before_retry
@@ -1679,7 +1729,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             assert fresh_controller.exitcode == 0
             result_receiver.close()
             assert termination_result[0] == "ok", termination_result
-            assert termination_result[1] not in {receipt["driver_pid"], controller_pid}
+            assert termination_result[1] not in {driver_pid, controller_pid}
             termination = termination_result[2]
             assert termination_result[3:] == (1, 0)
             assert termination["attempt_id"] == attempt["id"]
@@ -1705,14 +1755,25 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         else:
             assert type(durable["runc_exit_code"]) is int
             assert durable["runc_exit_code"] != 0
-        assert receipt["service_unit"] == service_unit
-        assert receipt["driver_pid"] == durable["launch_driver_pid"]
-        assert receipt["driver_identity"] == durable["launch_driver_identity"]
-        assert receipt["invocation_id"] == durable["launch_driver_invocation_id"]
-        assert receipt["control_group"] == durable["launch_driver_cgroup_path"]
-        assert receipt["control_group"] == (
+        assert durable["launch_driver_pid"] == driver_pid
+        assert (
+            durable["launch_driver_invocation_id"]
+            == durable_before_retry["launch_driver_invocation_id"]
+        )
+        assert durable["launch_driver_identity"] == durable_before_retry["launch_driver_identity"]
+        assert (
+            durable["launch_driver_cgroup_path"]
+            == durable_before_retry["launch_driver_cgroup_path"]
+        )
+        assert durable["launch_driver_cgroup_path"] == (
             f"{durable['attempt_slice_cgroup_path']}/{service_unit}"
         )
+        if producer_receipt is not None:
+            assert producer_receipt["service_unit"] == service_unit
+            assert producer_receipt["driver_pid"] == durable["launch_driver_pid"]
+            assert producer_receipt["driver_identity"] == durable["launch_driver_identity"]
+            assert producer_receipt["invocation_id"] == durable["launch_driver_invocation_id"]
+            assert producer_receipt["control_group"] == durable["launch_driver_cgroup_path"]
         assert durable["wrapper_cgroup_path"] != durable["attempt_slice_cgroup_path"]
         assert not Path(durable["wrapper_cgroup_path"]).is_relative_to(
             Path(durable["attempt_slice_cgroup_path"])
@@ -1822,7 +1883,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         assert fresh_reaper.exitcode == 0
         reap_receiver.close()
         assert reap_result[0] == "ok", reap_result
-        assert reap_result[1] not in {controller_pid, receipt["driver_pid"]}
+        assert reap_result[1] not in {controller_pid, driver_pid}
         reaped = reap_result[2]
         assert reaped["orphaned"] == [task["id"]]
         assert reaped["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
