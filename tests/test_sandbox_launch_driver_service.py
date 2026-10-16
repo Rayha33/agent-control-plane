@@ -4,20 +4,28 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from support import init_repo, make_task
 
 from agent_control_plane.supervisor import sandbox_execution_journal as journal
-from agent_control_plane.supervisor.common import SupervisorError, canonical_json
+from agent_control_plane.supervisor.common import RuntimePortPool, SupervisorError, canonical_json
 from agent_control_plane.supervisor.sandbox_launch_driver_service import (
     SandboxLaunchDriverServiceError,
     _read_request,
     _read_service_runner_credential,
+    _request_driver_failure_stop_and_cancel_monitor,
     _request_timeout_stop_and_cancel_monitor,
     _validate_request,
+    _wait_for_driver_running_handoff,
+    _wait_for_runc_with_attempt_heartbeat,
     _write_request,
+    start_registered_no_model_sandbox_worker,
     start_sandbox_launch_driver,
 )
 from agent_control_plane.supervisor.sandbox_monitor_receipt import (
@@ -44,6 +52,24 @@ def _request(command: list[str] | tuple[str, ...] = ("/bin/busybox", "true")) ->
         pids_max=_RESOURCES["pids_max"],
         timeout_seconds=30,
     )
+
+
+def test_request_freezes_mutable_command_before_validation() -> None:
+    command = ["/bin/busybox", "true"]
+
+    request = _request(command)
+    command[1] = "sh"
+
+    assert request["command"] == ["/bin/busybox", "true"]
+
+
+def test_request_rejects_tuple_subclasses_with_unstable_iteration() -> None:
+    class UnstableTuple(tuple):
+        def __iter__(self):
+            return iter(("/bin/busybox", "mutated"))
+
+    with pytest.raises(SandboxLaunchDriverServiceError, match="request is invalid"):
+        _request(UnstableTuple(("/bin/busybox", "true")))
 
 
 def _committed_execution(intent: SimpleNamespace, state_path: Path) -> dict[str, object]:
@@ -83,6 +109,395 @@ def _committed_execution(intent: SimpleNamespace, state_path: Path) -> dict[str,
         "scope_invocation_id": "5" * 32,
         "cgroup_path": f"/user.slice/user-acp.slice/{attempt_slice}/acp-scope-test.scope",
     }
+
+
+def test_registered_no_model_worker_requires_explicit_opt_in() -> None:
+    with pytest.raises(SandboxLaunchDriverServiceError, match="explicit experimental opt-in"):
+        start_registered_no_model_sandbox_worker(
+            object(),
+            attempt_id="attempt-1",
+            claim_token=7,
+            command=("/bin/true",),
+            **_RESOURCES,
+        )
+
+
+def test_registered_no_model_worker_rejects_unsupported_platform_before_supervisor_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    monkeypatch.setattr(service.sys, "platform", "darwin")
+    with pytest.raises(SandboxLaunchDriverServiceError, match="unprivileged supported Linux"):
+        start_registered_no_model_sandbox_worker(
+            object(),
+            attempt_id="attempt-1",
+            claim_token=7,
+            command=("/bin/true",),
+            experimental_opt_in=True,
+            **_RESOURCES,
+        )
+
+
+def test_registered_no_model_worker_rejects_missing_pins_before_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setattr(service.os, "geteuid", lambda: 1000)
+    supervisor = SimpleNamespace(
+        config=SimpleNamespace(
+            oci_rootfs_pin=None,
+            oci_runc_executable=None,
+            oci_runc_version=None,
+        ),
+        _sandbox_validate_attempt_id=lambda value: value,
+        _sandbox_claim_token=lambda value: value,
+    )
+    with pytest.raises(SandboxLaunchDriverServiceError, match="pinned rootfs and runc 1.5.2"):
+        start_registered_no_model_sandbox_worker(
+            supervisor,
+            attempt_id="attempt-1",
+            claim_token=7,
+            command=("/bin/true",),
+            experimental_opt_in=True,
+            **_RESOURCES,
+        )
+
+
+def test_post_reservation_preparation_failure_retains_partial_private_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    if os.geteuid() == 0:
+        pytest.skip("registered no-model composition refuses a root caller")
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    trusted_rootfs = tmp_path / "trusted-rootfs"
+    trusted_rootfs.mkdir(mode=0o700)
+    rootfs_pin = SimpleNamespace(sha256="a" * 64, closure_sha256="b" * 64)
+    runc_pin = SimpleNamespace(sha256="c" * 64)
+    version = service.oci_worker._RUNC_RECURSIVE_PRIVATE_VERSION
+    reserved: list[dict[str, object]] = []
+    heartbeat_calls: list[tuple[object, ...]] = []
+    execution_root = state_dir / "sandbox-executions" / "attempt-1-7"
+    execution = {
+        "attempt_id": "attempt-1",
+        "claim_token": 7,
+        "execution_id": "execution-1",
+        "bundle_path": str(execution_root / "bundle"),
+        "state_path": str(execution_root / "state"),
+    }
+
+    def reserve(*_args: object, **_kwargs: object) -> dict[str, object]:
+        reserved.append(execution)
+        return execution
+
+    supervisor = SimpleNamespace(
+        config=SimpleNamespace(
+            oci_rootfs_pin=rootfs_pin,
+            oci_runc_executable=runc_pin,
+            oci_runc_version=version,
+            lease_seconds=30,
+        ),
+        state_dir=state_dir,
+        _sandbox_validate_attempt_id=lambda value: value,
+        _sandbox_claim_token=lambda _value: None,
+        _sandbox_execution_reserve=reserve,
+        heartbeat=lambda *args, **kwargs: heartbeat_calls.append(args),
+    )
+    monkeypatch.setattr(service.oci_worker, "_verify_trusted_rootfs", lambda _pin: trusted_rootfs)
+    monkeypatch.setattr(service.oci_worker, "_verify_trusted_runc_executable", lambda _pin: None)
+    monkeypatch.setattr(
+        service.oci_worker, "_probe_trusted_runc_version", lambda _pin, _version: version
+    )
+    monkeypatch.setattr(
+        service.oci_worker,
+        "rootfs_tree_manifest",
+        lambda _path: {
+            "rootfs_sha256": rootfs_pin.sha256,
+            "closure_sha256": rootfs_pin.closure_sha256,
+        },
+    )
+
+    def fail_during_copy(_source: Path, destination: Path, *, symlinks: bool) -> None:
+        assert symlinks is True
+        destination.mkdir(mode=0o700)
+        (destination / "partial-entry").write_text("incomplete", encoding="utf-8")
+        raise OSError("injected partial rootfs copy failure")
+
+    monkeypatch.setattr(service.shutil, "copytree", fail_during_copy)
+    with pytest.raises(
+        SandboxLaunchDriverServiceError, match="could not be copied and re-verified"
+    ):
+        start_registered_no_model_sandbox_worker(
+            supervisor,
+            attempt_id="attempt-1",
+            claim_token=7,
+            command=("fake-worker", "--no-model"),
+            experimental_opt_in=True,
+            **_RESOURCES,
+        )
+
+    assert reserved == [execution]
+    assert heartbeat_calls
+    assert (execution_root / "bundle" / "rootfs" / "partial-entry").is_file()
+    assert (execution_root / "state").is_dir()
+
+
+def test_real_journal_quarantines_fences_after_partial_preparation_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from agent_control_plane.git_supervisor import CLEANUP_FENCE_EPOCH, GitSupervisor
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    if os.geteuid() == 0:
+        pytest.skip("registered no-model composition refuses a root caller")
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo(repo)
+    supervisor = GitSupervisor(repo)
+    supervisor.config = replace(
+        supervisor.config,
+        runtime_port_pools=(RuntimePortPool("ACP_TEST_PORT", 24003, 24003),),
+    )
+    supervisor._port_available = lambda _port: True
+    task = make_task(supervisor, "partial-preparation", title="partial preparation failure")
+    attempt = supervisor.claim(task["id"], "sandbox-worker")
+    state_dir = Path(supervisor.state_dir)
+    state_dir.chmod(0o700)
+    trusted_rootfs = tmp_path / "trusted-rootfs"
+    trusted_rootfs.mkdir(mode=0o700)
+    rootfs_pin = SimpleNamespace(sha256="a" * 64, closure_sha256="b" * 64)
+    runc_pin = SimpleNamespace(sha256="c" * 64)
+    version = service.oci_worker._RUNC_RECURSIVE_PRIVATE_VERSION
+    supervisor.config = replace(
+        supervisor.config,
+        oci_rootfs_pin=rootfs_pin,
+        oci_runc_executable=runc_pin,
+        oci_runc_version=version,
+        lease_seconds=3,
+    )
+    monkeypatch.setattr(service.oci_worker, "_verify_trusted_rootfs", lambda _pin: trusted_rootfs)
+    monkeypatch.setattr(service.oci_worker, "_verify_trusted_runc_executable", lambda _pin: None)
+    monkeypatch.setattr(
+        service.oci_worker, "_probe_trusted_runc_version", lambda _pin, _version: version
+    )
+    monkeypatch.setattr(
+        service.oci_worker,
+        "rootfs_tree_manifest",
+        lambda _path: {
+            "rootfs_sha256": rootfs_pin.sha256,
+            "closure_sha256": rootfs_pin.closure_sha256,
+        },
+    )
+
+    def fail_during_copy(_source: Path, destination: Path, *, symlinks: bool) -> None:
+        assert symlinks is True
+        destination.mkdir(mode=0o700)
+        (destination / "partial-entry").write_text("incomplete", encoding="utf-8")
+        raise OSError("injected partial rootfs copy failure")
+
+    monkeypatch.setattr(service.shutil, "copytree", fail_during_copy)
+    with pytest.raises(
+        SandboxLaunchDriverServiceError, match="could not be copied and re-verified"
+    ):
+        start_registered_no_model_sandbox_worker(
+            supervisor,
+            attempt_id=attempt["id"],
+            claim_token=attempt["claim_token"],
+            command=("fake-worker", "--no-model"),
+            experimental_opt_in=True,
+            **_RESOURCES,
+        )
+
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None and execution["phase"] == "reserved"
+    assert (Path(execution["bundle_path"]) / "rootfs" / "partial-entry").is_file()
+    assert Path(execution["state_path"]).is_dir()
+    with supervisor.connect() as connection:
+        lease_count = connection.execute(
+            "SELECT COUNT(*) AS n FROM resource_leases WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()["n"]
+        runtime = connection.execute(
+            "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        allocation_before = connection.execute(
+            "SELECT pool_name, value, lease_expires_at FROM runtime_allocations "
+            "WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert lease_count > 0
+    assert runtime is not None and runtime["state"] != "released"
+    assert allocation_before is not None
+    assert (allocation_before["pool_name"], allocation_before["value"]) == (
+        "ACP_TEST_PORT",
+        24003,
+    )
+    assert allocation_before["lease_expires_at"] != CLEANUP_FENCE_EPOCH
+
+    supervisor.reap_expired(now=int(time.time()) + 4)
+
+    with supervisor.connect() as connection:
+        quarantined_attempt = connection.execute(
+            "SELECT status, termination_target_status FROM attempts WHERE id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        quarantined_task = connection.execute(
+            "SELECT status, cleanup_target_status FROM tasks WHERE id = ?",
+            (task["id"],),
+        ).fetchone()
+        leases = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchall()
+        runtime_after = connection.execute(
+            "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        allocation_after = connection.execute(
+            "SELECT pool_name, value, lease_expires_at FROM runtime_allocations "
+            "WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert quarantined_attempt["status"] == "terminating"
+    assert quarantined_attempt["termination_target_status"] == "quarantined"
+    assert quarantined_task["status"] == "cleanup_pending"
+    assert quarantined_task["cleanup_target_status"] == "blocked"
+    assert leases and all(lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH for lease in leases)
+    assert runtime_after is not None and runtime_after["state"] != "released"
+    assert allocation_after is not None
+    assert (allocation_after["pool_name"], allocation_after["value"]) == (
+        "ACP_TEST_PORT",
+        24003,
+    )
+    assert allocation_after["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+
+
+def test_launch_driver_wait_renews_attempt_lease_between_bounded_waits() -> None:
+    from subprocess import TimeoutExpired
+
+    calls: list[object] = []
+
+    class Handle:
+        def wait(self, *, timeout: float):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise TimeoutExpired("pinned-runc", timeout)
+            return "wait-receipt"
+
+    supervisor = SimpleNamespace(
+        config=SimpleNamespace(lease_seconds=30),
+        heartbeat=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    result = _wait_for_runc_with_attempt_heartbeat(
+        supervisor,
+        Handle(),
+        attempt_id="attempt-1",
+        claim_token=7,
+        credential="runner-secret",
+        timeout_seconds=5,
+    )
+
+    assert result == "wait-receipt"
+    assert len(calls) == 3
+    heartbeat_call = calls[1]
+    assert heartbeat_call == (
+        ("attempt-1", 7, None),
+        {"credential": "runner-secret"},
+    )
+
+
+def test_producer_keeps_lease_until_driver_publishes_running_handoff() -> None:
+    class LeaseHeartbeat:
+        checks = 0
+
+        def check(self) -> None:
+            self.checks += 1
+
+    phases = iter(("launched", "running"))
+    identity = _IDENTITY
+    supervisor = SimpleNamespace(
+        _sandbox_execution_get=lambda _attempt_id: {
+            "attempt_id": identity[0],
+            "claim_token": identity[1],
+            "execution_id": identity[2],
+            "phase": next(phases),
+        }
+    )
+    lease_heartbeat = LeaseHeartbeat()
+
+    execution = _wait_for_driver_running_handoff(
+        supervisor,
+        identity,
+        lease_heartbeat,
+        timeout_seconds=1,
+    )
+
+    assert execution["phase"] == "running"
+    assert lease_heartbeat.checks == 2
+
+
+def test_expired_attempt_quarantines_then_cancels_exact_monitor_scope() -> None:
+    identity = _IDENTITY
+    current = {
+        "attempt_id": identity[0],
+        "claim_token": identity[1],
+        "execution_id": identity[2],
+        "phase": "running",
+    }
+    transitions: list[tuple[str, Any]] = []
+
+    def request_stop(*_args: Any, **_kwargs: Any) -> None:
+        raise SupervisorError("claim_inactive", "attempt lease expired")
+
+    def quarantine_lease_loss(
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        *,
+        credential: str | None,
+    ) -> dict[str, Any]:
+        assert (attempt_id, claim_token) == identity[:2]
+        assert execution_id == identity[2]
+        assert credential == "runner-secret"
+        transitions.append(("quarantine", execution_id))
+        current["phase"] = "ambiguous"
+        current["failure_reason"] = (
+            "launch-driver stop intent could not be recorded after attempt lease loss"
+        )
+        return dict(current)
+
+    def cancel_monitor(
+        execution: dict[str, Any], *, monitor_client: Any, _allow_ambiguous_failure: bool
+    ) -> dict[str, Any]:
+        assert execution["phase"] == "ambiguous"
+        assert execution["execution_id"] == identity[2]
+        assert monitor_client == "exact-monitor-client"
+        assert _allow_ambiguous_failure is True
+        transitions.append(("cancel", execution["execution_id"]))
+        return {"outcome": "stop_pending"}
+
+    supervisor = SimpleNamespace(
+        _sandbox_execution_request_stop=request_stop,
+        _sandbox_execution_get=lambda _attempt_id: dict(current),
+        _sandbox_execution_quarantine_lease_loss=quarantine_lease_loss,
+        _cancel_sandbox_execution_monitor=cancel_monitor,
+    )
+    _request_driver_failure_stop_and_cancel_monitor(
+        supervisor,
+        identity,
+        credential="runner-secret",
+        monitor_client="exact-monitor-client",
+    )
+
+    assert [kind for kind, _ in transitions] == ["quarantine", "cancel"]
 
 
 def test_request_is_canonical_private_and_bound_to_the_execution(tmp_path: Path) -> None:

@@ -580,17 +580,20 @@ execution path.
 
 ## Supervisor composition boundary (2026-10-16; task #3268)
 
-The current launch-driver/journal lifecycle is not yet a registered worker API.
+The launch-driver/journal lifecycle now has an explicit no-model composition
+entrypoint, but it is still not the registered worker's default API.
 `WorkersMixin.run_worker()` first validates a non-empty command and computes its
 digest, then returns `sandbox_executor_unavailable` when OCI is configured,
 before heartbeat, reservation, or host `Popen`; without OCI configuration, it
 uses its separate direct-host process path subject to the existing reservation
-preflight and Linux containment guard. In source,
-the sandbox reservation and workspace-binding methods have no production
-caller, and `start_sandbox_launch_driver()` has no supervisor caller. The live
-integration test creates a real task and claimed attempt, but manually invokes
-those preparation steps and the launch-driver service instead of calling
-`run_worker()`.
+preflight and Linux containment guard. The module-level
+`start_registered_no_model_sandbox_worker()` is now the sole composition
+caller: it requires `experimental_opt_in=True`, reserves the claimed attempt,
+copies and re-verifies the pinned rootfs, mints the baseline and disjoint
+workspace without `.git`, binds them in the journal, and calls
+`start_sandbox_launch_driver()`. It is not wired to `run_worker()`, a CLI, or a
+provider/model; the caller must supply a local fake-worker command. Result
+import remains a separate explicit call.
 
 The durable ownership boundaries that a caller must compose are:
 
@@ -609,11 +612,24 @@ The durable ownership boundaries that a caller must compose are:
   candidate, and produces a `pending_qc` submission. The live test calls this
   explicitly; the launch-driver does not import results itself.
 
-Therefore the next composition must provide a single attempt-scoped owner for
-preparation, launch, cancellation/recovery, wait/reap, verified cleanup, and
-the existing QC import handoff. It must not store the launch-driver PID as if
-it were a direct worker PID or permit both launch strategies for one attempt.
-Until that owner exists and is independently exercised on a disposable Linux
-host, no production caller is wired and the default `run_worker()` refusal
-remains mandatory. Provider authentication/egress and full workspace/Git
-isolation remain separate parent #2370 gates.
+The opt-in function renews the attempt lease during preparation and keeps
+renewing until the launch driver has itself renewed the lease and durably
+published `running`; the driver renews it while it owns the wait/reap path. If
+the attempt lease has already expired, the driver first quarantines the exact
+execution under its release lock, with the accepted phase set rechecked by the
+journal transaction, then asks only its identity-bound authenticated monitor to
+cancel the exact scope. If that cancellation is followed by the sealed runc
+kernel-wait receipt, the lease-loss path may advance only that exact quarantined
+execution to `exited`, perform the pinned-runc delete, and submit its cleanup
+action receipt. The independent verifier still owns `cleanup_verified`; the
+reaper releases fences only after that proof. If cancellation, wait, deletion,
+or verification evidence is unavailable, the execution remains fenced. A
+preparation failure after durable reservation intentionally retains the
+attempt and resource fences for reaper quarantine; partial private trees are
+not automatically cleaned. There is no host fallback or unverified rollback.
+The launch-driver retains process-local wait/reap ownership; the supervisor
+verifier and reaper retain cleanup authority; the caller retains the explicit
+QC import handoff.
+This narrow composition does not enable provider workers, prove provider
+egress or full host-path/Git isolation, or eliminate the parent #2370
+acceptance gates. The default `run_worker()` refusal remains mandatory.

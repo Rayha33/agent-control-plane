@@ -14,6 +14,7 @@ import time
 import weakref
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -2928,7 +2929,10 @@ def test_launch_starts_monitor_for_exact_fenced_scope_and_uses_service_receipt(
     assert launched["wrapper_cgroup_path"].endswith("/" + launched["wrapper_unit"])
 
 
-@pytest.mark.parametrize("failure_point", ["timeout", "post-launch-exception"])
+@pytest.mark.parametrize(
+    "failure_point",
+    ["timeout", "post-launch-exception", "lease-expired", "lease-expired-after-stop"],
+)
 def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_keeps_fence(
     monkeypatch: pytest.MonkeyPatch, repo: Path, failure_point: str
 ) -> None:
@@ -2937,6 +2941,11 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
     if os.geteuid() == 0:
         pytest.skip("the real launch-driver entrypoint refuses a root caller")
     supervisor = GitSupervisor(repo)
+    supervisor.config = replace(
+        supervisor.config,
+        runtime_port_pools=(RuntimePortPool("ACP_TEST_PORT", 24002, 24002),),
+    )
+    supervisor._port_available = lambda _port: True
     attempt = claimed(supervisor)
     execution = reserve(supervisor, attempt)
     identity = (attempt["id"], attempt["claim_token"], execution["execution_id"])
@@ -2964,7 +2973,8 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
         exact_handle: oci_worker.RuncLaunchHandle, timeout: float | None = None
     ) -> Any:
         wait_calls.append(timeout)
-        if timeout == request["timeout_seconds"]:
+        if timeout is not None and len(wait_calls) == 1:
+            time.sleep(timeout)
             raise subprocess.TimeoutExpired("pinned-runc", timeout)
         return original_wait(exact_handle, timeout)
 
@@ -3012,6 +3022,32 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
         return {name: values[name] for name in properties}
 
     monkeypatch.setattr(launch_driver_service, "_unit_properties", unit_properties)
+
+    if failure_point in {"lease-expired", "lease-expired-after-stop"}:
+        original_heartbeat = supervisor.heartbeat
+        request_stop_before_driver = supervisor._sandbox_execution_request_stop
+        heartbeat_calls = 0
+
+        def expire_lease_after_running(*args: Any, **kwargs: Any) -> Any:
+            nonlocal heartbeat_calls
+            result = original_heartbeat(*args, **kwargs)
+            heartbeat_calls += 1
+            if heartbeat_calls == 2:
+                if failure_point == "lease-expired-after-stop":
+                    stopping = request_stop_before_driver(
+                        attempt["id"], attempt["claim_token"], "attempt cancellation"
+                    )
+                    assert stopping["phase"] == "stopping"
+                with supervisor.connect() as connection:
+                    connection.execute(
+                        "UPDATE attempts SET lease_expires_at = 0 WHERE id = ?",
+                        (attempt["id"],),
+                    )
+                if failure_point == "lease-expired-after-stop":
+                    supervisor.reap_expired()
+            return result
+
+        monkeypatch.setattr(supervisor, "heartbeat", expire_lease_after_running)
 
     monitor_clients: list[monitor_ipc_module.SandboxMonitorControlClient] = []
 
@@ -3121,12 +3157,15 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
     def request_stop_with_timeout_race(
         attempt_id: str, claim_token: int, reason: str, *, credential: str | None
     ) -> dict[str, Any]:
-        if reason == "execution_timeout":
+        if reason == "execution_timeout" and failure_point == "timeout":
             return user_cancel_wins(attempt_id, claim_token, reason, credential=credential)
         return request_stop(attempt_id, claim_token, reason, credential=credential)
 
     def cancel_exact_monitor(
-        stopping: dict[str, Any], *, monitor_client: Any | None = None
+        stopping: dict[str, Any],
+        *,
+        monitor_client: Any | None = None,
+        _allow_ambiguous_failure: bool = False,
     ) -> None:
         durable_stop_reason = stopping.get("stop_reason")
         if stopping["phase"] == "launched":
@@ -3134,6 +3173,8 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
                 durable_stop_reason = journal_module._sandbox_execution_launch_stop_reason(
                     connection, stopping
                 )
+        elif stopping["phase"] == "ambiguous":
+            durable_stop_reason = stopping.get("failure_reason")
         cancellation_calls.append(
             (
                 stopping["attempt_id"],
@@ -3144,7 +3185,16 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
             )
         )
         cancelled_clients.append(monitor_client)
-        assert stopping["phase"] == ("stopping" if failure_point == "timeout" else "launched")
+        expected_cancel_phase = {
+            "timeout": "stopping",
+            "post-launch-exception": "launched",
+            "lease-expired": "ambiguous",
+            "lease-expired-after-stop": "ambiguous",
+        }[failure_point]
+        assert stopping["phase"] == expected_cancel_phase
+        assert _allow_ambiguous_failure is (
+            failure_point in {"lease-expired", "lease-expired-after-stop"}
+        )
 
     monkeypatch.setattr(
         supervisor, "_sandbox_execution_request_stop", request_stop_with_timeout_race
@@ -3162,13 +3212,40 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
 
     monkeypatch.setattr(supervisor, "_sandbox_execution_record_exit", trace_record_exit)
 
-    def stop_before_cleanup(*args: Any, **kwargs: Any) -> None:
+    def stop_before_cleanup(*args: Any, **kwargs: Any) -> Any:
         cleanup_calls.append((*args, kwargs))
         current = supervisor._sandbox_execution_get(attempt["id"])
         assert current is not None and current["phase"] == "exited"
-        supervisor._sandbox_execution_mark_ambiguous(
-            attempt["id"], attempt["claim_token"], "cleanup evidence unavailable"
-        )
+        if failure_point == "lease-expired-after-stop":
+            pin = supervisor.config.oci_runc_executable
+            assert pin is not None
+            action_payload = journal_module._sandbox_cleanup_action_payload_for_row(
+                current, executable_path=str(pin.path)
+            )
+            receipt = oci_worker._RuncCleanupActionReceipt(
+                attempt_id=current["attempt_id"],
+                claim_token=current["claim_token"],
+                execution_id=current["execution_id"],
+                container_id=current["container_id"],
+                state_root=current["state_path"],
+                state_root_device=current["state_root_dev"],
+                state_root_inode=current["state_root_ino"],
+                executable_path=str(pin.path),
+                executable_digest=pin.sha256,
+                runtime_version=current["runtime_version"],
+                argv=tuple(action_payload["argv"]),
+                argv_digest=action_payload["argv_sha256"],
+                actor_pid=current["launch_driver_pid"],
+                actor_identity=current["launch_driver_identity"],
+                returncode=0,
+                state_entry_absent=True,
+            )
+            oci_worker._register_runc_cleanup_action_receipt(receipt)
+            return receipt
+        if failure_point != "lease-expired":
+            supervisor._sandbox_execution_mark_ambiguous(
+                attempt["id"], attempt["claim_token"], "cleanup evidence unavailable"
+            )
         raise CleanupBoundaryReached
 
     monkeypatch.setattr(oci_worker, "_delete_pinned_runc_container", stop_before_cleanup)
@@ -3227,16 +3304,24 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
 
     try:
         payload_thread.start()
-        expected_error = (
-            CleanupBoundaryReached if failure_point == "timeout" else InjectedDriverFailure
+        expected_error = InjectedDriverFailure if failure_point == "post-launch-exception" else (
+            None if failure_point == "lease-expired-after-stop" else CleanupBoundaryReached
         )
-        with pytest.raises(expected_error):
+        if expected_error is None:
             launch_driver_service._run_driver(
                 repo=repo,
                 expected_identity=identity,
                 start_id=intent.start_id,
                 start_digest=intent.start_digest,
             )
+        else:
+            with pytest.raises(expected_error):
+                launch_driver_service._run_driver(
+                    repo=repo,
+                    expected_identity=identity,
+                    start_id=intent.start_id,
+                    start_digest=intent.start_digest,
+                )
     finally:
         payload_thread.join(timeout=2)
         if payload_thread.is_alive():
@@ -3250,7 +3335,9 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
     assert record_exit_errors == [], [repr(error) for error in record_exit_errors]
     if failure_point == "timeout":
         assert gate_observations == [(b"go\n", "running")]
-        assert wait_calls == [2.0, None]
+        assert len(wait_calls) == 2
+        assert wait_calls[0] == pytest.approx(2.0, abs=0.05)
+        assert wait_calls[1] is None
         assert cancellation_calls == [
             (
                 attempt["id"],
@@ -3258,6 +3345,20 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
                 execution["execution_id"],
                 "stopping",
                 "attempt cancellation",
+            )
+        ]
+    elif failure_point in {"lease-expired", "lease-expired-after-stop"}:
+        assert gate_observations == [(b"go\n", "running")]
+        assert len(wait_calls) == 2
+        assert wait_calls[0] == pytest.approx(2.0, abs=0.05)
+        assert wait_calls[1] is None
+        assert cancellation_calls == [
+            (
+                attempt["id"],
+                attempt["claim_token"],
+                execution["execution_id"],
+                "ambiguous",
+                "launch-driver stop intent could not be recorded after attempt lease loss",
             )
         ]
     else:
@@ -3273,15 +3374,26 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
             )
         ]
     assert len(monitor_clients) == 1 and cancelled_clients == monitor_clients
-    assert len(cleanup_calls) == (1 if failure_point == "timeout" else 0)
+    assert len(cleanup_calls) == (0 if failure_point == "post-launch-exception" else 1)
     assert spawn_calls == [target]
     assert not request_path.exists(), "redeemed request must be consumed before execution"
     durable = supervisor._sandbox_execution_get(attempt["id"])
-    expected_phase = "ambiguous" if failure_point == "timeout" else "launched"
+    expected_phase = {
+        "timeout": "ambiguous",
+        "post-launch-exception": "launched",
+        "lease-expired": "exited",
+        "lease-expired-after-stop": "cleanup_reported",
+    }[failure_point]
     assert durable is not None and durable["phase"] == expected_phase
     assert durable["cleanup_verification_json"] == "{}"
     if failure_point == "timeout":
         assert durable["failure_reason"] == "cleanup evidence unavailable"
+    elif failure_point in {"lease-expired", "lease-expired-after-stop"}:
+        assert durable["failure_reason"] == journal_module._LAUNCH_DRIVER_LEASE_LOSS_REASON
+    if failure_point == "lease-expired-after-stop":
+        assert durable["cleanup_receipt"]["version"] == 3
+        assert durable["cleanup_receipt"]["verification_status"] == "unverified"
+        assert durable["cleanup_verification_json"] == "{}"
     with pytest.raises(launch_driver_service.SandboxLaunchDriverServiceError):
         launch_driver_service._run_driver(
             repo=repo,
@@ -3297,15 +3409,101 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
         leases = connection.execute(
             "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?", (attempt["id"],)
         ).fetchall()
+        runtime_allocation = connection.execute(
+            "SELECT lease_expires_at FROM runtime_allocations WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        attempt_state = connection.execute(
+            "SELECT status, termination_target_status FROM attempts WHERE id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        task_state = connection.execute(
+            "SELECT status, cleanup_target_status FROM tasks WHERE id = ?",
+            (attempt["task_id"],),
+        ).fetchone()
     assert runtime is not None and runtime["state"] != "released"
-    if failure_point == "timeout":
+    if failure_point in {
+        "timeout",
+        "lease-expired",
+        "lease-expired-after-stop",
+    }:
         assert leases and all(
             lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH for lease in leases
         ), "ambiguous cleanup evidence must leave resource fences quarantined"
+        assert runtime_allocation is not None
+        assert runtime_allocation["lease_expires_at"] == CLEANUP_FENCE_EPOCH
     else:
         assert leases and all(lease["lease_expires_at"] > int(time.time()) for lease in leases), (
             "unattested launch must retain active resource leases"
         )
+    if failure_point == "lease-expired-after-stop":
+        assert attempt_state is not None
+        assert attempt_state["status"] == "terminating"
+        assert attempt_state["termination_target_status"] == "quarantined"
+        assert task_state is not None
+        assert task_state["status"] == "cleanup_pending"
+        assert task_state["cleanup_target_status"] == "blocked"
+
+
+def test_lease_loss_quarantine_rechecks_phase_after_release_lock_race(
+    monkeypatch: pytest.MonkeyPatch, repo: Path
+) -> None:
+    """An observed launched phase must not skip quarantine if running wins before lock."""
+
+    if os.geteuid() == 0:
+        pytest.skip("launch journal fixture requires an unprivileged caller")
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    record_launch(supervisor, attempt)
+    original_gate_lock = journal_module._runc_launch_gate_lock_for_execution
+    raced = False
+
+    @contextmanager
+    def publish_running_before_lock(*args: Any, **kwargs: Any):
+        nonlocal raced
+        if not raced:
+            raced = True
+            # The lease-loss caller already read `launched`. Model the driver
+            # committing `running` immediately before it acquires the same
+            # release lock; the journal must recheck and accept the new active
+            # phase instead of dropping exact monitor cancellation.
+            monkeypatch.setattr(
+                journal_module,
+                "_runc_launch_gate_lock_for_execution",
+                original_gate_lock,
+            )
+            record_running(supervisor, attempt)
+            with supervisor.connect() as connection:
+                connection.execute(
+                    "UPDATE attempts SET lease_expires_at = 0 WHERE id = ?",
+                    (attempt["id"],),
+                )
+        with original_gate_lock(*args, **kwargs) as handle:
+            yield handle
+
+    monkeypatch.setattr(
+        journal_module, "_runc_launch_gate_lock_for_execution", publish_running_before_lock
+    )
+    quarantined = supervisor._sandbox_execution_quarantine_lease_loss(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+
+    assert raced
+    assert quarantined["phase"] == "ambiguous"
+    assert quarantined["failure_reason"] == journal_module._LAUNCH_DRIVER_LEASE_LOSS_REASON
+    with supervisor.connect() as connection:
+        task = connection.execute(
+            "SELECT status, cleanup_target_status FROM tasks WHERE id = ?",
+            (attempt["task_id"],),
+        ).fetchone()
+        leases = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchall()
+    assert task["status"] == "cleanup_pending"
+    assert task["cleanup_target_status"] == "blocked"
+    assert leases and all(lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH for lease in leases)
 
 
 def test_launch_monitor_start_holds_process_shared_lifecycle_fence(repo: Path) -> None:
@@ -4638,7 +4836,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 33
+    assert SCHEMA_VERSION == 34
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1

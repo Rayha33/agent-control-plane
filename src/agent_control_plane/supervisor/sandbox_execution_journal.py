@@ -119,6 +119,9 @@ _INVOCATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _ATTEMPT_SLICE_COMPONENT = re.compile(r"user-acp-[0-9a-f]{64}\.slice\Z")
 _LEGACY_BUNDLE_DIGEST_SEMANTICS = "legacy-caller-asserted-v0"
 _BUNDLE_DIGEST_SEMANTICS = "oci-reservation-v1"
+_LAUNCH_DRIVER_LEASE_LOSS_REASON = (
+    "launch-driver stop intent could not be recorded after attempt lease loss"
+)
 _PHASES = frozenset(
     {
         "reserved",
@@ -2036,6 +2039,7 @@ class SandboxExecutionJournalMixin:
         running_attestation: RunningRuntimeAttestation | None = None,
         _cleanup_action_receipt: Any | None = None,
         _cleanup_verification_receipt: Any | None = None,
+        _allow_quarantined_failure_cleanup: bool = False,
     ) -> dict[str, Any]:
         allowed_fields = _TRANSITION_FIELDS.get((expected_phase, next_phase))
         if (
@@ -2054,6 +2058,15 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_cleanup_action_invalid",
                 "pinned-runc cleanup action can authorize only its exact report transition",
+            )
+        if _allow_quarantined_failure_cleanup and (
+            (expected_phase, next_phase) != ("exited", "cleanup_reported")
+            or _cleanup_action_receipt is None
+            or set(updates) != {"cleanup_receipt_json"}
+        ):
+            raise SupervisorError(
+                "sandbox_cleanup_action_invalid",
+                "quarantined cleanup requires an exact pinned-runc action receipt",
             )
         if _cleanup_verification_receipt is not None and (
             (expected_phase, next_phase) != ("cleanup_reported", "cleanup_verified")
@@ -2089,6 +2102,21 @@ class SandboxExecutionJournalMixin:
                     raise SupervisorError(
                         "stale_fencing_token", "cleanup verifier claim token is stale"
                     )
+            elif _allow_quarantined_failure_cleanup:
+                attempt = connection.execute(
+                    "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                if (
+                    attempt is None
+                    or attempt["claim_token"] != claim_token
+                    or attempt["status"] != "terminating"
+                    or attempt["termination_target_status"] != "quarantined"
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "quarantined cleanup action has no exact terminating attempt",
+                    )
+                self._authenticate_attempt(connection, attempt, credential)
             else:
                 attempt = self._active_attempt(
                     connection, attempt_id, claim_token, int(time.time())
@@ -2108,6 +2136,23 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_transition_invalid",
                     f"expected phase {expected_phase}, found {row['phase']}; fence retained",
                 )
+            if _allow_quarantined_failure_cleanup:
+                task = connection.execute(
+                    "SELECT current_attempt_id, status, cleanup_target_status "
+                    "FROM tasks WHERE id = ?",
+                    (attempt["task_id"],),
+                ).fetchone()
+                if (
+                    row["failure_reason"] != _LAUNCH_DRIVER_LEASE_LOSS_REASON
+                    or task is None
+                    or task["current_attempt_id"] != attempt_id
+                    or task["status"] != "cleanup_pending"
+                    or task["cleanup_target_status"] != "blocked"
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "quarantined cleanup action is not bound to the exact lease-loss cleanup",
+                    )
             if _cleanup_verification_receipt is not None:
                 from .sandbox_cleanup_verifier import (
                     _sandbox_cleanup_verification_json_is_self_consistent,
@@ -3581,6 +3626,31 @@ class SandboxExecutionJournalMixin:
                     "durable state-root identity changed while requesting stop; fence retained",
                 )
             if row["phase"] == "stopping":
+                # An existing stop intent is idempotent only while this exact
+                # attempt still owns a live lease. In particular, do not let a
+                # launch driver adopt a stale `stopping` row after expiry: the
+                # caller must route that lease loss through quarantine.
+                with self.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    attempt = self._active_attempt(
+                        connection, attempt_id, claim_token, int(time.time())
+                    )
+                    self._authenticate_attempt(connection, attempt, credential)
+                    durable_row = connection.execute(
+                        "SELECT * FROM sandbox_executions WHERE attempt_id = ?",
+                        (attempt_id,),
+                    ).fetchone()
+                    if (
+                        durable_row is None
+                        or durable_row["claim_token"] != claim_token
+                        or durable_row["execution_id"] != execution_id
+                        or durable_row["phase"] != "stopping"
+                    ):
+                        raise SupervisorError(
+                            "sandbox_execution_transition_conflict",
+                            "execution changed before adopting its stop intent",
+                        )
+                    row = durable_row
                 if row["stop_reason"] != reason:
                     raise SupervisorError(
                         "sandbox_execution_transition_conflict",
@@ -3672,6 +3742,7 @@ class SandboxExecutionJournalMixin:
         wait_receipt: _RuncClientWaitReceipt,
         *,
         credential: str | None = None,
+        _allow_quarantined_failure: bool = False,
     ) -> dict[str, Any]:
         if not _runc_client_wait_receipt_is_self_consistent(wait_receipt):
             raise SupervisorError(
@@ -3718,7 +3789,11 @@ class SandboxExecutionJournalMixin:
                     "execution changed before its exit receipt was committed; fence retained",
                 )
             updated = self._sandbox_execution_record_exit_under_gate_lock(
-                attempt_id, claim_token, wait_receipt, credential=credential
+                attempt_id,
+                claim_token,
+                wait_receipt,
+                credential=credential,
+                _allow_quarantined_failure=_allow_quarantined_failure,
             )
             if locked_handle is not None:
                 _revoke_runc_launch_gate_release_locked(
@@ -3739,6 +3814,7 @@ class SandboxExecutionJournalMixin:
         wait_receipt: _RuncClientWaitReceipt,
         *,
         credential: str | None = None,
+        _allow_quarantined_failure: bool = False,
     ) -> dict[str, Any]:
         """Persist exit evidence while its release gate cannot be opened."""
 
@@ -3763,7 +3839,7 @@ class SandboxExecutionJournalMixin:
                 )
             if row["claim_token"] != claim_token:
                 raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
-            if row["phase"] in {"launched", "running", "stopping"} and not (
+            if row["phase"] in {"launched", "running", "stopping", "ambiguous"} and not (
                 _sandbox_launch_plan_binding_is_self_consistent(row)
             ):
                 raise SupervisorError(
@@ -3792,15 +3868,50 @@ class SandboxExecutionJournalMixin:
                 raise SupervisorError(
                     "sandbox_execution_transition_conflict", "conflicting runc exit receipt"
                 )
-            if row["phase"] not in {"launched", "running", "stopping"}:
+            if row["phase"] not in {"launched", "running", "stopping"} and not (
+                _allow_quarantined_failure
+                and row["phase"] == "ambiguous"
+                and row["failure_reason"] == _LAUNCH_DRIVER_LEASE_LOSS_REASON
+            ):
                 raise SupervisorError(
                     "sandbox_execution_transition_invalid",
                     f"cannot record exit from phase {row['phase']}; fence retained",
                 )
-
-            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
-            if attempt["status"] != "working":
-                raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+            if _allow_quarantined_failure:
+                attempt = connection.execute(
+                    "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                task = (
+                    connection.execute(
+                        "SELECT current_attempt_id, status, cleanup_target_status "
+                        "FROM tasks WHERE id = ?",
+                        (attempt["task_id"],),
+                    ).fetchone()
+                    if attempt is not None
+                    else None
+                )
+                if (
+                    attempt is None
+                    or attempt["claim_token"] != claim_token
+                    or attempt["status"] != "terminating"
+                    or attempt["termination_target_status"] != "quarantined"
+                    or row["phase"] != "ambiguous"
+                    or row["failure_reason"] != _LAUNCH_DRIVER_LEASE_LOSS_REASON
+                    or task is None
+                    or task["current_attempt_id"] != attempt_id
+                    or task["status"] != "cleanup_pending"
+                    or task["cleanup_target_status"] != "blocked"
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "quarantined exit receipt is not authorized for this exact lease-loss execution",
+                    )
+            else:
+                attempt = self._active_attempt(
+                    connection, attempt_id, claim_token, int(time.time())
+                )
+                if attempt["status"] != "working":
+                    raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
             self._authenticate_attempt(connection, attempt, credential)
             with _authorize_sandbox_exit_receipt_write(connection, wait_receipt):
                 changed = connection.execute(
@@ -3827,6 +3938,7 @@ class SandboxExecutionJournalMixin:
                     "phase": "exited",
                     "runc_exit_code": exit_code,
                     "observed_by": "runc_client_kernel_waitpid",
+                    "recovered_after_lease_loss": _allow_quarantined_failure,
                 },
             )
             updated = connection.execute(
@@ -3842,6 +3954,7 @@ class SandboxExecutionJournalMixin:
         *,
         runc_delete_receipt: Any | None = None,
         credential: str | None = None,
+        _allow_quarantined_failure: bool = False,
     ) -> dict[str, Any]:
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
@@ -3904,6 +4017,7 @@ class SandboxExecutionJournalMixin:
             },
             credential=credential,
             _cleanup_action_receipt=runc_delete_receipt,
+            _allow_quarantined_failure_cleanup=_allow_quarantined_failure,
         )
 
     def _sandbox_execution_verify_cleanup(
@@ -4108,6 +4222,80 @@ class SandboxExecutionJournalMixin:
                 )
             return updated
 
+    def _sandbox_execution_quarantine_lease_loss(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        execution_id: str,
+        *,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Quarantine one exact execution under its release lock after lease loss.
+
+        The accepted phase set is checked by the journal transaction, not by a
+        phase snapshot taken before the lock. That lets a concurrent
+        ``launched -> running`` publication win cleanly without skipping the
+        fail-closed quarantine/cancellation path.
+        """
+
+        self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        execution_id = self._sandbox_text(execution_id, "execution_id")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if row is None or row["claim_token"] != claim_token or row["execution_id"] != execution_id:
+            raise SupervisorError(
+                "sandbox_execution_gate_identity_mismatch",
+                "lease-loss quarantine does not identify the exact execution; fence retained",
+            )
+        allowed_phases = frozenset({"launched", "running", "stopping", "ambiguous"})
+        state_identity = (row["state_path"], row["state_root_dev"], row["state_root_ino"])
+        with (
+            _runc_launch_gate_lock_for_execution(
+                attempt_id, claim_token, execution_id
+            ) as locked_handle,
+            _runc_execution_gate_fence(*_sandbox_execution_gate_identity(row)),
+        ):
+            with self.connect() as connection:
+                locked_row = connection.execute(
+                    "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+            if (
+                locked_row is None
+                or locked_row["claim_token"] != claim_token
+                or locked_row["execution_id"] != execution_id
+                or (
+                    locked_row["state_path"],
+                    locked_row["state_root_dev"],
+                    locked_row["state_root_ino"],
+                )
+                != state_identity
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_gate_identity_mismatch",
+                    "execution changed before lease-loss quarantine; fence retained",
+                )
+            if locked_row["phase"] not in allowed_phases:
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "lease-loss quarantine found no exact active execution to stop",
+                )
+            updated = self._sandbox_execution_mark_ambiguous_under_gate_lock(
+                attempt_id,
+                claim_token,
+                _LAUNCH_DRIVER_LEASE_LOSS_REASON,
+                credential=credential,
+                expected_phases=allowed_phases,
+                require_lease_loss=True,
+            )
+            if locked_handle is not None:
+                _revoke_runc_launch_gate_release_locked(
+                    locked_handle, attempt_id, claim_token, execution_id
+                )
+            return updated
+
     def _sandbox_execution_revoke_launch_driver_start(
         self,
         attempt_id: str,
@@ -4184,13 +4372,30 @@ class SandboxExecutionJournalMixin:
         *,
         credential: str | None = None,
         expected_phase: str | None = None,
+        expected_phases: frozenset[str] | None = None,
         expected_launch_driver_start: tuple[str, str, str] | None = None,
+        require_lease_loss: bool = False,
     ) -> dict[str, Any]:
         """Quarantine an unresolved execution and extend all attempt resource fences."""
 
         reason = self._sandbox_text(reason, "ambiguity_reason", limit=512)
         self._sandbox_validate_attempt_id(attempt_id)
         self._sandbox_claim_token(claim_token)
+        if (
+            expected_phase is not None
+            and expected_phases is not None
+            or expected_phases is not None
+            and (
+                type(expected_phases) is not frozenset
+                or not expected_phases
+                or not expected_phases <= _PHASES
+                or "cleanup_verified" in expected_phases
+            )
+        ):
+            raise SupervisorError(
+                "sandbox_execution_transition_invalid",
+                "ambiguity phase guard is malformed",
+            )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempt = connection.execute(
@@ -4207,6 +4412,34 @@ class SandboxExecutionJournalMixin:
                 raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
             if credential is not None:
                 self._authenticate_attempt(connection, attempt, credential)
+            if require_lease_loss:
+                now = int(time.time())
+                task = connection.execute(
+                    "SELECT current_attempt_id, status, cleanup_target_status "
+                    "FROM tasks WHERE id = ?",
+                    (attempt["task_id"],),
+                ).fetchone()
+                working_lease_expired = (
+                    attempt["status"] == "working"
+                    and attempt["lease_expires_at"] <= now
+                    and task is not None
+                    and task["current_attempt_id"] == attempt_id
+                    and task["status"] == "working"
+                )
+                reaper_quarantined_expired_attempt = (
+                    attempt["status"] == "terminating"
+                    and attempt["termination_target_status"] == "quarantined"
+                    and attempt["lease_expires_at"] <= now
+                    and task is not None
+                    and task["current_attempt_id"] == attempt_id
+                    and task["status"] == "cleanup_pending"
+                    and task["cleanup_target_status"] == "blocked"
+                )
+                if not (working_lease_expired or reaper_quarantined_expired_attempt):
+                    raise SupervisorError(
+                        "sandbox_execution_lease_loss_unconfirmed",
+                        "lease-loss quarantine requires the exact expired attempt and task",
+                    )
             if expected_phase is not None and row["phase"] not in {
                 expected_phase,
                 "ambiguous",
@@ -4214,6 +4447,13 @@ class SandboxExecutionJournalMixin:
                 raise SupervisorError(
                     "sandbox_execution_transition_conflict",
                     f"expected phase {expected_phase} or ambiguous, found {row['phase']}; fence retained",
+                )
+            if expected_phases is not None and row["phase"] not in (
+                expected_phases | {"ambiguous"}
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    f"expected one of {sorted(expected_phases)}, found {row['phase']}; fence retained",
                 )
             if expected_launch_driver_start is not None:
                 start_id, start_digest, service_unit = expected_launch_driver_start

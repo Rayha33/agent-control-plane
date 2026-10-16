@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -2355,6 +2355,114 @@ def _require_independent_sandbox_cleanup_verification(connection: sqlite3.Connec
     )
 
 
+def _allow_lease_loss_quarantined_exit(connection: sqlite3.Connection) -> None:
+    """Allow exact kernel-wait exit evidence to advance a quarantined lease-loss run.
+
+    The ambiguous-to-exited transition remains restricted to the launch-driver's
+    exact lease-loss quarantine reason and the existing process-local wait-receipt
+    authorization. Cleanup still requires its separate action and verifier receipts.
+    """
+
+    reason = "launch-driver stop intent could not be recorded after attempt lease loss"
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_phase_transition")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_phase_transition
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase != NEW.phase AND NOT (
+          (OLD.phase = 'reserved' AND NEW.phase IN ('launched', 'ambiguous'))
+          OR (OLD.phase = 'launched' AND NEW.phase IN ('running', 'stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'running' AND NEW.phase IN ('stopping', 'exited', 'ambiguous'))
+          OR (OLD.phase = 'stopping' AND NEW.phase IN ('exited', 'ambiguous'))
+          OR (OLD.phase = 'exited' AND NEW.phase IN ('cleanup_reported', 'ambiguous'))
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'ambiguous')
+          OR (OLD.phase = 'cleanup_reported' AND NEW.phase = 'cleanup_verified'
+            AND OLD.cleanup_verification_json = '{{}}'
+            AND NEW.cleanup_verification_json != '{{}}'
+            AND length(NEW.cleanup_verification_json) <= 65536
+            AND json_valid(NEW.cleanup_verification_json)
+            AND json_type(NEW.cleanup_verification_json, '$.version') = 'integer'
+            AND json_extract(NEW.cleanup_verification_json, '$.version') = 1
+            AND acp_sandbox_cleanup_verification_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.cleanup_verification_json
+            ) = 1)
+          OR (OLD.phase = 'ambiguous' AND NEW.phase = 'exited'
+            AND OLD.failure_reason = '{reason}')
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_phase_transition_invalid');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_requires_kernel_waitpid")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_exit_requires_kernel_waitpid
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN (
+          OLD.phase IN ('launched', 'running', 'stopping')
+          OR (OLD.phase = 'ambiguous' AND OLD.failure_reason = '{reason}')
+        )
+          AND NEW.phase = 'exited'
+          AND (
+            NEW.runc_exit_observed_by != 'runc_client_popen_wait'
+            OR NEW.runc_exit_evidence_source != 'runc_client_kernel_waitpid'
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_kernel_wait_evidence_required');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_evidence_write_guard")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_exit_evidence_write_guard
+        BEFORE UPDATE OF runc_exit_code, runc_exit_observed_by,
+          runc_exit_evidence_source ON sandbox_executions
+        WHEN (
+          OLD.runc_exit_code IS NOT NEW.runc_exit_code
+          OR OLD.runc_exit_observed_by IS NOT NEW.runc_exit_observed_by
+          OR OLD.runc_exit_evidence_source IS NOT NEW.runc_exit_evidence_source
+        ) AND NOT (
+          (
+            OLD.phase IN ('launched', 'running', 'stopping')
+            OR (OLD.phase = 'ambiguous' AND OLD.failure_reason = '{reason}')
+          )
+          AND NEW.phase = 'exited'
+          AND OLD.runc_exit_code IS NULL
+          AND OLD.runc_exit_observed_by = ''
+          AND OLD.runc_exit_evidence_source = ''
+          AND NEW.runc_exit_code IS NOT NULL
+          AND NEW.runc_exit_observed_by = 'runc_client_popen_wait'
+          AND NEW.runc_exit_evidence_source = 'runc_client_kernel_waitpid'
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_exit_evidence_write_requires_exit');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_execution_exit_receipt_guard")
+    connection.execute(
+        f"""
+        CREATE TRIGGER sandbox_execution_exit_receipt_guard
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN (
+          OLD.phase IN ('launched', 'running', 'stopping')
+          OR (OLD.phase = 'ambiguous' AND OLD.failure_reason = '{reason}')
+        )
+          AND NEW.phase = 'exited'
+          AND acp_sandbox_exit_receipt_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            OLD.runc_client_pid, OLD.runc_client_identity, NEW.runc_exit_code
+          ) != 1
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_wait_receipt_required');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -2388,6 +2496,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (31, _add_sandbox_launch_driver_start_redemption),
     (32, _require_pinned_runc_cleanup_action_receipt),
     (33, _require_independent_sandbox_cleanup_verification),
+    (34, _allow_lease_loss_quarantined_exit),
 )
 
 

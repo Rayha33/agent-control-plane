@@ -2,9 +2,12 @@
 
 The systemd service owns the pinned-runc handle, init gate, runtime attestation,
 wait receipt, and journal transitions. The authenticated recovery monitor is
-started by the journal outside the attempt slice. This module is deliberately
-not wired into ``WorkersMixin.run_worker``; callers must still meet the
-workspace, provider, and result-transfer acceptance gates before enabling OCI.
+started by the journal outside the attempt slice. The explicit
+``start_registered_no_model_sandbox_worker`` experiment composes a claimed
+attempt with this service but is not wired into ``WorkersMixin.run_worker``.
+This supervisor function makes no model/provider calls; callers must supply a
+local fake-worker command for the no-model experiment. Provider egress, full
+workspace/Git isolation, and default worker enablement remain separate gates.
 """
 
 from __future__ import annotations
@@ -13,9 +16,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -33,12 +38,13 @@ from .sandbox_attestation import (
     collect_running_runtime_attestation,
 )
 from .sandbox_execution_journal import (
+    _LAUNCH_DRIVER_LEASE_LOSS_REASON,
     _sandbox_execution_launch_stop_reason,
     _sandbox_launch_driver_service_unit,
     _sandbox_launch_driver_start_digest,
 )
 from .sandbox_monitor_receipt import sandbox_attempt_slice_unit, sandbox_monitor_service_unit
-from .sandbox_workspace import _restore_snapshot_from_record
+from .sandbox_workspace import _restore_snapshot_from_record, copy_snapshot
 
 _REQUEST_NAME = "launch-driver-request.json"
 _REQUEST_LIMIT = 16 * 1024
@@ -68,6 +74,140 @@ class SandboxLaunchDriverReceipt:
     control_group: str
 
 
+class _AttemptLeaseHeartbeat:
+    """Keep a prepared attempt and its resource leases alive during composition."""
+
+    def __init__(
+        self,
+        supervisor: GitSupervisor,
+        attempt_id: str,
+        claim_token: int,
+        credential: str | None,
+    ) -> None:
+        self.supervisor = supervisor
+        self.attempt_id = attempt_id
+        self.claim_token = claim_token
+        self.credential = credential
+        lease_seconds = int(supervisor.config.lease_seconds)
+        self.interval_seconds = max(1, min(10, lease_seconds // 3))
+        self._stop = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"acp-lease-{attempt_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.supervisor.heartbeat(
+            self.attempt_id,
+            self.claim_token,
+            None,
+            credential=self.credential,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.supervisor.heartbeat(
+                    self.attempt_id,
+                    self.claim_token,
+                    None,
+                    credential=self.credential,
+                )
+            except BaseException as error:
+                self._error = error
+                self._stop.set()
+                return
+
+    def check(self) -> None:
+        if self._error is not None:
+            raise SandboxLaunchDriverServiceError(
+                "registered attempt lease renewal failed; execution remains fenced"
+            ) from self._error
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=self.interval_seconds + 1)
+
+
+def _wait_for_runc_with_attempt_heartbeat(
+    supervisor: GitSupervisor,
+    handle: oci_worker.RuncLaunchHandle,
+    *,
+    attempt_id: str,
+    claim_token: int,
+    credential: str | None,
+    timeout_seconds: float,
+) -> Any:
+    """Renew the attempt lease while retaining exact process-local wait ownership."""
+
+    lease_seconds = int(supervisor.config.lease_seconds)
+    interval_seconds = max(1, min(10, lease_seconds // 3))
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("pinned-runc", timeout_seconds)
+        try:
+            return handle.wait(timeout=min(float(interval_seconds), remaining))
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("pinned-runc", timeout_seconds) from None
+            supervisor.heartbeat(
+                attempt_id,
+                claim_token,
+                None,
+                credential=credential,
+            )
+
+
+def _wait_for_driver_running_handoff(
+    supervisor: GitSupervisor,
+    expected_identity: tuple[str, int, str],
+    lease_heartbeat: _AttemptLeaseHeartbeat,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Keep producer lease ownership until the exact driver proves handoff."""
+
+    attempt_id = expected_identity[0]
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        lease_heartbeat.check()
+        current = supervisor._sandbox_execution_get(attempt_id)
+        if (
+            current is None
+            or (
+                current.get("attempt_id"),
+                current.get("claim_token"),
+                current.get("execution_id"),
+            )
+            != expected_identity
+        ):
+            raise SandboxLaunchDriverServiceError(
+                "registered sandbox execution identity changed during driver lease handoff"
+            )
+        if current["phase"] in {
+            "running",
+            "stopping",
+            "exited",
+            "cleanup_reported",
+            "cleanup_verified",
+        }:
+            return current
+        if current["phase"] not in {"reserved", "launched"}:
+            raise SandboxLaunchDriverServiceError(
+                "registered sandbox execution left the launch handoff in an unsafe phase"
+            )
+        time.sleep(0.05)
+    raise SandboxLaunchDriverServiceError(
+        "launch driver did not reach its durable running handoff before the startup deadline"
+    )
+
+
 def _execution_identity(value: Any) -> tuple[str, int, str]:
     if (
         not isinstance(value, tuple)
@@ -93,8 +233,10 @@ def _validate_request(
     pids_max: Any,
     timeout_seconds: Any,
 ) -> dict[str, Any]:
+    if type(command) is list:
+        command = tuple(command)
     if (
-        not isinstance(command, (list, tuple))
+        type(command) is not tuple
         or not command
         or len(command) > 128
         or any(
@@ -138,6 +280,39 @@ def _reject_runner_credential_in_command(request: dict[str, Any], credential: st
     ):
         raise SandboxLaunchDriverServiceError(
             "runner credential must not be included in the worker command"
+        )
+
+
+def _validate_runner_credential(credential: str | None) -> None:
+    if credential is not None and (
+        not isinstance(credential, str)
+        or not credential
+        or any(character in credential for character in "\x00\r\n")
+        or len(credential.encode("utf-8")) > _RUNNER_CREDENTIAL_LIMIT
+    ):
+        raise SandboxLaunchDriverServiceError("launch-driver runner credential is invalid")
+
+
+def _require_private_directory(path: Path, *, create: bool = False) -> None:
+    if create:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError(
+            f"private execution directory is unavailable: {path.name}"
+        ) from error
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise SandboxLaunchDriverServiceError(
+            f"private execution directory identity or mode is unsafe: {path.name}"
         )
 
 
@@ -794,6 +969,7 @@ def start_sandbox_launch_driver(
         timeout_seconds=timeout_seconds,
     )
     _reject_runner_credential_in_command(request, credential)
+    _validate_runner_credential(credential)
     execution = supervisor._sandbox_execution_get(identity[0])
     if (
         execution is None
@@ -857,13 +1033,6 @@ def start_sandbox_launch_driver(
             os.close(descriptor)
 
     if credential is not None:
-        if (
-            not isinstance(credential, str)
-            or not credential
-            or any(character in credential for character in "\x00\r\n")
-            or len(credential.encode("utf-8")) > _RUNNER_CREDENTIAL_LIMIT
-        ):
-            raise SandboxLaunchDriverServiceError("launch-driver runner credential is invalid")
         runtime_dir = Path(environment["XDG_RUNTIME_DIR"])
         try:
             runtime_info = runtime_dir.lstat()
@@ -1240,6 +1409,14 @@ def _request_timeout_stop_and_cancel_monitor(
             credential=credential,
         )
     except SupervisorError as error:
+        if error.code in {"claim_inactive", "lease_expired", "stale_fencing_token"}:
+            _request_driver_failure_stop_and_cancel_monitor(
+                supervisor,
+                expected_identity,
+                credential=credential,
+                monitor_client=monitor_client,
+            )
+            return
         if error.code != "sandbox_execution_transition_conflict":
             raise
         # A user cancellation may have won the stop-intent race. Adopt only
@@ -1276,9 +1453,33 @@ def _request_driver_failure_stop_and_cancel_monitor(
     credential: str | None,
     monitor_client: Any | None,
 ) -> None:
-    """Persist failure stop intent before authenticated monitor cancellation."""
+    """Persist stop intent and cancel, quarantining exactly if the lease expired."""
 
     attempt_id, claim_token, execution_id = expected_identity
+
+    def quarantine_then_cancel() -> None:
+        quarantined = supervisor._sandbox_execution_quarantine_lease_loss(
+            attempt_id,
+            claim_token,
+            execution_id,
+            credential=credential,
+        )
+        if (
+            quarantined.get("attempt_id"),
+            quarantined.get("claim_token"),
+            quarantined.get("execution_id"),
+            quarantined.get("phase"),
+        ) != (*expected_identity, "ambiguous"):
+            raise SupervisorError(
+                "sandbox_execution_transition_conflict",
+                "lease-loss quarantine changed the exact execution identity",
+            )
+        supervisor._cancel_sandbox_execution_monitor(
+            quarantined,
+            monitor_client=monitor_client,
+            _allow_ambiguous_failure=True,
+        )
+
     try:
         supervisor._sandbox_execution_request_stop(
             attempt_id,
@@ -1287,6 +1488,9 @@ def _request_driver_failure_stop_and_cancel_monitor(
             credential=credential,
         )
     except SupervisorError as error:
+        if error.code in {"claim_inactive", "lease_expired", "stale_fencing_token"}:
+            quarantine_then_cancel()
+            return
         if error.code != "sandbox_execution_transition_conflict":
             raise
         # A timeout or user cancellation may already own this exact execution.
@@ -1317,6 +1521,72 @@ def _request_driver_failure_stop_and_cancel_monitor(
             "launch-driver cancellation lacks an exact durable stop intent; fences remain held",
         )
     supervisor._cancel_sandbox_execution_monitor(stopping, monitor_client=monitor_client)
+
+
+def _record_driver_exit_with_lease_recovery(
+    supervisor: GitSupervisor,
+    expected_identity: tuple[str, int, str],
+    wait_receipt: Any,
+    *,
+    credential: str | None,
+) -> dict[str, Any]:
+    """Commit exact wait evidence, quarantining first if the lease expired."""
+
+    attempt_id, claim_token, execution_id = expected_identity
+    current = supervisor._sandbox_execution_get(attempt_id)
+    if (
+        current is None
+        or (current.get("attempt_id"), current.get("claim_token"), current.get("execution_id"))
+        != expected_identity
+    ):
+        raise SupervisorError(
+            "sandbox_execution_transition_conflict",
+            "runc wait receipt no longer identifies the exact execution",
+        )
+
+    def record(*, allow_quarantined_failure: bool) -> dict[str, Any]:
+        return supervisor._sandbox_execution_record_exit(
+            attempt_id,
+            claim_token,
+            wait_receipt,
+            credential=credential,
+            _allow_quarantined_failure=allow_quarantined_failure,
+        )
+
+    quarantined_lease_loss = (
+        current.get("phase") == "ambiguous"
+        and current.get("failure_reason") == _LAUNCH_DRIVER_LEASE_LOSS_REASON
+    )
+    try:
+        return record(allow_quarantined_failure=quarantined_lease_loss)
+    except SupervisorError as error:
+        if error.code not in {"claim_inactive", "lease_expired"}:
+            raise
+
+    quarantined = supervisor._sandbox_execution_quarantine_lease_loss(
+        attempt_id,
+        claim_token,
+        execution_id,
+        credential=credential,
+    )
+    if (
+        quarantined.get("attempt_id"),
+        quarantined.get("claim_token"),
+        quarantined.get("execution_id"),
+        quarantined.get("phase"),
+        quarantined.get("failure_reason"),
+    ) != (
+        attempt_id,
+        claim_token,
+        execution_id,
+        "ambiguous",
+        _LAUNCH_DRIVER_LEASE_LOSS_REASON,
+    ):
+        raise SupervisorError(
+            "sandbox_execution_transition_conflict",
+            "lease-expired exit did not produce the exact quarantine; fences remain held",
+        )
+    return record(allow_quarantined_failure=True)
 
 
 def _execute_pinned_request(
@@ -1477,6 +1747,10 @@ def _execute_pinned_request(
             expected_cpu_period=resources["cpu_period"],
             expected_pids_max=resources["pids_max"],
         )
+        # Publish `running` only after the launch driver itself has renewed the
+        # attempt lease. The producer can then stop its keeper on observing
+        # this durable phase without opening a lease-ownership gap.
+        supervisor.heartbeat(attempt_id, claim_token, None, credential=credential)
         running = supervisor._sandbox_execution_record_running(
             attempt_id,
             claim_token,
@@ -1487,8 +1761,16 @@ def _execute_pinned_request(
         if running["phase"] != "running":
             raise SandboxLaunchDriverServiceError("running transition was not durable")
         handle.release_gate()
+        supervisor.heartbeat(attempt_id, claim_token, None, credential=credential)
         try:
-            wait_receipt = handle.wait(timeout=float(request["timeout_seconds"]))
+            wait_receipt = _wait_for_runc_with_attempt_heartbeat(
+                supervisor,
+                handle,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                credential=credential,
+                timeout_seconds=float(request["timeout_seconds"]),
+            )
         except subprocess.TimeoutExpired:
             _request_timeout_stop_and_cancel_monitor(
                 supervisor,
@@ -1497,8 +1779,17 @@ def _execute_pinned_request(
                 monitor_client=handle._monitor_client,
             )
             wait_receipt = handle.wait()
-        supervisor._sandbox_execution_record_exit(
-            attempt_id, claim_token, wait_receipt, credential=credential
+        _record_driver_exit_with_lease_recovery(
+            supervisor,
+            expected_identity,
+            wait_receipt,
+            credential=credential,
+        )
+        exited = supervisor._sandbox_execution_get(attempt_id)
+        lease_loss_quarantine = (
+            exited is not None
+            and exited["phase"] == "exited"
+            and exited.get("failure_reason") == _LAUNCH_DRIVER_LEASE_LOSS_REASON
         )
         cleanup_action = oci_worker._delete_pinned_runc_container(
             runc_pin,
@@ -1516,6 +1807,7 @@ def _execute_pinned_request(
             claim_token,
             runc_delete_receipt=cleanup_action,
             credential=credential,
+            _allow_quarantined_failure=lease_loss_quarantine,
         )
     except BaseException:
         if handle is not None:
@@ -1525,7 +1817,13 @@ def _execute_pinned_request(
                 pass
             try:
                 current = supervisor._sandbox_execution_get(attempt_id)
-                if current is not None and current["phase"] in {"launched", "running", "stopping"}:
+                if current is not None and (
+                    current["phase"] in {"launched", "running", "stopping"}
+                    or (
+                        current["phase"] == "ambiguous"
+                        and current.get("failure_reason") == _LAUNCH_DRIVER_LEASE_LOSS_REASON
+                    )
+                ):
                     _request_driver_failure_stop_and_cancel_monitor(
                         supervisor,
                         (attempt_id, claim_token, execution_id),
@@ -1534,12 +1832,42 @@ def _execute_pinned_request(
                     )
                     wait_receipt = handle.wait(timeout=15.0)
                     after_cancel = supervisor._sandbox_execution_get(attempt_id)
-                    if after_cancel is not None and after_cancel["phase"] in {
-                        "running",
-                        "stopping",
-                    }:
-                        supervisor._sandbox_execution_record_exit(
-                            attempt_id, claim_token, wait_receipt, credential=credential
+                    if after_cancel is not None and (
+                        after_cancel["phase"] in {"running", "stopping"}
+                        or (
+                            after_cancel["phase"] == "ambiguous"
+                            and after_cancel.get("failure_reason")
+                            == _LAUNCH_DRIVER_LEASE_LOSS_REASON
+                        )
+                    ):
+                        _record_driver_exit_with_lease_recovery(
+                            supervisor,
+                            (attempt_id, claim_token, execution_id),
+                            wait_receipt,
+                            credential=credential,
+                        )
+                    exited = supervisor._sandbox_execution_get(attempt_id)
+                    if exited is not None and exited["phase"] == "exited":
+                        lease_loss_quarantine = (
+                            exited.get("failure_reason") == _LAUNCH_DRIVER_LEASE_LOSS_REASON
+                        )
+                        cleanup_action = oci_worker._delete_pinned_runc_container(
+                            runc_pin,
+                            expected_version=supervisor.config.oci_runc_version,
+                            state_root=state_root,
+                            expected_state_device=durable["state_root_dev"],
+                            expected_state_inode=durable["state_root_ino"],
+                            container_id=container_id,
+                            attempt_id=attempt_id,
+                            claim_token=claim_token,
+                            execution_id=execution_id,
+                        )
+                        supervisor._sandbox_execution_record_cleanup_report(
+                            attempt_id,
+                            claim_token,
+                            runc_delete_receipt=cleanup_action,
+                            credential=credential,
+                            _allow_quarantined_failure=lease_loss_quarantine,
                         )
                     # A launched-only row has no trusted init identity. The
                     # launcher's wait receipt cannot prove container-init
@@ -1549,6 +1877,240 @@ def _execute_pinned_request(
                 # monitor cancellation or runc wait evidence is unavailable.
                 pass
         raise
+
+
+def start_registered_no_model_sandbox_worker(
+    supervisor: GitSupervisor,
+    *,
+    attempt_id: str,
+    claim_token: int,
+    command: list[str] | tuple[str, ...],
+    memory_max_bytes: int,
+    cpu_quota: int,
+    cpu_period: int,
+    pids_max: int,
+    timeout_seconds: float = 600.0,
+    startup_timeout_seconds: float = 15.0,
+    credential: str | None = None,
+    experimental_opt_in: bool = False,
+) -> tuple[dict[str, Any], SandboxLaunchDriverReceipt]:
+    """Compose a registered attempt with the production OCI launch service.
+
+    This is an explicit no-model experiment, not the ``run_worker`` path. It
+    reserves the exact registered attempt, snapshots its worktree without Git
+    metadata, copies and re-verifies the configured rootfs pin, binds those
+    private paths in the journal, and hands off to the authenticated
+    launch-driver service. It does not call a model/provider or import results.
+
+    The default worker entrypoint remains fail-closed. Every argument that can
+    be rejected without side effects is validated before reservation. During
+    preparation this function renews the attempt lease; the launch driver
+    renews it while waiting on the worker. If preparation fails after
+    reservation, the execution and its fences are retained for reaper
+    quarantine; partial private trees are not automatically cleaned. This
+    function never falls back to a host process or attempts an unverified
+    rollback.
+    """
+
+    if experimental_opt_in is not True:
+        raise SandboxLaunchDriverServiceError(
+            "registered no-model sandbox execution requires explicit experimental opt-in"
+        )
+    if not sys.platform.startswith("linux") or os.geteuid() == 0:
+        raise SandboxLaunchDriverServiceError(
+            "registered sandbox execution requires an unprivileged supported Linux host"
+        )
+    attempt_id = supervisor._sandbox_validate_attempt_id(attempt_id)
+    supervisor._sandbox_claim_token(claim_token)
+    if (
+        type(startup_timeout_seconds) not in {int, float}
+        or not 0.2 <= startup_timeout_seconds <= 30
+    ):
+        raise SandboxLaunchDriverServiceError("launch-driver startup timeout is invalid")
+    _validate_runner_credential(credential)
+    preflight_request = _validate_request(
+        expected_identity=(attempt_id, claim_token, "preflight"),
+        command=command,
+        memory_max_bytes=memory_max_bytes,
+        cpu_quota=cpu_quota,
+        cpu_period=cpu_period,
+        pids_max=pids_max,
+        timeout_seconds=timeout_seconds,
+    )
+    _reject_runner_credential_in_command(preflight_request, credential)
+    validated_command = tuple(preflight_request["command"])
+
+    rootfs_pin = supervisor.config.oci_rootfs_pin
+    runc_pin = supervisor.config.oci_runc_executable
+    runtime_version = supervisor.config.oci_runc_version
+    if (
+        rootfs_pin is None
+        or runc_pin is None
+        or runtime_version != oci_worker._RUNC_RECURSIVE_PRIVATE_VERSION
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "registered sandbox execution requires pinned rootfs and runc 1.5.2"
+        )
+    try:
+        trusted_rootfs = oci_worker._verify_trusted_rootfs(rootfs_pin)
+        oci_worker._verify_trusted_runc_executable(runc_pin)
+        observed_version = oci_worker._probe_trusted_runc_version(runc_pin, runtime_version)
+        source_manifest = oci_worker.rootfs_tree_manifest(trusted_rootfs)
+    except (OSError, SupervisorError, subprocess.SubprocessError) as error:
+        raise SandboxLaunchDriverServiceError(
+            "registered sandbox runtime or rootfs pin could not be verified"
+        ) from error
+    if (
+        observed_version != runtime_version
+        or source_manifest["rootfs_sha256"] != rootfs_pin.sha256
+        or source_manifest["closure_sha256"] != rootfs_pin.closure_sha256
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "registered sandbox runtime or rootfs does not match its configured pin"
+        )
+
+    state_dir = Path(supervisor.state_dir)
+    try:
+        state_dir_info = state_dir.lstat()
+    except OSError as error:
+        raise SandboxLaunchDriverServiceError("supervisor state root is unavailable") from error
+    if (
+        not stat.S_ISDIR(state_dir_info.st_mode)
+        or stat.S_ISLNK(state_dir_info.st_mode)
+        or state_dir_info.st_uid != os.geteuid()
+        or stat.S_IMODE(state_dir_info.st_mode) != 0o700
+    ):
+        raise SandboxLaunchDriverServiceError("supervisor state root is not private")
+    state_dir = state_dir.resolve(strict=True)
+    sandbox_root = state_dir / "sandbox-executions"
+    if os.path.lexists(sandbox_root):
+        _require_private_directory(sandbox_root)
+
+    execution = supervisor._sandbox_execution_reserve(
+        attempt_id,
+        claim_token,
+        rootfs_digest=rootfs_pin.sha256,
+        rootfs_closure_digest=rootfs_pin.closure_sha256,
+        runc_executable_digest=runc_pin.sha256,
+        runtime_version=runtime_version,
+        oci_version="1.2.1",
+        credential=credential,
+    )
+    execution_id = execution["execution_id"]
+    identity = (attempt_id, claim_token, execution_id)
+    lease_heartbeat = _AttemptLeaseHeartbeat(
+        supervisor,
+        attempt_id,
+        claim_token,
+        credential,
+    )
+    try:
+        lease_heartbeat.start()
+        _require_private_directory(sandbox_root, create=True)
+        execution_root = Path(execution["bundle_path"]).parent
+        if execution_root != sandbox_root / f"{attempt_id}-{claim_token}":
+            raise SandboxLaunchDriverServiceError("reserved execution path is not host-derived")
+        bundle_root = Path(execution["bundle_path"])
+        state_root = Path(execution["state_path"])
+        _require_private_directory(execution_root, create=True)
+        _require_private_directory(bundle_root, create=True)
+        _require_private_directory(state_root, create=True)
+
+        rootfs_target = bundle_root / "rootfs"
+        try:
+            shutil.copytree(trusted_rootfs, rootfs_target, symlinks=True)
+            oci_worker._verify_trusted_rootfs(rootfs_pin)
+            copied_manifest = oci_worker.rootfs_tree_manifest(rootfs_target)
+        except (OSError, SupervisorError) as error:
+            raise SandboxLaunchDriverServiceError(
+                "private bundle rootfs could not be copied and re-verified"
+            ) from error
+        if (
+            copied_manifest["rootfs_sha256"] != rootfs_pin.sha256
+            or copied_manifest["closure_sha256"] != rootfs_pin.closure_sha256
+        ):
+            raise SandboxLaunchDriverServiceError(
+                "private bundle rootfs does not match the configured rootfs pin"
+            )
+        lease_heartbeat.check()
+
+        with supervisor.connect() as connection:
+            registered_attempt = supervisor._active_attempt(
+                connection, attempt_id, claim_token, int(time.time())
+            )
+            supervisor._authenticate_attempt(connection, registered_attempt, credential)
+            if (
+                registered_attempt["pid"] is not None
+                or registered_attempt["launch_owner_pid"] is not None
+            ):
+                raise SandboxLaunchDriverServiceError(
+                    "registered attempt already has a direct-worker launch owner"
+                )
+            worktree = Path(registered_attempt["worktree"])
+        worktree_root = (state_dir / "worktrees").resolve(strict=True)
+        worktree = worktree.resolve(strict=True)
+        if worktree == worktree_root or not worktree.is_relative_to(worktree_root):
+            raise SandboxLaunchDriverServiceError(
+                "registered attempt worktree is outside the supervisor worktree root"
+            )
+        baseline = copy_snapshot(worktree, execution_root / "baseline")
+        workspace = copy_snapshot(baseline.root, execution_root / "workspace")
+        if os.path.lexists(workspace.root / ".git"):
+            raise SandboxLaunchDriverServiceError(
+                "private registered worker workspace contains Git metadata"
+            )
+        supervisor._sandbox_execution_bind_workspace(
+            attempt_id,
+            claim_token,
+            baseline,
+            workspace,
+            credential=credential,
+        )
+        lease_heartbeat.check()
+        launch_receipt = start_sandbox_launch_driver(
+            supervisor,
+            expected_identity=identity,
+            command=validated_command,
+            memory_max_bytes=memory_max_bytes,
+            cpu_quota=cpu_quota,
+            cpu_period=cpu_period,
+            pids_max=pids_max,
+            timeout_seconds=timeout_seconds,
+            startup_timeout_seconds=startup_timeout_seconds,
+            credential=credential,
+        )
+        try:
+            _wait_for_driver_running_handoff(
+                supervisor,
+                identity,
+                lease_heartbeat,
+                timeout_seconds=float(startup_timeout_seconds),
+            )
+        except BaseException as handoff_error:
+            try:
+                _request_driver_failure_stop_and_cancel_monitor(
+                    supervisor,
+                    identity,
+                    credential=credential,
+                    monitor_client=None,
+                )
+            except BaseException as cancel_error:
+                handoff_error.add_note(
+                    "exact startup cancellation was not confirmed; execution and resource fences remain held"
+                )
+                handoff_error.add_note(f"startup cancellation error: {type(cancel_error).__name__}")
+            raise
+    finally:
+        lease_heartbeat.stop()
+    current = supervisor._sandbox_execution_get(attempt_id)
+    if (
+        current is None
+        or (current["attempt_id"], current["claim_token"], current["execution_id"]) != identity
+    ):
+        raise SandboxLaunchDriverServiceError(
+            "registered sandbox execution identity changed after launch handoff"
+        )
+    return current, launch_receipt
 
 
 def main(argv: list[str] | None = None) -> int:

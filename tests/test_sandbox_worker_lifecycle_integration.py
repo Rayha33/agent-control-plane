@@ -157,7 +157,8 @@ def _terminate_worker_from_fresh_process(
 
 def _start_launch_driver_then_crash_controller(
     repo: Path,
-    expected_identity: tuple[str, int, str],
+    attempt_id: str,
+    claim_token: int,
     command: tuple[str, ...],
     memory_max_bytes: int,
     cpu_quota: int,
@@ -302,16 +303,20 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
             "_run_trusted_runtime_command",
             capture_driver_service_output,
         ):
-            receipt = sandbox_launch_driver_service.start_sandbox_launch_driver(
-                GitSupervisor(repo),
-                expected_identity=expected_identity,
-                command=command,
-                memory_max_bytes=memory_max_bytes,
-                cpu_quota=cpu_quota,
-                cpu_period=cpu_period,
-                pids_max=pids_max,
-                timeout_seconds=timeout_seconds,
-                credential=credential,
+            _execution, receipt = (
+                sandbox_launch_driver_service.start_registered_no_model_sandbox_worker(
+                    GitSupervisor(repo),
+                    attempt_id=attempt_id,
+                    claim_token=claim_token,
+                    command=command,
+                    memory_max_bytes=memory_max_bytes,
+                    cpu_quota=cpu_quota,
+                    cpu_period=cpu_period,
+                    pids_max=pids_max,
+                    timeout_seconds=timeout_seconds,
+                    credential=credential,
+                    experimental_opt_in=True,
+                )
             )
         result_sender.send(
             (
@@ -331,7 +336,8 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
         )
     except BaseException as error:
         exit_code = 1
-        result_sender.send(("error", type(error).__name__))
+        detail = str(error).replace(credential, "[redacted]")[:800]
+        result_sender.send(("error", type(error).__name__, detail))
     finally:
         result_sender.close()
     # Abruptly lose the producer after the one-shot handoff. The independent
@@ -1607,10 +1613,29 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition(
     not _LIVE_ENABLED,
     reason="set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 on a disposable supported Linux host",
 )
-def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
+def test_live_production_launch_driver_runs_exact_pinned_runc_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Use the production launcher and reaper for completion, cancel, or timeout."""
 
     source_root = Path(__file__).resolve().parents[1]
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as launch_service
+
+    if Path(launch_service.__file__).resolve().parents[2] != (source_root / "src").resolve():
+        pytest.fail("live producer did not import the package from this exact source checkout")
+
+    original_systemd_environment = launch_service._trusted_systemd_command_environment
+
+    def source_pinned_systemd_environment() -> dict[str, str]:
+        environment = original_systemd_environment()
+        environment["PYTHONPATH"] = str(source_root / "src")
+        return environment
+
+    monkeypatch.setattr(
+        launch_service,
+        "_trusted_systemd_command_environment",
+        source_pinned_systemd_environment,
+    )
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
         pytest.fail("live launch-driver proof requires an unprivileged Linux user")
     if not source_root.is_relative_to(Path("/tmp")):
@@ -1662,6 +1687,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         repo_root = run_root / "repo"
         repo_root.mkdir(mode=0o700)
         repo = init_repo(repo_root)
+        if os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1":
+            config_path = repo / "acp.toml"
+            config_text = config_path.read_text(encoding="utf-8")
+            if "lease_seconds = 60" not in config_text:
+                pytest.fail("live fixture did not start with the expected test lease")
+            config_path.write_text(
+                config_text.replace("lease_seconds = 60", "lease_seconds = 10", 1),
+                encoding="utf-8",
+            )
         _ensure_private_fixture_directory(repo / ".acp")
         _ensure_private_fixture_directory(repo / ".acp" / "sandbox-executions")
         rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
@@ -1695,6 +1729,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             "sandbox-launch-driver-test",
             credential=runner["credential"],
         )
+        initial_lease_expires_at = attempt["lease_expires_at"]
         rootfs_pin = supervisor.config.oci_rootfs_pin
         runc_pin = supervisor.config.oci_runc_executable
         if (
@@ -1703,43 +1738,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             or supervisor.config.oci_runc_version != _SUPPORTED_RUNC_VERSION
         ):
             pytest.fail("test config did not pin the exact rootfs and runc identities")
-        execution = supervisor._sandbox_execution_reserve(
-            attempt["id"],
-            attempt["claim_token"],
-            rootfs_digest=rootfs_pin.sha256,
-            rootfs_closure_digest=rootfs_pin.closure_sha256,
-            runc_executable_digest=runc_pin.sha256,
-            runtime_version=supervisor.config.oci_runc_version,
-            oci_version="1.2.1",
-            credential=runner["credential"],
-        )
-        execution_root = Path(execution["bundle_path"]).parent
-        execution_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        bundle_root = Path(execution["bundle_path"])
-        state_root = Path(execution["state_path"])
-        bundle_root.mkdir(mode=0o700)
-        state_root.mkdir(mode=0o700)
-        shutil.copytree(rootfs_source, bundle_root / "rootfs", symlinks=True)
         source_worktree = Path(attempt["worktree"])
-        baseline = copy_snapshot(source_worktree, execution_root / "baseline")
-        workspace = copy_snapshot(baseline.root, execution_root / "workspace")
-        assert not _entry_is_present(workspace.root / ".git")
-        supervisor._sandbox_execution_bind_workspace(
-            attempt["id"],
-            attempt["claim_token"],
-            baseline,
-            workspace,
-            credential=runner["credential"],
-        )
-
-        identity = (attempt["id"], attempt["claim_token"], execution["execution_id"])
-        service_unit = f"acp-launch-driver-{execution['execution_id']}.service"
-        monitor_unit = sandbox_monitor_service_unit(*identity)
-        slice_unit = sandbox_attempt_slice_unit(*identity)
-        _assert_units_available_for_test(service_unit, monitor_unit, slice_unit)
-        service_start_attempted = True
-        slice_start_attempted = True
-        monitor_start_attempted = True
+        execution: dict[str, Any] | None = None
+        identity: tuple[str, int, str] | None = None
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         timeout_after_start = os.environ.get("ACP_LIVE_TIMEOUT_AFTER_START") == "1"
@@ -1796,7 +1797,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             target=_start_launch_driver_then_crash_controller,
             args=(
                 repo,
-                identity,
+                attempt["id"],
+                attempt["claim_token"],
                 payload_command,
                 _CONTAINER_MEMORY_BYTES,
                 _CONTAINER_CPU_QUOTA_US,
@@ -1816,8 +1818,36 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         producer_controller.start()
         child_processes.append(producer_controller)
         producer_result_sender.close()
+        execution_deadline = time.monotonic() + 15
+        while time.monotonic() < execution_deadline:
+            execution = supervisor._sandbox_execution_get(attempt["id"])
+            if execution is not None:
+                break
+            time.sleep(0.05)
+        if execution is None:
+            producer_detail = (
+                producer_result_receiver.recv()
+                if producer_result_receiver.poll()
+                else "producer returned no diagnostic"
+            )
+            pytest.fail(
+                "registered no-model path did not reserve the attempt; "
+                f"producer result={producer_detail!r}; exit={producer_controller.exitcode}"
+            )
+        state_root = Path(execution["state_path"])
+        identity = (attempt["id"], attempt["claim_token"], execution["execution_id"])
+        service_unit = f"acp-launch-driver-{execution['execution_id']}.service"
+        monitor_unit = sandbox_monitor_service_unit(*identity)
+        slice_unit = sandbox_attempt_slice_unit(*identity)
+        # The composition may already have reached systemd while this process
+        # observed the reservation. Conservatively inspect all tuple-derived
+        # units during teardown, including activation-uncertain failures.
+        service_start_attempted = True
+        slice_start_attempted = True
+        monitor_start_attempted = True
         assert producer_result_receiver.poll(35), "launch producer did not report its handoff"
         producer_result = producer_result_receiver.recv()
+        assert identity is not None and execution is not None
         producer_controller.join(timeout=5)
         assert not producer_controller.is_alive(), (
             "launch producer survived simulated controller loss"
@@ -2344,6 +2374,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 time.sleep(0.05)
             assert _entry_is_present(started_marker), "bounded payload never entered its command"
 
+            # Cross the deliberately short ten-second claim lease while the
+            # payload remains active; both fresh cancellation and normal exit
+            # depend on the execution owner renewing the exact attempt.
+            time.sleep(12)
+            renewed_attempt = supervisor.attempt(attempt["id"])
+            assert renewed_attempt["status"] == "working"
+            assert renewed_attempt["lease_expires_at"] > initial_lease_expires_at
+            assert renewed_attempt["lease_expires_at"] > int(time.time())
+
             wrong_credential_supervisor = GitSupervisor(repo)
             with patch.object(
                 sandbox_monitor_lifecycle,
@@ -2398,6 +2437,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         else:
             assert type(durable["runc_exit_code"]) is int
             assert durable["runc_exit_code"] != 0
+        attempt_after_execution = supervisor.attempt(attempt["id"])
         assert durable["launch_driver_pid"] == driver_pid
         assert (
             durable["launch_driver_invocation_id"]
@@ -2586,12 +2626,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             for lease in lease_before.values():
                 assert lease["task_id"] == task["id"]
                 assert lease["attempt_id"] == attempt["id"]
-                assert lease["lease_expires_at"] == attempt["lease_expires_at"]
+                assert lease["lease_expires_at"] == attempt_after_execution["lease_expires_at"]
         else:
             for lease in lease_before.values():
                 assert lease["task_id"] == task["id"]
                 assert lease["attempt_id"] is None
-                assert lease["lease_expires_at"] > attempt["lease_expires_at"]
+                assert lease["lease_expires_at"] > attempt_after_execution["lease_expires_at"]
         assert len(allocations_before) == 1
         assert runtime_before is not None and runtime_before["state"] != "released"
         assert [
@@ -2606,7 +2646,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         )
         fresh_reaper = context.Process(
             target=_reap_expired_from_fresh_process,
-            args=(repo, attempt["lease_expires_at"] + 1, reap_sender, import_probe),
+            args=(repo, attempt_after_execution["lease_expires_at"] + 1, reap_sender, import_probe),
         )
         fresh_reaper.start()
         child_processes.append(fresh_reaper)

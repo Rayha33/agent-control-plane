@@ -63,7 +63,11 @@ class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
 
     def _cancel_sandbox_execution_monitor(
-        self, execution: dict[str, Any], *, monitor_client: Any | None = None
+        self,
+        execution: dict[str, Any],
+        *,
+        monitor_client: Any | None = None,
+        _allow_ambiguous_failure: bool = False,
     ) -> dict[str, Any]:
         """Cancel a journaled execution only through its authenticated monitor."""
 
@@ -101,11 +105,17 @@ class WorkersMixin:
             durable_stop_reason = (
                 (durable["stop_reason"] or launch_stop_reason) if durable is not None else None
             )
+            ambiguous_failure = (
+                _allow_ambiguous_failure
+                and durable is not None
+                and durable.get("phase") == "ambiguous"
+                and bool(durable.get("failure_reason"))
+            )
             if (
                 durable is None
                 or durable["claim_token"] != identity[1]
                 or durable["execution_id"] != identity[2]
-                or not durable_stop_reason
+                or (not durable_stop_reason and not ambiguous_failure)
             ):
                 raise SupervisorError(
                     "sandbox_execution_transition_conflict",
@@ -114,7 +124,9 @@ class WorkersMixin:
             return {
                 "attempt_id": execution["attempt_id"],
                 "execution_id": execution["execution_id"],
-                "outcome": "stop_pending" if durable["phase"] == "launched" else "ok",
+                "outcome": "stop_pending"
+                if durable["phase"] in {"launched", "ambiguous"}
+                else "ok",
                 "phase": durable["phase"],
                 "stop_requested": True,
                 "monitor_phase": monitor_phase,

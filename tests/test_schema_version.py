@@ -319,7 +319,7 @@ def test_v29_launch_driver_identity_migration_is_idempotent_and_authorization_ga
 
 
 def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
-    assert SCHEMA_VERSION == 33
+    assert SCHEMA_VERSION == 34
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -375,7 +375,7 @@ def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
 
 
 def test_v31_launch_driver_redemption_migration_is_idempotent_and_fences_submission() -> None:
-    assert SCHEMA_VERSION == 33
+    assert SCHEMA_VERSION == 34
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -458,7 +458,7 @@ def test_v31_launch_driver_redemption_migration_is_idempotent_and_fences_submiss
 def test_v32_cleanup_report_migration_requires_scoped_provenance(
     encoded_receipt: str,
 ) -> None:
-    assert SCHEMA_VERSION == 33
+    assert SCHEMA_VERSION == 34
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
