@@ -1221,8 +1221,14 @@ def _request_timeout_stop_and_cancel_monitor(
     expected_identity: tuple[str, int, str],
     *,
     credential: str | None,
+    monitor_client: Any | None = None,
 ) -> None:
-    """Persist timeout intent before asking the exact monitor to stop the scope."""
+    """Persist timeout intent before asking the exact monitor to stop the scope.
+
+    The launch-driver created the recovery monitor and retains its authenticated
+    startup client on the process-local launch handle. It must use that client;
+    reconnect intentionally rejects the original controller process.
+    """
 
     attempt_id, claim_token, execution_id = expected_identity
     try:
@@ -1259,7 +1265,7 @@ def _request_timeout_stop_and_cancel_monitor(
             "sandbox_execution_transition_conflict",
             "timeout stop intent returned a different execution identity; fences remain held",
         )
-    supervisor._cancel_sandbox_execution_monitor(stopping)
+    supervisor._cancel_sandbox_execution_monitor(stopping, monitor_client=monitor_client)
 
 
 def _execute_pinned_request(
@@ -1437,6 +1443,7 @@ def _execute_pinned_request(
                 supervisor,
                 expected_identity,
                 credential=credential,
+                monitor_client=handle._monitor_client,
             )
             wait_receipt = handle.wait()
         supervisor._sandbox_execution_record_exit(
@@ -1468,7 +1475,9 @@ def _execute_pinned_request(
             try:
                 current = supervisor._sandbox_execution_get(attempt_id)
                 if current is not None and current["phase"] in {"launched", "running", "stopping"}:
-                    supervisor._cancel_sandbox_execution_monitor(current)
+                    supervisor._cancel_sandbox_execution_monitor(
+                        current, monitor_client=handle._monitor_client
+                    )
                     wait_receipt = handle.wait(timeout=15.0)
                     supervisor._sandbox_execution_record_exit(
                         attempt_id, claim_token, wait_receipt, credential=credential

@@ -3012,6 +3012,8 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
 
     monkeypatch.setattr(launch_driver_service, "_unit_properties", unit_properties)
 
+    monitor_clients: list[monitor_ipc_module.SandboxMonitorControlClient] = []
+
     def fake_start_monitor(**_kwargs: Any) -> Any:
         wrapper_unit = journal_module._sandbox_monitor_service_unit(*identity)
         receipt = SandboxMonitorReceipt(
@@ -3029,18 +3031,19 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
             attempt_slice_unit=attempt_slice,
             attempt_slice_control_group=slice_cgroup,
         )
-        return SimpleNamespace(
-            _receipt=receipt,
-            status=lambda: SimpleNamespace(
-                outcome="ok",
-                payload={
-                    "phase": "running",
-                    "scope_unit": scope_unit,
-                    "scope_invocation_id": "2" * 32,
-                    "scope_control_group": scope_cgroup,
-                },
-            ),
+        client = object.__new__(monitor_ipc_module.SandboxMonitorControlClient)
+        client._receipt = receipt
+        client.status = lambda: SimpleNamespace(
+            outcome="ok",
+            payload={
+                "phase": "running",
+                "scope_unit": scope_unit,
+                "scope_invocation_id": "2" * 32,
+                "scope_control_group": scope_cgroup,
+            },
         )
+        monitor_clients.append(client)
+        return client
 
     monkeypatch.setattr(
         "agent_control_plane.supervisor.sandbox_monitor_service.start_sandbox_execution_monitor",
@@ -3092,6 +3095,7 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
 
     cleanup_calls: list[tuple[Any, ...]] = []
     cancellation_calls: list[tuple[str, int, str, str]] = []
+    cancelled_clients: list[Any] = []
     request_stop = supervisor._sandbox_execution_request_stop
 
     def user_cancel_wins(
@@ -3108,7 +3112,9 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
             "sandbox_execution_transition_conflict", "user cancellation won the stop race"
         )
 
-    def cancel_exact_monitor(stopping: dict[str, Any]) -> None:
+    def cancel_exact_monitor(
+        stopping: dict[str, Any], *, monitor_client: Any | None = None
+    ) -> None:
         cancellation_calls.append(
             (
                 stopping["attempt_id"],
@@ -3117,6 +3123,7 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
                 stopping["stop_reason"],
             )
         )
+        cancelled_clients.append(monitor_client)
         assert stopping["phase"] == "stopping"
 
     monkeypatch.setattr(supervisor, "_sandbox_execution_request_stop", user_cancel_wins)
@@ -3209,6 +3216,7 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
     assert cancellation_calls == [
         (attempt["id"], attempt["claim_token"], execution["execution_id"], "attempt cancellation")
     ]
+    assert len(monitor_clients) == 1 and cancelled_clients == monitor_clients
     assert len(cleanup_calls) == 1
     assert spawn_calls == [target]
     assert not request_path.exists(), "redeemed request must be consumed before execution"

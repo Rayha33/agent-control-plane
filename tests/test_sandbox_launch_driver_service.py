@@ -105,6 +105,7 @@ def test_request_is_canonical_private_and_bound_to_the_execution(tmp_path: Path)
 def test_timeout_records_exact_stop_intent_before_monitor_cancel() -> None:
     events: list[tuple[object, ...]] = []
     credential = "runner-secret"
+    monitor_client = object()
     stopping = {
         "attempt_id": _IDENTITY[0],
         "claim_token": _IDENTITY[1],
@@ -120,23 +121,27 @@ def test_timeout_records_exact_stop_intent_before_monitor_cancel() -> None:
             events.append(("request_stop", attempt_id, claim_token, reason, credential))
             return stopping
 
-        def _cancel_sandbox_execution_monitor(self, execution: dict[str, object]) -> None:
-            events.append(("cancel_monitor", execution))
+        def _cancel_sandbox_execution_monitor(
+            self, execution: dict[str, object], *, monitor_client: object | None = None
+        ) -> None:
+            events.append(("cancel_monitor", execution, monitor_client))
 
     _request_timeout_stop_and_cancel_monitor(
         SupervisorStub(),
         _IDENTITY,
         credential=credential,  # type: ignore[arg-type]
+        monitor_client=monitor_client,
     )
 
     assert events == [
         ("request_stop", *_IDENTITY[:2], "execution_timeout", credential),
-        ("cancel_monitor", stopping),
+        ("cancel_monitor", stopping, monitor_client),
     ]
 
 
 def test_timeout_adopts_existing_exact_stop_reason_after_cancel_race() -> None:
     events: list[tuple[object, ...]] = []
+    monitor_client = object()
     stopping = {
         "attempt_id": _IDENTITY[0],
         "claim_token": _IDENTITY[1],
@@ -157,16 +162,19 @@ def test_timeout_adopts_existing_exact_stop_reason_after_cancel_race() -> None:
             assert attempt_id == _IDENTITY[0]
             return stopping
 
-        def _cancel_sandbox_execution_monitor(self, execution: dict[str, object]) -> None:
-            events.append(("cancel_monitor", execution))
+        def _cancel_sandbox_execution_monitor(
+            self, execution: dict[str, object], *, monitor_client: object | None = None
+        ) -> None:
+            events.append(("cancel_monitor", execution, monitor_client))
 
     _request_timeout_stop_and_cancel_monitor(
         SupervisorStub(),
         _IDENTITY,
         credential="runner-secret",  # type: ignore[arg-type]
+        monitor_client=monitor_client,
     )
 
-    assert events == [("cancel_monitor", stopping)]
+    assert events == [("cancel_monitor", stopping, monitor_client)]
 
 
 def test_timeout_conflict_cannot_cancel_a_different_execution() -> None:
@@ -191,7 +199,9 @@ def test_timeout_conflict_cannot_cancel_a_different_execution() -> None:
             assert attempt_id == _IDENTITY[0]
             return unrelated
 
-        def _cancel_sandbox_execution_monitor(self, execution: dict[str, object]) -> None:
+        def _cancel_sandbox_execution_monitor(
+            self, execution: dict[str, object], *, monitor_client: object | None = None
+        ) -> None:
             events.append(execution)
 
     with pytest.raises(SupervisorError, match="another stop reason already won"):

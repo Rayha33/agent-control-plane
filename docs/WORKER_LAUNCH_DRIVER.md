@@ -392,9 +392,32 @@ crash mode in this subsection proves one handoff crash window and fail-closed
 containment only; it does not prove successful runc wait/delete,
 `cleanup_verified`, fence release, every crash window, restart of the pytest
 harness or supervisor daemon, systemd user-manager restart/logout/reboot,
-result import, provider access, or `run_worker()` enablement. The newly added
-launch-driver timeout mode has not yet been run live; it remains pending exact
-host/guest hash and postflight evidence.
+result import, provider access, or `run_worker()` enablement. The launch-driver
+timeout mode is now live-tested; its exact run and scope are recorded below.
+
+### Live launch-driver timeout and cleanup (2026-10-16; pass)
+
+The opt-in `ACP_LIVE_TIMEOUT_AFTER_START=1` mode passed 1/1 on the disposable
+Debian 12 ARM64 / Linux 6.1 / systemd 252.39 guest with cgroup v2, Python
+3.11.2, pytest 9.1.1, and rootless runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+live run used `src/agent_control_plane/supervisor/sandbox_launch_driver_service.py`
+SHA-256 `7f4de61acb83653269683a1ae14593e849f65d78e11a36411560244f0113a243` and
+`tests/test_sandbox_worker_lifecycle_integration.py` SHA-256
+`a4e81f27e692bf238c11af8dcacb476718066d66a7da2c19982aaaf45c29125f`; the
+host and guest copies matched. The one-second timeout persisted the exact
+`execution_timeout` stop intent, cancelled through the launch handle's cached
+authenticated monitor client, reaped runc, and reached `cleanup_verified`
+after independent process/unit/cgroup absence checks and resource/runtime
+fence release. The timed-out result remained ineligible for import.
+
+Postflight found no live fixture root, active ACP unit, runc/driver/pytest
+process, or D-state process. The same two pre-existing failed transient units
+(`acp-launch-driver-32fa5c47-cd84-4bfd-a7c8-5fca996e76bb.service` and
+`acp-launch-driver-691a278d-fcb8-4127-9729-6be157313772.service`) remained
+untouched. This proves the opt-in timeout cleanup path on this guest, not
+provider access, result import, successful worker output, broad crash recovery,
+or `run_worker()` enablement.
 
 ### Spawned journal crash during monitor handoff (2026-10-16; synthetic systemd)
 
