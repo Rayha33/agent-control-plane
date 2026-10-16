@@ -25,6 +25,10 @@ loss after handoff—not a full supervisor-daemon restart. A separate
 manager-acceptance crash mode now proves the specific interruption after
 successful `systemd-run` return and before receipt propagation; broader crash
 windows and daemon restart remain unproven.
+The journal suite also now has a spawned-process regression for launch-driver
+death after the recovery-monitor starter reports acceptance but before the
+durable `launched` receipt commits; that test uses synthetic systemd
+observations and is not live manager evidence.
 The code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487` passed
 [exact-head hosted CI run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
 with all four Ubuntu/macOS × Python 3.11/3.12 jobs green. Result import is not
@@ -319,6 +323,28 @@ were left untouched. Code-bearing commit
 `e5f664f538996738cd310c482c778d08f9ee0440` passed
 [exact-head hosted CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380):
 all four Ubuntu/macOS × Python 3.11/3.12 jobs passed.
+
+### Spawned journal crash during monitor handoff (2026-10-16; synthetic systemd)
+
+`test_fresh_supervisor_contains_driver_crash_after_monitor_acceptance` now
+crashes a spawned launch-driver with `os._exit(74)` after its fake monitor
+starter signals manager acceptance and before `record_launch()` can commit the
+durable `launched` receipt. A fresh `GitSupervisor` process runs the real
+revocation and exact-unit reconciliation path against stubbed systemd
+observations. In the quiescent case it stops only the exact launch-driver,
+recovery-monitor, and attempt-slice units; the row remains `ambiguous`, the
+one-shot launch submission and start identity remain unchanged, cleanup
+verification is absent, and the resource lease remains fenced. In the
+uncertain-driver case, a still-active post-stop observation raises and retains
+the same fences without proceeding to stop the monitor or slice. A retry is
+rejected before monitor start.
+
+The exact test-module SHA-256 is
+`63829a2d83d66d08363061653722f32ba57771c33107a71cffedc97291f2203f`.
+This is real process loss, SQLite state, and process-shared locking, but the
+manager acceptance and unit states are test doubles: it does not validate live
+systemd start/stop behavior, a supervisor-daemon or user-manager restart,
+result import, provider access, or `run_worker()` enablement.
 
 All three live modes used no model, provider credential, network egress, or paid call.
 Postflight found no running ACP test units, pinned-runc process, or

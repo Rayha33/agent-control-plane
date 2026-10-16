@@ -67,6 +67,17 @@ The manager-acceptance crash increment at code-bearing commit
 `e5f664f538996738cd310c482c778d08f9ee0440` passed
 [exact-head hosted CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380):
 all four Ubuntu/macOS × Python 3.11/3.12 jobs passed.
+Separately, `test_fresh_supervisor_contains_driver_crash_after_monitor_acceptance`
+now kills a spawned launch-driver after the fake monitor starter reports
+acceptance but before the journal's `launched` commit. Fresh-process recovery
+stops only the exact driver/monitor/slice units when observations are quiescent;
+an uncertain still-active driver fails closed, and both cases retain the
+ambiguous phase, cleanup fence, and one-shot submission. The exact test-module
+SHA-256 is
+`63829a2d83d66d08363061653722f32ba57771c33107a71cffedc97291f2203f`. This
+uses real spawned-process loss, SQLite, and process-shared locking, but
+synthetic systemd observations; it is not live manager/start-stop or full
+daemon-restart evidence.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
 socket beneath the verified private runtime directory. OCI `run_worker()` and

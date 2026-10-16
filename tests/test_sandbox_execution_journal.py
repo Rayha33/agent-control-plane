@@ -38,7 +38,7 @@ from agent_control_plane.supervisor import sandbox_launch_driver_service as laun
 from agent_control_plane.supervisor import sandbox_monitor_ipc as monitor_ipc_module
 from agent_control_plane.supervisor import sandbox_monitor_lifecycle as monitor_lifecycle_module
 from agent_control_plane.supervisor import workers as workers_module
-from agent_control_plane.supervisor.common import canonical_json
+from agent_control_plane.supervisor.common import RuntimePortPool, canonical_json
 from agent_control_plane.supervisor.sandbox_attestation import (
     ProcessSnapshot,
     collect_running_runtime_attestation,
@@ -317,6 +317,122 @@ def _reconcile_timeout_from_fresh_process(
         result_sender.send(("error", type(error).__name__, str(error), unit_reads, stops))
     finally:
         event_sender.close()
+        result_sender.close()
+
+
+def _crash_record_launch_after_monitor_acceptance(
+    repo: Path,
+    attempt: dict[str, Any],
+    intent_values: dict[str, Any],
+    accepted_sender,
+) -> None:
+    """Lose the launch-driver process after manager acceptance, before receipt return."""
+
+    supervisor = GitSupervisor(repo)
+    redeem_test_launch_driver_start(supervisor, attempt, intent=SimpleNamespace(**intent_values))
+
+    def manager_accepted(_kwargs: dict[str, Any]) -> None:
+        accepted_sender.send(("accepted", os.getpid()))
+        accepted_sender.close()
+        os._exit(74)
+
+    record_launch(supervisor, attempt, monitor_start_hook=manager_accepted)
+    os._exit(75)  # The accepted hook must terminate before record_launch can commit.
+
+
+def _reconcile_monitor_accepted_driver_crash(
+    repo: Path,
+    execution: dict[str, Any],
+    intent_values: dict[str, Any],
+    attempt_slice: str,
+    uncertain_after_stop_unit: str | None,
+    result_sender,
+) -> None:
+    """Recover a stranded handoff from a fresh supervisor process."""
+
+    from agent_control_plane.supervisor import sandbox_launch_driver_service as service
+
+    supervisor = GitSupervisor(repo)
+    intent = SimpleNamespace(**intent_values)
+    monitor_unit = sandbox_monitor_service_unit(
+        intent.attempt_id, intent.claim_token, intent.execution_id
+    )
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/user-acp.slice"
+    unit_reads: list[str] = []
+    stopped: set[str] = set()
+    stop_commands: list[list[str]] = []
+
+    def unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
+        unit_reads.append(unit)
+        active = unit not in stopped or unit == uncertain_after_stop_unit
+        if unit == intent.service_unit:
+            values = {
+                "ActiveState": "active" if active else "inactive",
+                "ControlGroup": (
+                    f"{common_cgroup}/{attempt_slice}/{intent.service_unit}" if active else ""
+                ),
+                "Id": unit,
+                "InvocationID": execution["launch_driver_start_redeemed_invocation_id"],
+                "Job": "",
+                "LoadState": "loaded",
+                "MainPID": "2345" if active else "0",
+                "Slice": attempt_slice,
+                "SubState": "running" if active else "dead",
+            }
+        elif unit == monitor_unit:
+            values = {
+                "ActiveState": "active" if active else "inactive",
+                "ControlGroup": f"{common_cgroup}/{monitor_unit}" if active else "",
+                "Id": unit,
+                "InvocationID": "5" * 32,
+                "Job": "",
+                "LoadState": "loaded",
+                "MainPID": "3456" if active else "0",
+                "Slice": "user-acp.slice",
+                "SubState": "running" if active else "dead",
+            }
+        else:
+            assert unit == attempt_slice
+            values = {
+                "ActiveState": "active" if active else "inactive",
+                "ControlGroup": f"{common_cgroup}/{unit}" if active else "",
+                "Id": unit,
+                "InvocationID": "3" * 32,
+                "Job": "",
+                "LoadState": "loaded",
+                "MainPID": "0",
+                "Slice": "user-acp.slice",
+                "SubState": "active" if active else "dead",
+            }
+        assert set(properties).issubset(values)
+        return {name: values[name] for name in properties}
+
+    def stop_unit(command: list[str], *, environment: dict[str, str]) -> bytes:
+        del environment
+        unit = command[4]
+        assert command == ["/usr/bin/systemctl", "--user", "stop", "--", unit]
+        assert unit in {intent.service_unit, monitor_unit, attempt_slice}
+        stop_commands.append(command)
+        stopped.add(unit)
+        return b""
+
+    service._unit_properties = unit_properties
+    service._trusted_systemctl_executable = lambda: Path("/usr/bin/systemctl")
+    service._trusted_systemd_command_environment = lambda: {"PATH": "/usr/bin"}
+    service._run_trusted_runtime_command = stop_unit
+    try:
+        adopted = service._stop_and_reconcile_exact_start(
+            supervisor,
+            execution=execution,
+            intent=intent,
+            attempt_slice=attempt_slice,
+            reason="launch-driver died after monitor manager acceptance",
+            credential=None,
+        )
+        result_sender.send(("ok", adopted, unit_reads, stop_commands))
+    except BaseException as error:
+        result_sender.send(("error", type(error).__name__, str(error), unit_reads, stop_commands))
+    finally:
         result_sender.close()
 
 
@@ -2917,6 +3033,184 @@ def test_timeout_waits_for_cross_process_monitor_handoff_then_adopts(repo: Path)
                 event_sender.close()
             if not result_sender.closed:
                 result_sender.close()
+
+
+@pytest.mark.parametrize("recovery_mode", ["quiescent", "uncertain_driver"])
+def test_fresh_supervisor_contains_driver_crash_after_monitor_acceptance(
+    repo: Path, recovery_mode: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    task = make_task(
+        supervisor,
+        f"monitor-accepted-driver-crash-{recovery_mode}.txt",
+        title="sandbox journal test",
+    )
+    supervisor.config = replace(
+        supervisor.config,
+        runtime_port_pools=(RuntimePortPool("ACP_TEST_PORT", 24001, 24001),),
+    )
+    supervisor._port_available = lambda _port: True
+    attempt = supervisor.claim(task["id"], "sandbox-worker")
+    execution = reserve(supervisor, attempt)
+    intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        attempt["id"], attempt["claim_token"], launch_request_digest="e" * 64
+    )
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None and execution["phase"] == "reserved"
+    attempt_slice = sandbox_attempt_slice_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    intent_values = {
+        "attempt_id": intent.attempt_id,
+        "claim_token": intent.claim_token,
+        "execution_id": intent.execution_id,
+        "start_id": intent.start_id,
+        "start_digest": intent.start_digest,
+        "service_unit": intent.service_unit,
+    }
+
+    context = multiprocessing.get_context("spawn")
+    accepted_receiver, accepted_sender = context.Pipe(duplex=False)
+    producer = context.Process(
+        target=_crash_record_launch_after_monitor_acceptance,
+        args=(repo, attempt, intent_values, accepted_sender),
+    )
+    producer_started = False
+    try:
+        producer.start()
+        producer_started = True
+        accepted_sender.close()
+        assert accepted_receiver.poll(10), "producer did not reach monitor manager acceptance"
+        accepted = accepted_receiver.recv()
+        assert accepted[0] == "accepted" and accepted[1] > 0
+        producer.join(timeout=10)
+        assert not producer.is_alive(), "producer did not crash at the handoff boundary"
+        assert producer.exitcode == 74
+    finally:
+        if producer_started and producer.is_alive():
+            producer.terminate()
+            producer.join(timeout=5)
+        accepted_receiver.close()
+        if not accepted_sender.closed:
+            accepted_sender.close()
+
+    stranded = supervisor._sandbox_execution_get(attempt["id"])
+    assert stranded is not None and stranded["phase"] == "reserved"
+    assert stranded["launch_driver_start_id"] == intent.start_id
+    assert stranded["launch_driver_start_digest"] == intent.start_digest
+    assert stranded["launch_driver_start_unit"] == intent.service_unit
+    assert stranded["launch_submission_id"]
+    assert stranded["launch_submission_digest"]
+    assert stranded["launch_plan_binding_version"] == 0
+    assert stranded["wrapper_unit"] == ""
+    with supervisor.connect() as connection:
+        allocation_before = connection.execute(
+            "SELECT pool_name, value, lease_expires_at FROM runtime_allocations "
+            "WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        runtime_before = connection.execute(
+            "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert allocation_before is not None
+    assert allocation_before["pool_name"] == "ACP_TEST_PORT"
+    assert allocation_before["value"] == 24001
+    assert allocation_before["lease_expires_at"] == attempt["lease_expires_at"]
+    assert runtime_before is not None and runtime_before["state"] != "released"
+
+    monitor_unit = sandbox_monitor_service_unit(
+        attempt["id"], attempt["claim_token"], execution["execution_id"]
+    )
+    uncertain_unit = intent.service_unit if recovery_mode == "uncertain_driver" else None
+    result_receiver, result_sender = context.Pipe(duplex=False)
+    recovery = context.Process(
+        target=_reconcile_monitor_accepted_driver_crash,
+        args=(repo, stranded, intent_values, attempt_slice, uncertain_unit, result_sender),
+    )
+    recovery_started = False
+    try:
+        recovery.start()
+        recovery_started = True
+        result_sender.close()
+        assert result_receiver.poll(10), "fresh supervisor did not return crash reconciliation"
+        result = result_receiver.recv()
+        recovery.join(timeout=10)
+        assert not recovery.is_alive(), "fresh supervisor did not exit after reconciliation"
+        assert recovery.exitcode == 0
+    finally:
+        if recovery_started and recovery.is_alive():
+            recovery.terminate()
+            recovery.join(timeout=5)
+        result_receiver.close()
+        if not result_sender.closed:
+            result_sender.close()
+
+    if recovery_mode == "quiescent":
+        assert result[0] == "ok" and result[1] is False
+        assert result[2] == [
+            intent.service_unit,
+            intent.service_unit,
+            monitor_unit,
+            monitor_unit,
+            attempt_slice,
+            attempt_slice,
+        ]
+        assert result[-1] == [
+            ["/usr/bin/systemctl", "--user", "stop", "--", unit]
+            for unit in (intent.service_unit, monitor_unit, attempt_slice)
+        ]
+    else:
+        assert result[0:2] == ("error", "SandboxLaunchDriverServiceError")
+        assert "remains active" in result[2]
+        assert result[3] == [intent.service_unit, intent.service_unit]
+        assert result[-1] == [["/usr/bin/systemctl", "--user", "stop", "--", intent.service_unit]]
+
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None and durable["phase"] == "ambiguous"
+    assert durable["launch_driver_start_id"] == intent.start_id
+    assert durable["launch_driver_start_digest"] == intent.start_digest
+    assert durable["launch_driver_start_unit"] == intent.service_unit
+    assert durable["launch_submission_id"] == stranded["launch_submission_id"]
+    assert durable["launch_submission_digest"] == stranded["launch_submission_digest"]
+    assert durable["launch_plan_binding_version"] == 0
+    assert durable["cleanup_verification_json"] == "{}"
+    assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
+    assert supervisor.task(attempt["task_id"])["cleanup_target_status"] == "blocked"
+    with supervisor.connect() as connection:
+        resource_leases = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchall()
+        allocation_after = connection.execute(
+            "SELECT pool_name, value, lease_expires_at FROM runtime_allocations "
+            "WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+        runtime_after = connection.execute(
+            "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchone()
+    assert resource_leases and all(
+        lease["lease_expires_at"] == CLEANUP_FENCE_EPOCH for lease in resource_leases
+    )
+    assert allocation_after is not None
+    assert (allocation_after["pool_name"], allocation_after["value"]) == (
+        allocation_before["pool_name"],
+        allocation_before["value"],
+    )
+    assert allocation_after["lease_expires_at"] == CLEANUP_FENCE_EPOCH
+    assert runtime_after is not None and runtime_after["state"] == runtime_before["state"]
+
+    monitor_start_calls: list[dict[str, Any]] = []
+    with pytest.raises(SupervisorError):
+        record_launch(supervisor, attempt, monitor_start_calls=monitor_start_calls)
+    assert monitor_start_calls == []
+    assert (
+        supervisor._sandbox_execution_get(attempt["id"])["launch_submission_id"]
+        == (stranded["launch_submission_id"])
+    )
+    assert supervisor.verify_event_chain()["ok"] is True
 
 
 def test_cross_process_revoke_wins_launch_barrier_and_prevents_monitor_start(
