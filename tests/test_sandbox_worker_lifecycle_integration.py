@@ -2678,6 +2678,78 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             assert [(row["pool_name"], row["value"]) for row in allocations_after] == [
                 ("LAUNCH_DRIVER_TEST_PORT", runtime_test_port)
             ]
+            qc_reap_receiver, qc_reap_sender = context.Pipe(duplex=False)
+            fresh_qc_reaper = context.Process(
+                target=_reap_expired_from_fresh_process,
+                args=(repo, expected_lease_expiry + 1, qc_reap_sender, import_probe),
+            )
+            fresh_qc_reaper.start()
+            child_processes.append(fresh_qc_reaper)
+            qc_reap_sender.close()
+            assert qc_reap_receiver.poll(30), "fresh supervisor did not expire the QC reservation"
+            qc_reap_result = qc_reap_receiver.recv()
+            fresh_qc_reaper.join(timeout=5)
+            assert not fresh_qc_reaper.is_alive()
+            assert fresh_qc_reaper.exitcode == 0
+            qc_reap_receiver.close()
+            assert qc_reap_result[0] == "ok", qc_reap_result
+            assert qc_reap_result[1] not in {controller_pid, driver_pid}
+            qc_reaped = qc_reap_result[2]
+            assert qc_reaped["conflicted"] == [task["id"]]
+            assert qc_reaped["orphaned"] == []
+            assert {
+                tuple(sorted(item.items()))
+                for item in qc_reaped["runtime_cleanup"]
+                if item.get("task_id") == task["id"]
+            } == {
+                tuple(
+                    sorted(
+                        {
+                            "task_id": task["id"],
+                            "attempt_id": attempt["id"],
+                            "state": "released",
+                        }.items()
+                    )
+                )
+            }
+            recovered_before_expiry, recovered_after_expiry = qc_reap_result[3:5]
+            assert recovered_before_expiry == recovered_after
+            assert recovered_after_expiry == {
+                "task_status": "conflicted",
+                "attempt_status": "submitted",
+                "submission_id": imported_submission["id"],
+                "submission_status": "pending_qc",
+                "submission_commit_sha": imported_submission["commit_sha"],
+                "task_latest_submission_id": imported_submission["id"],
+                "execution_id": execution["execution_id"],
+                "execution_phase": "cleanup_verified",
+            }
+            assert supervisor.task(task["id"])["status"] == "conflicted"
+            assert supervisor.attempt(attempt["id"])["status"] == "submitted"
+            assert supervisor.submission(imported_submission["id"])["status"] == "pending_qc"
+            with supervisor.connect() as connection:
+                final_lease_rows = connection.execute(
+                    "SELECT resource, task_id, attempt_id, lease_expires_at FROM resource_leases "
+                    f"WHERE resource IN ({placeholders}) ORDER BY resource",
+                    lease_resources,
+                ).fetchall()
+                final_runtime = connection.execute(
+                    "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+                    (attempt["id"],),
+                ).fetchone()
+                final_allocations = connection.execute(
+                    "SELECT pool_name, value FROM runtime_allocations WHERE attempt_id = ?",
+                    (attempt["id"],),
+                ).fetchall()
+            assert {row["resource"] for row in final_lease_rows} == set(lease_before)
+            assert all(
+                row["task_id"] is None
+                and row["attempt_id"] is None
+                and row["lease_expires_at"] == 0
+                for row in final_lease_rows
+            )
+            assert final_runtime is not None and final_runtime["state"] == "released"
+            assert final_allocations == []
         verified = supervisor._sandbox_execution_get(attempt["id"])
         assert verified is not None
         assert verified["phase"] == "cleanup_verified"
