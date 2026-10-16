@@ -279,10 +279,16 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
             ),
         }
         for name, snapshot in units.items():
+            if not isinstance(snapshot, dict):
+                return False
             expected_id, expected_invocation, expected_cgroup = expected_units[name]
+            failed_unit_identity_is_exact = snapshot.get("active_state") != "failed" or (
+                snapshot.get("load_state") == "loaded"
+                and snapshot.get("id") == expected_id
+                and snapshot.get("invocation_id") == expected_invocation
+            )
             if (
-                not isinstance(snapshot, dict)
-                or set(snapshot)
+                set(snapshot)
                 != {
                     "id",
                     "load_state",
@@ -302,6 +308,7 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
                 or snapshot.get("id") not in {"", expected_id}
                 or snapshot.get("invocation_id") not in {"", expected_invocation}
                 or snapshot.get("control_group") not in {"", expected_cgroup}
+                or not failed_unit_identity_is_exact
             ):
                 return False
         expected_processes = {

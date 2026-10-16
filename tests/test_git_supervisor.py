@@ -3008,12 +3008,18 @@ def test_quarantined_cleanup_finalizes_without_registered_worker_identity(
 
 
 @pytest.mark.parametrize(
-    ("launch_owner_column", "launch_owner_value"),
-    (("launch_owner_pid", 424242), ("launch_owner_identity", "linux:424242:9")),
+    ("registered_pid", "launch_owner_column", "launch_owner_value"),
+    (
+        (None, "launch_owner_pid", 424242),
+        (None, "launch_owner_identity", "linux:424242:9"),
+        (424243, "launch_owner_pid", 424242),
+        (424243, "launch_owner_identity", "linux:424242:9"),
+    ),
 )
-def test_quarantined_cleanup_retains_unproven_launch_owner_without_worker_pid(
+def test_quarantined_cleanup_retains_unproven_launch_owner(
     repo: Path,
     monkeypatch: pytest.MonkeyPatch,
+    registered_pid: int | None,
     launch_owner_column: str,
     launch_owner_value: int | str,
 ) -> None:
@@ -3023,8 +3029,15 @@ def test_quarantined_cleanup_retains_unproven_launch_owner_without_worker_pid(
     with supervisor.connect() as connection:
         connection.execute(
             "UPDATE attempts SET status = 'terminating', termination_target_status = 'quarantined', "
-            f"{launch_owner_column} = ? WHERE id = ?",
-            (launch_owner_value, attempt["id"]),
+            f"{launch_owner_column} = ?, pid = ?, pid_identity = ?, termination_proof = ? "
+            "WHERE id = ?",
+            (
+                launch_owner_value,
+                registered_pid,
+                "linux:424243:10" if registered_pid is not None else "",
+                "worker-death-proof" if registered_pid is not None else "",
+                attempt["id"],
+            ),
         )
         connection.execute(
             "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = 'blocked' "
@@ -3047,6 +3060,7 @@ def test_quarantined_cleanup_retains_unproven_launch_owner_without_worker_pid(
     assert error.value.code == "worker_cleanup_unproven"
     retained = supervisor.attempt(attempt["id"])
     assert retained["status"] == "terminating"
+    assert retained["termination_target_status"] == "quarantined"
     assert retained[launch_owner_column] == launch_owner_value
 
 

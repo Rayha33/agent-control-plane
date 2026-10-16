@@ -187,6 +187,20 @@ def test_persisted_verification_receipt_is_bound_to_exact_cleanup_report(exit_co
         row, canonical_json(failed_service)
     )
 
+    for field, value in (
+        ("load_state", "not-found"),
+        ("id", ""),
+        ("invocation_id", ""),
+        ("invocation_id", "f" * 32),
+    ):
+        incomplete_failed_service = json.loads(proof)
+        launch_driver = incomplete_failed_service["observations"]["units"]["launch_driver"]
+        launch_driver["active_state"] = "failed"
+        launch_driver[field] = value
+        assert not verifier._sandbox_cleanup_verification_json_is_self_consistent(
+            row, canonical_json(incomplete_failed_service)
+        )
+
     failed_slice = json.loads(proof)
     failed_slice["observations"]["units"]["attempt_slice"]["active_state"] = "failed"
     assert not verifier._sandbox_cleanup_verification_json_is_self_consistent(
