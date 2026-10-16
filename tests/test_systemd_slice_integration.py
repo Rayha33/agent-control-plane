@@ -24,6 +24,8 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import pytest
+
 from agent_control_plane.supervisor.common import SupervisorError
 from agent_control_plane.supervisor.oci_worker import _oci_worker_systemd_slice
 from agent_control_plane.supervisor.process import ProcessMixin
@@ -36,6 +38,7 @@ from agent_control_plane.supervisor.sandbox_attestation import (
 from agent_control_plane.supervisor.sandbox_monitor_ipc import (
     SandboxMonitorControlClient,
     SandboxMonitorControlServer,
+    SandboxMonitorIPCError,
     _linux_process_identity,
 )
 from agent_control_plane.supervisor.sandbox_monitor_lifecycle import (
@@ -53,7 +56,12 @@ from agent_control_plane.supervisor.sandbox_monitor_receipt import (
     validate_monitor_service_reconciliation,
     write_sandbox_monitor_receipt,
 )
-from agent_control_plane.supervisor.sandbox_monitor_service import start_sandbox_execution_monitor
+from agent_control_plane.supervisor.sandbox_monitor_service import (
+    RuncClientScopeBinding,
+    attach_held_runc_client_to_attempt_scope,
+    sandbox_runc_client_scope_unit,
+    start_sandbox_execution_monitor,
+)
 
 _ENABLED = os.environ.get("ACP_RUN_SYSTEMD_SLICE_INTEGRATION") == "1"
 _WAIT_SECONDS = 8.0
@@ -140,6 +148,386 @@ def _unit_properties(systemctl: str, unit: str) -> dict[str, str]:
         ]
     )
     return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def _scope_binding_is_active(binding: RuncClientScopeBinding, observed: dict[str, str]) -> bool:
+    """Require the same loaded activation before a test cleanup stop."""
+
+    return (
+        observed.get("Id") == binding.scope_unit
+        and observed.get("LoadState") == "loaded"
+        and observed.get("ActiveState") == "active"
+        and observed.get("InvocationID") == binding.scope_invocation_id
+        and observed.get("ControlGroup") == binding.scope_control_group
+        and observed.get("Slice") == binding.attempt_slice_unit
+    )
+
+
+def _stop_exact_runc_client_scope(systemctl: str, binding: RuncClientScopeBinding) -> bool:
+    """Stop only the exact active scope activation previously returned by the helper."""
+
+    observed = _unit_properties(systemctl, binding.scope_unit)
+    if not _scope_binding_is_active(binding, observed):
+        return False
+    _run([systemctl, "--user", "stop", "--", binding.scope_unit])
+    return True
+
+
+def _linux_process_identity_if_present(pid: int) -> str | None:
+    """Treat only a vanished /proc entry as absence; preserve other probe failures."""
+
+    try:
+        return _linux_process_identity(pid)
+    except SandboxMonitorIPCError as error:
+        if isinstance(error.__cause__, FileNotFoundError):
+            return None
+        raise
+
+
+def _stop_exact_attempt_slice(systemctl: str, binding: dict[str, str]) -> bool:
+    """Stop only the loaded active attempt-slice activation captured by this test."""
+
+    unit = binding.get("Id", "")
+    if not unit:
+        return False
+    observed = _unit_properties(systemctl, unit)
+    if observed.get("LoadState") == "not-found":
+        return True
+    if (
+        any(
+            observed.get(name) != binding.get(name)
+            for name in ("Id", "InvocationID", "ControlGroup", "Slice")
+        )
+        or observed.get("LoadState") != "loaded"
+        or observed.get("ActiveState") != "active"
+    ):
+        return False
+    _run([systemctl, "--user", "stop", "--", unit])
+    return True
+
+
+def _cleanup_step(errors: list[str], label: str, action) -> None:
+    try:
+        action()
+    except Exception as error:
+        errors.append(f"{label}: {error}")
+
+
+def _cleanup_held_scope_probe(
+    *,
+    systemctl: str,
+    attempt_slice_started: bool,
+    attempt_slice_binding: dict[str, str] | None,
+    attachment_attempted: bool,
+    scope_binding: RuncClientScopeBinding | None,
+    child: subprocess.Popen[bytes] | None,
+) -> None:
+    """Attempt every owned cleanup independently and preserve uncertain units."""
+
+    errors: list[str] = []
+    if scope_binding is not None:
+        _cleanup_step(
+            errors,
+            "could not stop the exact runc client scope",
+            lambda: _stop_exact_runc_client_scope(systemctl, scope_binding),
+        )
+
+    if child is not None:
+        try:
+            child_running = child.poll() is None
+        except Exception as error:
+            errors.append(f"could not inspect held child before cleanup: {error}")
+            child_running = True
+        if child_running:
+            _cleanup_step(errors, "could not kill exact held child", child.kill)
+        wait_failed = False
+        try:
+            child.wait(timeout=_WAIT_SECONDS)
+        except Exception as error:
+            errors.append(f"could not wait/reap exact held child: {error}")
+            wait_failed = True
+        if child.stdin is not None and not child.stdin.closed:
+            _cleanup_step(errors, "could not close held child gate", child.stdin.close)
+        if wait_failed:
+            _cleanup_step(
+                errors,
+                "could not reap exact held child after closing abort gate",
+                lambda: child.wait(timeout=_WAIT_SECONDS),
+            )
+
+    if scope_binding is not None:
+        _cleanup_step(
+            errors,
+            "could not verify runc client scope inactivity",
+            lambda: _wait_inactive(systemctl, scope_binding.scope_unit),
+        )
+
+    if attempt_slice_started:
+        if attempt_slice_binding is None:
+            errors.append("attempt slice identity was not verified; left it untouched")
+        elif attachment_attempted and scope_binding is None:
+            errors.append("scope binding was not verified; left attempt slice untouched")
+        else:
+            stopped = False
+            try:
+                stopped = _stop_exact_attempt_slice(systemctl, attempt_slice_binding)
+                if not stopped:
+                    errors.append("attempt slice activation changed; refused cleanup stop")
+            except Exception as error:
+                errors.append(f"could not stop exact attempt slice: {error}")
+            _cleanup_step(
+                errors,
+                "could not verify attempt slice inactivity",
+                lambda: _wait_inactive(systemctl, attempt_slice_binding["Id"]),
+            )
+
+    if errors:
+        raise RuntimeError("held runc-client scope probe cleanup failed: " + "; ".join(errors))
+
+
+def _held_child_argv() -> list[str]:
+    """The child may exec only on an explicit byte; EOF is an abort signal."""
+
+    code = (
+        "import os; os.read(0, 1) == b'x' and "
+        "os.execv('/usr/bin/sleep', ['sleep', '60']); os._exit(126)"
+    )
+    return [sys.executable, "-c", code]
+
+
+def _test_runc_client_scope_binding() -> RuncClientScopeBinding:
+    identity = ("attempt-cleanup", 1, "12345678-0000-4000-8000-000000000001")
+    slice_unit = sandbox_attempt_slice_unit(*identity)
+    scope_unit = sandbox_runc_client_scope_unit(*identity)
+    slice_cgroup = f"/user.slice/user-1000.slice/user@1000.service/user-acp.slice/{slice_unit}"
+    return RuncClientScopeBinding(
+        attempt_id=identity[0],
+        claim_token=identity[1],
+        execution_id=identity[2],
+        pid=4321,
+        pid_identity="linux:4321:7654321",
+        scope_unit=scope_unit,
+        scope_invocation_id="a" * 32,
+        scope_control_group=f"{slice_cgroup}/{scope_unit}",
+        attempt_slice_unit=slice_unit,
+        attempt_slice_invocation_id="b" * 32,
+        attempt_slice_control_group=slice_cgroup,
+    )
+
+
+def test_scope_cleanup_requires_the_exact_returned_active_binding(monkeypatch) -> None:
+    binding = _test_runc_client_scope_binding()
+    observed = {
+        "Id": binding.scope_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "InvocationID": binding.scope_invocation_id,
+        "ControlGroup": binding.scope_control_group,
+        "Slice": binding.attempt_slice_unit,
+    }
+    commands: list[list[str]] = []
+    monkeypatch.setattr(sys.modules[__name__], "_unit_properties", lambda *_args: observed.copy())
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_run",
+        lambda argv, **_kwargs: commands.append(argv),
+    )
+
+    for property_name, wrong_value in (
+        ("Id", "other.scope"),
+        ("LoadState", "not-found"),
+        ("ActiveState", "inactive"),
+        ("InvocationID", "c" * 32),
+        ("ControlGroup", "/different/cgroup"),
+        ("Slice", "other.slice"),
+    ):
+        original_value = observed[property_name]
+        observed[property_name] = wrong_value
+        assert not _stop_exact_runc_client_scope("systemctl", binding)
+        assert commands == []
+        observed[property_name] = original_value
+
+    assert _stop_exact_runc_client_scope("systemctl", binding)
+    assert commands == [["systemctl", "--user", "stop", "--", binding.scope_unit]]
+
+
+def test_scope_probe_cleanup_continues_after_scope_stop_failure(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeStdin:
+        closed = False
+
+        def close(self) -> None:
+            events.append("gate-close")
+            self.closed = True
+
+    class FakeChild:
+        stdin = FakeStdin()
+        running = True
+
+        def poll(self) -> int | None:
+            return None if self.running else 0
+
+        def kill(self) -> None:
+            events.append("child-kill")
+            self.running = False
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == _WAIT_SECONDS
+            events.append("child-wait")
+            return 0
+
+    def fail_scope_stop(_systemctl: str, _binding: RuncClientScopeBinding) -> bool:
+        events.append("scope-stop")
+        raise RuntimeError("injected scope-stop failure")
+
+    monkeypatch.setattr(sys.modules[__name__], "_stop_exact_runc_client_scope", fail_scope_stop)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_stop_exact_attempt_slice",
+        lambda *_args: events.append("slice-stop") or True,
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_wait_inactive",
+        lambda _systemctl, unit: events.append(f"wait:{unit}"),
+    )
+
+    binding = _test_runc_client_scope_binding()
+    attempt_slice = {
+        "Id": binding.attempt_slice_unit,
+        "InvocationID": binding.attempt_slice_invocation_id,
+        "ControlGroup": binding.attempt_slice_control_group,
+        "Slice": "user-acp.slice",
+    }
+    with pytest.raises(RuntimeError, match="injected scope-stop failure"):
+        _cleanup_held_scope_probe(
+            systemctl="systemctl",
+            attempt_slice_started=True,
+            attempt_slice_binding=attempt_slice,
+            attachment_attempted=True,
+            scope_binding=binding,
+            child=FakeChild(),
+        )
+
+    assert "child-kill" in events
+    assert "child-wait" in events
+    assert "gate-close" in events
+    assert "slice-stop" in events
+    assert f"wait:{binding.scope_unit}" in events
+    assert f"wait:{binding.attempt_slice_unit}" in events
+
+
+def test_scope_probe_cleanup_preserves_slice_without_verified_scope_binding(monkeypatch) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_stop_exact_attempt_slice",
+        lambda *_args: events.append("slice-stop") or True,
+    )
+    with pytest.raises(RuntimeError, match="scope binding was not verified"):
+        _cleanup_held_scope_probe(
+            systemctl="systemctl",
+            attempt_slice_started=True,
+            attempt_slice_binding={"Id": "attempt.slice"},
+            attachment_attempted=True,
+            scope_binding=None,
+            child=None,
+        )
+    assert events == []
+
+
+def test_scope_probe_cleanup_gate_eof_aborts_after_kill_and_wait_failures(monkeypatch) -> None:
+    events: list[str] = []
+
+    child = subprocess.Popen(
+        _held_child_argv(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=_environment(),
+    )
+    if child.stdin is None:
+        child.kill()
+        child.wait(timeout=_WAIT_SECONDS)
+        raise AssertionError("held child stdin gate is unavailable")
+
+    class FaultInjectedStdin:
+        @property
+        def closed(self) -> bool:
+            return child.stdin is None or child.stdin.closed
+
+        def close(self) -> None:
+            events.append("gate-close")
+            if child.stdin is not None:
+                child.stdin.close()
+
+    class FaultInjectedChild:
+        stdin = FaultInjectedStdin()
+
+        def poll(self) -> int | None:
+            return child.poll()
+
+        def kill(self) -> None:
+            events.append("child-kill")
+            raise OSError("injected kill failure")
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == _WAIT_SECONDS
+            events.append("child-wait")
+            if not self.stdin.closed:
+                raise subprocess.TimeoutExpired("held-child", timeout)
+            return child.wait(timeout=timeout)
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_stop_exact_attempt_slice",
+        lambda *_args: events.append("slice-stop") or True,
+    )
+    try:
+        with pytest.raises(RuntimeError) as error:
+            _cleanup_held_scope_probe(
+                systemctl="systemctl",
+                attempt_slice_started=True,
+                attempt_slice_binding={"Id": "attempt.slice"},
+                attachment_attempted=True,
+                scope_binding=None,
+                child=FaultInjectedChild(),
+            )
+
+        assert "injected kill failure" in str(error.value)
+        assert "could not wait/reap exact held child" in str(error.value)
+        assert "scope binding was not verified; left attempt slice untouched" in str(error.value)
+        assert events == ["child-kill", "child-wait", "gate-close", "child-wait"]
+        assert child.wait(timeout=_WAIT_SECONDS) == 126
+    finally:
+        if child.poll() is None:
+            if child.stdin is not None and not child.stdin.closed:
+                child.stdin.close()
+            try:
+                child.wait(timeout=_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=_WAIT_SECONDS)
+
+
+def test_held_child_gate_eof_aborts_without_executing_payload() -> None:
+    child = subprocess.Popen(
+        _held_child_argv(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=_environment(),
+    )
+    try:
+        if child.stdin is None:
+            raise AssertionError("held child stdin gate is unavailable")
+        child.stdin.close()
+        assert child.wait(timeout=_WAIT_SECONDS) == 126
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=_WAIT_SECONDS)
 
 
 def _write_monitor_receipt(path: Path, receipt: dict[str, Any]) -> None:
@@ -2433,6 +2821,103 @@ def test_live_systemd_loadcredential_restart_requires_source_again() -> None:
                 f"{private_directory}: " + "; ".join(cleanup_errors)
             ) from sys.exc_info()[1]
         shutil.rmtree(private_directory)
+
+
+def test_live_systemd_attaches_blocked_child_to_execution_scope_before_exec() -> None:
+    """Prove StartTransientUnit(PIDs=...) moves the exact held child once."""
+
+    import pytest
+
+    if not _ENABLED:
+        pytest.skip("set ACP_RUN_SYSTEMD_SLICE_INTEGRATION=1 on a disposable Linux host")
+    if (
+        not sys.platform.startswith("linux")
+        or not Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+    ):
+        raise RuntimeError("the runc-client scope probe requires Linux cgroup v2")
+    systemctl = shutil.which("systemctl", path=_environment()["PATH"])
+    if systemctl is None:
+        raise RuntimeError("systemctl is required")
+    manager_state = _run(
+        [systemctl, "--user", "is-system-running"], accepted_returncodes=(0, 1)
+    ).stdout.strip()
+    if manager_state not in {"running", "degraded"}:
+        raise RuntimeError(f"user systemd manager is not available: {manager_state!r}")
+
+    token = uuid.uuid4().hex
+    identity = (
+        f"attempt-{token}",
+        7,
+        f"{token[:8]}-0000-4000-8000-{token[8:20]}",
+    )
+    attempt_slice_unit = sandbox_attempt_slice_unit(*identity)
+    scope_unit = sandbox_runc_client_scope_unit(*identity)
+    attempt_slice_started = False
+    attempt_slice_binding: dict[str, str] | None = None
+    attachment_attempted = False
+    scope_binding: RuncClientScopeBinding | None = None
+    child: subprocess.Popen[bytes] | None = None
+    try:
+        _run([systemctl, "--user", "start", attempt_slice_unit])
+        attempt_slice_started = True
+        attempt_slice_binding = _wait_active(systemctl, attempt_slice_unit)
+        attempt_slice = attempt_slice_binding
+        parent_snapshot = read_linux_process_snapshot(os.getpid())
+        unified = [
+            line.split(b":", 2)[2].decode("ascii")
+            for line in parent_snapshot.cgroup.splitlines()
+            if line.startswith(b"0::")
+        ]
+        if len(unified) != 1:
+            raise RuntimeError("test controller has no unique cgroup-v2 membership")
+        monitor_cgroup = unified[0]
+
+        child = subprocess.Popen(
+            _held_child_argv(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=_environment(),
+        )
+        pid_identity = _linux_process_identity(child.pid)
+        if pid_identity is None:
+            raise RuntimeError("held test child PID/start identity is unavailable")
+        attachment_attempted = True
+        scope = attach_held_runc_client_to_attempt_scope(
+            expected_identity=identity,
+            pid=child.pid,
+            pid_identity=pid_identity,
+            monitor_control_group=monitor_cgroup,
+            attempt_slice_invocation_id=attempt_slice["InvocationID"],
+            attempt_slice_control_group=attempt_slice["ControlGroup"],
+        )
+        scope_binding = scope
+        if scope.scope_unit != scope_unit or _linux_process_identity(child.pid) != pid_identity:
+            raise RuntimeError("runc client PID or deterministic unit identity changed at attach")
+
+        if child.stdin is None:
+            raise RuntimeError("held test child stdin gate is unavailable")
+        child.stdin.write(b"x")
+        child.stdin.close()
+        if child.poll() is not None:
+            detail = child.stderr.read().decode("utf-8", errors="replace") if child.stderr else ""
+            raise RuntimeError(f"held child exited before scope cancellation: {detail}")
+
+        if not _stop_exact_runc_client_scope(systemctl, scope_binding):
+            raise RuntimeError("runc client scope activation changed before cancellation")
+        child.wait(timeout=_WAIT_SECONDS)
+        _wait_inactive(systemctl, scope_unit)
+        if _linux_process_identity_if_present(child.pid) is not None:
+            raise RuntimeError("systemd scope stop left the held child alive")
+    finally:
+        _cleanup_held_scope_probe(
+            systemctl=systemctl,
+            attempt_slice_started=attempt_slice_started,
+            attempt_slice_binding=attempt_slice_binding,
+            attachment_attempted=attachment_attempted,
+            scope_binding=scope_binding,
+            child=child,
+        )
 
 
 if __name__ == "__main__":

@@ -54,6 +54,17 @@ from agent_control_plane.supervisor.sandbox_workspace import (
 )
 from agent_control_plane.supervisor.store import _authorize_sandbox_reservation_write
 
+_RECORD_LAUNCH_MONITOR = threading.local()
+
+
+def _record_launch_monitor_for_thread(**kwargs: Any) -> Any:
+    """Route one shared mock to the caller thread's exact launch fixture."""
+
+    starter = getattr(_RECORD_LAUNCH_MONITOR, "starter", None)
+    if starter is None:
+        raise AssertionError("record_launch test monitor callback is not configured")
+    return starter(**kwargs)
+
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
@@ -1154,15 +1165,24 @@ def test_concurrent_launch_plan_binding_has_one_durable_winner(repo: Path) -> No
     def race_launch() -> tuple[str, object]:
         barrier.wait(timeout=3)
         try:
-            return "ok", record_launch(supervisor, attempt, runc_handle=handle)
+            return "ok", record_launch(
+                supervisor,
+                attempt,
+                runc_handle=handle,
+                patch_monitor_starter=False,
+            )
         except SupervisorError as error:
             return "error", error
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = [
-            future.result(timeout=5)
-            for future in (pool.submit(race_launch), pool.submit(race_launch))
-        ]
+    with patch(
+        "agent_control_plane.supervisor.sandbox_monitor_service.start_sandbox_execution_monitor",
+        side_effect=_record_launch_monitor_for_thread,
+    ):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [
+                future.result(timeout=5)
+                for future in (pool.submit(race_launch), pool.submit(race_launch))
+            ]
 
     assert [kind for kind, _ in results].count("ok") == 1
     errors = [value for kind, value in results if kind == "error"]
@@ -2107,6 +2127,7 @@ def record_launch(
     wrapper_cgroup_path: str | None = None,
     monitor_start_calls: list[dict[str, Any]] | None = None,
     monitor_start_error: Exception | None = None,
+    patch_monitor_starter: bool = True,
 ) -> dict:
     if runc_handle is None:
         execution = supervisor._sandbox_execution_get(attempt["id"])
@@ -2192,10 +2213,7 @@ def record_launch(
             raise monitor_start_error
         return client
 
-    with patch(
-        "agent_control_plane.supervisor.sandbox_monitor_service.start_sandbox_execution_monitor",
-        side_effect=start_monitor,
-    ):
+    def record() -> dict:
         return supervisor._sandbox_execution_record_launch(
             attempt["id"],
             attempt["claim_token"],
@@ -2208,6 +2226,23 @@ def record_launch(
             scope_invocation_id="2" * 32,
             cgroup_path=f"{slice_cgroup}/acp-container.scope",
         )
+
+    if patch_monitor_starter:
+        with patch(
+            "agent_control_plane.supervisor.sandbox_monitor_service.start_sandbox_execution_monitor",
+            side_effect=start_monitor,
+        ):
+            return record()
+
+    previous_starter = getattr(_RECORD_LAUNCH_MONITOR, "starter", None)
+    _RECORD_LAUNCH_MONITOR.starter = start_monitor
+    try:
+        return record()
+    finally:
+        if previous_starter is None:
+            del _RECORD_LAUNCH_MONITOR.starter
+        else:
+            _RECORD_LAUNCH_MONITOR.starter = previous_starter
 
 
 def test_launch_starts_monitor_for_exact_fenced_scope_and_uses_service_receipt(

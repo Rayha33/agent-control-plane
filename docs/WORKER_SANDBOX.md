@@ -27,6 +27,23 @@ retaining that gate. No `run_worker` path yet connects launch to the durable
 journal, runtime attestation, cleanup verification, or result import. This
 record does not authorize `externalSandbox` for ACP workers.
 
+**Current launch ownership decision (2026-10-16):** Use the two-service
+topology in [`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): the exact
+launch-driver service sits inside the attempt slice and owns the process-local
+pinned-runc handle, gate, collector attestation, journal transition, wait/reap,
+and cleanup evidence. The authenticated recovery monitor stays outside and
+routes status/cancel over IPC; it never receives or reconstructs those
+process-local capabilities. The runc client remains in the driver's exact
+service cgroup, matching the existing attestation contract. Independent review
+rejected the earlier outside-monitor owner and PIDs-to-scope migration design.
+The PIDs attachment helper is an unselected experiment only; it does not itself
+prove or retain the private launcher's exec gate, which remains a caller
+precondition. Independent review gave the revised two-service ownership ADR
+**GO** on 2026-10-16; this is decision-level approval, not implementation or
+lifecycle acceptance. Production launch-driver producer, monitor-to-driver IPC,
+and end-to-end lifecycle proof remain pending; OCI worker execution stays
+fail-closed.
+
 ## Codex adapter contract (2026-10-15; OpenAI Docs)
 
 OpenAI positions the Codex SDK for automated coding jobs and CI, and the App
@@ -418,37 +435,40 @@ first OS-boundary proof should use a registered no-model fake worker; each
 provider adapter must then prove its own auth and egress contract before launch
 is enabled. No provider adapter or `externalSandbox` opt-in is selected yet.
 
-### Lifecycle ownership decision (2026-10-10)
+### Historical single-monitor ownership proposal (2026-10-10; superseded)
 
-The durable owner must be a systemd-managed transient **service** for each
-attempt/fencing epoch, not the API process, its `systemd-run` client, or a
-transient scope around a client-launched monitor. Put that service in a
-dedicated monitor slice outside the worker attempt slice. It owns the pinned
-runc launch handle and its one-shot init gate, observes the exact worker scope,
-and is the only component allowed to advance launch/running/exit journal
-receipts. Give each execution a non-reusable unit identity bound to the
-attempt, claim token, and execution ID. The manager's unit name alone is not
-enough: durable adoption must also match the exact invocation ID, control-group
-path, main-process start identity, and journaled fencing epoch. If any evidence
-is absent or conflicts, classify the execution as unknown and retain the
-attempt fence.
+The earlier single-service design is retained as history, not as the selected
+ownership model. The current decision is in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): an exact launch-driver
+service inside the attempt slice owns the process-local launch handle, gate,
+attestation, journal transition, wait/reap, and cleanup evidence; a separate
+authenticated recovery monitor remains outside the slice and controls the
+driver through IPC. The runc client stays in the launch-driver service cgroup,
+matching the existing attestation contract. Do not move it into a sibling
+transient scope or give the outside monitor its process-local handle.
+
+Both services must be systemd-managed and bound to the exact attempt, claim
+token, and execution ID; a unit name alone is not enough. Adoption must match
+the exact invocation ID, control-group path, main-process start identity, and
+journaled fencing epoch. Missing or conflicting evidence means unknown; retain
+the attempt fence.
 
 The worker scope is a separate systemd object: launch rootless runc with the
 qualified systemd cgroup driver into the exact attempt slice, then independently
 reconcile/stop that scope and container. `KillMode=control-group` governs the
 processes in its own service unit; it is not evidence that a sibling runc scope
 was killed. A controller restart may reconnect to the still-active exact
-monitor service, but a new controller must never reconstruct the monitor's
+monitor service, but a new controller must never reconstruct the launch-driver's
 in-process runc handle or gate from a PID, path, or self-reported receipt. This
 only covers a controller-process restart while the system manager remains
 alive: a `systemd --user` manager normally terminates its services after the
 last login session ends unless lingering is enabled. The deployment preflight
 must therefore prove the chosen manager's lifetime (for example, require
-lingering for a user manager); this is not a reboot-survival claim. If the
-monitor is gone, recovery must use a separate trusted cleanup/reconciliation
-path to prove the exact init identity absent, the stopped container deleted,
-the state entry absent, and the worker cgroup empty before recording
-`cleanup_verified` or importing results. Ambiguous cleanup stays fenced.
+lingering for a user manager); this is not a reboot-survival claim. For this
+iteration, no trusted cleanup/reconciliation recovery path is implemented. If
+the launch-driver is gone before its required wait receipt and unverified cleanup
+report are durable, the execution remains ambiguous and fenced: no
+`cleanup_verified` transition, fence release, or result import is available.
 
 **Production monitor receipt codec (2026-10-11; identity primitive only).** The
 durable receipt codec and exact service-reconciliation checks now live in
@@ -533,9 +553,10 @@ units, zero runc processes, and zero temporary control directories.
 
 This is an IPC/service-lifecycle integration proof only. The monitor is still a
 test helper, and its owned process is not an OCI container. It does not prove a
-production monitor owning `RuncLaunchHandle`, journal-authorized gate release,
-OCI scope enforcement, `cleanup_verified`, result import, provider auth/egress,
-or the registered `run_worker()` path. `run_worker()` remains fail-closed.
+production launch-driver owning `RuncLaunchHandle`, journal-authorized gate
+release, OCI scope enforcement, `cleanup_verified`, result import, provider
+auth/egress, or the registered `run_worker()` path. `run_worker()` remains
+fail-closed.
 
 **Controller restart adoption helper (2026-10-11; production recovery primitive).**
 `supervisor/sandbox_monitor_lifecycle.py` now provides a controller-side
@@ -769,9 +790,9 @@ commit-before-marker ordering, post-launch pairing rejection, invalid callback
 results, and cross-process at-most-once authorization. It does not substitute
 for a live Linux launcher test.
 The callback and journal primitive are not wired to `run_worker`, and no
-production monitor owns the callback yet. They do not prove restart recovery,
-cleanup, cancellation, or worker isolation; OCI worker execution remains
-fail-closed.
+production launch-driver redeems the callback yet. They do not prove restart
+recovery, cleanup, cancellation, or worker isolation; OCI worker execution
+remains fail-closed.
 
 ### Provider egress destination-policy primitive (2026-10-15; unit proof only)
 
@@ -2638,36 +2659,39 @@ mismatched identity keeps the attempt fenced. Required property readback must
 be tested for each supported systemd version, and reverse-lookup methods need
 an explicit version/behavior test before use.
 
-The recovery design must not use `systemd-run --scope` as the durable monitor:
-in v252 the command remains a child of the `systemd-run` client and the client
-waits synchronously for it. Instead, the candidate architecture is one
-systemd-owned transient **monitor service** per attempt/fencing epoch, outside
-the unique worker attempt slice. That trusted service owns the pinned
-foreground-runc client, gate authorization, wait, and durable lifecycle
-receipts. The runc-created scope and container init belong inside the exact
-attempt slice; the monitor service must not. Stopping the worker slice must
-terminate the scope while leaving the trusted monitor alive to reap runc,
-observe teardown, and record cleanup. The service is intended to outlive an ACP
-supervisor-process restart while the same user manager remains active; that
-recovery property is not yet proven. For the user-manager deployment, verify
-the host's logout/linger and manager-restart behavior rather than assuming
-persistence across logout or reboot.
+The recovery design must not use `systemd-run --scope` as a durable service: in
+v252 the command remains a child of the `systemd-run` client and the client
+waits synchronously for it. The selected two-service model is described in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): the authenticated recovery
+monitor stays outside the exact attempt slice, and the launch-driver service
+inside the slice retains the local handle while its runc client remains in the
+driver cgroup. Runc creates the worker scope and container init inside the same
+attempt slice. The monitor routes authenticated cancellation to the driver and
+does not own or reconstruct its handle. No end-to-end lifecycle is yet
+integrated with `run_worker()`. The monitor and driver are intended to outlive
+an ACP supervisor-process restart while the same user manager remains active;
+that recovery property is not yet proven. For the user-manager deployment,
+verify the host's logout/linger and manager-restart behavior rather than
+assuming persistence across logout or reboot.
 The untrusted worker must never receive the host systemd bus socket or a route
 to the control API.
 
 `KillMode=control-group` covers one unit's control group, not an runc scope in
-the separate worker slice; stopping the monitor service alone is therefore
-insufficient. The trusted service must serialize start/cancel/recovery, query
-the exact monitor and scope invocation IDs and `ControlGroup` values, and use
-the manager to stop only the exact per-attempt worker slice. An owner restart,
-missing or reused invocation, unexpected cgroup ancestry, or ambiguous cleanup
-must leave the execution fence held and prohibit result import. A sequential
-cgroup scan followed by stop is still only point-in-time evidence, not an
-atomic cleanup proof. No durable monitor service or integrated worker path has
-been implemented. The earlier same-slice probe below is historical; the new
-split-placement probe validates that the trusted service survives stopping the
-worker slice, but it uses `/usr/bin/sleep` and an external scope controller,
-not a monitor that owns runc wait/reconciliation. Manager-restart recovery
+the attempt slice; stopping the recovery-monitor service alone is therefore
+insufficient. The launch-driver must serialize launch, gate release,
+cancellation, wait/reap, and cleanup; authenticated monitor IPC may request
+status or cancellation but cannot replace the driver's local handle. The
+driver stops only the exact worker scope, never the enclosing attempt slice
+that contains the driver itself. An owner restart, missing or reused
+invocation, unexpected cgroup ancestry, or ambiguous cleanup must leave the
+execution fence held and prohibit result import. A sequential cgroup scan
+followed by stop is still only point-in-time evidence, not an atomic cleanup
+proof. The systemd recovery-monitor primitive and scoped IPC exist; launch-driver
+service-placement attestation has component and disposable live coverage. A
+production driver producer, monitor-before-launch wiring, driver/monitor IPC,
+and integrated worker lifecycle remain unimplemented. The earlier same-slice
+probe below is historical; the split-placement probe uses `/usr/bin/sleep` and
+does not prove driver-owned runc wait/reconciliation. Manager-restart recovery
 remains untested and OCI remains fail-closed. Sources:
 [systemd v252 `systemd-run`](https://github.com/systemd/systemd/blob/v252/man/systemd-run.xml),
 [systemd v252 unit dependencies](https://github.com/systemd/systemd/blob/v252/man/systemd.unit.xml),
@@ -2860,8 +2884,9 @@ now protects another exact wrapper/slice/scope property read, including wrapper
 Systemd, procfs, and cgroup reads remain sequential, not an atomic snapshot; an
 ABA transition or change after the final read is not ruled out. This narrows the
 observation window, not a kernel-level race. It does not establish that a
-production ACP monitor owns or waits for runc, is crash-recoverable, or is
-connected to `run_worker`; OCI remains fail-closed.
+production launch-driver owns or waits for runc, that the recovery monitor is
+crash-recoverable, or that either service is connected to `run_worker`; OCI
+remains fail-closed.
 
 **Gate-release systemd identity recheck (2026-10-10; exact-source live replay).**
 The journal now re-reads the exact wrapper service, attempt slice, and runc
@@ -3319,9 +3344,9 @@ D-state processes. This run had no AppArmor profile applied to the monitor and
 is not evidence of AppArmor confinement or a production prerequisite policy.
 Keep configured OCI worker execution fail-closed.
 
-### Exact launch-driver cgroup attestation (2026-10-15)
+### Launch-driver-service cgroup attestation (2026-10-15; current source contract)
 
-The runc client must run in the deterministic systemd service
+The current two-service architecture places the runc client in the deterministic systemd service
 `acp-launch-driver-{execution_id}.service`, derived from the reserved durable
 execution ID. The service must be active with a valid invocation ID, and its
 cgroup must be a direct child of that attempt's exact slice. The runc client
@@ -3356,10 +3381,11 @@ no fixture roots, ACP test units, or D-state processes remained. These live
 tests prove the attested systemd/runc launch boundary and its negative cases;
 they do not qualify `run_worker()`, which remains fail-closed.
 
-This closes the arbitrary-sibling-cgroup gap for the launch client. It does
-not prove worker registration, monitor-owned cleanup, recovery after monitor
-crash, provider isolation, or end-to-end `run_worker()` acceptance; configured
-OCI worker execution remains disabled.
+This records the current attestation contract and closes the arbitrary-sibling-
+cgroup gap for the launch client. It does not prove that the production
+launch-driver producer is integrated, worker registration, recovery-monitor
+cleanup, recovery after driver crash, provider isolation, or end-to-end
+`run_worker()` acceptance; configured OCI worker execution remains disabled.
 
 ### Production monitor producer and controller reconnect (2026-10-15)
 

@@ -30,6 +30,85 @@ def _binding() -> monitor_service.SandboxMonitorScopeBinding:
     )
 
 
+def _configure_held_runc_client_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scope_created: bool = True,
+    scope_overrides: dict[str, str] | None = None,
+    slice_overrides: dict[str, str] | None = None,
+) -> SimpleNamespace:
+    binding = _binding()
+    identity = (binding.attempt_id, binding.claim_token, binding.execution_id)
+    scope_unit = monitor_service.sandbox_runc_client_scope_unit(*identity)
+    scope_cgroup = f"{binding.attempt_slice_control_group}/{scope_unit}"
+    monitor_cgroup = (
+        f"/user.slice/user-1000.slice/user@1000.service/user-acp.slice/"
+        f"{monitor_service.sandbox_monitor_service_unit(*identity)}"
+    )
+    slice_properties = {
+        "Id": binding.attempt_slice_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "InvocationID": "b" * 32,
+        "ControlGroup": binding.attempt_slice_control_group,
+        "Slice": "user-acp.slice",
+        **(slice_overrides or {}),
+    }
+    scope_properties = {
+        "Id": scope_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "InvocationID": "c" * 32,
+        "ControlGroup": scope_cgroup,
+        "Slice": binding.attempt_slice_unit,
+        **(scope_overrides or {}),
+    }
+    scope_reads = 0
+
+    def read_unit(unit: str, _properties: tuple[str, ...]) -> dict[str, str]:
+        nonlocal scope_reads
+        if unit == binding.attempt_slice_unit:
+            return slice_properties
+        assert unit == scope_unit
+        scope_reads += 1
+        if scope_reads == 1 or not scope_created:
+            return {"LoadState": "not-found"}
+        return scope_properties
+
+    monkeypatch.setattr(monitor_service, "_unit_properties", read_unit)
+    monkeypatch.setattr(
+        monitor_service, "_trusted_busctl_executable", lambda: Path("/usr/bin/busctl")
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_trusted_systemd_command_environment",
+        lambda: {"DBUS_SESSION_BUS_ADDRESS": "test"},
+    )
+    membership_checks: list[tuple[int, str, str]] = []
+
+    def verify_membership(pid: int, *, expected_cgroup: str, expected_identity: str) -> str:
+        membership_checks.append((pid, expected_cgroup, expected_identity))
+        return expected_identity
+
+    monkeypatch.setattr(monitor_service, "verify_linux_process_membership", verify_membership)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: commands.append(argv) or b'"/org/freedesktop/systemd1/job/17"',
+    )
+    return SimpleNamespace(
+        binding=binding,
+        identity=identity,
+        scope_unit=scope_unit,
+        scope_cgroup=scope_cgroup,
+        monitor_cgroup=monitor_cgroup,
+        slice_properties=slice_properties,
+        membership_checks=membership_checks,
+        commands=commands,
+    )
+
+
 def test_scope_binding_is_fenced_to_exact_attempt_slice_and_scope() -> None:
     binding = _binding()
     assert monitor_service.SandboxMonitorScopeBinding.from_dict(binding.as_dict()) == binding
@@ -45,7 +124,6 @@ def test_scope_binding_is_fenced_to_exact_attempt_slice_and_scope() -> None:
                 "scope_unit": "other-execution.scope",
             }
         )
-
     with pytest.raises(monitor_service.SandboxMonitorServiceError):
         monitor_service.SandboxMonitorScopeBinding(
             **{
@@ -54,6 +132,265 @@ def test_scope_binding_is_fenced_to_exact_attempt_slice_and_scope() -> None:
                 "scope_control_group": f"{binding.attempt_slice_control_group}/{container_id}.scope",
             }
         )
+
+
+def test_held_runc_client_scope_uses_exact_pid_and_slice_before_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    identity = (binding.attempt_id, binding.claim_token, binding.execution_id)
+    client_scope_unit = monitor_service.sandbox_runc_client_scope_unit(*identity)
+    client_scope_cgroup = f"{binding.attempt_slice_control_group}/{client_scope_unit}"
+    monitor_cgroup = (
+        f"/user.slice/user-1000.slice/user@1000.service/user-acp.slice/"
+        f"{monitor_service.sandbox_monitor_service_unit(*identity)}"
+    )
+    slice_properties = {
+        "Id": binding.attempt_slice_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "InvocationID": "b" * 32,
+        "ControlGroup": binding.attempt_slice_control_group,
+        "Slice": "user-acp.slice",
+    }
+    scope_properties = {
+        "Id": client_scope_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "InvocationID": "c" * 32,
+        "ControlGroup": client_scope_cgroup,
+        "Slice": binding.attempt_slice_unit,
+    }
+    scope_reads = 0
+
+    def read_unit(unit: str, _properties: tuple[str, ...]) -> dict[str, str]:
+        nonlocal scope_reads
+        if unit == binding.attempt_slice_unit:
+            return slice_properties
+        assert unit == client_scope_unit
+        scope_reads += 1
+        return {"LoadState": "not-found"} if scope_reads == 1 else scope_properties
+
+    monkeypatch.setattr(monitor_service, "_unit_properties", read_unit)
+    monkeypatch.setattr(
+        monitor_service, "_trusted_busctl_executable", lambda: Path("/usr/bin/busctl")
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "_trusted_systemd_command_environment",
+        lambda: {"DBUS_SESSION_BUS_ADDRESS": "test"},
+    )
+    membership_checks: list[tuple[int, str, str]] = []
+
+    def verify_membership(pid: int, *, expected_cgroup: str, expected_identity: str) -> str:
+        membership_checks.append((pid, expected_cgroup, expected_identity))
+        return expected_identity
+
+    monkeypatch.setattr(monitor_service, "verify_linux_process_membership", verify_membership)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: commands.append(argv) or b'"/org/freedesktop/systemd1/job/17"',
+    )
+
+    result = monitor_service.attach_held_runc_client_to_attempt_scope(
+        expected_identity=identity,
+        pid=4321,
+        pid_identity="linux:4321:7654321",
+        monitor_control_group=monitor_cgroup,
+        attempt_slice_invocation_id=slice_properties["InvocationID"],
+        attempt_slice_control_group=binding.attempt_slice_control_group,
+    )
+
+    assert result.scope_unit == client_scope_unit
+    assert result.scope_invocation_id == "c" * 32
+    assert result.scope_control_group == client_scope_cgroup
+    assert result.attempt_slice_unit == binding.attempt_slice_unit
+    assert membership_checks == [
+        (4321, monitor_cgroup, "linux:4321:7654321"),
+        (4321, client_scope_cgroup, "linux:4321:7654321"),
+    ]
+    assert commands == [
+        [
+            "/usr/bin/busctl",
+            "--user",
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "StartTransientUnit",
+            "ssa(sv)a(sa(sv))",
+            client_scope_unit,
+            "fail",
+            "2",
+            "Slice",
+            "s",
+            binding.attempt_slice_unit,
+            "PIDs",
+            "au",
+            "1",
+            "4321",
+            "0",
+        ]
+    ]
+
+
+def test_held_runc_client_scope_refuses_existing_unit_without_starting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    identity = (binding.attempt_id, binding.claim_token, binding.execution_id)
+    scope_unit = monitor_service.sandbox_runc_client_scope_unit(*identity)
+    monitor_cgroup = (
+        f"/user.slice/user-1000.slice/user@1000.service/user-acp.slice/"
+        f"{monitor_service.sandbox_monitor_service_unit(*identity)}"
+    )
+    properties = {
+        "Id": binding.attempt_slice_unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "InvocationID": "b" * 32,
+        "ControlGroup": binding.attempt_slice_control_group,
+        "Slice": "user-acp.slice",
+    }
+
+    def read_unit(unit: str, _props: tuple[str, ...]) -> dict[str, str]:
+        if unit == binding.attempt_slice_unit:
+            return properties
+        assert unit == scope_unit
+        return {"LoadState": "loaded"}
+
+    monkeypatch.setattr(monitor_service, "_unit_properties", read_unit)
+    monkeypatch.setattr(
+        monitor_service, "verify_linux_process_membership", lambda *_args, **_kwargs: None
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        monitor_service,
+        "_run_trusted_runtime_command",
+        lambda argv, **_kwargs: commands.append(argv) or b"",
+    )
+
+    with pytest.raises(monitor_service.SandboxMonitorServiceError, match="already exists"):
+        monitor_service.attach_held_runc_client_to_attempt_scope(
+            expected_identity=identity,
+            pid=4321,
+            pid_identity="linux:4321:7654321",
+            monitor_control_group=monitor_cgroup,
+            attempt_slice_invocation_id="b" * 32,
+            attempt_slice_control_group=binding.attempt_slice_control_group,
+        )
+
+    assert commands == []
+
+
+def test_held_runc_client_scope_reconciles_lost_bus_reply_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = _configure_held_runc_client_scope(monkeypatch)
+
+    def start_then_lose_reply(argv: list[str], **_kwargs: object) -> bytes:
+        configured.commands.append(argv)
+        raise TimeoutError("the manager reply was lost after scope creation")
+
+    monkeypatch.setattr(monitor_service, "_run_trusted_runtime_command", start_then_lose_reply)
+
+    result = monitor_service.attach_held_runc_client_to_attempt_scope(
+        expected_identity=configured.identity,
+        pid=4321,
+        pid_identity="linux:4321:7654321",
+        monitor_control_group=configured.monitor_cgroup,
+        attempt_slice_invocation_id=configured.slice_properties["InvocationID"],
+        attempt_slice_control_group=configured.binding.attempt_slice_control_group,
+    )
+
+    assert result.scope_unit == configured.scope_unit
+    assert result.scope_control_group == configured.scope_cgroup
+    assert len(configured.commands) == 1
+    assert configured.membership_checks == [
+        (4321, configured.monitor_cgroup, "linux:4321:7654321"),
+        (4321, configured.scope_cgroup, "linux:4321:7654321"),
+    ]
+
+
+def test_held_runc_client_scope_does_not_retry_ambiguous_start_without_exact_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = _configure_held_runc_client_scope(monkeypatch, scope_created=False)
+
+    def start_without_observable_scope(argv: list[str], **_kwargs: object) -> bytes:
+        configured.commands.append(argv)
+        raise TimeoutError("the manager reply was lost and no exact scope is visible")
+
+    monkeypatch.setattr(
+        monitor_service, "_run_trusted_runtime_command", start_without_observable_scope
+    )
+
+    with pytest.raises(
+        monitor_service.SandboxMonitorServiceError,
+        match="ambiguous; caller must close, reap, and retain the fence",
+    ):
+        monitor_service.attach_held_runc_client_to_attempt_scope(
+            expected_identity=configured.identity,
+            pid=4321,
+            pid_identity="linux:4321:7654321",
+            monitor_control_group=configured.monitor_cgroup,
+            attempt_slice_invocation_id=configured.slice_properties["InvocationID"],
+            attempt_slice_control_group=configured.binding.attempt_slice_control_group,
+            timeout_seconds=0.2,
+        )
+
+    assert len(configured.commands) == 1
+    assert configured.membership_checks == [(4321, configured.monitor_cgroup, "linux:4321:7654321")]
+
+
+def test_held_runc_client_scope_rejects_mismatched_slice_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = _configure_held_runc_client_scope(
+        monkeypatch, scope_overrides={"Slice": "user.slice"}
+    )
+
+    with pytest.raises(
+        monitor_service.SandboxMonitorServiceError,
+        match="readback is incomplete or stale",
+    ):
+        monitor_service.attach_held_runc_client_to_attempt_scope(
+            expected_identity=configured.identity,
+            pid=4321,
+            pid_identity="linux:4321:7654321",
+            monitor_control_group=configured.monitor_cgroup,
+            attempt_slice_invocation_id=configured.slice_properties["InvocationID"],
+            attempt_slice_control_group=configured.binding.attempt_slice_control_group,
+        )
+
+    assert len(configured.commands) == 1
+    assert configured.membership_checks == [(4321, configured.monitor_cgroup, "linux:4321:7654321")]
+
+
+def test_held_runc_client_scope_refuses_attempt_slice_with_wrong_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = _configure_held_runc_client_scope(
+        monkeypatch, slice_overrides={"Slice": "user.slice"}
+    )
+
+    with pytest.raises(
+        monitor_service.SandboxMonitorServiceError,
+        match="attempt slice identity changed before runc attachment",
+    ):
+        monitor_service.attach_held_runc_client_to_attempt_scope(
+            expected_identity=configured.identity,
+            pid=4321,
+            pid_identity="linux:4321:7654321",
+            monitor_control_group=configured.monitor_cgroup,
+            attempt_slice_invocation_id=configured.slice_properties["InvocationID"],
+            attempt_slice_control_group=configured.binding.attempt_slice_control_group,
+        )
+
+    assert configured.commands == []
+    assert configured.membership_checks == []
 
 
 def test_status_reports_only_the_bound_scope_activation(monkeypatch: pytest.MonkeyPatch) -> None:

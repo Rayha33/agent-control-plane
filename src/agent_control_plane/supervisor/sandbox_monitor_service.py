@@ -1,10 +1,10 @@
 """Production systemd producer for authenticated sandbox-scope monitoring.
 
 This starts a per-execution monitor service outside the worker slice after a
-trusted launcher has durably recorded the exact scope identity.  The service
-owns status and cancellation of that one scope and survives supervisor exit.
-It does not launch candidate code, recover a missing control key, or enable
-``run_worker``.
+trusted launcher has durably recorded the exact scope identity. It owns status
+and cancellation of that one scope and survives supervisor exit. It does not
+launch candidate code, recover a missing control key, or enable ``run_worker``.
+The separate launch-driver producer is not yet integrated.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from .sandbox_attestation import (
     _run_trusted_runtime_command,
     _trusted_systemctl_executable,
     _trusted_systemd_command_environment,
+    verify_linux_process_membership,
 )
 from .sandbox_monitor_ipc import (
     SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS,
@@ -66,10 +67,43 @@ _MONITOR_PROPERTIES = (
     "Slice",
     "MainPID",
 )
+_ATTEMPT_SLICE_PROPERTIES = (
+    "Id",
+    "LoadState",
+    "ActiveState",
+    "InvocationID",
+    "ControlGroup",
+    "Slice",
+)
+_RUNC_CLIENT_SCOPE_PREFIX = "acp-runc-client-"
 
 
 class SandboxMonitorServiceError(RuntimeError):
     """The production monitor could not start or attest its exact scope."""
+
+
+@dataclass(frozen=True)
+class RuncClientScopeBinding:
+    """Exact manager and PID identity for the held pinned-runc client."""
+
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    pid: int
+    pid_identity: str
+    scope_unit: str
+    scope_invocation_id: str
+    scope_control_group: str
+    attempt_slice_unit: str
+    attempt_slice_invocation_id: str
+    attempt_slice_control_group: str
+
+
+def sandbox_runc_client_scope_unit(attempt_id: str, claim_token: int, execution_id: str) -> str:
+    """Return the collision-resistant transient scope name for one execution."""
+
+    container_id = sandbox_container_id(attempt_id, claim_token, execution_id)
+    return f"{_RUNC_CLIENT_SCOPE_PREFIX}{container_id.removeprefix('acp-')}.scope"
 
 
 @dataclass(frozen=True)
@@ -225,6 +259,208 @@ def _trusted_systemd_run_executable() -> Path:
         except DriverError:
             continue
     raise SandboxMonitorServiceError("a trusted root-owned systemd-run is unavailable")
+
+
+def _trusted_busctl_executable() -> Path:
+    """Resolve busctl only from a root-owned, non-replaceable system path."""
+
+    from ..runtime_drivers import DriverError, resolve_trusted_executable
+
+    module_root = Path(__file__).resolve().parents[3]
+    for candidate in (Path("/usr/bin/busctl"), Path("/bin/busctl")):
+        try:
+            return resolve_trusted_executable(str(candidate), module_root, expected_owners={0})
+        except DriverError:
+            continue
+    raise SandboxMonitorServiceError("a trusted root-owned busctl is unavailable")
+
+
+def attach_held_runc_client_to_attempt_scope(
+    *,
+    expected_identity: tuple[str, int, str],
+    pid: int,
+    pid_identity: str,
+    monitor_control_group: str,
+    attempt_slice_invocation_id: str,
+    attempt_slice_control_group: str,
+    timeout_seconds: float = 10.0,
+) -> RuncClientScopeBinding:
+    """Experimental systemd primitive: move one held child into a transient scope.
+
+    This must be called while the private launcher is still blocked on its
+    exec-ack pipe. After an uncertain D-Bus result, exact readback may adopt
+    only this still-held PID in the expected active scope. The caller must not
+    retry unit creation or release the execution gate on an unresolved result.
+
+    This primitive is not used by the selected launch-driver architecture.
+    Calling it for the production runc client would move that client out of the
+    exact launch-driver service cgroup and invalidate the existing attestation
+    contract.
+    """
+
+    if type(expected_identity) is not tuple or len(expected_identity) != 3:
+        raise SandboxMonitorServiceError("runc client execution identity is invalid")
+    attempt_id, claim_token, execution_id = expected_identity
+    try:
+        attempt_slice_unit = sandbox_attempt_slice_unit(*expected_identity)
+        scope_unit = sandbox_runc_client_scope_unit(*expected_identity)
+    except (TypeError, SandboxMonitorReceiptError) as error:
+        raise SandboxMonitorServiceError("runc client execution identity is invalid") from error
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or not isinstance(pid_identity, str)
+        or re.fullmatch(rf"linux:{pid}:[1-9][0-9]*", pid_identity) is None
+        or type(timeout_seconds) not in {int, float}
+        or not 0.2 <= timeout_seconds <= 30
+        or not isinstance(attempt_slice_invocation_id, str)
+        or _INVOCATION_ID.fullmatch(attempt_slice_invocation_id) is None
+    ):
+        raise SandboxMonitorServiceError("runc client process or attempt slice identity is invalid")
+
+    def canonical_cgroup(value: str, label: str) -> PurePosixPath:
+        if (
+            not isinstance(value, str)
+            or not value.startswith("/")
+            or "\x00" in value
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise SandboxMonitorServiceError(f"{label} is invalid")
+        path = PurePosixPath(value)
+        if path.as_posix() != value or any(part in {".", ".."} for part in path.parts):
+            raise SandboxMonitorServiceError(f"{label} is not canonical")
+        return path
+
+    monitor_path = canonical_cgroup(monitor_control_group, "monitor cgroup")
+    attempt_path = canonical_cgroup(attempt_slice_control_group, "attempt slice cgroup")
+    if (
+        attempt_path.name != attempt_slice_unit
+        or attempt_path.parent.name != _MONITOR_SLICE_UNIT
+        or monitor_path.is_relative_to(attempt_path)
+        or attempt_path.is_relative_to(monitor_path)
+    ):
+        raise SandboxMonitorServiceError("monitor and attempt slice identities are not disjoint")
+
+    slice_properties = _unit_properties(attempt_slice_unit, _ATTEMPT_SLICE_PROPERTIES)
+    if (
+        slice_properties.get("Id") != attempt_slice_unit
+        or slice_properties.get("LoadState") != "loaded"
+        or slice_properties.get("ActiveState") != "active"
+        or slice_properties.get("InvocationID") != attempt_slice_invocation_id
+        or slice_properties.get("ControlGroup") != attempt_slice_control_group
+        or slice_properties.get("Slice") != _MONITOR_SLICE_UNIT
+    ):
+        raise SandboxMonitorServiceError("attempt slice identity changed before runc attachment")
+
+    verify_linux_process_membership(
+        pid,
+        expected_cgroup=monitor_control_group,
+        expected_identity=pid_identity,
+    )
+    previous = _unit_properties(scope_unit, _PROPERTY_SET)
+    if previous.get("LoadState") != "not-found":
+        raise SandboxMonitorServiceError("runc client scope already exists; refusing takeover")
+
+    # This is the systemd Manager.StartTransientUnit signature. `PIDs` is a
+    # construction-only scope property; `fail` prevents replacing an existing
+    # unit of the same unique name. Do not retry if this call has an uncertain
+    # result: readback below can adopt only the exact same still-held PID.
+    start_error: Exception | None = None
+    try:
+        _run_trusted_runtime_command(
+            [
+                str(_trusted_busctl_executable()),
+                "--user",
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartTransientUnit",
+                "ssa(sv)a(sa(sv))",
+                scope_unit,
+                "fail",
+                "2",
+                "Slice",
+                "s",
+                attempt_slice_unit,
+                "PIDs",
+                "au",
+                "1",
+                str(pid),
+                "0",
+            ],
+            environment=_trusted_systemd_command_environment(),
+        )
+    except Exception as error:
+        # The manager may have completed StartTransientUnit before the bus
+        # client lost its reply. Never issue a second call; proceed only if
+        # exact readback proves this same held PID was attached as requested.
+        start_error = error
+
+    deadline = time.monotonic() + float(timeout_seconds)
+    scope_properties: dict[str, str] = {}
+    while time.monotonic() < deadline:
+        scope_properties = _unit_properties(scope_unit, _PROPERTY_SET)
+        if scope_properties.get("LoadState") == "not-found":
+            time.sleep(0.05)
+            continue
+        if (
+            scope_properties.get("Id") != scope_unit
+            or scope_properties.get("LoadState") != "loaded"
+            or scope_properties.get("InvocationID") == ""
+            or scope_properties.get("ControlGroup") == ""
+            or scope_properties.get("Slice") != attempt_slice_unit
+        ):
+            raise SandboxMonitorServiceError("runc client scope readback is incomplete or stale")
+        if scope_properties.get("ActiveState") == "active":
+            break
+        if scope_properties.get("ActiveState") not in {"activating", "reloading"}:
+            raise SandboxMonitorServiceError("runc client scope did not become active")
+        time.sleep(0.05)
+    else:
+        raise SandboxMonitorServiceError(
+            "runc client scope result is ambiguous; caller must close, reap, and retain the fence"
+        ) from start_error
+
+    invocation_id = scope_properties["InvocationID"]
+    control_group = scope_properties["ControlGroup"]
+    control_path = canonical_cgroup(control_group, "runc client scope cgroup")
+    if (
+        _INVOCATION_ID.fullmatch(invocation_id) is None
+        or control_path.name != scope_unit
+        or control_path.parent != attempt_path
+    ):
+        raise SandboxMonitorServiceError("runc client scope is outside the exact attempt slice")
+
+    current_slice = _unit_properties(attempt_slice_unit, _ATTEMPT_SLICE_PROPERTIES)
+    if (
+        current_slice.get("Id") != attempt_slice_unit
+        or current_slice.get("LoadState") != "loaded"
+        or current_slice.get("ActiveState") != "active"
+        or current_slice.get("InvocationID") != attempt_slice_invocation_id
+        or current_slice.get("ControlGroup") != attempt_slice_control_group
+        or current_slice.get("Slice") != _MONITOR_SLICE_UNIT
+    ):
+        raise SandboxMonitorServiceError("attempt slice identity changed during runc attachment")
+    verify_linux_process_membership(
+        pid,
+        expected_cgroup=control_group,
+        expected_identity=pid_identity,
+    )
+    return RuncClientScopeBinding(
+        attempt_id=attempt_id,
+        claim_token=claim_token,
+        execution_id=execution_id,
+        pid=pid,
+        pid_identity=pid_identity,
+        scope_unit=scope_unit,
+        scope_invocation_id=invocation_id,
+        scope_control_group=control_group,
+        attempt_slice_unit=attempt_slice_unit,
+        attempt_slice_invocation_id=attempt_slice_invocation_id,
+        attempt_slice_control_group=attempt_slice_control_group,
+    )
 
 
 def _validate_scope_binding(
