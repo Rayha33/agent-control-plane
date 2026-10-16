@@ -75,6 +75,12 @@ SENSITIVE_ENV_NAMES = {
 }
 
 
+def _default_chroot_path() -> str:
+    """Prefer the traditional path, with the usr-merged coreutils location as fallback."""
+    candidates = ("/usr/sbin/chroot", "/usr/bin/chroot")
+    return next((candidate for candidate in candidates if Path(candidate).is_file()), candidates[0])
+
+
 def _validated_private_runtime_directory(path: Path, owner_uid: int) -> str | None:
     """Return a private, owner-controlled systemd runtime directory, if safe."""
     try:
@@ -614,7 +620,9 @@ class ResourceDriver:
 
         if phase == "verify":
             present, observation = self.probe(context, runner)
-            verified = present is not None and observation.get("exit_code", 0) == 0
+            verified = (present is True and observation.get("exit_code", 0) == 0) or (
+                present is False and self.cleanup_is_proven(present, observation)
+            )
             return PhaseEvidence(
                 driver=self.definition.name,
                 kind=self.kind,
@@ -1459,6 +1467,19 @@ class NamespaceRuntimeDriver(ResourceDriver):
                 "invalid_config",
                 f"driver {self.definition.name!r} needs a payload to run inside the runtime",
             )
+        preflight = runner(
+            self._namespace_preflight_argv(),
+            context.runtime_dir,
+            self._env(context),
+            self._timeout(),
+            None,
+        )
+        if preflight.get("exit_code") != 0 or preflight.get("timed_out"):
+            raise DriverError(
+                "namespace_unavailable",
+                "required rootless user, mount, PID, or network namespace is unavailable; "
+                "refusing to start the runtime unit",
+            )
         argv = [
             str(self.definition.executable),
             "--user",
@@ -1495,6 +1516,12 @@ class NamespaceRuntimeDriver(ResourceDriver):
         # this wrapper CAP_SYS_ADMIN only long enough to build its private mount,
         # PID and optional network namespaces. The payload is exec'd after every
         # capability is removed, so it cannot undo those mounts.
+        apparmor_profile = self._apparmor_profile()
+        if apparmor_profile:
+            # AppArmorProfile= is not supported by all per-user systemd
+            # managers. Apply the administrator-installed profile to the
+            # actual runtime command instead of relying on a unit property.
+            argv.extend([self._apparmor_exec(), "-p", apparmor_profile, "--"])
         argv.extend(
             [
                 self._unshare(),
@@ -1594,12 +1621,19 @@ class NamespaceRuntimeDriver(ResourceDriver):
             ),
             f"chmod 0700 {root}/work && chmod 1777 {root}/tmp",
             (
-                "for acp_path in /usr /bin /sbin /lib /lib64 /etc; do "
+                "for acp_path in /usr /bin /sbin /lib /lib64; do "
                 'if [ -e "$acp_path" ]; then '
                 f'{mount} --bind "$acp_path" "{root}$acp_path"; '
                 f'{mount} -o remount,bind,ro "{root}$acp_path"; '
                 "fi; done"
             ),
+            # Keep each operation standalone: `set -e` does not stop on every
+            # failed command inside an `&&` list.
+            f"chmod 0755 {root}/etc",
+            "printf '%s\\n' 'NAME=\"ACP\"' 'ID=acp-isolated-runtime' "
+            "'PRETTY_NAME=\"ACP isolated resource runtime\"' "
+            f"> {root}/etc/os-release",
+            f"chmod 0444 {root}/etc/os-release",
             f"mkdir -p {root}/dev/shm {root}/dev/pts",
             (
                 "for acp_dev in null zero random urandom tty; do "
@@ -1662,6 +1696,8 @@ class NamespaceRuntimeDriver(ResourceDriver):
             self._unit(context),
             "--property=LoadState",
             "--property=ActiveState",
+            "--property=MainPID",
+            "--property=ControlGroup",
             "--property=InvocationID",
             "--property=Result",
             "--property=ExecMainStatus",
@@ -1680,24 +1716,50 @@ class NamespaceRuntimeDriver(ResourceDriver):
             self._timeout(),
             None,
         )
-        load_state = self._show_value(result.get("stdout", ""), "LoadState")
+        stdout = str(result.get("stdout", ""))
+        systemd_properties = {
+            line.partition("=")[0].strip(): line.partition("=")[2].strip()
+            for line in stdout.splitlines()
+            if "=" in line
+        }
+        load_state = systemd_properties.get("LoadState", "")
         stderr = str(result.get("stderr", ""))
-        missing = load_state == "not-found" or (
+        not_found_error = (
             result.get("exit_code", 0) != 0
             and self._unit(context).casefold() in stderr.casefold()
             and ("not found" in stderr.casefold() or "could not be found" in stderr.casefold())
         )
-        if missing:
-            # A transient unit is normally garbage-collected after stop and
-            # reset-failed. systemctl versions differ: some report
-            # LoadState=not-found, while others return non-zero with a
-            # unit-specific not-found diagnostic. Both are positive absence
-            # proof because the trusted query names only this owned unit.
+        terminal_not_found_snapshot = (
+            result.get("exit_code") == 0
+            and systemd_properties.get("LoadState") == "not-found"
+            and systemd_properties.get("ActiveState") == "inactive"
+            and systemd_properties.get("MainPID") == "0"
+            and systemd_properties.get("ControlGroup") == ""
+            and systemd_properties.get("InvocationID") == ""
+        )
+        no_properties_on_not_found_error = not_found_error and not any(
+            key in systemd_properties
+            for key in ("LoadState", "ActiveState", "MainPID", "ControlGroup", "InvocationID")
+        )
+        not_found_signal = load_state == "not-found" or not_found_error
+        if not_found_signal and (terminal_not_found_snapshot or no_properties_on_not_found_error):
+            # A unit's name being reported as not found is not enough: systemd
+            # has returned contradictory ActiveState values in the wild. Accept
+            # structured output only when it is the complete terminal snapshot;
+            # older systemd error output remains usable only when it contains no
+            # contradictory unit properties at all.
             result = {
                 **result,
                 "original_exit_code": result.get("exit_code", 0),
                 "exit_code": 0,
                 "absence_proved_by": "systemd-unit-not-found",
+            }
+        elif not_found_signal:
+            result = {
+                **result,
+                "original_exit_code": result.get("exit_code", 0),
+                "exit_code": 1,
+                "absence_conflict": "systemd unit properties are not a terminal not-found snapshot",
             }
         state = self._show_value(result.get("stdout", ""), "ActiveState")
         present = state in {"active", "activating", "deactivating", "reloading"}
@@ -1797,6 +1859,31 @@ class NamespaceRuntimeDriver(ResourceDriver):
     def _unshare(self) -> str:
         return self.definition.option("unshare_path", "/usr/bin/unshare") or "/usr/bin/unshare"
 
+    def _apparmor_profile(self) -> str:
+        return self.definition.option("apparmor_profile", "") or ""
+
+    def _apparmor_exec(self) -> str:
+        return (
+            self.definition.option("apparmor_exec_path", "/usr/bin/aa-exec") or "/usr/bin/aa-exec"
+        )
+
+    def _namespace_preflight_argv(self) -> list[str]:
+        argv = [
+            self._unshare(),
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+        ]
+        if self._egress_denied():
+            argv.append("--net")
+        command = [*argv, "--", self._shell(), "-c", "exit 0"]
+        apparmor_profile = self._apparmor_profile()
+        if apparmor_profile:
+            return [self._apparmor_exec(), "-p", apparmor_profile, "--", *command]
+        return command
+
     def _shell(self) -> str:
         # Only used to run the read-only bind prelude before exec'ing the
         # payload; trusted-resolved at config load like every other binary here.
@@ -1809,7 +1896,9 @@ class NamespaceRuntimeDriver(ResourceDriver):
         return self.definition.option("mount_path", "/usr/bin/mount") or "/usr/bin/mount"
 
     def _chroot(self) -> str:
-        return self.definition.option("chroot_path", "/usr/sbin/chroot") or "/usr/sbin/chroot"
+        return (
+            self.definition.option("chroot_path", _default_chroot_path()) or _default_chroot_path()
+        )
 
     @staticmethod
     def _show_value(stdout: str, key: str) -> str:
@@ -1964,6 +2053,15 @@ def parse_driver_definitions(
                     f"namespace runtime driver {name!r} disk_max must be a positive K/M/G size",
                 )
             options["disk_max"] = disk_max.upper()
+            apparmor_profile = str(options.get("apparmor_profile", "")).strip()
+            if apparmor_profile and not re.fullmatch(
+                r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", apparmor_profile
+            ):
+                raise DriverError(
+                    "invalid_config",
+                    f"namespace runtime driver {name!r} apparmor_profile must be a plain profile name",
+                )
+            options["apparmor_profile"] = apparmor_profile
             read_only = options.get("read_only_paths", "")
             for raw_path in (part.strip() for part in read_only.split(",")):
                 if raw_path and not Path(raw_path).is_absolute():
@@ -1983,11 +2081,15 @@ def parse_driver_definitions(
                 ("shell_path", "/bin/sh"),
                 ("setpriv_path", "/usr/bin/setpriv"),
                 ("mount_path", "/usr/bin/mount"),
-                ("chroot_path", "/usr/sbin/chroot"),
+                ("chroot_path", _default_chroot_path()),
             ):
                 candidate = options.get(option_name, "").strip() or default
                 resolve_trusted_executable(candidate, repo_root, expected_owners)
                 options[option_name] = candidate
+            if apparmor_profile:
+                candidate = str(options.get("apparmor_exec_path", "")).strip() or "/usr/bin/aa-exec"
+                resolve_trusted_executable(candidate, repo_root, expected_owners)
+                options["apparmor_exec_path"] = candidate
 
         if kind == PostgresSchemaDriver.kind:
             if options.get("dsn") or options.get("dsn_env"):

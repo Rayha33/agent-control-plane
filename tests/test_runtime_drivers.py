@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2160,6 +2165,10 @@ def recording_runner(stdout_for: dict[str, str] | None = None):
     return runner, calls
 
 
+def namespace_unit_argv(calls: list[list[str]]) -> list[str]:
+    return next(call for call in calls if Path(call[0]).name == "systemd-run")
+
+
 # /bin/sh is root-owned on both macOS and Linux, so it satisfies the trust
 # boundary in a parse test without needing systemd present.
 TRUSTED_BIN = "/bin/sh"
@@ -2171,7 +2180,9 @@ ACTIVE_SHOW = (
     "CPUUsageNSec=123456789\nCPUQuotaPerSecUSec=500000\n"
 )
 GONE_SHOW = "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
-NOT_FOUND_SHOW = "LoadState=not-found\nActiveState=inactive\n"
+NOT_FOUND_SHOW = (
+    "LoadState=not-found\nActiveState=inactive\nMainPID=0\nControlGroup=\nInvocationID=\n"
+)
 OOM_SHOW = "ActiveState=failed\nResult=oom-kill\nExecMainStatus=137\n"
 
 
@@ -2188,16 +2199,52 @@ def test_namespace_runtime_never_uses_a_scope(tmp_path: Path) -> None:
     driver = namespace_driver()
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--scope" not in argv
     assert "--property=KillMode=control-group" in argv
+    assert not any(arg.startswith("--property=AppArmorProfile=") for arg in argv)
+    assert "/usr/bin/aa-exec" not in argv
+
+
+def test_namespace_runtime_uses_explicit_apparmor_profile_for_preflight_and_unit(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver(apparmor_profile="lxc-unshare", apparmor_exec_path="/usr/bin/aa-exec")
+    runner, calls = recording_runner()
+
+    driver.setup(context(tmp_path), runner)
+
+    assert calls[0][:4] == [
+        "/usr/bin/aa-exec",
+        "-p",
+        "lxc-unshare",
+        "--",
+    ]
+    assert calls[0][4:10] == [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--pid",
+        "--fork",
+    ]
+    assert "--net" in calls[0]
+    unit_argv = namespace_unit_argv(calls)
+    unshare_index = unit_argv.index("/usr/bin/unshare")
+    assert unit_argv[unshare_index - 4 : unshare_index] == [
+        "/usr/bin/aa-exec",
+        "-p",
+        "lxc-unshare",
+        "--",
+    ]
+    assert not any(arg.startswith("--property=AppArmorProfile=") for arg in unit_argv)
 
 
 def test_namespace_runtime_applies_every_quota_as_a_unit_property(tmp_path: Path) -> None:
     driver = namespace_driver()
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--property=MemoryMax=64M" in argv
     assert "--property=TasksMax=16" in argv
     assert "--property=CPUQuota=50%" in argv
@@ -2208,7 +2255,11 @@ def test_namespace_runtime_denies_egress_by_default(tmp_path: Path) -> None:
     driver = namespace_driver()
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    preflight = calls[0]
+    assert Path(preflight[0]).name == "unshare"
+    assert preflight[1:7] == ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--net"]
+    assert preflight[7:] == ["--", "/bin/sh", "-c", "exit 0"]
+    argv = namespace_unit_argv(calls)
     assert "/usr/bin/unshare" in argv and "--net" in argv
     # 🔴 Detaching a netns needs CAP_SYS_ADMIN: plain `unshare --net` fails
     # EPERM unprivileged, the unit never starts, and a "can the host reach it"
@@ -2225,7 +2276,8 @@ def test_namespace_runtime_egress_allow_skips_only_the_network_namespace(tmp_pat
     driver = namespace_driver(egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    assert "--net" not in calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--net" not in argv
     assert "--mount" in argv and "--pid" in argv and "--fork" in argv
 
@@ -2248,6 +2300,42 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     assert "--property=TasksCurrent" in calls[0]
     assert "--property=CPUUsageNSec" in calls[0]
     assert "--property=InvocationID" in calls[0]
+    assert "--property=MainPID" in calls[0]
+    assert "--property=ControlGroup" in calls[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ActiveState", "active"),
+        ("MainPID", "71"),
+        ("ControlGroup", "/user.slice/acp-attempt.service"),
+        ("InvocationID", "0123456789abcdef0123456789abcdef"),
+    ],
+)
+def test_namespace_runtime_not_found_rejects_contradictory_unit_properties(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    driver = namespace_driver()
+    properties = dict(
+        line.split("=", maxsplit=1) for line in NOT_FOUND_SHOW.splitlines() if "=" in line
+    )
+    properties[field] = value
+    output = "\n".join(f"{name}={item}" for name, item in properties.items()) + "\n"
+    runner, _calls = recording_runner({"show": output})
+
+    evidence = driver.run_phase("verify", context(tmp_path), runner)
+
+    assert evidence.present is (field == "ActiveState")
+    assert evidence.exit_code == 1
+    assert not evidence.ok
+    observation = evidence.proof["observation"]
+    assert "absence_proved_by" not in observation
+    assert observation["exit_code"] == 1
+    assert observation["absence_conflict"] == (
+        "systemd unit properties are not a terminal not-found snapshot"
+    )
+    assert not driver.cleanup_is_proven(evidence.present, observation)
 
     runner, _ = recording_runner(
         {
@@ -2287,6 +2375,28 @@ def test_namespace_runtime_probe_reads_presence_from_active_state(tmp_path: Path
     present, observation = driver.probe(context(tmp_path), runner)
     assert present is False
     assert observation["absence_proved_by"] == "systemd-unit-not-found"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        GONE_SHOW,
+        "LoadState=loaded\nActiveState=failed\nMainPID=0\n"
+        "ControlGroup=/user.slice/acp-runtime.service\nInvocationID=\n",
+    ],
+)
+def test_namespace_runtime_verify_requires_positive_absence_proof(
+    tmp_path: Path, output: str
+) -> None:
+    driver = namespace_driver()
+    runner, _calls = recording_runner({"show": output})
+
+    evidence = driver.run_phase("verify", context(tmp_path), runner)
+
+    assert evidence.present is False
+    assert evidence.exit_code == 1
+    assert not evidence.ok
+    assert not evidence.proof["observation"].get("absence_proved_by")
 
 
 def test_supervisor_persists_namespace_runtime_unit_invocation_id(
@@ -2355,6 +2465,74 @@ def test_supervisor_persists_namespace_runtime_unit_invocation_id(
     )
     assert setup_payload["systemd_unit_invocation_id"] == "0123456789abcdef0123456789abcdef"
     assert supervisor.verify_event_chain()["ok"] is True
+
+
+def test_namespace_runtime_conflicting_not_found_snapshot_cannot_release_quarantine(
+    driver_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda raw, _repo, _owners=None: Path(raw),
+    )
+    config = (driver_repo / "acp.toml").read_text(encoding="utf-8")
+    config = config.replace(
+        'name = "browser"\nkind = "browser_profile"',
+        'name = "runtime"\nkind = "namespace_runtime"\n'
+        'executable = "/usr/bin/systemd-run"\n'
+        'systemctl_path = "/usr/bin/systemctl"\n'
+        'payload = "/bin/sleep 30"\n'
+        'tasks_max = "16"\n'
+        'memory_max = "64M"\n'
+        'cpu_quota = "50%"\n'
+        'wall_clock_seconds = "120"',
+    )
+    (driver_repo / "acp.toml").write_text(config, encoding="utf-8")
+    snapshots = {
+        "active": (
+            "LoadState=loaded\nActiveState=active\nMainPID=71\n"
+            "ControlGroup=/user.slice/acp-runtime.service\n"
+            "InvocationID=0123456789abcdef0123456789abcdef\n"
+        ),
+        "conflict": (
+            "LoadState=not-found\nActiveState=inactive\nMainPID=71\n"
+            "ControlGroup=/user.slice/acp-runtime.service\n"
+            "InvocationID=0123456789abcdef0123456789abcdef\n"
+        ),
+    }
+    state = {"snapshot": "active"}
+
+    def fake_run_trusted(argv, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        output = ""
+        if len(argv) > 2 and Path(argv[0]).name == "systemctl" and argv[2] == "show":
+            output = snapshots[state["snapshot"]]
+        return {"argv": list(argv), "exit_code": 0, "stdout": output, "stderr": ""}
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_run_trusted)
+    supervisor = GitSupervisor(driver_repo)
+    attempt = claimed_attempt(supervisor)
+    resources = supervisor.driver_resources(attempt["id"])
+    assert resources[0]["state"] == "active"
+
+    supervisor._quarantine_driver_attempt(attempt["id"], "test_induced")
+    enrolled = supervisor.enroll_runner("operator-a", "integrator")
+    state["snapshot"] = "conflict"
+    recovered = supervisor.quarantine_recover(
+        attempt["id"],
+        "manual-receipt",
+        operator="operator-a",
+        credential=enrolled["credential"],
+        reason="systemd returned a contradictory not-found snapshot",
+    )
+
+    assert recovered["released"] == []
+    assert recovered["still_quarantined"] == 1
+    assert recovered["receipts"][0]["absence_proved"] is False
+    resource = supervisor.driver_resources(attempt["id"])[0]
+    assert resource["state"] == "quarantined"
+    observation = resource["evidence"]["proof"]["observation"]
+    assert observation["exit_code"] == 1
+    assert "absence_proved_by" not in observation
 
 
 def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
@@ -2481,6 +2659,8 @@ def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
     assert exit_code == 0
     assert inactive["available"] is False
     assert inactive["drivers"][0]["present"] is False
+    assert inactive["drivers"][0]["active_state"] == "inactive"
+    assert inactive["drivers"][0]["error_code"] is None
     assert inactive["drivers"][0]["usage"]["tasks_current"] is None
     assert acp_snapshot() == before_inactive
 
@@ -2504,6 +2684,27 @@ def test_runtime_resources_fresh_sample_is_read_only_and_identity_bound(
     assert inactive_counters["drivers"][0]["usage"]["memory_current_bytes"] is None
     assert inactive_counters["drivers"][0]["usage"]["cpu_usage_ns"] is None
     assert acp_snapshot() == before_inactive_counters
+
+    show_payload.update(
+        value=(
+            "LoadState=not-found\nActiveState=inactive\nMainPID=71\n"
+            "ControlGroup=/user.slice/acp-runtime.service\n"
+            "InvocationID=0123456789abcdef0123456789abcdef\n"
+        ),
+        exit_code=0,
+    )
+    before_conflict = acp_snapshot()
+    exit_code = cli_module.main(
+        ["--repo", str(driver_repo), "runtime-resources", attempt["id"], "--fresh"]
+    )
+    conflict = json.loads(capsys.readouterr().out)["live_sample"]
+    assert exit_code == 0
+    assert conflict["available"] is False
+    assert conflict["drivers"][0]["active_state"] is None
+    assert conflict["drivers"][0]["present"] is None
+    assert conflict["drivers"][0]["error_code"] == "systemd_absence_conflict"
+    assert conflict["drivers"][0]["usage"]["tasks_current"] is None
+    assert acp_snapshot() == before_conflict
 
     show_payload.update(value="LoadState=loaded\nActiveState=not-a-state\n", exit_code=0)
     calls.clear()
@@ -2808,6 +3009,59 @@ def test_namespace_runtime_rejects_an_unknown_egress_mode(tmp_path: Path) -> Non
     assert "egress" in str(error.value)
 
 
+@pytest.mark.parametrize("profile", ["lxc-unshare --debug", "-lxc-unshare"])
+def test_namespace_runtime_rejects_non_plain_apparmor_profile_names(
+    tmp_path: Path, profile: str
+) -> None:
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions(
+            [
+                {
+                    "name": "rt",
+                    "kind": "namespace_runtime",
+                    "executable": TRUSTED_BIN,
+                    "payload": "/bin/true",
+                    "apparmor_profile": profile,
+                    "apparmor_exec_path": str(TRUSTED_BIN),
+                }
+            ],
+            tmp_path,
+        )
+    assert error.value.code == "invalid_config"
+    assert "plain profile name" in str(error.value)
+
+
+def test_namespace_runtime_trusts_configured_apparmor_helper(tmp_path: Path) -> None:
+    definition = {
+        "name": "rt",
+        "kind": "namespace_runtime",
+        "executable": TRUSTED_BIN,
+        "payload": "/bin/true",
+        "apparmor_profile": "acp-test-profile",
+        "apparmor_exec_path": str(TRUSTED_BIN),
+    }
+    # These defaults are Linux-only. Point them at the trusted cross-platform
+    # test binary so the parser test can focus on the opt-in helper contract.
+    for helper in (
+        "systemctl_path",
+        "unshare_path",
+        "shell_path",
+        "setpriv_path",
+        "mount_path",
+        "chroot_path",
+    ):
+        definition[helper] = str(TRUSTED_BIN)
+    definitions = parse_driver_definitions([definition], tmp_path)
+    assert definitions[0].option("apparmor_profile") == "acp-test-profile"
+    assert definitions[0].option("apparmor_exec_path") == str(TRUSTED_BIN)
+
+    attacker = make_executable(tmp_path / "aa-exec")
+    definition["apparmor_exec_path"] = str(attacker)
+    with pytest.raises(DriverError) as error:
+        parse_driver_definitions([definition], tmp_path)
+    assert error.value.code == "untrusted_driver"
+
+
 def test_namespace_runtime_validates_every_helper_binary(tmp_path: Path) -> None:
     """Every helper in the privileged namespace prelude is part of the trust root."""
     attacker = make_executable(tmp_path / "systemctl")
@@ -2930,6 +3184,40 @@ def test_namespace_runtime_refuses_a_named_credential_with_no_registry(tmp_path:
     assert error.value.code == "credential_unavailable"
 
 
+def test_namespace_runtime_refuses_a_missing_named_credential_before_unit_launch(
+    tmp_path: Path,
+) -> None:
+    credential_context = postgres_context(tmp_path)
+    assert credential_context.credential_registry is not None
+    handle = (credential_context.credential_handles or {})["database"]
+    Path(handle.source_reference).unlink()
+    named = DriverContext(
+        attempt_id=credential_context.attempt_id,
+        task_id=credential_context.task_id,
+        runtime_dir=credential_context.runtime_dir,
+        expires_at=credential_context.expires_at,
+        secret=credential_context.secret,
+        environment=credential_context.environment,
+        credential_registry=credential_context.credential_registry,
+        credential_handles={"runtime": handle},
+    )
+    driver = namespace_driver()
+    calls: list[list[str]] = []
+
+    def runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        calls.append(list(argv))
+        return {"argv": list(argv), "exit_code": 0, "stdout": "", "stderr": ""}
+
+    with pytest.raises(DriverError) as error:
+        driver.setup(named, runner)
+
+    assert error.value.code == "credential_unavailable"
+    assert calls, "namespace capability preflight must run before credential materialization"
+    assert not any(any(str(part).startswith("--unit=") for part in argv) for argv in calls), (
+        "a missing credential must fail before a systemd worker unit is submitted"
+    )
+
+
 def test_namespace_runtime_disk_quota_is_a_sized_tmpfs(tmp_path: Path) -> None:
     """`io` is not a delegated controller, so the cap is a mount, not a cgroup attr.
 
@@ -2940,7 +3228,7 @@ def test_namespace_runtime_disk_quota_is_a_sized_tmpfs(tmp_path: Path) -> None:
     driver = namespace_driver(disk_max="16M", egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     assert "--mount" in argv  # a tmpfs needs the mount namespace
     script = argv[-1]
     assert " -t tmpfs -o size=16M,mode=0700 tmpfs /tmp" in script
@@ -2966,11 +3254,37 @@ def test_namespace_runtime_reenters_the_writable_layer_after_mounting_it(tmp_pat
     assert script.index("cd ") < script.index("/bin/sleep 30")
 
 
+def test_namespace_runtime_fails_before_unit_when_rootless_namespaces_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver()
+    calls: list[list[str]] = []
+
+    def unavailable_runner(argv, *_args):  # type: ignore[no-untyped-def]
+        calls.append(list(argv))
+        assert Path(argv[0]).name == "unshare"
+        return {
+            "argv": list(argv),
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "write failed /proc/self/uid_map: Operation not permitted",
+            "timed_out": False,
+        }
+
+    with pytest.raises(DriverError) as error:
+        driver.setup(context(tmp_path), unavailable_runner)
+
+    assert error.value.code == "namespace_unavailable"
+    assert "refusing to start the runtime unit" in str(error.value)
+    assert len(calls) == 1
+    assert calls[0][1:7] == ["--user", "--map-root-user", "--mount", "--pid", "--fork", "--net"]
+
+
 def test_namespace_runtime_combines_disk_quota_with_read_only_base(tmp_path: Path) -> None:
     driver = namespace_driver(disk_max="32M", read_only_paths="/opt/base", egress="deny")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     script = argv[-1]
     # one mount namespace serves both, and the netns is still applied
     assert argv.count("--mount") == 1 and "--net" in argv
@@ -2983,7 +3297,7 @@ def test_namespace_runtime_without_disk_max_uses_a_safe_default(tmp_path: Path) 
     driver = namespace_driver(egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    assert "size=64M" in calls[0][-1]
+    assert "size=64M" in namespace_unit_argv(calls)[-1]
 
 
 def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
@@ -2992,12 +3306,18 @@ def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
     driver = namespace_driver(egress="allow")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
     script = argv[-1]
 
     assert "/tmp/acp-root" in script
     assert 'remount,bind,ro "/tmp/acp-root$acp_path"' in script
-    assert "exec /usr/sbin/chroot /tmp/acp-root" in script
+    assert "for acp_path in /usr /bin /sbin /lib /lib64; do" in script
+    assert "for acp_path in /usr /bin /sbin /lib /lib64 /etc; do" not in script
+    assert "ID=acp-isolated-runtime" in script
+    assert "/tmp/acp-root/etc/os-release" in script
+    assert "chmod 0755 /tmp/acp-root/etc &&" not in script
+    assert "os-release && chmod" not in script
+    assert f"exec {driver._chroot()} /tmp/acp-root" in script
     assert "--pid" in argv and "-t proc" in script
     assert "--no-new-privs" in script
     assert "--bounding-set=-all" in script
@@ -3005,11 +3325,360 @@ def test_namespace_runtime_uses_a_private_root_and_drops_mount_capability(
     assert script.index("chroot") < script.index("--bounding-set=-all")
 
 
+def test_namespace_runtime_fails_closed_if_generated_etc_file_creation_fails(
+    tmp_path: Path,
+) -> None:
+    driver = namespace_driver(egress="allow")
+    runner, calls = recording_runner()
+    driver.setup(context(tmp_path), runner)
+    script = namespace_unit_argv(calls)[-1]
+    setup_lines = [
+        line
+        for line in script.splitlines()
+        if line == "chmod 0755 /tmp/acp-root/etc"
+        or line.startswith("printf '%s\\n' 'NAME=")
+        or line == "chmod 0444 /tmp/acp-root/etc/os-release"
+    ]
+    assert len(setup_lines) == 3
+    assert not any("&&" in line for line in setup_lines)
+
+    sandbox_root = tmp_path / "sandbox-root"
+    sandbox_root.mkdir()
+    (sandbox_root / "etc").write_text("not-a-directory", encoding="utf-8")
+    payload_marker = tmp_path / "payload-ran"
+    setup_script = "\n".join(
+        line.replace("/tmp/acp-root", str(sandbox_root)) for line in setup_lines
+    )
+    result = subprocess.run(
+        ["/bin/sh", "-c", f"set -eu\n{setup_script}\n: > {payload_marker}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result
+    assert not payload_marker.exists()
+
+
+def test_namespace_runtime_default_chroot_supports_usr_merged_layout(monkeypatch) -> None:
+    monkeypatch.setattr(Path, "is_file", lambda path: str(path) == "/usr/bin/chroot")
+
+    assert runtime_driver_module._default_chroot_path() == "/usr/bin/chroot"
+
+
+def test_namespace_runtime_parser_uses_adaptive_chroot_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(runtime_driver_module, "_default_chroot_path", lambda: TRUSTED_BIN)
+    definition = {
+        "name": "runtime",
+        "kind": "namespace_runtime",
+        "executable": TRUSTED_BIN,
+        "payload": "/bin/true",
+    }
+    for helper in ("systemctl_path", "unshare_path", "shell_path", "setpriv_path", "mount_path"):
+        definition[helper] = TRUSTED_BIN
+
+    parsed = parse_driver_definitions([definition], tmp_path)
+
+    assert parsed[0].option("chroot_path") == TRUSTED_BIN
+
+
+def test_live_namespace_runtime_hosts_payload_but_exposes_worker_boundary_gaps(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Measure the real resource driver; this is not registered-worker proof."""
+
+    if os.environ.get("ACP_RUN_NAMESPACE_INTEGRATION") != "1":
+        pytest.skip("set ACP_RUN_NAMESPACE_INTEGRATION=1 on a disposable supported Linux host")
+    if not sys.platform.startswith("linux"):
+        pytest.skip("NamespaceRuntimeDriver integration requires Linux user namespaces")
+
+    assert os.geteuid() != 0, "the live namespace driver must be exercised rootlessly"
+    assert Path("/sys/fs/cgroup/cgroup.controllers").is_file(), "unified cgroup v2 is required"
+    attempt_id = f"live-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    # The driver makes /tmp private before bind-mounting its inputs. Keep this
+    # source outside /tmp so the live probe exercises a viable host path.
+    worktree = Path.home() / f".acp-live-worktree-{uuid.uuid4().hex}"
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    credential_secret = f"fixture-provider-{uuid.uuid4().hex}"
+    credential_context = postgres_context(
+        tmp_path, attempt_id=attempt_id, password=credential_secret
+    )
+    assert credential_context.credential_registry is not None
+    credential_handle = (credential_context.credential_handles or {})["database"]
+    credential_source = Path(credential_handle.source_reference)
+
+    def remove_credential_source() -> None:
+        credential_source.unlink(missing_ok=True)
+        assert not credential_source.exists(), (
+            "fake credential source remained after test finalization"
+        )
+
+    request.addfinalizer(remove_credential_source)
+    expected_credential_digest = hashlib.sha256(credential_source.read_bytes()).hexdigest()
+    driver_context = DriverContext(
+        attempt_id=attempt_id,
+        task_id="task-2370-live-probe",
+        runtime_dir=runtime_dir,
+        expires_at=int(time.time()) + 90,
+        secret=b"test-secret",
+        environment={
+            "ACP_ATTEMPT_ID": attempt_id,
+            "ACP_WORKTREE": str(worktree),
+            "ACP_REPO_ROOT": str(worktree),
+            "ACP_EXPECTED_CREDENTIAL_SHA256": expected_credential_digest,
+        },
+        credential_registry=credential_context.credential_registry,
+        credential_handles={"runtime": credential_handle},
+    )
+    chroot_path = runtime_driver_module._default_chroot_path()
+    if not Path(chroot_path).is_file():
+        pytest.skip("NamespaceRuntimeDriver integration requires a trusted chroot executable")
+    driver_options = {
+        "payload": "/bin/sh /workspace/fake-agent.sh",
+        "unit_prefix": "acp-ns-it",
+        "wall_clock_seconds": "60",
+    }
+    apparmor_profile = os.environ.get("ACP_NAMESPACE_TEST_APPARMOR_PROFILE", "").strip()
+    if apparmor_profile:
+        driver_options["apparmor_profile"] = apparmor_profile
+        driver_options["apparmor_exec_path"] = os.environ.get(
+            "ACP_NAMESPACE_TEST_APPARMOR_EXEC", "/usr/bin/aa-exec"
+        )
+    driver = namespace_driver(
+        **driver_options,
+    )
+    assert driver._chroot() == chroot_path
+    unit = driver._unit(driver_context)
+    marker = None
+    marker_host_pid = None
+    worktree_identity = None
+    parent_fd = os.open(
+        worktree.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+
+    try:
+        os.mkdir(worktree.name, mode=0o700, dir_fd=parent_fd)
+        worktree_stat = os.stat(worktree.name, dir_fd=parent_fd, follow_symlinks=False)
+        assert stat.S_ISDIR(worktree_stat.st_mode)
+        worktree_identity = (worktree_stat.st_dev, worktree_stat.st_ino)
+        (worktree / "fake-agent.sh").write_text(
+            "#!/bin/sh\n"
+            "sleep 1\n"
+            "{\n"
+            "  printf 'inner_pid=%s\\n' \"$$\"\n"
+            "  printf 'home=%s\\n' \"$HOME\"\n"
+            "  printf 'cwd=%s\\n' \"$PWD\"\n"
+            "  printf 'etc_os_release_id=%s\\n' "
+            "\"$(sed -n 's/^ID=//p' /etc/os-release)\"\n"
+            "  if [ -r /etc/passwd ]; then echo host_etc_passwd=readable; "
+            "else echo host_etc_passwd=absent; fi\n"
+            "  if touch /workspace/should-not-write 2>/dev/null; then "
+            "echo workspace_write=allowed; else echo workspace_write=denied; fi\n"
+            '  if [ "${ACP_RUNTIME_CREDENTIAL:-}" = /credential ] && '
+            "[ -r /credential ]; then\n"
+            "    echo credential_path=present\n"
+            "    printf 'credential_sha256=%s\\n' "
+            "\"$(sha256sum /credential | cut -d' ' -f1)\"\n"
+            "    printf 'credential_mode=%s\\n' \"$(stat -c '%a' /credential)\"\n"
+            "    if printf x >> /credential 2>/dev/null; then "
+            "echo credential_write=allowed; else echo credential_write=denied; fi\n"
+            "  else echo credential_path=missing; fi\n"
+            '  if [ "${CREDENTIALS_DIRECTORY+x}" = x ]; then '
+            "echo credential_dir_env=present; else echo credential_dir_env=absent; fi\n"
+            "  if [ \"$(sha256sum /credential 2>/dev/null | cut -d' ' -f1)\" "
+            '= "$ACP_EXPECTED_CREDENTIAL_SHA256" ]; then '
+            "echo credential_digest_matches=yes; "
+            "else echo credential_digest_matches=no; fi\n"
+            "} > /work/acp-agent-marker.tmp\n"
+            "mv /work/acp-agent-marker.tmp /work/acp-agent-marker\n"
+            "sleep 30\n",
+            encoding="utf-8",
+        )
+
+        launch_calls: list[tuple[list[str], dict[str, str]]] = []
+
+        def audited_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+            launch_calls.append((list(argv), dict(env)))
+            return run_trusted(argv, cwd, env, timeout, credential)
+
+        launch = driver.setup(driver_context, audited_runner)
+        assert launch.get("exit_code") == 0, launch
+        present, observation = driver.probe(driver_context, run_trusted)
+        assert present is True, observation
+        assert observation.get("systemd_unit_invocation_id")
+        # systemd has copied the descriptor-backed credential at activation;
+        # the running namespace must continue to read only its unit copy.
+        credential_source.unlink()
+        assert not credential_source.exists()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and marker is None:
+            shown = run_trusted(
+                [
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "--property=MainPID",
+                    "--property=ControlGroup",
+                ],
+                runtime_dir,
+                {},
+                10,
+                None,
+            )
+            assert shown.get("exit_code") == 0, shown
+            properties = dict(
+                line.split("=", 1) for line in shown.get("stdout", "").splitlines() if "=" in line
+            )
+            control_group = properties.get("ControlGroup", "")
+            group_parts = Path(control_group.lstrip("/")).parts
+            assert group_parts and group_parts[0] == "user.slice", properties
+            assert all(part not in {"", ".", ".."} for part in group_parts), properties
+            cgroup_root = Path("/sys/fs/cgroup").resolve()
+            cgroup_dir = cgroup_root.joinpath(*group_parts).resolve()
+            assert cgroup_dir.is_relative_to(cgroup_root), properties
+            cgroup_procs = cgroup_dir / "cgroup.procs"
+            pids = {
+                int(value)
+                for value in cgroup_procs.read_text(encoding="ascii").splitlines()
+                if value.isdigit()
+            }
+            for pid in sorted(pids):
+                try:
+                    marker = Path(f"/proc/{pid}/root/work/acp-agent-marker").read_text(
+                        encoding="utf-8"
+                    )
+                    marker_host_pid = pid
+                    break
+                except OSError:
+                    pass
+            if marker is None:
+                time.sleep(0.05)
+
+        assert marker is not None and marker_host_pid is not None, observation
+        observed = dict(line.split("=", 1) for line in marker.splitlines() if "=" in line)
+        assert observed["home"] == "/work"
+        assert observed["cwd"] == "/work"
+        assert observed["etc_os_release_id"] == "acp-isolated-runtime"
+        assert Path("/etc/passwd").is_file()
+        assert observed["host_etc_passwd"] == "absent"
+        sandbox_os_release = Path(f"/proc/{marker_host_pid}/root/etc/os-release").read_text(
+            encoding="utf-8"
+        )
+        assert sandbox_os_release == (
+            'NAME="ACP"\nID=acp-isolated-runtime\nPRETTY_NAME="ACP isolated resource runtime"\n'
+        )
+        assert sandbox_os_release != Path("/etc/os-release").read_text(encoding="utf-8")
+        assert observed["workspace_write"] == "denied"
+        assert int(observed["inner_pid"]) > 0
+        assert observed["credential_path"] == "present"
+        assert observed["credential_digest_matches"] == "yes"
+        assert observed["credential_write"] == "denied"
+        assert int(observed["credential_mode"], 8) & 0o222 == 0
+        assert observed["credential_dir_env"] == "absent"
+        assert credential_secret not in marker
+        process_environ = Path(f"/proc/{marker_host_pid}/environ").read_bytes()
+        process_cmdline = Path(f"/proc/{marker_host_pid}/cmdline").read_bytes()
+        assert credential_secret.encode() not in process_environ
+        assert credential_secret.encode() not in process_cmdline
+        assert b"ACP_RUNTIME_CREDENTIAL=/credential" in process_environ
+        recorded_launch = json.dumps({"calls": launch_calls, "result": launch}, sort_keys=True)
+        assert credential_secret not in recorded_launch
+        assert credential_secret not in json.dumps(observation, sort_keys=True)
+        assert os.readlink(f"/proc/{marker_host_pid}/ns/pid") != os.readlink("/proc/self/ns/pid")
+        if apparmor_profile:
+            effective_label = (
+                Path(f"/proc/{marker_host_pid}/attr/current").read_text(encoding="utf-8").strip()
+            )
+            assert effective_label.split(" (", 1)[0] == apparmor_profile
+        assert not (worktree / "should-not-write").exists()
+        for root in (worktree, runtime_dir):
+            for path in root.rglob("*"):
+                if path.is_file():
+                    assert credential_secret.encode() not in path.read_bytes(), path
+    finally:
+        cleanup_proven = False
+        try:
+            driver.teardown(driver_context, run_trusted)
+            present_after, cleanup_observation = driver.probe(driver_context, run_trusted)
+            cleanup_proven = driver.cleanup_is_proven(present_after, cleanup_observation)
+            assert cleanup_proven, (cleanup_observation, str(worktree))
+            assert credential_secret not in json.dumps(cleanup_observation, sort_keys=True)
+            assert not credential_source.exists(), "fake credential source remained after teardown"
+            for path in tmp_path.rglob("*"):
+                if path.is_file():
+                    assert credential_secret.encode() not in path.read_bytes(), path
+        finally:
+            try:
+                try:
+                    credential_source.unlink(missing_ok=True)
+                    assert not credential_source.exists(), "fake credential source remained"
+                finally:
+                    if cleanup_proven and worktree_identity is not None:
+                        assert shutil.rmtree.avoids_symlink_attacks, "fd-safe rmtree is unavailable"
+                        current_stat = os.stat(
+                            worktree.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        assert stat.S_ISDIR(current_stat.st_mode)
+                        assert (current_stat.st_dev, current_stat.st_ino) == worktree_identity
+                        shutil.rmtree(worktree.name, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+
+
+def test_live_namespace_runtime_refuses_unit_when_rootless_namespaces_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    if os.environ.get("ACP_RUN_NAMESPACE_INTEGRATION") != "1":
+        pytest.skip("set ACP_RUN_NAMESPACE_INTEGRATION=1 on a disposable Linux host")
+    if not sys.platform.startswith("linux"):
+        pytest.skip("NamespaceRuntimeDriver integration requires Linux user namespaces")
+
+    attempt_id = f"preflight-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    driver_context = context(tmp_path, attempt_id=attempt_id)
+    driver = namespace_driver(
+        payload="/bin/true",
+        unit_prefix="acp-ns-preflight-it",
+        wall_clock_seconds="60",
+    )
+    present_before, before_observation = driver.probe(driver_context, run_trusted)
+    if before_observation.get("exit_code") != 0 or present_before is not False:
+        pytest.skip("a working systemd --user manager with no matching unit is required")
+
+    capability = run_trusted(
+        driver._namespace_preflight_argv(),
+        driver_context.runtime_dir,
+        driver._env(driver_context),
+        10,
+        None,
+    )
+    if capability.get("exit_code") == 0 and not capability.get("timed_out"):
+        pytest.skip("rootless namespace prerequisites are available on this host")
+
+    try:
+        with pytest.raises(DriverError) as error:
+            driver.setup(driver_context, run_trusted)
+        assert error.value.code == "namespace_unavailable"
+        present_after, observation = driver.probe(driver_context, run_trusted)
+        assert present_after is False
+        assert observation.get("absence_proved_by") == "systemd-unit-not-found"
+    finally:
+        driver.teardown(driver_context, run_trusted)
+        cleaned, cleanup_observation = driver.probe(driver_context, run_trusted)
+        assert driver.cleanup_is_proven(cleaned, cleanup_observation)
+
+
 def test_namespace_runtime_exports_only_sandbox_paths_to_the_service(tmp_path: Path) -> None:
     driver = namespace_driver(egress="allow", read_only_paths="/opt/base")
     runner, calls = recording_runner()
     driver.setup(context(tmp_path), runner)
-    argv = calls[0]
+    argv = namespace_unit_argv(calls)
 
     assert "--working-directory=/" in argv
     assert "--setenv=ACP_WORKTREE=/workspace" in argv

@@ -26,7 +26,11 @@ from typing import Any
 from ..worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from ..worker_trampoline import MONITOR_MODE as MONITOR_MODE
 from .common import SupervisorError, utc_now
-from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
+from .sandbox_execution_journal import (
+    _runc_launch_gate_lock_for_execution,
+    _sandbox_execution_cleanup_is_verified,
+    _sandbox_execution_launch_stop_reason,
+)
 
 _MAX_WORKER_LOG_BYTES = 8 * 1024 * 1024
 _WORKER_LOG_TRUNCATION_MARKER = b"\n[ACP worker output truncated at 8 MiB]\n"
@@ -47,8 +51,192 @@ def _read_worker_output_chunk(
     return written, written < len(chunk), False
 
 
+def _worker_command_digest(command: Sequence[str]) -> str:
+    """Fingerprint argv for receipts; the digest is correlation, not confidentiality."""
+
+    return hashlib.sha256(
+        json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+
+
 class WorkersMixin:
     """Worker launch reservation, registration, exit recording and termination."""
+
+    def _cancel_sandbox_execution_monitor(
+        self,
+        execution: dict[str, Any],
+        *,
+        monitor_client: Any | None = None,
+        _allow_ambiguous_failure: bool = False,
+    ) -> dict[str, Any]:
+        """Cancel a journaled execution only through its authenticated monitor."""
+
+        from .sandbox_monitor_ipc import (
+            SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS,
+            SandboxMonitorControlClient,
+            SandboxMonitorIPCError,
+        )
+        from .sandbox_monitor_lifecycle import (
+            reconnect_sandbox_monitor,
+            sandbox_monitor_cancel_request_id,
+            sandbox_monitor_control_paths,
+        )
+        from .sandbox_monitor_receipt import SandboxMonitorReceipt, SandboxMonitorReceiptError
+
+        identity = (
+            execution["attempt_id"],
+            execution["claim_token"],
+            execution["execution_id"],
+        )
+
+        def durable_stop_result(monitor_phase: str) -> dict[str, Any]:
+            durable = self._sandbox_execution_get(execution["attempt_id"])
+            with self.connect() as connection:
+                launch_stop_reason = (
+                    _sandbox_execution_launch_stop_reason(connection, durable)
+                    if durable is not None
+                    else None
+                )
+                cleanup_verified = (
+                    _sandbox_execution_cleanup_is_verified(connection, execution["attempt_id"])
+                    if durable is not None
+                    else False
+                )
+            durable_stop_reason = (
+                (durable["stop_reason"] or launch_stop_reason) if durable is not None else None
+            )
+            ambiguous_failure = (
+                _allow_ambiguous_failure
+                and durable is not None
+                and durable.get("phase") == "ambiguous"
+                and bool(durable.get("failure_reason"))
+            )
+            if (
+                durable is None
+                or durable["claim_token"] != identity[1]
+                or durable["execution_id"] != identity[2]
+                or (not durable_stop_reason and not ambiguous_failure)
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "monitor stop acknowledgement has no matching durable stop intent",
+                )
+            return {
+                "attempt_id": execution["attempt_id"],
+                "execution_id": execution["execution_id"],
+                "outcome": "stop_pending"
+                if durable["phase"] in {"launched", "ambiguous"}
+                else "ok",
+                "phase": durable["phase"],
+                "stop_requested": True,
+                "monitor_phase": monitor_phase,
+                "cleanup_verified": cleanup_verified,
+            }
+
+        expected_scope = {
+            "scope_unit": execution.get("scope_unit"),
+            "scope_invocation_id": execution.get("scope_invocation_id"),
+            "scope_control_group": execution.get("cgroup_path"),
+        }
+        if any(not isinstance(value, str) or not value for value in expected_scope.values()):
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "durable scope identity is unavailable; execution and resource fences remain held",
+            )
+        try:
+            if monitor_client is None:
+                control_directory, receipt_path, socket_path = sandbox_monitor_control_paths(
+                    state_path=execution["state_path"], expected_identity=identity
+                )
+                client = reconnect_sandbox_monitor(
+                    receipt_path=receipt_path,
+                    control_directory=control_directory,
+                    socket_path=socket_path,
+                    expected_identity=identity,
+                    timeout_seconds=SANDBOX_MONITOR_OPERATION_TIMEOUT_SECONDS,
+                )
+            else:
+                receipt = getattr(monitor_client, "_receipt", None)
+                if (
+                    type(monitor_client) is not SandboxMonitorControlClient
+                    or type(receipt) is not SandboxMonitorReceipt
+                    or (
+                        receipt.attempt_id,
+                        receipt.claim_token,
+                        receipt.execution_id,
+                    )
+                    != identity
+                    or receipt.controller_pid != os.getpid()
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_monitor_identity_mismatch",
+                        "cached monitor client is not bound to this process and execution",
+                    )
+                client = monitor_client
+            status = client.status()
+            if status.outcome != "ok":
+                raise SupervisorError(
+                    "sandbox_execution_monitor_ambiguous",
+                    "monitor status is ambiguous; execution and resource fences remain held",
+                )
+            if any(status.payload.get(key) != value for key, value in expected_scope.items()):
+                raise SupervisorError(
+                    "sandbox_execution_monitor_identity_mismatch",
+                    "monitor status does not match the journaled scope; execution and resource fences remain held",
+                )
+            phase = status.payload.get("phase")
+            if phase not in {
+                "reserved",
+                "launched",
+                "running",
+                "stopping",
+                "exited",
+                "cleanup_verified",
+            }:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_ambiguous",
+                    "monitor returned an unknown phase; execution and resource fences remain held",
+                )
+            if phase in {"exited", "cleanup_verified"}:
+                # An exit report does not satisfy the journal's independent
+                # cleanup verifier. Do not alter the durable execution phase.
+                monitor_phase = phase
+            else:
+                cancelled = client.cancel(sandbox_monitor_cancel_request_id(identity))
+                if cancelled.outcome != "ok" or cancelled.payload.get("phase") not in {
+                    "stopping",
+                    "exited",
+                }:
+                    raise SupervisorError(
+                        "sandbox_execution_monitor_ambiguous",
+                        "monitor cancellation is ambiguous; execution and resource fences remain held",
+                    )
+                monitor_phase = cancelled.payload["phase"]
+        except SupervisorError as error:
+            if error.code in {
+                "sandbox_execution_monitor_ambiguous",
+                "sandbox_execution_monitor_identity_mismatch",
+            }:
+                raise
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "authenticated monitor control is unavailable; refusing host-PID signaling and retaining execution fences",
+            ) from error
+        except (SandboxMonitorIPCError, SandboxMonitorReceiptError, OSError, TimeoutError) as error:
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "authenticated monitor control is unavailable; refusing host-PID signaling and retaining execution fences",
+            ) from error
+        except Exception as error:
+            # The monitor is an authorization boundary. Unexpected failure is
+            # not permission to fall back to a PID, process group, or systemctl
+            # action in the supervisor.
+            raise SupervisorError(
+                "sandbox_execution_monitor_unavailable",
+                "authenticated monitor control failed; refusing host-PID signaling and retaining execution fences",
+            ) from error
+
+        return durable_stop_result(monitor_phase)
 
     def run_worker(
         self,
@@ -65,6 +253,7 @@ class WorkersMixin:
         command = tuple(command)
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
+        command_digest = _worker_command_digest(command)
         if self.config.oci_runc_executable is not None:
             raise SupervisorError(
                 "sandbox_executor_unavailable",
@@ -76,17 +265,21 @@ class WorkersMixin:
         # This is only a side-effect-free preflight: _reserve_worker_launch
         # retains the transactional check that arbitrates concurrent claims.
         self._preflight_direct_worker_launch(attempt_id, claim_token, credential)
-        attempt = self.heartbeat(
-            attempt_id,
-            claim_token,
-            {"phase": "launching", "command": list(command)},
-            credential=credential,
-        )
         if not sys.platform.startswith("linux"):
             raise SupervisorError(
                 "process_containment_unavailable",
                 "long-running workers require Linux child-subreaper containment",
             )
+        attempt = self.heartbeat(
+            attempt_id,
+            claim_token,
+            {
+                "phase": "launching",
+                "command_digest": command_digest,
+                "command_argument_count": len(command),
+            },
+            credential=credential,
+        )
         worker_env = self._child_env(
             self._phase_runtime_env(
                 self._runtime_env(attempt_id), "worker", Path(attempt["worktree"])
@@ -226,7 +419,8 @@ class WorkersMixin:
                             {
                                 "attempt_id": attempt_id,
                                 "pid": process.pid,
-                                "command": list(command),
+                                "command_digest": command_digest,
+                                "command_argument_count": len(command),
                             },
                         )
                 if launch_fenced:
@@ -625,7 +819,18 @@ class WorkersMixin:
                 "SELECT state FROM runtime_environments WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()
-            if not attempt["termination_proof"] or not runtime or runtime["state"] != "released":
+            # Sandbox-only attempts have no separate registered worker PID to
+            # prove dead; a registered PID still requires explicit proof.
+            worker_identity_unproven = (
+                (attempt["pid"] is not None and not attempt["termination_proof"])
+                or (
+                    attempt["pid"] is None
+                    and (attempt["pid_identity"] or attempt["termination_proof"])
+                )
+                or attempt["launch_owner_pid"] is not None
+                or bool(attempt["launch_owner_identity"])
+            )
+            if worker_identity_unproven or not runtime or runtime["state"] != "released":
                 raise SupervisorError(
                     "worker_cleanup_unproven",
                     "worker identity and runtime cleanup are not both proven",
@@ -678,9 +883,7 @@ class WorkersMixin:
     ) -> str:
         """Persist the blocked command identity before releasing its exec gate."""
 
-        command_digest = hashlib.sha256(
-            json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
-        ).hexdigest()
+        command_digest = _worker_command_digest(command)
         if (
             command_pid < 1
             or command_pid == monitor_pid
@@ -812,6 +1015,97 @@ class WorkersMixin:
                 raise SupervisorError("attempt_not_found", f"attempt {attempt_id} not found")
             self._authenticate_attempt(connection, row, credential)
             attempt = self._attempt_view(connection, row)
+        # A sandbox execution is stopped only by its exact authenticated
+        # systemd-owned monitor. Reconnection checks the fenced identity before
+        # reading the existing key or contacting the socket; any failure keeps
+        # the execution fenced and never reaches the legacy PID path.
+        execution = self._sandbox_execution_get(attempt_id)
+        if execution is not None:
+            if execution["phase"] in {"exited", "cleanup_reported", "cleanup_verified"}:
+                with self.connect() as connection:
+                    cleanup_verified = _sandbox_execution_cleanup_is_verified(
+                        connection, attempt_id
+                    )
+                    launch_stop_reason = _sandbox_execution_launch_stop_reason(
+                        connection, execution
+                    )
+                return {
+                    "attempt_id": attempt_id,
+                    "execution_id": execution["execution_id"],
+                    "outcome": "ok",
+                    "phase": execution["phase"],
+                    "stop_requested": bool(execution.get("stop_reason") or launch_stop_reason),
+                    "monitor_phase": None,
+                    "cleanup_verified": cleanup_verified,
+                }
+            if execution["phase"] not in {"launched", "running", "stopping"}:
+                raise SupervisorError(
+                    "sandbox_execution_monitor_unavailable",
+                    "journaled execution has no stoppable monitor-owned scope; execution and resource fences remain held",
+                )
+            with self.connect() as connection:
+                launch_stop_reason = (
+                    _sandbox_execution_launch_stop_reason(connection, execution)
+                    if execution["phase"] == "launched"
+                    else None
+                )
+            stop_reason = execution.get("stop_reason") or launch_stop_reason or "terminate_worker"
+            try:
+                self._sandbox_execution_request_stop(
+                    attempt_id,
+                    execution["claim_token"],
+                    stop_reason,
+                    credential=credential,
+                )
+            except SupervisorError as error:
+                if error.code != "sandbox_execution_transition_conflict":
+                    raise
+                # A timeout may have durably stopped this exact execution
+                # after our snapshot. Adopt only that fenced stopping row;
+                # never replace the first stop reason or soften other errors.
+                stopped_execution = self._sandbox_execution_get(attempt_id)
+                if (
+                    stopped_execution is None
+                    or (
+                        stopped_execution.get("attempt_id"),
+                        stopped_execution.get("claim_token"),
+                        stopped_execution.get("execution_id"),
+                    )
+                    != (
+                        attempt_id,
+                        execution["claim_token"],
+                        execution["execution_id"],
+                    )
+                    or stopped_execution.get("phase") != "stopping"
+                    or not stopped_execution.get("stop_reason")
+                ):
+                    raise
+            else:
+                stopped_execution = self._sandbox_execution_get(attempt_id)
+            if (
+                stopped_execution is None
+                or stopped_execution["claim_token"] != execution["claim_token"]
+                or stopped_execution["execution_id"] != execution["execution_id"]
+            ):
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "durable execution identity changed after recording stop intent",
+                )
+            with _runc_launch_gate_lock_for_execution(
+                attempt_id,
+                stopped_execution["claim_token"],
+                stopped_execution["execution_id"],
+            ) as locked_handle:
+                if locked_handle is not None:
+                    # Closing an unreleased init gate makes its fixed trampoline
+                    # exit on EOF; the monitor still handles exact-scope stop.
+                    locked_handle._close_gate_locked()
+                monitor_client = (
+                    locked_handle._monitor_client if locked_handle is not None else None
+                )
+            return self._cancel_sandbox_execution_monitor(
+                stopped_execution, monitor_client=monitor_client
+            )
         if not attempt["pid"]:
             raise SupervisorError("worker_not_running", "attempt has no running worker")
         if attempt["pid"] < 0:

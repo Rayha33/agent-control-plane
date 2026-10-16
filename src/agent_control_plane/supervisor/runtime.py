@@ -774,10 +774,14 @@ class RuntimeMixin:
         for item in evidence:
             observation = item.proof.get("observation")
             observation = observation if isinstance(observation, dict) else {}
-            active_state = observation.get("active_state") if item.ok else None
+            # A successful read of ActiveState is useful status, even when an
+            # inactive unit is not strong enough to prove teardown. Keep that
+            # diagnostic separate from the stricter verify/recovery result.
+            observation_ok = observation.get("exit_code", 0) == 0
+            active_state = observation.get("active_state") if observation_ok else None
             active_states = {"active", "activating", "deactivating", "reloading"}
             inactive_states = {"inactive", "failed"}
-            if not item.ok:
+            if not observation_ok:
                 present: bool | None = None
             elif observation.get("absence_proved_by") == "systemd-unit-not-found":
                 present = False
@@ -788,15 +792,19 @@ class RuntimeMixin:
             else:
                 # Missing or unrecognized ActiveState is not proof of absence.
                 present = None
-            available = item.ok and present is True
+            available = observation_ok and present is True
+            error_code = item.proof.get("code")
+            if error_code is None and observation.get("absence_conflict"):
+                error_code = "systemd_absence_conflict"
+            if error_code is None and not observation_ok:
+                error_code = "runtime_probe_unavailable"
             drivers.append(
                 {
                     "driver": item.driver,
                     "active_state": active_state or None,
                     "present": present,
                     "available": available,
-                    "error_code": item.proof.get("code")
-                    or (None if item.ok else "runtime_probe_unavailable"),
+                    "error_code": error_code,
                     # systemd can return useful-looking partial stdout alongside
                     # an error, and inactive-unit counters can reflect stale
                     # state. Only an active, successful probe is a current sample.

@@ -116,7 +116,13 @@ def _pin_test_rootfs(rootfs: Path) -> oci_worker._TrustedRootfs:
     )
 
 
-def compile_config(bundle: Path, workspace: Snapshot, *, private_git: bool = False) -> dict:
+def compile_config(
+    bundle: Path,
+    workspace: Snapshot,
+    *,
+    private_git: bool = False,
+    apparmor_profile: str | None = None,
+) -> dict:
     rootfs = bundle / "rootfs"
     rootfs_pin = _pin_test_rootfs(rootfs)
     return build_oci_worker_config(
@@ -129,6 +135,7 @@ def compile_config(bundle: Path, workspace: Snapshot, *, private_git: bool = Fal
         pids_limit=32,
         cpu_quota_us=100_000,
         private_git=private_git,
+        apparmor_profile=apparmor_profile,
     )
 
 
@@ -650,11 +657,11 @@ def test_runc_version_probe_requires_the_exact_release_and_uses_a_clean_environm
         os.fstat(descriptor)
         assert argv == [str(pin.path), "--version"]
         calls.append((argv, kwargs))
-        return 0, "runc version 1.3.5\nspec: 1.2.1\n"
+        return 0, "runc version 1.5.2\nspec: 1.2.1\n"
 
     monkeypatch.setattr(oci_worker, "_run_bounded_command", fake_run)
 
-    assert oci_worker._probe_trusted_runc_version(pin, "1.3.5") == "1.3.5"
+    assert oci_worker._probe_trusted_runc_version(pin, "1.5.2") == "1.5.2"
     argv, kwargs = calls[0]
     assert argv[1] == "--version"
     assert len(kwargs["pass_fds"]) == 1
@@ -680,18 +687,18 @@ def test_pinned_runc_adapter_uses_recursive_private_for_exact_probed_release(
     def fake_run(argv: list[str], **kwargs: Any) -> tuple[int, str]:
         os.fstat(kwargs["exec_fd"])
         calls.append((argv, kwargs))
-        return 0, "runc version 1.3.5\nspec: 1.2.1\n"
+        return 0, "runc version 1.5.2\nspec: 1.2.1\n"
 
     monkeypatch.setattr(oci_worker, "_run_bounded_command", fake_run)
     config = compile_config(bundle, workspace)
 
     adapted = oci_worker._apply_pinned_runc_recursive_private_policy(
-        config, pin, expected_version="1.3.5"
+        config, pin, expected_version="1.5.2"
     )
     adapted_config = json.loads(adapted.config_json)
 
     assert adapted.executable is pin
-    assert adapted.version == "1.3.5"
+    assert adapted.version == "1.5.2"
     assert adapted_config["linux"]["rootfsPropagation"] == "rprivate"
     configured_rootfs = oci_worker.rootfs_tree_manifest(bundle / "rootfs")
     assert adapted.rootfs_sha256 == configured_rootfs["rootfs_sha256"]
@@ -711,10 +718,10 @@ def test_pinned_runc_worker_config_rejects_a_different_executable_pin(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
 
     with pytest.raises(SupervisorError, match="exact executable") as error:
@@ -732,10 +739,10 @@ def test_pinned_worker_diagnostic_uses_bound_executable_and_exact_config_bytes(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle_root, workspace_snapshot), pin, expected_version="1.3.5"
+        compile_config(bundle_root, workspace_snapshot), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -780,7 +787,7 @@ def test_private_bundle_launcher_script_is_valid_python() -> None:
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux namespaces")
-def test_private_bundle_launcher_reaps_client_on_setup_failure(
+def test_private_bundle_launcher_reaps_client_on_submission_authorization_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if os.environ.get("ACP_RUN_OCI_INTEGRATION") != "1":
@@ -794,10 +801,10 @@ def test_private_bundle_launcher_reaps_client_on_setup_failure(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -815,12 +822,16 @@ def test_private_bundle_launcher_reaps_client_on_setup_failure(
     monkeypatch.setattr(oci_worker.subprocess, "Popen", capture_popen)
     callback_reached = False
 
-    def fail_before_runc_exec(_pid: int, _private_bundle: Path, _bundle_fd: int) -> None:
+    def fail_submission_authorization(target: oci_worker._RuncLaunchTarget) -> None:
         nonlocal callback_reached
         callback_reached = True
-        raise RuntimeError("injected private-bundle setup failure")
+        assert target.launch_mode == "private_bundle"
+        assert target.container_id == "acp-worker-123"
+        raise RuntimeError("injected launch-submission authorization failure")
 
-    with pytest.raises(SupervisorError, match="injected private-bundle setup failure") as error:
+    with pytest.raises(
+        SupervisorError, match="injected launch-submission authorization failure"
+    ) as error:
         oci_worker._spawn_pinned_runc_with_private_bundle(
             pin,
             argv,
@@ -828,7 +839,7 @@ def test_private_bundle_launcher_reaps_client_on_setup_failure(
             binding.config_json,
             rootfs_sha256=binding.rootfs_sha256,
             rootfs_closure_sha256=binding.rootfs_closure_sha256,
-            _before_runc_exec=fail_before_runc_exec,
+            _authorize_runc_submission=fail_submission_authorization,
         )
 
     assert error.value.code == "sandbox_bundle_setup_failed"
@@ -846,10 +857,10 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -865,6 +876,9 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
         spawned.append((executable, tuple(argv), bundle_root, config_json, kwargs))
         return object()
 
+    def authorize_submission(_target: oci_worker._RuncLaunchTarget) -> object:
+        return object()
+
     monkeypatch.setattr(oci_worker, "_spawn_pinned_runc_with_private_bundle", private_spawn)
 
     result = oci_worker.spawn_pinned_runc(
@@ -874,6 +888,7 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
         workspace.root,
         state_root / "worker.pid",
         "acp-worker-123",
+        _authorize_runc_submission=authorize_submission,
     )
 
     assert result is not None
@@ -886,6 +901,7 @@ def test_supported_pinned_worker_launch_uses_private_bundle_owner(
     assert config_json == binding.config_json
     assert launch_options["rootfs_sha256"] == binding.rootfs_sha256
     assert launch_options["rootfs_closure_sha256"] == binding.rootfs_closure_sha256
+    assert launch_options["_authorize_runc_submission"] is authorize_submission
 
 
 def test_pinned_spawn_rejects_rootfs_changed_after_config_compilation_before_launch(
@@ -897,11 +913,11 @@ def test_pinned_spawn_rejects_rootfs_changed_after_config_compilation_before_lau
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     config = compile_config(bundle, workspace)
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        config, pin, expected_version="1.3.5"
+        config, pin, expected_version="1.5.2"
     )
     configured_rootfs = oci_worker.rootfs_tree_manifest(bundle / "rootfs")
     assert binding.rootfs_sha256 == configured_rootfs["rootfs_sha256"]
@@ -950,10 +966,10 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -998,6 +1014,7 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     workspace_mount = next(
         mount for mount in config["mounts"] if mount["destination"] == "/workspace"
     )
+    resources = config["linux"]["resources"]
 
     assert bound.argv[2] == "/proc/self/fd/66"
     assert bound.argv[6] == "/proc/self/fd/64"
@@ -1005,6 +1022,10 @@ def test_private_bundle_target_binds_runtime_paths_and_workspace_anchor(
     assert workspace_mount["source"] == "/dev/shm/acp-acp-worker-123-workspace"
     assert target.state_path == str(state_root)
     assert target.workspace_path == str(workspace.root)
+    assert target.memory_limit_bytes == resources["memory"]["limit"]
+    assert target.cpu_quota == resources["cpu"]["quota"]
+    assert target.cpu_period == resources["cpu"]["period"]
+    assert target.pids_limit == resources["pids"]["limit"]
     assert bound.config_sha256 == hashlib.sha256(config_json).hexdigest()
     assert config_json != binding.config_json
 
@@ -1053,10 +1074,10 @@ def test_same_uid_can_replace_diagnostic_bundle_config_after_validation(
     monkeypatch.setattr(
         oci_worker,
         "_run_bounded_command",
-        lambda _argv, **_kwargs: (0, "runc version 1.3.5\nspec: 1.2.1\n"),
+        lambda _argv, **_kwargs: (0, "runc version 1.5.2\nspec: 1.2.1\n"),
     )
     binding = oci_worker._apply_pinned_runc_recursive_private_policy(
-        compile_config(bundle, workspace), pin, expected_version="1.3.5"
+        compile_config(bundle, workspace), pin, expected_version="1.5.2"
     )
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -1117,7 +1138,7 @@ def test_pinned_runc_adapter_rejects_unregistered_config_before_probe(
 
     with pytest.raises(SupervisorError, match="compiler-issued OCI config") as error:
         oci_worker._apply_pinned_runc_recursive_private_policy(
-            config, pin, expected_version="1.3.5"
+            config, pin, expected_version="1.5.2"
         )
 
     assert error.value.code == "invalid_oci_worker_policy"
@@ -1142,15 +1163,16 @@ def test_pinned_runc_adapter_rejects_mutated_compiler_config_before_probe(
 
     with pytest.raises(SupervisorError, match="mutated after build") as error:
         oci_worker._apply_pinned_runc_recursive_private_policy(
-            config, pin, expected_version="1.3.5"
+            config, pin, expected_version="1.5.2"
         )
 
     assert error.value.code == "invalid_oci_worker_policy"
     assert not probe_called
 
 
+@pytest.mark.parametrize("unsupported_version", ["1.3.5", "1.3.6", "1.4.3"])
 def test_pinned_runc_adapter_rejects_other_versions_before_probe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsupported_version: str
 ) -> None:
     pin = pinned_runc(tmp_path)
     probe_called = False
@@ -1166,7 +1188,7 @@ def test_pinned_runc_adapter_rejects_other_versions_before_probe(
         oci_worker._apply_pinned_runc_recursive_private_policy(
             {"linux": {"rootfsPropagation": "private"}},
             pin,
-            expected_version="1.3.6",
+            expected_version=unsupported_version,
         )
 
     assert error.value.code == "invalid_oci_runtime_version"
@@ -1188,7 +1210,7 @@ def test_pinned_runc_adapter_rejects_a_different_observed_release(
 
     with pytest.raises(SupervisorError) as error:
         oci_worker._apply_pinned_runc_recursive_private_policy(
-            config, pin, expected_version="1.3.5"
+            config, pin, expected_version="1.5.2"
         )
 
     assert error.value.code == "invalid_oci_runtime_version"
@@ -1198,10 +1220,10 @@ def test_pinned_runc_adapter_rejects_a_different_observed_release(
 @pytest.mark.parametrize(
     ("stdout", "returncode", "expected_version"),
     [
-        ("runc version 1.3.5\nspec: 1.2.1", 0, "1.3.4"),
-        ("runc version 1.3.5-rc1", 0, "1.3.5"),
-        ("not runc", 0, "1.3.5"),
-        ("runc version 1.3.5", 1, "1.3.5"),
+        ("runc version 1.5.2\nspec: 1.2.1", 0, "1.3.4"),
+        ("runc version 1.5.2-rc1", 0, "1.5.2"),
+        ("not runc", 0, "1.5.2"),
+        ("runc version 1.5.2", 1, "1.5.2"),
     ],
 )
 def test_runc_version_probe_fails_closed(
@@ -1372,7 +1394,7 @@ def test_runc_version_probe_fails_closed_without_linux_fd_exec(tmp_path: Path) -
     pin = pinned_runc(tmp_path)
 
     with pytest.raises(SupervisorError, match="require Linux fd-based execve") as error:
-        oci_worker._probe_trusted_runc_version(pin, "1.3.5")
+        oci_worker._probe_trusted_runc_version(pin, "1.5.2")
 
     assert error.value.code == "invalid_oci_runtime_version"
 
@@ -1381,11 +1403,26 @@ def test_open_runc_fd_rejects_inode_replaced_after_initial_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pin = pinned_runc(tmp_path)
+    # Resolve a regular system binary: some Linux images make /bin/echo itself
+    # a symlink, which O_NOFOLLOW correctly refuses before the inode check.
+    replacement = next(
+        (
+            candidate.resolve()
+            for candidate in (Path("/usr/bin/sleep"), Path("/bin/sleep"))
+            if candidate.is_file()
+        ),
+        None,
+    )
+    assert replacement is not None
+    replacement_info = replacement.stat()
+    assert stat.S_ISREG(replacement_info.st_mode)
+    assert replacement_info.st_uid == 0
+    assert (replacement_info.st_dev, replacement_info.st_ino) != (pin.device, pin.inode)
     real_open = os.open
 
     def replaced_open(path, flags, *args, **kwargs):
         if Path(path) == pin.path:
-            return real_open("/bin/echo", flags, *args, **kwargs)
+            return real_open(replacement, flags, *args, **kwargs)
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(oci_worker, "_verify_trusted_runc_executable", lambda _pin: pin.path)
@@ -1634,6 +1671,11 @@ def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) ->
         (("mounts", 1, "options", 4), "nr_inodes=0"),
         (("mounts", 3, "options", 3), "size=9223372036854775808"),
         (("mounts", 4, "options", 3), "size=" + ("9" * 5000)),
+        (("linux", "cgroupsPath"), "user.slice:acp:acp-worker-123"),
+        (
+            ("linux", "cgroupsPath"),
+            f"user-acp-{hashlib.sha256(b'acp-worker-124').hexdigest()}.slice:acp:acp-worker-123",
+        ),
     ],
     ids=(
         "root-readonly-int-alias",
@@ -1645,6 +1687,8 @@ def test_compiled_oci_worker_config_matches_pinned_oci_schema(tmp_path: Path) ->
         "dev-tmpfs-unbounded-inodes",
         "tmpfs-over-int64",
         "tmpfs-unbounded-decimal",
+        "shared-user-parent-slice",
+        "parent-slice-bound-to-different-container",
     ),
 )
 def test_complete_oci_worker_policy_rejects_type_confusion_and_unbounded_tmpfs(
@@ -1751,11 +1795,34 @@ def test_oci_policy_encodes_mutable_snapshot_and_private_ephemeral_mounts(
         "pids": {"limit": 32},
         "devices": [{"allow": False, "access": "rwm"}],
     }
-    assert linux["cgroupsPath"] == "user.slice:acp:acp-worker-123"
+    expected_slice = f"user-acp-{hashlib.sha256(b'acp-worker-123').hexdigest()}.slice"
+    assert linux["cgroupsPath"] == f"{expected_slice}:acp:acp-worker-123"
+    assert oci_worker._oci_worker_cgroups_path("acp-worker-124") != linux["cgroupsPath"]
     assert linux["rootfsPropagation"] == "private"
     assert "architectures" not in linux["seccomp"]
     assert linux["uidMappings"][0] == {"containerID": 0, "hostID": os.geteuid(), "size": 1}
     assert linux["gidMappings"][0] == {"containerID": 0, "hostID": os.getegid(), "size": 1}
+
+
+def test_oci_policy_can_bind_an_explicit_worker_apparmor_profile(tmp_path: Path) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+
+    config = compile_config(bundle, workspace, apparmor_profile="acp-worker-test")
+
+    assert config["process"]["apparmorProfile"] == "acp-worker-test"
+    oci_worker._validate_complete_oci_worker_policy(json.loads(json.dumps(config)))
+
+
+@pytest.mark.parametrize("profile", ["", "../escape", "profile name", "x\\ny", ":ns://worker"])
+def test_oci_policy_rejects_unsafe_worker_apparmor_profile_name(
+    tmp_path: Path, profile: str
+) -> None:
+    bundle, workspace = oci_fixture(tmp_path)
+
+    with pytest.raises(SupervisorError, match="AppArmor profile name is invalid") as error:
+        compile_config(bundle, workspace, apparmor_profile=profile)
+
+    assert error.value.code == "invalid_oci_worker_policy"
 
 
 def test_oci_worker_seccomp_profile_is_native_only_and_denies_high_risk_syscalls() -> None:

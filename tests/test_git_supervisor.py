@@ -359,7 +359,7 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
 ) -> None:
     write_config(repo)
     rootfs, rootfs_digest = append_oci_config(
-        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"'
+        repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"'
     )
     pin = object()
     calls: list[tuple[str, str]] = []
@@ -370,8 +370,8 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
 
     def fake_probe(executable, expected_version: str) -> str:
         assert executable is pin
-        assert expected_version == "1.3.5"
-        return "1.3.5"
+        assert expected_version == "1.5.2"
+        return "1.5.2"
 
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", fake_pin)
     monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", fake_probe)
@@ -379,7 +379,7 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     supervisor = GitSupervisor(repo)
 
     assert supervisor.config.oci_runc_executable is pin
-    assert supervisor.config.oci_runc_version == "1.3.5"
+    assert supervisor.config.oci_runc_version == "1.5.2"
     assert supervisor.config.oci_rootfs_pin.path == rootfs.resolve()
     assert supervisor.config.oci_rootfs_pin.sha256 == rootfs_digest
     assert (
@@ -389,6 +389,32 @@ def test_oci_runc_config_pins_executable_and_records_verified_version(
     assert calls == [("/usr/bin/runc", str(repo.resolve()))]
 
 
+@pytest.mark.parametrize("unsupported_version", ["1.3.5", "1.3.6", "1.4.3"])
+def test_oci_runc_config_rejects_non_pinned_runc_before_opening_runtime(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, unsupported_version: str
+) -> None:
+    write_config(repo)
+    append_oci_config(
+        repo,
+        f'runc_executable = "/usr/bin/runc"\nrunc_version = "{unsupported_version}"',
+    )
+    opened: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        opened.append("runtime")
+        pytest.fail("unsupported runc version must be rejected before opening runtime files")
+
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_rootfs", forbidden)
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", forbidden)
+    monkeypatch.setattr(oci_worker_module, "_probe_trusted_runc_version", forbidden)
+
+    with pytest.raises(SupervisorError, match="supported exact release 1.5.2") as error:
+        GitSupervisor(repo)
+
+    assert error.value.code == "invalid_config"
+    assert not opened
+
+
 def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> None:
     write_config(repo)
     rootfs, digest = _create_test_oci_rootfs(repo)
@@ -396,7 +422,7 @@ def test_oci_config_rejects_rootfs_drift_from_operator_digest(repo: Path) -> Non
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write(
             '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
-            'runc_version = "1.3.5"\n'
+            'runc_version = "1.5.2"\n'
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
             f"rootfs_closure_sha256 = {json.dumps(closure_digest)}\n"
@@ -415,7 +441,7 @@ def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
         handle.write(
             '\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\n'
-            'runc_version = "1.3.5"\n'
+            'runc_version = "1.5.2"\n'
             f"rootfs_path = {json.dumps(str(rootfs))}\n"
             f"rootfs_sha256 = {json.dumps(digest)}\n"
             f"rootfs_closure_sha256 = {json.dumps('0' * 64)}\n"
@@ -430,7 +456,7 @@ def test_oci_config_rejects_rootfs_closure_drift(repo: Path) -> None:
 def test_oci_config_requires_a_rootfs_path_and_digest(repo: Path) -> None:
     write_config(repo)
     with (repo / "acp.toml").open("a", encoding="utf-8") as handle:
-        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\n')
+        handle.write('\n[sandbox.oci]\nrunc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"\n')
 
     with pytest.raises(
         SupervisorError, match="requires runc_executable.*rootfs_sha256.*rootfs_closure_sha256"
@@ -444,7 +470,7 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_config(repo)
-    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"')
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
     pin = object()
     monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
     monkeypatch.setattr(
@@ -457,6 +483,8 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     created = task(supervisor, "alpha.txt")
     attempt = supervisor.claim(created["id"], "worker")
     marker = repo / "host-fallback-worker-ran"
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
 
     def heartbeat_must_not_run(*_args, **_kwargs):
         pytest.fail("configured OCI fallback must fail before worker heartbeat")
@@ -479,20 +507,52 @@ def test_oci_configured_worker_fails_closed_before_host_fallback(
     assert error.value.code == "sandbox_executor_unavailable"
     assert "refusing host fallback" in str(error.value)
     assert not marker.exists()
-    assert supervisor.attempt(attempt["id"])["pid"] is None
+    attempt_after = supervisor.attempt(attempt["id"])
+    assert attempt_after["pid"] is None
+    assert attempt_after["updated_at"] == attempt_before["updated_at"]
+    assert not worker_log.exists()
+
+
+def test_unsupported_worker_platform_fails_before_attempt_mutation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def side_effect_must_not_run(*_args, **_kwargs):
+        pytest.fail("unsupported worker platform must fail before heartbeat or launch")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "darwin")
+    monkeypatch.setattr(supervisor, "heartbeat", side_effect_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", side_effect_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", side_effect_must_not_run)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(attempt["id"], attempt["claim_token"], [sys.executable, "-c", "pass"])
+
+    assert error.value.code == "process_containment_unavailable"
+    assert "require Linux child-subreaper containment" in str(error.value)
+    attempt_after = supervisor.attempt(attempt["id"])
+    assert attempt_after["pid"] is None
+    assert attempt_after["updated_at"] == attempt_before["updated_at"]
+    assert not worker_log.exists()
 
 
 @pytest.mark.parametrize(
     ("entry", "message"),
     [
-        ('runc_executable = "runc"\nrunc_version = "1.3.5"', "absolute path"),
+        ('runc_executable = "runc"\nrunc_version = "1.5.2"', "absolute path"),
         ('runc_executable = "/usr/bin/runc"\nrunc_version = "latest"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-01"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a..b"', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5-a."', "release version"),
-        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5+meta."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-01"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-a..b"', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2-a."', "release version"),
+        ('runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2+meta."', "release version"),
         (
-            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.3.5"\nextra = true',
+            'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"\nextra = true',
             "requires runc_executable",
         ),
     ],
@@ -2910,6 +2970,100 @@ def test_reaper_tears_down_expired_runtime(repo: Path) -> None:
     assert supervisor.runtime_environment(attempt["id"])["state"] == "released"
 
 
+def test_quarantined_cleanup_finalizes_without_registered_worker_identity(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox-only attempt")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET status = 'terminating', termination_target_status = 'quarantined' "
+            "WHERE id = ?",
+            (attempt["id"],),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = 'blocked' "
+            "WHERE id = ?",
+            (created["id"],),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    monkeypatch.setattr(
+        workers_module,
+        "_sandbox_execution_cleanup_is_verified",
+        lambda _connection, _attempt_id: True,
+    )
+
+    assert supervisor._finalize_registered_worker_cleanup(attempt["id"]) == "quarantined"
+
+    finalized = supervisor.attempt(attempt["id"])
+    assert finalized["status"] == "quarantined"
+    assert finalized["pid"] is None
+    assert finalized["pid_identity"] == ""
+    assert finalized["termination_proof"] == ""
+    assert finalized["termination_target_status"] == ""
+
+
+@pytest.mark.parametrize(
+    ("registered_pid", "launch_owner_column", "launch_owner_value"),
+    (
+        (None, "launch_owner_pid", 424242),
+        (None, "launch_owner_identity", "linux:424242:9"),
+        (424243, "launch_owner_pid", 424242),
+        (424243, "launch_owner_identity", "linux:424242:9"),
+    ),
+)
+def test_quarantined_cleanup_retains_unproven_launch_owner(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registered_pid: int | None,
+    launch_owner_column: str,
+    launch_owner_value: int | str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt", "sandbox-only attempt with launch owner")
+    attempt = supervisor.claim(created["id"], "worker")
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET status = 'terminating', termination_target_status = 'quarantined', "
+            f"{launch_owner_column} = ?, pid = ?, pid_identity = ?, termination_proof = ? "
+            "WHERE id = ?",
+            (
+                launch_owner_value,
+                registered_pid,
+                "linux:424243:10" if registered_pid is not None else "",
+                "worker-death-proof" if registered_pid is not None else "",
+                attempt["id"],
+            ),
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'cleanup_pending', cleanup_target_status = 'blocked' "
+            "WHERE id = ?",
+            (created["id"],),
+        )
+        connection.execute(
+            "UPDATE runtime_environments SET state = 'released' WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+    monkeypatch.setattr(
+        workers_module,
+        "_sandbox_execution_cleanup_is_verified",
+        lambda _connection, _attempt_id: True,
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor._finalize_registered_worker_cleanup(attempt["id"])
+
+    assert error.value.code == "worker_cleanup_unproven"
+    retained = supervisor.attempt(attempt["id"])
+    assert retained["status"] == "terminating"
+    assert retained["termination_target_status"] == "quarantined"
+    assert retained[launch_owner_column] == launch_owner_value
+
+
 @requires_linux_worker
 def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> None:
     start, _ = two_free_ports()
@@ -4819,6 +4973,7 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
     ready_entered = Event()
     release_ready = Event()
     original_record = supervisor._record_worker_command_ready
+    secret_argument = "worker-argument-secret-sentinel"
 
     def block_before_receipt(*arguments, **keywords):
         ready_entered.set()
@@ -4836,6 +4991,7 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
             "subprocess.run(['git','add','alpha.txt'],check=True); "
             "subprocess.run(['git','commit','-m','gated worker'],check=True)"
         ),
+        secret_argument,
     ]
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(supervisor.run_worker, attempt["id"], attempt["claim_token"], command)
@@ -4872,6 +5028,23 @@ def test_worker_payload_waits_for_durable_command_identity_receipt(
             json.dumps(list(command), ensure_ascii=True, separators=(",", ":")).encode("ascii")
         ).hexdigest()
     )
+    with supervisor.connect() as connection:
+        telemetry = connection.execute(
+            "SELECT event_type, payload_json FROM events "
+            "WHERE json_extract(payload_json, '$.attempt_id') = ?",
+            (attempt["id"],),
+        ).fetchall()
+    assert telemetry
+    assert all(secret_argument not in row["payload_json"] for row in telemetry)
+    started = next(row for row in telemetry if row["event_type"] == "worker.started")
+    started_payload = json.loads(started["payload_json"])
+    assert started_payload["command_digest"] == ready["command_digest"]
+    assert started_payload["command_argument_count"] == len(command)
+    assert "command" not in started_payload
+    checkpoint = supervisor.attempt(attempt["id"])["checkpoint"]
+    assert secret_argument not in canonical_json(checkpoint)
+    assert checkpoint["command_digest"] == ready["command_digest"]
+    assert checkpoint["command_argument_count"] == len(command)
 
 
 @requires_linux_worker

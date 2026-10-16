@@ -45,6 +45,12 @@ adding one.
   matching rather than being denied its own declared write. (#1708)
 
 ### Added
+- Optional `namespace_runtime.apparmor_profile` applies an administrator-installed
+  AppArmor profile to both the rootless namespace preflight and the transient
+  service's actual runtime command via the trusted `aa-exec` helper. This avoids
+  depending on `AppArmorProfile=` support in per-user systemd managers. Profile names
+  are constrained; the default remains unchanged, and ACP does not install profiles
+  or disable Ubuntu's global user-namespace restriction. (#2370)
 - `meta.schema_version` and `meta.written_by`. A control database newer than the
   binary is refused with `schema_newer_than_binary` rather than opened — previously
   an older acp opened it successfully and simply did not see the newer columns, so a
