@@ -18,7 +18,10 @@ constructed in bounded per-import private object stores; the prepared journal
 commits before ACP promotes exact object IDs into the common repository store.
 Unjournaled private stages and ambiguous promotions have scoped reconciliation;
 committed result refs remain retained pending a separate retention policy, and
-ACP does not run repository-wide GC. See
+ACP does not run repository-wide GC. An opt-in disposable-Linux integration
+fixture now exercises production launch, cleanup verification, host-side
+capture/import, and pending-QC handoff; this does not connect `run_worker()` to
+the sandbox path. See the live evidence below and
 [`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
 retention, and cleanup contract. End-to-end worker isolation proof remains
 incomplete. The OCI policy compiler stages init behind fd 3, and a reusable
@@ -80,10 +83,12 @@ synthetic systemd observations; it is not live manager/start-stop or full
 daemon-restart evidence.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
-socket beneath the verified private runtime directory. OCI `run_worker()` and
-result import remain unintegrated and fail-closed. This current status supersedes older statements below that no
-verifier implementation or reaper retry path exists; historical run results
-remain scoped to the source hashes actually tested.
+socket beneath the verified private runtime directory. Result import now has
+separate opt-in live launch/cleanup/import evidence below, but remains
+unconnected to `run_worker()`, which stays fail-closed. This current status
+supersedes older statements below that no verifier implementation or reaper
+retry path exists; historical run results remain scoped to the source hashes
+actually tested.
 
 **Current launch ownership decision (2026-10-16):** Use the two-service
 topology in [`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): the exact
@@ -1159,7 +1164,42 @@ At this live-probe revision, exact-head hosted CI was pending; the later
 manager-acceptance increment at code-bearing commit
 `e5f664f538996738cd310c482c778d08f9ee0440` passed
 [exact-head CI run 38888249380](https://github.com/Rayha33/agent-control-plane/actions/runs/38888249380).
-Result import and `run_worker()` remain out of scope and fail-closed.
+Result import was out of scope for this pinned-runc probe; the separate explicit
+result-import probe follows. `run_worker()` remains out of scope and fail-closed.
+
+### Live cleanup-gated sandbox result import (2026-10-16)
+
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` passed the opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` on the
+disposable Ubuntu 26.04.1 ARM64 guest (Linux `7.0.0-38-generic`, Python 3.14.4,
+systemd 259.5, cgroup v2) with pinned rootless runc 1.5.2
+(`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`) and
+BusyBox 1.37.0 (`27b2daf105ab5e4d489456e99731b05884f6a95623d2d10b3eda6881ad380577`).
+The exact test file SHA-256 was
+`0dfe0890e3ac0ee5e3e7f046831fdfdfb89687e3841e05a7ed9d3bb38fdfb061` for this
+run. With guest umask `0002`, the fixture made its disposable `.acp` and
+`sandbox-executions` directories owner-only (`0700`), retaining the launcher's
+private-ancestor checks. The production launch-driver ran the local marker-only
+payload to natural completion; the production verifier advanced it to
+`cleanup_verified`; then
+host-side capture/import created a submitted result in `pending_qc`. Assertions
+bound the source kind to the exact sandbox execution and cleanup receipt,
+verified the imported commit's base and both payload files, and confirmed the
+registered source worktree stayed clean.
+
+Before and after a fresh-process real reaper pass at the original synthetic
+lease expiry, the test checked the full two-resource lease set and allocated
+test port. Both leases remained owned by the task (with no attempt owner), their
+extended expiry and runtime allocation remained intact, and the task stayed in
+`qc_review`; the reaper neither orphaned the pending submission nor released
+its runtime. Postflight found no test-specific service/scope, runc process, or
+fixture root. No model/provider credentials or outbound/provider network call
+were used. The guest's `kernel.apparmor_restrict_unprivileged_userns` value was
+temporarily changed from 1 to 0 to permit rootless user namespaces and restored
+to 1 by an exit trap; this run does not prove AppArmor confinement with that
+restriction enabled. It also does not wire this path into `run_worker()`,
+authorize a provider worker, or prove provider egress policy. Exact-head hosted CI for the
+test change remains a separate gate.
 
 **Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
 systemd documents that `ExecStopPost=` also runs after unexpected service exit.
@@ -1615,11 +1655,11 @@ execution-root identity and workspace/baseline bindings still match. The
 cleanup-report digest identifies the journaled report; it is not proof that
 the report is trusted or verified. A supervisor-owned verifier/writer now
 provides that separate evidence and passed the live launch-driver cleanup,
-fence-release, and exact-head CI gates for #3142. The new import route has not
-yet been exercised end to end from a registered supervised coding worker:
-its success/recovery test constructs synthetic already-verified journal state
-only to cover downstream import logic. It is not live result-capture/import
-evidence, and configured OCI `run_worker()` remains fail-closed.
+fence-release, and exact-head CI gates for #3142. Earlier success/recovery tests
+construct synthetic already-verified journal state for downstream import
+coverage. The separate live integration evidence above now exercises host
+result capture/import after production launch and cleanup verification, but is
+still not invoked by registered OCI `run_worker()`, which remains fail-closed.
 
 **Runtime-attestation validator and partial host collector (2026-10-04; still
 no launcher).** The `sandbox_attestation` module binds bounded observations into

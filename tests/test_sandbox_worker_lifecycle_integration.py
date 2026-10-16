@@ -7,7 +7,10 @@ reaper-driven cleanup verification/runtime release. Opt-in branches also cover
 fresh-supervisor cancellation and launch-driver timeout. The production
 producer runs in a short-lived process that exits abruptly after durable
 handoff; fresh supervisor processes cancel (when requested) and reap the exact
-execution. None of these branches wires ``run_worker`` or authorizes result import.
+execution. An additional opt-in natural-completion branch asks the independent
+cleanup verifier to prove teardown, then imports the host-captured workspace
+result into the normal pending-QC submission path. None of these branches
+wires ``run_worker`` or starts a provider/model worker.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -51,6 +54,12 @@ For a driver crash after the gated runc scope exists but before monitor
 activation is requested, add:
 
     ACP_LIVE_CRASH_BEFORE_MONITOR_START=1
+
+For natural completion followed by production cleanup verification and
+host-side sandbox-result import (mutually exclusive with cancellation, timeout,
+and crash modes), add:
+
+    ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1
 """
 
 from __future__ import annotations
@@ -1622,6 +1631,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         repo_root = run_root / "repo"
         repo_root.mkdir(mode=0o700)
         repo = init_repo(repo_root)
+        _ensure_private_fixture_directory(repo / ".acp")
+        _ensure_private_fixture_directory(repo / ".acp" / "sandbox-executions")
         rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
         runtime_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -1642,7 +1653,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             )
         supervisor = GitSupervisor(repo)
         runner = supervisor.enroll_runner("sandbox-launch-driver-test", "worker")
-        task = make_task(supervisor, "launch-driver-marker", title="launch-driver producer test")
+        task = make_task(
+            supervisor,
+            "launch-driver-marker",
+            "launch-driver-started",
+            title="launch-driver producer test",
+        )
         attempt = supervisor.claim(
             task["id"],
             "sandbox-launch-driver-test",
@@ -1703,6 +1719,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             os.environ.get("ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE") == "1"
         )
         crash_before_monitor_start = os.environ.get("ACP_LIVE_CRASH_BEFORE_MONITOR_START") == "1"
+        import_result_after_cleanup = os.environ.get("ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP") == "1"
         if (
             sum(
                 (
@@ -1716,6 +1733,16 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             > 1
         ):
             pytest.fail("live cancel, timeout, and crash-injection modes are mutually exclusive")
+        if import_result_after_cleanup and any(
+            (
+                cancel_after_start,
+                timeout_after_start,
+                crash_after_manager_acceptance,
+                crash_after_monitor_acceptance,
+                crash_before_monitor_start,
+            )
+        ):
+            pytest.fail("live result import requires the natural-completion mode")
         crash_driver_service_before_receipt = (
             crash_after_manager_acceptance
             or crash_after_monitor_acceptance
@@ -2429,12 +2456,87 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         assert action["state_entry_absent_immediately_after_delete"] is True
         assert not (state_root / execution["container_id"]).exists()
 
+        imported_submission = None
+        if import_result_after_cleanup:
+            verified_before_import = supervisor._sandbox_execution_verify_cleanup(
+                attempt["id"],
+                attempt["claim_token"],
+                credential=runner["credential"],
+            )
+            assert verified_before_import["phase"] == "cleanup_verified"
+            assert verified_before_import["runc_exit_code"] == 0
+            assert verified_before_import["cleanup_verification"]["observations"]
+            assert not _entry_is_present(
+                Path(verified_before_import["workspace_root_path"]) / ".git"
+            )
+
+            imported_submission = supervisor.import_sandbox_execution_result(
+                attempt["id"], attempt["claim_token"], credential=runner["credential"]
+            )
+            assert imported_submission["status"] == "pending_qc"
+            assert imported_submission["commit_sha"]
+            assert supervisor.attempt(attempt["id"])["status"] == "submitted"
+            assert supervisor.task(task["id"])["status"] == "qc_review"
+
+            def git_text(*arguments: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *arguments],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                return completed.stdout.strip()
+
+            assert git_text("rev-parse", "HEAD") == task["base_sha"]
+            assert (
+                git_text("rev-parse", f"{imported_submission['commit_sha']}^") == task["base_sha"]
+            )
+            assert (
+                git_text("show", f"{imported_submission['commit_sha']}:launch-driver-started")
+                == "production-driver-started"
+            )
+            assert (
+                git_text("show", f"{imported_submission['commit_sha']}:launch-driver-marker")
+                == "production-driver-ran"
+            )
+            assert (
+                subprocess.run(
+                    ["git", "-C", str(source_worktree), "status", "--porcelain=v1"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                ).stdout
+                == ""
+            )
+
+            with supervisor.connect() as connection:
+                imported_row = connection.execute(
+                    "SELECT * FROM result_imports WHERE attempt_id = ?",
+                    (attempt["id"],),
+                ).fetchone()
+                import_source = supervisor._sandbox_execution_result_import_source(
+                    connection, attempt["id"], attempt["claim_token"]
+                )
+            assert imported_row is not None
+            assert imported_row["phase"] == "submitted"
+            assert imported_row["source_kind"] == "sandbox_execution"
+            assert imported_row["sandbox_execution_id"] == execution["execution_id"]
+            assert (
+                imported_row["sandbox_cleanup_receipt_digest"]
+                == import_source["cleanup_receipt_digest"]
+            )
+            assert imported_row["worker_pid"] is None
+            assert imported_row["worker_identity"] == ""
+            assert imported_row["worker_exit_receipt_json"] == ""
+
         with supervisor.connect() as connection:
-            lease_before = connection.execute(
+            lease_before_rows = connection.execute(
                 "SELECT resource, task_id, attempt_id, lease_expires_at "
-                "FROM resource_leases WHERE attempt_id = ?",
-                (attempt["id"],),
-            ).fetchone()
+                "FROM resource_leases WHERE task_id = ? ORDER BY resource",
+                (task["id"],),
+            ).fetchall()
             runtime_before = connection.execute(
                 "SELECT state FROM runtime_environments WHERE attempt_id = ?",
                 (attempt["id"],),
@@ -2444,14 +2546,26 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 "WHERE attempt_id = ?",
                 (attempt["id"],),
             ).fetchall()
-        assert lease_before is not None
-        assert lease_before["task_id"] == task["id"]
-        assert lease_before["attempt_id"] == attempt["id"]
-        assert lease_before["lease_expires_at"] == attempt["lease_expires_at"]
+        lease_before = {row["resource"]: row for row in lease_before_rows}
+        assert set(lease_before) == set(task["resources"])
+        assert len(lease_before) == 2
+        assert len({row["lease_expires_at"] for row in lease_before.values()}) == 1
+        expected_lease_expiry = next(iter(lease_before.values()))["lease_expires_at"]
+        if imported_submission is None:
+            for lease in lease_before.values():
+                assert lease["task_id"] == task["id"]
+                assert lease["attempt_id"] == attempt["id"]
+                assert lease["lease_expires_at"] == attempt["lease_expires_at"]
+        else:
+            for lease in lease_before.values():
+                assert lease["task_id"] == task["id"]
+                assert lease["attempt_id"] is None
+                assert lease["lease_expires_at"] > attempt["lease_expires_at"]
+        assert len(allocations_before) == 1
         assert runtime_before is not None and runtime_before["state"] != "released"
         assert [
             (row["pool_name"], row["value"], row["lease_expires_at"]) for row in allocations_before
-        ] == [("LAUNCH_DRIVER_TEST_PORT", runtime_test_port, attempt["lease_expires_at"])]
+        ] == [("LAUNCH_DRIVER_TEST_PORT", runtime_test_port, expected_lease_expiry)]
 
         reap_receiver, reap_sender = context.Pipe(duplex=False)
         fresh_reaper = context.Process(
@@ -2470,16 +2584,24 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         assert reap_result[0] == "ok", reap_result
         assert reap_result[1] not in {controller_pid, driver_pid}
         reaped = reap_result[2]
-        assert reaped["orphaned"] == [task["id"]]
-        assert reaped["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
-        assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
-        assert supervisor.task(task["id"])["status"] == "orphaned"
+        if imported_submission is None:
+            assert reaped["orphaned"] == [task["id"]]
+            assert reaped["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
+            assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
+            assert supervisor.task(task["id"])["status"] == "orphaned"
+        else:
+            assert reaped["orphaned"] == []
+            assert reaped["runtime_cleanup"] == []
+            assert supervisor.attempt(attempt["id"])["status"] == "submitted"
+            assert supervisor.task(task["id"])["status"] == "qc_review"
         with supervisor.connect() as connection:
-            lease_after = connection.execute(
-                "SELECT task_id, attempt_id, lease_expires_at FROM resource_leases "
-                "WHERE resource = ?",
-                (lease_before["resource"],),
-            ).fetchone()
+            lease_resources = sorted(lease_before)
+            placeholders = ", ".join("?" for _ in lease_resources)
+            lease_after_rows = connection.execute(
+                "SELECT resource, task_id, attempt_id, lease_expires_at FROM resource_leases "
+                f"WHERE resource IN ({placeholders}) ORDER BY resource",
+                lease_resources,
+            ).fetchall()
             runtime_after = connection.execute(
                 "SELECT state FROM runtime_environments WHERE attempt_id = ?",
                 (attempt["id"],),
@@ -2488,12 +2610,26 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 "SELECT pool_name, value FROM runtime_allocations WHERE attempt_id = ?",
                 (attempt["id"],),
             ).fetchall()
-        assert lease_after is not None
-        assert lease_after["task_id"] is None
-        assert lease_after["attempt_id"] is None
-        assert lease_after["lease_expires_at"] == 0
-        assert runtime_after is not None and runtime_after["state"] == "released"
-        assert allocations_after == []
+        lease_after = {row["resource"]: row for row in lease_after_rows}
+        assert set(lease_after) == set(lease_before)
+        assert runtime_after is not None
+        if imported_submission is None:
+            for resource, lease in lease_after.items():
+                assert lease["task_id"] is None
+                assert lease["attempt_id"] is None
+                assert lease["lease_expires_at"] == 0
+                assert lease_before[resource]["task_id"] == task["id"]
+            assert runtime_after["state"] == "released"
+            assert allocations_after == []
+        else:
+            for resource, lease in lease_after.items():
+                assert lease["task_id"] == task["id"]
+                assert lease["attempt_id"] is None
+                assert lease["lease_expires_at"] == lease_before[resource]["lease_expires_at"]
+            assert runtime_after["state"] == runtime_before["state"]
+            assert [(row["pool_name"], row["value"]) for row in allocations_after] == [
+                ("LAUNCH_DRIVER_TEST_PORT", runtime_test_port)
+            ]
         verified = supervisor._sandbox_execution_get(attempt["id"])
         assert verified is not None
         assert verified["phase"] == "cleanup_verified"
