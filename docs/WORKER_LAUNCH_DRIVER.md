@@ -14,10 +14,13 @@ verifier, schema-33 write-once verification receipt, and reaper retry path are
 implemented; unit and mocked SQLite integration tests pass. Post-stop verifier
 now rejects cgroup paths unless mountinfo maps `/sys/fs/cgroup` to the complete
 cgroup-v2 hierarchy, and safely removes only the execution-derived monitor
-socket from the private runtime directory. Natural completion and fresh-process
-cancellation both passed the opt-in production-launcher test with these live
-Linux/systemd observations (`cleanup_verified`, one pass per mode). Exact-head
-hosted CI is still pending, and result import is not connected to the worker.
+socket from the private runtime directory. Natural completion and
+fresh-process cancellation both passed the opt-in production-launcher test
+through the real `reap_expired()` path (`cleanup_verified` and runtime/fence
+release, one pass per mode). The reaper receives a synthetic lease expiry in
+the same controller process; no controller crash or restart is simulated.
+Full passing exact-head hosted CI is still pending, and result import is not
+connected to the worker.
 `cleanup_verified` certifies resource cleanup, not worker success; every result
 consumer continues to require runc exit code 0. Configured OCI
 `run_worker()` still fails closed with
@@ -181,8 +184,9 @@ execution tuple. Recovery can retry an eligible `cleanup_reported` row from the
 reaper; failed or unavailable observations leave the attempt fenced. The
 positive reaper retry/fence-release regression now drives the real verifier
 with deterministic OS observations and a runtime-teardown double. The live
-Linux/systemd lifecycle results below verify cleanup after natural exit and
-cancellation, but do not exercise live reaper recovery.
+Linux/systemd lifecycle results below additionally exercise reaper-driven
+verification and runtime/fence release after natural exit and cancellation, in
+the same controller process rather than after a crash/restart.
 
 The independent review of the prior ADR found a blocking mismatch: it placed the
 handle-owning monitor outside the attempt slice and proposed migrating attestation
@@ -233,7 +237,7 @@ transition, fresh-process cancellation of the exact worker scope, or
 supervisor-owned cleanup verification; the integrated lifecycle remains
 unimplemented.
 
-### Current-branch launch-driver and fresh-process cancellation (2026-10-16; live cleanup verification pass)
+### Current-branch launch-driver and fresh-process cancellation (2026-10-16; live reaper cleanup/fence-release pass)
 
 The opt-in
 `test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in
@@ -244,9 +248,15 @@ rootless pinned runc 1.5.2
 BusyBox 1.35.0. Each mode reported `1 passed`.
 Natural completion started the exact driver service, ran a bounded no-model
 payload, observed the same-process `running` transition and kernel wait/reap,
-executed pinned `runc delete --force`, verified the container-state entry
-absent immediately after deletion, then passed the independent post-stop
-verifier and persisted `cleanup_verified`.
+executed pinned `runc delete --force`, and verified the container-state entry
+absent immediately after deletion. The test then passed the cleanup-reported
+attempt to `reap_expired()` with an expired lease; the reaper ran the
+independent post-stop verifier, persisted `cleanup_verified`, released the
+runtime, and released the terminal attempt/resource fence. The live test
+queried SQLite before and after that handoff: before, the task/attempt-owned
+lease and one allocated test-port row matched the attempt expiry; afterward,
+the lease owner fields were null with expiry zero, the runtime was `released`,
+and the allocation row was absent.
 
 The cancellation mode waited for the bounded payload's start marker, rejected
 a wrong runner credential before monitor contact, then used a spawned fresh
@@ -254,19 +264,23 @@ controller process with the enrolled credential. That process reconnected to
 the live monitor exactly once; a test hook made any legacy host-PID path fail.
 The monitor stopped only the journal-bound worker scope. The launch-driver
 waited/reaped with a nonzero task exit and persisted its exact v3 delete
-receipt; the independent verifier then observed cleanup and wrote
-`cleanup_verified`. The start marker existed and the payload completion marker
-did not. A direct result-eligibility check still rejected the nonzero exit.
+receipt; `reap_expired()` then observed cleanup and wrote `cleanup_verified`
+before releasing the runtime and terminal fence. The start marker existed and
+the payload completion marker did not. A direct result-eligibility check still
+rejected the nonzero exit.
 Both modes used no model, provider credential, network egress, or paid call.
 Postflight found no matching active service/slice, payload process, or
-`acp-live-launch-driver-*` fixture root.
+`acp-live-launch-driver-*` fixture root. Two pre-existing failed transient
+launch-driver units had `MainPID=0` and empty cgroups; they were not changed or
+removed.
 
 Host and guest SHA-256 matched for every listed production/test source at both
 runs. This proves the tested cancellation request, separate pinned-runc action
 receipt, exact process/unit/cgroup/state/path absence checks, and
-`cleanup_verified` transition on this guest. It does not prove crash recovery,
-exact-head hosted CI, result import, provider access, or `run_worker()`
-enablement. The older direct-monitor lifecycle fixture is explicitly skipped
+reaper-driven `cleanup_verified` plus runtime/fence release on this guest. The
+lease expiry is injected in the same controller process, so it does not prove
+controller crash/restart recovery. Exact-head hosted CI, result import, provider
+access, and `run_worker()` enablement remain unproven. The older direct-monitor lifecycle fixture is explicitly skipped
 because it predates exact launch-driver redemption; it must be rebuilt around
 the production start API before it can be re-enabled.
 
@@ -277,12 +291,14 @@ this worktree and the disposable guest before the passing run:
 | --- | --- |
 | `git_supervisor.py` | `138cbe89018d748728c9c97d95b91f129c1548260cb4211b442d64f510729f7d` |
 | `oci_worker.py` | `2451885b35f3e3646537df2972504206dd5db7cc0c9834cd7af2117dc0f7a2ec` |
+| `reaper.py` | `09aacc9c0d6c4e0e04e63e92ef03793a77fbfd9560bfafd9b82163e79df7b0c9` |
+| `sandbox_attestation.py` | `205485f0dee05b9250658139f07364214cbdc9f5fcf22ccebd135b8d0c013b67` |
 | `sandbox_execution_journal.py` | `4b40be3eb4e6502b9be807f99e500d2d9c6692318eeabab4e67d65d44d2914eb` |
 | `sandbox_cleanup_verifier.py` | `c9feadb387dc6e325716975a933c14ea37ccfb1fdeeb422473a7cd232abe3553` |
 | `sandbox_launch_driver_service.py` | `f7deb8d2fe6f36b4e9281a61e72e7e33cc400212627186d2a7d6c96273815b67` |
 | `sandbox_monitor_service.py` | `c27fe68d764bfde7067195d64bee1a9056c5b73356849161b60ece9c76a4197a` |
 | `store.py` | `c712b56ee1155db9b89c9321bc6bf90d7f581ab5a8ead41cb9e125c4744b977a` |
-| `test_sandbox_worker_lifecycle_integration.py` | `0ead598dce07d2c1952e126fd197372abb36114a1fa3153937e86bcebaaedab5` |
+| `test_sandbox_worker_lifecycle_integration.py` | `661dd1cede3a1f8acb51f361bc3a09bc2c75d403a5617de00b7c125e77943387` |
 
 The live run closed a systemd-252-specific startup defect: `systemd-run
 --no-block` returned before `LoadCredential=` consumed its `/proc/<pid>/fd/`

@@ -13,6 +13,10 @@ from agent_control_plane.git_supervisor import SupervisorError
 from agent_control_plane.supervisor import sandbox_cleanup_verifier as verifier
 from agent_control_plane.supervisor.common import canonical_json
 
+_RUNTIME_TMP_DIR = Path("/private/tmp")
+if not _RUNTIME_TMP_DIR.is_dir() or _RUNTIME_TMP_DIR.is_symlink():
+    _RUNTIME_TMP_DIR = Path("/tmp")
+
 
 def _proof(report_json: str) -> str:
     report_digest = hashlib.sha256(report_json.encode("utf-8")).hexdigest()
@@ -449,7 +453,7 @@ def test_cgroup_verifier_rejects_unmapped_mount_even_for_missing_path(
 def test_stale_monitor_socket_is_removed_only_at_exact_private_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
-    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir="/private/tmp")
+    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir=str(_RUNTIME_TMP_DIR))
     request.addfinalizer(runtime_context.cleanup)
     runtime = Path(runtime_context.name)
     row = {
@@ -483,7 +487,7 @@ def test_stale_monitor_socket_is_removed_only_at_exact_private_path(
 def test_monitor_socket_cleanup_refuses_non_socket_target(
     tmp_path: Path, monkeypatch, request: pytest.FixtureRequest
 ) -> None:
-    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir="/private/tmp")
+    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir=str(_RUNTIME_TMP_DIR))
     request.addfinalizer(runtime_context.cleanup)
     runtime = Path(runtime_context.name)
     row = {

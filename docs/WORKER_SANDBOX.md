@@ -34,16 +34,20 @@ the verifier checks the exact service invocations, process identities, cgroup
 trees, runc state entry, mount table, and inode-bound private paths, then
 rechecks process/cgroup/systemd state after deleting only the recorded bundle
 and state trees. Unit tests and a mocked OS/SQLite integration test pass. The
-exact production-launcher integration also passed in both natural-completion
-and fresh-supervisor cancellation modes on disposable Debian 12 ARM64 / Linux
-6.1 / systemd 252.39 with cgroup v2 and pinned runc 1.5.2; each run reached
-`cleanup_verified` after live process, unit, invocation, cgroup, runc-state,
-private-path, and monitor-socket checks. The cancelled run's nonzero runc exit
-remains ineligible for result import. A positive `reap_expired()` regression now
-calls the real cleanup verifier and proves successful terminal resource-fence
-release using deterministic mocked OS observations and a runtime-teardown
-double; live reaper recovery itself remains untested. Exact-head hosted CI is
-still pending.
+exact production-launcher integration passed in both natural-completion and
+fresh-supervisor cancellation modes on disposable Debian 12 ARM64 / Linux 6.1 /
+systemd 252.39 with cgroup v2 and pinned runc 1.5.2. Each run now hands the
+durable `cleanup_reported` attempt to the real `reap_expired()` path with a
+synthetically expired lease; the reaper invokes the real verifier, reaches
+`cleanup_verified`, releases the runtime, and orphans the terminal attempt and
+resource fence. Both runs passed live process, unit, invocation, cgroup,
+runc-state, private-path, and monitor-socket checks. The cancelled run's
+nonzero runc exit remains ineligible for result import. This exercises
+reaper-driven recovery in the same controller process, not controller crash or
+restart. The separate positive reaper regression continues to cover failed
+verification with deterministic mocked OS observations. Full passing exact-head
+hosted CI remains pending: run 38875452816 exposed the `/private/tmp`
+cross-platform test-fixture defect, and the fix requires a new exact-head run.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
 socket beneath the verified private runtime directory. OCI `run_worker()` and
@@ -66,11 +70,11 @@ precondition. Independent review gave the revised two-service ownership ADR
 **GO** on 2026-10-16; this is decision-level approval, not implementation or
 lifecycle acceptance. The production launch-driver producer, bounded
 pinned-runc path, and fresh-process cancellation branch have disposable
-Debian/systemd evidence. The supervisor-owned cleanup verifier has now passed
-live OS observations for both natural completion and cancellation; the
-automatic reaper retry and fence release have source plus mocked OS/SQLite
-regression coverage; live reaper recovery remains untested. Exact-head hosted
-CI is still pending, including its reaper recovery path.
+Debian/systemd evidence. The live natural-completion and cancellation runs both
+now exercise automatic reaper verification and runtime/fence release after a
+synthetic lease expiry. This runs in the same controller process and does not
+simulate controller crash/restart. Full passing exact-head hosted CI remains
+pending for the corrected cross-platform test fixtures.
 Full end-to-end lifecycle proof and `run_worker()` integration remain pending;
 OCI worker execution stays fail-closed.
 
@@ -1106,7 +1110,11 @@ credential, network egress, or paid call was used. Host and guest hashes
 matched for the production/test sources listed in
 [`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md). Postflight found no active
 matching services or attempt slices, payload process, or
-`acp-live-launch-driver-*` fixture root.
+`acp-live-launch-driver-*` fixture root. The test also read the persisted
+resource lease, runtime environment, and allocated test-port row before and
+after the real reaper path: it verified the lease was owned by the exact task
+and attempt with the attempt expiry, then unowned with expiry zero; the runtime
+was `released` and its allocation row was gone.
 
 The obsolete direct-monitor live fixture is skipped until it is rebuilt around
 exact launch-driver redemption. Crash-recovery/ABA injection and exact-head
@@ -1419,8 +1427,10 @@ At the time this historical entry was written no application method wrote
 `cleanup_verified`. Later updates at the top of this document add the
 supervisor-owned writer and record live Linux/systemd cleanup-verifier runs.
 The positive reaper retry/fence-release path has deterministic mocked
-OS/SQLite coverage, but no live end-to-end reaper recovery or exact-head hosted
-CI result is claimed here.
+OS/SQLite coverage. At the time this historical entry was written there was no
+live end-to-end reaper recovery result; the later pinned-runc launch-driver
+section above records the 2026-10-16 live reaper proof. Exact-head hosted CI
+remains a separate gate.
 OCI worker execution remains fail-closed pending that acceptance and separate
 worker-path integration. The legacy `attempts.pid` slot remains reserved for
 direct workers; sandbox supervision uses a distinct journal-backed path.

@@ -3,11 +3,13 @@
 The process-local runc handle must remain in the exact systemd launch-driver
 process; a separate systemd-owned service controls the exact worker scope. The
 default branch proves launch-to-``running``, natural completion, and
-supervisor-owned cleanup verification. The `ACP_LIVE_CANCEL_AFTER_START=1`
+reaper-driven cleanup verification/runtime release. The
+`ACP_LIVE_CANCEL_AFTER_START=1`
 branch requests cancellation through `WorkersMixin.terminate_worker()` from a
 fresh supervisor and checks the real monitor response before the same
-independent cleanup proof. Neither branch wires ``run_worker``, proves crash
-recovery, or authorizes result import.
+reaper path. The reaper receives an expired lease in the same controller
+process; this does not simulate controller crash or restart. Neither branch
+wires ``run_worker`` or authorizes result import.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -36,6 +38,7 @@ import os
 import posixpath
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -1257,7 +1260,7 @@ def test_live_monitor_journal_holds_payload_until_durable_running_transition(
     reason="set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 on a disposable supported Linux host",
 )
 def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
-    """Use the production systemd producer for a bounded run or fresh-controller cancel."""
+    """Use the production launcher and reaper for completion or fresh-controller cancel."""
 
     source_root = Path(__file__).resolve().parents[1]
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
@@ -1311,6 +1314,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         repo_root.mkdir(mode=0o700)
         repo = init_repo(repo_root)
         rootfs_manifest = oci_worker.rootfs_tree_manifest(rootfs_source)
+        runtime_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            runtime_probe.bind(("127.0.0.1", 0))
+            runtime_test_port = runtime_probe.getsockname()[1]
+        finally:
+            runtime_probe.close()
         with (repo / "acp.toml").open("a", encoding="utf-8") as stream:
             stream.write(
                 "\n[sandbox.oci]\n"
@@ -1319,6 +1328,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
                 f"rootfs_path = {json.dumps(str(rootfs_source.resolve(strict=True)))}\n"
                 f"rootfs_sha256 = {json.dumps(rootfs_manifest['rootfs_sha256'])}\n"
                 f"rootfs_closure_sha256 = {json.dumps(rootfs_manifest['closure_sha256'])}\n"
+                "\n[runtime.ports]\n"
+                f"LAUNCH_DRIVER_TEST_PORT = [{runtime_test_port}, {runtime_test_port}]\n"
             )
         supervisor = GitSupervisor(repo)
         runner = supervisor.enroll_runner("sandbox-launch-driver-test", "worker")
@@ -1569,9 +1580,57 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         assert action["state_entry_absent_immediately_after_delete"] is True
         assert not (state_root / execution["container_id"]).exists()
 
-        verified = supervisor._sandbox_execution_verify_cleanup(
-            attempt["id"], attempt["claim_token"]
-        )
+        with supervisor.connect() as connection:
+            lease_before = connection.execute(
+                "SELECT resource, task_id, attempt_id, lease_expires_at "
+                "FROM resource_leases WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()
+            runtime_before = connection.execute(
+                "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()
+            allocations_before = connection.execute(
+                "SELECT pool_name, value, lease_expires_at FROM runtime_allocations "
+                "WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchall()
+        assert lease_before is not None
+        assert lease_before["task_id"] == task["id"]
+        assert lease_before["attempt_id"] == attempt["id"]
+        assert lease_before["lease_expires_at"] == attempt["lease_expires_at"]
+        assert runtime_before is not None and runtime_before["state"] != "released"
+        assert [
+            (row["pool_name"], row["value"], row["lease_expires_at"]) for row in allocations_before
+        ] == [("LAUNCH_DRIVER_TEST_PORT", runtime_test_port, attempt["lease_expires_at"])]
+
+        reaped = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+        assert reaped["orphaned"] == [task["id"]]
+        assert reaped["runtime_cleanup"] == [{"attempt_id": attempt["id"], "state": "released"}]
+        assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
+        assert supervisor.task(task["id"])["status"] == "orphaned"
+        with supervisor.connect() as connection:
+            lease_after = connection.execute(
+                "SELECT task_id, attempt_id, lease_expires_at FROM resource_leases "
+                "WHERE resource = ?",
+                (lease_before["resource"],),
+            ).fetchone()
+            runtime_after = connection.execute(
+                "SELECT state FROM runtime_environments WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()
+            allocations_after = connection.execute(
+                "SELECT pool_name, value FROM runtime_allocations WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchall()
+        assert lease_after is not None
+        assert lease_after["task_id"] is None
+        assert lease_after["attempt_id"] is None
+        assert lease_after["lease_expires_at"] == 0
+        assert runtime_after is not None and runtime_after["state"] == "released"
+        assert allocations_after == []
+        verified = supervisor._sandbox_execution_get(attempt["id"])
+        assert verified is not None
         assert verified["phase"] == "cleanup_verified"
         if cancel_after_start:
             assert verified["runc_exit_code"] != 0

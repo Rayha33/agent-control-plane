@@ -65,6 +65,10 @@ from agent_control_plane.supervisor.store import (
     _authorize_sandbox_reservation_write,
 )
 
+_RUNTIME_TMP_DIR = Path("/private/tmp")
+if not _RUNTIME_TMP_DIR.is_dir() or _RUNTIME_TMP_DIR.is_symlink():
+    _RUNTIME_TMP_DIR = Path("/tmp")
+
 _RECORD_LAUNCH_MONITOR = threading.local()
 
 
@@ -3539,7 +3543,7 @@ def configure_cleanup_verifier_os_observations(
     monkeypatch.setattr(
         verifier_module, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
     )
-    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir="/private/tmp")
+    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir=str(_RUNTIME_TMP_DIR))
     request.addfinalizer(runtime_context.cleanup)
     runtime_environment = {"XDG_RUNTIME_DIR": runtime_context.name}
     monkeypatch.setattr(
