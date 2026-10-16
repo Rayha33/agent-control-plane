@@ -1176,7 +1176,7 @@ systemd 259.5, cgroup v2) with pinned rootless runc 1.5.2
 (`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`) and
 BusyBox 1.37.0 (`27b2daf105ab5e4d489456e99731b05884f6a95623d2d10b3eda6881ad380577`).
 The exact test file SHA-256 was
-`0dfe0890e3ac0ee5e3e7f046831fdfdfb89687e3841e05a7ed9d3bb38fdfb061` for this
+`479baf773f9c18c215b906fc624e248f6e85cd01d377c0abe2f48782cb810c77` for this
 run. With guest umask `0002`, the fixture made its disposable `.acp` and
 `sandbox-executions` directories owner-only (`0700`), retaining the launcher's
 private-ancestor checks. The production launch-driver ran the local marker-only
@@ -1193,13 +1193,17 @@ test port. Both leases remained owned by the task (with no attempt owner), their
 extended expiry and runtime allocation remained intact, and the task stayed in
 `qc_review`; the reaper neither orphaned the pending submission nor released
 its runtime. Postflight found no test-specific service/scope, runc process, or
-fixture root. No model/provider credentials or outbound/provider network call
-were used. The guest's `kernel.apparmor_restrict_unprivileged_userns` value was
+fixture root. A fresh supervisor reopened the state before and after the reaper
+pass and observed the same pending-QC submission ID/commit, submitted attempt,
+`qc_review` task, and `cleanup_verified` execution. No model/provider
+credentials or outbound/provider network call were used. The guest's
+`kernel.apparmor_restrict_unprivileged_userns` value was
 temporarily changed from 1 to 0 to permit rootless user namespaces and restored
 to 1 by an exit trap; this run does not prove AppArmor confinement with that
 restriction enabled. It also does not wire this path into `run_worker()`,
-authorize a provider worker, or prove provider egress policy. Exact-head hosted CI for the
-test change remains a separate gate.
+authorize a provider worker, or prove provider egress policy. Exact-head hosted
+CI for the test change remains a separate gate. This probe does not exercise
+expiry or cleanup of the extended QC reservation itself.
 
 **Systemd post-stop boundary (2026-10-11; disposable Linux probe).** Upstream
 systemd documents that `ExecStopPost=` also runs after unexpected service exit.

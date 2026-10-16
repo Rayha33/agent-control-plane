@@ -388,11 +388,42 @@ def _retry_launch_driver_without_replay_from_fresh_process(
         result_sender.close()
 
 
-def _reap_expired_from_fresh_process(repo: Path, now: int, result_sender) -> None:
+def _reap_expired_from_fresh_process(
+    repo: Path,
+    now: int,
+    result_sender,
+    import_probe: tuple[str, str, str] | None = None,
+) -> None:
     """Run the real reaper in a new supervisor process after producer loss."""
 
     try:
-        result_sender.send(("ok", os.getpid(), GitSupervisor(repo).reap_expired(now=now)))
+        supervisor = GitSupervisor(repo)
+
+        def imported_state_snapshot() -> dict[str, Any]:
+            if import_probe is None:
+                return {}
+            task_id, attempt_id, submission_id = import_probe
+            task = supervisor.task(task_id)
+            attempt = supervisor.attempt(attempt_id)
+            submission = supervisor.submission(submission_id)
+            execution = supervisor._sandbox_execution_get(attempt_id)
+            if execution is None:
+                raise AssertionError("fresh supervisor could not recover the imported execution")
+            return {
+                "task_status": task["status"],
+                "attempt_status": attempt["status"],
+                "submission_id": submission["id"],
+                "submission_status": submission["status"],
+                "submission_commit_sha": submission["commit_sha"],
+                "task_latest_submission_id": task["latest_submission"]["id"],
+                "execution_id": execution["execution_id"],
+                "execution_phase": execution["phase"],
+            }
+
+        before = imported_state_snapshot()
+        reaped = supervisor.reap_expired(now=now)
+        after = imported_state_snapshot()
+        result_sender.send(("ok", os.getpid(), reaped, before, after))
     except BaseException as error:
         result_sender.send(("error", type(error).__name__))
     finally:
@@ -2568,9 +2599,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
         ] == [("LAUNCH_DRIVER_TEST_PORT", runtime_test_port, expected_lease_expiry)]
 
         reap_receiver, reap_sender = context.Pipe(duplex=False)
+        import_probe = (
+            (task["id"], attempt["id"], imported_submission["id"])
+            if imported_submission is not None
+            else None
+        )
         fresh_reaper = context.Process(
             target=_reap_expired_from_fresh_process,
-            args=(repo, attempt["lease_expires_at"] + 1, reap_sender),
+            args=(repo, attempt["lease_expires_at"] + 1, reap_sender, import_probe),
         )
         fresh_reaper.start()
         child_processes.append(fresh_reaper)
@@ -2594,6 +2630,18 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request() -> None:
             assert reaped["runtime_cleanup"] == []
             assert supervisor.attempt(attempt["id"])["status"] == "submitted"
             assert supervisor.task(task["id"])["status"] == "qc_review"
+            recovered_before, recovered_after = reap_result[3:5]
+            assert recovered_before == recovered_after
+            assert recovered_before == {
+                "task_status": "qc_review",
+                "attempt_status": "submitted",
+                "submission_id": imported_submission["id"],
+                "submission_status": "pending_qc",
+                "submission_commit_sha": imported_submission["commit_sha"],
+                "task_latest_submission_id": imported_submission["id"],
+                "execution_id": execution["execution_id"],
+                "execution_phase": "cleanup_verified",
+            }
         with supervisor.connect() as connection:
             lease_resources = sorted(lease_before)
             placeholders = ", ".join("?" for _ in lease_resources)
