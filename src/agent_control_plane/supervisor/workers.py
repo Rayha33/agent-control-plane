@@ -1027,13 +1027,38 @@ class WorkersMixin:
                     else None
                 )
             stop_reason = execution.get("stop_reason") or launch_stop_reason or "terminate_worker"
-            self._sandbox_execution_request_stop(
-                attempt_id,
-                execution["claim_token"],
-                stop_reason,
-                credential=credential,
-            )
-            stopped_execution = self._sandbox_execution_get(attempt_id)
+            try:
+                self._sandbox_execution_request_stop(
+                    attempt_id,
+                    execution["claim_token"],
+                    stop_reason,
+                    credential=credential,
+                )
+            except SupervisorError as error:
+                if error.code != "sandbox_execution_transition_conflict":
+                    raise
+                # A timeout may have durably stopped this exact execution
+                # after our snapshot. Adopt only that fenced stopping row;
+                # never replace the first stop reason or soften other errors.
+                stopped_execution = self._sandbox_execution_get(attempt_id)
+                if (
+                    stopped_execution is None
+                    or (
+                        stopped_execution.get("attempt_id"),
+                        stopped_execution.get("claim_token"),
+                        stopped_execution.get("execution_id"),
+                    )
+                    != (
+                        attempt_id,
+                        execution["claim_token"],
+                        execution["execution_id"],
+                    )
+                    or stopped_execution.get("phase") != "stopping"
+                    or not stopped_execution.get("stop_reason")
+                ):
+                    raise
+            else:
+                stopped_execution = self._sandbox_execution_get(attempt_id)
             if (
                 stopped_execution is None
                 or stopped_execution["claim_token"] != execution["claim_token"]

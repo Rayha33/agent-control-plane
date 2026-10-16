@@ -5774,6 +5774,151 @@ def test_journaled_sandbox_termination_reuses_identity_bound_monitor_cancel_id(
         os.close(gate_read)
 
 
+def test_journaled_termination_adopts_timeout_stop_that_wins_race(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    record_launch(supervisor, attempt, runc_handle=handle)
+    assert record_running(supervisor, attempt)["phase"] == "running"
+
+    request_stop = supervisor._sandbox_execution_request_stop
+    timeout_won: list[bool] = []
+
+    def timeout_wins_then_stale_termination(
+        attempt_id: str,
+        claim_token: int,
+        reason: str,
+        *,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        if reason == "terminate_worker":
+            timeout_won.append(True)
+            request_stop(
+                attempt_id,
+                claim_token,
+                "execution_timeout",
+                credential=credential,
+            )
+        return request_stop(attempt_id, claim_token, reason, credential=credential)
+
+    monkeypatch.setattr(
+        supervisor,
+        "_sandbox_execution_request_stop",
+        timeout_wins_then_stale_termination,
+    )
+    cancelled: list[dict[str, Any]] = []
+
+    def cancel_exact(execution: dict[str, Any], *, monitor_client: Any | None = None):
+        cancelled.append(execution)
+        return {
+            "attempt_id": execution["attempt_id"],
+            "execution_id": execution["execution_id"],
+            "outcome": "ok",
+            "phase": execution["phase"],
+            "stop_requested": True,
+            "monitor_phase": "stopping",
+            "cleanup_verified": False,
+        }
+
+    monkeypatch.setattr(supervisor, "_cancel_sandbox_execution_monitor", cancel_exact)
+    try:
+        result = supervisor.terminate_worker(attempt["id"])
+
+        durable = supervisor._sandbox_execution_get(attempt["id"])
+        assert timeout_won == [True]
+        assert durable is not None and durable["phase"] == "stopping"
+        assert durable["stop_reason"] == "execution_timeout"
+        assert len(cancelled) == 1
+        assert (
+            cancelled[0]["attempt_id"],
+            cancelled[0]["claim_token"],
+            cancelled[0]["execution_id"],
+        ) == (attempt["id"], attempt["claim_token"], execution["execution_id"])
+        assert result["execution_id"] == execution["execution_id"]
+        assert result["phase"] == "stopping"
+    finally:
+        handle.close_gate()
+
+
+@pytest.mark.parametrize(
+    "reread_overrides",
+    [
+        pytest.param(
+            {"execution_id": "00000000-0000-4000-8000-000000000001"},
+            id="different-execution",
+        ),
+        pytest.param({"phase": "running"}, id="same-execution-not-stopping"),
+        pytest.param({"stop_reason": None}, id="same-execution-no-durable-reason"),
+    ],
+)
+def test_journaled_termination_does_not_adopt_unqualified_execution_after_stop_conflict(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reread_overrides: dict[str, Any],
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    handle = _test_runc_handle(target=_test_runc_target(execution))
+    record_launch(supervisor, attempt, runc_handle=handle)
+    assert record_running(supervisor, attempt)["phase"] == "running"
+
+    request_stop = supervisor._sandbox_execution_request_stop
+
+    def timeout_wins_then_stale_termination(
+        attempt_id: str,
+        claim_token: int,
+        reason: str,
+        *,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        if reason == "terminate_worker":
+            request_stop(
+                attempt_id,
+                claim_token,
+                "execution_timeout",
+                credential=credential,
+            )
+        return request_stop(attempt_id, claim_token, reason, credential=credential)
+
+    monkeypatch.setattr(
+        supervisor,
+        "_sandbox_execution_request_stop",
+        timeout_wins_then_stale_termination,
+    )
+    get_execution = supervisor._sandbox_execution_get
+    reads = 0
+
+    def mismatched_reread(attempt_id: str) -> dict[str, Any] | None:
+        nonlocal reads
+        reads += 1
+        current = get_execution(attempt_id)
+        if reads == 2 and current is not None:
+            current = {**current, **reread_overrides}
+        return current
+
+    monkeypatch.setattr(supervisor, "_sandbox_execution_get", mismatched_reread)
+    monkeypatch.setattr(
+        supervisor,
+        "_cancel_sandbox_execution_monitor",
+        lambda *_args, **_kwargs: pytest.fail("a different execution must not be cancelled"),
+    )
+    try:
+        with pytest.raises(SupervisorError) as termination:
+            supervisor.terminate_worker(attempt["id"])
+
+        assert termination.value.code == "sandbox_execution_transition_conflict"
+        assert reads >= 2
+        durable = get_execution(attempt["id"])
+        assert durable is not None and durable["phase"] == "stopping"
+        assert durable["stop_reason"] == "execution_timeout"
+    finally:
+        handle.close_gate()
+
+
 def test_terminal_termination_reports_durable_stop_without_fake_monitor_phase(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
