@@ -3304,8 +3304,10 @@ def test_registered_launch_driver_fake_worker_opens_gate_only_after_running_and_
 
     try:
         payload_thread.start()
-        expected_error = InjectedDriverFailure if failure_point == "post-launch-exception" else (
-            None if failure_point == "lease-expired-after-stop" else CleanupBoundaryReached
+        expected_error = (
+            InjectedDriverFailure
+            if failure_point == "post-launch-exception"
+            else (None if failure_point == "lease-expired-after-stop" else CleanupBoundaryReached)
         )
         if expected_error is None:
             launch_driver_service._run_driver(
