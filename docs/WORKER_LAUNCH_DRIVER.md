@@ -524,6 +524,55 @@ cleanup observations, and a fenced/no-import outcome if the driver dies before
 the wait receipt. Component tests, the separate PIDs-scope experiment, and
 exact-head CI are not substitutes for this lifecycle proof.
 
+## 2026-10-16 exact-head launch-driver lifecycle refresh
+
+The code-bearing head `29758f8f1455167877397334279a2df8e58d282f` passed
+GitHub Actions run [38923445474](https://github.com/Rayha33/agent-control-plane/actions/runs/38923445474):
+all four Ubuntu/macOS × Python 3.11/3.12 jobs completed successfully, including
+tests, Ruff lint/format checks, and package build. This run used the workflow's
+then-current `ubuntu-latest` image. It predates this documentation-only
+increment.
+
+On the disposable Debian 12 ARM64 guest (Linux 6.1, systemd 252.39, cgroup v2,
+active private user manager), the production launch-driver test passed
+individually in each mode below. The test and service source were SHA-256
+matched between host and guest (`a4e81f27e692bf238c11af8dcacb476718066d66a7da2c19982aaaf45c29125f`
+and `976355e6575b590a72c2fc7bdf0db3e82170252a5fd323fd38f76ff2453785ce`,
+respectively); pinned runc was v1.5.2 with release digest
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+
+| Live mode | Result | Evidence boundary |
+| --- | --- | --- |
+| Normal completion | 1 passed | Bounded BusyBox payload through production launch-driver; normal completion and cleanup path. |
+| `ACP_LIVE_TIMEOUT_AFTER_START=1` | 1 passed | Timeout path persisted stop intent before monitor cancellation and completed exact cleanup verification. |
+| `ACP_LIVE_CANCEL_AFTER_START=1` | 1 passed | Fresh-supervisor authenticated cancellation used the exact service; no host-PID fallback. |
+| `ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1` | 1 passed | Fail-closed containment and no replay after the injected manager-acceptance crash window. |
+| `ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE=1` | 1 passed | Fail-closed containment and no replay after the injected monitor-acceptance crash window. |
+| `ACP_LIVE_CRASH_BEFORE_MONITOR_START=1` | 1 passed | Fail-closed containment; monitor remained unstarted and the launch was not replayed. |
+
+These were six separate opt-in invocations, not one aggregated run. They used
+no model, provider credentials, network egress, or paid calls. An initial
+attempt to stage runc under world-writable `/tmp` was correctly rejected by
+the production executable-trust check before any unit or container launch;
+the identical verified binary was then staged under root-owned
+`/var/lib/acp-runc-29758f8` and accepted. No trust rule was relaxed. Postflight
+found no test fixture roots, driver/runc processes, or new units. Two
+pre-existing failed units remained `MainPID=0` and unchanged; they were not
+removed or restarted. Manual postflight removed the temporary checkout and
+pinned binary; binary removal is an operator observation, not an assertion in
+the test's fixture finalizer.
+
+Independent source-level adversarial QC is GO for the
+`launch_driver_failure` stop-intent fix, but NO-GO for closing broader #3142 or
+#2370. In particular, the exception-path regression stubs the monitor cancel
+IPC; live timeout and fresh-supervisor cancellation exercise production IPC
+separately, but the exact post-launch-exception branch has not been injected
+through real monitor IPC. This guest run also does not prove daemon/user-manager
+restart, logout, reboot, arbitrary crash timing, or result import. Workspace
+isolation, production provider authentication/egress, and validated result
+transfer remain open acceptance gates. `run_worker()` must remain
+fail-closed; this evidence does not enable OCI execution.
+
 Parent task #2370 remains open until workspace isolation, provider
 authentication/egress, validated result transfer, and all independent safety
 gates pass. This ADR does not enable OCI in `run_worker()` or weaken the macOS
