@@ -135,6 +135,15 @@ domains does not start that proxy. ACP must enforce and test provider egress at
 the outer boundary, fail closed when that policy is unavailable, and must not
 mount or copy the host's Codex auth/config directory into an attempt.
 
+The App Server API also exposes execution surfaces distinct from `command/exec`:
+`thread/shellCommand` runs outside Codex's sandbox with full access, and the
+experimental `process/spawn` (which requires `capabilities.experimentalApi`)
+starts a process outside that sandbox. An ACP
+adapter must not route untrusted worker requests through those surfaces. If
+either is required, independently confine the App Server and its spawned
+process tree inside the attempt boundary; a per-command sandbox setting alone
+is insufficient. See [App Server API overview](https://learn.chatgpt.com/docs/app-server#api-overview).
+
 The documented interface split is in [OpenAI's Codex SDK
 guide](https://learn.chatgpt.com/docs/codex-sdk) and [App Server
 guide](https://learn.chatgpt.com/docs/app-server#command-execution). The
