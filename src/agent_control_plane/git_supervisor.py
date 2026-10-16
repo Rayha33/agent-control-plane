@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -2042,6 +2042,182 @@ def _add_sandbox_launch_driver_start_intent(connection: sqlite3.Connection) -> N
     )
 
 
+def _add_sandbox_launch_driver_start_redemption(connection: sqlite3.Connection) -> None:
+    """Persist the one exact service activation that may submit the pinned launch."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before launch-driver redemption migration"
+        )
+    additions = (
+        ("launch_driver_start_redeemed_at", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_pid", "INTEGER"),
+        ("launch_driver_start_redeemed_identity", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_slice_unit", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_slice_invocation_id", "TEXT NOT NULL DEFAULT ''"),
+        ("launch_driver_start_redeemed_slice_cgroup_path", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, definition in additions:
+        if name not in columns:
+            connection.execute(f"ALTER TABLE sandbox_executions ADD COLUMN {name} {definition}")
+
+    for trigger in (
+        "sandbox_launch_driver_redemption_insert_guard",
+        "sandbox_launch_driver_redemption_write_once",
+        "sandbox_execution_submission_requires_driver_redemption",
+        "sandbox_execution_launch_requires_driver_redemption",
+        "sandbox_execution_running_requires_redeemed_driver",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_redemption_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.launch_driver_start_redeemed_at != ''
+          OR NEW.launch_driver_start_redeemed_invocation_id != ''
+          OR NEW.launch_driver_start_redeemed_pid IS NOT NULL
+          OR NEW.launch_driver_start_redeemed_identity != ''
+          OR NEW.launch_driver_start_redeemed_cgroup_path != ''
+          OR NEW.launch_driver_start_redeemed_slice_unit != ''
+          OR NEW.launch_driver_start_redeemed_slice_invocation_id != ''
+          OR NEW.launch_driver_start_redeemed_slice_cgroup_path != ''
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_redemption_must_follow_start_intent');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_launch_driver_redemption_write_once
+        BEFORE UPDATE OF launch_driver_start_redeemed_at,
+          launch_driver_start_redeemed_invocation_id, launch_driver_start_redeemed_pid,
+          launch_driver_start_redeemed_identity, launch_driver_start_redeemed_cgroup_path,
+          launch_driver_start_redeemed_slice_unit,
+          launch_driver_start_redeemed_slice_invocation_id,
+          launch_driver_start_redeemed_slice_cgroup_path ON sandbox_executions
+        WHEN NOT (
+          OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+          AND OLD.launch_driver_start_id != ''
+          AND OLD.launch_driver_start_digest != ''
+          AND OLD.launch_driver_start_unit = 'acp-launch-driver-' || OLD.execution_id || '.service'
+          AND OLD.launch_driver_start_redeemed_at = ''
+          AND OLD.launch_driver_start_redeemed_invocation_id = ''
+          AND OLD.launch_driver_start_redeemed_pid IS NULL
+          AND OLD.launch_driver_start_redeemed_identity = ''
+          AND OLD.launch_driver_start_redeemed_cgroup_path = ''
+          AND OLD.launch_driver_start_redeemed_slice_unit = ''
+          AND OLD.launch_driver_start_redeemed_slice_invocation_id = ''
+          AND OLD.launch_driver_start_redeemed_slice_cgroup_path = ''
+          AND length(NEW.launch_driver_start_redeemed_at) BETWEEN 1 AND 64
+          AND length(NEW.launch_driver_start_redeemed_invocation_id) = 32
+          AND NEW.launch_driver_start_redeemed_invocation_id NOT GLOB '*[^0-9a-f]*'
+          AND NEW.launch_driver_start_redeemed_pid IS NOT NULL
+          AND NEW.launch_driver_start_redeemed_pid > 0
+          AND NEW.launch_driver_start_redeemed_identity LIKE
+            ('linux:' || NEW.launch_driver_start_redeemed_pid || ':%')
+          AND NEW.launch_driver_start_redeemed_cgroup_path =
+            NEW.launch_driver_start_redeemed_slice_cgroup_path || '/' || OLD.launch_driver_start_unit
+          AND NEW.launch_driver_start_redeemed_slice_unit != ''
+          AND substr(NEW.launch_driver_start_redeemed_slice_unit, -6) = '.slice'
+          AND length(NEW.launch_driver_start_redeemed_slice_invocation_id) = 32
+          AND NEW.launch_driver_start_redeemed_slice_invocation_id NOT GLOB '*[^0-9a-f]*'
+          AND NEW.launch_driver_start_redeemed_slice_cgroup_path != ''
+          AND substr(NEW.launch_driver_start_redeemed_slice_cgroup_path, 1, 1) = '/'
+          AND substr(NEW.launch_driver_start_redeemed_slice_cgroup_path,
+            -length(NEW.launch_driver_start_redeemed_slice_unit)) =
+            NEW.launch_driver_start_redeemed_slice_unit
+          AND acp_sandbox_launch_driver_redemption_authorized(
+            OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+            OLD.launch_driver_start_id, OLD.launch_driver_start_digest,
+            OLD.launch_driver_start_unit,
+            NEW.launch_driver_start_redeemed_at,
+            NEW.launch_driver_start_redeemed_invocation_id,
+            NEW.launch_driver_start_redeemed_pid,
+            NEW.launch_driver_start_redeemed_identity,
+            NEW.launch_driver_start_redeemed_cgroup_path,
+            NEW.launch_driver_start_redeemed_slice_unit,
+            NEW.launch_driver_start_redeemed_slice_invocation_id,
+            NEW.launch_driver_start_redeemed_slice_cgroup_path
+          ) = 1
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_launch_driver_redemption_must_be_authorized_once');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_submission_requires_driver_redemption
+        BEFORE UPDATE OF launch_submission_id, launch_submission_digest,
+          launch_submission_at ON sandbox_executions
+        WHEN (
+          NEW.launch_submission_id != OLD.launch_submission_id
+          OR NEW.launch_submission_digest != OLD.launch_submission_digest
+          OR NEW.launch_submission_at != OLD.launch_submission_at
+        ) AND (
+          OLD.launch_driver_start_id = ''
+          OR OLD.launch_driver_start_redeemed_at = ''
+          OR OLD.launch_driver_start_redeemed_pid IS NULL
+          OR OLD.launch_driver_start_redeemed_invocation_id = ''
+          OR OLD.launch_driver_start_redeemed_slice_unit = ''
+          OR OLD.launch_driver_start_redeemed_slice_invocation_id = ''
+          OR OLD.launch_driver_start_redeemed_slice_cgroup_path = ''
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_redemption_required');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_launch_requires_driver_redemption
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'reserved' AND NEW.phase = 'launched'
+          AND (
+            OLD.launch_driver_start_redeemed_at = ''
+            OR OLD.launch_driver_start_redeemed_pid IS NULL
+            OR NEW.attempt_slice_unit IS NOT OLD.launch_driver_start_redeemed_slice_unit
+            OR NEW.attempt_slice_invocation_id IS NOT
+              OLD.launch_driver_start_redeemed_slice_invocation_id
+            OR NEW.attempt_slice_cgroup_path IS NOT
+              OLD.launch_driver_start_redeemed_slice_cgroup_path
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_driver_redemption_mismatch');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_execution_running_requires_redeemed_driver
+        BEFORE UPDATE OF phase ON sandbox_executions
+        WHEN OLD.phase = 'launched' AND NEW.phase = 'running'
+          AND (
+            OLD.launch_driver_start_redeemed_at = ''
+            OR NEW.launch_driver_pid IS NOT OLD.launch_driver_start_redeemed_pid
+            OR NEW.launch_driver_identity IS NOT OLD.launch_driver_start_redeemed_identity
+            OR NEW.launch_driver_unit IS NOT OLD.launch_driver_start_unit
+            OR NEW.launch_driver_invocation_id IS NOT
+              OLD.launch_driver_start_redeemed_invocation_id
+            OR NEW.launch_driver_cgroup_path IS NOT
+              OLD.launch_driver_start_redeemed_cgroup_path
+            OR NEW.attempt_slice_unit IS NOT OLD.launch_driver_start_redeemed_slice_unit
+            OR NEW.attempt_slice_invocation_id IS NOT
+              OLD.launch_driver_start_redeemed_slice_invocation_id
+            OR NEW.attempt_slice_cgroup_path IS NOT
+              OLD.launch_driver_start_redeemed_slice_cgroup_path
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_execution_running_driver_redemption_mismatch');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -2072,6 +2248,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (28, _add_sandbox_launch_submission_receipt),
     (29, _add_sandbox_launch_driver_process_identity),
     (30, _add_sandbox_launch_driver_start_intent),
+    (31, _add_sandbox_launch_driver_start_redemption),
 )
 
 

@@ -150,6 +150,9 @@ _SANDBOX_LAUNCH_SUBMISSION_AUTHORIZATION: ContextVar[
 _SANDBOX_LAUNCH_DRIVER_START_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str, str]] | None
 ] = ContextVar("acp_sandbox_launch_driver_start_authorization", default=None)
+_SANDBOX_LAUNCH_DRIVER_REDEMPTION_AUTHORIZATION: ContextVar[tuple[int, tuple[Any, ...]] | None] = (
+    ContextVar("acp_sandbox_launch_driver_redemption_authorization", default=None)
+)
 _SANDBOX_RESERVATION_AUTHORIZATION: ContextVar[
     tuple[int, tuple[str, int, str, str, str]] | None
 ] = ContextVar("acp_sandbox_reservation_authorization", default=None)
@@ -404,6 +407,58 @@ def _sandbox_launch_driver_start_authorized_for(connection: sqlite3.Connection):
 
 
 @contextmanager
+def _authorize_sandbox_launch_driver_redemption_write(
+    connection: sqlite3.Connection, redemption: Any, redeemed_at: str
+) -> Iterator[None]:
+    """Scope one redemption write to the exact collector-issued service identity."""
+
+    from .sandbox_attestation import launch_driver_start_redemption_is_self_consistent
+
+    if not launch_driver_start_redemption_is_self_consistent(redemption):
+        raise SupervisorError(
+            "sandbox_launch_driver_redemption_required",
+            "launch-driver redemption requires a registered service-identity receipt",
+        )
+    fields = (
+        redemption.attempt_id,
+        redemption.claim_token,
+        redemption.execution_id,
+        redemption.start_id,
+        redemption.start_digest,
+        redemption.service_unit,
+        redeemed_at,
+        redemption.service_invocation_id,
+        redemption.driver_pid,
+        redemption.driver_identity,
+        redemption.driver_control_group,
+        redemption.attempt_slice_unit,
+        redemption.attempt_slice_invocation_id,
+        redemption.attempt_slice_control_group,
+    )
+    token = _SANDBOX_LAUNCH_DRIVER_REDEMPTION_AUTHORIZATION.set(
+        (_store_connection_identity(connection), fields)
+    )
+    try:
+        yield
+    finally:
+        _SANDBOX_LAUNCH_DRIVER_REDEMPTION_AUTHORIZATION.reset(token)
+
+
+def _sandbox_launch_driver_redemption_authorized_for(connection: sqlite3.Connection):
+    connection_id = id(connection)
+
+    def authorized(*fields: Any) -> int:
+        authorization = _SANDBOX_LAUNCH_DRIVER_REDEMPTION_AUTHORIZATION.get()
+        return int(
+            authorization is not None
+            and authorization[0] == connection_id
+            and authorization[1] == fields
+        )
+
+    return authorized
+
+
+@contextmanager
 def _authorize_sandbox_reservation_write(
     connection: sqlite3.Connection,
     attempt_id: str,
@@ -498,6 +553,11 @@ class StoreMixin:
                 _sandbox_launch_driver_start_authorized_for(raw_connection),
             )
             raw_connection.create_function(
+                "acp_sandbox_launch_driver_redemption_authorized",
+                14,
+                _sandbox_launch_driver_redemption_authorized_for(raw_connection),
+            )
+            raw_connection.create_function(
                 "acp_sandbox_reservation_authorized",
                 5,
                 _sandbox_reservation_authorized_for(raw_connection),
@@ -535,6 +595,11 @@ class StoreMixin:
             "acp_sandbox_launch_driver_start_authorized",
             6,
             _sandbox_launch_driver_start_authorized_for(raw_connection),
+        )
+        raw_connection.create_function(
+            "acp_sandbox_launch_driver_redemption_authorized",
+            14,
+            _sandbox_launch_driver_redemption_authorized_for(raw_connection),
         )
         raw_connection.create_function(
             "acp_sandbox_reservation_authorized",

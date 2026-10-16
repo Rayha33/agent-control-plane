@@ -1007,3 +1007,98 @@ def test_attestation_bounds_untrusted_observations() -> None:
     with pytest.raises(SupervisorError) as malformed:
         _validate(runc_state=b"[" * 200 + b"]" * 200)
     assert malformed.value.code == "sandbox_runtime_attestation_invalid"
+
+
+def test_launch_driver_start_redemption_binds_exact_current_service_and_slice() -> None:
+    attempt_id = "1" * 32
+    execution_id = "execution-123"
+    container_id = "acp-test-container"
+    service_unit = f"acp-launch-driver-{execution_id}.service"
+    slice_unit = _oci_worker_systemd_slice(container_id)
+    parent = "/user.slice/user-1000.slice/user@1000.service/app.slice/user-acp.slice"
+    slice_cgroup = f"{parent}/{slice_unit}"
+    service_cgroup = f"{slice_cgroup}/{service_unit}"
+    pid = 303
+
+    def properties(
+        *, unit: str, invocation: str, cgroup: str, slice_name: str, main_pid: int | None = None
+    ) -> bytes:
+        value = (
+            "ActiveState=active\n"
+            f"ControlGroup={cgroup}\n"
+            f"Id={unit}\n"
+            f"InvocationID={invocation}\n"
+            "LoadState=loaded\n"
+        )
+        if main_pid is not None:
+            value += f"MainPID={main_pid}\n"
+        value += f"Slice={slice_name}\n"
+        return value.encode("ascii")
+
+    service = properties(
+        unit=service_unit,
+        invocation="a" * 32,
+        cgroup=service_cgroup,
+        slice_name=slice_unit,
+        main_pid=pid,
+    )
+    attempt_slice = properties(
+        unit=slice_unit,
+        invocation="b" * 32,
+        cgroup=slice_cgroup,
+        slice_name="user-acp.slice",
+    )
+    inputs = {
+        "expected_identity": (attempt_id, 7, execution_id),
+        "expected_container_id": container_id,
+        "start_id": "c" * 32,
+        "start_digest": "d" * 64,
+        "service_unit": service_unit,
+        "attempt_slice_unit": slice_unit,
+        "service_properties": service,
+        "attempt_slice_properties": attempt_slice,
+        "expected_current_pid": pid,
+    }
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            sandbox_attestation,
+            "verify_linux_process_membership",
+            lambda observed_pid, *, expected_cgroup, expected_identity=None: (
+                f"linux:{observed_pid}:123456"
+            ),
+        )
+        receipt = sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **inputs
+        )
+
+    assert sandbox_attestation.launch_driver_start_redemption_has_collector_provenance(receipt)
+    assert sandbox_attestation.launch_driver_start_redemption_is_self_consistent(receipt)
+    assert receipt.driver_pid == pid
+    assert receipt.driver_control_group == service_cgroup
+    assert receipt.attempt_slice_control_group == slice_cgroup
+
+    with pytest.raises(SupervisorError, match="MainPID is not the current service process"):
+        sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **(inputs | {"service_properties": service.replace(b"MainPID=303", b"MainPID=304")})
+        )
+    with pytest.raises(SupervisorError, match="identity is not active and exact"):
+        sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **(
+                inputs
+                | {
+                    "attempt_slice_properties": attempt_slice.replace(
+                        b"Slice=user-acp.slice", b"Slice=system.slice"
+                    )
+                }
+            )
+        )
+    with pytest.raises(SupervisorError, match="direct child of its exact attempt slice"):
+        sandbox_attestation._collect_launch_driver_start_redemption_from_observations(
+            **{
+                **inputs,
+                "service_properties": service.replace(
+                    service_cgroup.encode("ascii"),
+                    f"{parent}/sibling.slice/{service_unit}".encode("ascii"),
+                ),
+            }
+        )

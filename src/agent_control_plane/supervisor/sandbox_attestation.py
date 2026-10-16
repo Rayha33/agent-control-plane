@@ -128,10 +128,52 @@ class RunningRuntimeAttestation:
         }
 
 
+@dataclass(frozen=True)
+class LaunchDriverStartRedemption:
+    """Collector-issued identity for one exact launch-driver activation."""
+
+    attempt_id: str
+    claim_token: int
+    execution_id: str
+    start_id: str
+    start_digest: str
+    service_unit: str
+    service_invocation_id: str
+    driver_pid: int
+    driver_identity: str
+    driver_control_group: str
+    attempt_slice_unit: str
+    attempt_slice_invocation_id: str
+    attempt_slice_control_group: str
+    evidence_sha256: str
+
+    def audit_payload(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "claim_token": self.claim_token,
+            "execution_id": self.execution_id,
+            "start_id": self.start_id,
+            "start_digest": self.start_digest,
+            "service_unit": self.service_unit,
+            "service_invocation_id": self.service_invocation_id,
+            "driver_pid": self.driver_pid,
+            "driver_identity": self.driver_identity,
+            "driver_control_group": self.driver_control_group,
+            "attempt_slice_unit": self.attempt_slice_unit,
+            "attempt_slice_invocation_id": self.attempt_slice_invocation_id,
+            "attempt_slice_control_group": self.attempt_slice_control_group,
+            "evidence_sha256": self.evidence_sha256,
+        }
+
+
 _COLLECTED_ATTESTATION_LOCK = threading.Lock()
 _COLLECTED_ATTESTATIONS: weakref.WeakValueDictionary[int, RunningRuntimeAttestation] = (
     weakref.WeakValueDictionary()
 )
+_COLLECTED_LAUNCH_DRIVER_REDEMPTION_LOCK = threading.Lock()
+_COLLECTED_LAUNCH_DRIVER_REDEMPTIONS: weakref.WeakValueDictionary[
+    int, LaunchDriverStartRedemption
+] = weakref.WeakValueDictionary()
 
 
 def running_attestation_has_collector_provenance(value: Any) -> bool:
@@ -145,6 +187,59 @@ def running_attestation_has_collector_provenance(value: Any) -> bool:
         return False
     with _COLLECTED_ATTESTATION_LOCK:
         return _COLLECTED_ATTESTATIONS.get(id(value)) is value
+
+
+def launch_driver_start_redemption_has_collector_provenance(value: Any) -> bool:
+    """Return true only for the exact object issued by the driver collector."""
+
+    if type(value) is not LaunchDriverStartRedemption:
+        return False
+    with _COLLECTED_LAUNCH_DRIVER_REDEMPTION_LOCK:
+        return _COLLECTED_LAUNCH_DRIVER_REDEMPTIONS.get(id(value)) is value
+
+
+def launch_driver_start_redemption_is_self_consistent(value: Any) -> bool:
+    if not launch_driver_start_redemption_has_collector_provenance(value):
+        return False
+    try:
+        payload = value.audit_payload()
+        if (
+            type(value.claim_token) is not int
+            or value.claim_token <= 0
+            or not isinstance(value.attempt_id, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", value.attempt_id) is None
+            or not isinstance(value.execution_id, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", value.execution_id) is None
+            or re.fullmatch(r"[0-9a-f]{32}", value.start_id) is None
+            or not _is_sha256(value.start_digest)
+            or value.service_unit != f"acp-launch-driver-{value.execution_id}.service"
+            or _unit(value.service_unit, ".service", "launch-driver service unit")
+            != value.service_unit
+            or _invocation(value.service_invocation_id, "launch-driver invocation ID")
+            != value.service_invocation_id
+            or _pid(value.driver_pid, "launch-driver PID") != value.driver_pid
+            or _identity(value.driver_identity, value.driver_pid, "launch-driver identity")
+            != value.driver_identity
+            or _cgroup_path(value.driver_control_group, "launch-driver cgroup")
+            != value.driver_control_group
+            or _unit(value.attempt_slice_unit, ".slice", "attempt slice unit")
+            != value.attempt_slice_unit
+            or _invocation(value.attempt_slice_invocation_id, "attempt-slice invocation ID")
+            != value.attempt_slice_invocation_id
+            or _cgroup_path(value.attempt_slice_control_group, "attempt-slice cgroup")
+            != value.attempt_slice_control_group
+            or PurePosixPath(value.driver_control_group).name != value.service_unit
+            or PurePosixPath(value.driver_control_group).parent.as_posix()
+            != value.attempt_slice_control_group
+            or PurePosixPath(value.attempt_slice_control_group).name != value.attempt_slice_unit
+        ):
+            return False
+        payload.pop("evidence_sha256", None)
+        return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest() == (
+            value.evidence_sha256
+        )
+    except (SupervisorError, TypeError, ValueError):
+        return False
 
 
 def read_linux_process_snapshot(pid: int) -> ProcessSnapshot:
@@ -1408,6 +1503,195 @@ def _parse_unit_properties(raw: bytes, *, require_main_pid: bool = False) -> dic
     if require_main_pid:
         _parse_main_pid(properties["MainPID"], "systemd MainPID")
     return properties
+
+
+def _parse_launch_driver_start_unit_properties(raw: bytes, *, service: bool) -> dict[str, str]:
+    """Parse only the fixed systemd properties needed to redeem the intent."""
+
+    raw = _bounded(raw, "launch-driver systemd properties")
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise _invalid("launch-driver systemd properties are not ASCII") from error
+    properties: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if (
+            not separator
+            or not key
+            or value != value.strip()
+            or key in properties
+            or any(character in value for character in "\x00\r")
+        ):
+            raise _invalid("launch-driver systemd properties are malformed or duplicated")
+        properties[key] = value
+    expected = {"ActiveState", "ControlGroup", "Id", "InvocationID", "LoadState", "Slice"}
+    if service:
+        expected.add("MainPID")
+    if set(properties) != expected:
+        raise _invalid("launch-driver systemd properties are incomplete or unexpected")
+    if service:
+        _parse_main_pid(properties["MainPID"], "launch-driver MainPID")
+    return properties
+
+
+def _collect_launch_driver_start_redemption_from_observations(
+    *,
+    expected_identity: tuple[str, int, str],
+    expected_container_id: str,
+    start_id: str,
+    start_digest: str,
+    service_unit: str,
+    attempt_slice_unit: str,
+    service_properties: bytes,
+    attempt_slice_properties: bytes,
+    expected_current_pid: int,
+) -> LaunchDriverStartRedemption:
+    """Validate exact live service/slice observations and issue a local receipt."""
+
+    if (
+        not isinstance(expected_identity, tuple)
+        or len(expected_identity) != 3
+        or type(expected_identity[1]) is not int
+        or not isinstance(expected_container_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", expected_container_id) is None
+        or not isinstance(start_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", start_id) is None
+        or not _is_sha256(start_digest)
+        or service_unit != f"acp-launch-driver-{expected_identity[2]}.service"
+        or attempt_slice_unit != _oci_worker_systemd_slice(expected_container_id)
+        or _pid(expected_current_pid, "current launch-driver PID") != expected_current_pid
+    ):
+        raise _invalid("launch-driver start redemption identity is invalid")
+    attempt_id, claim_token, execution_id = expected_identity
+    if (
+        not isinstance(attempt_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", attempt_id) is None
+        or type(claim_token) is not int
+        or claim_token <= 0
+        or not isinstance(execution_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", execution_id) is None
+    ):
+        raise _invalid("launch-driver start redemption tuple is invalid")
+
+    service = _parse_launch_driver_start_unit_properties(service_properties, service=True)
+    attempt_slice = _parse_launch_driver_start_unit_properties(
+        attempt_slice_properties, service=False
+    )
+    if (
+        service["Id"] != service_unit
+        or service["LoadState"] != "loaded"
+        or service["ActiveState"] != "active"
+        or service["Slice"] != attempt_slice_unit
+        or attempt_slice["Id"] != attempt_slice_unit
+        or attempt_slice["LoadState"] != "loaded"
+        or attempt_slice["ActiveState"] != "active"
+        or attempt_slice["Slice"] != "user-acp.slice"
+    ):
+        raise _invalid("launch-driver or attempt-slice systemd identity is not active and exact")
+    driver_pid = _parse_main_pid(service["MainPID"], "launch-driver MainPID")
+    if driver_pid != expected_current_pid:
+        raise _invalid("launch-driver MainPID is not the current service process")
+    service_invocation_id = _invocation(service["InvocationID"], "launch-driver invocation ID")
+    attempt_slice_invocation_id = _invocation(
+        attempt_slice["InvocationID"], "attempt-slice invocation ID"
+    )
+    driver_control_group = _cgroup_path(service["ControlGroup"], "launch-driver cgroup")
+    attempt_slice_control_group = _cgroup_path(
+        attempt_slice["ControlGroup"], "attempt-slice cgroup"
+    )
+    if (
+        PurePosixPath(driver_control_group).name != service_unit
+        or PurePosixPath(driver_control_group).parent.as_posix() != attempt_slice_control_group
+        or PurePosixPath(attempt_slice_control_group).name != attempt_slice_unit
+    ):
+        raise _invalid("launch-driver cgroup is not a direct child of its exact attempt slice")
+    driver_identity = verify_linux_process_membership(
+        driver_pid, expected_cgroup=driver_control_group
+    )
+    payload = {
+        "attempt_id": attempt_id,
+        "claim_token": claim_token,
+        "execution_id": execution_id,
+        "start_id": start_id,
+        "start_digest": start_digest,
+        "service_unit": service_unit,
+        "service_invocation_id": service_invocation_id,
+        "driver_pid": driver_pid,
+        "driver_identity": driver_identity,
+        "driver_control_group": driver_control_group,
+        "attempt_slice_unit": attempt_slice_unit,
+        "attempt_slice_invocation_id": attempt_slice_invocation_id,
+        "attempt_slice_control_group": attempt_slice_control_group,
+    }
+    receipt = LaunchDriverStartRedemption(
+        **payload,
+        evidence_sha256=hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
+    )
+    with _COLLECTED_LAUNCH_DRIVER_REDEMPTION_LOCK:
+        _COLLECTED_LAUNCH_DRIVER_REDEMPTIONS[id(receipt)] = receipt
+    if not launch_driver_start_redemption_is_self_consistent(receipt):
+        raise _invalid("launch-driver start redemption receipt is inconsistent")
+    return receipt
+
+
+def collect_launch_driver_start_redemption(
+    *,
+    expected_identity: tuple[str, int, str],
+    expected_container_id: str,
+    start_id: str,
+    start_digest: str,
+    service_unit: str,
+    attempt_slice_unit: str,
+) -> LaunchDriverStartRedemption:
+    """Observe the current systemd-owned launch-driver activation from inside it."""
+
+    if not sys.platform.startswith("linux"):
+        raise _invalid("launch-driver start redemption requires Linux")
+    systemctl_path = _trusted_systemctl_executable()
+    environment = _trusted_systemd_command_environment()
+
+    def read_unit(unit: str, *, service: bool) -> bytes:
+        properties = ["ActiveState", "ControlGroup", "Id", "InvocationID", "LoadState", "Slice"]
+        if service:
+            properties.append("MainPID")
+        return _run_trusted_runtime_command(
+            [
+                str(systemctl_path),
+                "--user",
+                "show",
+                "--no-pager",
+                f"--property={','.join(properties)}",
+                "--",
+                unit,
+            ],
+            environment=environment,
+        )
+
+    service_before = read_unit(service_unit, service=True)
+    slice_before = read_unit(attempt_slice_unit, service=False)
+    receipt = _collect_launch_driver_start_redemption_from_observations(
+        expected_identity=expected_identity,
+        expected_container_id=expected_container_id,
+        start_id=start_id,
+        start_digest=start_digest,
+        service_unit=service_unit,
+        attempt_slice_unit=attempt_slice_unit,
+        service_properties=service_before,
+        attempt_slice_properties=slice_before,
+        expected_current_pid=os.getpid(),
+    )
+    if (
+        read_unit(service_unit, service=True) != service_before
+        or read_unit(attempt_slice_unit, service=False) != slice_before
+    ):
+        raise _invalid("launch-driver service or attempt-slice identity changed during collection")
+    verify_linux_process_membership(
+        receipt.driver_pid,
+        expected_cgroup=receipt.driver_control_group,
+        expected_identity=receipt.driver_identity,
+    )
+    return receipt
 
 
 def _parse_main_pid(value: Any, field: str) -> int:

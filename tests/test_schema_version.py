@@ -319,7 +319,7 @@ def test_v29_launch_driver_identity_migration_is_idempotent_and_authorization_ga
 
 
 def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
-    assert SCHEMA_VERSION == 30
+    assert SCHEMA_VERSION == 31
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -369,6 +369,74 @@ def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
                     "2026-10-16T00:00:00Z",
                     "acp-launch-driver-legacy-execution.service",
                 ),
+            )
+    finally:
+        connection.close()
+
+
+def test_v31_launch_driver_redemption_migration_is_idempotent_and_fences_submission() -> None:
+    assert SCHEMA_VERSION == 31
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE sandbox_executions ("
+            "attempt_id TEXT, claim_token INTEGER, execution_id TEXT, phase TEXT NOT NULL, "
+            "launch_submission_id TEXT NOT NULL DEFAULT '', "
+            "launch_submission_digest TEXT NOT NULL DEFAULT '', "
+            "launch_submission_at TEXT NOT NULL DEFAULT '', "
+            "launch_plan_required INTEGER NOT NULL DEFAULT 1, "
+            "workspace_binding_version INTEGER NOT NULL DEFAULT 1, "
+            "private_path_binding_version INTEGER NOT NULL DEFAULT 1, "
+            "launch_driver_pid INTEGER, launch_driver_identity TEXT NOT NULL DEFAULT '', "
+            "launch_driver_unit TEXT NOT NULL DEFAULT '', "
+            "launch_driver_invocation_id TEXT NOT NULL DEFAULT '', "
+            "launch_driver_cgroup_path TEXT NOT NULL DEFAULT '', "
+            "attempt_slice_unit TEXT NOT NULL DEFAULT '', "
+            "attempt_slice_invocation_id TEXT NOT NULL DEFAULT '', "
+            "attempt_slice_cgroup_path TEXT NOT NULL DEFAULT '')"
+        )
+        connection.execute(
+            "INSERT INTO sandbox_executions "
+            "(attempt_id, claim_token, execution_id, phase) "
+            "VALUES ('attempt', 1, 'execution', 'reserved')"
+        )
+        connection.create_function("acp_sandbox_launch_driver_start_authorized", 6, lambda *_: 0)
+        migrations = dict(MIGRATIONS)
+        migrations[30](connection)
+        migrations[31](connection)
+        migrations[31](connection)
+
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")
+        }
+        assert {
+            "launch_driver_start_redeemed_at",
+            "launch_driver_start_redeemed_invocation_id",
+            "launch_driver_start_redeemed_pid",
+            "launch_driver_start_redeemed_identity",
+            "launch_driver_start_redeemed_cgroup_path",
+            "launch_driver_start_redeemed_slice_unit",
+            "launch_driver_start_redeemed_slice_invocation_id",
+            "launch_driver_start_redeemed_slice_cgroup_path",
+        } <= columns
+        connection.create_function(
+            "acp_sandbox_launch_driver_redemption_authorized", 14, lambda *_: 0
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="sandbox_execution_driver_redemption_required"
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET launch_submission_id = ?, "
+                "launch_submission_digest = ?, launch_submission_at = ? WHERE attempt_id = ?",
+                ("a" * 32, "b" * 64, "now", "attempt"),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="sandbox_execution_driver_redemption_mismatch"
+        ):
+            connection.execute(
+                "UPDATE sandbox_executions SET phase = 'launched' WHERE attempt_id = ?",
+                ("attempt",),
             )
     finally:
         connection.close()

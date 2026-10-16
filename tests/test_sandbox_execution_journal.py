@@ -52,7 +52,10 @@ from agent_control_plane.supervisor.sandbox_workspace import (
     copy_snapshot,
     read_snapshot_files,
 )
-from agent_control_plane.supervisor.store import _authorize_sandbox_reservation_write
+from agent_control_plane.supervisor.store import (
+    _authorize_sandbox_launch_driver_redemption_write,
+    _authorize_sandbox_reservation_write,
+)
 
 _RECORD_LAUNCH_MONITOR = threading.local()
 
@@ -491,6 +494,126 @@ def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
     )
 
 
+def redeem_test_launch_driver_start(
+    supervisor: GitSupervisor, attempt: dict, *, intent: Any | None = None
+) -> tuple[Any, dict[str, Any]]:
+    """Issue synthetic collector evidence for one journal-only redemption test."""
+
+    if intent is None:
+        existing = supervisor._sandbox_execution_get(attempt["id"])
+        assert existing is not None
+        if existing["launch_driver_start_id"]:
+            intent = SimpleNamespace(
+                attempt_id=attempt["id"],
+                claim_token=attempt["claim_token"],
+                execution_id=existing["execution_id"],
+                start_id=existing["launch_driver_start_id"],
+                start_digest=existing["launch_driver_start_digest"],
+                service_unit=existing["launch_driver_start_unit"],
+            )
+        else:
+            intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+                attempt["id"], attempt["claim_token"]
+            )
+    redemption = collect_test_launch_driver_redemption(supervisor, attempt)
+    updated = supervisor._sandbox_execution_redeem_launch_driver_start(
+        attempt["id"], attempt["claim_token"], redemption=redemption
+    )
+    return redemption, updated
+
+
+def collect_test_launch_driver_redemption(
+    supervisor: GitSupervisor,
+    attempt: dict,
+    *,
+    service_active_state: str = "active",
+    service_invocation_id: str = "4" * 32,
+    slice_active_state: str = "active",
+    slice_invocation_id: str = "3" * 32,
+) -> Any:
+    """Issue synthetic collector evidence for one journal-only observation."""
+
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    assert row is not None
+    attempt_slice_unit = oci_worker._oci_worker_systemd_slice(row["container_id"])
+    parent_cgroup = "/user.slice/user-1000.slice/user@1000.service/user-acp.slice"
+    attempt_slice_cgroup = f"{parent_cgroup}/{attempt_slice_unit}"
+    driver_cgroup = f"{attempt_slice_cgroup}/{row['launch_driver_start_unit']}"
+    pid = os.getpid()
+    service_properties = (
+        f"ActiveState={service_active_state}\n"
+        f"ControlGroup={driver_cgroup}\n"
+        f"Id={row['launch_driver_start_unit']}\n"
+        f"InvocationID={service_invocation_id}\n"
+        "LoadState=loaded\n"
+        f"MainPID={pid}\n"
+        f"Slice={attempt_slice_unit}\n"
+    ).encode("ascii")
+    slice_properties = (
+        f"ActiveState={slice_active_state}\n"
+        f"ControlGroup={attempt_slice_cgroup}\n"
+        f"Id={attempt_slice_unit}\n"
+        f"InvocationID={slice_invocation_id}\n"
+        "LoadState=loaded\n"
+        "Slice=user-acp.slice\n"
+    ).encode("ascii")
+    with patch.object(
+        sandbox_attestation_module,
+        "verify_linux_process_membership",
+        return_value=f"linux:{pid}:1404",
+    ):
+        redemption = (
+            sandbox_attestation_module._collect_launch_driver_start_redemption_from_observations(
+                expected_identity=(attempt["id"], attempt["claim_token"], row["execution_id"]),
+                expected_container_id=row["container_id"],
+                start_id=row["launch_driver_start_id"],
+                start_digest=row["launch_driver_start_digest"],
+                service_unit=row["launch_driver_start_unit"],
+                attempt_slice_unit=attempt_slice_unit,
+                service_properties=service_properties,
+                attempt_slice_properties=slice_properties,
+                expected_current_pid=pid,
+            )
+        )
+    return redemption
+
+
+def authorize_test_launch_submission(
+    supervisor: GitSupervisor,
+    attempt: dict,
+    launch_target: oci_worker._RuncLaunchTarget,
+) -> Any:
+    """Give legacy journal tests an explicit synthetic service-receipt setup."""
+
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None
+    ready = (
+        execution["launch_plan_required"] == 1
+        and execution["workspace_binding_version"] == 1
+        and execution["private_path_binding_version"] == 1
+    )
+    if ready and not execution["launch_driver_start_redeemed_at"]:
+        redeem_test_launch_driver_start(supervisor, attempt)
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None
+    redemption = collect_test_launch_driver_redemption(supervisor, attempt) if ready else None
+    with (
+        patch.object(
+            journal_module,
+            "collect_launch_driver_start_redemption",
+            return_value=redemption,
+        ),
+        patch.object(
+            journal_module,
+            "verify_linux_process_membership",
+            return_value=execution["launch_driver_start_redeemed_identity"],
+        ),
+    ):
+        return supervisor._sandbox_execution_authorize_launch_submission(
+            attempt["id"], attempt["claim_token"], launch_target=launch_target
+        )
+
+
 def test_sandbox_container_id_binds_full_execution_identity() -> None:
     first_execution = "12345678-0000-4000-8000-000000000001"
     second_execution = "12345678-0000-4000-8000-000000000002"
@@ -593,9 +716,7 @@ def test_launch_submission_commit_precedes_fake_runc_exec_marker(repo: Path) -> 
     # This models the launcher's callback boundary: the durable transaction
     # commits before the fake runc marker and its exact handle are registered.
     def authorize_before_exec(launch_target):
-        submission = supervisor._sandbox_execution_authorize_launch_submission(
-            attempt["id"], attempt["claim_token"], launch_target=launch_target
-        )
+        submission = authorize_test_launch_submission(supervisor, attempt, launch_target)
         durable = supervisor._sandbox_execution_get(attempt["id"])
         assert durable is not None
         assert durable["phase"] == "reserved"
@@ -633,11 +754,7 @@ def test_private_launcher_rejects_missing_or_mismatched_capability_before_exec_a
         if callback_result == "unrelated":
             return object()
         wrong_target = replace(launch_target, config_sha256="c" * 64)
-        return supervisor._sandbox_execution_authorize_launch_submission(
-            attempt["id"],
-            attempt["claim_token"],
-            launch_target=wrong_target,
-        )
+        return authorize_test_launch_submission(supervisor, attempt, wrong_target)
 
     with pytest.raises(SupervisorError) as rejected:
         submission = oci_worker._authorize_runc_submission_before_exec(authorize, target)
@@ -664,9 +781,7 @@ def test_post_launch_authorization_cannot_be_paired_with_existing_handle(repo: P
     # Model an unjournaled submission first, then an attacker attempting to
     # authorize the same target after the handle already exists.
     _register_test_runc_launch(handle, launch_submission=None)
-    submission = supervisor._sandbox_execution_authorize_launch_submission(
-        attempt["id"], attempt["claim_token"], launch_target=target
-    )
+    submission = authorize_test_launch_submission(supervisor, attempt, target)
     attempt["_test_launch_submission"] = submission
 
     assert not oci_worker._runc_launch_submission_is_bound_to_handle(handle, submission)
@@ -992,9 +1107,7 @@ def test_generic_transition_cannot_forge_launch_plan_binding(repo: Path) -> None
     execution = reserve(supervisor, attempt)
     target = _test_runc_target(execution)
     updates = launch_transition_updates(execution, target)
-    supervisor._sandbox_execution_authorize_launch_submission(
-        attempt["id"], attempt["claim_token"], launch_target=target
-    )
+    authorize_test_launch_submission(supervisor, attempt, target)
 
     with pytest.raises(sqlite3.IntegrityError, match="sandbox_launch_plan_binding_required"):
         supervisor._sandbox_execution_transition(
@@ -1035,9 +1148,7 @@ def test_launch_transition_rejects_mismatched_config_or_argv(repo: Path, mismatc
     execution = reserve(supervisor, attempt)
     target = _test_runc_target(execution)
     updates = launch_transition_updates(execution, target)
-    supervisor._sandbox_execution_authorize_launch_submission(
-        attempt["id"], attempt["claim_token"], launch_target=target
-    )
+    authorize_test_launch_submission(supervisor, attempt, target)
     plan = json.loads(updates["launch_plan_json"])
     if mismatch == "config":
         plan["launch"]["config_sha256"] = "f" * 64
@@ -1191,6 +1302,7 @@ def test_concurrent_launch_plan_binding_has_one_durable_winner(repo: Path) -> No
     assert errors[0].code in {
         "sandbox_execution_transition_invalid",
         "sandbox_execution_launch_submission_exists",
+        "sandbox_launch_driver_start_ambiguous",
     }
     durable = supervisor._sandbox_execution_get(attempt["id"])
     assert durable["phase"] == "launched"
@@ -2367,11 +2479,7 @@ def record_launch(
         if launch_target.launch_mode == "private_bundle" and launch_submission is None:
             # The synthetic launcher calls the durable callback first, then
             # captures its returned capability in the exact registered handle.
-            launch_submission = supervisor._sandbox_execution_authorize_launch_submission(
-                attempt["id"],
-                attempt["claim_token"],
-                launch_target=launch_target,
-            )
+            launch_submission = authorize_test_launch_submission(supervisor, attempt, launch_target)
             attempt["_test_launch_submission"] = launch_submission
         _register_test_runc_launch(
             runc_handle,
@@ -2520,9 +2628,7 @@ def test_launch_submission_is_not_retried_after_monitor_restart(repo: Path) -> N
 
     # Model the monitor's durable callback immediately before runc submission,
     # then lose its process-local capability before record_launch can commit.
-    submission = supervisor._sandbox_execution_authorize_launch_submission(
-        attempt["id"], attempt["claim_token"], launch_target=target
-    )
+    submission = authorize_test_launch_submission(supervisor, attempt, target)
     stranded = supervisor._sandbox_execution_get(attempt["id"])
     assert stranded is not None
     assert stranded["phase"] == "reserved"
@@ -2555,11 +2661,12 @@ def test_launch_submission_is_not_retried_after_monitor_restart(repo: Path) -> N
     assert after_restart["launch_submission_id"] == submission.submission_id
 
 
-def test_concurrent_fresh_processes_consume_only_one_launch_submission(repo: Path) -> None:
+def test_fresh_processes_cannot_submit_with_parent_driver_redemption(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
     execution = reserve(supervisor, attempt)
     target = _test_runc_target(execution)
+    redeem_test_launch_driver_start(supervisor, attempt)
     context = multiprocessing.get_context("spawn")
     start_event = context.Event()
     workers = []
@@ -2592,12 +2699,12 @@ def test_concurrent_fresh_processes_consume_only_one_launch_submission(repo: Pat
                 process.join(timeout=5)
 
     assert [process.exitcode for process in workers] == [0, 0]
-    assert [kind for kind, _value in results].count("ok") == 1
-    assert results.count(("error", "sandbox_execution_launch_submission_exists")) == 1
+    assert [kind for kind, _value in results].count("ok") == 0
+    assert results.count(("error", "sandbox_launch_driver_redemption_required")) == 2
     durable = supervisor._sandbox_execution_get(attempt["id"])
     assert durable is not None
     assert durable["phase"] == "reserved"
-    assert durable["launch_submission_id"]
+    assert durable["launch_submission_id"] == ""
     assert supervisor.verify_event_chain()["ok"] is True
 
 
@@ -2609,7 +2716,8 @@ def test_sql_cannot_forge_launch_submission(repo: Path) -> None:
     with supervisor.connect() as connection:
         with pytest.raises(
             sqlite3.IntegrityError,
-            match="sandbox_launch_submission_must_be_authorized_once",
+            match="sandbox_execution_driver_redemption_required|"
+            "sandbox_launch_submission_must_be_authorized_once",
         ):
             connection.execute(
                 "UPDATE sandbox_executions SET launch_submission_id = ?, "
@@ -2697,7 +2805,7 @@ def test_adoption_rejects_a_self_consistent_plan_with_reused_monitor_unit(repo: 
 def launch_transition_updates(execution: dict, target: oci_worker._RuncLaunchTarget) -> dict:
     plan = journal_module._sandbox_launch_plan_material(execution, target)
     slice_unit = oci_worker._oci_worker_systemd_slice(target.container_id)
-    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    common_cgroup = "/user.slice/user-1000.slice/user@1000.service/user-acp.slice"
     slice_cgroup = common_cgroup + "/" + slice_unit
     wrapper_unit = journal_module._sandbox_monitor_service_unit(
         execution["attempt_id"], execution["claim_token"], execution["execution_id"]
@@ -3048,7 +3156,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 30
+    assert SCHEMA_VERSION == 31
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1
@@ -3207,6 +3315,193 @@ def test_launch_driver_start_intent_is_exact_and_one_shot(repo: Path) -> None:
                 "UPDATE sandbox_executions SET launch_driver_start_id = ? WHERE attempt_id = ?",
                 ("f" * 32, attempt["id"]),
             )
+
+
+def test_launch_driver_redemption_is_exact_and_one_shot(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    first_attempt = claimed(supervisor, "redemption-first.txt")
+    reserve(supervisor, first_attempt)
+    second_attempt = claimed(supervisor, "redemption-second.txt")
+    reserve(supervisor, second_attempt)
+
+    first_intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        first_attempt["id"], first_attempt["claim_token"]
+    )
+    first_row = supervisor._sandbox_execution_get(first_attempt["id"])
+    assert first_row is not None
+    attempt_slice_unit = oci_worker._oci_worker_systemd_slice(first_row["container_id"])
+    parent_cgroup = "/user.slice/user-1000.slice/user@1000.service/user-acp.slice"
+    attempt_slice_cgroup = f"{parent_cgroup}/{attempt_slice_unit}"
+    driver_cgroup = f"{attempt_slice_cgroup}/{first_intent.service_unit}"
+    pid = os.getpid()
+    service_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={driver_cgroup}\n"
+        f"Id={first_intent.service_unit}\n"
+        f"InvocationID={'c' * 32}\n"
+        "LoadState=loaded\n"
+        f"MainPID={pid}\n"
+        f"Slice={attempt_slice_unit}\n"
+    ).encode("ascii")
+    slice_properties = (
+        "ActiveState=active\n"
+        f"ControlGroup={attempt_slice_cgroup}\n"
+        f"Id={attempt_slice_unit}\n"
+        f"InvocationID={'d' * 32}\n"
+        "LoadState=loaded\n"
+        "Slice=user-acp.slice\n"
+    ).encode("ascii")
+    with patch.object(
+        sandbox_attestation_module,
+        "verify_linux_process_membership",
+        return_value=f"linux:{pid}:123456",
+    ):
+        redemption = (
+            sandbox_attestation_module._collect_launch_driver_start_redemption_from_observations(
+                expected_identity=(
+                    first_attempt["id"],
+                    first_attempt["claim_token"],
+                    first_row["execution_id"],
+                ),
+                expected_container_id=first_row["container_id"],
+                start_id=first_intent.start_id,
+                start_digest=first_intent.start_digest,
+                service_unit=first_intent.service_unit,
+                attempt_slice_unit=attempt_slice_unit,
+                service_properties=service_properties,
+                attempt_slice_properties=slice_properties,
+                expected_current_pid=pid,
+            )
+        )
+
+    with pytest.raises(SupervisorError) as cross_tuple:
+        supervisor._sandbox_execution_redeem_launch_driver_start(
+            second_attempt["id"], second_attempt["claim_token"], redemption=redemption
+        )
+    assert cross_tuple.value.code == "sandbox_launch_driver_redemption_required"
+    first = supervisor._sandbox_execution_redeem_launch_driver_start(
+        first_attempt["id"], first_attempt["claim_token"], redemption=redemption
+    )
+    assert first["launch_driver_start_redeemed_invocation_id"] == "c" * 32
+    assert first["launch_driver_start_redeemed_pid"] == pid
+    assert first["launch_driver_start_redeemed_slice_invocation_id"] == "d" * 32
+    with pytest.raises(SupervisorError) as duplicate:
+        supervisor._sandbox_execution_redeem_launch_driver_start(
+            first_attempt["id"], first_attempt["claim_token"], redemption=redemption
+        )
+    assert duplicate.value.code == "sandbox_launch_driver_redemption_ambiguous"
+
+
+def test_launch_submission_requires_redeemed_driver_activation(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "redemption-required.txt")
+    execution = reserve(supervisor, attempt)
+    intent = supervisor._sandbox_execution_authorize_launch_driver_start(
+        attempt["id"], attempt["claim_token"]
+    )
+
+    with pytest.raises(SupervisorError) as missing:
+        supervisor._sandbox_execution_authorize_launch_submission(
+            attempt["id"],
+            attempt["claim_token"],
+            launch_target=_test_runc_target(execution),
+        )
+    assert missing.value.code == "sandbox_launch_driver_redemption_required"
+
+    _receipt, redeemed = redeem_test_launch_driver_start(supervisor, attempt, intent=intent)
+    assert redeemed["launch_driver_start_redeemed_at"]
+    submission = authorize_test_launch_submission(supervisor, attempt, _test_runc_target(execution))
+    assert submission.execution_id == execution["execution_id"]
+
+
+@pytest.mark.parametrize("activation_change", ["deactivating", "restarted"])
+def test_launch_submission_rechecks_live_driver_activation(
+    repo: Path, activation_change: str
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, f"redemption-{activation_change}.txt")
+    execution = reserve(supervisor, attempt)
+    redeem_test_launch_driver_start(supervisor, attempt)
+    target = _test_runc_target(execution)
+
+    if activation_change == "deactivating":
+
+        def collect_deactivating_activation(**_kwargs: Any) -> Any:
+            return collect_test_launch_driver_redemption(
+                supervisor, attempt, service_active_state="deactivating"
+            )
+
+        collector = collect_deactivating_activation
+    else:
+
+        def collect_restarted_activation(**_kwargs: Any) -> Any:
+            return collect_test_launch_driver_redemption(
+                supervisor, attempt, service_invocation_id="5" * 32
+            )
+
+        collector = collect_restarted_activation
+
+    with (
+        patch.object(
+            journal_module,
+            "collect_launch_driver_start_redemption",
+            side_effect=collector,
+        ),
+        patch.object(journal_module, "verify_linux_process_membership", return_value="unused"),
+        pytest.raises(SupervisorError) as stale,
+    ):
+        supervisor._sandbox_execution_authorize_launch_submission(
+            attempt["id"], attempt["claim_token"], launch_target=target
+        )
+
+    assert stale.value.code == "sandbox_launch_driver_redemption_stale"
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None
+    assert durable["launch_submission_id"] == ""
+    assert durable["launch_submission_at"] == ""
+
+
+def test_redemption_sql_authorization_binds_exact_timestamp(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor, "redemption-timestamp.txt")
+    reserve(supervisor, attempt)
+    redeem_test_launch_driver_start(supervisor, attempt)
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    assert row is not None
+    redemption = collect_test_launch_driver_redemption(supervisor, attempt)
+    redeemed_at = "2026-10-16T03:00:00Z"
+    fields = (
+        attempt["id"],
+        attempt["claim_token"],
+        row["execution_id"],
+        row["launch_driver_start_id"],
+        row["launch_driver_start_digest"],
+        row["launch_driver_start_unit"],
+        redeemed_at,
+        redemption.service_invocation_id,
+        redemption.driver_pid,
+        redemption.driver_identity,
+        redemption.driver_control_group,
+        redemption.attempt_slice_unit,
+        redemption.attempt_slice_invocation_id,
+        redemption.attempt_slice_control_group,
+    )
+    with supervisor.connect() as connection:
+        with _authorize_sandbox_launch_driver_redemption_write(connection, redemption, redeemed_at):
+            exact = connection.execute(
+                "SELECT acp_sandbox_launch_driver_redemption_authorized("
+                + ",".join("?" for _ in fields)
+                + ")",
+                fields,
+            ).fetchone()[0]
+            changed_timestamp = connection.execute(
+                "SELECT acp_sandbox_launch_driver_redemption_authorized("
+                + ",".join("?" for _ in fields)
+                + ")",
+                (*fields[:6], "2026-10-16T03:00:01Z", *fields[7:]),
+            ).fetchone()[0]
+    assert exact == 1
+    assert changed_timestamp == 0
 
 
 def test_v15_to_v16_migration_adds_non_authorizing_candidate_fields() -> None:
@@ -3453,7 +3748,8 @@ def test_sandbox_launch_cannot_bypass_workspace_binding(repo: Path) -> None:
             match=(
                 "workspace_binding_required|private_paths_required|"
                 "sandbox_execution_launch_plan_required|attempt_slice_identity_required|"
-                "sandbox_execution_launch_submission_required|phase_transition_invalid"
+                "sandbox_execution_launch_submission_required|phase_transition_invalid|"
+                "sandbox_execution_driver_redemption_mismatch"
             ),
         ),
     ):
@@ -4795,7 +5091,14 @@ def test_exit_evidence_cannot_be_stamped_before_kernel_wait(repo: Path) -> None:
 
     with supervisor.connect() as connection:
         row = connection.execute(
-            "SELECT execution_id, attempt_slice_cgroup_path FROM sandbox_executions "
+            "SELECT execution_id, attempt_slice_cgroup_path, "
+            "launch_driver_start_redeemed_pid, launch_driver_start_redeemed_identity, "
+            "launch_driver_start_redeemed_invocation_id, "
+            "launch_driver_start_redeemed_cgroup_path, "
+            "launch_driver_start_redeemed_slice_unit, "
+            "launch_driver_start_redeemed_slice_invocation_id, "
+            "launch_driver_start_redeemed_slice_cgroup_path "
+            "FROM sandbox_executions "
             "WHERE attempt_id = ?",
             (attempt["id"],),
         ).fetchone()
@@ -4824,15 +5127,17 @@ def test_exit_evidence_cannot_be_stamped_before_kernel_wait(repo: Path) -> None:
                 UPDATE sandbox_executions
                 SET phase = 'running', init_pid = 4242, init_identity = 'synthetic-start',
                     runc_exit_evidence_source = 'runc_client_kernel_waitpid',
-                    launch_driver_pid = 4243, launch_driver_identity = 'linux:4243:1303',
+                    launch_driver_pid = ?, launch_driver_identity = ?,
                     launch_driver_unit = ?, launch_driver_invocation_id = ?,
                     launch_driver_cgroup_path = ?
                 WHERE attempt_id = ?
                 """,
                 (
+                    row["launch_driver_start_redeemed_pid"],
+                    row["launch_driver_start_redeemed_identity"],
                     driver_unit,
-                    "a" * 32,
-                    f"{row['attempt_slice_cgroup_path']}/{driver_unit}",
+                    row["launch_driver_start_redeemed_invocation_id"],
+                    row["launch_driver_start_redeemed_cgroup_path"],
                     attempt["id"],
                 ),
             )

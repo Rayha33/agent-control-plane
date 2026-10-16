@@ -49,9 +49,14 @@ from .oci_worker import (
     _RuncLaunchTarget,
 )
 from .sandbox_attestation import (
+    LaunchDriverStartRedemption,
     RunningRuntimeAttestation,
+    collect_launch_driver_start_redemption,
+    launch_driver_start_redemption_has_collector_provenance,
+    launch_driver_start_redemption_is_self_consistent,
     running_attestation_has_collector_provenance,
     running_attestation_is_self_consistent,
+    verify_linux_process_membership,
     verify_running_runtime_process_membership,
     verify_running_runtime_resource_controls,
     verify_running_runtime_systemd_units,
@@ -69,6 +74,7 @@ from .sandbox_workspace import _snapshot_origin as _snapshot_origin
 from .sandbox_workspace import collect_changes as _collect_changes
 from .store import (
     _authorize_sandbox_exit_receipt_write,
+    _authorize_sandbox_launch_driver_redemption_write,
     _authorize_sandbox_launch_driver_start_write,
     _authorize_sandbox_launch_plan_write,
     _authorize_sandbox_launch_submission_write,
@@ -2129,6 +2135,145 @@ class SandboxExecutionJournalMixin:
                 raise
         return intent
 
+    def _sandbox_execution_redeem_launch_driver_start(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        *,
+        redemption: LaunchDriverStartRedemption,
+        credential: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind the sole start intent to the current exact systemd service activation."""
+
+        attempt_id = self._sandbox_validate_attempt_id(attempt_id)
+        self._sandbox_claim_token(claim_token)
+        if (
+            not launch_driver_start_redemption_has_collector_provenance(redemption)
+            or not launch_driver_start_redemption_is_self_consistent(redemption)
+            or redemption.driver_pid != os.getpid()
+            or (redemption.attempt_id, redemption.claim_token) != (attempt_id, claim_token)
+        ):
+            raise SupervisorError(
+                "sandbox_launch_driver_redemption_required",
+                "redemption must come from the current exact service process",
+            )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._active_attempt(connection, attempt_id, claim_token, int(time.time()))
+            if attempt["status"] != "working":
+                raise SupervisorError("claim_inactive", "sandbox attempt is no longer working")
+            self._authenticate_attempt(connection, attempt, credential)
+            row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise SupervisorError("sandbox_execution_not_found", "execution was not reserved")
+            if row["claim_token"] != claim_token:
+                raise SupervisorError("stale_fencing_token", "sandbox claim token is stale")
+            if row["phase"] != "reserved":
+                raise SupervisorError(
+                    "sandbox_execution_transition_invalid",
+                    f"expected phase reserved, found {row['phase']}; fence retained",
+                )
+            if (
+                not row["launch_driver_start_id"]
+                or not row["launch_driver_start_digest"]
+                or row["launch_driver_start_unit"]
+                != _sandbox_launch_driver_service_unit(row["execution_id"])
+            ):
+                raise SupervisorError(
+                    "sandbox_launch_driver_start_intent_required",
+                    "redemption requires the exact durable pre-activation intent",
+                )
+            if (
+                redemption.execution_id != row["execution_id"]
+                or redemption.start_id != row["launch_driver_start_id"]
+                or redemption.start_digest != row["launch_driver_start_digest"]
+                or redemption.service_unit != row["launch_driver_start_unit"]
+                or redemption.attempt_slice_unit != _oci_worker_systemd_slice(row["container_id"])
+            ):
+                raise SupervisorError(
+                    "sandbox_launch_driver_redemption_mismatch",
+                    "activation does not match the durable intent and attempt slice",
+                )
+            redeemed_fields = (
+                "launch_driver_start_redeemed_at",
+                "launch_driver_start_redeemed_invocation_id",
+                "launch_driver_start_redeemed_identity",
+                "launch_driver_start_redeemed_cgroup_path",
+                "launch_driver_start_redeemed_slice_unit",
+                "launch_driver_start_redeemed_slice_invocation_id",
+                "launch_driver_start_redeemed_slice_cgroup_path",
+            )
+            if (
+                any(row[name] for name in redeemed_fields)
+                or row["launch_driver_start_redeemed_pid"] is not None
+            ):
+                raise SupervisorError(
+                    "sandbox_launch_driver_redemption_ambiguous",
+                    "the sole start intent was already redeemed; fence retained",
+                )
+
+            stamp = utc_now()
+            with _authorize_sandbox_launch_driver_redemption_write(connection, redemption, stamp):
+                changed = connection.execute(
+                    "UPDATE sandbox_executions SET launch_driver_start_redeemed_at = ?, "
+                    "launch_driver_start_redeemed_invocation_id = ?, "
+                    "launch_driver_start_redeemed_pid = ?, "
+                    "launch_driver_start_redeemed_identity = ?, "
+                    "launch_driver_start_redeemed_cgroup_path = ?, "
+                    "launch_driver_start_redeemed_slice_unit = ?, "
+                    "launch_driver_start_redeemed_slice_invocation_id = ?, "
+                    "launch_driver_start_redeemed_slice_cgroup_path = ?, updated_at = ? "
+                    "WHERE attempt_id = ? AND claim_token = ? AND phase = 'reserved' "
+                    "AND launch_driver_start_redeemed_at = '' "
+                    "AND launch_driver_start_redeemed_pid IS NULL",
+                    (
+                        stamp,
+                        redemption.service_invocation_id,
+                        redemption.driver_pid,
+                        redemption.driver_identity,
+                        redemption.driver_control_group,
+                        redemption.attempt_slice_unit,
+                        redemption.attempt_slice_invocation_id,
+                        redemption.attempt_slice_control_group,
+                        stamp,
+                        attempt_id,
+                        claim_token,
+                    ),
+                ).rowcount
+            if changed != 1:
+                raise SupervisorError(
+                    "sandbox_execution_transition_conflict",
+                    "redemption changed concurrently; attempt fence retained",
+                )
+            self._event(
+                connection,
+                "sandbox.execution_launch_driver_start_redeemed",
+                attempt["agent_id"],
+                {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "execution_id": row["execution_id"],
+                    "start_id": row["launch_driver_start_id"],
+                    "start_digest": row["launch_driver_start_digest"],
+                    "service_unit": redemption.service_unit,
+                    "service_invocation_id": redemption.service_invocation_id,
+                    "driver_pid": redemption.driver_pid,
+                    "driver_identity": redemption.driver_identity,
+                    "driver_control_group": redemption.driver_control_group,
+                    "attempt_slice_unit": redemption.attempt_slice_unit,
+                    "attempt_slice_invocation_id": redemption.attempt_slice_invocation_id,
+                    "attempt_slice_control_group": redemption.attempt_slice_control_group,
+                    "evidence_sha256": redemption.evidence_sha256,
+                    "boundary": "current_service_before_runc_submission",
+                },
+            )
+            updated = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        return self._sandbox_execution_view(updated)
+
     def _sandbox_execution_authorize_launch_submission(
         self,
         attempt_id: str,
@@ -2186,6 +2331,95 @@ class SandboxExecutionJournalMixin:
                     "sandbox_private_path_unbound",
                     "launch submission requires exact private bundle/state directory identities",
                 )
+            if (
+                not row["launch_driver_start_id"]
+                or not row["launch_driver_start_digest"]
+                or row["launch_driver_start_unit"]
+                != _sandbox_launch_driver_service_unit(row["execution_id"])
+                or not row["launch_driver_start_redeemed_at"]
+                or row["launch_driver_start_redeemed_pid"] is None
+                or not row["launch_driver_start_redeemed_invocation_id"]
+                or not row["launch_driver_start_redeemed_identity"]
+                or not row["launch_driver_start_redeemed_cgroup_path"]
+                or row["launch_driver_start_redeemed_slice_unit"]
+                != _oci_worker_systemd_slice(row["container_id"])
+                or not row["launch_driver_start_redeemed_slice_invocation_id"]
+                or not row["launch_driver_start_redeemed_slice_cgroup_path"]
+                or row["launch_driver_start_redeemed_cgroup_path"]
+                != row["launch_driver_start_redeemed_slice_cgroup_path"]
+                + "/"
+                + row["launch_driver_start_unit"]
+            ):
+                raise SupervisorError(
+                    "sandbox_launch_driver_redemption_required",
+                    "runc submission requires one exact redeemed service activation",
+                )
+            if row["launch_driver_start_redeemed_pid"] != os.getpid():
+                raise SupervisorError(
+                    "sandbox_launch_driver_redemption_required",
+                    "runc submission must be authorized by the exact redeemed service MainPID",
+                )
+            try:
+                live_redemption = collect_launch_driver_start_redemption(
+                    expected_identity=(attempt_id, claim_token, row["execution_id"]),
+                    expected_container_id=row["container_id"],
+                    start_id=row["launch_driver_start_id"],
+                    start_digest=row["launch_driver_start_digest"],
+                    service_unit=row["launch_driver_start_unit"],
+                    attempt_slice_unit=row["launch_driver_start_redeemed_slice_unit"],
+                )
+            except SupervisorError as error:
+                raise SupervisorError(
+                    "sandbox_launch_driver_redemption_stale",
+                    "live service or attempt-slice activation is no longer active and exact",
+                ) from error
+            durable_redemption_fields = (
+                row["launch_driver_start_unit"],
+                row["launch_driver_start_id"],
+                row["launch_driver_start_digest"],
+                row["launch_driver_start_redeemed_invocation_id"],
+                row["launch_driver_start_redeemed_pid"],
+                row["launch_driver_start_redeemed_identity"],
+                row["launch_driver_start_redeemed_cgroup_path"],
+                row["launch_driver_start_redeemed_slice_unit"],
+                row["launch_driver_start_redeemed_slice_invocation_id"],
+                row["launch_driver_start_redeemed_slice_cgroup_path"],
+            )
+            live_redemption_fields = (
+                live_redemption.service_unit,
+                live_redemption.start_id,
+                live_redemption.start_digest,
+                live_redemption.service_invocation_id,
+                live_redemption.driver_pid,
+                live_redemption.driver_identity,
+                live_redemption.driver_control_group,
+                live_redemption.attempt_slice_unit,
+                live_redemption.attempt_slice_invocation_id,
+                live_redemption.attempt_slice_control_group,
+            )
+            if (
+                not launch_driver_start_redemption_has_collector_provenance(live_redemption)
+                or not launch_driver_start_redemption_is_self_consistent(live_redemption)
+                or (live_redemption.attempt_id, live_redemption.claim_token)
+                != (attempt_id, claim_token)
+                or live_redemption.execution_id != row["execution_id"]
+                or live_redemption_fields != durable_redemption_fields
+            ):
+                raise SupervisorError(
+                    "sandbox_launch_driver_redemption_stale",
+                    "live service or attempt-slice activation changed after redemption",
+                )
+            try:
+                verify_linux_process_membership(
+                    live_redemption.driver_pid,
+                    expected_cgroup=live_redemption.driver_control_group,
+                    expected_identity=live_redemption.driver_identity,
+                )
+            except SupervisorError as error:
+                raise SupervisorError(
+                    "sandbox_launch_driver_redemption_stale",
+                    "redeemed MainPID identity or cgroup changed before runc submission",
+                ) from error
             if any(
                 _DIGEST.fullmatch(row[name] or "") is None
                 for name in ("rootfs_closure_digest", "runc_executable_digest")
@@ -2348,6 +2582,24 @@ class SandboxExecutionJournalMixin:
             raise SupervisorError(
                 "sandbox_execution_transition_invalid",
                 f"expected phase reserved, found {durable_execution['phase']}; fence retained",
+            )
+        if (
+            not durable_execution["launch_driver_start_redeemed_at"]
+            or durable_execution["launch_driver_start_redeemed_pid"] is None
+            or not durable_execution["launch_driver_start_redeemed_invocation_id"]
+            or not durable_execution["launch_driver_start_redeemed_identity"]
+            or not durable_execution["launch_driver_start_redeemed_cgroup_path"]
+            or attempt_slice_unit != durable_execution["launch_driver_start_redeemed_slice_unit"]
+            or attempt_slice_invocation_id
+            != durable_execution["launch_driver_start_redeemed_slice_invocation_id"]
+            or attempt_slice_cgroup_path
+            != durable_execution["launch_driver_start_redeemed_slice_cgroup_path"]
+            or durable_execution["launch_driver_start_redeemed_cgroup_path"]
+            != attempt_slice_cgroup_path + "/" + durable_execution["launch_driver_start_unit"]
+        ):
+            raise SupervisorError(
+                "sandbox_launch_driver_redemption_mismatch",
+                "attempt slice differs from the redeemed launch-driver placement",
             )
         submission_digest = _sandbox_launch_submission_digest(durable_execution, launch_target)
         if (
@@ -2758,6 +3010,23 @@ class SandboxExecutionJournalMixin:
                 "sandbox_runtime_attestation_stale",
                 "runtime evidence does not match the durable launch identities",
             )
+        redeemed_driver_identity = {
+            "launch_driver_pid": row["launch_driver_start_redeemed_pid"],
+            "launch_driver_identity": row["launch_driver_start_redeemed_identity"],
+            "launch_driver_unit": row["launch_driver_start_unit"],
+            "launch_driver_invocation_id": row["launch_driver_start_redeemed_invocation_id"],
+            "launch_driver_control_group": row["launch_driver_start_redeemed_cgroup_path"],
+            "attempt_slice_unit": row["launch_driver_start_redeemed_slice_unit"],
+            "attempt_slice_invocation_id": row["launch_driver_start_redeemed_slice_invocation_id"],
+            "attempt_slice_control_group": row["launch_driver_start_redeemed_slice_cgroup_path"],
+        }
+        if not row["launch_driver_start_redeemed_at"] or any(
+            getattr(attestation, key) != value for key, value in redeemed_driver_identity.items()
+        ):
+            raise SupervisorError(
+                "sandbox_runtime_attestation_stale",
+                "running evidence does not match the once-redeemed launch-driver activation",
+            )
         init_pid = self._sandbox_pid(attestation.init_pid, "init_pid")
         init_identity = self._sandbox_process_identity(attestation.init_identity, "init_identity")
         if init_pid in {
@@ -2914,6 +3183,32 @@ class SandboxExecutionJournalMixin:
                         for key, value in _sandbox_running_attestation_expected_for_row(
                             current_row
                         ).items()
+                    )
+                    or not current_row["launch_driver_start_redeemed_at"]
+                    or any(
+                        getattr(attestation, key) != value
+                        for key, value in {
+                            "launch_driver_pid": current_row["launch_driver_start_redeemed_pid"],
+                            "launch_driver_identity": current_row[
+                                "launch_driver_start_redeemed_identity"
+                            ],
+                            "launch_driver_unit": current_row["launch_driver_start_unit"],
+                            "launch_driver_invocation_id": current_row[
+                                "launch_driver_start_redeemed_invocation_id"
+                            ],
+                            "launch_driver_control_group": current_row[
+                                "launch_driver_start_redeemed_cgroup_path"
+                            ],
+                            "attempt_slice_unit": current_row[
+                                "launch_driver_start_redeemed_slice_unit"
+                            ],
+                            "attempt_slice_invocation_id": current_row[
+                                "launch_driver_start_redeemed_slice_invocation_id"
+                            ],
+                            "attempt_slice_control_group": current_row[
+                                "launch_driver_start_redeemed_slice_cgroup_path"
+                            ],
+                        }.items()
                     )
                 ):
                     raise SupervisorError(

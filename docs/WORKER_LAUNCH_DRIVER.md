@@ -77,9 +77,11 @@ either process-local capability would invalidate that contract.
    `InvocationID`, unit name, and `ControlGroup` match the exact active service
    directly beneath the recorded attempt slice. It redeems the single-use
    intent, validates the pinned plan, and invokes the existing sealed launcher.
-   The runc child stays inside the launch-driver cgroup. If startup, redemption,
-   or service identity is ambiguous, the gate remains closed and the execution
-   fence remains held.
+   Immediately before authorizing the one runc submission, it rereads the exact
+   service and slice properties and process identity; a stopped, deactivating,
+   restarted, or otherwise changed activation is stale. The runc child stays
+   inside the launch-driver cgroup. If startup, redemption, or service identity
+   is ambiguous, the gate remains closed and the execution fence remains held.
 3. While init is gated, the launch-driver obtains the existing collector-issued
    runtime attestation for the exact recovery monitor, launch-driver service,
    attempt slice, runc client, worker scope, init, process-start identities,
@@ -114,15 +116,21 @@ either process-local capability would invalidate that contract.
 
 ## Evidence and non-evidence
 
-Schema 30 now provides a journal primitive for recording exactly one
-launch-driver service start intent before systemd activation. The write-once
-receipt binds the attempt/claim/execution tuple, derived driver unit, pinned
-runtime, and inode-bound private bundle/state/workspace roots. A repeated call
-returns an ambiguity error and cannot mint a second intent. This is only the
-durable pre-activation marker: the production systemd producer, exact unit
-adoption/reconciliation, driver-side redemption, and live lifecycle remain
-unimplemented. No current caller starts a launch-driver service from this
-receipt, so it is not evidence that a worker can be launched.
+Schema 31 provides two journal primitives: one write-once pre-activation start
+intent and one write-once redemption receipt. The start intent binds the
+attempt/claim/execution tuple, derived driver unit, pinned runtime, and
+inode-bound private bundle/state/workspace roots. Redemption is accepted only
+from a collector-issued observation whose systemd MainPID is the current
+process and whose exact service invocation, process-start identity, cgroup,
+attempt-slice invocation, and cgroup match. Launch submission and the
+`reserved` → `launched` transition are fenced on that receipt; the final
+`running` attestation must match it again. The SQL-scoped write capability binds
+the complete receipt, including its redemption timestamp. The launch-submission
+gate also recollects and compares the live service/slice activation immediately
+before consuming the sole runc submission. This is still a journal/collector
+primitive only: no production caller starts a launch-driver service, and exact
+unit adoption/reconciliation and the live lifecycle remain unimplemented. It
+is not evidence that a worker can be launched.
 
 The independent review of the prior ADR found a blocking mismatch: it placed the
 handle-owning monitor outside the attempt slice and proposed migrating attestation
@@ -165,7 +173,7 @@ driver cleanup evidence.
 Current production code does not implement this decision. In particular,
 `start_sandbox_execution_monitor()` still starts after a worker scope is live;
 there is no launch-driver service producer that starts before execution; the
-durable journal has no at-most-once driver-start redemption path; and the
+new redemption collector and journal path have no production caller; and the
 existing handle/attestation/running flow is not yet owned by the launch-driver
 service. The journal intentionally has no production `cleanup_verified`
 writer; a separately authorized, exact-identity verifier is required after
