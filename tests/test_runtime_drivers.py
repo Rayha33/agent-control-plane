@@ -2206,19 +2206,19 @@ def test_supervisor_rejects_missing_or_mismatched_postgres_schema_export(
 def postgres_test_binaries() -> dict[str, str] | None:
     names = ("initdb", "pg_ctl", "psql")
     binaries = {name: shutil.which(name) for name in names}
+    candidate_dirs: list[Path] = []
+    pg_config = shutil.which("pg_config")
+    if pg_config is not None:
+        configured = subprocess.run(
+            [pg_config, "--bindir"], capture_output=True, text=True, timeout=5, check=False
+        )
+        bindir = Path(configured.stdout.strip()) if configured.returncode == 0 else None
+        if bindir is not None:
+            candidate_dirs.append(bindir)
+    postgres_bin_root = Path("/usr/lib/postgresql")
+    if postgres_bin_root.is_dir():
+        candidate_dirs.extend(sorted(postgres_bin_root.glob("*/bin")))
     if any(path is None for path in binaries.values()):
-        candidate_dirs: list[Path] = []
-        pg_config = shutil.which("pg_config")
-        if pg_config is not None:
-            configured = subprocess.run(
-                [pg_config, "--bindir"], capture_output=True, text=True, timeout=5, check=False
-            )
-            bindir = Path(configured.stdout.strip()) if configured.returncode == 0 else None
-            if bindir is not None:
-                candidate_dirs.append(bindir)
-        postgres_bin_root = Path("/usr/lib/postgresql")
-        if postgres_bin_root.is_dir():
-            candidate_dirs.extend(sorted(postgres_bin_root.glob("*/bin")))
         for name, path in binaries.items():
             if path is not None:
                 continue
@@ -2227,9 +2227,56 @@ def postgres_test_binaries() -> dict[str, str] | None:
                 if candidate.is_file() and os.access(candidate, os.X_OK):
                     binaries[name] = str(candidate)
                     break
+    # Debian/Ubuntu expose psql through pg_wrapper, whose shared helper is
+    # intentionally writable by the postgres group. The supervisor correctly
+    # rejects that wrapper as an untrusted executable, so test the versioned
+    # PostgreSQL binary instead when one is available.
+    psql = binaries["psql"]
+    if psql is not None and Path(psql).resolve().name == "pg_wrapper":
+        for bindir in candidate_dirs:
+            candidate = bindir / "psql"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                binaries["psql"] = str(candidate)
+                break
     if any(path is None for path in binaries.values()):
         return None
     return {name: str(path) for name, path in binaries.items()}
+
+
+def test_postgres_test_binaries_uses_versioned_psql_for_pg_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bindir = tmp_path / "postgres" / "bin"
+    bindir.mkdir(parents=True)
+    for name in ("initdb", "pg_ctl"):
+        (bindir / name).touch()
+    psql = bindir / "psql"
+    make_executable(psql)
+    wrapper = tmp_path / "postgres-common" / "pg_wrapper"
+    wrapper.parent.mkdir()
+    make_executable(wrapper)
+    usr_bin = tmp_path / "usr-bin"
+    usr_bin.mkdir()
+    psql_entry = usr_bin / "psql"
+    psql_entry.symlink_to(wrapper)
+    fake_paths = {
+        "initdb": str(bindir / "initdb"),
+        "pg_ctl": str(bindir / "pg_ctl"),
+        "psql": str(psql_entry),
+        "pg_config": str(tmp_path / "pg_config"),
+    }
+    monkeypatch.setattr(shutil, "which", lambda name: fake_paths.get(name))
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, str(bindir), ""),
+    )
+
+    assert postgres_test_binaries() == {
+        "initdb": str(bindir / "initdb"),
+        "pg_ctl": str(bindir / "pg_ctl"),
+        "psql": str(psql),
+    }
 
 
 def stop_disposable_postgres(pg_ctl: str, data_dir: Path) -> None:
@@ -2383,6 +2430,7 @@ def test_disposable_postgres_workers_use_distinct_attempt_schemas(tmp_path: Path
             credential_registry=first_context.credential_registry,
             credential_handles=first_context.credential_handles,
         )
+        first_context.runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         driver_definition = DriverDefinition(
             name="database",
             kind="postgres_schema",
@@ -2399,9 +2447,9 @@ def test_disposable_postgres_workers_use_distinct_attempt_schemas(tmp_path: Path
         second_driver = PostgresSchemaDriver(driver_definition)
 
         def disposable_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
-            # This test-only runner executes a user-owned Homebrew psql against
-            # its local trust-auth cluster. The credential is synthetic and the
-            # server/data live only under pytest's disposable tmp_path.
+            # This test-only runner executes the resolved PostgreSQL binary
+            # against a local trust-auth cluster. The credential is synthetic
+            # and the server/data live only under pytest's disposable tmp_path.
             result = subprocess.run(
                 list(argv),
                 cwd=cwd,
