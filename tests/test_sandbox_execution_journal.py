@@ -809,8 +809,14 @@ def _test_runc_target(
     )
 
 
-def reserve(supervisor: GitSupervisor, attempt: dict) -> dict:
-    runtime_claims = configured_sandbox_claims(supervisor)
+def reserve(
+    supervisor: GitSupervisor,
+    attempt: dict,
+    *,
+    runtime_claims: dict[str, str] | None = None,
+) -> dict:
+    if runtime_claims is None:
+        runtime_claims = configured_sandbox_claims(supervisor)
     row = supervisor._sandbox_execution_reserve(
         attempt["id"],
         attempt["claim_token"],
@@ -6992,6 +6998,69 @@ def test_concurrent_direct_and_sandbox_reservations_serialize(repo: Path) -> Non
     else:
         assert journal is None
         assert direct_pid == -1
+
+
+def test_concurrent_sandbox_attempts_bind_disjoint_private_workspaces(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    first = claimed(supervisor, "alpha.txt")
+    second = claimed(supervisor, "beta.txt")
+    runtime_claims = configured_sandbox_claims(supervisor)
+    barrier = threading.Barrier(2)
+
+    def reserve_attempt(attempt: dict) -> dict:
+        barrier.wait(timeout=5)
+        return reserve(supervisor, attempt, runtime_claims=runtime_claims)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_execution, second_execution = list(pool.map(reserve_attempt, (first, second)))
+
+    assert first_execution["attempt_id"] == first["id"]
+    assert second_execution["attempt_id"] == second["id"]
+    assert first_execution["execution_id"] != second_execution["execution_id"]
+    assert first_execution["container_id"] != second_execution["container_id"]
+
+    first_root = Path(first_execution["bundle_path"]).parent
+    second_root = Path(second_execution["bundle_path"]).parent
+    assert first_root != second_root
+    assert first_root.parent == second_root.parent == supervisor.state_dir / "sandbox-executions"
+    assert first_root.name == f"{first['id']}-{first['claim_token']}"
+    assert second_root.name == f"{second['id']}-{second['claim_token']}"
+
+    first_workspace = Path(first_execution["workspace_root_path"])
+    second_workspace = Path(second_execution["workspace_root_path"])
+    first_baseline = Path(first_execution["baseline_root_path"])
+    second_baseline = Path(second_execution["baseline_root_path"])
+    assert first_workspace == first_root / "workspace"
+    assert second_workspace == second_root / "workspace"
+    assert first_baseline == first_root / "baseline"
+    assert second_baseline == second_root / "baseline"
+    assert not (first_workspace / ".git").exists()
+    assert not (second_workspace / ".git").exists()
+    assert not os.path.samefile(first_workspace, second_workspace)
+    assert not os.path.samefile(first_baseline, second_baseline)
+
+    write_barrier = threading.Barrier(2)
+
+    def write_sentinel(workspace: Path, owner: str) -> str:
+        write_barrier.wait(timeout=5)
+        marker = workspace / "parallel-owner.marker"
+        marker.write_text(owner, encoding="ascii")
+        return marker.read_text(encoding="ascii")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_marker, second_marker = list(
+            pool.map(
+                write_sentinel,
+                (first_workspace, second_workspace),
+                ("first", "second"),
+            )
+        )
+    assert first_marker == "first"
+    assert second_marker == "second"
+    assert not (first_baseline / "parallel-owner.marker").exists()
+    assert not (second_baseline / "parallel-owner.marker").exists()
+    assert not (Path(first["worktree"]) / "parallel-owner.marker").exists()
+    assert not (Path(second["worktree"]) / "parallel-owner.marker").exists()
 
 
 def test_sql_phase_checks_reject_nullable_process_identities(repo: Path) -> None:

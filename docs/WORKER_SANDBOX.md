@@ -21,7 +21,11 @@ committed result refs remain retained pending a separate retention policy, and
 ACP does not run repository-wide GC. An opt-in disposable-Linux integration
 fixture now exercises production launch, cleanup verification, host-side
 capture/import, and pending-QC handoff; this does not connect `run_worker()` to
-the sandbox path. See the live evidence below and
+the sandbox path. A separate journal regression concurrently reserves two
+different attempts and binds disjoint baseline/workspace roots, proving unique
+execution/container identities and concurrent independent write sentinels at
+the filesystem/journal layer; it does not run two live runc workers concurrently
+or prove cross-container kernel isolation. See the live evidence below and
 [`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
 retention, and cleanup contract. End-to-end worker isolation proof remains
 incomplete. The OCI policy compiler stages init behind fd 3, and a reusable
