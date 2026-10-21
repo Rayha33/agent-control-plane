@@ -938,3 +938,78 @@ restart, logout/linger, reboot, provider authentication, or destination-
 restricted provider egress. It does not close #2370's broader recovery or
 integrated-agent-isolation gates, and the default OCI `run_worker()` path
 remains fail-closed.
+
+### Guarded user-manager service restart after launch-driver crash (live proof; 2026-10-21)
+
+The production lifecycle test also has an explicit disposable-VM-only mode,
+`ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH=1`, paired with exactly one
+monitor-acceptance crash point, the exact guest hostname, and the literal
+`ACP_LIVE_USER_MANAGER_RESTART_ACK=RESTART_ONLY_THIS_DISPOSABLE_GUEST`. It is
+restricted to a VM with passwordless `sudo -n` and an exact Debian 12 Lima
+baseline inventory. Before launching the fixture it compares structured JSON
+rows from `systemctl --user list-units --all`—including device units and any
+otherwise unrecognized unit type and state—to the explicit 84-unit allowlist.
+Structured rows prevent multiline unit descriptions from being mistaken for
+extra units. It also captures the exact `init.scope` and `dbus.service` PID sets
+and verifies the single direct `(sd-pam)` child of the manager. Immediately
+before restart it rechecks the full unit inventory and requires those baseline
+PID sets to be unchanged, then proves every process under the manager cgroup
+belongs to those baseline units or the fixture's exact driver, monitor, attempt
+slice, and worker scope. Any additional unit, state, or process fails closed.
+
+The mode restarts only the current test user's `user@<uid>.service`. Before
+fresh-supervisor reconciliation it requires a successful replacement-manager
+PID query, a reachable manager control socket, and a successful `busctl
+--user status` check (which exercises normal D-Bus socket activation). The
+driver and monitor services and worker scope must be absent; there may be no
+test process left in the manager cgroup. Systemd can retain the exact
+attempt-specific slice as `loaded/inactive/dead` after restart, but only with an
+empty control group; no other fixture unit may remain. The empty `user.slice`
+and `user-acp.slice` baseline units may be absent, inactive, or loaded/inactive;
+all other baseline unit states remain exact. If the restart command times out,
+returns nonzero, or its outcome cannot be verified, the test preserves the VM
+and exact fixture, performs no retry or automatic unit cleanup, and requires
+manual inspection before any recovery or rerun.
+
+Two live attempts on 2026-10-21 reached the manager-restart postflight but did
+not complete the end-to-end test. On Debian 12 ARM64 / kernel 6.12.95 / systemd
+252.39 / runc 1.5.2, attempt one restarted the user-manager PID from 645 to
+1699, then failed because the fresh manager lazily unloaded empty baseline
+slices and D-Bus/session units. The fixture was preserved; read-only inspection
+found no driver, monitor, runc process, or worker cgroup. After D-Bus socket
+activation and restoration of the two empty user slices, the exact 84-unit
+baseline and process inventory matched. Attempt two restarted the manager PID
+from 1699 to 2067, but failed closed because its exact attempt-specific slice
+remained `loaded/inactive/dead` with no control group; driver and monitor units
+were absent and the manager-cgroup process audit passed. Both failed run roots
+remain preserved, and neither reached supervisor recovery or automatic
+cleanup. These observations are partial restart evidence, not a successful
+recovery proof. The focused postflight now permits only this exact empty slice
+state while keeping service, scope, process, and eventual cleanup checks strict.
+
+A third run passed the complete opt-in test on the same Debian 12 ARM64 guest
+(kernel `6.12.95+deb12-cloud-arm64`, systemd `252.39-1~deb12u2`, Python
+`3.11.2`, rootless runc `1.5.2`, runc SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). It
+used test-source SHA-256
+`d48ade517f3275df27f2f2adf15d43c242039a317d2b304ec86b5512f0ac8930` and
+restarted the exact user's manager from PID 2067 to 2397. The replacement
+manager and user D-Bus became reachable; the driver, monitor, and scope were
+absent before recovery. A fresh supervisor reconciled the interrupted
+monitor-accepted handoff, recorded the durable `ambiguous` phase with the
+attempt quarantined and task blocked, and rejected result capture and launch
+replay. A fresh-process reaper then finalized the nonrecoverable attempt as
+orphaned, released its runtime allocation, and reached `cleanup_verified`;
+process, cgroup, runc-state, socket, and bundle checks were clear. Postflight
+found only `init.scope` and D-Bus processes under the manager cgroup, no ACP
+test units, and the two expected empty user slices unloaded. The successful
+fixture root was removed after its exact cleanup checks; the two earlier failed
+roots remain preserved. The live run used no provider credentials, endpoint,
+API call, or model.
+
+This closes the specifically tested user-manager service-restart recovery path
+for a monitor-accepted launch-driver crash on this disposable Debian 12 guest.
+It does not prove supervisor-daemon failure, logout/linger, reboot recovery,
+provider authentication, or destination-restricted provider egress, and does
+not close #2370's broader isolation gate or enable the default OCI
+`run_worker()` path.

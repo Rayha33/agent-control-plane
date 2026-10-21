@@ -75,6 +75,28 @@ supervisor reconciliation, combine either monitor crash mode with:
 This verifies transient unit identities survive `systemctl --user daemon-reexec`;
 it does not simulate manager shutdown, logout/linger, or reboot.
 
+For an actual systemd user-manager service restart in a disposable VM, combine
+either monitor crash mode with:
+
+    ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH=1
+    ACP_LIVE_USER_MANAGER_RESTART_DISPOSABLE_HOST=<exact-guest-hostname>
+    ACP_LIVE_USER_MANAGER_RESTART_ACK=RESTART_ONLY_THIS_DISPOSABLE_GUEST
+
+This additionally requires `systemd-detect-virt --quiet --vm`, Debian 12,
+passwordless `sudo -n`, and the exact allowlisted Debian 12 Lima unit inventory.
+It compares all rows from `systemctl --user list-units --all`, including device
+units and unrecognized unit types, against the exact baseline. It also checks
+every process in the manager cgroup against the exact manager, D-Bus, and
+test-unit cgroups. Any unrecognized unit, state, or process fails closed. It
+restarts only the current test user's `user@<uid>.service`. Before
+fresh-supervisor recovery, the driver and monitor services and worker scope
+must be absent, with no test process remaining. Systemd may retain the exact
+attempt-specific slice as `loaded/inactive/dead`; if so, its control group must
+be empty and the manager-cgroup process audit must still pass. No other test
+unit may remain. A timeout or uncertain postflight preserves the VM and fixture
+for manual inspection without retry or automatic cleanup. Never use this mode
+on a shared host or the NAS.
+
 For natural completion followed by production cleanup verification, a
 deterministic in-sandbox source edit and test, and host-side sandbox-result
 import (mutually exclusive with cancellation, timeout, and crash modes), add:
@@ -880,6 +902,316 @@ def _unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
     if set(values) != set(properties):
         raise RuntimeError(f"incomplete systemd properties for {unit}: {values!r}")
     return values
+
+
+def _user_manager_restart_expected_inventory(uid: int) -> dict[str, tuple[str, str, str]]:
+    """Exact baseline user-manager inventory for the supported Debian 12 Lima probe."""
+    expected: dict[str, tuple[str, str, str]] = {}
+    device_units = (
+        "dev-disk-by\\x2ddiskseq-1.device",
+        "dev-disk-by\\x2ddiskseq-2.device",
+        "dev-disk-by\\x2dlabel-cidata.device",
+        "dev-disk-by\\x2dpartuuid-5837337c\\x2d084c\\x2d4836\\x2d9e1a\\x2d47b625a8c517.device",
+        "dev-disk-by\\x2dpartuuid-98dae4db\\x2d3ee7\\x2d40a9\\x2d8433\\x2dc4d56c32dedc.device",
+        "dev-disk-by\\x2dpath-pci\\x2d0000:00:06.0.device",
+        "dev-disk-by\\x2dpath-pci\\x2d0000:00:06.0\\x2dpart1.device",
+        "dev-disk-by\\x2dpath-pci\\x2d0000:00:06.0\\x2dpart15.device",
+        "dev-disk-by\\x2dpath-pci\\x2d0000:00:07.0.device",
+        "dev-disk-by\\x2dpath-virtio\\x2dpci\\x2d0000:00:06.0.device",
+        "dev-disk-by\\x2dpath-virtio\\x2dpci\\x2d0000:00:06.0\\x2dpart1.device",
+        "dev-disk-by\\x2dpath-virtio\\x2dpci\\x2d0000:00:06.0\\x2dpart15.device",
+        "dev-disk-by\\x2dpath-virtio\\x2dpci\\x2d0000:00:07.0.device",
+        "dev-disk-by\\x2duuid-2026\\x2d10\\x2d21\\x2d05\\x2d55\\x2d50\\x2d09.device",
+        "dev-disk-by\\x2duuid-8588\\x2dFECA.device",
+        "dev-disk-by\\x2duuid-db8fda2d\\x2d25d7\\x2d4bb8\\x2d827d\\x2d9c93ea89bf3c.device",
+        *(f"dev-hvc{index}.device" for index in range(8)),
+        "dev-vda.device",
+        "dev-vda1.device",
+        "dev-vda15.device",
+        "dev-vdb.device",
+        "dev-vport1p0.device",
+        "sys-devices-pci0000:00-0000:00:01.0-virtio0-net-eth0.device",
+        "sys-devices-pci0000:00-0000:00:05.0-virtio1-virtio\\x2dports-vport1p0.device",
+        "sys-devices-pci0000:00-0000:00:06.0-virtio2-block-vda-vda1.device",
+        "sys-devices-pci0000:00-0000:00:06.0-virtio2-block-vda-vda15.device",
+        "sys-devices-pci0000:00-0000:00:06.0-virtio2-block-vda.device",
+        "sys-devices-pci0000:00-0000:00:07.0-virtio3-block-vdb.device",
+        *(f"sys-devices-virtual-tty-hvc{index}.device" for index in range(8)),
+        "sys-module-configfs.device",
+        "sys-module-fuse.device",
+        "sys-subsystem-net-devices-eth0.device",
+    )
+    for unit in device_units:
+        expected[unit] = ("loaded", "active", "plugged")
+    for unit in (
+        "-.mount",
+        "boot-efi.mount",
+        "dev-hugepages.mount",
+        "dev-mqueue.mount",
+        "mnt-lima\\x2dcidata.mount",
+        "proc-sys-fs-binfmt_misc.mount",
+        "run-credentials-systemd\\x2dsysctl.service.mount",
+        "run-credentials-systemd\\x2dsysusers.service.mount",
+        "run-credentials-systemd\\x2dtmpfiles\\x2dsetup.service.mount",
+        "run-credentials-systemd\\x2dtmpfiles\\x2dsetup\\x2ddev.service.mount",
+        f"run-user-{uid}.mount",
+        "sys-fs-fuse-connections.mount",
+        "sys-kernel-config.mount",
+        "sys-kernel-debug.mount",
+        "sys-kernel-tracing.mount",
+    ):
+        expected[unit] = ("loaded", "active", "mounted")
+    expected["init.scope"] = ("loaded", "active", "running")
+    expected["dbus.service"] = ("loaded", "active", "running")
+    for unit in ("-.slice", "app.slice", "session.slice", "user-acp.slice", "user.slice"):
+        expected[unit] = ("loaded", "active", "active")
+    expected["dbus.socket"] = ("loaded", "active", "running")
+    for unit in (
+        "dirmngr.socket",
+        "gpg-agent-browser.socket",
+        "gpg-agent-extra.socket",
+        "gpg-agent-ssh.socket",
+        "gpg-agent.socket",
+    ):
+        expected[unit] = ("loaded", "active", "listening")
+    for unit in (
+        "basic.target",
+        "default.target",
+        "paths.target",
+        "sockets.target",
+        "timers.target",
+    ):
+        expected[unit] = ("loaded", "active", "active")
+    for unit in ("dirmngr.service", "gpg-agent.service"):
+        expected[unit] = ("loaded", "inactive", "dead")
+    for unit in ("blockdev@dev-vda15.target", "blockdev@dev-vdb.target"):
+        expected[unit] = ("not-found", "inactive", "dead")
+    expected["shutdown.target"] = ("loaded", "inactive", "dead")
+    return expected
+
+
+def _user_manager_unit_inventory(systemctl: str) -> dict[str, tuple[str, str, str]]:
+    result = _systemd_command(
+        [systemctl, "--user", "list-units", "--all", "--no-pager", "--output=json"]
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"could not inventory user-manager units: {result.stderr!r}")
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("user-manager unit inventory is not valid JSON") from error
+    if not isinstance(rows, list):
+        raise RuntimeError("user-manager unit inventory is not a JSON list")
+    inventory: dict[str, tuple[str, str, str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError(f"malformed user-manager unit inventory object: {row!r}")
+        unit = row.get("unit")
+        load_state = row.get("load")
+        active_state = row.get("active")
+        sub_state = row.get("sub")
+        if not all(
+            isinstance(value, str) and value
+            for value in (unit, load_state, active_state, sub_state)
+        ):
+            raise RuntimeError(f"incomplete user-manager unit inventory object: {row!r}")
+        if unit in inventory:
+            raise RuntimeError(f"duplicate user-manager inventory row for {unit}")
+        inventory[unit] = (load_state, active_state, sub_state)
+    return inventory
+
+
+def _user_manager_restart_test_unit_state_is_safe(
+    *, unit: str, attempt_slice_unit: str, state: tuple[str, str, str]
+) -> bool:
+    """Allow only absent units or the exact empty, inactive attempt slice."""
+    absent = ("not-found", "inactive", "dead")
+    return state == absent or (
+        unit == attempt_slice_unit and state == ("loaded", "inactive", "dead")
+    )
+
+
+def test_user_manager_restart_accepts_only_exact_inactive_attempt_slice_residual() -> None:
+    attempt_slice = "user-acp-0123456789abcdef.slice"
+    assert _user_manager_restart_test_unit_state_is_safe(
+        unit=attempt_slice,
+        attempt_slice_unit=attempt_slice,
+        state=("loaded", "inactive", "dead"),
+    )
+    assert _user_manager_restart_test_unit_state_is_safe(
+        unit=attempt_slice,
+        attempt_slice_unit=attempt_slice,
+        state=("not-found", "inactive", "dead"),
+    )
+    assert _user_manager_restart_test_unit_state_is_safe(
+        unit="acp-launch-driver-0123456789abcdef.service",
+        attempt_slice_unit=attempt_slice,
+        state=("not-found", "inactive", "dead"),
+    )
+    assert not _user_manager_restart_test_unit_state_is_safe(
+        unit="acp-monitor-0123456789abcdef.service",
+        attempt_slice_unit=attempt_slice,
+        state=("loaded", "inactive", "dead"),
+    )
+    assert not _user_manager_restart_test_unit_state_is_safe(
+        unit="user-acp-fedcba9876543210.slice",
+        attempt_slice_unit=attempt_slice,
+        state=("loaded", "inactive", "dead"),
+    )
+    assert not _user_manager_restart_test_unit_state_is_safe(
+        unit=attempt_slice,
+        attempt_slice_unit=attempt_slice,
+        state=("loaded", "active", "active"),
+    )
+
+
+def _process_cgroup_identity(pid: int) -> tuple[str, str, int]:
+    proc = Path("/proc") / str(pid)
+    cgroup_lines = (proc / "cgroup").read_text(encoding="ascii").splitlines()
+    unified = [line.partition("::")[2] for line in cgroup_lines if line.startswith("0::")]
+    if len(unified) != 1:
+        raise RuntimeError(f"process {pid} lacks one unified cgroup identity")
+    stat_line = (proc / "stat").read_text(encoding="ascii")
+    stat_tail = stat_line[stat_line.rfind(")") + 2 :].split()
+    if len(stat_tail) < 2 or not stat_tail[1].isdecimal():
+        raise RuntimeError(f"process {pid} has a malformed parent identity")
+    return unified[0], (proc / "comm").read_text(encoding="utf-8").strip(), int(stat_tail[1])
+
+
+def _assert_user_manager_process_inventory(
+    *,
+    manager_cgroup: str,
+    manager_pid: str,
+    test_cgroups: dict[str, str] | None = None,
+    expected_monitor_pid: str | None = None,
+    expected_baseline_processes: dict[str, frozenset[int]] | None = None,
+) -> dict[str, frozenset[int]]:
+    """Fail closed unless every manager-cgroup process belongs to an exact known unit."""
+    if not manager_cgroup.startswith("/user.slice/user-") or not manager_pid.isdecimal():
+        raise AssertionError("unexpected user-manager cgroup or PID identity")
+    root = Path("/sys/fs/cgroup") / manager_cgroup.lstrip("/")
+    root = root.resolve(strict=True)
+    root_group = PurePosixPath(manager_cgroup)
+    init = _unit_properties("init.scope", ("ControlGroup", "LoadState"))
+    dbus = _unit_properties("dbus.service", ("ControlGroup", "LoadState", "MainPID"))
+    if init["LoadState"] != "loaded" or dbus["LoadState"] != "loaded":
+        raise AssertionError("manager init/dbus unit identities are not loaded")
+    init_group = PurePosixPath(init["ControlGroup"])
+    dbus_group = PurePosixPath(dbus["ControlGroup"])
+    if init_group != root_group / "init.scope" or not dbus_group.is_relative_to(root_group):
+        raise AssertionError("manager init/dbus cgroups escaped the exact manager subtree")
+    if dbus["MainPID"] == "0" or not dbus["MainPID"].isdecimal():
+        raise AssertionError("the user-manager D-Bus service has no exact MainPID")
+
+    allowed_test_groups: dict[str, PurePosixPath] = {}
+    for name, raw_group in (test_cgroups or {}).items():
+        if not raw_group.startswith("/"):
+            raise AssertionError(f"{name} has no absolute cgroup identity")
+        group = PurePosixPath(raw_group)
+        if not group.is_relative_to(root_group) or group == root_group:
+            raise AssertionError(f"{name} cgroup is outside the manager subtree")
+        allowed_test_groups[name] = group
+    if len(set(allowed_test_groups.values())) != len(allowed_test_groups):
+        raise AssertionError("test units unexpectedly share a cgroup identity")
+
+    process_groups: dict[PurePosixPath, set[int]] = {}
+    process_identities: dict[int, tuple[str, int]] = {}
+    for procs_file in root.rglob("cgroup.procs"):
+        group = root_group / PurePosixPath(procs_file.parent.relative_to(root).as_posix())
+        pids = {int(value) for value in procs_file.read_text(encoding="ascii").split()}
+        process_groups[group] = pids
+        for pid in pids:
+            proc_group, comm, ppid = _process_cgroup_identity(pid)
+            if PurePosixPath(proc_group) != group:
+                raise AssertionError(f"PID {pid} cgroup.procs disagrees with /proc/{pid}/cgroup")
+            process_identities[pid] = (comm, ppid)
+
+    init_pids = process_groups.get(init_group, set())
+    manager_pid_int = int(manager_pid)
+    if manager_pid_int not in init_pids:
+        raise AssertionError("the current user manager is absent from init.scope")
+    sd_pam_pids = init_pids - {manager_pid_int}
+    if len(sd_pam_pids) != 1:
+        raise AssertionError(
+            f"expected exactly one baseline (sd-pam) process in init.scope, got {sorted(sd_pam_pids)}"
+        )
+    for pid in sd_pam_pids:
+        comm, ppid = process_identities[pid]
+        if comm != "(sd-pam)" or ppid != manager_pid_int:
+            raise AssertionError(f"unexpected process {pid} in user-manager init.scope: {comm!r}")
+    dbus_pids = process_groups.get(dbus_group, set())
+    if dbus_pids != {int(dbus["MainPID"])}:
+        raise AssertionError(
+            f"unexpected processes in user-manager dbus.service: {sorted(dbus_pids)}"
+        )
+    baseline_processes = {
+        "init.scope": frozenset(init_pids),
+        "dbus.service": frozenset(dbus_pids),
+    }
+    if (
+        expected_baseline_processes is not None
+        and baseline_processes != expected_baseline_processes
+    ):
+        raise AssertionError(
+            "manager init/dbus process inventory changed since preflight: "
+            f"expected={expected_baseline_processes!r}, actual={baseline_processes!r}"
+        )
+
+    ordered_test_groups = sorted(
+        allowed_test_groups.items(), key=lambda item: len(item[1].parts), reverse=True
+    )
+    for group, pids in process_groups.items():
+        if not pids or group in {init_group, dbus_group}:
+            continue
+        if group.is_relative_to(dbus_group):
+            raise AssertionError(
+                f"unexpected child cgroup under user-manager dbus.service: {group}"
+            )
+        matches = [
+            (name, candidate)
+            for name, candidate in ordered_test_groups
+            if group.is_relative_to(candidate)
+        ]
+        if not matches:
+            raise AssertionError(f"unaccounted process cgroup under user manager: {group}")
+        name, candidate = matches[0]
+        if (
+            name in {"attempt_slice", "launch_driver"}
+            or group == candidate
+            and name == "monitor"
+            and expected_monitor_pid is None
+        ):
+            raise AssertionError(f"unexpected process in {name} cgroup: {sorted(pids)}")
+        if name == "monitor" and pids != {int(expected_monitor_pid or "0")}:
+            raise AssertionError(f"monitor PID does not match its cgroup: {sorted(pids)}")
+    return baseline_processes
+
+
+def test_user_manager_unit_inventory_retains_unknown_types_and_multiline_descriptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unrecognized_unit = "unexpected-agent.busname"
+    completed = subprocess.CompletedProcess(
+        args=["systemctl"],
+        returncode=0,
+        stdout=json.dumps(
+            [
+                {
+                    "unit": unrecognized_unit,
+                    "load": "loaded",
+                    "active": "active",
+                    "sub": "running",
+                    "description": "Example D-Bus name\nimport json",
+                }
+            ]
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_systemd_command", lambda _args: completed)
+
+    assert _user_manager_unit_inventory("systemctl") == {
+        unrecognized_unit: ("loaded", "active", "running")
+    }
 
 
 def _assert_units_available_for_test(*units: str) -> None:
@@ -2201,6 +2533,128 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     isolation_probes = os.environ.get("ACP_LIVE_ISOLATION_PROBES") == "1"
     import_result_after_cleanup = os.environ.get("ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP") == "1"
     supervised_run_worker = os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1"
+    user_manager_restart_after_driver_crash = (
+        os.environ.get("ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH") == "1"
+    )
+    user_manager_restart_target: tuple[Path, str, str, str] | None = None
+    user_manager_restart_baseline: dict[str, tuple[str, str, str]] | None = None
+    user_manager_restart_baseline_processes: dict[str, frozenset[int]] | None = None
+    user_manager_restart_busctl: Path | None = None
+    user_manager_restart_uncertain = False
+    if user_manager_restart_after_driver_crash:
+        expected_host = os.environ.get("ACP_LIVE_USER_MANAGER_RESTART_DISPOSABLE_HOST", "")
+        if not expected_host or expected_host != socket.gethostname():
+            pytest.fail(
+                "set ACP_LIVE_USER_MANAGER_RESTART_DISPOSABLE_HOST to this exact disposable VM hostname"
+            )
+        if (
+            os.environ.get("ACP_LIVE_USER_MANAGER_RESTART_ACK")
+            != "RESTART_ONLY_THIS_DISPOSABLE_GUEST"
+        ):
+            pytest.fail(
+                "user-manager restart requires ACP_LIVE_USER_MANAGER_RESTART_ACK="
+                "RESTART_ONLY_THIS_DISPOSABLE_GUEST"
+            )
+        detect_virt = shutil.which("systemd-detect-virt", path=environment["PATH"])
+        if (
+            detect_virt is None
+            or _systemd_command(
+                [str(Path(detect_virt).resolve(strict=True)), "--quiet", "--vm"]
+            ).returncode
+            != 0
+        ):
+            pytest.fail("user-manager restart is restricted to a virtual machine")
+        os_release = {}
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                parsed_value = shlex.split(value)
+                if len(parsed_value) == 1:
+                    os_release[key] = parsed_value[0]
+        if os_release.get("ID") != "debian" or os_release.get("VERSION_ID") != "12":
+            pytest.fail("user-manager restart is restricted to the Debian 12 disposable Lima VM")
+        sudo = shutil.which("sudo", path=environment["PATH"])
+        if sudo is None:
+            pytest.fail("user-manager restart requires passwordless sudo on its disposable VM")
+        sudo_path = Path(sudo).resolve(strict=True)
+        sudo_preflight = _systemd_command([str(sudo_path), "-n", "true"])
+        if sudo_preflight.returncode != 0:
+            pytest.fail("user-manager restart requires passwordless sudo on its disposable VM")
+        busctl = shutil.which("busctl", path=environment["PATH"])
+        if busctl is None:
+            pytest.fail("user-manager restart requires busctl to verify the restarted user bus")
+        user_manager_restart_busctl = Path(busctl).resolve(strict=True)
+        user_manager_unit = f"user@{os.getuid()}.service"
+        manager_pid_result = _systemd_command(
+            [
+                str(sudo_path),
+                "-n",
+                systemctl,
+                "show",
+                user_manager_unit,
+                "-p",
+                "MainPID",
+                "--value",
+            ]
+        )
+        manager_pid = manager_pid_result.stdout.strip()
+        if manager_pid_result.returncode != 0 or not manager_pid.isdecimal() or manager_pid == "0":
+            pytest.fail("the exact test user's systemd manager service is not active")
+        manager_cgroup_result = _systemd_command(
+            [
+                str(sudo_path),
+                "-n",
+                systemctl,
+                "show",
+                user_manager_unit,
+                "-p",
+                "ControlGroup",
+                "--value",
+            ]
+        )
+        manager_cgroup = manager_cgroup_result.stdout.strip()
+        if manager_cgroup_result.returncode != 0 or not manager_cgroup:
+            pytest.fail("the exact test user's manager cgroup is unavailable")
+        user_manager_restart_baseline = _user_manager_restart_expected_inventory(os.getuid())
+        try:
+            actual_inventory = _user_manager_unit_inventory(systemctl)
+        except RuntimeError as error:
+            pytest.fail(str(error))
+        if actual_inventory != user_manager_restart_baseline:
+            pytest.fail(
+                "refusing user-manager restart because the full baseline unit inventory does not "
+                "match the explicit disposable-VM allowlist; "
+                f"unexpected={actual_inventory!r}"
+            )
+        try:
+            user_manager_restart_baseline_processes = _assert_user_manager_process_inventory(
+                manager_cgroup=manager_cgroup,
+                manager_pid=manager_pid,
+            )
+        except (AssertionError, OSError, RuntimeError) as error:
+            pytest.fail(
+                f"refusing user-manager restart because baseline cgroup audit failed: {error}"
+            )
+        user_manager_restart_target = (sudo_path, user_manager_unit, manager_pid, manager_cgroup)
+        monitor_crash_modes = (
+            os.environ.get("ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE") == "1",
+            os.environ.get("ACP_LIVE_CRASH_BEFORE_MONITOR_START") == "1",
+        )
+        if sum(monitor_crash_modes) != 1:
+            pytest.fail(
+                "user-manager restart requires exactly one monitor-acceptance or pre-monitor crash mode"
+            )
+        if any(
+            os.environ.get(name) == "1"
+            for name in (
+                "ACP_LIVE_CANCEL_AFTER_START",
+                "ACP_LIVE_TIMEOUT_AFTER_START",
+                "ACP_LIVE_LEASE_EXPIRY_AFTER_STOP",
+                "ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE",
+                "ACP_LIVE_USER_MANAGER_REEXEC_AFTER_DRIVER_CRASH",
+            )
+        ):
+            pytest.fail("user-manager restart mode cannot be combined with another live mode")
     coding_task = isolation_probes or import_result_after_cleanup
     coding_source = "printf 'coding-task-pass\\n'"
     coding_script_name = "sandbox-coding-task.sh"
@@ -2581,6 +3035,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             pytest.fail(
                 "user-manager re-exec requires a monitor-acceptance or pre-monitor crash mode"
             )
+        if user_manager_restart_after_driver_crash and not (
+            crash_after_monitor_acceptance or crash_before_monitor_start
+        ):
+            pytest.fail(
+                "user-manager restart requires a monitor-acceptance or pre-monitor crash mode"
+            )
+        if user_manager_reexec_after_driver_crash and user_manager_restart_after_driver_crash:
+            pytest.fail("user-manager re-exec and restart modes are mutually exclusive")
         if import_result_after_cleanup and any(
             (
                 cancel_after_start,
@@ -2589,6 +3051,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 crash_after_manager_acceptance,
                 crash_after_monitor_acceptance,
                 crash_before_monitor_start,
+                user_manager_reexec_after_driver_crash,
+                user_manager_restart_after_driver_crash,
             )
         ):
             pytest.fail("live result import requires the natural-completion mode")
@@ -2863,6 +3327,184 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     ),
                 )
                 assert driver_after_reexec == driver_after_crash
+            if user_manager_restart_target is not None:
+                sudo_path, user_manager_unit, original_manager_pid, manager_cgroup = (
+                    user_manager_restart_target
+                )
+                assert user_manager_restart_baseline is not None
+                current_inventory = _user_manager_unit_inventory(systemctl)
+                test_units = {service_unit, monitor_unit, slice_unit, scope["unit"]}
+                missing_baseline_units = set(user_manager_restart_baseline) - set(current_inventory)
+                unexpected_units = (
+                    set(current_inventory) - set(user_manager_restart_baseline) - test_units
+                )
+                changed_baseline_units = {
+                    unit: (user_manager_restart_baseline[unit], current_inventory.get(unit))
+                    for unit in user_manager_restart_baseline
+                    if current_inventory.get(unit) != user_manager_restart_baseline[unit]
+                }
+                assert not missing_baseline_units, (
+                    "refusing user-manager restart because baseline units disappeared: "
+                    f"{sorted(missing_baseline_units)!r}"
+                )
+                assert not unexpected_units, (
+                    "refusing user-manager restart because unapproved user units appeared: "
+                    f"{sorted(unexpected_units)!r}"
+                )
+                assert not changed_baseline_units, (
+                    "refusing user-manager restart because baseline unit states changed: "
+                    f"{changed_baseline_units!r}"
+                )
+                for unit in test_units & set(current_inventory):
+                    active_state = current_inventory[unit][1]
+                    assert active_state not in {"activating", "reloading", "deactivating"}, (
+                        f"refusing user-manager restart during {unit} transition: {active_state}"
+                    )
+                    assert active_state != "failed" or unit == service_unit, (
+                        f"refusing user-manager restart with failed non-driver unit {unit}"
+                    )
+                attempt_slice_properties = _unit_properties(
+                    slice_unit, ("ActiveState", "ControlGroup", "LoadState")
+                )
+                assert attempt_slice_properties["LoadState"] == "loaded"
+                assert attempt_slice_properties["ActiveState"] == "active"
+                assert (
+                    attempt_slice_properties["ControlGroup"]
+                    == accepted["attempt_slice_control_group"]
+                )
+                if monitor is not None:
+                    monitor_properties = _unit_properties(
+                        monitor_unit, ("ActiveState", "ControlGroup", "LoadState", "MainPID")
+                    )
+                    assert monitor_properties["LoadState"] == "loaded"
+                    assert monitor_properties["ActiveState"] == "active"
+                    assert monitor_properties["MainPID"] == str(monitor["pid"])
+                    assert monitor_properties["ControlGroup"] == monitor["control_group"]
+                scope_properties = _unit_properties(
+                    scope["unit"], ("ActiveState", "ControlGroup", "LoadState")
+                )
+                assert scope_properties["ActiveState"] in {"active", "inactive"}
+                if scope_properties["ActiveState"] == "active":
+                    assert scope_properties["ControlGroup"] == scope["control_group"]
+                else:
+                    assert not scope_properties["ControlGroup"]
+                manager_pid_result = _systemd_command(
+                    [
+                        str(sudo_path),
+                        "-n",
+                        systemctl,
+                        "show",
+                        user_manager_unit,
+                        "-p",
+                        "MainPID",
+                        "--value",
+                    ]
+                )
+                assert manager_pid_result.returncode == 0
+                assert manager_pid_result.stdout.strip() == original_manager_pid, (
+                    "the test user's manager changed before the requested restart"
+                )
+                test_cgroups = {
+                    "attempt_slice": accepted["attempt_slice_control_group"],
+                    "launch_driver": driver["control_group"],
+                    "scope": scope["control_group"],
+                }
+                expected_monitor_pid = None
+                if monitor is not None:
+                    test_cgroups["monitor"] = monitor["control_group"]
+                    expected_monitor_pid = str(monitor["pid"])
+                assert user_manager_restart_baseline_processes is not None
+                _assert_user_manager_process_inventory(
+                    manager_cgroup=manager_cgroup,
+                    manager_pid=original_manager_pid,
+                    test_cgroups=test_cgroups,
+                    expected_monitor_pid=expected_monitor_pid,
+                    expected_baseline_processes=user_manager_restart_baseline_processes,
+                )
+                user_manager_restart_uncertain = True
+                try:
+                    restart = _systemd_command(
+                        [str(sudo_path), "-n", systemctl, "restart", user_manager_unit],
+                        timeout=60,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    pytest.fail(
+                        "user-manager restart timed out with an uncertain outcome; no retry or "
+                        "automatic unit cleanup was attempted. Preserve this disposable VM and "
+                        "manually inspect user@UID.service and the exact ACP fixture units before "
+                        "any recovery or rerun."
+                    )
+                    raise error
+                if restart.returncode != 0:
+                    pytest.fail(
+                        "user-manager restart returned nonzero with an uncertain outcome; no "
+                        "retry or automatic unit cleanup was attempted. Preserve this disposable "
+                        "VM and manually inspect user@UID.service and the exact ACP fixture units "
+                        f"before recovery. stdout={restart.stdout!r}; stderr={restart.stderr!r}"
+                    )
+                manager_after_restart = ""
+                manager_reachable = False
+                user_bus_reachable = False
+                assert user_manager_restart_busctl is not None
+                restart_deadline = time.monotonic() + 15
+                while time.monotonic() < restart_deadline:
+                    manager_pid_result = _systemd_command(
+                        [
+                            str(sudo_path),
+                            "-n",
+                            systemctl,
+                            "show",
+                            user_manager_unit,
+                            "-p",
+                            "MainPID",
+                            "--value",
+                        ]
+                    )
+                    manager_after_restart = manager_pid_result.stdout.strip()
+                    manager_reachable = (
+                        _systemd_command(
+                            [systemctl, "--user", "show-environment"], timeout=5
+                        ).returncode
+                        == 0
+                    )
+                    user_bus_reachable = (
+                        _systemd_command(
+                            [
+                                str(user_manager_restart_busctl),
+                                "--user",
+                                "--no-pager",
+                                "status",
+                            ],
+                            timeout=5,
+                        ).returncode
+                        == 0
+                    )
+                    if (
+                        manager_pid_result.returncode == 0
+                        and manager_after_restart.isdecimal()
+                        and manager_after_restart not in {"0", original_manager_pid}
+                        and manager_reachable
+                        and user_bus_reachable
+                    ):
+                        break
+                    time.sleep(0.25)
+                assert manager_pid_result.returncode == 0, (
+                    "restarted user manager PID could not be verified by systemd"
+                )
+                assert manager_after_restart.isdecimal()
+                assert manager_after_restart not in {"0", original_manager_pid}
+                assert manager_reachable, "restarted user manager did not become reachable"
+                assert user_bus_reachable, "restarted user D-Bus did not become reachable"
+                driver_after_restart = _unit_properties(
+                    service_unit,
+                    ("ActiveState", "ControlGroup", "Id", "InvocationID", "LoadState", "MainPID"),
+                )
+                assert driver_after_restart["Id"] == service_unit
+                assert driver_after_restart["LoadState"] == "not-found"
+                assert driver_after_restart["ActiveState"] == "inactive"
+                assert driver_after_restart["MainPID"] == "0"
+                assert not driver_after_restart["ControlGroup"]
+                assert not driver_after_restart["InvocationID"]
             monitor_before_recovery = _unit_properties(
                 monitor_unit,
                 (
@@ -2876,7 +3518,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 ),
             )
             assert monitor_before_recovery["Id"] == monitor_unit
-            if crash_before_monitor_start:
+            if user_manager_restart_target is not None:
+                assert monitor_before_recovery["ActiveState"] == "inactive"
+                assert monitor_before_recovery["LoadState"] == "not-found"
+                assert monitor_before_recovery["MainPID"] == "0"
+                assert not monitor_before_recovery["InvocationID"]
+                assert not monitor_before_recovery["ControlGroup"]
+            elif crash_before_monitor_start:
                 assert monitor_before_recovery["ActiveState"] == "inactive"
                 assert monitor_before_recovery["LoadState"] == "not-found"
                 assert monitor_before_recovery["MainPID"] == "0"
@@ -2889,21 +3537,36 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert monitor_before_recovery["InvocationID"] == monitor["invocation_id"]
                 assert monitor_before_recovery["ControlGroup"] == monitor["control_group"]
             attempt_slice_before_recovery = _unit_properties(
-                slice_unit, ("ActiveState", "ControlGroup", "Id", "LoadState")
+                slice_unit, ("ActiveState", "ControlGroup", "Id", "LoadState", "SubState")
             )
-            assert attempt_slice_before_recovery["ActiveState"] == "active"
             assert attempt_slice_before_recovery["Id"] == slice_unit
-            assert (
-                attempt_slice_before_recovery["ControlGroup"]
-                == accepted["attempt_slice_control_group"]
-            )
+            if user_manager_restart_target is not None:
+                assert slice_unit == accepted["attempt_slice"]
+                assert attempt_slice_before_recovery["ActiveState"] == "inactive"
+                assert attempt_slice_before_recovery["LoadState"] in {"loaded", "not-found"}
+                assert attempt_slice_before_recovery["SubState"] == "dead"
+                assert not attempt_slice_before_recovery["ControlGroup"]
+            else:
+                assert attempt_slice_before_recovery["ActiveState"] == "active"
+                assert (
+                    attempt_slice_before_recovery["ControlGroup"]
+                    == accepted["attempt_slice_control_group"]
+                )
             scope_before_recovery = _unit_properties(
                 scope["unit"],
                 ("ActiveState", "ControlGroup", "Id", "InvocationID", "LoadState", "Slice"),
             )
             assert scope_before_recovery["Id"] == scope["unit"]
-            assert scope_before_recovery["ActiveState"] in {"active", "inactive"}
-            if scope_before_recovery["ActiveState"] == "active":
+            if user_manager_restart_target is not None:
+                assert scope_before_recovery["ActiveState"] == "inactive"
+                assert scope_before_recovery["LoadState"] == "not-found"
+                assert not scope_before_recovery["ControlGroup"]
+            else:
+                assert scope_before_recovery["ActiveState"] in {"active", "inactive"}
+            if (
+                user_manager_restart_target is None
+                and scope_before_recovery["ActiveState"] == "active"
+            ):
                 assert scope_before_recovery["InvocationID"] == scope["invocation_id"]
                 assert scope_before_recovery["ControlGroup"] == scope["control_group"]
                 assert scope_before_recovery["Slice"] == slice_unit
@@ -2913,6 +3576,61 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert not scope_before_recovery["ControlGroup"]
                 assert scope_before_recovery["LoadState"] in {"loaded", "not-found"}
                 assert scope_before_recovery["Slice"] in {"", slice_unit}
+            if user_manager_restart_target is not None:
+                sudo_path, user_manager_unit, _original_manager_pid, manager_cgroup = (
+                    user_manager_restart_target
+                )
+                current_cgroup_result = _systemd_command(
+                    [
+                        str(sudo_path),
+                        "-n",
+                        systemctl,
+                        "show",
+                        user_manager_unit,
+                        "-p",
+                        "ControlGroup",
+                        "--value",
+                    ]
+                )
+                assert current_cgroup_result.returncode == 0
+                assert current_cgroup_result.stdout.strip() == manager_cgroup
+                assert user_manager_restart_baseline is not None
+                post_restart_inventory = _user_manager_unit_inventory(systemctl)
+                test_units = {service_unit, monitor_unit, slice_unit, scope["unit"]}
+                assert (
+                    set(post_restart_inventory) <= set(user_manager_restart_baseline) | test_units
+                )
+                restart_unloaded_slices = {"user.slice", "user-acp.slice"}
+                for unit, expected_state in user_manager_restart_baseline.items():
+                    actual_state = post_restart_inventory.get(unit)
+                    if unit in restart_unloaded_slices:
+                        assert actual_state in {
+                            expected_state,
+                            ("loaded", "inactive", "dead"),
+                            None,
+                        }, (
+                            f"manager restart left unexpected state for empty user slice {unit}: "
+                            f"{actual_state!r}"
+                        )
+                        continue
+                    assert actual_state == expected_state, (
+                        f"baseline unit changed across manager restart: {unit} "
+                        f"{actual_state!r} != {expected_state!r}"
+                    )
+                for unit in test_units & set(post_restart_inventory):
+                    assert _user_manager_restart_test_unit_state_is_safe(
+                        unit=unit,
+                        attempt_slice_unit=slice_unit,
+                        state=post_restart_inventory[unit],
+                    ), (
+                        f"test unit remained in an unsafe state after manager restart: "
+                        f"{unit}={post_restart_inventory[unit]!r}"
+                    )
+                _assert_user_manager_process_inventory(
+                    manager_cgroup=manager_cgroup,
+                    manager_pid=manager_after_restart,
+                )
+                user_manager_restart_uncertain = False
 
             durable_before_recovery = supervisor._sandbox_execution_get(attempt["id"])
             assert durable_before_recovery is not None
@@ -3985,6 +4703,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             pytest.fail(
                 "controller child processes are not quiescent; preserving the exact "
                 f"fixture and service state at {run_root}; pids={live_children}"
+            )
+        if user_manager_restart_uncertain:
+            pytest.fail(
+                "user-manager restart outcome or postflight remains uncertain; no retry, unit "
+                "stop, fixture deletion, or automatic recovery was attempted. Preserve the "
+                f"disposable VM and exact fixture at {run_root}; manually inspect user@UID.service "
+                "and the exact ACP fixture units before recovery."
             )
         driver_safe = _stop_attempted_units_and_check_quiescence(
             systemctl, service_unit, service_start_attempted, slice_unit, slice_start_attempted
