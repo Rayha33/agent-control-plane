@@ -1385,7 +1385,8 @@ def test_open_runc_fd_rejects_inode_replaced_after_initial_verification(
 
     def replaced_open(path, flags, *args, **kwargs):
         if Path(path) == pin.path:
-            return real_open("/bin/echo", flags, *args, **kwargs)
+            replacement = Path("/bin/echo").resolve(strict=True)
+            return real_open(replacement, flags, *args, **kwargs)
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(oci_worker, "_verify_trusted_runc_executable", lambda _pin: pin.path)

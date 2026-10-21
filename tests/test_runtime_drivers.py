@@ -1534,15 +1534,17 @@ def test_expired_browser_session_cannot_write_into_sibling_attempt_profile(
     assert first_profile != second_profile
     assert first_profile.is_dir() and second_profile.is_dir()
 
-    # Keep the sibling alive even if the two claims land in the same clock tick.
+    # Expire the first worker well beyond its heartbeat lease, but keep the
+    # sibling's lease later than the reaper's synthetic clock.
+    reap_at = int(time.time()) + 1800
     with supervisor.connect() as connection:
         connection.execute(
             "UPDATE attempts SET lease_expires_at = ? WHERE id = ?",
-            (int(time.time()) + 3600, second["id"]),
+            (reap_at + 1800, second["id"]),
         )
         connection.execute(
             "UPDATE resource_leases SET lease_expires_at = ? WHERE attempt_id = ?",
-            (int(time.time()) + 3600, second["id"]),
+            (reap_at + 1800, second["id"]),
         )
 
     ready = Path(supervisor.state_dir) / f"browser-session-started-{first['id']}"
@@ -1587,7 +1589,8 @@ def test_expired_browser_session_cannot_write_into_sibling_attempt_profile(
             time.sleep(0.01)
         assert ready.exists(), "the browser worker never reached its child-process barrier"
 
-        expired = supervisor.reap_expired(now=first["lease_expires_at"])
+        expired = supervisor.reap_expired(now=reap_at)
+        assert expired["terminated_workers"][0]["termination"] == "terminated", expired
         with pytest.raises(SupervisorError):
             worker.result(timeout=5)
 
@@ -2357,7 +2360,7 @@ def test_disposable_postgres_workers_use_distinct_attempt_schemas(tmp_path: Path
                 "-l",
                 str(log_path),
                 "-o",
-                f"-h 127.0.0.1 -p {port}",
+                f"-h 127.0.0.1 -p {port} -c unix_socket_directories=",
                 "-w",
                 "start",
             ],
@@ -2366,7 +2369,12 @@ def test_disposable_postgres_workers_use_distinct_attempt_schemas(tmp_path: Path
             timeout=30,
             check=False,
         )
-        assert start.returncode == 0, start.stderr
+        startup_log = (
+            log_path.read_text(encoding="utf-8", errors="replace")
+            if log_path.exists()
+            else "(PostgreSQL startup log was not created)"
+        )
+        assert start.returncode == 0, f"{start.stderr}\n{startup_log}"
 
         first_context = postgres_context(tmp_path, "attempt-worker-a", "disposable-only")
         second_context = context(
@@ -2542,7 +2550,7 @@ def test_supervised_postgres_workers_receive_distinct_ports_and_schemas(
                 "-l",
                 str(log_path),
                 "-o",
-                f"-h 127.0.0.1 -p {database_port}",
+                f"-h 127.0.0.1 -p {database_port} -c unix_socket_directories=",
                 "-w",
                 "start",
             ],
@@ -2551,7 +2559,12 @@ def test_supervised_postgres_workers_receive_distinct_ports_and_schemas(
             timeout=30,
             check=False,
         )
-        assert start.returncode == 0, start.stderr
+        startup_log = (
+            log_path.read_text(encoding="utf-8", errors="replace")
+            if log_path.exists()
+            else "(PostgreSQL startup log was not created)"
+        )
+        assert start.returncode == 0, f"{start.stderr}\n{startup_log}"
 
         current, _, _ = postgres_versions(tmp_path)
         repo = postgres_repo(tmp_path, current)
