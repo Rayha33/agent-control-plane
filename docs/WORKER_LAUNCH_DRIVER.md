@@ -1019,3 +1019,42 @@ disposable Debian 12 guest. It does not prove supervisor-daemon failure,
 logout/linger, reboot recovery, provider authentication, or destination-
 restricted provider egress, and does not close #2370's broader isolation gate
 or enable the default OCI `run_worker()` path.
+
+### Explicit supervised `run_worker()` path with isolation and result import (live proof; 2026-10-21)
+
+On exact code-bearing commit `6df4b16c2f6b75e29d7598e15d4bb1905cc2fa08`,
+the opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`
+passed 1/1 on disposable VM
+`lima-acp-2370-live-sandbox-kernel612-20261021` (Debian 12 ARM64, Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39-1~deb12u2`, Python 3.11.2).
+It used root-owned runc 1.5.2 at `/usr/local/bin/runc`, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`, with
+`ACP_LIVE_SUPERVISED_RUN_WORKER=1`,
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1`, and
+`ACP_LIVE_ISOLATION_PROBES=1`, with the exact guest name supplied through
+`ACP_LIVE_ISOLATION_DISPOSABLE_HOST`.
+
+This exercised the explicit experimental `WorkersMixin.run_worker()` route,
+not just a direct launch-driver call. A deterministic no-model coding task ran
+in its attempt-private workspace; the production cleanup verifier completed,
+and host-side validation/import placed only the expected fixture changes into
+the normal pending-QC path. All live isolation assertions passed: writable
+attempt workspace without shared `.git`, read-only rootfs/toolchain closure,
+denial of base/harness/sibling/unrelated-project, home/config/credential and
+host-temp sentinels, and symlink and canonical-path escapes. The fixture also
+confirmed that its specific controller-PID path and two host Unix-socket paths
+were absent from the worker view. Its direct-IP probe to `192.0.2.1:443` got the
+required `EPERM`/`EACCES` denial. These checks do not establish general
+process/socket isolation or broad network-egress denial. No real provider
+credentials, provider endpoint, or model call was used.
+
+Postflight found no ACP user units, test roots, or sentinels; the exact VM was
+stopped. An initial invocation omitted the required result-import mode and was
+rejected by the fixture guard before worker launch; its read-only postflight
+found the temporary-root, ACP-unit, and sentinel sets empty (captured output:
+`tmp_roots=`; `acp_units=sentinels=`). This proves one no-model execution
+through the explicit opt-in supervisor route and its verified-import boundary.
+It does not prove a provider/model worker, brokered authentication or allowed
+provider egress, supervisor-daemon restart, logout/linger, or reboot recovery. The
+default OCI worker path remains fail-closed unless the experimental opt-in and
+all required pinned runtime/resource inputs are supplied; #2370 remains open.
