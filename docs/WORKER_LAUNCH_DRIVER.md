@@ -949,14 +949,26 @@ hostname, and the literal
 restricted to a VM with passwordless `sudo -n` and an exact Debian 12 Lima
 baseline inventory. Before launching the fixture it compares structured JSON
 rows from `systemctl --user list-units --all`—including device units and any
-otherwise unrecognized unit type and state—to the explicit 84-unit allowlist.
+otherwise unrecognized unit type and state—to the exact Debian 12 Lima
+allowlist. The CIDATA UUID device unit is derived only after verifying that its
+sole `/dev/disk/by-uuid` alias resolves to the same `/dev/vdb` block device as
+`/dev/disk/by-label/cidata`. A successful `busctl --user status` first exercises
+the user's normal D-Bus socket activation. The optional `user.slice` and
+`user-acp.slice` must be absent or exact implicit slices below the test
+manager; loaded/inactive instances must have no cgroup or unit file. Active
+instances must have their exact manager-relative cgroup path and no unit file;
+`user-acp.slice` must be nested under `user.slice`. Both parent slices are
+checked separately from the otherwise exact baseline.
 Structured rows prevent multiline unit descriptions from being mistaken for
-extra units. It also captures the exact `init.scope` and `dbus.service` PID sets
-and verifies the single direct `(sd-pam)` child of the manager. Immediately
-before restart it rechecks the full unit inventory and requires those baseline
-PID sets to be unchanged, then proves every process under the manager cgroup
-belongs to those baseline units or the fixture's exact driver, monitor, attempt
-slice, and worker scope. Any additional unit, state, or process fails closed.
+extra units. It captures the exact `init.scope` and `dbus.service` PID sets and
+verifies the single direct `(sd-pam)` child of the manager. Immediately before
+restart it rechecks the full unit inventory and requires those baseline PID
+sets to be unchanged, then proves every process under the manager cgroup
+belongs to those baseline units or the fixture's exact driver, monitor,
+attempt-slice, and worker-scope cgroups. Parent-slice hierarchy and cgroup
+identity are verified separately; parent slices are not process-allowlist
+entries, so a direct process in either slice fails closed. Any other unit,
+state, or process also fails closed.
 
 The mode restarts only the current test user's `user@<uid>.service`. Before
 fresh-supervisor reconciliation it requires a successful replacement-manager
@@ -965,9 +977,9 @@ PID query, a reachable manager control socket, and a successful `busctl
 driver and monitor services and worker scope must be absent; there may be no
 test process left in the manager cgroup. Systemd can retain the exact
 attempt-specific slice as `loaded/inactive/dead` after restart, but only with an
-empty control group; no other fixture unit may remain. The empty `user.slice`
-and `user-acp.slice` baseline units may be absent, inactive, or loaded/inactive;
-all other baseline unit states remain exact. If the restart command times out,
+empty control group; no other fixture unit may remain. Either parent slice may
+be absent after restart or remain loaded/inactive with no cgroup or unit file.
+All other baseline unit states remain exact. If the restart command times out,
 returns nonzero, or its outcome cannot be verified, the test preserves the VM
 and exact fixture, performs no retry or automatic unit cleanup, and requires
 manual inspection before any recovery or rerun.
@@ -1012,6 +1024,20 @@ test units, and the two expected empty user slices unloaded. Both successful
 fixture roots were removed after their exact cleanup checks; the two earlier
 failed roots remain preserved. These no-model runs used no provider
 credentials, endpoint, or API call.
+
+An initial probe on this guest exposed a per-VM CIDATA UUID and lazily
+activated empty parent slices, so the allowlist was narrowed around the stable
+device-label identity and those exact implicit slices. A fifth guarded run
+then passed the same monitor-accepted crash/restart path on this guest. It used
+test-source SHA-256
+`154348ab69d04ea11ae0652c1b8f13a39b377e6eb2c170b6a9b746a614324a68` and
+restarted the user-manager PID from 546 to 1371. The replacement manager and
+D-Bus were reachable; fresh-supervisor reconciliation and independent cleanup
+verification completed. Postflight found no ACP units, runc containers, worker
+processes, or this run's launch-driver fixture root under `/tmp`; the
+user-manager cgroup contained only `systemd --user`, its one direct `(sd-pam)`
+child, and the D-Bus daemon in their exact baseline cgroups. This no-model run
+used no provider credentials, endpoint, or API call.
 
 This closes the specifically tested user-manager service-restart recovery paths
 for monitor-accepted and before-monitor-start launch-driver crashes on this
@@ -1058,3 +1084,57 @@ It does not prove a provider/model worker, brokered authentication or allowed
 provider egress, supervisor-daemon restart, logout/linger, or reboot recovery. The
 default OCI worker path remains fail-closed unless the experimental opt-in and
 all required pinned runtime/resource inputs are supplied; #2370 remains open.
+
+### Follow-up known-host PID visibility probe (2026-10-21; no model)
+
+The exact opt-in live test was extended by test-only unified-zero diff
+`abeb50625fb9c8c3b7746bd855b82c2218e6de91b53ff41791988f662a3bfbb9` on top of
+source commit `7597bf92c904cb25eeb745d3f997ed746e4b061c`. The new fixture starts
+one synthetic host-side Python process whose PID exceeds the worker's configured
+PID limit; the worker asserts that both the supervising test PID and this
+sentinel PID are absent from its `/proc` view. The test asserts that this
+sentinel remains alive through worker completion and stops/reaps it only after
+the launch-driver and monitor units are verified quiescent. It retains the
+existing two host-socket path absence checks and direct-IP denial probe.
+
+The opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`
+passed 1/1 on the same disposable Debian 12 ARM64 / Linux
+`6.12.95+deb12-cloud-arm64` / systemd 252.39 / Python 3.11.2 guest with
+root-owned runc 1.5.2 (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). It used
+`ACP_LIVE_SUPERVISED_RUN_WORKER=1`,
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1`,
+`ACP_LIVE_ISOLATION_PROBES=1`, and the exact guest hostname. The no-model worker
+completed the cleanup-gated result import. After verifying the launch-driver
+and monitor units quiescent, the harness terminated and reaped the synthetic
+host process; independent postflight found no runc process, ACP service unit,
+live-launch root, or sentinel process. The exact VM was stopped, and the
+temporary source checkout and virtual environment were removed.
+
+This establishes absence of the two specifically checked host PIDs inside this
+test namespace, not a general process enumeration guarantee. The socket and
+direct-IP probes remain limited to their exact paths/address; broad socket or
+network-egress isolation is not claimed. No provider credential, endpoint, or
+model call was used. The default OCI `run_worker()` path remains fail-closed,
+and task #2370 remains open.
+
+### Follow-up concurrent no-model scope probe (2026-10-21)
+
+`test_live_concurrent_attempts_use_distinct_scopes_and_clean_up` passed 1/1 on
+the same disposable Debian 12 ARM64 / Linux `6.12.95+deb12-cloud-arm64` /
+systemd 252.39 / Python 3.11.2 VM with root-owned runc 1.5.2 (the SHA-256 is
+recorded above). The opt-in started two fresh cancellation-mode pytest
+processes at the same time. Its assertions require distinct attempt, container,
+execution, PID, repository, run-root, scope-unit, source-worktree, and workspace
+identities, plus two consecutive samples where the active ACP scopes exactly
+match those two workers' reported scope units. Both child lifecycle tests
+completed their cancellation and exact-unit cleanup checks.
+
+Postflight found no runc or Python worker process, active ACP scope,
+`acp-live-launch-driver-*` root, or `acp-live-concurrent-control-*` directory.
+The VM was stopped and the temporary guest checkout and virtual environment
+were removed. This is evidence for simultaneous per-attempt scope and identity
+separation during cancellation; it does not establish cross-attempt workspace
+read/write isolation, shared Git-metadata isolation, provider/model execution,
+or use of the public `run_worker()` entry point. No model or credential was
+used, and task #2370 remains open.

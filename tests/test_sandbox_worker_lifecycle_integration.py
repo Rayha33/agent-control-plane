@@ -904,8 +904,46 @@ def _unit_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
     return values
 
 
-def _user_manager_restart_expected_inventory(uid: int) -> dict[str, tuple[str, str, str]]:
-    """Exact baseline user-manager inventory for the supported Debian 12 Lima probe."""
+def _user_manager_cidata_uuid_device_unit(
+    systemd_escape: str,
+    *,
+    cidata_label_path: Path,
+    uuid_directory: Path,
+    expected_device_path: Path | None,
+) -> str:
+    """Resolve the sole UUID alias for the supported Lima CIDATA device."""
+    try:
+        cidata_device = cidata_label_path.resolve(strict=True)
+        if expected_device_path is not None:
+            expected_device = expected_device_path.resolve(strict=True)
+            if cidata_device != expected_device or not stat.S_ISBLK(expected_device.stat().st_mode):
+                raise RuntimeError("the CIDATA label does not resolve to the expected block device")
+        uuid_aliases = [
+            path
+            for path in sorted(uuid_directory.iterdir())
+            if path.is_symlink() and path.resolve(strict=True) == cidata_device
+        ]
+    except OSError as error:
+        raise RuntimeError(f"could not identify the Lima CIDATA device: {error}") from error
+    if len(uuid_aliases) != 1:
+        raise RuntimeError("the Lima CIDATA device must have exactly one /dev/disk/by-uuid alias")
+    uuid_alias = uuid_aliases[0]
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", uuid_alias.name):
+        raise RuntimeError("the Lima CIDATA UUID alias has an unsupported name")
+    escaped = _systemd_command([systemd_escape, "--path", "--suffix=device", str(uuid_alias)])
+    expected_uuid = uuid_alias.name.replace("-", r"\x2d")
+    expected_unit = r"dev-disk-by\x2duuid-" + expected_uuid + ".device"
+    if escaped.returncode != 0 or escaped.stdout.strip() != expected_unit:
+        raise RuntimeError(
+            "systemd did not derive the expected unit for the verified Lima CIDATA UUID alias"
+        )
+    return expected_unit
+
+
+def _user_manager_restart_expected_inventory(
+    uid: int, *, cidata_uuid_device_unit: str
+) -> dict[str, tuple[str, str, str]]:
+    """Exact baseline inventory for the supported Debian 12 Lima user manager."""
     expected: dict[str, tuple[str, str, str]] = {}
     device_units = (
         "dev-disk-by\\x2ddiskseq-1.device",
@@ -921,7 +959,6 @@ def _user_manager_restart_expected_inventory(uid: int) -> dict[str, tuple[str, s
         "dev-disk-by\\x2dpath-virtio\\x2dpci\\x2d0000:00:06.0\\x2dpart1.device",
         "dev-disk-by\\x2dpath-virtio\\x2dpci\\x2d0000:00:06.0\\x2dpart15.device",
         "dev-disk-by\\x2dpath-virtio\\x2dpci\\x2d0000:00:07.0.device",
-        "dev-disk-by\\x2duuid-2026\\x2d10\\x2d21\\x2d05\\x2d55\\x2d50\\x2d09.device",
         "dev-disk-by\\x2duuid-8588\\x2dFECA.device",
         "dev-disk-by\\x2duuid-db8fda2d\\x2d25d7\\x2d4bb8\\x2d827d\\x2d9c93ea89bf3c.device",
         *(f"dev-hvc{index}.device" for index in range(8)),
@@ -943,6 +980,7 @@ def _user_manager_restart_expected_inventory(uid: int) -> dict[str, tuple[str, s
     )
     for unit in device_units:
         expected[unit] = ("loaded", "active", "plugged")
+    expected[cidata_uuid_device_unit] = ("loaded", "active", "plugged")
     for unit in (
         "-.mount",
         "boot-efi.mount",
@@ -963,7 +1001,7 @@ def _user_manager_restart_expected_inventory(uid: int) -> dict[str, tuple[str, s
         expected[unit] = ("loaded", "active", "mounted")
     expected["init.scope"] = ("loaded", "active", "running")
     expected["dbus.service"] = ("loaded", "active", "running")
-    for unit in ("-.slice", "app.slice", "session.slice", "user-acp.slice", "user.slice"):
+    for unit in ("-.slice", "app.slice", "session.slice", "user.slice"):
         expected[unit] = ("loaded", "active", "active")
     expected["dbus.socket"] = ("loaded", "active", "running")
     for unit in (
@@ -988,6 +1026,61 @@ def _user_manager_restart_expected_inventory(uid: int) -> dict[str, tuple[str, s
         expected[unit] = ("not-found", "inactive", "dead")
     expected["shutdown.target"] = ("loaded", "inactive", "dead")
     return expected
+
+
+def _user_manager_restart_inventory_is_allowlisted(
+    actual: dict[str, tuple[str, str, str]],
+    expected: dict[str, tuple[str, str, str]],
+) -> bool:
+    """Allow only known absent or empty states for the two parent slices."""
+    if "user.slice" not in expected:
+        return False
+    allowed_parent_states = {
+        "user.slice": {expected["user.slice"], ("loaded", "inactive", "dead"), None},
+        "user-acp.slice": {("loaded", "active", "active"), ("loaded", "inactive", "dead"), None},
+    }
+    if any(actual.get(unit) not in states for unit, states in allowed_parent_states.items()):
+        return False
+    parent_slices = set(allowed_parent_states)
+    expected_without_parent_slices = {
+        unit: state for unit, state in expected.items() if unit not in parent_slices
+    }
+    actual_without_parent_slices = {
+        unit: state for unit, state in actual.items() if unit not in parent_slices
+    }
+    return actual_without_parent_slices == expected_without_parent_slices
+
+
+def _user_manager_parent_slice_state_is_safe(
+    unit: str,
+    state: tuple[str, str, str],
+    manager_cgroup: str,
+    *,
+    allow_active: bool,
+) -> bool:
+    expected_suffix = {
+        "user.slice": "user.slice",
+        "user-acp.slice": "user.slice/user-acp.slice",
+    }.get(unit)
+    if expected_suffix is None:
+        return False
+    if state == ("loaded", "active", "active"):
+        if not allow_active:
+            return False
+        properties = _unit_properties(unit, ("ControlGroup", "FragmentPath", "LoadState"))
+        return (
+            properties["LoadState"] == "loaded"
+            and properties["ControlGroup"] == f"{manager_cgroup}/{expected_suffix}"
+            and not properties["FragmentPath"]
+        )
+    if state == ("loaded", "inactive", "dead"):
+        properties = _unit_properties(unit, ("ControlGroup", "FragmentPath", "LoadState"))
+        return (
+            properties["LoadState"] == "loaded"
+            and not properties["ControlGroup"]
+            and not properties["FragmentPath"]
+        )
+    return False
 
 
 def _user_manager_unit_inventory(systemctl: str) -> dict[str, tuple[str, str, str]]:
@@ -1212,6 +1305,112 @@ def test_user_manager_unit_inventory_retains_unknown_types_and_multiline_descrip
     assert _user_manager_unit_inventory("systemctl") == {
         unrecognized_unit: ("loaded", "active", "running")
     }
+
+
+def test_user_manager_cidata_uuid_unit_tracks_only_the_labeled_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device = tmp_path / "vdb"
+    device.touch()
+    unrelated_device = tmp_path / "vdc"
+    unrelated_device.touch()
+    by_label = tmp_path / "by-label"
+    by_uuid = tmp_path / "by-uuid"
+    by_label.mkdir()
+    by_uuid.mkdir()
+    (by_label / "cidata").symlink_to(device)
+    uuid_name = "2026-10-21-08-08-25-32"
+    (by_uuid / uuid_name).symlink_to(device)
+    (by_uuid / "unrelated-volume").symlink_to(unrelated_device)
+    expected_unit = r"dev-disk-by\x2duuid-2026\x2d10\x2d21\x2d08\x2d08\x2d25\x2d32.device"
+    calls: list[list[str]] = []
+
+    def fake_systemd_command(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, f"{expected_unit}\n", "")
+
+    monkeypatch.setattr(sys.modules[__name__], "_systemd_command", fake_systemd_command)
+
+    assert (
+        _user_manager_cidata_uuid_device_unit(
+            "/usr/bin/systemd-escape",
+            cidata_label_path=by_label / "cidata",
+            uuid_directory=by_uuid,
+            expected_device_path=None,
+        )
+        == expected_unit
+    )
+    assert calls == [
+        ["/usr/bin/systemd-escape", "--path", "--suffix=device", str(by_uuid / uuid_name)]
+    ]
+
+    (by_uuid / "second-alias").symlink_to(device)
+    with pytest.raises(RuntimeError, match="exactly one"):
+        _user_manager_cidata_uuid_device_unit(
+            "/usr/bin/systemd-escape",
+            cidata_label_path=by_label / "cidata",
+            uuid_directory=by_uuid,
+            expected_device_path=None,
+        )
+
+
+def test_user_manager_restart_inventory_allows_only_known_user_slice_states() -> None:
+    expected = _user_manager_restart_expected_inventory(
+        501, cidata_uuid_device_unit=r"dev-disk-by\x2duuid-2026\x2d10\x2d21.device"
+    )
+    assert _user_manager_restart_inventory_is_allowlisted(expected, expected)
+
+    absent_user_slice = {unit: state for unit, state in expected.items() if unit != "user.slice"}
+    assert _user_manager_restart_inventory_is_allowlisted(absent_user_slice, expected)
+
+    fixture_parent_slice = dict(absent_user_slice)
+    fixture_parent_slice["user-acp.slice"] = ("loaded", "active", "active")
+    assert _user_manager_restart_inventory_is_allowlisted(fixture_parent_slice, expected)
+
+    fixture_parent_slice["user-acp.slice"] = ("loaded", "inactive", "dead")
+    assert _user_manager_restart_inventory_is_allowlisted(fixture_parent_slice, expected)
+
+    inactive_user_slice = dict(expected)
+    inactive_user_slice["user.slice"] = ("loaded", "inactive", "dead")
+    assert _user_manager_restart_inventory_is_allowlisted(inactive_user_slice, expected)
+
+    unexpected_unit = dict(expected)
+    unexpected_unit["agent-session.service"] = ("loaded", "active", "running")
+    assert not _user_manager_restart_inventory_is_allowlisted(unexpected_unit, expected)
+
+    changed_dbus = dict(expected)
+    changed_dbus["dbus.service"] = ("loaded", "inactive", "dead")
+    assert not _user_manager_restart_inventory_is_allowlisted(changed_dbus, expected)
+
+
+def test_user_manager_parent_slice_requires_exact_empty_implicit_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "user-acp.slice"
+    manager_cgroup = "/user.slice/user-501.slice/user@501.service"
+    properties = {
+        "ControlGroup": f"{manager_cgroup}/user.slice/{unit}",
+        "FragmentPath": "",
+        "LoadState": "loaded",
+    }
+    monkeypatch.setattr(
+        sys.modules[__name__], "_unit_properties", lambda _unit, _properties: properties
+    )
+    active = ("loaded", "active", "active")
+    inactive = ("loaded", "inactive", "dead")
+    assert _user_manager_parent_slice_state_is_safe(unit, active, manager_cgroup, allow_active=True)
+    assert not _user_manager_parent_slice_state_is_safe(
+        unit, active, manager_cgroup, allow_active=False
+    )
+
+    properties["ControlGroup"] = ""
+    assert _user_manager_parent_slice_state_is_safe(
+        unit, inactive, manager_cgroup, allow_active=False
+    )
+    properties["ControlGroup"] = "/unexpected/cgroup"
+    assert not _user_manager_parent_slice_state_is_safe(
+        unit, inactive, manager_cgroup, allow_active=False
+    )
 
 
 def _assert_units_available_for_test(*units: str) -> None:
@@ -2584,6 +2783,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         if busctl is None:
             pytest.fail("user-manager restart requires busctl to verify the restarted user bus")
         user_manager_restart_busctl = Path(busctl).resolve(strict=True)
+        initial_bus = _systemd_command(
+            [str(user_manager_restart_busctl), "--user", "--no-pager", "status"], timeout=5
+        )
+        if initial_bus.returncode != 0:
+            pytest.fail("the exact test user's D-Bus service could not be activated safely")
+        systemd_escape = shutil.which("systemd-escape", path=environment["PATH"])
+        if systemd_escape is None:
+            pytest.fail("user-manager restart requires systemd-escape to verify the CIDATA alias")
         user_manager_unit = f"user@{os.getuid()}.service"
         manager_pid_result = _systemd_command(
             [
@@ -2615,17 +2822,50 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         manager_cgroup = manager_cgroup_result.stdout.strip()
         if manager_cgroup_result.returncode != 0 or not manager_cgroup:
             pytest.fail("the exact test user's manager cgroup is unavailable")
-        user_manager_restart_baseline = _user_manager_restart_expected_inventory(os.getuid())
+        try:
+            cidata_uuid_device_unit = _user_manager_cidata_uuid_device_unit(
+                str(Path(systemd_escape).resolve(strict=True)),
+                cidata_label_path=Path("/dev/disk/by-label/cidata"),
+                uuid_directory=Path("/dev/disk/by-uuid"),
+                expected_device_path=Path("/dev/vdb"),
+            )
+        except (OSError, RuntimeError) as error:
+            pytest.fail(f"refusing user-manager restart without exact CIDATA identity: {error}")
+        user_manager_restart_baseline = _user_manager_restart_expected_inventory(
+            os.getuid(), cidata_uuid_device_unit=cidata_uuid_device_unit
+        )
         try:
             actual_inventory = _user_manager_unit_inventory(systemctl)
         except RuntimeError as error:
             pytest.fail(str(error))
-        if actual_inventory != user_manager_restart_baseline:
+        if not _user_manager_restart_inventory_is_allowlisted(
+            actual_inventory, user_manager_restart_baseline
+        ):
             pytest.fail(
                 "refusing user-manager restart because the full baseline unit inventory does not "
                 "match the explicit disposable-VM allowlist; "
                 f"unexpected={actual_inventory!r}"
             )
+        if actual_inventory.get(_MONITOR_SLICE_UNIT) is not None and actual_inventory.get(
+            "user.slice"
+        ) != ("loaded", "active", "active"):
+            pytest.fail(
+                "refusing user-manager restart because user-acp.slice lacks its exact parent"
+            )
+        parent_slices = {"user.slice", _MONITOR_SLICE_UNIT}
+        for parent_slice in parent_slices & set(actual_inventory):
+            if not _user_manager_parent_slice_state_is_safe(
+                parent_slice,
+                actual_inventory[parent_slice],
+                manager_cgroup,
+                allow_active=True,
+            ):
+                pytest.fail(
+                    f"refusing user-manager restart with unsafe parent slice {parent_slice}"
+                )
+        user_manager_restart_baseline = {
+            unit: state for unit, state in actual_inventory.items() if unit not in parent_slices
+        }
         try:
             user_manager_restart_baseline_processes = _assert_user_manager_process_inventory(
                 manager_cgroup=manager_cgroup,
@@ -2705,8 +2945,24 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     slice_start_attempted = False
     safe_to_remove = False
     child_processes: list[multiprocessing.Process] = []
+    host_process_sentinel: subprocess.Popen[bytes] | None = None
     try:
         run_root.chmod(0o700)
+        if isolation_probes:
+            host_process_sentinel = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(180)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            if (
+                host_process_sentinel.poll() is not None
+                or host_process_sentinel.pid <= _CONTAINER_PIDS_LIMIT
+            ):
+                pytest.fail(
+                    "synthetic host process sentinel is not running above the worker PID limit"
+                )
         rootfs_source.mkdir(mode=0o755)
         for directory in (
             "bin",
@@ -2858,6 +3114,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             )
             quoted_host_socket = shlex.quote(str(isolation_socket_path))
             quoted_systemd_socket = shlex.quote(str(Path(environment["XDG_RUNTIME_DIR"]) / "bus"))
+            if host_process_sentinel is None or host_process_sentinel.poll() is not None:
+                pytest.fail("synthetic host process sentinel exited before the worker probe")
             probe_lines.extend(
                 (
                     "/bin/busybox ln -s "
@@ -2873,9 +3131,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     "/bin/busybox printf 'probe-ok:canonical-path-escape\\n' "
                     ">> /workspace/launch-driver-started",
                     "/bin/busybox test ! -e " + shlex.quote(f"/proc/{os.getpid()}"),
+                    f"/bin/busybox test ! -e /proc/{host_process_sentinel.pid}",
                     f"/bin/busybox test ! -S {quoted_host_socket}",
                     f"/bin/busybox test ! -S {quoted_systemd_socket}",
-                    "/bin/busybox printf 'probe-ok:proc-and-host-sockets\\n' "
+                    "/bin/busybox printf 'probe-ok:host-process-visibility-and-sockets\\n' "
                     ">> /workspace/launch-driver-started",
                     "/bin/busybox printf "
                     f"{shlex.quote(isolation_scratch_content.decode('ascii'))} > "
@@ -3333,7 +3592,14 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 )
                 assert user_manager_restart_baseline is not None
                 current_inventory = _user_manager_unit_inventory(systemctl)
-                test_units = {service_unit, monitor_unit, slice_unit, scope["unit"]}
+                test_units = {
+                    service_unit,
+                    monitor_unit,
+                    slice_unit,
+                    scope["unit"],
+                    "user.slice",
+                    _MONITOR_SLICE_UNIT,
+                }
                 missing_baseline_units = set(user_manager_restart_baseline) - set(current_inventory)
                 unexpected_units = (
                     set(current_inventory) - set(user_manager_restart_baseline) - test_units
@@ -3355,6 +3621,23 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     "refusing user-manager restart because baseline unit states changed: "
                     f"{changed_baseline_units!r}"
                 )
+                assert current_inventory.get(_MONITOR_SLICE_UNIT) == (
+                    "loaded",
+                    "active",
+                    "active",
+                ), "the test-owned monitor parent slice is not active"
+                assert current_inventory.get("user.slice") == (
+                    "loaded",
+                    "active",
+                    "active",
+                ), "the test-owned parent slice is not active"
+                for parent_slice in {"user.slice", _MONITOR_SLICE_UNIT} & set(current_inventory):
+                    assert _user_manager_parent_slice_state_is_safe(
+                        parent_slice,
+                        current_inventory[parent_slice],
+                        manager_cgroup,
+                        allow_active=True,
+                    ), f"unsafe user-manager parent slice before restart: {parent_slice}"
                 for unit in test_units & set(current_inventory):
                     active_state = current_inventory[unit][1]
                     assert active_state not in {"activating", "reloading", "deactivating"}, (
@@ -3596,35 +3879,43 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert current_cgroup_result.stdout.strip() == manager_cgroup
                 assert user_manager_restart_baseline is not None
                 post_restart_inventory = _user_manager_unit_inventory(systemctl)
-                test_units = {service_unit, monitor_unit, slice_unit, scope["unit"]}
+                test_units = {
+                    service_unit,
+                    monitor_unit,
+                    slice_unit,
+                    scope["unit"],
+                    "user.slice",
+                    _MONITOR_SLICE_UNIT,
+                }
                 assert (
                     set(post_restart_inventory) <= set(user_manager_restart_baseline) | test_units
                 )
-                restart_unloaded_slices = {"user.slice", "user-acp.slice"}
+                for parent_slice in {"user.slice", _MONITOR_SLICE_UNIT} & set(
+                    post_restart_inventory
+                ):
+                    assert _user_manager_parent_slice_state_is_safe(
+                        parent_slice,
+                        post_restart_inventory[parent_slice],
+                        manager_cgroup,
+                        allow_active=False,
+                    ), f"parent slice remained active or nonempty after restart: {parent_slice}"
                 for unit, expected_state in user_manager_restart_baseline.items():
                     actual_state = post_restart_inventory.get(unit)
-                    if unit in restart_unloaded_slices:
-                        assert actual_state in {
-                            expected_state,
-                            ("loaded", "inactive", "dead"),
-                            None,
-                        }, (
-                            f"manager restart left unexpected state for empty user slice {unit}: "
-                            f"{actual_state!r}"
-                        )
-                        continue
                     assert actual_state == expected_state, (
                         f"baseline unit changed across manager restart: {unit} "
                         f"{actual_state!r} != {expected_state!r}"
                     )
                 for unit in test_units & set(post_restart_inventory):
+                    state = post_restart_inventory[unit]
+                    if unit in {"user.slice", _MONITOR_SLICE_UNIT}:
+                        continue
                     assert _user_manager_restart_test_unit_state_is_safe(
                         unit=unit,
                         attempt_slice_unit=slice_unit,
-                        state=post_restart_inventory[unit],
+                        state=state,
                     ), (
                         f"test unit remained in an unsafe state after manager restart: "
-                        f"{unit}={post_restart_inventory[unit]!r}"
+                        f"{unit}={state!r}"
                     )
                 _assert_user_manager_process_inventory(
                     manager_cgroup=manager_cgroup,
@@ -4695,6 +4986,11 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert observations["paths"]["monitor_socket"]["absent"] is True
         assert not Path(durable["bundle_path"]).exists()
         assert not state_root.exists()
+        if host_process_sentinel is not None:
+            assert host_process_sentinel.poll() is None, (
+                "synthetic host process sentinel exited before the worker probe completed; "
+                f"pid={host_process_sentinel.pid}"
+            )
     finally:
         for child in child_processes:
             child.join(timeout=30)
@@ -4721,6 +5017,27 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             )
         safe_to_remove = driver_safe and monitor_safe
         if safe_to_remove:
+            if host_process_sentinel is not None:
+                try:
+                    if host_process_sentinel.poll() is None:
+                        host_process_sentinel.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    host_process_sentinel.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        host_process_sentinel.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        host_process_sentinel.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pytest.fail(
+                            "synthetic host process sentinel did not terminate after ACP "
+                            "units were confirmed quiescent; "
+                            f"pid={host_process_sentinel.pid}"
+                        )
             isolation_cleanup_errors: list[str] = []
             if isolation_socket is not None:
                 isolation_socket.close()
