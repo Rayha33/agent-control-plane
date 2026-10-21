@@ -283,13 +283,28 @@ outside this integration.
 
 ACP's `namespace_runtime` is a resource driver, not the supervised worker's
 execution boundary. It launches a configured payload in a transient systemd user
-service and mounts the registered worktree read-only at `/workspace`. The supervised
-`run_worker` path instead launches ACP's packaged `worker_trampoline.py` with the
-registered worktree as its current working directory; it does not enter that runtime.
-The bounded no-model probe ran source-generated setup, probe, and teardown commands
-against a synthetic fixture; it did not run an installed ACP supervisor or a registered
-ACP worker. Do not treat the driver's private root, quotas, or a separate attempt
-worktree as proof that a worker cannot read the host.
+service and mounts the registered worktree read-only at `/workspace`. That driver
+is still not the supervised worker boundary. Without configured OCI, the default
+`run_worker` branch launches ACP's packaged `worker_trampoline.py` with the
+registered worktree as its current working directory. With OCI configured, that
+default branch fails closed; only the explicit experimental no-provider opt-in
+enters the separate rootless-runc launch-driver lifecycle.
+
+The experimental branch now snapshots the registered attempt into a private
+mutable workspace without `.git`, waits for exact execution identity and
+independent cleanup verification, then imports only the host-validated workspace
+diff. An opt-in live guest replay exercised this public `run_worker` path alongside
+host-path sentinels for home/config, temporary files, the task base and sibling
+worktree, an unrelated project, symlink/canonical traversal, process visibility,
+Unix sockets, and direct network denial. This is evidence for the pinned test
+rootfs/runtime on one disposable Linux guest, not proof of provider authentication
+or egress, every same-UID attack, or recovery across daemon restart/reboot.
+
+The separate bounded no-model `namespace_runtime` probe still ran only
+source-generated setup, probe, and teardown commands against a synthetic fixture;
+it did not run an installed ACP supervisor or registered worker. Do not treat that
+driver's private root, quotas, or a separate attempt worktree alone as proof that a
+worker cannot read the host.
 
 On Linux, trusted `systemd-run` and `systemctl` calls receive `XDG_RUNTIME_DIR` only
 when `/run/user/<euid>` and its parent directories pass owner and mode checks. Other
@@ -314,10 +329,11 @@ Codex App Server's `sandboxPolicy.type = "externalSandbox"` tells Codex to skip 
 own command sandbox because an outer sandbox is already in force. It does not create
 or select an ACP namespace. Do not use this mode for an ACP worker until every
 untrusted command-execution path is routed through a separately enforced boundary.
-An implementation still needs an isolated mutable attempt root, private Git metadata
-and validated result transfer, least-privilege credentials, bounded provider egress,
-and cancellation/recovery tied to the registered worker lifecycle. Until those are
-proven, ACP's supervised Codex integration does not claim OS-enforced read isolation.
+Remaining acceptance includes least-privilege provider authentication, independently
+destination-restricted provider egress, and recovery across daemon/user-manager
+restart and reboot. These boundaries have not been proven for a production provider
+worker. Keep the default path fail-closed; the experimental no-provider replay is not
+production readiness and does not close parent task #2370.
 See [Codex App Server](https://learn.chatgpt.com/docs/app-server) and
 [Agent approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security).
 

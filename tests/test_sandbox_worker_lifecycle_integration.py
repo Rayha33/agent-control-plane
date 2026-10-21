@@ -10,9 +10,10 @@ handoff; fresh supervisor processes cancel (when requested) and reap the exact
 execution. An additional opt-in natural-completion branch asks the independent
 cleanup verifier to prove teardown, performs a deterministic source edit and
 test inside the private workspace, then imports the host-captured result into
-the normal pending-QC submission path. A separate explicit opt-in mode drives
-that fixture through ``WorkersMixin.run_worker`` and its verified-import
-boundary. These are no-model executor proofs; they do not start a
+the normal pending-QC submission path. An explicit opt-in mode drives that
+fixture through ``WorkersMixin.run_worker`` and its verified-import boundary;
+it can be combined with the host-path probes to test those denials through the
+public supervisor path. These are no-model executor proofs; they do not start a
 provider/model worker or enable the default ``run_worker`` path.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
@@ -2581,7 +2582,6 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         )
         if supervised_run_worker and (
             not import_result_after_cleanup
-            or isolation_probes
             or cancel_after_start
             or timeout_after_start
             or lease_expiry_after_stop

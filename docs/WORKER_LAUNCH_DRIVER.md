@@ -694,9 +694,27 @@ ACP_LIVE_ISOLATION_DISPOSABLE_HOST="$(hostname)" \
 uv run --extra dev pytest -q tests/test_sandbox_worker_lifecycle_integration.py
 ```
 
+To run these same host-path probes through the public `run_worker()` path,
+also set both `ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` and
+`ACP_LIVE_SUPERVISED_RUN_WORKER=1`. This mode requires natural completion and
+imports the validated diff only after independent cleanup verification:
+
+```sh
+ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc-1.5.2 \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_LIVE_ISOLATION_PROBES=1 \
+ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1 \
+ACP_LIVE_SUPERVISED_RUN_WORKER=1 \
+ACP_LIVE_ISOLATION_DISPOSABLE_HOST="$(hostname)" \
+uv run --extra dev pytest -q tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
 To exercise the full explicit supervisor `run_worker()` lifecycle bridge on a
-disposable host, use the coding-task import fixture without the separate
-isolation-sentinel mode:
+disposable host, use the coding-task import fixture. Add
+`ACP_LIVE_ISOLATION_PROBES=1` and
+`ACP_LIVE_ISOLATION_DISPOSABLE_HOST="$(hostname)"` to combine it with the
+host-path sentinels above:
 
 ```sh
 ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
@@ -817,3 +835,34 @@ Python `3.11.2`, uv `0.12.21`, cgroup v2, and rootless runc `1.5.2` with SHA-256
 `d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`. No
 provider credentials or egress were configured. Postflight found no ACP test
 units or `acp-live-launch-driver-*` fixture roots.
+
+### Supervisor `run_worker()` plus host-path isolation replay (2026-10-21; no model)
+
+The combined command above passed **1/1** on the same disposable Debian 12
+ARM64 guest, Linux `6.1.0-53-cloud-arm64`, systemd `252.39`, Python `3.11.2`,
+uv `0.12.21`, and pinned rootless runc `1.5.2` (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The exact
+test-module SHA-256 on host and guest was
+`997a11d3ae4b7084e4636eaf284d03497b726e6833d29c6b131e2032ca526b60`; the live
+worker/helper/CLI source hashes matched those recorded in the preceding
+replay.
+
+This combined run exercised the public experimental `run_worker()` API with
+no provider or model. It checked unique sentinels in host `/etc`,
+`/usr/local/share`, home/config, a synthetic credential, host `/tmp`, the
+harness checkout, task-base checkout, sibling worktree, and unrelated project.
+It also checked workspace symlink and canonical-path escapes, private procfs,
+host Unix sockets, tmpfs `/tmp` and `/home/agent`, read-only rootfs, writable
+workspace, and denied direct IPv4 networking. The deterministic coding task
+completed; after exact cleanup verification, import reached `pending_qc` with
+only the four expected fixture output paths. Postflight found no active ACP
+test services, runc/launch-driver processes, fixture roots, scratch files, or
+sentinels.
+
+This closes the earlier test-coverage gap between a separate lower-level
+isolation probe and the explicit `run_worker()` lifecycle replay for this
+pinned fixture. It does not establish provider authentication or restricted
+provider egress, reboot/daemon-restart recovery, safety against every same-UID
+host actor, or support across other kernels/rootfs/runtime versions. The
+default OCI `run_worker()` path remains fail-closed and parent task #2370
+remains open.
