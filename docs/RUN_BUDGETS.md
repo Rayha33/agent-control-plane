@@ -368,20 +368,35 @@ that claim expires, the coordination reaper moves the task to `blocked` instead
 of making it automatically claimable, and reports it in
 `blocked_interruption_task_ids`. An administrator must explicitly reopen the
 task with a reason before a new claim can start; a provider quota reset alone
-does not resume it. Migration 10 installs a SQLite status-transition guard as
-well: a pre-migration reaper cannot orphan the interrupted generation, and an
-older claimant cannot automatically resume an already-orphaned generation.
-Migration 11 parks any pre-existing `orphaned` task whose interruption report
-matches its current claim fence as `blocked`, so the normal audited reopen path
-can recover it. Each migrated task transition is appended to the hash-chained audit
-log inside the same schema transaction; an audit write failure rolls the migration
-back. The current reaper may park it as `blocked`; only the audited
-`blocked` → `open` reopen followed by a fresh claim is allowed. This lifecycle
-fence does not stop an active local process or prove sandbox cleanup; those
-remain separate runtime gates. If an older reaper encounters an interrupted
-task, the database guard rejects its legacy transition and may roll back that
-reaper transaction as a whole, delaying cleanup of other expired claims until
-the upgraded reaper runs.
+does not resume it. Migration 10 adds a SQLite status-transition guard for the
+same interrupted claim fence. Migration 11 parks pre-existing orphaned tasks
+whose report matches that fence. Migration 12 closes the mixed-version gap
+where an older service already reaped and automatically reclaimed the task at
+a higher fence before upgrade: a report remains unresolved until a later
+hash-chained admin `task.reopened` event for that task. The migration parks
+every task with an unresolved report as `blocked`, including work already in
+`qc_review`, `approved`, `merging`, or `done`; it clears task ownership, resource
+leases, and heartbeats, and preserves the latest fence. A higher fence by
+itself is not authorization. The persistent database guard rejects every
+subsequent task-status transition except quarantine to `blocked` and the
+intermediate `blocked` to `open` transition while a report remains unresolved.
+The latter preserves compatibility with older service versions that append the
+reopen audit after changing status; the unresolved view still blocks the next
+claim transition and all dispatch/submission inserts until that audit event is
+written in the same transaction. Database dispatch/submission guards plus
+current-service checks also reject writes from higher-fence legacy workers.
+The exact reported claim fence remains retired even after reopen. The current
+service inserts the audited reopen event before the `blocked` to `open`
+transition; either ordering stays atomic, and a failed transaction rolls the
+event back. A later audited reopen keeps a legitimate fresh claim eligible. Missing
+report-to-audit provenance fails closed. Each migration park is appended to the
+hash-chained audit log inside the same schema transaction; an audit write
+failure rolls the migration back. The current reaper uses the same
+unresolved-report rule. This lifecycle fence does not stop an active local
+process or prove sandbox cleanup; those remain separate runtime gates. If an
+older reaper encounters an interrupted task, the database guard rejects its
+legacy transition and may roll back that reaper transaction as a whole,
+delaying cleanup of other expired claims until the upgraded reaper runs.
 Reservations retain the task and resource fencing-token snapshot that was
 checked at creation. Reservation and client-reported receipt rows survive a
 service restart; task views recompute consumed slots from those persisted rows.

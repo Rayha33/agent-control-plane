@@ -442,9 +442,14 @@ class CoordinationService:
                 now,
             )
             interrupted = connection.execute(
-                """SELECT 1 FROM budget_interruption_reports
-                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
-                (task_id, agent["id"], request.claim_fencing_token),
+                """SELECT 1 WHERE EXISTS (
+                       SELECT 1 FROM budget_unresolved_interruption_reports
+                       WHERE task_id = ?
+                   ) OR EXISTS (
+                       SELECT 1 FROM budget_interruption_reports
+                       WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?
+                   )""",
+                (task_id, task_id, agent["id"], request.claim_fencing_token),
             ).fetchone()
             if interrupted is not None:
                 raise ControlPlaneError(
@@ -838,9 +843,14 @@ class CoordinationService:
                 now,
             )
             interrupted = connection.execute(
-                """SELECT 1 FROM budget_interruption_reports
-                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
-                (task_id, agent["id"], request.claim_fencing_token),
+                """SELECT 1 WHERE EXISTS (
+                       SELECT 1 FROM budget_unresolved_interruption_reports
+                       WHERE task_id = ?
+                   ) OR EXISTS (
+                       SELECT 1 FROM budget_interruption_reports
+                       WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?
+                   )""",
+                (task_id, task_id, agent["id"], request.claim_fencing_token),
             ).fetchone()
             if interrupted is not None:
                 raise ControlPlaneError(
@@ -1143,6 +1153,16 @@ class CoordinationService:
                     "task_not_reopenable",
                     f"task cannot be reopened while status is {previous_status}",
                 )
+            self.database.append_audit(
+                "task.reopened",
+                "admin",
+                {
+                    "previous_status": previous_status,
+                    "reason": reason,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
             connection.execute(
                 """
                 UPDATE tasks
@@ -1162,17 +1182,6 @@ class CoordinationService:
                 (reopened_at, task_id),
             )
             self._clear_heartbeats(connection, task_id)
-
-            self.database.append_audit(
-                "task.reopened",
-                "admin",
-                {
-                    "previous_status": previous_status,
-                    "reason": reason,
-                    "task_id": task_id,
-                },
-                connection=connection,
-            )
         return self.task(task_id)
 
     def reap_expired(self) -> dict[str, Any]:
@@ -1188,9 +1197,8 @@ class CoordinationService:
                 """
                 SELECT task.id,
                        EXISTS (
-                           SELECT 1 FROM budget_interruption_reports AS report
+                           SELECT 1 FROM budget_unresolved_interruption_reports AS report
                            WHERE report.task_id = task.id
-                             AND report.claim_fencing_token = task.claim_fencing_token
                        ) AS interruption_reported
                 FROM tasks AS task
                 WHERE task.status IN ('claimed', 'working')

@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 11
+SERVICE_SCHEMA_VERSION = 12
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -925,6 +925,204 @@ def _park_previously_orphaned_interrupted_tasks(connection: sqlite3.Connection) 
         )
 
 
+def _guard_unresolved_interruption_resumes(connection: sqlite3.Connection) -> None:
+    """Quarantine legacy reclaims unless an operator audited a later reopen.
+
+    Before migration 10, a service process could reap a reported claim to
+    ``orphaned`` and then claim it again under a higher fence. Exact-fence
+    checks no longer recognize that older report. A report is resolved only by
+    a later hash-chained ``task.reopened`` event for the same task; missing
+    report provenance fails closed.
+    """
+    connection.execute("DROP TRIGGER IF EXISTS budget_interruption_task_resume_guard")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_interruption_report_id
+        ON audit_events(json_extract(payload_json, '$.report_id'))
+        WHERE event_type = 'task.interruption_reported'
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_task_reopened_id
+        ON audit_events(json_extract(payload_json, '$.task_id'))
+        WHERE event_type = 'task.reopened'
+        """
+    )
+    connection.execute("DROP VIEW IF EXISTS budget_unresolved_interruption_reports")
+    connection.execute(
+        """
+        CREATE VIEW budget_unresolved_interruption_reports AS
+        SELECT report.id AS report_id,
+               report.task_id,
+               report.agent_id,
+               report.claim_fencing_token,
+               report.received_at
+        FROM budget_interruption_reports AS report
+        LEFT JOIN audit_events AS interruption_event
+          ON interruption_event.event_type = 'task.interruption_reported'
+         AND json_extract(interruption_event.payload_json, '$.report_id') = report.id
+         AND json_extract(interruption_event.payload_json, '$.task_id') = report.task_id
+         AND json_extract(
+                 interruption_event.payload_json, '$.claim_fencing_token'
+             ) = report.claim_fencing_token
+        WHERE interruption_event.sequence IS NULL
+           OR interruption_event.sequence > COALESCE(
+               (
+                   SELECT MAX(reopened_event.sequence)
+                   FROM audit_events AS reopened_event
+                   WHERE reopened_event.event_type = 'task.reopened'
+                     AND reopened_event.actor = 'admin'
+                     AND json_extract(reopened_event.payload_json, '$.task_id') = report.task_id
+               ),
+               0
+           )
+        """
+    )
+    rows = connection.execute(
+        """
+        SELECT task.id, task.status, task.owner_agent_id, task.claim_expires_at,
+               task.claim_fencing_token, task.version,
+               (
+                   SELECT report.report_id
+                   FROM budget_unresolved_interruption_reports AS report
+                   WHERE report.task_id = task.id
+                   ORDER BY report.claim_fencing_token DESC, report.received_at DESC,
+                            report.report_id DESC
+                   LIMIT 1
+               ) AS interruption_report_id,
+               (
+                   SELECT report.claim_fencing_token
+                   FROM budget_unresolved_interruption_reports AS report
+                   WHERE report.task_id = task.id
+                   ORDER BY report.claim_fencing_token DESC, report.received_at DESC,
+                            report.report_id DESC
+                   LIMIT 1
+               ) AS interruption_report_fencing_token,
+               (
+                   SELECT COUNT(*)
+                   FROM budget_unresolved_interruption_reports AS report
+                   WHERE report.task_id = task.id
+               ) AS unresolved_interruption_report_count
+        FROM tasks AS task
+        WHERE EXISTS (
+              SELECT 1 FROM budget_unresolved_interruption_reports AS report
+              WHERE report.task_id = task.id
+          )
+        ORDER BY task.id
+        """
+    ).fetchall()
+    for row in rows:
+        changed_at = utc_now()
+        task_changed = (
+            row["status"] != "blocked"
+            or row["owner_agent_id"] is not None
+            or row["claim_expires_at"] is not None
+        )
+        if task_changed:
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'blocked', owner_agent_id = NULL, claim_expires_at = NULL,
+                    version = version + 1, updated_at = ?
+                WHERE id = ? AND status = ? AND claim_fencing_token = ?
+                """,
+                (changed_at, row["id"], row["status"], row["claim_fencing_token"]),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("interrupted task changed during schema migration")
+        released_leases = connection.execute(
+            """
+            UPDATE resource_leases
+            SET task_id = NULL, holder_agent_id = NULL, expires_at = 0, updated_at = ?
+            WHERE task_id = ?
+            """,
+            (changed_at, row["id"]),
+        ).rowcount
+        removed_heartbeats = connection.execute(
+            "DELETE FROM agent_heartbeats WHERE task_id = ?", (row["id"],)
+        ).rowcount
+        if not task_changed and not released_leases and not removed_heartbeats:
+            # Migration 11 already parked and audited this exact-fence orphan.
+            # Do not increment its version or emit a duplicate park event.
+            continue
+        _append_audit_event(
+            connection,
+            "task.interruption_migration_parked",
+            "system",
+            {
+                "claim_fencing_token": row["claim_fencing_token"],
+                "from_status": row["status"],
+                "interruption_report_fencing_token": row["interruption_report_fencing_token"],
+                "interruption_report_id": row["interruption_report_id"],
+                "previous_version": row["version"],
+                "schema_version": 12,
+                "task_id": row["id"],
+                "to_status": "blocked",
+                "unresolved_interruption_report_count": row["unresolved_interruption_report_count"],
+            },
+        )
+
+    # A stale worker may have submitted or passed QC under a higher fence before
+    # this migration acquired SQLite's write lock. Quarantine every lifecycle
+    # state, including qc_review/approved/merging/done, before installing guards.
+    # The report remains unresolved until a later audited task.reopened event.
+    for trigger_name in (
+        "budget_interruption_dispatch_insert_guard",
+        "budget_interruption_submission_insert_guard",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    connection.execute(
+        """
+        CREATE TRIGGER budget_interruption_dispatch_insert_guard
+        BEFORE INSERT ON dispatch_attempt_reservations
+        WHEN EXISTS (
+                 SELECT 1 FROM budget_unresolved_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+             )
+          OR EXISTS (
+                 SELECT 1 FROM budget_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+                   AND report.agent_id = NEW.agent_id
+                   AND report.claim_fencing_token = NEW.claim_fencing_token
+             )
+        BEGIN SELECT RAISE(ABORT, 'claim_interrupted'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER budget_interruption_submission_insert_guard
+        BEFORE INSERT ON submissions
+        WHEN EXISTS (
+                 SELECT 1 FROM budget_unresolved_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+             )
+          OR EXISTS (
+                 SELECT 1 FROM budget_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+                   AND report.agent_id = NEW.worker_agent_id
+                   AND report.claim_fencing_token = NEW.claim_fencing_token
+             )
+        BEGIN SELECT RAISE(ABORT, 'claim_interrupted'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER budget_interruption_task_resume_guard
+        BEFORE UPDATE OF status ON tasks
+        WHEN NEW.status <> OLD.status AND NEW.status <> 'blocked'
+         AND NOT (OLD.status = 'blocked' AND NEW.status = 'open')
+         AND EXISTS (
+             SELECT 1 FROM budget_unresolved_interruption_reports AS report
+             WHERE report.task_id = OLD.id
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'task_interruption_requires_reopen');
+        END
+        """
+    )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -951,6 +1149,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (9, _guard_interrupted_claim_writes),
     (10, _guard_interrupted_task_resume),
     (11, _park_previously_orphaned_interrupted_tasks),
+    (12, _guard_unresolved_interruption_resumes),
 )
 
 SCHEMA = """

@@ -389,14 +389,12 @@ def test_v7_service_database_migrates_append_only_interruption_reports(
     assert version == str(SERVICE_SCHEMA_VERSION)
 
 
-def test_v9_service_database_guards_interrupted_resume_across_old_writers(
+def test_v9_service_database_quarantines_legacy_reclaims_but_keeps_audited_reopen(
     database_path: Path,
 ) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.execute("DROP TRIGGER IF EXISTS budget_interruption_task_resume_guard")
         connection.execute("UPDATE meta SET value = '9' WHERE key = ?", (SCHEMA_VERSION_KEY,))
-
-    Database(str(database_path)).initialize()
 
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -404,7 +402,7 @@ def test_v9_service_database_guards_interrupted_resume_across_old_writers(
             "VALUES ('legacy-worker', 'legacy worker', 'owner', 'worker', 'now')"
         )
 
-        def add_interrupted_task(task_id: str, status: str, owner: str | None) -> None:
+        def add_interrupted_task(task_id: str, *, status: str, owner: str | None) -> None:
             connection.execute(
                 """
                 INSERT INTO tasks(
@@ -438,51 +436,91 @@ def test_v9_service_database_guards_interrupted_resume_across_old_writers(
                 (f"report-{task_id}", task_id, "0" * 64),
             )
 
-        add_interrupted_task("expired-interrupted", "claimed", "legacy-worker")
-        with pytest.raises(
-            sqlite3.IntegrityError,
-            match="task_interruption_requires_reopen",
-        ):
+        add_interrupted_task("resumed-claimed", status="claimed", owner="legacy-worker")
+        add_interrupted_task("resumed-orphaned", status="claimed", owner="legacy-worker")
+        add_interrupted_task("audited-reopen", status="claimed", owner="legacy-worker")
+
+        for task_id in ("resumed-claimed", "resumed-orphaned", "audited-reopen"):
             connection.execute(
-                "UPDATE tasks SET status = 'orphaned' WHERE id = 'expired-interrupted'"
+                "INSERT INTO resource_leases(resource, task_id, holder_agent_id, fencing_token, "
+                "expires_at, updated_at) VALUES (?, ?, 'legacy-worker', 3, 4102444800, 'now')",
+                (f"resource-{task_id}", task_id),
             )
-        assert (
             connection.execute(
-                "SELECT status FROM tasks WHERE id = 'expired-interrupted'"
-            ).fetchone()[0]
-            == "claimed"
+                "INSERT INTO agent_heartbeats(agent_id, task_id, claim_fencing_token, "
+                "checkpoint_json, expires_at, updated_at) VALUES "
+                "('legacy-worker', ?, 1, '{}', 4102444800, 'now')",
+                (task_id,),
+            )
+
+    database = Database(str(database_path))
+    for task_id in ("resumed-claimed", "resumed-orphaned", "audited-reopen"):
+        database.append_audit(
+            "task.interruption_reported",
+            "legacy-worker",
+            {
+                "claim_fencing_token": 1,
+                "report_id": f"report-{task_id}",
+                "task_id": task_id,
+            },
         )
+    database.append_audit(
+        "task.reopened",
+        "admin",
+        {"previous_status": "blocked", "reason": "audited recovery", "task_id": "audited-reopen"},
+    )
 
-        add_interrupted_task("orphaned-interrupted", "orphaned", None)
-        with pytest.raises(
-            sqlite3.IntegrityError,
-            match="task_interruption_requires_reopen",
-        ):
+    with sqlite3.connect(database_path) as connection:
+        # Reproduce v9's reaper -> orphaned -> automatic claim path. The old
+        # implementation had no status guard, so the old worker advances to fence 2.
+        for task_id in ("resumed-claimed", "resumed-orphaned"):
             connection.execute(
-                """
-                UPDATE tasks
-                SET status = 'claimed', owner_agent_id = 'legacy-worker',
-                    claim_expires_at = 4102444800, claim_fencing_token = 2
-                WHERE id = 'orphaned-interrupted'
-                """
+                "UPDATE tasks SET status = 'orphaned', owner_agent_id = NULL, "
+                "claim_expires_at = NULL WHERE id = ?",
+                (task_id,),
             )
-
-        # The current reaper's blocked state and the operator's audited reopen path
-        # remain valid, and the next claim uses a fresh generation.
-        connection.execute("UPDATE tasks SET status = 'blocked' WHERE id = 'orphaned-interrupted'")
-        connection.execute("UPDATE tasks SET status = 'open' WHERE id = 'orphaned-interrupted'")
+            connection.execute(
+                "UPDATE tasks SET status = 'claimed', owner_agent_id = 'legacy-worker', "
+                "claim_expires_at = 4102444800, claim_fencing_token = 2 WHERE id = ?",
+                (task_id,),
+            )
         connection.execute(
-            """
-            UPDATE tasks
-            SET status = 'claimed', owner_agent_id = 'legacy-worker',
-                claim_expires_at = 4102444800, claim_fencing_token = 2
-            WHERE id = 'orphaned-interrupted'
-            """
+            "UPDATE tasks SET status = 'orphaned', owner_agent_id = NULL, "
+            "claim_expires_at = NULL WHERE id = 'resumed-orphaned'"
         )
-        assert connection.execute(
-            "SELECT status, claim_fencing_token FROM tasks WHERE id = 'orphaned-interrupted'"
-        ).fetchone() == ("claimed", 2)
+        # The required operator action is audited before the fresh claim.
+        connection.execute("UPDATE tasks SET status = 'open' WHERE id = 'audited-reopen'")
+        connection.execute(
+            "UPDATE tasks SET status = 'claimed', owner_agent_id = 'legacy-worker', "
+            "claim_expires_at = 4102444800, claim_fencing_token = 2 "
+            "WHERE id = 'audited-reopen'"
+        )
 
+    Database(str(database_path)).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        rows = {
+            row[0]: row[1:]
+            for row in connection.execute(
+                "SELECT id, status, owner_agent_id, claim_expires_at, claim_fencing_token "
+                "FROM tasks WHERE id IN ('resumed-claimed', 'resumed-orphaned', 'audited-reopen')"
+            )
+        }
+        interrupted_leases = connection.execute(
+            "SELECT COUNT(*) FROM resource_leases WHERE task_id IN "
+            "('resumed-claimed', 'resumed-orphaned') AND expires_at > 0"
+        ).fetchone()[0]
+        interrupted_heartbeats = connection.execute(
+            "SELECT COUNT(*) FROM agent_heartbeats WHERE task_id IN "
+            "('resumed-claimed', 'resumed-orphaned')"
+        ).fetchone()[0]
+        audited_reopen_lease_count = connection.execute(
+            "SELECT COUNT(*) FROM resource_leases WHERE task_id = 'audited-reopen' "
+            "AND holder_agent_id = 'legacy-worker' AND expires_at = 4102444800"
+        ).fetchone()[0]
+        audited_reopen_heartbeat_count = connection.execute(
+            "SELECT COUNT(*) FROM agent_heartbeats WHERE task_id = 'audited-reopen'"
+        ).fetchone()[0]
         triggers = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
@@ -492,17 +530,366 @@ def test_v9_service_database_guards_interrupted_resume_across_old_writers(
         ).fetchone()[0]
 
     assert "budget_interruption_task_resume_guard" in triggers
+    assert rows["resumed-claimed"] == ("blocked", None, None, 2)
+    assert rows["resumed-orphaned"] == ("blocked", None, None, 2)
+    assert rows["audited-reopen"] == ("claimed", "legacy-worker", 4102444800, 2)
+    assert interrupted_leases == 0
+    assert interrupted_heartbeats == 0
+    assert audited_reopen_lease_count == 1
+    assert audited_reopen_heartbeat_count == 1
     assert version == str(SERVICE_SCHEMA_VERSION)
+    assert Database(str(database_path)).verify_audit_chain() == (True, 6, None)
+
+    with sqlite3.connect(database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="task_interruption_requires_reopen"):
+            connection.execute("UPDATE tasks SET status = 'claimed' WHERE id = 'resumed-claimed'")
+
+
+def test_v11_migration_quarantines_interrupted_work_past_submit_and_qc(
+    database_path: Path,
+) -> None:
+    task_states = {
+        "stale-claimed": "claimed",
+        "stale-working": "working",
+        "stale-qc-review": "qc_review",
+        "stale-approved": "approved",
+        "stale-merging": "merging",
+        "stale-done": "done",
+        "missing-report-event": "working",
+        "mismatched-report-event": "working",
+        "reopened-without-report-event": "open",
+        "legacy-reopen-compat": "blocked",
+    }
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("UPDATE meta SET value = '11' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+        connection.execute(
+            "INSERT INTO agents(id, name, owner, role, created_at) "
+            "VALUES ('legacy-worker', 'legacy worker', 'owner', 'worker', 'now')"
+        )
+        for task_id, status in task_states.items():
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    id, title, description, acceptance_criteria_json, resources_json,
+                    status, owner_agent_id, claim_expires_at, claim_fencing_token,
+                    version, created_at, updated_at
+                ) VALUES (?, 'task', 'legacy lifecycle state', '[]', '[]',
+                          'open', NULL, NULL, 0, 1, 'now', 'before')
+                """,
+                (task_id,),
+            )
+            connection.execute(
+                "UPDATE tasks SET status = 'claimed', owner_agent_id = 'legacy-worker', "
+                "claim_expires_at = 4102444800, claim_fencing_token = 1 WHERE id = ?",
+                (task_id,),
+            )
+            connection.execute(
+                "UPDATE tasks SET claim_fencing_token = 2, version = 7 WHERE id = ?",
+                (task_id,),
+            )
+            if status != "claimed":
+                connection.execute(
+                    "UPDATE tasks SET status = ?, owner_agent_id = NULL, "
+                    "claim_expires_at = NULL WHERE id = ?",
+                    (status, task_id),
+                )
+            connection.execute(
+                """
+                INSERT INTO resource_leases(
+                    resource, task_id, holder_agent_id, fencing_token, expires_at, updated_at
+                ) VALUES (?, ?, 'legacy-worker', 4, 4102444800, 'before')
+                """,
+                (f"resource-{task_id}", task_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO agent_heartbeats(
+                    agent_id, task_id, claim_fencing_token, checkpoint_json, expires_at, updated_at
+                ) VALUES ('legacy-worker', ?, 2, '{}', 4102444800, 'before')
+                """,
+                (task_id,),
+            )
+
+        # This is a higher-fence submission committed by the old writer before
+        # the migration obtains SQLite's write lock. The stale report arrives
+        # afterward, leaving the row in qc_review on a v11 database.
+        connection.execute(
+            """
+            INSERT INTO submissions(
+                id, task_id, worker_agent_id, task_version, claim_fencing_token,
+                resource_fencing_tokens_json, base_revision, artifact_uri,
+                artifact_hash, summary, evidence_json, status, created_at
+            ) VALUES ('old-submit', 'stale-qc-review', 'legacy-worker', 7, 2, '{}',
+                      'main@old', 'patch://old', ?, 'committed before upgrade', '[]',
+                      'pending_qc', 'before')
+            """,
+            ("a" * 64,),
+        )
+        for task_id in task_states:
+            connection.execute(
+                """
+                INSERT INTO budget_interruption_reports(
+                    id, task_id, agent_id, claim_fencing_token,
+                    resource_fencing_tokens_json, status, source, reason, summary,
+                    checkpoint_json, checkpoint_sha256, dispatch_attempt_ids_json, received_at
+                ) VALUES (?, ?, 'legacy-worker', 1, '{}', 'partial', 'client_reported',
+                          'provider_quota_exhausted', 'interrupted', '{}', ?, '[]', 'now')
+                """,
+                (f"report-{task_id}", task_id, "0" * 64),
+            )
+
+    database = Database(str(database_path))
+    for task_id in task_states:
+        if task_id in {"missing-report-event", "reopened-without-report-event"}:
+            continue
+        report_id = (
+            f"wrong-report-{task_id}"
+            if task_id == "mismatched-report-event"
+            else f"report-{task_id}"
+        )
+        database.append_audit(
+            "task.interruption_reported",
+            "legacy-worker",
+            {
+                "claim_fencing_token": 1,
+                "report_id": report_id,
+                "task_id": task_id,
+            },
+        )
+    database.append_audit(
+        "task.reopened",
+        "admin",
+        {
+            "previous_status": "blocked",
+            "reason": "legacy reopen without report provenance",
+            "task_id": "reopened-without-report-event",
+        },
+    )
+
+    database.initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        rows = {
+            row[0]: row[1:]
+            for row in connection.execute(
+                "SELECT id, status, owner_agent_id, claim_expires_at, "
+                "claim_fencing_token, version, updated_at FROM tasks"
+            )
+            if row[0] in task_states
+        }
+        active_leases = connection.execute(
+            "SELECT COUNT(*) FROM resource_leases WHERE task_id IS NOT NULL"
+        ).fetchone()[0]
+        heartbeats = connection.execute(
+            "SELECT COUNT(*) FROM agent_heartbeats WHERE task_id IN "
+            "('stale-claimed', 'stale-working', 'stale-qc-review', 'stale-approved', "
+            "'stale-merging', 'stale-done', 'missing-report-event', "
+            "'mismatched-report-event', 'reopened-without-report-event', "
+            "'legacy-reopen-compat')"
+        ).fetchone()[0]
+        schema_version = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()[0]
+
+        assert set(rows) == set(task_states)
+        for task_id, row in rows.items():
+            expected_version = 7 if task_id == "legacy-reopen-compat" else 8
+            assert row[:5] == ("blocked", None, None, 2, expected_version), task_id
+            if task_id != "legacy-reopen-compat":
+                assert row[5] != "before", task_id
+        assert active_leases == 0
+        assert heartbeats == 0
+        assert schema_version == str(SERVICE_SCHEMA_VERSION)
+
+        with pytest.raises(sqlite3.IntegrityError, match="task_interruption_requires_reopen"):
+            connection.execute("UPDATE tasks SET status = 'approved' WHERE id = 'stale-qc-review'")
+        with pytest.raises(sqlite3.IntegrityError, match="task_interruption_requires_reopen"):
+            connection.execute(
+                "UPDATE tasks SET status = 'done' WHERE id = 'reopened-without-report-event'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="claim_interrupted"):
+            connection.execute(
+                """
+                INSERT INTO submissions(
+                    id, task_id, worker_agent_id, task_version, claim_fencing_token,
+                    resource_fencing_tokens_json, base_revision, artifact_uri,
+                    artifact_hash, summary, evidence_json, status, created_at
+                ) VALUES ('new-submit', 'stale-qc-review', 'legacy-worker', 8, 2, '{}',
+                          'main@new', 'patch://new', ?, 'must stay parked', '[]',
+                          'pending_qc', 'after')
+                """,
+                ("b" * 64,),
+            )
+
+    database = Database(str(database_path))
+    migration_events = [
+        event
+        for event in database.audit_events()
+        if event["event_type"] == "task.interruption_migration_parked"
+    ]
+    assert len(migration_events) == len(task_states)
+
+    # An older service writes task.reopened after its blocked->open update. The
+    # intermediate open row remains unresolved and cannot advance before the
+    # admin event is appended in the same transaction.
+    with database.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("UPDATE tasks SET status = 'open' WHERE id = 'legacy-reopen-compat'")
+        unresolved_count = connection.execute(
+            "SELECT COUNT(*) FROM budget_unresolved_interruption_reports "
+            "WHERE task_id = 'legacy-reopen-compat'"
+        ).fetchone()[0]
+        assert unresolved_count == 1
+        with pytest.raises(sqlite3.IntegrityError, match="task_interruption_requires_reopen"):
+            connection.execute(
+                "UPDATE tasks SET status = 'claimed' WHERE id = 'legacy-reopen-compat'"
+            )
+        database.append_audit(
+            "task.reopened",
+            "admin",
+            {
+                "previous_status": "blocked",
+                "reason": "legacy service transaction ordering",
+                "task_id": "legacy-reopen-compat",
+            },
+            connection=connection,
+        )
+        connection.execute("SAVEPOINT fresh_claim_probe")
+        connection.execute(
+            "UPDATE tasks SET status = 'claimed', owner_agent_id = 'legacy-worker', "
+            "claim_expires_at = 4102444800, claim_fencing_token = 3 "
+            "WHERE id = 'legacy-reopen-compat'"
+        )
+        connection.execute("ROLLBACK TO fresh_claim_probe")
+        connection.execute("RELEASE fresh_claim_probe")
+        resolved_count = connection.execute(
+            "SELECT COUNT(*) FROM budget_unresolved_interruption_reports "
+            "WHERE task_id = 'legacy-reopen-compat'"
+        ).fetchone()[0]
+        assert resolved_count == 0
+    assert database.verify_audit_chain() == (True, 20, None)
+
+
+def test_v11_migration_12_park_and_cleanup_roll_back_on_audit_failure(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("UPDATE meta SET value = '11' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+        connection.execute(
+            "INSERT INTO agents(id, name, owner, role, created_at) "
+            "VALUES ('legacy-worker', 'legacy worker', 'owner', 'worker', 'now')"
+        )
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                id, title, description, acceptance_criteria_json, resources_json,
+                status, owner_agent_id, claim_expires_at, claim_fencing_token,
+                version, created_at, updated_at
+            ) VALUES ('migration12-rollback', 'task', 'stale fence', '[]', '[]',
+                      'open', NULL, NULL, 0, 1, 'now', 'before')
+            """
+        )
+        connection.execute(
+            "UPDATE tasks SET status = 'claimed', owner_agent_id = 'legacy-worker', "
+            "claim_expires_at = 4102444800, claim_fencing_token = 1 "
+            "WHERE id = 'migration12-rollback'"
+        )
+        connection.execute(
+            "UPDATE tasks SET claim_fencing_token = 2, version = 7, status = 'qc_review', "
+            "owner_agent_id = NULL, claim_expires_at = NULL "
+            "WHERE id = 'migration12-rollback'"
+        )
+        connection.execute(
+            """
+            INSERT INTO resource_leases(
+                resource, task_id, holder_agent_id, fencing_token, expires_at, updated_at
+            ) VALUES ('resource-rollback', 'migration12-rollback', 'legacy-worker',
+                      4, 4102444800, 'before')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_heartbeats(
+                agent_id, task_id, claim_fencing_token, checkpoint_json, expires_at, updated_at
+            ) VALUES ('legacy-worker', 'migration12-rollback', 2, '{}', 4102444800, 'before')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO budget_interruption_reports(
+                id, task_id, agent_id, claim_fencing_token,
+                resource_fencing_tokens_json, status, source, reason, summary,
+                checkpoint_json, checkpoint_sha256, dispatch_attempt_ids_json, received_at
+            ) VALUES ('report-rollback', 'migration12-rollback', 'legacy-worker', 1,
+                      '{}', 'partial', 'client_reported', 'provider_quota_exhausted',
+                      'interrupted', '{}', ?, '[]', 'now')
+            """,
+            ("0" * 64,),
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER reject_migration12_park BEFORE INSERT ON audit_events
+            WHEN NEW.event_type = 'task.interruption_migration_parked'
+             AND json_extract(NEW.payload_json, '$.schema_version') = 12
+            BEGIN SELECT RAISE(ABORT, 'induced migration 12 audit failure'); END
+            """
+        )
+
+    database = Database(str(database_path))
+    database.append_audit(
+        "task.interruption_reported",
+        "legacy-worker",
+        {
+            "claim_fencing_token": 1,
+            "report_id": "report-rollback",
+            "task_id": "migration12-rollback",
+        },
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="induced migration 12 audit failure"):
+        database.initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        task = connection.execute(
+            "SELECT status, owner_agent_id, claim_expires_at, claim_fencing_token, version, "
+            "updated_at FROM tasks WHERE id = 'migration12-rollback'"
+        ).fetchone()
+        lease = connection.execute(
+            "SELECT task_id, holder_agent_id, expires_at, updated_at "
+            "FROM resource_leases WHERE resource = 'resource-rollback'"
+        ).fetchone()
+        heartbeat_count = connection.execute(
+            "SELECT COUNT(*) FROM agent_heartbeats WHERE task_id = 'migration12-rollback'"
+        ).fetchone()[0]
+        schema_version = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+        ).fetchone()[0]
+        migration12_events = connection.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'task.interruption_migration_parked'"
+        ).fetchone()[0]
+
+    assert task == ("qc_review", None, None, 2, 7, "before")
+    assert lease == ("migration12-rollback", "legacy-worker", 4102444800, "before")
+    assert heartbeat_count == 1
+    assert schema_version == "11"
+    assert migration12_events == 0
+    assert Database(str(database_path)).verify_audit_chain() == (True, 1, None)
 
 
 def test_v10_migration_parks_preexisting_interrupted_orphans(database_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
+        # This fixture represents a v10 database, before the schema-12 view and
+        # lifecycle trigger existed.
+        connection.execute("DROP TRIGGER IF EXISTS budget_interruption_task_resume_guard")
+        connection.execute("DROP VIEW IF EXISTS budget_unresolved_interruption_reports")
         connection.execute(
             "INSERT INTO agents(id, name, owner, role, created_at) "
             "VALUES ('legacy-worker', 'legacy worker', 'owner', 'worker', 'now')"
         )
 
-        def add_orphan(task_id: str, *, report_token: int | None) -> None:
+        report_specs: list[tuple[str, int]] = []
+
+        def add_orphan(task_id: str, *, report_token: int | None, task_token: int = 1) -> None:
             connection.execute(
                 """
                 INSERT INTO tasks(
@@ -515,12 +902,28 @@ def test_v10_migration_parks_preexisting_interrupted_orphans(database_path: Path
             connection.execute(
                 """
                 UPDATE tasks
-                SET status = 'orphaned', claim_fencing_token = ?,
-                    owner_agent_id = NULL, claim_expires_at = NULL
+                SET status = 'claimed', claim_fencing_token = 1,
+                    owner_agent_id = 'legacy-worker', claim_expires_at = 0
                 WHERE id = ?
                 """,
-                (1, task_id),
+                (task_id,),
             )
+            connection.execute(
+                "UPDATE tasks SET status = 'orphaned', owner_agent_id = NULL, "
+                "claim_expires_at = NULL WHERE id = ?",
+                (task_id,),
+            )
+            if task_token == 2:
+                connection.execute(
+                    "UPDATE tasks SET status = 'claimed', claim_fencing_token = 2, "
+                    "owner_agent_id = 'legacy-worker', claim_expires_at = 0 WHERE id = ?",
+                    (task_id,),
+                )
+                connection.execute(
+                    "UPDATE tasks SET status = 'orphaned', owner_agent_id = NULL, "
+                    "claim_expires_at = NULL WHERE id = ?",
+                    (task_id,),
+                )
             if report_token is not None:
                 connection.execute(
                     """
@@ -534,11 +937,24 @@ def test_v10_migration_parks_preexisting_interrupted_orphans(database_path: Path
                     """,
                     (f"report-{task_id}", task_id, report_token, "0" * 64),
                 )
+                report_specs.append((task_id, report_token))
 
         add_orphan("interrupted-orphan", report_token=1)
-        add_orphan("stale-report-orphan", report_token=2)
+        add_orphan("stale-report-orphan", report_token=1, task_token=2)
         add_orphan("unreported-orphan", report_token=None)
         connection.execute("UPDATE meta SET value = '10' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    database = Database(str(database_path))
+    for task_id, report_token in report_specs:
+        database.append_audit(
+            "task.interruption_reported",
+            "legacy-worker",
+            {
+                "claim_fencing_token": report_token,
+                "report_id": f"report-{task_id}",
+                "task_id": task_id,
+            },
+        )
 
     Database(str(database_path)).initialize()
 
@@ -561,16 +977,21 @@ def test_v10_migration_parks_preexisting_interrupted_orphans(database_path: Path
     interrupted = rows["interrupted-orphan"]
     assert interrupted[:5] == ("blocked", None, None, 1, 8)
     assert interrupted[5] != "before"
-    assert rows["stale-report-orphan"] == ("orphaned", None, None, 1, 7, "before")
+    stale = rows["stale-report-orphan"]
+    assert stale[:5] == ("blocked", None, None, 2, 8)
+    assert stale[5] != "before"
     assert rows["unreported-orphan"] == ("orphaned", None, None, 1, 7, "before")
     assert version == str(SERVICE_SCHEMA_VERSION)
 
     database = Database(str(database_path))
     events = database.audit_events()
-    assert len(events) == 1
-    assert events[0]["event_type"] == "task.interruption_migration_parked"
-    assert events[0]["actor"] == "system"
-    assert events[0]["payload"] == {
+    migration_events = [
+        event for event in events if event["event_type"] == "task.interruption_migration_parked"
+    ]
+    migration_events.sort(key=lambda event: event["sequence"])
+    assert len(migration_events) == 2
+    assert migration_events[0]["actor"] == "system"
+    assert migration_events[0]["payload"] == {
         "claim_fencing_token": 1,
         "from_status": "orphaned",
         "interruption_report_id": "report-interrupted-orphan",
@@ -579,13 +1000,27 @@ def test_v10_migration_parks_preexisting_interrupted_orphans(database_path: Path
         "task_id": "interrupted-orphan",
         "to_status": "blocked",
     }
-    assert database.verify_audit_chain() == (True, 1, None)
+    assert migration_events[1]["actor"] == "system"
+    assert migration_events[1]["payload"] == {
+        "claim_fencing_token": 2,
+        "from_status": "orphaned",
+        "interruption_report_fencing_token": 1,
+        "interruption_report_id": "report-stale-report-orphan",
+        "previous_version": 7,
+        "schema_version": 12,
+        "task_id": "stale-report-orphan",
+        "to_status": "blocked",
+        "unresolved_interruption_report_count": 1,
+    }
+    assert database.verify_audit_chain() == (True, 4, None)
 
 
 def test_v10_migration_rolls_back_when_interrupted_orphan_audit_fails(
     database_path: Path,
 ) -> None:
     with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TRIGGER IF EXISTS budget_interruption_task_resume_guard")
+        connection.execute("DROP VIEW IF EXISTS budget_unresolved_interruption_reports")
         connection.execute(
             "INSERT INTO agents(id, name, owner, role, created_at) "
             "VALUES ('legacy-worker', 'legacy worker', 'owner', 'worker', 'now')"
