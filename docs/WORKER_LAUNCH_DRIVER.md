@@ -903,3 +903,38 @@ manager, logout/linger, or reboot; it therefore does not close #2370's broader
 recovery gate. Provider authentication and destination-restricted external
 egress also remain unproven, and the default OCI `run_worker()` path remains
 fail-closed.
+
+### User-manager daemon-reexec after launch-driver crash (2026-10-21; no model)
+
+The two monitor crash modes above were repeated with
+`ACP_LIVE_USER_MANAGER_REEXEC_AFTER_DRIVER_CRASH=1` on the same disposable
+Debian 12 ARM64 environment (Linux `6.12.95+deb12-cloud-arm64`, systemd
+`252.39`, Python `3.11.2`, cgroup v2, rootless runc `1.5.2`, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+frozen test source staged from `2f8cf15dc7dffcd332fed333a9b35dcfaa23ea94`
+had SHA-256 `a99ce18638695d33f8ab92bc91507d65ab08e39f713d4d9031f0ec2a89d8f8e4`;
+the launch-driver source remained SHA-256
+`3f9a3b9fe515074b5542518b44a4473f994c956c695d2d5fec047ff0ebb049ff`.
+
+| Injected launch-driver crash phase | Result | Assertions |
+| --- | --- | --- |
+| `ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE=1` | 1 passed (1.69s) | Trusted `systemctl --user daemon-reexec` returned 0; exact launch-driver unit properties were unchanged; active monitor/scope identity checks, slice unit/cgroup checks, and fresh-supervisor reconciliation passed. |
+| `ACP_LIVE_CRASH_BEFORE_MONITOR_START=1` | 1 passed (1.22s) | Same re-exec and state/reconciliation checks passed; the monitor remained unstarted at the injected crash point. |
+
+The test first confirms the exact launch-driver unit is inactive, performs one
+user-manager `daemon-reexec`, then compares the launch-driver unit properties
+before and after re-exec. Post-re-exec checks verify monitor identity when the
+monitor is active, compare the slice unit ID and cgroup, and assert that the
+monitor is absent in the pre-monitor case; they run before fresh-supervisor
+reconciliation. Postflight found the user manager reachable and no active
+`acp-*` units, launch-driver/monitor/runc processes, or
+`acp-live-launch-driver-*` / `acp-live-sandbox-lifecycle-*` fixture roots. The
+run used no model, provider credential, provider endpoint, or provider API
+call; it made no changes to the NAS.
+
+This proves state retention across `systemctl --user daemon-reexec` only. It
+does not simulate supervisor-daemon failure, systemd user-manager shutdown or
+restart, logout/linger, reboot, provider authentication, or destination-
+restricted provider egress. It does not close #2370's broader recovery or
+integrated-agent-isolation gates, and the default OCI `run_worker()` path
+remains fail-closed.

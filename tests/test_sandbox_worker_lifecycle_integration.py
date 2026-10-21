@@ -67,6 +67,14 @@ activation is requested, add:
 
     ACP_LIVE_CRASH_BEFORE_MONITOR_START=1
 
+To re-exec the user manager after the launch-driver crash and before fresh
+supervisor reconciliation, combine either monitor crash mode with:
+
+    ACP_LIVE_USER_MANAGER_REEXEC_AFTER_DRIVER_CRASH=1
+
+This verifies transient unit identities survive `systemctl --user daemon-reexec`;
+it does not simulate manager shutdown, logout/linger, or reboot.
+
 For natural completion followed by production cleanup verification, a
 deterministic in-sandbox source edit and test, and host-side sandbox-result
 import (mutually exclusive with cancellation, timeout, and crash modes), add:
@@ -2548,6 +2556,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             os.environ.get("ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE") == "1"
         )
         crash_before_monitor_start = os.environ.get("ACP_LIVE_CRASH_BEFORE_MONITOR_START") == "1"
+        user_manager_reexec_after_driver_crash = (
+            os.environ.get("ACP_LIVE_USER_MANAGER_REEXEC_AFTER_DRIVER_CRASH") == "1"
+        )
         if (
             sum(
                 (
@@ -2563,6 +2574,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         ):
             pytest.fail(
                 "live cancel, timeout, lease-expiry, and crash-injection modes are mutually exclusive"
+            )
+        if user_manager_reexec_after_driver_crash and not (
+            crash_after_monitor_acceptance or crash_before_monitor_start
+        ):
+            pytest.fail(
+                "user-manager re-exec requires a monitor-acceptance or pre-monitor crash mode"
             )
         if import_result_after_cleanup and any(
             (
@@ -2826,6 +2843,26 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert driver_after_crash["MainPID"] == "0"
             assert driver_after_crash["InvocationID"] == driver["invocation_id"]
             assert driver_after_crash["Slice"] == slice_unit
+            if user_manager_reexec_after_driver_crash:
+                systemctl = str(sandbox_attestation._trusted_systemctl_executable())
+                reexec = _systemd_command([systemctl, "--user", "daemon-reexec"], timeout=30)
+                assert reexec.returncode == 0, (
+                    "systemd user-manager daemon-reexec failed: "
+                    f"stdout={reexec.stdout!r}; stderr={reexec.stderr!r}"
+                )
+                driver_after_reexec = _unit_properties(
+                    service_unit,
+                    (
+                        "ActiveState",
+                        "ControlGroup",
+                        "Id",
+                        "InvocationID",
+                        "LoadState",
+                        "MainPID",
+                        "Slice",
+                    ),
+                )
+                assert driver_after_reexec == driver_after_crash
             monitor_before_recovery = _unit_properties(
                 monitor_unit,
                 (
