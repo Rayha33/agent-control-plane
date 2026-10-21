@@ -411,6 +411,7 @@ class ConfigMixin:
             runtime.get("targets", []),
             port_envs={pool.env_name for pool in runtime_port_pools},
             driver_names={definition.name for definition in runtime_drivers},
+            driver_kinds={definition.name: definition.kind for definition in runtime_drivers},
         )
         # Loaded here so a reviewer's command obeys the same trust rule as the
         # legacy single critic, and so a bad policy fails at construction.

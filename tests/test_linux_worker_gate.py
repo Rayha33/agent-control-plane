@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import _requires_linux_worker_proofs
 
 pytest_plugins = ["pytester"]
 
@@ -12,6 +13,7 @@ pytest_plugins = ["pytester"]
 def worker_gate(pytester, monkeypatch):
     """Exercise the real hooks in a fresh pytest process, not a hook simulation."""
     monkeypatch.setenv("ACP_REQUIRE_LINUX_WORKER", "1")
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
     pytester.makeconftest(Path(__file__).with_name("conftest.py").read_text())
     pytester.makeini("[pytest]\nmarkers = linux_worker: required worker test\n")
     return pytester
@@ -96,6 +98,26 @@ def test_optional_gate_allows_platform_skip(worker_gate, monkeypatch, setting):
     result = worker_gate.runpytest_subprocess("-q")
     result.assert_outcomes(skipped=1)
     assert result.ret == pytest.ExitCode.OK
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="GitHub Linux gate only")
+def test_github_actions_linux_requires_worker_proofs_by_default(worker_gate, monkeypatch):
+    monkeypatch.delenv("ACP_REQUIRE_LINUX_WORKER", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    worker_gate.makepyfile(
+        "import pytest\n"
+        "@pytest.mark.linux_worker\ndef test_worker(): pytest.skip('runtime unavailable')"
+    )
+    result = worker_gate.runpytest_subprocess("-q")
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.stdout.fnmatch_lines(["*ACP_REQUIRE_LINUX_WORKER=1*", "*test_worker*"])
+
+
+def test_explicit_gate_disable_cannot_override_github_default(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("ACP_REQUIRE_LINUX_WORKER", "0")
+    assert _requires_linux_worker_proofs() is True
 
 
 def test_required_gate_preserves_collection_error_exit_code(worker_gate):

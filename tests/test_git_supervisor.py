@@ -2917,14 +2917,21 @@ def test_reaper_stops_supervised_worker_before_releasing_runtime(repo: Path) -> 
     supervisor = GitSupervisor(repo)
     attempt = supervisor.claim(task(supervisor, "alpha.txt")["id"], "worker")
     port = int(attempt["runtime"]["environment"]["APP_PORT"])
+    detached_server = (
+        "import os,socket,time; "
+        "listener=socket.socket(); "
+        "listener.bind(('127.0.0.1',int(os.environ['APP_PORT']))); "
+        "listener.listen(); time.sleep(60)"
+    )
     command = [
         sys.executable,
         "-c",
         (
-            "import os,socket,time; "
-            "listener=socket.socket(); "
-            "listener.bind(('127.0.0.1',int(os.environ['APP_PORT']))); "
-            "listener.listen(); time.sleep(60)"
+            "import subprocess,sys,time; "
+            f"subprocess.Popen([sys.executable,'-c',{detached_server!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL, start_new_session=True); "
+            "time.sleep(60)"
         ),
     ]
 

@@ -77,6 +77,46 @@ checkout and the receipt records its hash. These permissions and hashes detect
 accidental mutation; a same-UID command is not prevented from changing the
 file.
 
+After a `postgres_schema` driver creates and independently probes its
+driver- and attempt-specific schema, the worker also receives
+`ACP_DATABASE_SCHEMA_<DRIVER>_<SHA256>` (with a bounded readable driver slug
+and the full SHA-256 of the configured driver name) set to that schema name.
+This value is non-secret and lets a cooperating test or service select its
+namespace. ACP validates the key and value against the driver receipt, persists
+it across worker launch and recovery, and removes it only after teardown proves
+the schema absent. This routes cooperating clients; it does not restrict what a
+database role can access. Use per-attempt roles/grants and database-side policy
+when isolation from a non-cooperating or hostile client is required.
+
+## Resource support and limits
+
+The backing control planes remain host-global: local TCP/port space, the
+PostgreSQL server and role, the Docker daemon, installed browser binaries, and
+the CoreSimulator service. ACP scopes only the attempt-owned allocation or
+namespace listed below; it does not make those host services private.
+
+| Resource | Namespace classification | Cleanup / limit |
+| --- | --- | --- |
+| Local TCP services | Attempt-private port assignment from each configured pool. | ACP probes before recycling and quarantines a port still in use. Assignment is not socket-ownership proof; use the process/container runtime for that. |
+| PostgreSQL | Attempt-private schema per driver and attempt on a shared-global server/role. | Cleanup drops the schema and independently probes for absence. Schemas route cooperating clients only; the configured role can still access other schemas unless database grants or policies restrict it. |
+| Compose-backed services / queues | Attempt-private Compose project on the shared-global Docker daemon. A runtime target's `queue_driver`, when present, must use this adapter. | Teardown issues `down --volumes --remove-orphans` and verifies the project's containers are absent. External queues (for example, shared Redis, SQS, or a hosted broker) have no per-attempt adapter here: a declared non-Compose queue driver fails configuration. Treat undeclared external queues as unsupported for mutating tests, or shared-read-only only when the test is demonstrably read-only. |
+| Browser profiles | Attempt-private browser data directory; browser binaries remain host-global. The path is passed to the worker as `ACP_BROWSER_PROFILE_<DRIVER>_<SHA256>`. | The browser/test command must consume that variable. ACP removes the directory only after its absence proof; the directory does not force a browser binary to use it or provide a browser process sandbox by itself. Use process-tree containment and do not launch detached host browsers. |
+| CoreSimulator | Attempt-private cloned UDID on the shared-global CoreSimulator service, on supported macOS hosts. | The clone is shut down and deleted through the simulator driver's lifecycle. Availability and capacity are host-dependent; other simulator profiles are unsupported. |
+
+ACP cannot discover arbitrary service access hidden inside candidate code. A
+target receipt is therefore not permission to mutate an undeclared global
+service; shared third-party services must be disabled or restricted to
+read-only by the selected execution profile.
+
+Driver allocations, fencing tokens, setup/teardown receipts, and cleanup probes
+are owned by the supervisor and survive worker restart/recovery. On Linux, use
+the supervised worker trampoline or `namespace_runtime` when test processes
+must be contained and reaped on cancellation/expiry. Without process-tree
+containment, ACP can prove resource setup and cleanup but cannot claim that an
+arbitrary detached process stopped using an external service. A worker or
+service that ignores its supplied namespace remains outside the isolation
+guarantee; do not run mutating tests against shared external services.
+
 QC and integration hold the task-operation lock continuously across target preflight
 and their configured commands. Public runtime restart and recovery acquire that same
 lock, so they fail closed instead of replacing a target after its receipt is checked.

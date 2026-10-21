@@ -28,7 +28,13 @@ from pathlib import Path
 from typing import Any
 
 from ..credential_providers import CredentialHandle, CredentialRegistry
-from ..runtime_drivers import DriverContext, DriverDefinition, PhaseEvidence
+from ..runtime_drivers import (
+    DriverContext,
+    DriverDefinition,
+    PhaseEvidence,
+    browser_profile_environment_name,
+    postgres_schema_environment_name,
+)
 from .common import (
     PUBLIC_CHILD_ENV,
     SUPERVISOR_SECRET_ENV,
@@ -543,6 +549,32 @@ class RuntimeMixin:
         for item in evidence:
             item_exports = dict(item.environment_exports)
             allowed = allowed_exports.get(item.kind, set())
+            postgres_schema_key: str | None = None
+            browser_profile_key: str | None = None
+            if item.kind == "postgres_schema":
+                postgres_schema_key = postgres_schema_environment_name(item.driver)
+                allowed = {postgres_schema_key}
+                if (
+                    phase == "setup"
+                    and item.ok
+                    and item_exports != {postgres_schema_key: item.resource_id}
+                ):
+                    raise SupervisorError(
+                        "runtime_driver_environment_invalid",
+                        f"driver {item.driver} did not export its proved Postgres schema",
+                    )
+            elif item.kind == "browser_profile":
+                browser_profile_key = browser_profile_environment_name(item.driver)
+                allowed = {browser_profile_key}
+                if (
+                    phase == "setup"
+                    and item.ok
+                    and item_exports != {browser_profile_key: item.resource_id}
+                ):
+                    raise SupervisorError(
+                        "runtime_driver_environment_invalid",
+                        f"driver {item.driver} did not export its proved browser profile",
+                    )
             if item_exports and (phase != "setup" or not item.ok or set(item_exports) - allowed):
                 raise SupervisorError(
                     "runtime_driver_environment_invalid",
@@ -552,26 +584,45 @@ class RuntimeMixin:
                 if not isinstance(value, str):
                     raise SupervisorError(
                         "runtime_driver_environment_invalid",
-                        f"driver {item.driver} returned a non-text simulator UDID",
+                        f"driver {item.driver} returned a non-text runtime environment value",
                     )
-                try:
-                    parsed = str(uuid.UUID(value))
-                except (TypeError, ValueError) as error:
+                if item.kind == "core_simulator":
+                    try:
+                        parsed = str(uuid.UUID(value))
+                    except (TypeError, ValueError) as error:
+                        raise SupervisorError(
+                            "runtime_driver_environment_invalid",
+                            f"driver {item.driver} returned an invalid simulator UDID",
+                        ) from error
+                    if key != "ACP_SIMULATOR_UDID" or parsed.upper() != value.upper():
+                        raise SupervisorError(
+                            "runtime_driver_environment_invalid",
+                            f"driver {item.driver} returned an invalid simulator environment value",
+                        )
+                    value = value.upper()
+                elif item.kind == "postgres_schema":
+                    if key != postgres_schema_key or value != item.resource_id:
+                        raise SupervisorError(
+                            "runtime_driver_environment_invalid",
+                            f"driver {item.driver} returned an invalid runtime environment value",
+                        )
+                elif item.kind == "browser_profile":
+                    if key != browser_profile_key or value != item.resource_id:
+                        raise SupervisorError(
+                            "runtime_driver_environment_invalid",
+                            f"driver {item.driver} returned an invalid runtime environment value",
+                        )
+                else:
                     raise SupervisorError(
                         "runtime_driver_environment_invalid",
-                        f"driver {item.driver} returned an invalid simulator UDID",
-                    ) from error
-                if key != "ACP_SIMULATOR_UDID" or parsed.upper() != value.upper():
-                    raise SupervisorError(
-                        "runtime_driver_environment_invalid",
-                        f"driver {item.driver} returned an invalid simulator environment value",
+                        f"driver {item.driver} returned an unsupported runtime environment value",
                     )
                 if key in exports and exports[key] != value:
                     raise SupervisorError(
                         "runtime_driver_environment_invalid",
                         f"multiple runtime drivers exported conflicting values for {key}",
                     )
-                exports[key] = value.upper()
+                exports[key] = value
             if phase == "teardown" and item.proof.get("cleanup_proved"):
                 removals.update(allowed)
         if environment is not None:
@@ -648,7 +699,7 @@ class RuntimeMixin:
                     "present": item.present,
                     "cleanup_proved": item.proof.get("cleanup_proved"),
                     "environment_exports": dict(item.environment_exports),
-                    "environment_removed": sorted(allowed_exports.get(item.kind, set()))
+                    "environment_removed": sorted(allowed)
                     if phase == "teardown" and item.proof.get("cleanup_proved")
                     else [],
                 }

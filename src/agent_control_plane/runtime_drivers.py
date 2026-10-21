@@ -292,6 +292,28 @@ def _sanitize(value: str, *, allow: str) -> str:
     return "".join(char if char.isalnum() or char in allow else "-" for char in value)
 
 
+def postgres_schema_environment_name(driver_name: str) -> str:
+    """Return a bounded, ASCII worker variable name for one Postgres driver.
+
+    The readable prefix is only diagnostic. The full digest keeps names such as
+    ``database-prod`` and ``database_prod`` distinct even after normalization.
+    """
+
+    raw_name = driver_name.strip()
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", raw_name).strip("_").upper()[:32] or "DRIVER"
+    digest = sha256(raw_name.encode("utf-8")).hexdigest().upper()
+    return f"ACP_DATABASE_SCHEMA_{slug}_{digest}"
+
+
+def browser_profile_environment_name(driver_name: str) -> str:
+    """Return a bounded worker variable for one attempt-private browser profile."""
+
+    raw_name = driver_name.strip()
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", raw_name).strip("_").upper()[:32] or "DRIVER"
+    digest = sha256(raw_name.encode("utf-8")).hexdigest().upper()
+    return f"ACP_BROWSER_PROFILE_{slug}_{digest}"
+
+
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
@@ -704,15 +726,36 @@ class PostgresSchemaDriver(ResourceDriver):
     kind = "postgres_schema"
 
     def resource_id(self, context: DriverContext) -> str:
-        prefix = self.definition.option("schema_prefix", "acp") or "acp"
-        raw = _sanitize(f"{prefix}_{context.attempt_id}", allow="_").lower()
-        return raw.replace("-", "_")
+        prior = context.prior_driver_evidence.get(self.definition.name, {})
+        prior_state = context.prior_driver_states.get(self.definition.name)
+        prior_id = prior.get("resource_id") if prior.get("kind") == self.kind else None
+        if prior_state not in {None, "released"}:
+            if not isinstance(prior_id, str):
+                raise DriverError("invalid_resource", "stored Postgres schema identity is invalid")
+            self._identifier(prior_id)
+            return prior_id
+
+        raw_prefix = (self.definition.option("schema_prefix", "acp") or "acp").strip() or "acp"
+        prefix = re.sub(r"[^A-Za-z0-9]+", "_", raw_prefix).strip("_").lower() or "acp"
+        raw_attempt = context.attempt_id
+        attempt = re.sub(r"[^A-Za-z0-9]+", "_", raw_attempt).strip("_").lower()
+        attempt = attempt[:9] or "attempt"
+
+        # PostgreSQL silently truncates identifiers at 63 bytes. The readable
+        # parts aid diagnostics; hashing the raw prefix, driver name, and attempt
+        # prevents distinct drivers or normalized values from sharing a schema.
+        identity_fields = json.dumps(
+            [raw_prefix, self.definition.name, raw_attempt],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        identity = sha256(identity_fields).hexdigest()[:36]
+        return f"{prefix[:16]}_{attempt}_{identity}"
 
     def _psql(
         self,
         context: DriverContext,
         sql: str,
-        variables: Mapping[str, str] | None = None,
     ) -> list[str]:
         if self.definition.executable is None:
             raise DriverError("invalid_config", "postgres driver executable is missing")
@@ -731,10 +774,28 @@ class PostgresSchemaDriver(ResourceDriver):
             if value:
                 argv.extend([flag, value])
         argv.extend(["-v", "ON_ERROR_STOP=1"])
-        for name, value in sorted((variables or {}).items()):
-            argv.extend(["--set", f"{name}={value}"])
         argv.extend(["-tAc", sql])
         return argv
+
+    @staticmethod
+    def _identifier(schema: str) -> str:
+        if (
+            not schema
+            or not all(char.isalnum() or char == "_" for char in schema)
+            or len(schema.encode("utf-8")) > 63
+        ):
+            raise DriverError("invalid_resource", "postgres schema identifier is unsafe")
+        return f'"{schema}"'
+
+    @staticmethod
+    def _literal(schema: str) -> str:
+        if (
+            not schema
+            or not all(char.isalnum() or char == "_" for char in schema)
+            or len(schema.encode("utf-8")) > 63
+        ):
+            raise DriverError("invalid_resource", "postgres schema literal is unsafe")
+        return "'" + schema.replace("'", "''") + "'"
 
     def ownership_identity(self, context: DriverContext) -> str:
         handle = self.credential_handle(context)
@@ -769,17 +830,23 @@ class PostgresSchemaDriver(ResourceDriver):
     def setup(self, context: DriverContext, runner: CommandRunner) -> dict[str, Any]:
         schema = self.resource_id(context)
         with self._connection(context) as (env, material):
-            return runner(
+            result = runner(
                 self._psql(
                     context,
-                    'CREATE SCHEMA IF NOT EXISTS :"schema"',
-                    {"schema": schema},
+                    f"CREATE SCHEMA IF NOT EXISTS {self._identifier(schema)}",
                 ),
                 context.runtime_dir,
                 env,
                 DEFAULT_PHASE_TIMEOUT_SECONDS,
                 material,
             )
+        result = dict(result)
+        result["environment_exports"] = (
+            {postgres_schema_environment_name(self.definition.name): schema}
+            if result.get("exit_code", 0) == 0
+            else {}
+        )
+        return result
 
     def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
         schema = self.resource_id(context)
@@ -787,8 +854,8 @@ class PostgresSchemaDriver(ResourceDriver):
             result = runner(
                 self._psql(
                     context,
-                    "SELECT 1 FROM information_schema.schemata WHERE schema_name = :'schema'",
-                    {"schema": schema},
+                    "SELECT 1 FROM information_schema.schemata "
+                    f"WHERE schema_name = {self._literal(schema)}",
                 ),
                 context.runtime_dir,
                 env,
@@ -804,8 +871,7 @@ class PostgresSchemaDriver(ResourceDriver):
             return runner(
                 self._psql(
                     context,
-                    'DROP SCHEMA IF EXISTS :"schema" CASCADE',
-                    {"schema": schema},
+                    f"DROP SCHEMA IF EXISTS {self._identifier(schema)} CASCADE",
                 ),
                 context.runtime_dir,
                 env,
@@ -851,6 +917,9 @@ class BrowserProfileDriver(ResourceDriver):
             "exit_code": 0,
             "stdout": "",
             "stderr": "",
+            "environment_exports": {
+                browser_profile_environment_name(self.definition.name): str(target)
+            },
         }
 
     def probe(self, context: DriverContext, runner: CommandRunner) -> tuple[bool, dict[str, Any]]:
@@ -1881,6 +1950,10 @@ def parse_driver_definitions(
         name = str(entry.get("name") or "").strip()
         if not name:
             raise DriverError("invalid_config", f"runtime driver #{index} needs a name")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in name):
+            raise DriverError(
+                "invalid_config", f"runtime driver #{index} name contains a control character"
+            )
         if name in seen:
             raise DriverError("invalid_config", f"duplicate runtime driver name {name!r}")
         seen.add(name)
@@ -1990,6 +2063,11 @@ def parse_driver_definitions(
                 options[option_name] = candidate
 
         if kind == PostgresSchemaDriver.kind:
+            schema_prefix = options.get("schema_prefix", "")
+            if any(ord(character) < 0x20 or ord(character) == 0x7F for character in schema_prefix):
+                raise DriverError(
+                    "invalid_config", "postgres schema_prefix contains a control character"
+                )
             if options.get("dsn") or options.get("dsn_env"):
                 raise DriverError(
                     "invalid_config",
