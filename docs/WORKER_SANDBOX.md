@@ -844,10 +844,20 @@ Current source-level constraints and deployment evidence:
 
 | Item | Current evidence | Required before launch |
 | --- | --- | --- |
-| OS/runtime | Linux user, mount, PID, and optionally network namespaces; systemd user service and delegated cgroup v2 are required by the current resource driver. | Disposable target-host probe of namespace, cgroup, systemd-manager lifetime, and mount policy. |
-| Kernel/distribution | **MISSING** for the target NAS; no live-host version or capability result is claimed. Namespace isolation also trusts the host kernel. | Record exact kernel/distribution and required namespace/cgroup settings from an approved disposable Linux lane; use a VM/microVM if the host kernel is not in the trust boundary. |
+| OS/runtime | The target NAS is Debian 12 with systemd 252.38 and cgroup v2. Its `/usr/bin/runc` is root-owned mode 0755, version 1.3.5, SHA-256 `66a04d0424b03b65b9e5f4be1bc4c3090f5cf301b29866d5fe2d38d3bd0c443a`. The current registered-worker contract pins runc 1.5.2, so this host binary is not that tested runtime. | Qualify the exact pinned runc 1.5.2 and prove delegated cgroup, systemd-manager lifetime, and mount policy in a disposable/approved target-matching lane; do not replace the shared host binary as part of this task. |
+| Kernel/distribution | Read-only target probe (2026-10-21): Linux 6.18.15 x86_64; `userns_clone=1`, `max_user_namespaces=62761`; `unshare --user --map-root-user --mount --pid --net --fork true` passed. This proves only namespace creation, not rootless runc behavior or worker isolation. Namespace isolation also trusts the host kernel. | Prove cgroup delegation and manager lifetime, then exercise the pinned runtime and exact mount policy in a disposable/approved lane; use a VM/microVM if the host kernel is not in the trust boundary. |
 | Codex adapter | The repository has no pinned Codex CLI/App Server in this execution path. The current App Server docs describe stdio/Unix socket transports; WebSocket transport is marked experimental/unsupported. | Pin an exact binary/version and protocol schema, then test it inside the proven boundary without a model call. |
 | Authentication | No host Codex config, OAuth file, API key, or Git credential may be mounted into the candidate tree. | Prove a brokered/least-privilege auth path or reject the adapter; no credential material has been tested here. |
+
+**Target NAS read-only compatibility probe (2026-10-21).** The Debian/kernel,
+systemd, cgroup-v2, user-namespace settings, and `/usr/bin/runc` identity above
+were read over SSH; a transient user/mount/PID/network namespace command
+completed successfully. A process-list check found no matching ACP or runc
+workers. The probe changed no files or services. It does not establish the
+user-manager lifecycle, cgroup delegation, rootless runc 1.5.2 behavior, mount
+policy, or any filesystem/network isolation claim. In particular, do not infer
+target qualification from the disposable 6.12.95/runc-1.5.2 guest result while
+the target's observed `/usr/bin/runc` is 1.3.5.
 
 **Evidence update (2026-10-15).** The primitive-level Linux boundary checks are
 now demonstrated by the opt-in
