@@ -866,3 +866,40 @@ provider egress, reboot/daemon-restart recovery, safety against every same-UID
 host actor, or support across other kernels/rootfs/runtime versions. The
 default OCI `run_worker()` path remains fail-closed and parent task #2370
 remains open.
+
+### Launch-driver handoff crash recovery (2026-10-21; no model)
+
+The production launch-driver integration test was run separately with each of
+`ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE=1`,
+`ACP_LIVE_CRASH_BEFORE_MONITOR_START=1`, and
+`ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE=1`. All three runs passed (**1/1**;
+2.47s, 1.22s, and 1.59s respectively) on a disposable Debian 12 ARM64 guest:
+Linux `6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`, cgroup
+v2, and rootless runc `1.5.2` (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). The
+tests used uv `0.5.9` with `--frozen`; the test module and launch-driver source
+matched the staged commit `1beda4356df307c2c32a640e795b7ed4683b3254` at
+SHA-256 `997a11d3ae4b7084e4636eaf284d03497b726e6833d29c6b131e2032ca526b60`
+and `3f9a3b9fe515074b5542518b44a4473f994c956c695d2d5fec047ff0ebb049ff`.
+
+The manager-acceptance mode exits the producer after `systemd-run` accepts the
+launch but before receipt propagation. A fresh retry controller then rejects
+the duplicate one-shot start before invoking `systemd-run` (the recorded call
+count is zero); this mode does not exercise the monitor-crash reconciliation
+path.
+
+The two monitor modes (`BEFORE_MONITOR_START` and `AFTER_MONITOR_ACCEPTANCE`)
+exercise reconciliation from a fresh supervisor process. They assert the
+selected crash phase and exact attempt/runtime identities, keep the untrusted
+payload behind the unreleased launch gate, quarantine ambiguous execution,
+retain cleanup fences, and reject result capture/replay. The fixture uses a
+local ACP runner credential for enrollment, claim, and launch; it uses no
+provider credentials, provider endpoint, model, or model API call. Postflight
+across all three runs found no active test launch-driver or monitor unit,
+worker scope, runc process, or `acp-live-launch-driver-*` fixture root.
+
+This does not simulate a crash/restart of the supervisor daemon or systemd user
+manager, logout/linger, or reboot; it therefore does not close #2370's broader
+recovery gate. Provider authentication and destination-restricted external
+egress also remain unproven, and the default OCI `run_worker()` path remains
+fail-closed.
