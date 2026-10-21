@@ -40,6 +40,11 @@ def target_definition(**overrides: Any) -> runtime_targets.RuntimeTargetDefiniti
         [entry],
         port_envs={"APP_PORT"},
         driver_names={"api", "postgres", "queue"},
+        driver_kinds={
+            "api": "docker_compose",
+            "postgres": "postgres_schema",
+            "queue": "docker_compose",
+        },
     )[0]
 
 
@@ -377,7 +382,10 @@ def test_target_config_rejects_unbound_or_unsafe_declarations(
 ) -> None:
     with pytest.raises(SupervisorError) as rejected:
         runtime_targets.parse_runtime_target_definitions(
-            [entry], port_envs=port_envs, driver_names=driver_names
+            [entry],
+            port_envs=port_envs,
+            driver_names=driver_names,
+            driver_kinds={name: "docker_compose" for name in driver_names},
         )
     assert rejected.value.code == "invalid_config"
 
@@ -392,6 +400,25 @@ def test_target_names_must_not_alias_environment_variables() -> None:
             entries,
             port_envs={"APP_PORT", "ADMIN_PORT"},
             driver_names={"api"},
+            driver_kinds={"api": "docker_compose"},
+        )
+
+    assert rejected.value.code == "invalid_config"
+
+
+def test_queue_target_rejects_non_compose_driver() -> None:
+    entry = {
+        "name": "api",
+        "port_env": "APP_PORT",
+        "driver": "api",
+        "queue_driver": "external-queue",
+    }
+    with pytest.raises(SupervisorError, match="external queues are unsupported") as rejected:
+        runtime_targets.parse_runtime_target_definitions(
+            [entry],
+            port_envs={"APP_PORT"},
+            driver_names={"api", "external-queue"},
+            driver_kinds={"api": "docker_compose", "external-queue": "postgres_schema"},
         )
 
     assert rejected.value.code == "invalid_config"

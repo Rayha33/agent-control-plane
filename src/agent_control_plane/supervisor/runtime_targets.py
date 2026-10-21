@@ -59,6 +59,7 @@ def parse_runtime_target_definitions(
     *,
     port_envs: set[str],
     driver_names: set[str],
+    driver_kinds: Mapping[str, str],
 ) -> tuple[RuntimeTargetDefinition, ...]:
     """Validate ``[[runtime.targets]]`` against attempt-owned ports and drivers."""
 
@@ -117,6 +118,12 @@ def parse_runtime_target_definitions(
                 raise SupervisorError(
                     "invalid_config", f"runtime target {name} has an unknown {field}"
                 )
+        if queue_driver is not None and driver_kinds.get(queue_driver) != "docker_compose":
+            raise SupervisorError(
+                "invalid_config",
+                f"runtime target {name} queue_driver must be a per-attempt docker_compose driver; "
+                "external queues are unsupported",
+            )
         identity_path = entry.get("identity_path", "/.well-known/acp/runtime-target")
         if (
             not isinstance(identity_path, str)

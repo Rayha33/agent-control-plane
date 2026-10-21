@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,9 +37,11 @@ from agent_control_plane.runtime_drivers import (
     NamespaceRuntimeDriver,
     PostgresSchemaDriver,
     ResourceDriver,
+    browser_profile_environment_name,
     build_driver,
     ownership_token,
     parse_driver_definitions,
+    postgres_schema_environment_name,
     resolve_trusted_executable,
     run_trusted,
 )
@@ -498,6 +506,9 @@ def test_setup_creates_and_teardown_proves_absence(tmp_path: Path) -> None:
     setup = driver.run_phase("setup", ctx, run_trusted)
     assert setup.ok and setup.present is True
     assert Path(setup.resource_id).is_dir()
+    assert setup.environment_exports == {
+        browser_profile_environment_name("browser"): setup.resource_id
+    }
 
     teardown = driver.run_phase("teardown", ctx, run_trusted)
     assert teardown.ok
@@ -1099,7 +1110,9 @@ def test_core_simulator_config_is_macos_only_and_validates_target(
     assert definitions[0].options["timeout_seconds"] == "300"
 
 
-def test_postgres_schema_is_passed_as_psql_variable_not_sql_text(tmp_path: Path) -> None:
+def test_postgres_schema_uses_validated_quoted_sql_and_never_exposes_credential(
+    tmp_path: Path,
+) -> None:
     recorded: list[list[str]] = []
     environments: list[dict[str, str]] = []
     credential_payloads: list[str] = []
@@ -1130,20 +1143,179 @@ def test_postgres_schema_is_passed_as_psql_variable_not_sql_text(tmp_path: Path)
     ctx = postgres_context(tmp_path, "Attempt-XYZ", "fd-only-password")
     schema = driver.resource_id(ctx)
 
-    for phase in ("setup", "verify", "teardown"):
-        driver.run_phase(phase, ctx, recorder)
+    evidence = {
+        phase: driver.run_phase(phase, ctx, recorder) for phase in ("setup", "verify", "teardown")
+    }
 
     assert recorded
     for argv in recorded:
         sql = argv[-1]
         assert argv[1:3] == ["-X", "--no-password"]
-        assert schema not in sql
-        assert ["--set", f"schema={schema}"] == argv[argv.index("--set") :][:2]
+        assert sql in {
+            f'CREATE SCHEMA IF NOT EXISTS "{schema}"',
+            f"SELECT 1 FROM information_schema.schemata WHERE schema_name = '{schema}'",
+            f'DROP SCHEMA IF EXISTS "{schema}" CASCADE',
+        }
+        assert ":" not in sql
         assert "fd-only-password" not in argv
     assert environments
     assert all("PGDATABASE" not in env for env in environments)
     assert all(env["PGPASSFILE"].startswith(("/dev/fd/", "/proc/self/fd/")) for env in environments)
     assert credential_payloads == ["*:*:*:*:fd-only-password\n"] * 5
+    export_name = postgres_schema_environment_name("database")
+    assert evidence["setup"].environment_exports == {export_name: schema}
+    assert evidence["verify"].environment_exports == {}
+    assert evidence["teardown"].environment_exports == {}
+    assert "fd-only-password" not in json.dumps(evidence["setup"].as_dict())
+
+    def failed_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+        return {"argv": list(argv), "exit_code": 1, "stdout": "", "stderr": "failed"}
+
+    failed_setup = driver.run_phase("setup", ctx, failed_runner)
+    assert not failed_setup.ok
+    assert failed_setup.environment_exports == {}
+
+
+def test_postgres_schema_environment_name_is_ascii_bounded_and_collision_resistant() -> None:
+    dashed = postgres_schema_environment_name("database-prod")
+    underscored = postgres_schema_environment_name("database_prod")
+    long = postgres_schema_environment_name("é" * 500)
+
+    assert dashed != underscored
+    assert dashed.startswith("ACP_DATABASE_SCHEMA_DATABASE_PROD_")
+    assert dashed.isascii() and dashed.replace("_", "").isalnum()
+    assert long.isascii() and len(long) < 128
+
+
+def test_postgres_schema_id_is_safe_bounded_and_keeps_attempt_identity(tmp_path: Path) -> None:
+    first_driver = PostgresSchemaDriver(
+        DriverDefinition(
+            name="database",
+            kind="postgres_schema",
+            executable=Path("/bin/echo"),
+            options={"schema_prefix": 'very-long-prefix-"; DROP SCHEMA'},
+        )
+    )
+    second_driver = PostgresSchemaDriver(
+        DriverDefinition(
+            name="database",
+            kind="postgres_schema",
+            executable=Path("/bin/echo"),
+            options={"schema_prefix": 'very-long-prefix-"; DROP SCHEMAX'},
+        )
+    )
+    same_prefix_other_driver = PostgresSchemaDriver(
+        DriverDefinition(
+            name="database-secondary",
+            kind="postgres_schema",
+            executable=Path("/bin/echo"),
+            options={"schema_prefix": 'very-long-prefix-"; DROP SCHEMA'},
+        )
+    )
+    first = first_driver.resource_id(context(tmp_path, "attempt-a"))
+    second = first_driver.resource_id(context(tmp_path, "attempt-b"))
+    same_attempt_other_prefix = second_driver.resource_id(context(tmp_path, "attempt-a"))
+    same_attempt_other_driver = same_prefix_other_driver.resource_id(context(tmp_path, "attempt-a"))
+    normalized_attempt_collision = first_driver.resource_id(context(tmp_path, "attempt_a"))
+
+    assert len(first.encode("ascii")) <= 63
+    assert re.fullmatch(r"[a-z0-9_]+", first)
+    assert first != second
+    assert first != same_attempt_other_prefix
+    assert first != same_attempt_other_driver
+    assert first != normalized_attempt_collision
+
+
+def test_postgres_schema_identity_encodes_fields_without_delimiter_collisions(
+    tmp_path: Path,
+) -> None:
+    first = PostgresSchemaDriver(
+        DriverDefinition(
+            name="x\x00z",
+            kind="postgres_schema",
+            executable=Path("/bin/echo"),
+            options={"schema_prefix": "a" * 16},
+        )
+    )
+    second = PostgresSchemaDriver(
+        DriverDefinition(
+            name="z",
+            kind="postgres_schema",
+            executable=Path("/bin/echo"),
+            options={"schema_prefix": f"{'a' * 16}\x00x"},
+        )
+    )
+
+    assert first.resource_id(context(tmp_path, "same-attempt")) != second.resource_id(
+        context(tmp_path, "same-attempt")
+    )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("name", "database\x00prod"), ("schema_prefix", "acp\x00prod")],
+)
+def test_postgres_schema_config_rejects_control_characters(
+    tmp_path: Path, monkeypatch, field: str, value: str
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        runtime_driver_module,
+        "resolve_trusted_executable",
+        lambda *_args, **_kwargs: Path("/usr/bin/echo"),
+    )
+    entry = {
+        "name": "database",
+        "kind": "postgres_schema",
+        "executable": "/usr/bin/echo",
+        "credential": "pg",
+        "host": "localhost",
+        "database": "agent_db",
+        "user": "agent",
+        "schema_prefix": "acp",
+    }
+    entry[field] = value
+
+    with pytest.raises(DriverError, match="control character"):
+        parse_driver_definitions([entry], tmp_path, credential_names={"pg"})
+
+
+def test_postgres_schema_cleanup_preserves_active_legacy_identity(tmp_path: Path) -> None:
+    driver = PostgresSchemaDriver(
+        DriverDefinition(
+            name="database",
+            kind="postgres_schema",
+            executable=Path("/bin/echo"),
+            options={"schema_prefix": "acp"},
+        )
+    )
+    base = context(tmp_path, "attempt-1")
+    active = replace(
+        base,
+        prior_driver_states={"database": "active"},
+        prior_driver_evidence={
+            "database": {
+                "kind": "postgres_schema",
+                "resource_id": "acp_attempt_1",
+            }
+        },
+    )
+    assert driver.resource_id(active) == "acp_attempt_1"
+
+    released = replace(active, prior_driver_states={"database": "released"})
+    assert driver.resource_id(released) != "acp_attempt_1"
+
+    malformed = replace(
+        active,
+        prior_driver_evidence={
+            "database": {
+                "kind": "postgres_schema",
+                "resource_id": 'acp_attempt_1"; DROP SCHEMA unrelated',
+            }
+        },
+    )
+    with pytest.raises(DriverError) as rejected:
+        driver.resource_id(malformed)
+    assert rejected.value.code == "invalid_resource"
 
 
 def test_postgres_ownership_capability_binds_credential_version(tmp_path: Path) -> None:
@@ -1298,6 +1470,17 @@ def test_supervisor_sets_up_and_proves_driver_cleanup(driver_repo: Path) -> None
     assert resources[0]["state"] == "active"
     profile = Path(resources[0]["resource_id"])
     assert profile.is_dir(), "driver setup must actually create the resource"
+    profile_env_name = browser_profile_environment_name("browser")
+    runtime = supervisor.runtime_environment(attempt["id"])
+    assert runtime["environment"][profile_env_name] == str(profile)
+    worker_env = supervisor._child_env(
+        supervisor._phase_runtime_env(runtime["environment"], "worker", Path(attempt["worktree"]))
+    )
+    assert worker_env[profile_env_name] == str(profile)
+    reopened = GitSupervisor(driver_repo)
+    assert reopened.runtime_environment(attempt["id"])["environment"][profile_env_name] == str(
+        profile
+    )
     assert "ownership_token" not in resources[0], "capability token must not be public"
     assert "ownership_token" not in resources[0]["evidence"]
     with sqlite3.connect(supervisor.db_path) as connection:
@@ -1313,6 +1496,184 @@ def test_supervisor_sets_up_and_proves_driver_cleanup(driver_repo: Path) -> None
     assert released[0]["state"] == "released"
     assert released[0]["evidence"]["proof"]["cleanup_proved"] is True
     assert not profile.exists()
+    assert profile_env_name not in supervisor.runtime_environment(attempt["id"])["environment"]
+
+
+@requires_linux_worker
+def test_expired_browser_session_cannot_write_into_sibling_attempt_profile(
+    driver_repo: Path,
+) -> None:
+    (driver_repo / "beta.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(driver_repo), "add", "beta.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(driver_repo), "commit", "-m", "add sibling attempt file"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    supervisor = GitSupervisor(driver_repo)
+    first_task = supervisor.create_task(
+        "expire browser attempt", "Use only the first browser profile.", ["done"], ["alpha.txt"]
+    )
+    first = supervisor.claim(first_task["id"], "browser-worker-a")
+    second_task = supervisor.create_task(
+        "preserve browser attempt",
+        "Keep the second browser profile intact.",
+        ["done"],
+        ["beta.txt"],
+    )
+    second = supervisor.claim(second_task["id"], "browser-worker-b")
+
+    profile_env_name = browser_profile_environment_name("browser")
+    first_profile = Path(
+        supervisor.runtime_environment(first["id"])["environment"][profile_env_name]
+    )
+    second_profile = Path(
+        supervisor.runtime_environment(second["id"])["environment"][profile_env_name]
+    )
+    assert first_profile != second_profile
+    assert first_profile.is_dir() and second_profile.is_dir()
+
+    # Keep the sibling alive even if the two claims land in the same clock tick.
+    with supervisor.connect() as connection:
+        connection.execute(
+            "UPDATE attempts SET lease_expires_at = ? WHERE id = ?",
+            (int(time.time()) + 3600, second["id"]),
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = ? WHERE attempt_id = ?",
+            (int(time.time()) + 3600, second["id"]),
+        )
+
+    ready = Path(supervisor.state_dir) / f"browser-session-started-{first['id']}"
+    child_ready = Path(supervisor.state_dir) / f"browser-child-started-{first['id']}"
+    child_gate = Path(supervisor.state_dir) / f"browser-child-release-{first['id']}"
+    stale_write = second_profile / "late-write-from-expired-browser"
+    child = (
+        "import pathlib,time; "
+        f"pathlib.Path({str(child_ready)!r}).write_text('started'); "
+        f"gate=pathlib.Path({str(child_gate)!r}); "
+        "deadline=time.monotonic()+10\n"
+        "while not gate.exists() and time.monotonic()<deadline:\n"
+        "    time.sleep(0.01)\n"
+        f"pathlib.Path({str(stale_write)!r}).write_text('stale')"
+    )
+    compile(child, "<expired-browser-child>", "exec")
+    worker_script = (
+        "import os,pathlib,subprocess,sys,time\n"
+        f"assert os.environ[{profile_env_name!r}] == {str(first_profile)!r}\n"
+        f"child = {child!r}\n"
+        "subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
+        f"child_ready = pathlib.Path({str(child_ready)!r})\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not child_ready.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "assert child_ready.exists(), 'detached browser child did not start'\n"
+        f"pathlib.Path({str(ready)!r}).write_text('started')\n"
+        "time.sleep(60)\n"
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(
+            supervisor.run_worker,
+            first["id"],
+            first["claim_token"],
+            [sys.executable, "-c", worker_script],
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            if worker.done():
+                worker.result()
+            time.sleep(0.01)
+        assert ready.exists(), "the browser worker never reached its child-process barrier"
+
+        expired = supervisor.reap_expired(now=first["lease_expires_at"])
+        with pytest.raises(SupervisorError):
+            worker.result(timeout=5)
+
+    assert expired["terminated_workers"][0]["attempt_id"] == first["id"]
+    assert expired["runtime_cleanup"] == [{"attempt_id": first["id"], "state": "released"}]
+    assert not first_profile.exists()
+    assert second_profile.is_dir()
+    # The child is known to be alive and waiting before expiry. Release its write
+    # only after reaping: a surviving detached session would now mutate the sibling.
+    child_gate.write_text("release", encoding="utf-8")
+    child_deadline = time.monotonic() + 1
+    while not stale_write.exists() and time.monotonic() < child_deadline:
+        time.sleep(0.01)
+    assert not stale_write.exists(), "a detached browser child outlived its expired attempt"
+
+
+def test_expired_compose_queue_cleanup_preserves_sibling_attempt(
+    driver_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (driver_repo / "beta.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(driver_repo), "add", "beta.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(driver_repo), "commit", "-m", "add sibling attempt file"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    compose_config = DRIVER_CONFIG.replace(
+        'name = "browser"\nkind = "browser_profile"',
+        'name = "queue"\nkind = "docker_compose"\nexecutable = "/bin/echo"',
+    )
+    (driver_repo / "acp.toml").write_text(compose_config, encoding="utf-8")
+    active_projects: set[str] = set()
+    operations: list[tuple[str, str]] = []
+
+    def fake_compose_runner(argv, cwd, env, timeout, credential, **kwargs):  # type: ignore[no-untyped-def]
+        del cwd, env, timeout, credential, kwargs
+        project = argv[3]
+        operation = argv[4]
+        operations.append((operation, project))
+        if operation == "up":
+            active_projects.add(project)
+        elif operation == "down":
+            active_projects.discard(project)
+        stdout = (
+            f"{project}-container\n" if operation == "ps" and project in active_projects else ""
+        )
+        return {"argv": list(argv), "exit_code": 0, "stdout": stdout, "stderr": ""}
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", fake_compose_runner)
+    supervisor = GitSupervisor(driver_repo)
+    first_task = supervisor.create_task(
+        "expire queue project", "Use only the first queue project.", ["done"], ["alpha.txt"]
+    )
+    first = supervisor.claim(first_task["id"], "queue-worker-a")
+    second_task = supervisor.create_task(
+        "preserve queue project", "Keep the second queue project intact.", ["done"], ["beta.txt"]
+    )
+    second = supervisor.claim(second_task["id"], "queue-worker-b")
+    first_project, second_project = (
+        supervisor.driver_resources(attempt["id"])[0]["resource_id"] for attempt in (first, second)
+    )
+    assert first_project != second_project
+    assert active_projects == {first_project, second_project}
+
+    # Make this test independent of whether both attempts were claimed in one second.
+    with supervisor.connect() as connection:
+        later = int(time.time()) + 3600
+        connection.execute(
+            "UPDATE attempts SET lease_expires_at = ? WHERE id = ?", (later, second["id"])
+        )
+        connection.execute(
+            "UPDATE resource_leases SET lease_expires_at = ? WHERE attempt_id = ?",
+            (later, second["id"]),
+        )
+
+    expired = supervisor.reap_expired(now=first["lease_expires_at"])
+
+    assert expired["runtime_cleanup"] == [{"attempt_id": first["id"], "state": "released"}]
+    assert active_projects == {second_project}
+    assert ("down", first_project) in operations
+    assert ("down", second_project) not in operations
+    assert (
+        supervisor.driver_resources(first["id"])[0]["evidence"]["proof"]["cleanup_proved"] is True
+    )
+    assert supervisor.driver_resources(second["id"])[0]["state"] == "active"
 
 
 def test_supervisor_persists_verified_simulator_udid_across_all_attempt_phases(
@@ -1728,6 +2089,583 @@ def fake_postgres_runner(active: set[str], operations: list[tuple[str, str]]):
         }
 
     return runner
+
+
+def test_postgres_schema_is_persisted_for_workers_until_cleanup_is_proven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current, _, _ = postgres_versions(tmp_path)
+    repo = postgres_repo(tmp_path, current)
+    active_schemas: set[str] = set()
+    operations: list[tuple[str, str]] = []
+    cleanup = {"drop": False}
+
+    def runner(argv, cwd, env, timeout, credential, **kwargs):  # type: ignore[no-untyped-def]
+        del cwd, env, timeout, kwargs
+        assert credential is not None
+        sql = argv[-1]
+        if sql.startswith("CREATE SCHEMA"):
+            operation, stdout = "create", ""
+            schema = sql.split('"')[1]
+            active_schemas.add(schema)
+        elif sql.startswith("DROP SCHEMA"):
+            operation, stdout = "drop", ""
+            schema = sql.split('"')[1]
+            if cleanup["drop"]:
+                active_schemas.discard(schema)
+        else:
+            operation = "probe"
+            schema = sql.partition("schema_name = '")[2].partition("'")[0]
+            stdout = "1\n" if schema in active_schemas else ""
+        operations.append((operation, schema))
+        return {"argv": list(argv), "exit_code": 0, "stdout": stdout, "stderr": ""}
+
+    monkeypatch.setattr(supervisor_module, "run_trusted", runner)
+    supervisor = GitSupervisor(repo)
+    first = claimed_attempt(supervisor)
+    second_task = supervisor.create_task(
+        "second bounded change",
+        "Use a distinct source path while sharing the same disposable fixture service.",
+        ["The second declared content is correct"],
+        ["beta.txt"],
+    )
+    second = supervisor.claim(second_task["id"], "agent-b")
+    export_name = postgres_schema_environment_name("database")
+
+    first_runtime = supervisor.runtime_environment(first["id"])
+    second_runtime = supervisor.runtime_environment(second["id"])
+    first_schema = first_runtime["environment"][export_name]
+    second_schema = second_runtime["environment"][export_name]
+    assert first_schema != second_schema
+    assert first_schema in active_schemas and second_schema in active_schemas
+    reopened = GitSupervisor(repo)
+    for attempt, schema, runtime in (
+        (first, first_schema, first_runtime),
+        (second, second_schema, second_runtime),
+    ):
+        resource = supervisor.driver_resources(attempt["id"])[0]
+        assert resource["resource_id"] == schema
+        assert resource["evidence"]["environment_exports"] == {export_name: schema}
+        worker_env = supervisor._child_env(
+            supervisor._phase_runtime_env(
+                runtime["environment"], "worker", Path(attempt["worktree"])
+            )
+        )
+        assert worker_env[export_name] == schema
+        assert "old-target-password" not in repr(worker_env)
+        assert not {"PGPASSWORD", "PGPASSFILE", "DATABASE_URL"} & worker_env.keys()
+        assert reopened.runtime_environment(attempt["id"])["environment"][export_name] == schema
+
+    # A teardown command may return zero while the resource is still present.
+    # The independent probe keeps the worker selector durable in quarantine.
+    blocked_cleanup = supervisor.runtime_down(first["id"], _allow_active=True)
+    assert blocked_cleanup["state"] == "teardown_failed"
+    assert blocked_cleanup["environment"][export_name] == first_schema
+    assert first_schema in active_schemas
+
+    cleanup["drop"] = True
+    released = supervisor.runtime_down(first["id"], _allow_active=True)
+    assert released["state"] == "released"
+    assert export_name not in released["environment"]
+    assert first_schema not in active_schemas
+    assert operations.count(("create", first_schema)) == 1
+    assert operations.count(("drop", first_schema)) == 2
+    supervisor.runtime_down(second["id"], _allow_active=True)
+
+
+@pytest.mark.parametrize("export_mode", ["missing", "mismatch"])
+def test_supervisor_rejects_missing_or_mismatched_postgres_schema_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, export_mode: str
+) -> None:
+    current, _, _ = postgres_versions(tmp_path)
+    repo = postgres_repo(tmp_path, current)
+    monkeypatch.setattr(
+        supervisor_module,
+        "run_trusted",
+        fake_postgres_runner(set(), []),
+    )
+    original_setup = PostgresSchemaDriver.setup
+
+    def invalid_setup(self, attempt_context, runner):  # type: ignore[no-untyped-def]
+        result = original_setup(self, attempt_context, runner)
+        key = postgres_schema_environment_name(self.definition.name)
+        result["environment_exports"] = {} if export_mode == "missing" else {key: "other_schema"}
+        return result
+
+    monkeypatch.setattr(PostgresSchemaDriver, "setup", invalid_setup)
+    supervisor = GitSupervisor(repo)
+
+    with pytest.raises(SupervisorError) as error:
+        claimed_attempt(supervisor)
+    assert error.value.code == "runtime_driver_environment_invalid"
+
+
+def postgres_test_binaries() -> dict[str, str] | None:
+    names = ("initdb", "pg_ctl", "psql")
+    binaries = {name: shutil.which(name) for name in names}
+    if any(path is None for path in binaries.values()):
+        candidate_dirs: list[Path] = []
+        pg_config = shutil.which("pg_config")
+        if pg_config is not None:
+            configured = subprocess.run(
+                [pg_config, "--bindir"], capture_output=True, text=True, timeout=5, check=False
+            )
+            bindir = Path(configured.stdout.strip()) if configured.returncode == 0 else None
+            if bindir is not None:
+                candidate_dirs.append(bindir)
+        postgres_bin_root = Path("/usr/lib/postgresql")
+        if postgres_bin_root.is_dir():
+            candidate_dirs.extend(sorted(postgres_bin_root.glob("*/bin")))
+        for name, path in binaries.items():
+            if path is not None:
+                continue
+            for bindir in candidate_dirs:
+                candidate = bindir / name
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    binaries[name] = str(candidate)
+                    break
+    if any(path is None for path in binaries.values()):
+        return None
+    return {name: str(path) for name, path in binaries.items()}
+
+
+def stop_disposable_postgres(pg_ctl: str, data_dir: Path) -> None:
+    status = subprocess.run(
+        [pg_ctl, "-D", str(data_dir), "status"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if status.returncode != 0:
+        return
+    stop = subprocess.run(
+        [pg_ctl, "-D", str(data_dir), "-m", "fast", "-w", "stop"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert stop.returncode == 0, stop.stderr or stop.stdout
+
+
+def postgres_supervised_worker_command(
+    psql: str,
+    database_port: int,
+    export_name: str,
+    owner: str,
+    result_path: str,
+    ready_path: Path,
+    release_path: Path,
+) -> list[str]:
+    code = (
+        "import os, pathlib, re, socket, subprocess, time\n"
+        f"schema_key = {export_name!r}\n"
+        "schema = os.environ[schema_key]\n"
+        "assert re.fullmatch(r'[a-z0-9_]{1,63}', schema)\n"
+        "port = int(os.environ['APP_PORT'])\n"
+        "listener = socket.socket()\n"
+        "listener.bind(('127.0.0.1', port))\n"
+        "listener.listen()\n"
+        "listener.settimeout(15)\n"
+        f"pathlib.Path({str(ready_path)!r}).write_text(f'{{port}}\\n{{schema}}', encoding='utf-8')\n"
+        "connection, _ = listener.accept()\n"
+        "connection.sendall(f'{port}\\n{schema}'.encode())\n"
+        "connection.close()\n"
+        f"release = pathlib.Path({str(release_path)!r})\n"
+        "deadline = time.monotonic() + 15\n"
+        "while not release.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "assert release.exists(), 'coordinator did not release concurrent workers'\n"
+        "sql = (\n"
+        "    f'SET search_path TO \"{schema}\"; '\n"
+        "    'CREATE TABLE IF NOT EXISTS acp_worker_rows(owner text NOT NULL); '\n"
+        f"    \"INSERT INTO acp_worker_rows(owner) VALUES ('{owner}'); \"\n"
+        "    'SELECT pg_sleep(1); '\n"
+        "    \"SELECT string_agg(owner, ',' ORDER BY owner) FROM acp_worker_rows\"\n"
+        ")\n"
+        "query = subprocess.run([\n"
+        f"    {psql!r}, '-X', '--no-password', '--host', '127.0.0.1',\n"
+        f"    '--port', {str(database_port)!r}, '--dbname', 'postgres',\n"
+        "    '--username', 'acp_test', '--no-align', '--tuples-only',\n"
+        "    '--set=ON_ERROR_STOP=1', '--command', sql,\n"
+        "], capture_output=True, text=True, timeout=20, check=False)\n"
+        "assert query.returncode == 0, query.stderr\n"
+        "observed = query.stdout.strip().splitlines()[-1]\n"
+        f"assert observed == {owner!r}, f'cross-worker rows visible: {{observed}}'\n"
+        f"pathlib.Path({result_path!r}).write_text(f'{{port}}\\n{{schema}}\\n{{observed}}\\n', encoding='utf-8')\n"
+        f"subprocess.run(['git', 'add', {result_path!r}], check=True)\n"
+        "subprocess.run(['git', 'commit', '-m', 'record isolated runtime'], check=True)\n"
+        "listener.close()\n"
+    )
+    compile(code, "<acp-supervised-postgres-worker>", "exec")
+    return [sys.executable, "-c", code]
+
+
+def test_supervised_postgres_worker_command_uses_runtime_exports(tmp_path: Path) -> None:
+    export_name = postgres_schema_environment_name("database")
+    command = postgres_supervised_worker_command(
+        "/usr/bin/psql",
+        5432,
+        export_name,
+        "worker-a",
+        "worker-a.txt",
+        tmp_path / "ready",
+        tmp_path / "release",
+    )
+    assert command[:2] == [sys.executable, "-c"]
+    assert f"schema_key = {export_name!r}" in command[2]
+    assert "port = int(os.environ['APP_PORT'])" in command[2]
+
+
+def test_disposable_postgres_workers_use_distinct_attempt_schemas(tmp_path: Path) -> None:
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("disposable Postgres proof requires a non-root local user")
+    binaries = postgres_test_binaries()
+    if binaries is None:
+        pytest.skip("disposable Postgres worker proof requires initdb, pg_ctl, and psql")
+    initdb, pg_ctl, psql = (binaries[name] for name in ("initdb", "pg_ctl", "psql"))
+
+    data_dir = tmp_path / "postgres-data"
+    log_path = tmp_path / "postgres.log"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    initialized = subprocess.run(
+        [
+            initdb,
+            "-D",
+            str(data_dir),
+            "--auth-local=trust",
+            "--auth-host=trust",
+            "--username=acp_test",
+            "--no-sync",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    try:
+        start = subprocess.run(
+            [
+                pg_ctl,
+                "-D",
+                str(data_dir),
+                "-l",
+                str(log_path),
+                "-o",
+                f"-h 127.0.0.1 -p {port}",
+                "-w",
+                "start",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert start.returncode == 0, start.stderr
+
+        first_context = postgres_context(tmp_path, "attempt-worker-a", "disposable-only")
+        second_context = context(
+            tmp_path,
+            "attempt-worker-b",
+            credential_registry=first_context.credential_registry,
+            credential_handles=first_context.credential_handles,
+        )
+        driver_definition = DriverDefinition(
+            name="database",
+            kind="postgres_schema",
+            executable=Path(psql).resolve(),
+            options={
+                "credential": "postgres-main",
+                "host": "127.0.0.1",
+                "port": str(port),
+                "database": "postgres",
+                "user": "acp_test",
+            },
+        )
+        first_driver = PostgresSchemaDriver(driver_definition)
+        second_driver = PostgresSchemaDriver(driver_definition)
+
+        def disposable_runner(argv, cwd, env, timeout, credential):  # type: ignore[no-untyped-def]
+            # This test-only runner executes a user-owned Homebrew psql against
+            # its local trust-auth cluster. The credential is synthetic and the
+            # server/data live only under pytest's disposable tmp_path.
+            result = subprocess.run(
+                list(argv),
+                cwd=cwd,
+                env=dict(env),
+                pass_fds=(credential.fd,) if credential else (),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            return {
+                "argv": list(argv),
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+
+        first = first_driver.run_phase("setup", first_context, disposable_runner)
+        second = second_driver.run_phase("setup", second_context, disposable_runner)
+        assert first.ok, (
+            first.proof["action"].get("stderr"),
+            first.proof["observation"].get("stderr"),
+        )
+        assert second.ok, (
+            second.proof["action"].get("stderr"),
+            second.proof["observation"].get("stderr"),
+        )
+        export_name = postgres_schema_environment_name("database")
+        first_schema = first.environment_exports[export_name]
+        second_schema = second.environment_exports[export_name]
+        assert first_schema != second_schema
+
+        def worker_command(schema: str, owner: str) -> tuple[list[str], dict[str, str]]:
+            worker_environment = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "PGHOST": "127.0.0.1",
+                "PGPORT": str(port),
+                "PGDATABASE": "postgres",
+                "PGUSER": "acp_test",
+                export_name: schema,
+            }
+            sql = (
+                f'SET search_path TO "{schema}"; '
+                "CREATE TABLE IF NOT EXISTS worker_rows (owner text NOT NULL); "
+                f"INSERT INTO worker_rows(owner) VALUES ('{owner}')"
+            )
+            return (
+                [
+                    psql,
+                    "-X",
+                    "--no-password",
+                    "--no-align",
+                    "--tuples-only",
+                    "--set=ON_ERROR_STOP=1",
+                    "--command",
+                    sql,
+                ],
+                worker_environment,
+            )
+
+        workers = [
+            subprocess.Popen(
+                command,
+                env=worker_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for command, worker_environment in (
+                worker_command(first_schema, "worker-a"),
+                worker_command(second_schema, "worker-b"),
+            )
+        ]
+        for worker in workers:
+            stdout, stderr = worker.communicate(timeout=15)
+            assert worker.returncode == 0, f"worker failed: {stdout}\n{stderr}"
+
+        def read_namespace(schema: str) -> str:
+            command, worker_environment = worker_command(schema, "unused")
+            command[-1] = (
+                f'SET search_path TO "{schema}"; '
+                "SELECT string_agg(owner, ',' ORDER BY owner) FROM worker_rows"
+            )
+            result = subprocess.run(
+                command,
+                env=worker_environment,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr
+            return result.stdout.strip().splitlines()[-1]
+
+        assert read_namespace(first_schema) == "worker-a"
+        assert read_namespace(second_schema) == "worker-b"
+        for driver, driver_context in (
+            (first_driver, first_context),
+            (second_driver, second_context),
+        ):
+            teardown = driver.run_phase("teardown", driver_context, disposable_runner)
+            assert teardown.ok and teardown.proof["cleanup_proved"]
+    finally:
+        stop_disposable_postgres(pg_ctl, data_dir)
+
+
+@requires_linux_worker
+def test_supervised_postgres_workers_receive_distinct_ports_and_schemas(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("supervised disposable Postgres proof requires a non-root user")
+    binaries = postgres_test_binaries()
+    if binaries is None:
+        pytest.skip("supervised Postgres proof requires initdb, pg_ctl, and psql")
+    initdb, pg_ctl, psql = (binaries[name] for name in ("initdb", "pg_ctl", "psql"))
+
+    data_dir = tmp_path / "supervised-postgres-data"
+    log_path = tmp_path / "supervised-postgres.log"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        database_port = probe.getsockname()[1]
+
+    initialized = subprocess.run(
+        [
+            initdb,
+            "-D",
+            str(data_dir),
+            "--auth-local=trust",
+            "--auth-host=trust",
+            "--username=acp_test",
+            "--no-sync",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    try:
+        start = subprocess.run(
+            [
+                pg_ctl,
+                "-D",
+                str(data_dir),
+                "-l",
+                str(log_path),
+                "-o",
+                f"-h 127.0.0.1 -p {database_port}",
+                "-w",
+                "start",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert start.returncode == 0, start.stderr
+
+        current, _, _ = postgres_versions(tmp_path)
+        repo = postgres_repo(tmp_path, current)
+        config_path = repo / "acp.toml"
+        config_text = config_path.read_text(encoding="utf-8")
+        config_text = config_text.replace('executable = "/bin/echo"', f'executable = "{psql}"')
+        config_text = config_text.replace('host = "database.internal"', 'host = "127.0.0.1"')
+        config_text = config_text.replace('port = "5432"', f'port = "{database_port}"')
+        config_text = config_text.replace('database = "app"', 'database = "postgres"')
+        config_text = config_text.replace('user = "acp"', 'user = "acp_test"')
+        config_text += "\n[runtime.ports]\nAPP_PORT = [43000, 43999]\n"
+        config_path.write_text(config_text, encoding="utf-8")
+        for path in ("worker-a.txt", "worker-b.txt"):
+            (repo / path).write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "acp.toml", "worker-a.txt", "worker-b.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "configure disposable runtime fixture"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        supervisor = GitSupervisor(repo)
+        attempts: list[dict] = []
+        for owner, path in (("worker-a", "worker-a.txt"), ("worker-b", "worker-b.txt")):
+            created = supervisor.create_task(
+                f"record isolated runtime for {owner}",
+                "Write only the declared worker result after checking runtime isolation.",
+                ["The worker result contains only its own database row."],
+                [path],
+            )
+            attempts.append(supervisor.claim(created["id"], owner))
+
+        export_name = postgres_schema_environment_name("database")
+        environments = [
+            supervisor.runtime_environment(attempt["id"])["environment"] for attempt in attempts
+        ]
+        schema_values = [environment[export_name] for environment in environments]
+        port_values = [environment["APP_PORT"] for environment in environments]
+        assert len(set(schema_values)) == 2
+        assert len(set(port_values)) == 2
+
+        release = tmp_path / "release-workers"
+        ready_files = [tmp_path / "worker-a.ready", tmp_path / "worker-b.ready"]
+
+        work = list(
+            zip(
+                attempts,
+                ("worker-a", "worker-b"),
+                ("worker-a.txt", "worker-b.txt"),
+                strict=True,
+            )
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(
+                    supervisor.run_worker,
+                    attempt["id"],
+                    attempt["claim_token"],
+                    postgres_supervised_worker_command(
+                        psql,
+                        database_port,
+                        export_name,
+                        owner,
+                        result_path,
+                        ready_path,
+                        release,
+                    ),
+                )
+                for (attempt, owner, result_path), ready_path in zip(work, ready_files, strict=True)
+            ]
+            try:
+                deadline = time.monotonic() + 20
+                while not all(path.exists() for path in ready_files):
+                    for future in futures:
+                        if future.done():
+                            future.result()
+                    if time.monotonic() >= deadline:
+                        pytest.fail("both supervised workers did not reach their ready barrier")
+                    time.sleep(0.02)
+                for environment, ready_path in zip(environments, ready_files, strict=True):
+                    assert ready_path.read_text(encoding="utf-8").splitlines() == [
+                        environment["APP_PORT"],
+                        environment[export_name],
+                    ]
+                for environment in environments:
+                    with socket.create_connection(
+                        ("127.0.0.1", int(environment["APP_PORT"])), timeout=5
+                    ) as client:
+                        reply = client.recv(512).decode().splitlines()
+                    assert reply == [environment["APP_PORT"], environment[export_name]]
+            finally:
+                release.write_text("go\n", encoding="utf-8")
+            submissions = [future.result(timeout=35) for future in futures]
+
+        assert all(submission["status"] == "pending_qc" for submission in submissions)
+        for attempt, owner, result_path, environment in zip(
+            attempts,
+            ("worker-a", "worker-b"),
+            ("worker-a.txt", "worker-b.txt"),
+            environments,
+            strict=True,
+        ):
+            assert (Path(attempt["worktree"]) / result_path).read_text(
+                encoding="utf-8"
+            ).splitlines() == [
+                environment["APP_PORT"],
+                environment[export_name],
+                owner,
+            ]
+    finally:
+        stop_disposable_postgres(pg_ctl, data_dir)
 
 
 def test_rotation_cleans_old_credential_target_before_using_new_version(

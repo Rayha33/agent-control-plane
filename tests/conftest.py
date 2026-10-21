@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,6 +33,15 @@ def admin_headers():
 
 
 REQUIRE_LINUX_WORKER_ENV = "ACP_REQUIRE_LINUX_WORKER"
+GITHUB_ACTIONS_ENV = "GITHUB_ACTIONS"
+
+
+def _requires_linux_worker_proofs() -> bool:
+    if sys.platform.startswith("linux") and os.getenv(GITHUB_ACTIONS_ENV) == "true":
+        return True
+    setting = os.getenv(REQUIRE_LINUX_WORKER_ENV)
+    return setting == "1"
+
 
 _skipped: list[tuple[str, str]] = []
 _skipped_linux_worker: list[tuple[str, str]] = []
@@ -94,17 +104,19 @@ def pytest_sessionfinish(session, exitstatus) -> None:
     `acp run` supervises workers through a Linux child subreaper and /proc; those
     tests skip everywhere else. On a Linux runner they must actually execute — if a
     future image lost /proc or subreaper support, every one of them would skip and CI
-    would stay green while the path the README sells went untested. Set
-    ACP_REQUIRE_LINUX_WORKER=1 there and a skip in any phase becomes a failure,
-    including xfail. Every selected worker test must reach a passing call phase;
-    an empty selection, deselection, or collect-only run cannot satisfy the gate.
+    would stay green while the path the README sells went untested. On GitHub
+    Actions Linux the gate is mandatory and cannot be disabled by an environment
+    override. Other Linux CI can opt in with ACP_REQUIRE_LINUX_WORKER=1
+    or opt out with ACP_REQUIRE_LINUX_WORKER=0. A skip in any phase then becomes
+    a failure, including xfail. Every selected worker test must reach a passing call
+    phase; an empty selection, deselection, or collect-only run cannot satisfy the gate.
 
     Only tests carrying the `linux_worker` marker count. Measured on Linux: exactly
     one test skips there legitimately — a Darwin-specific fail-closed contract — so
     "assert zero skips" would be a control that cries wolf on every green run.
     """
 
-    if os.getenv(REQUIRE_LINUX_WORKER_ENV) != "1":
+    if not _requires_linux_worker_proofs():
         return
     problems = []
     if not _selected_linux_worker:
