@@ -34,6 +34,35 @@ retaining that gate. No `run_worker` path yet connects launch to the durable
 journal, runtime attestation, cleanup verification, or result import. This
 record does not authorize `externalSandbox` for ACP workers.
 
+**Current-source live isolation and import probe (2026-10-21):** On exact
+source commit `a70eef36b1b90523be383598bc7d0e0501d710cf`, the opt-in
+`test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in a
+disposable Debian 12 ARM64 Lima guest (Linux 6.1.187-1, Python 3.11.2, systemd
+user manager, cgroup v2). The trusted root-owned runc 1.5.2 executable matched
+the upstream ARM64 asset SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+`ACP_LIVE_ISOLATION_PROBES=1` passed, and the combined
+`ACP_LIVE_ISOLATION_PROBES=1` plus
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` run also passed. These runs exercised
+the production launch driver with no model or provider credentials; the
+combined run verified a deterministic workspace edit/test, cleanup reaching
+`cleanup_verified`, and host-side import of only the expected paths. The
+isolation assertions denied base/harness/sibling/unrelated-project, home,
+config, credential, and host-temp sentinels; symlink and canonical-path
+escapes; access to the tested host controller PID and the two host/systemd
+socket paths; and a direct-IP network probe.
+An initial setup with a user-owned runc under `/tmp` was rejected before
+launch; installing the same hash-verified binary at root-owned
+`/usr/local/bin/runc` satisfied the trust pin without weakening it. The test
+verified its run root was gone and the exact attempt units were quiescent;
+post-run unit listing showed no `acp-*` entries. The VM was stopped, not
+deleted. Exact-head
+hosted CI for this source passed all four Ubuntu/macOS × Python 3.11/3.12 jobs
+([run 39522242994](https://github.com/Rayha33/agent-control-plane/actions/runs/39522242994)).
+Each invocation exercised one no-model launch-driver attempt; neither proves
+concurrent live runc workers, `run_worker()` integration, or provider
+authentication/egress. Configured `run_worker()` remains fail-closed.
+
 **Cleanup-verification update (2026-10-16):** The supervisor-owned verifier is
 now implemented in source and wired into reaper recovery for eligible
 `cleanup_reported` attempts. Schema 33 stores a separate write-once receipt;
