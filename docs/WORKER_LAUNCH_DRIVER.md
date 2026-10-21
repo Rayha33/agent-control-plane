@@ -35,11 +35,14 @@ manager and runc processes. They prove fail-closed containment, not successful
 cleanup or restart recovery.
 The code-bearing commit `2383221c1a84cf52c08f42043465baea2ed4d487` passed
 [exact-head hosted CI run 38884017803](https://github.com/Rayha33/agent-control-plane/actions/runs/38884017803)
-with all four Ubuntu/macOS × Python 3.11/3.12 jobs green. Result import is not
-connected to the worker.
+with all four Ubuntu/macOS × Python 3.11/3.12 jobs green. An explicitly opted-in
+no-provider `run_worker()` bridge now composes the registered launch service,
+independent cleanup verification, and host-validated result import. It does not
+enable provider authentication or egress, and the default OCI worker path
+continues to fail closed.
 `cleanup_verified` certifies resource cleanup, not worker success; every result
 consumer continues to require runc exit code 0. Configured OCI
-`run_worker()` still fails closed with
+`run_worker()` without `--sandbox-experimental-opt-in` still fails closed with
 `sandbox_executor_unavailable`.
 
 ## Decision
@@ -570,30 +573,39 @@ separately, but the exact post-launch-exception branch has not been injected
 through real monitor IPC. This guest run also does not prove daemon/user-manager
 restart, logout, reboot, arbitrary crash timing, or result import. Workspace
 isolation, production provider authentication/egress, and validated result
-transfer remain open acceptance gates. `run_worker()` must remain
-fail-closed; this evidence does not enable OCI execution.
+transfer remain open acceptance gates. The default `run_worker()` path must
+remain fail-closed; this evidence does not enable the later experimental
+opt-in or weaken the macOS execution path.
 
 Parent task #2370 remains open until workspace isolation, provider
 authentication/egress, validated result transfer, and all independent safety
-gates pass. This ADR does not enable OCI in `run_worker()` or weaken the macOS
-execution path.
+gates pass. At the time of this ADR evidence, OCI was not enabled in
+`run_worker()`; the later explicit no-provider experiment is recorded below.
+This ADR does not weaken the macOS execution path.
 
-## Supervisor composition boundary (2026-10-16; task #3268)
+## Supervisor composition boundary (updated 2026-10-21; task #3268/#2370)
 
-The launch-driver/journal lifecycle now has an explicit no-model composition
-entrypoint, but it is still not the registered worker's default API.
+The launch-driver/journal lifecycle has an explicit no-model composition
+entrypoint, but it is not the registered worker's default API.
 `WorkersMixin.run_worker()` first validates a non-empty command and computes its
-digest, then returns `sandbox_executor_unavailable` when OCI is configured,
-before heartbeat, reservation, or host `Popen`; without OCI configuration, it
-uses its separate direct-host process path subject to the existing reservation
-preflight and Linux containment guard. The module-level
-`start_registered_no_model_sandbox_worker()` is now the sole composition
-caller: it requires `experimental_opt_in=True`, reserves the claimed attempt,
-copies and re-verifies the pinned rootfs, mints the baseline and disjoint
-workspace without `.git`, binds them in the journal, and calls
-`start_sandbox_launch_driver()`. It is not wired to `run_worker()`, a CLI, or a
-provider/model; the caller must supply a local fake-worker command. Result
-import remains a separate explicit call.
+digest. With OCI configured and no opt-in it still returns
+`sandbox_executor_unavailable`, before heartbeat, reservation, or host
+`Popen`; without OCI configuration, it uses its separate direct-host process
+path subject to the existing reservation preflight and Linux containment
+guard. The CLI can forward `--sandbox-experimental-opt-in` plus explicit
+resource limits; that opt-in is currently limited to this no-provider
+experiment and is not a production-provider enablement claim.
+
+`start_registered_no_model_sandbox_worker()` requires
+`experimental_opt_in=True`, reserves the claimed attempt, copies and
+re-verifies the pinned rootfs, mints the baseline and disjoint workspace
+without `.git`, binds them in the journal, and calls
+`start_sandbox_launch_driver()`. It makes no model/provider calls; callers
+supply a local fake-worker command. The direct helper returns its execution
+and launch receipt for explicit composition. The opted-in `run_worker()` path
+waits for the exact execution identity, requires independent cleanup
+verification and exit code zero, then calls the existing host-validated
+workspace importer and returns its `pending_qc` result.
 
 The durable ownership boundaries that a caller must compose are:
 
@@ -607,10 +619,12 @@ The durable ownership boundaries that a caller must compose are:
   alone records `cleanup_verified`; the reaper consumes that proof to release
   runtime and leases/fences. These owners cannot be collapsed into the
   direct-worker PID fields or host-PID cleanup.
-- Result import is a separate supervisor call after verified cleanup. It
-  rejects an attempt that aliases a direct worker PID, captures a write-once
-  candidate, and produces a `pending_qc` submission. The live test calls this
-  explicitly; the launch-driver does not import results itself.
+- Result import is always a separate supervisor action after verified cleanup.
+  It rejects an attempt that aliases a direct worker PID, captures a
+  write-once candidate, and produces a `pending_qc` submission. The direct
+  helper leaves this call to its caller; the explicit `run_worker()` opt-in
+  performs it only after exact cleanup verification and exit code zero. The
+  launch-driver itself never imports results.
 
 The opt-in function renews the attempt lease during preparation and keeps
 renewing until the launch driver has itself renewed the lease and durably
@@ -631,8 +645,12 @@ The launch-driver retains process-local wait/reap ownership; the supervisor
 verifier and reaper retain cleanup authority; the caller retains the explicit
 QC import handoff.
 This narrow composition does not enable provider workers, prove provider
-egress or full host-path/Git isolation, or eliminate the parent #2370
-acceptance gates. The default `run_worker()` refusal remains mandatory.
+egress, or eliminate the parent #2370 acceptance gates. The default
+`run_worker()` path remains fail-closed; the separate experimental opt-in
+requires explicit resource limits, waits for the exact execution identity,
+requires the independent `cleanup_verified` transition, and only then invokes
+the existing host-validated workspace importer. It rejects `--result-manifest`
+because sandbox imports use the validated private-workspace diff instead.
 
 ### Registered-worker host-path probe
 
@@ -676,6 +694,25 @@ ACP_LIVE_ISOLATION_DISPOSABLE_HOST="$(hostname)" \
 uv run --extra dev pytest -q tests/test_sandbox_worker_lifecycle_integration.py
 ```
 
+To exercise the full explicit supervisor `run_worker()` lifecycle bridge on a
+disposable host, use the coding-task import fixture without the separate
+isolation-sentinel mode:
+
+```sh
+ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 \
+ACP_OCI_TEST_RUNC=/usr/local/bin/runc-1.5.2 \
+ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
+ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1 \
+ACP_LIVE_SUPERVISED_RUN_WORKER=1 \
+uv run --extra dev pytest -q \
+  tests/test_sandbox_worker_lifecycle_integration.py::test_live_production_launch_driver_runs_exact_pinned_runc_request
+```
+
+This mode is intended to prove the no-provider end-to-end path only: launch,
+completion, independent cleanup verification, and exact validated import to
+`pending_qc`. Do not interpret it as provider authentication/egress proof or
+as permission to enable the experimental flag on a shared production host.
+
 The import assertion requires the complete imported commit path set to equal
 the two expected worker outputs; the probe script is already in the task base
 commit. The hostname variable is an operator self-attestation, not automatic
@@ -683,8 +720,9 @@ VM detection.
 
 This is targeted evidence for this pinned BusyBox rootfs, Linux kernel, and
 runc 1.5.2 configuration—not proof against every same-UID host actor, every
-kernel/runtime, provider authentication, or approved provider egress. Neither
-test enables production `run_worker()` or closes parent task #2370.
+kernel/runtime, provider authentication, or approved provider egress. Only the
+explicit no-provider test mode enables the experimental `run_worker()` bridge;
+the default path remains fail-closed and parent task #2370 remains open.
 
 ### Provider-proxy primitive live probe
 
@@ -751,4 +789,31 @@ found no ACP test units/processes or `acp-live-*` fixture directories.
 This is still a deterministic no-model fixture, not a provider/model coding
 agent or the default `run_worker()` path. It does not prove provider
 authentication/egress, or close the remaining #2370 recovery and integrated
-worker acceptance gates; configured OCI `run_worker()` remains fail-closed.
+worker acceptance gates; configured OCI `run_worker()` without
+`--sandbox-experimental-opt-in` remains fail-closed.
+
+### Explicit `run_worker()` bridge replay (2026-10-21; no model)
+
+The same production launch-driver test passed **1/1** with
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` and
+`ACP_LIVE_SUPERVISED_RUN_WORKER=1`. This exercises the public supervisor path:
+the opt-in `run_worker()` reserves and launches the exact attempt, waits for
+the execution identity, requires independently verified cleanup and exit code
+zero, then imports the validated workspace diff to `pending_qc`. The fixture
+asserted its expected four imported paths. The default OCI path remains
+fail-closed; this proves neither provider authentication/egress nor the
+production provider-enabled worker.
+
+The isolated test source was staged under guest `/tmp` without host mounts.
+Host and guest SHA-256 matched for `workers.py`
+(`c9cabd34d052578252aa55ae096e65d9c079223ead7d8a701aa72dfe1e74dd1f`),
+`sandbox_launch_driver_service.py`
+(`3f9a3b9fe515074b5542518b44a4473f994c956c695d2d5fec047ff0ebb049ff`),
+`cli.py` (`70abb22d81933f27938f2eb4a62f14c8d01b2c6f90df1c5be671fbace411b2a1`),
+and the test module
+(`cdbaf024abd1bab8a5b7a04984b8481bdf670e627c6d41c90cf6ea89deafcf58`). The
+guest was Debian 12 ARM64, Linux `6.1.0-53-cloud-arm64`, systemd `252.39`,
+Python `3.11.2`, uv `0.12.21`, cgroup v2, and rootless runc `1.5.2` with SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`. No
+provider credentials or egress were configured. Postflight found no ACP test
+units or `acp-live-launch-driver-*` fixture roots.

@@ -354,6 +354,19 @@ def parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="optional manifest path in the worker commit (relative to the attempt worktree)",
     )
+    run.add_argument(
+        "--sandbox-experimental-opt-in",
+        action="store_true",
+        help=(
+            "run the local no-provider OCI worker experiment; requires every explicit "
+            "sandbox resource limit below and a pinned sandbox.oci configuration"
+        ),
+    )
+    run.add_argument("--sandbox-memory-max-bytes", type=int)
+    run.add_argument("--sandbox-cpu-quota", type=int, help="CPU quota in microseconds")
+    run.add_argument("--sandbox-cpu-period", type=int, help="CPU period in microseconds")
+    run.add_argument("--sandbox-pids-max", type=int)
+    run.add_argument("--sandbox-timeout-seconds", type=float)
     add_credential_source(run)
     run.add_argument("command", nargs=argparse.REMAINDER)
     terminate = commands.add_parser("terminate", help="stop a supervised worker")
@@ -996,12 +1009,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = supervisor.integrate(args.task_id, args.integrator, _read_credential(args))
         elif args.action == "run":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            sandbox_options = {}
+            sandbox_values = (
+                args.sandbox_memory_max_bytes,
+                args.sandbox_cpu_quota,
+                args.sandbox_cpu_period,
+                args.sandbox_pids_max,
+                args.sandbox_timeout_seconds,
+            )
+            if args.sandbox_experimental_opt_in or any(
+                value is not None for value in sandbox_values
+            ):
+                sandbox_options = {
+                    "sandbox_experimental_opt_in": args.sandbox_experimental_opt_in,
+                    "sandbox_memory_max_bytes": args.sandbox_memory_max_bytes,
+                    "sandbox_cpu_quota": args.sandbox_cpu_quota,
+                    "sandbox_cpu_period": args.sandbox_cpu_period,
+                    "sandbox_pids_max": args.sandbox_pids_max,
+                    "sandbox_timeout_seconds": args.sandbox_timeout_seconds,
+                }
             result = supervisor.run_worker(
                 args.attempt_id,
                 args.claim_token,
                 command,
                 _read_credential(args),
                 result_manifest_path=args.result_manifest,
+                **sandbox_options,
             )
         elif args.action == "terminate":
             result = supervisor.terminate_worker(args.attempt_id, _read_credential(args))

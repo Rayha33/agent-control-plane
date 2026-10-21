@@ -10,8 +10,10 @@ handoff; fresh supervisor processes cancel (when requested) and reap the exact
 execution. An additional opt-in natural-completion branch asks the independent
 cleanup verifier to prove teardown, performs a deterministic source edit and
 test inside the private workspace, then imports the host-captured result into
-the normal pending-QC submission path. This is no-model executor evidence: it
-does not wire ``run_worker`` or start a provider/model worker.
+the normal pending-QC submission path. A separate explicit opt-in mode drives
+that fixture through ``WorkersMixin.run_worker`` and its verified-import
+boundary. These are no-model executor proofs; they do not start a
+provider/model worker or enable the default ``run_worker`` path.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -597,31 +599,48 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
 
     exit_code = 73
     try:
+        supervisor = GitSupervisor(repo)
         with patch.object(
             sandbox_launch_driver_service,
             "_run_trusted_runtime_command",
             capture_driver_service_output,
         ):
-            _execution, receipt = (
-                sandbox_launch_driver_service.start_registered_no_model_sandbox_worker(
-                    GitSupervisor(repo),
-                    attempt_id=attempt_id,
-                    claim_token=claim_token,
-                    command=command,
-                    memory_max_bytes=memory_max_bytes,
-                    cpu_quota=cpu_quota,
-                    cpu_period=cpu_period,
-                    pids_max=pids_max,
-                    timeout_seconds=timeout_seconds,
-                    credential=credential,
-                    experimental_opt_in=True,
+            if os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1":
+                result = supervisor.run_worker(
+                    attempt_id,
+                    claim_token,
+                    command,
+                    credential,
+                    sandbox_experimental_opt_in=True,
+                    sandbox_memory_max_bytes=memory_max_bytes,
+                    sandbox_cpu_quota=cpu_quota,
+                    sandbox_cpu_period=cpu_period,
+                    sandbox_pids_max=pids_max,
+                    sandbox_timeout_seconds=timeout_seconds,
                 )
-            )
-        result_sender.send(
-            (
-                "ok",
-                os.getpid(),
-                {
+                receipt_payload = result["sandbox_launch_receipt"]
+                result_summary = {
+                    "status": result["status"],
+                    "sandbox_execution_id": result["sandbox_execution_id"],
+                    "sandbox_cleanup_verified": result["sandbox_cleanup_verified"],
+                }
+            else:
+                _execution, receipt = (
+                    sandbox_launch_driver_service.start_registered_no_model_sandbox_worker(
+                        supervisor,
+                        attempt_id=attempt_id,
+                        claim_token=claim_token,
+                        command=command,
+                        memory_max_bytes=memory_max_bytes,
+                        cpu_quota=cpu_quota,
+                        cpu_period=cpu_period,
+                        pids_max=pids_max,
+                        timeout_seconds=timeout_seconds,
+                        credential=credential,
+                        experimental_opt_in=True,
+                    )
+                )
+                receipt_payload = {
                     "attempt_id": receipt.attempt_id,
                     "claim_token": receipt.claim_token,
                     "execution_id": receipt.execution_id,
@@ -630,7 +649,14 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                     "driver_pid": receipt.driver_pid,
                     "driver_identity": receipt.driver_identity,
                     "control_group": receipt.control_group,
-                },
+                }
+                result_summary = None
+        result_sender.send(
+            (
+                "ok",
+                os.getpid(),
+                receipt_payload,
+                result_summary,
             )
         )
     except BaseException as error:
@@ -2165,8 +2191,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
 
     isolation_probes = os.environ.get("ACP_LIVE_ISOLATION_PROBES") == "1"
     import_result_after_cleanup = os.environ.get("ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP") == "1"
+    supervised_run_worker = os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1"
     coding_task = isolation_probes or import_result_after_cleanup
-    coding_source = "printf 'coding-task-pass\\n'\n"
+    coding_source = "printf 'coding-task-pass\\n'"
     coding_script_name = "sandbox-coding-task.sh"
     coding_test_output_name = "sandbox-coding-task.test"
     if isolation_probes:
@@ -2552,6 +2579,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             or crash_after_monitor_acceptance
             or crash_before_monitor_start
         )
+        if supervised_run_worker and (
+            not import_result_after_cleanup
+            or isolation_probes
+            or cancel_after_start
+            or timeout_after_start
+            or lease_expiry_after_stop
+            or crash_driver_service_before_receipt
+        ):
+            pytest.fail(
+                "supervisor run_worker proof requires successful coding-task completion and result import"
+            )
         if isolation_probes and (
             cancel_after_start
             or timeout_after_start
@@ -2684,11 +2722,20 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         if producer_result[0] == "manager_accepted":
             controller_pid = producer_result[1]
             producer_receipt = None
+            producer_summary = None
         else:
-            controller_pid, producer_receipt = producer_result[1:]
+            controller_pid, producer_receipt, producer_summary = producer_result[1:]
             assert producer_receipt["attempt_id"] == identity[0]
             assert producer_receipt["claim_token"] == identity[1]
             assert producer_receipt["execution_id"] == identity[2]
+        if supervised_run_worker:
+            assert producer_summary == {
+                "status": "pending_qc",
+                "sandbox_execution_id": identity[2],
+                "sandbox_cleanup_verified": True,
+            }
+        else:
+            assert producer_summary is None
         if crash_after_monitor_acceptance or crash_before_monitor_start:
             _wait_for_receipt(run_root, "monitor-handoff-crash.json", timeout=40.0)
             accepted = json.loads(monitor_acceptance_marker.read_text(encoding="ascii"))
@@ -3295,14 +3342,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         durable = supervisor._sandbox_execution_get(attempt["id"])
         while (
             durable is not None
-            and durable["phase"] != "cleanup_reported"
+            and durable["phase"] not in {"cleanup_reported", "cleanup_verified"}
             and time.monotonic() < deadline
         ):
             time.sleep(0.05)
             durable = supervisor._sandbox_execution_get(attempt["id"])
         service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
         assert runner["credential"] not in service_log
-        assert durable is not None and durable["phase"] == "cleanup_reported", service_log
+        expected_cleanup_phase = "cleanup_verified" if supervised_run_worker else "cleanup_reported"
+        assert durable is not None and durable["phase"] == expected_cleanup_phase, service_log
         if isolation_probes and durable["runc_exit_code"] != 0:
             probe_marker = Path(durable["workspace_root_path"]) / "launch-driver-started"
             probe_detail = (
@@ -3421,7 +3469,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         assert runner["credential"] not in event_bodies
         assert runner["credential"].encode("utf-8") not in Path(supervisor.db_path).read_bytes()
         assert not (Path(execution["state_path"]) / "launch-driver-request.json").exists()
-        assert durable["phase"] == "cleanup_reported"
+        assert durable["phase"] == expected_cleanup_phase
         assert durable["cleanup_receipt"]["version"] == 3
         assert durable["cleanup_receipt"]["verification_status"] == "unverified"
         action = durable["cleanup_receipt"]["action"]

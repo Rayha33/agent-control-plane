@@ -245,6 +245,13 @@ class WorkersMixin:
         command: Sequence[str],
         credential: str | None = None,
         result_manifest_path: str | None = None,
+        *,
+        sandbox_experimental_opt_in: bool = False,
+        sandbox_memory_max_bytes: int | None = None,
+        sandbox_cpu_quota: int | None = None,
+        sandbox_cpu_period: int | None = None,
+        sandbox_pids_max: int | None = None,
+        sandbox_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         from ..worker_trampoline import _monitor_argv_prefix
 
@@ -254,6 +261,62 @@ class WorkersMixin:
         if not command:
             raise SupervisorError("invalid_command", "worker command is required")
         command_digest = _worker_command_digest(command)
+        sandbox_options = (
+            sandbox_memory_max_bytes,
+            sandbox_cpu_quota,
+            sandbox_cpu_period,
+            sandbox_pids_max,
+            sandbox_timeout_seconds,
+        )
+        if sandbox_experimental_opt_in is True:
+            from . import oci_worker
+            from .sandbox_launch_driver_service import _MAX_TIMEOUT_SECONDS
+
+            if result_manifest_path is not None:
+                raise SupervisorError(
+                    "sandbox_result_manifest_unsupported",
+                    "sandboxed workers use the host-validated workspace import; --result-manifest is not supported",
+                )
+            if any(value is None for value in sandbox_options):
+                raise SupervisorError(
+                    "sandbox_resource_limits_required",
+                    "experimental sandbox execution requires explicit memory, CPU quota, CPU period, PID, and timeout limits",
+                )
+            if (
+                any(type(value) is not int or value <= 0 for value in sandbox_options[:4])
+                or (
+                    type(sandbox_timeout_seconds) not in {int, float}
+                    or not 0.2 <= sandbox_timeout_seconds <= _MAX_TIMEOUT_SECONDS
+                )
+                or (
+                    not oci_worker._MIN_MEMORY_BYTES
+                    <= sandbox_memory_max_bytes
+                    <= oci_worker._MAX_INT64
+                    or sandbox_cpu_quota > oci_worker._MAX_INT64
+                    or sandbox_cpu_period > oci_worker._MAX_UINT64
+                    or sandbox_pids_max > oci_worker._MAX_PIDS
+                )
+            ):
+                raise SupervisorError(
+                    "invalid_sandbox_resource_limits",
+                    "sandbox resource limits must satisfy the OCI compiler bounds and timeout must be between 0.2 and 3540 seconds",
+                )
+            return self._run_experimental_sandbox_worker(
+                attempt_id,
+                claim_token,
+                command,
+                credential=credential,
+                memory_max_bytes=sandbox_memory_max_bytes,
+                cpu_quota=sandbox_cpu_quota,
+                cpu_period=sandbox_cpu_period,
+                pids_max=sandbox_pids_max,
+                timeout_seconds=sandbox_timeout_seconds,
+            )
+        if any(value is not None for value in sandbox_options):
+            raise SupervisorError(
+                "sandbox_opt_in_required",
+                "sandbox resource limits require the explicit experimental opt-in",
+            )
         if self.config.oci_runc_executable is not None:
             raise SupervisorError(
                 "sandbox_executor_unavailable",
@@ -584,6 +647,221 @@ class WorkersMixin:
                 process.returncode,
             )
             raise
+
+    def _run_experimental_sandbox_worker(
+        self,
+        attempt_id: str,
+        claim_token: int,
+        command: Sequence[str],
+        *,
+        credential: str | None,
+        memory_max_bytes: int,
+        cpu_quota: int,
+        cpu_period: int,
+        pids_max: int,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Run a no-provider worker through the explicit OCI lifecycle experiment.
+
+        Provider authentication and egress are intentionally not configured by
+        this path. Result transfer is allowed only after the exact execution
+        exits successfully, its independent cleanup verifier passes, and the
+        existing host-side importer validates the private workspace diff.
+        """
+
+        from .sandbox_launch_driver_service import (
+            SandboxLaunchDriverServiceError,
+            start_registered_no_model_sandbox_worker,
+        )
+
+        if self.config.oci_runc_executable is None or self.config.oci_rootfs_pin is None:
+            raise SupervisorError(
+                "sandbox_executor_unavailable",
+                "experimental sandbox execution requires configured pinned runc and rootfs; refusing host fallback",
+            )
+        try:
+            execution, launch_receipt = start_registered_no_model_sandbox_worker(
+                self,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                command=tuple(command),
+                memory_max_bytes=memory_max_bytes,
+                cpu_quota=cpu_quota,
+                cpu_period=cpu_period,
+                pids_max=pids_max,
+                timeout_seconds=float(timeout_seconds),
+                credential=credential,
+                experimental_opt_in=True,
+            )
+        except SandboxLaunchDriverServiceError as error:
+            raise SupervisorError("sandbox_execution_start_failed", str(error)) from error
+
+        identity = (
+            attempt_id,
+            claim_token,
+            execution.get("execution_id") if isinstance(execution, dict) else None,
+        )
+        if not isinstance(identity[2], str) or not identity[2]:
+            raise SupervisorError(
+                "sandbox_execution_identity_invalid",
+                "sandbox launch returned no durable execution identity; execution remains fenced",
+            )
+
+        deadline = time.monotonic() + float(timeout_seconds) + 90
+        cancellation_deadline: float | None = None
+        try:
+            while True:
+                current = self._sandbox_execution_get(attempt_id)
+                if (
+                    current is None
+                    or (
+                        current.get("attempt_id"),
+                        current.get("claim_token"),
+                        current.get("execution_id"),
+                    )
+                    != identity
+                ):
+                    raise SupervisorError(
+                        "sandbox_execution_transition_conflict",
+                        "sandbox worker execution identity changed while waiting; execution remains fenced",
+                    )
+                phase = current.get("phase")
+                if phase == "cleanup_verified":
+                    verified = current
+                    break
+                if phase == "cleanup_reported":
+                    verified = self._sandbox_execution_verify_cleanup(
+                        attempt_id,
+                        claim_token,
+                        credential=credential,
+                    )
+                    break
+                if phase == "ambiguous":
+                    raise SupervisorError(
+                        "sandbox_execution_ambiguous",
+                        "sandbox worker cleanup is ambiguous; execution and resource fences remain held",
+                    )
+                if phase not in {"reserved", "launched", "running", "stopping", "exited"}:
+                    raise SupervisorError(
+                        "sandbox_execution_transition_invalid",
+                        "sandbox worker reached an unknown phase; execution and resource fences remain held",
+                    )
+
+                now = time.monotonic()
+                if now >= deadline and cancellation_deadline is None:
+                    # The launch driver has its own exact systemd deadline. If
+                    # its durable cleanup handoff is late, request cancellation
+                    # only through the authenticated monitor and keep polling.
+                    if phase in {"launched", "running", "stopping"}:
+                        self.terminate_worker(attempt_id, credential=credential)
+                    cancellation_deadline = now + 30
+                elif cancellation_deadline is not None and now >= cancellation_deadline:
+                    raise SupervisorError(
+                        "sandbox_execution_cleanup_unverified",
+                        "sandbox worker did not produce a cleanup report after exact cancellation; execution and resource fences remain held",
+                    )
+                time.sleep(0.05)
+        except KeyboardInterrupt as error:
+            try:
+                current = self._sandbox_execution_get(attempt_id)
+                if (
+                    current is not None
+                    and (
+                        current.get("attempt_id"),
+                        current.get("claim_token"),
+                        current.get("execution_id"),
+                    )
+                    == identity
+                    and current.get("phase") in {"launched", "running", "stopping"}
+                ):
+                    self.terminate_worker(attempt_id, credential=credential)
+                cleanup_deadline = time.monotonic() + 30
+                while time.monotonic() < cleanup_deadline:
+                    current = self._sandbox_execution_get(attempt_id)
+                    if (
+                        current is None
+                        or (
+                            current.get("attempt_id"),
+                            current.get("claim_token"),
+                            current.get("execution_id"),
+                        )
+                        != identity
+                    ):
+                        raise SupervisorError(
+                            "sandbox_execution_transition_conflict",
+                            "sandbox worker identity changed during cancellation; execution remains fenced",
+                        )
+                    if current.get("phase") == "cleanup_reported":
+                        verified = self._sandbox_execution_verify_cleanup(
+                            attempt_id,
+                            claim_token,
+                            credential=credential,
+                        )
+                        if (
+                            verified.get("attempt_id"),
+                            verified.get("claim_token"),
+                            verified.get("execution_id"),
+                            verified.get("phase"),
+                        ) != (*identity, "cleanup_verified"):
+                            raise SupervisorError(
+                                "sandbox_execution_transition_conflict",
+                                "cleanup verifier returned a different execution identity; execution remains fenced",
+                            )
+                        break
+                    if current.get("phase") == "cleanup_verified":
+                        break
+                    if current.get("phase") == "ambiguous":
+                        raise SupervisorError(
+                            "sandbox_execution_ambiguous",
+                            "sandbox cancellation is ambiguous; execution and resource fences remain held",
+                        )
+                    time.sleep(0.05)
+                else:
+                    raise SupervisorError(
+                        "sandbox_execution_cleanup_unverified",
+                        "sandbox cancellation did not produce a cleanup report; execution and resource fences remain held",
+                    )
+            except BaseException as cleanup_error:
+                error.add_note(
+                    f"sandbox cancellation/cleanup verification also failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+        if (
+            verified.get("attempt_id"),
+            verified.get("claim_token"),
+            verified.get("execution_id"),
+        ) != identity or verified.get("phase") != "cleanup_verified":
+            raise SupervisorError(
+                "sandbox_execution_cleanup_unverified",
+                "sandbox worker result cannot be imported without exact-identity independent cleanup verification",
+            )
+        exit_code = verified.get("runc_exit_code")
+        if type(exit_code) is not int or exit_code != 0:
+            raise SupervisorError(
+                "worker_failed",
+                f"sandbox worker exited {exit_code!r}; cleanup was independently verified and no result was imported",
+            )
+        imported = self.import_sandbox_execution_result(
+            attempt_id,
+            claim_token,
+            credential=credential,
+        )
+        return {
+            **imported,
+            "sandbox_execution_id": identity[2],
+            "sandbox_cleanup_verified": True,
+            "sandbox_launch_receipt": {
+                "attempt_id": launch_receipt.attempt_id,
+                "claim_token": launch_receipt.claim_token,
+                "execution_id": launch_receipt.execution_id,
+                "service_unit": launch_receipt.service_unit,
+                "invocation_id": launch_receipt.invocation_id,
+                "driver_pid": launch_receipt.driver_pid,
+                "driver_identity": launch_receipt.driver_identity,
+                "control_group": launch_receipt.control_group,
+            },
+        }
 
     def _preflight_direct_worker_launch(
         self,

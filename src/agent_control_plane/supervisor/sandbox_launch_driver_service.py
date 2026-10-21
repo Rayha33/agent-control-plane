@@ -3,11 +3,12 @@
 The systemd service owns the pinned-runc handle, init gate, runtime attestation,
 wait receipt, and journal transitions. The authenticated recovery monitor is
 started by the journal outside the attempt slice. The explicit
-``start_registered_no_model_sandbox_worker`` experiment composes a claimed
-attempt with this service but is not wired into ``WorkersMixin.run_worker``.
-This supervisor function makes no model/provider calls; callers must supply a
-local fake-worker command for the no-model experiment. Provider egress, full
-workspace/Git isolation, and default worker enablement remain separate gates.
+``start_registered_no_model_sandbox_worker`` path composes a claimed attempt
+with this service; ``WorkersMixin.run_worker`` exposes that composition only
+behind the explicit sandbox experimental opt-in. This supervisor function
+makes no model/provider calls; callers must supply a local fake-worker command
+for the no-model experiment. Provider egress, full workspace/Git isolation,
+and default worker enablement remain separate gates.
 """
 
 from __future__ import annotations
@@ -1896,11 +1897,13 @@ def start_registered_no_model_sandbox_worker(
 ) -> tuple[dict[str, Any], SandboxLaunchDriverReceipt]:
     """Compose a registered attempt with the production OCI launch service.
 
-    This is an explicit no-model experiment, not the ``run_worker`` path. It
-    reserves the exact registered attempt, snapshots its worktree without Git
-    metadata, copies and re-verifies the configured rootfs pin, binds those
-    private paths in the journal, and hands off to the authenticated
-    launch-driver service. It does not call a model/provider or import results.
+    This explicit no-model helper is the launch composition used by
+    ``run_worker`` only behind its experimental opt-in. It reserves the exact
+    registered attempt, snapshots its worktree without Git metadata, copies
+    and re-verifies the configured rootfs pin, binds those private paths in the
+    journal, and hands off to the authenticated launch-driver service. It does
+    not call a model/provider or import results; the caller retains the
+    cleanup-gated result-import decision.
 
     The default worker entrypoint remains fail-closed. Every argument that can
     be rejected without side effects is validated before reservation. During
