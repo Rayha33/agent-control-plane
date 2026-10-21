@@ -53,6 +53,16 @@ exhaustion. A study of coding-agent token consumption reports high
 run-to-run variability on its evaluated tasks. These reports motivate
 controls; they do not establish rates or generalize provider pricing.
 
+A recent Codex desktop report records 8.95 billion input-plus-output tokens
+over a fixed 36-hour window, including compaction responses omitted from a
+legacy counter. Its author explicitly does not establish billed cost, incorrect
+billing, a configured-budget violation, or a concurrency-limit breach. The
+companion feature request proposes one shared reserve-before-request budget for
+root and descendant model calls, including compaction and retries, with honest
+units and conservative handling of unresolved requests. This is a bounded
+practitioner report plus a proposed safeguard, not prevalence or proof of the
+incident's root cause.
+
 ## Budget and usage contract
 
 Every value has an explicit scope, unit, source, observation time, and status.
@@ -547,6 +557,13 @@ The counter must match the operation:
 
 - ACP can count mandate/attempt launches that pass through its own issuance
   boundary. It cannot claim this count includes provider-internal agents.
+- A model-request budget must reserve at the shared request-admission boundary,
+  not at worker launch: sampling, compaction, and each retry can incur another
+  provider request across the root and descendants. Settle each confirmed
+  response once; keep an unresolved reservation outstanding after timeout,
+  cancellation, or missing usage until reconciled. A request/token ceiling is
+  not a dollar ceiling unless the provider supplies a trustworthy unit and a
+  conservative pre-request bound or enforces the cap itself.
 - Local CPU, memory, process, and elapsed-time limits require an owned runtime
   boundary and a live identity binding. A cgroup sample is useful evidence but
   does not by itself prove the worker is stopped or safe to signal.
@@ -705,6 +722,17 @@ promotable evidence.
   environment; it does not establish current behavior across products or ACP,
   but supports requiring evidence at the actual spawn boundary before claiming
   a depth limit is enforced.
+- [OpenAI Codex issue #55168](https://github.com/openai/codex/issues/55168) and
+  its [request-budget companion #55180](https://github.com/openai/codex/issues/55180):
+  opened 2026-10-19. A sanitized, source-audited local ledger reports 8.95B
+  processed input-plus-output tokens over 36 hours across 50,465 unique
+  responses, including compaction omitted from a legacy usage counter. The
+  report does not establish billed cost, incorrect billing, a configured-cap
+  breach, or a concurrency-limit breach. The companion proposes atomic shared
+  admission before each model request, including sampling, compaction, and
+  retries, and retaining uncertain reservations across timeout/cancellation.
+  Treat this as one practitioner evidence package and a proposed engineering
+  contract, not as prevalence or proof of root cause.
 - [How Do AI Agents Spend Your Money?](https://arxiv.org/abs/2604.22750):
   research on token use in evaluated coding-agent tasks; results are specific
   to its dataset and setup.
