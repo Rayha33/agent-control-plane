@@ -334,6 +334,19 @@ destination-restricted provider egress, and recovery across daemon/user-manager
 restart and reboot. These boundaries have not been proven for a production provider
 worker. Keep the default path fail-closed; the experimental no-provider replay is not
 production readiness and does not close parent task #2370.
+
+The opt-in `test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
+probe also ran on the disposable Debian 12 ARM64 guest (kernel
+`6.1.0-53-cloud-arm64`, runc 1.5.2). The worker launched and reached the
+mode-0600 provider socket through its read-only mount; its socket write/remove
+probes were denied. Peer authentication then stopped at `SO_PEERPIDFD` with
+`errno 92` (`Protocol not available`), so the probe failed before cgroup
+authorization or CONNECT relay. Cleanup was verified, and no upstream connection
+or provider credential was used. This kernel therefore cannot prove the
+proxy's peer-identity path. The NAS kernel was observed read-only as `6.18.15`,
+but that observation is not a live proxy qualification. See
+[`test_oci_worker_runtime.py`](../tests/test_oci_worker_runtime.py) for the
+opt-in probe.
 See [Codex App Server](https://learn.chatgpt.com/docs/app-server) and
 [Agent approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security).
 
