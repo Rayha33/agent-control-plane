@@ -341,10 +341,31 @@ probe also ran on the disposable Debian 12 ARM64 guest (kernel
 mode-0600 provider socket through its read-only mount; its socket write/remove
 probes were denied. Peer authentication then stopped at `SO_PEERPIDFD` with
 `errno 92` (`Protocol not available`), so the probe failed before cgroup
-authorization or CONNECT relay. Cleanup was verified, and no upstream connection
-or provider credential was used. This kernel therefore cannot prove the
+authorization or CONNECT relay. Cleanup was verified; the test failed before
+dialing its local CONNECT fixture. No provider credential or external provider
+endpoint was used. This kernel therefore cannot prove the
 proxy's peer-identity path. The NAS kernel was observed read-only as `6.18.15`,
-but that observation is not a live proxy qualification. See
+but that observation is not a live proxy qualification.
+
+To separate kernel support from a code failure, a clone of that disposable guest
+was booted with Debian Bookworm backports `linux-image-cloud-arm64`
+`6.12.95-1~bpo12+1` (kernel `6.12.95+deb12-cloud-arm64`); the original 6.1 guest
+was left unchanged. On the clone, the exact `a77219f` source passed the live
+rootless-runc proxy probe and all proxy unit tests: **24 passed in 5.61s**. The
+probe verified a non-inheritable peer pidfd, exact worker-cgroup authorization,
+read-only socket-directory behavior, and CONNECT relay to its local TCP fixture.
+The collector receipt is test-only. No provider credential or external provider
+endpoint was used; the CONNECT tunnel terminated at a local TCP fixture. The
+implementation still has no provider-enabled `run_worker`
+launch path, so this qualifies the proxy primitive only, not pre-launch auth
+setup, real provider access, destination-restricted egress, or restart recovery.
+
+Upstream Linux v6.5 defines `SO_PEERPIDFD` as socket option 77; vendors may
+backport it, so a runtime feature probe—not `uname` version comparison—must
+remain authoritative. Unsupported kernels must continue to fail closed. See
+the [v6.5 Linux socket UAPI](https://github.com/torvalds/linux/blob/v6.5/include/uapi/asm-generic/socket.h)
+and [upstream peer-pidfd implementation](https://github.com/torvalds/linux/commit/7b26952a91cf65ff1cc867a2382a8964d8c0ee7d).
+The NAS kernel remains unqualified until the same safe probe runs there. See
 [`test_oci_worker_runtime.py`](../tests/test_oci_worker_runtime.py) for the
 opt-in probe.
 See [Codex App Server](https://learn.chatgpt.com/docs/app-server) and
