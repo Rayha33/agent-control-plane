@@ -943,7 +943,8 @@ remains fail-closed.
 
 The production lifecycle test also has an explicit disposable-VM-only mode,
 `ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH=1`, paired with exactly one
-monitor-acceptance crash point, the exact guest hostname, and the literal
+monitor-acceptance or before-monitor-start crash point, the exact guest
+hostname, and the literal
 `ACP_LIVE_USER_MANAGER_RESTART_ACK=RESTART_ONLY_THIS_DISPOSABLE_GUEST`. It is
 restricted to a VM with passwordless `sudo -n` and an exact Debian 12 Lima
 baseline inventory. Before launching the fixture it compares structured JSON
@@ -987,29 +988,34 @@ cleanup. These observations are partial restart evidence, not a successful
 recovery proof. The focused postflight now permits only this exact empty slice
 state while keeping service, scope, process, and eventual cleanup checks strict.
 
-A third run passed the complete opt-in test on the same Debian 12 ARM64 guest
-(kernel `6.12.95+deb12-cloud-arm64`, systemd `252.39-1~deb12u2`, Python
-`3.11.2`, rootless runc `1.5.2`, runc SHA-256
-`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). It
+Two additional guarded runs passed the complete opt-in test on the same Debian
+12 ARM64 guest (kernel `6.12.95+deb12-cloud-arm64`, systemd
+`252.39-1~deb12u2`, Python `3.11.2`, rootless runc `1.5.2`, runc SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`). Both
 used test-source SHA-256
-`d48ade517f3275df27f2f2adf15d43c242039a317d2b304ec86b5512f0ac8930` and
-restarted the exact user's manager from PID 2067 to 2397. The replacement
-manager and user D-Bus became reachable; the driver, monitor, and scope were
-absent before recovery. A fresh supervisor reconciled the interrupted
-monitor-accepted handoff, recorded the durable `ambiguous` phase with the
-attempt quarantined and task blocked, and rejected result capture and launch
-replay. A fresh-process reaper then finalized the nonrecoverable attempt as
-orphaned, released its runtime allocation, and reached `cleanup_verified`;
+`d48ade517f3275df27f2f2adf15d43c242039a317d2b304ec86b5512f0ac8930`.
+
+| Successful attempt | Injected crash phase | User-manager PID | Additional assertion |
+| --- | --- | --- | --- |
+| Third run | `ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE=1` | 2067 → 2397 | The accepted monitor was gone after manager restart. |
+| Fourth run | `ACP_LIVE_CRASH_BEFORE_MONITOR_START=1` | 2397 → 2718 | The monitor had never started and remained absent. |
+
+For both runs, the replacement manager and user D-Bus became reachable; the
+driver, monitor, and scope were absent before recovery. A fresh supervisor
+reconciled the interrupted handoff, recorded the durable `ambiguous` phase with
+the attempt quarantined and task blocked, and rejected result capture and
+launch replay. A fresh-process reaper then finalized the nonrecoverable attempt
+as orphaned, released its runtime allocation, and reached `cleanup_verified`;
 process, cgroup, runc-state, socket, and bundle checks were clear. Postflight
 found only `init.scope` and D-Bus processes under the manager cgroup, no ACP
-test units, and the two expected empty user slices unloaded. The successful
-fixture root was removed after its exact cleanup checks; the two earlier failed
-roots remain preserved. The live run used no provider credentials, endpoint,
-API call, or model.
+test units, and the two expected empty user slices unloaded. Both successful
+fixture roots were removed after their exact cleanup checks; the two earlier
+failed roots remain preserved. These no-model runs used no provider
+credentials, endpoint, or API call.
 
-This closes the specifically tested user-manager service-restart recovery path
-for a monitor-accepted launch-driver crash on this disposable Debian 12 guest.
-It does not prove supervisor-daemon failure, logout/linger, reboot recovery,
-provider authentication, or destination-restricted provider egress, and does
-not close #2370's broader isolation gate or enable the default OCI
-`run_worker()` path.
+This closes the specifically tested user-manager service-restart recovery paths
+for monitor-accepted and before-monitor-start launch-driver crashes on this
+disposable Debian 12 guest. It does not prove supervisor-daemon failure,
+logout/linger, reboot recovery, provider authentication, or destination-
+restricted provider egress, and does not close #2370's broader isolation gate
+or enable the default OCI `run_worker()` path.
