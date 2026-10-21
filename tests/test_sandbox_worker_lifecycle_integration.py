@@ -69,6 +69,16 @@ deterministic in-sandbox source edit and test, and host-side sandbox-result
 import (mutually exclusive with cancellation, timeout, and crash modes), add:
 
     ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1
+
+For two simultaneous, isolated cancellation attempts on the same disposable
+Linux host, add:
+
+    ACP_LIVE_CONCURRENT_ATTEMPTS=1
+
+This launches two fresh pytest processes with no provider credentials, observes
+two distinct live ACP scopes in consecutive samples, and requires both exact
+launch-driver fixtures to verify cancellation and teardown. It does not prove
+same-repository cross-attempt workspace isolation or wire ``run_worker``.
 """
 
 from __future__ import annotations
@@ -80,6 +90,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -417,6 +428,10 @@ def _start_launch_driver_then_crash_controller(
     crash_after_manager_acceptance: bool = False,
     monitor_acceptance_crash_marker: Path | None = None,
     crash_before_monitor_start: bool = False,
+    concurrent_control_root: Path | None = None,
+    concurrent_slot: str | None = None,
+    concurrent_run_root: Path | None = None,
+    concurrent_source_worktree: Path | None = None,
 ) -> None:
     """Exit the launch-driver service at the selected monitor-handoff crash point."""
 
@@ -424,6 +439,44 @@ def _start_launch_driver_then_crash_controller(
 
     def capture_driver_service_output(argv: list[str], *, environment: dict[str, str]) -> bytes:
         if Path(argv[0]).name == "systemd-run":
+            if concurrent_control_root is not None:
+                if (
+                    concurrent_slot not in {"0", "1"}
+                    or concurrent_run_root is None
+                    or concurrent_source_worktree is None
+                ):
+                    raise RuntimeError("concurrent launch receipt inputs are incomplete")
+                execution = GitSupervisor(repo)._sandbox_execution_get(attempt_id)
+                if execution is None or (execution["attempt_id"], execution["claim_token"]) != (
+                    attempt_id,
+                    claim_token,
+                ):
+                    raise RuntimeError("concurrent launch receipt has no matching durable attempt")
+                identity = (attempt_id, claim_token, execution["execution_id"])
+                monitor_unit = sandbox_monitor_service_unit(*identity)
+                prepared = {
+                    "attempt_id": attempt_id,
+                    "claim_token": claim_token,
+                    "container_id": execution["container_id"],
+                    "execution_id": execution["execution_id"],
+                    "monitor_unit": monitor_unit,
+                    "pytest_pid": os.getppid(),
+                    "repo": str(repo.resolve(strict=True)),
+                    "run_root": str(concurrent_run_root.resolve(strict=True)),
+                    "scope_unit": f"acp-{execution['container_id']}.scope",
+                    "service_unit": f"acp-launch-driver-{execution['execution_id']}.service",
+                    "slice_unit": sandbox_attempt_slice_unit(*identity),
+                    "slot": concurrent_slot,
+                    "source_worktree": str(concurrent_source_worktree.resolve(strict=True)),
+                    "workspace_root": str(
+                        Path(execution["workspace_root_path"]).resolve(strict=True)
+                    ),
+                }
+                _write_live_concurrent_marker(
+                    concurrent_control_root,
+                    f"prepared-{concurrent_slot}.json",
+                    json.dumps(prepared, sort_keys=True).encode("utf-8"),
+                )
             argv = list(argv)
             insertion = argv.index("--working-directory")
             argv[insertion:insertion] = [
@@ -1328,6 +1381,193 @@ def _systemd_command(argv: list[str], timeout: float = 10.0) -> subprocess.Compl
     )
 
 
+def _live_concurrent_control() -> tuple[Path, str] | None:
+    if os.environ.get("ACP_LIVE_CONCURRENT_CHILD") != "1":
+        if os.environ.get("ACP_LIVE_CONCURRENT_CONTROL_ROOT") or os.environ.get(
+            "ACP_LIVE_CONCURRENT_SLOT"
+        ):
+            raise RuntimeError("concurrent live control variables require child mode")
+        return None
+    raw_root = os.environ.get("ACP_LIVE_CONCURRENT_CONTROL_ROOT")
+    slot = os.environ.get("ACP_LIVE_CONCURRENT_SLOT")
+    if not raw_root or slot not in {"0", "1"}:
+        raise RuntimeError("concurrent live child requires its private control root and slot")
+    root = Path(raw_root)
+    try:
+        info = root.lstat()
+    except OSError as error:
+        raise RuntimeError("concurrent live control root is unavailable") from error
+    if (
+        not root.is_absolute()
+        or not root.is_relative_to(Path("/tmp"))
+        or not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise RuntimeError("concurrent live control root is not a private test-owned directory")
+    return root, slot
+
+
+def _write_live_concurrent_marker(root: Path, name: str, content: bytes) -> None:
+    path = root / name
+    temporary = root / f".{name}.{os.getpid()}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        if os.write(descriptor, content) != len(content):
+            raise OSError("short write creating concurrent live control marker")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if os.path.lexists(path):
+        temporary.unlink()
+        raise FileExistsError(path)
+    os.rename(temporary, path)
+
+
+def _signal_live_test_process_group(process: subprocess.Popen[str], signum: int) -> None:
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def _wait_for_live_concurrent_release(
+    control: tuple[Path, str],
+    *,
+    attempt: dict[str, Any],
+    execution: dict[str, Any],
+    repo: Path,
+    run_root: Path,
+    source_worktree: Path,
+    workspace_root: Path,
+) -> None:
+    root, slot = control
+    scope_unit = f"acp-{execution['container_id']}.scope"
+    properties = _unit_properties(
+        scope_unit,
+        ("ActiveState", "ControlGroup", "Id", "InvocationID", "LoadState", "SubState"),
+    )
+    if (
+        properties["Id"] != scope_unit
+        or properties["LoadState"] != "loaded"
+        or properties["ActiveState"] != "active"
+        or properties["SubState"] != "running"
+        or not properties["InvocationID"]
+        or not properties["ControlGroup"]
+    ):
+        raise RuntimeError("concurrent child did not own an exact running ACP scope")
+    ready = {
+        "attempt_id": attempt["id"],
+        "claim_token": attempt["claim_token"],
+        "container_id": execution["container_id"],
+        "execution_id": execution["execution_id"],
+        "pid": os.getpid(),
+        "repo": str(repo.resolve(strict=True)),
+        "run_root": str(run_root.resolve(strict=True)),
+        "scope_control_group": properties["ControlGroup"],
+        "scope_invocation_id": properties["InvocationID"],
+        "scope_unit": scope_unit,
+        "slot": slot,
+        "source_worktree": str(source_worktree.resolve(strict=True)),
+        "workspace_root": str(workspace_root.resolve(strict=True)),
+    }
+    _write_live_concurrent_marker(
+        root,
+        f"ready-{slot}.json",
+        json.dumps(ready, sort_keys=True).encode("utf-8"),
+    )
+    release_path = root / f"release-{slot}"
+    deadline = time.monotonic() + 90
+    while not os.path.lexists(release_path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    try:
+        release_info = release_path.lstat()
+    except OSError as error:
+        raise TimeoutError("parent did not release the concurrent live barrier") from error
+    if (
+        not stat.S_ISREG(release_info.st_mode)
+        or stat.S_ISLNK(release_info.st_mode)
+        or release_info.st_uid != os.geteuid()
+        or stat.S_IMODE(release_info.st_mode) != 0o600
+        or release_path.read_text(encoding="ascii") != "release"
+    ):
+        raise RuntimeError("concurrent live release marker identity or content changed")
+
+
+def _read_live_concurrent_prepared_records(
+    control_root: Path, *, expected_pids: dict[str, int] | None = None
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    records: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for slot in ("0", "1"):
+        path = control_root / f"prepared-{slot}.json"
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            failures.append(f"could not inspect slot {slot} cleanup receipt: {error}")
+            continue
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            failures.append(f"slot {slot} cleanup receipt has unsafe file metadata")
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("receipt is not an object")
+            attempt_id = record["attempt_id"]
+            claim_token = record["claim_token"]
+            execution_id = record["execution_id"]
+            container_id = record["container_id"]
+            pytest_pid = record["pytest_pid"]
+            run_root = record["run_root"]
+            if (
+                record.get("slot") != slot
+                or not isinstance(attempt_id, str)
+                or not isinstance(execution_id, str)
+                or not isinstance(container_id, str)
+                or type(pytest_pid) is not int
+                or pytest_pid <= 0
+                or (expected_pids is not None and expected_pids.get(slot) != pytest_pid)
+                or not isinstance(run_root, str)
+                or not Path(run_root).is_absolute()
+                or not Path(run_root).is_relative_to(Path("/tmp"))
+                or Path(run_root).parent != Path("/tmp")
+                or not Path(run_root).name.startswith("acp-live-launch-driver-")
+            ):
+                raise ValueError("receipt identity or run root is invalid")
+            identity = (attempt_id, claim_token, execution_id)
+            monitor_unit = sandbox_monitor_service_unit(*identity)
+            expected_container_id = "acp-" + monitor_unit.removeprefix("acp-monitor-").removesuffix(
+                ".service"
+            )
+            if container_id != expected_container_id:
+                raise ValueError("receipt container does not match its attempt identity")
+            expected_units = {
+                "service_unit": f"acp-launch-driver-{execution_id}.service",
+                "monitor_unit": monitor_unit,
+                "scope_unit": f"acp-{expected_container_id}.scope",
+                "slice_unit": sandbox_attempt_slice_unit(*identity),
+            }
+            if any(record.get(field) != value for field, value in expected_units.items()):
+                raise ValueError("receipt systemd units do not match its attempt identity")
+        except (KeyError, TypeError, ValueError) as error:
+            failures.append(f"slot {slot} cleanup receipt is invalid: {error}")
+            continue
+        records[slot] = record
+    return records, failures
+
+
 def _wait_for_quiescence(service_unit: str | None, slice_unit: str | None) -> bool:
     safe = True
     for unit in (service_unit, slice_unit):
@@ -1353,11 +1593,11 @@ def _wait_for_quiescence(service_unit: str | None, slice_unit: str | None) -> bo
     return safe
 
 
-def _best_effort_stop_unit(systemctl: str, unit: str) -> None:
+def _best_effort_stop_unit(systemctl: str, unit: str, *, timeout: float = 12.0) -> None:
     """Request stop even when a start client timed out after systemd accepted it."""
 
     try:
-        _systemd_command([systemctl, "--user", "stop", unit], timeout=12.0)
+        _systemd_command([systemctl, "--user", "stop", unit], timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         # The caller still requires an independent exact-unit quiescence proof.
         pass
@@ -1885,6 +2125,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     """Use the production launcher and reaper across completion and failure paths."""
 
     source_root = Path(__file__).resolve().parents[1]
+    concurrent_control = _live_concurrent_control()
     from agent_control_plane.supervisor import sandbox_launch_driver_service as launch_service
 
     if Path(launch_service.__file__).resolve().parents[2] != (source_root / "src").resolve():
@@ -2270,6 +2511,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         timeout_after_start = os.environ.get("ACP_LIVE_TIMEOUT_AFTER_START") == "1"
+        concurrent_live_child = concurrent_control is not None
         lease_expiry_after_stop = os.environ.get("ACP_LIVE_LEASE_EXPIRY_AFTER_STOP") == "1"
         crash_after_manager_acceptance = (
             os.environ.get("ACP_LIVE_CRASH_AFTER_MANAGER_ACCEPTANCE") == "1"
@@ -2319,9 +2561,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             pytest.fail("live isolation probes require natural worker completion")
         monitor_acceptance_marker = run_root / "monitor-handoff-crash.json"
         payload_sleep_seconds = (
-            30 if cancel_after_start or timeout_after_start or lease_expiry_after_stop else 1
+            120
+            if concurrent_live_child
+            else 30
+            if cancel_after_start or timeout_after_start or lease_expiry_after_stop
+            else 1
         )
-        sandbox_timeout_seconds = 1 if timeout_after_start else 30
+        sandbox_timeout_seconds = 150 if concurrent_live_child else 1 if timeout_after_start else 30
         if isolation_probes:
             payload_command = ("/bin/busybox", "sh", f"/workspace/{isolation_script_name}")
         elif coding_task:
@@ -2372,6 +2618,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 if crash_after_monitor_acceptance or crash_before_monitor_start
                 else None,
                 crash_before_monitor_start,
+                concurrent_control[0] if concurrent_control is not None else None,
+                concurrent_control[1] if concurrent_control is not None else None,
+                run_root if concurrent_control is not None else None,
+                source_worktree if concurrent_control is not None else None,
             ),
         )
         producer_controller.start()
@@ -2938,6 +3188,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert _entry_is_present(started_marker), "bounded payload never entered its command"
 
             if cancel_after_start:
+                if concurrent_control is not None:
+                    assert execution is not None
+                    _wait_for_live_concurrent_release(
+                        concurrent_control,
+                        attempt=attempt,
+                        execution=execution,
+                        repo=repo,
+                        run_root=run_root,
+                        source_worktree=source_worktree,
+                        workspace_root=Path(durable["workspace_root_path"]),
+                    )
                 # Cross the deliberately short ten-second claim lease while the
                 # payload remains active; both fresh cancellation and normal exit
                 # depend on the execution owner renewing the exact attempt.
@@ -3751,6 +4012,680 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "exact production-driver test units are not quiescent; preserving "
                 f"artifacts at {run_root}"
             )
+
+
+@pytest.mark.skipif(
+    not _LIVE_ENABLED or os.environ.get("ACP_LIVE_CONCURRENT_ATTEMPTS") != "1",
+    reason=(
+        "set ACP_RUN_SANDBOX_WORKER_LIFECYCLE=1 and ACP_LIVE_CONCURRENT_ATTEMPTS=1 "
+        "on a disposable supported Linux host"
+    ),
+)
+def test_live_concurrent_attempts_use_distinct_scopes_and_clean_up() -> None:
+    """Observe two fresh no-model cancellation runs active at the same time."""
+
+    source_root = Path(__file__).resolve().parents[1]
+    if not sys.platform.startswith("linux") or os.geteuid() == 0:
+        pytest.fail("concurrent live proof requires an unprivileged Linux user")
+    if not source_root.is_relative_to(Path("/tmp")):
+        pytest.fail("run this opt-in proof from a disposable checkout beneath /tmp")
+    if os.environ.get("ACP_OCI_TEST_RUNC_VERSION") != _SUPPORTED_RUNC_VERSION:
+        pytest.fail("set ACP_OCI_TEST_RUNC_VERSION=1.5.2 for this exact live proof")
+    runc_path = Path(os.environ.get("ACP_OCI_TEST_RUNC", "/usr/bin/runc"))
+    if not runc_path.is_file():
+        pytest.fail("set ACP_OCI_TEST_RUNC to the trusted runc 1.5.2 executable")
+
+    systemctl = str(sandbox_attestation._trusted_systemctl_executable())
+    systemd_environment = sandbox_attestation._trusted_systemd_command_environment()
+    if _systemd_command([systemctl, "--user", "show-environment"]).returncode != 0:
+        pytest.fail("active systemd user manager is required")
+
+    def acp_scope_states() -> dict[str, tuple[str, str]]:
+        result = _systemd_command(
+            [
+                systemctl,
+                "--user",
+                "list-units",
+                "--all",
+                "--type=scope",
+                "--no-legend",
+                "--plain",
+            ]
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"could not inspect systemd scopes: {result.stderr[-2000:]}")
+        states: dict[str, tuple[str, str]] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and fields[0].startswith("acp-") and fields[0].endswith(".scope"):
+                states[fields[0]] = (fields[2], fields[3])
+        return states
+
+    preexisting = {
+        unit
+        for unit, (active_state, _sub_state) in acp_scope_states().items()
+        if active_state not in {"inactive", "failed"}
+    }
+    if preexisting:
+        pytest.fail(
+            f"refusing concurrent proof with pre-existing ACP scopes: {sorted(preexisting)}"
+        )
+
+    child_environment = dict(systemd_environment)
+    child_environment["PYTHONPATH"] = str(source_root / "src")
+    child_environment["ACP_RUN_SANDBOX_WORKER_LIFECYCLE"] = "1"
+    child_environment["ACP_LIVE_CANCEL_AFTER_START"] = "1"
+    child_environment["ACP_OCI_TEST_RUNC"] = str(runc_path.resolve(strict=True))
+    child_environment["ACP_OCI_TEST_RUNC_VERSION"] = _SUPPORTED_RUNC_VERSION
+    if os.environ.get("ACP_OCI_TEST_BUSYBOX"):
+        child_environment["ACP_OCI_TEST_BUSYBOX"] = os.environ["ACP_OCI_TEST_BUSYBOX"]
+
+    control_root = Path(tempfile.mkdtemp(prefix="acp-live-concurrent-control-", dir="/tmp"))
+    control_info = control_root.lstat()
+    if (
+        not stat.S_ISDIR(control_info.st_mode)
+        or stat.S_ISLNK(control_info.st_mode)
+        or control_info.st_uid != os.geteuid()
+        or stat.S_IMODE(control_info.st_mode) != 0o700
+    ):
+        pytest.fail("concurrent control root is not a private test-owned directory")
+
+    target = (
+        f"{Path(__file__).resolve()}::"
+        "test_live_production_launch_driver_runs_exact_pinned_runc_request"
+    )
+    command = [sys.executable, "-m", "pytest", target]
+    preexisting_run_roots = {
+        str(path)
+        for path in Path("/tmp").glob("acp-live-launch-driver-*")
+        if path.is_dir() or path.is_symlink()
+    }
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        for slot in ("0", "1"):
+            slot_environment = dict(child_environment)
+            slot_environment["ACP_LIVE_CONCURRENT_CHILD"] = "1"
+            slot_environment["ACP_LIVE_CONCURRENT_CONTROL_ROOT"] = str(control_root)
+            slot_environment["ACP_LIVE_CONCURRENT_SLOT"] = slot
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    cwd=source_root,
+                    env=slot_environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
+            )
+    except BaseException as spawn_error:
+        cleanup_failures: list[str] = []
+        for slot in ("0", "1"):
+            release_path = control_root / f"release-{slot}"
+            try:
+                if os.path.lexists(release_path):
+                    info = release_path.lstat()
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or stat.S_ISLNK(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600
+                        or release_path.read_text(encoding="ascii") != "release"
+                    ):
+                        raise RuntimeError("existing release marker has unsafe identity or content")
+                else:
+                    _write_live_concurrent_marker(control_root, release_path.name, b"release")
+            except (OSError, RuntimeError) as error:
+                cleanup_failures.append(f"could not release slot {slot} from its barrier: {error}")
+
+        prepared_records: dict[str, dict[str, Any]] = {}
+        stopped_units: set[str] = set()
+
+        def add_cleanup_failure(message: str) -> None:
+            if message not in cleanup_failures:
+                cleanup_failures.append(message)
+
+        def refresh_prepared_records() -> None:
+            expected_pids = {str(index): process.pid for index, process in enumerate(processes)}
+            records, record_failures = _read_live_concurrent_prepared_records(
+                control_root, expected_pids=expected_pids
+            )
+            prepared_records.update(records)
+            for failure in record_failures:
+                add_cleanup_failure(failure)
+
+        def stop_exact_units(*, retry: bool = False) -> None:
+            refresh_prepared_records()
+            for record in prepared_records.values():
+                for unit in (
+                    record["service_unit"],
+                    record["monitor_unit"],
+                    record["scope_unit"],
+                    record["slice_unit"],
+                ):
+                    if unit in stopped_units and not retry:
+                        continue
+                    _best_effort_stop_unit(systemctl, unit, timeout=3.0)
+                    stopped_units.add(unit)
+
+        def process_group_exists(process: subprocess.Popen[str]) -> bool:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        natural_deadline = time.monotonic() + 45
+        while time.monotonic() < natural_deadline:
+            refresh_prepared_records()
+            if all(process.poll() is not None for process in processes):
+                break
+            time.sleep(0.1)
+
+        # The receipt is atomically published before any exact unit is started.
+        # Read it before interruption and again during teardown so a raced
+        # manager acceptance is always stopped by its attempt-derived names.
+        stop_exact_units()
+        for process in processes:
+            if process.poll() is None or process_group_exists(process):
+                _signal_live_test_process_group(process, signal.SIGINT)
+        interrupt_deadline = time.monotonic() + 20
+        while time.monotonic() < interrupt_deadline:
+            refresh_prepared_records()
+            if all(
+                process.poll() is not None and not process_group_exists(process)
+                for process in processes
+            ):
+                break
+            time.sleep(0.1)
+        stop_exact_units(retry=True)
+        for process in processes:
+            if process.poll() is None or process_group_exists(process):
+                _signal_live_test_process_group(process, signal.SIGTERM)
+        terminate_deadline = time.monotonic() + 10
+        while time.monotonic() < terminate_deadline:
+            refresh_prepared_records()
+            if all(
+                process.poll() is not None and not process_group_exists(process)
+                for process in processes
+            ):
+                break
+            time.sleep(0.1)
+        refresh_prepared_records()
+        stop_exact_units(retry=True)
+        for process in processes:
+            if process.poll() is None or process_group_exists(process):
+                _signal_live_test_process_group(process, signal.SIGKILL)
+
+        for process in processes:
+            try:
+                process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                cleanup_failures.append(
+                    f"test process group {process.pid} did not close its output pipes"
+                )
+        # After bounded process termination, retry exact-unit stops to close
+        # an activation race against an earlier stop request.
+        stop_exact_units(retry=True)
+        for process in processes:
+            if process.poll() is None or process_group_exists(process):
+                cleanup_failures.append(
+                    f"test-owned process group {process.pid} survived bounded cleanup"
+                )
+
+        refresh_prepared_records()
+        for record in prepared_records.values():
+            for unit in (
+                record["service_unit"],
+                record["monitor_unit"],
+                record["scope_unit"],
+                record["slice_unit"],
+            ):
+                try:
+                    properties = _unit_properties(
+                        unit,
+                        ("ActiveState", "ControlGroup", "Id", "LoadState", "MainPID")
+                        if unit.endswith(".service")
+                        else ("ActiveState", "ControlGroup", "Id", "LoadState"),
+                    )
+                except Exception as error:
+                    cleanup_failures.append(f"could not verify exact unit {unit}: {error}")
+                    continue
+                if (
+                    properties["Id"] != unit
+                    or properties["ActiveState"] not in {"inactive", "failed"}
+                    or properties["LoadState"] not in {"loaded", "not-found"}
+                    or properties["ControlGroup"]
+                    or ("MainPID" in properties and properties["MainPID"] != "0")
+                ):
+                    cleanup_failures.append(f"exact unit {unit} was not quiescent")
+            if os.path.lexists(record["run_root"]):
+                cleanup_failures.append(f"child test root was not removed: {record['run_root']}")
+
+        try:
+            active_scopes = {
+                unit
+                for unit, (active_state, _sub_state) in acp_scope_states().items()
+                if active_state not in {"inactive", "failed"}
+            }
+            if active_scopes:
+                cleanup_failures.append(
+                    f"partial launch cleanup left active ACP scopes: {sorted(active_scopes)}"
+                )
+        except Exception as error:
+            cleanup_failures.append(f"could not verify global ACP scope quiescence: {error}")
+
+        remaining_run_roots = {
+            str(path)
+            for path in Path("/tmp").glob("acp-live-launch-driver-*")
+            if path.is_dir() or path.is_symlink()
+        } - preexisting_run_roots
+        if remaining_run_roots:
+            cleanup_failures.append(
+                f"partial launch cleanup left test roots: {sorted(remaining_run_roots)}"
+            )
+
+        if not cleanup_failures:
+            allowed_names = {
+                f"{kind}-{slot}{suffix}"
+                for slot in ("0", "1")
+                for kind, suffix in (("prepared", ".json"), ("ready", ".json"), ("release", ""))
+            }
+            try:
+                entries = list(control_root.iterdir())
+            except OSError as error:
+                cleanup_failures.append(f"could not inspect concurrent control directory: {error}")
+            else:
+                if any(path.name not in allowed_names for path in entries):
+                    cleanup_failures.append(
+                        "concurrent control directory contains unexpected artifacts"
+                    )
+                else:
+                    for path in entries:
+                        try:
+                            info = path.lstat()
+                        except OSError as error:
+                            cleanup_failures.append(
+                                f"could not inspect concurrent control artifact {path.name}: {error}"
+                            )
+                            break
+                        if (
+                            not stat.S_ISREG(info.st_mode)
+                            or stat.S_ISLNK(info.st_mode)
+                            or info.st_uid != os.geteuid()
+                            or stat.S_IMODE(info.st_mode) != 0o600
+                        ):
+                            cleanup_failures.append(
+                                f"concurrent control artifact has unsafe metadata: {path.name}"
+                            )
+                            break
+                    if not cleanup_failures:
+                        for path in entries:
+                            try:
+                                path.unlink()
+                            except OSError as error:
+                                cleanup_failures.append(
+                                    f"could not remove concurrent control artifact {path.name}: {error}"
+                                )
+                                break
+                    if not cleanup_failures:
+                        try:
+                            control_root.rmdir()
+                        except OSError as error:
+                            cleanup_failures.append(
+                                f"could not remove concurrent control directory: {error}"
+                            )
+        if cleanup_failures:
+            raise RuntimeError(
+                "partial concurrent launch cleanup could not be verified: "
+                + "; ".join(dict.fromkeys(cleanup_failures))
+            ) from spawn_error
+        raise
+
+    failures: list[str] = []
+    prepared_records: dict[str, dict[str, Any]] = {}
+    ready_records: dict[str, dict[str, Any]] = {}
+    ready_deadline = time.monotonic() + 90
+    try:
+        while time.monotonic() < ready_deadline:
+            if all((control_root / f"ready-{slot}.json").is_file() for slot in ("0", "1")):
+                break
+            if any(process.poll() is not None for process in processes):
+                break
+            time.sleep(0.1)
+
+        prepared_records, receipt_failures = _read_live_concurrent_prepared_records(
+            control_root,
+            expected_pids={str(index): process.pid for index, process in enumerate(processes)},
+        )
+        failures.extend(receipt_failures)
+        for slot in ("0", "1"):
+            ready_path = control_root / f"ready-{slot}.json"
+            if ready_path.is_file():
+                ready_records[slot] = json.loads(ready_path.read_text(encoding="utf-8"))
+
+        if len(ready_records) != 2 or len(prepared_records) != 2:
+            failures.append("both child attempts did not reach the exact-scope readiness barrier")
+        else:
+            shared_fields = (
+                "attempt_id",
+                "claim_token",
+                "container_id",
+                "execution_id",
+                "repo",
+                "run_root",
+                "scope_unit",
+                "source_worktree",
+                "workspace_root",
+            )
+            for slot in ("0", "1"):
+                prepared = prepared_records[slot]
+                ready = ready_records[slot]
+                if ready.get("slot") != slot or ready.get("pid") != processes[int(slot)].pid:
+                    failures.append(
+                        f"slot {slot} readiness receipt is not tied to its child process"
+                    )
+                if prepared.get("pytest_pid") != ready.get("pid"):
+                    failures.append(
+                        f"slot {slot} prepared receipt is not tied to its pytest process"
+                    )
+                if any(prepared.get(field) != ready.get(field) for field in shared_fields):
+                    failures.append(f"slot {slot} prepared and live receipts disagree")
+
+            unique_fields = (
+                "attempt_id",
+                "container_id",
+                "execution_id",
+                "pid",
+                "repo",
+                "run_root",
+                "scope_unit",
+                "source_worktree",
+                "workspace_root",
+            )
+            for field in unique_fields:
+                if len({ready[field] for ready in ready_records.values()}) != 2:
+                    failures.append(f"the two child receipts do not have distinct {field} values")
+            expected_units = {ready["scope_unit"] for ready in ready_records.values()}
+            live_samples: list[dict[str, tuple[str, str, str]]] = []
+            for _ in range(2):
+                scope_states = acp_scope_states()
+                live_units = {
+                    unit
+                    for unit, (active_state, _sub_state) in scope_states.items()
+                    if active_state not in {"inactive", "failed"}
+                }
+                if live_units != expected_units:
+                    failures.append(
+                        "active ACP scopes do not equal the two child-reported scopes: "
+                        f"expected={sorted(expected_units)} observed={sorted(live_units)}"
+                    )
+                sample: dict[str, tuple[str, str, str]] = {}
+                for ready in ready_records.values():
+                    unit = ready["scope_unit"]
+                    properties = _unit_properties(
+                        unit,
+                        (
+                            "ActiveState",
+                            "ControlGroup",
+                            "Id",
+                            "InvocationID",
+                            "LoadState",
+                            "SubState",
+                        ),
+                    )
+                    if (
+                        properties["Id"] != unit
+                        or properties["LoadState"] != "loaded"
+                        or properties["ActiveState"] != "active"
+                        or properties["SubState"] != "running"
+                        or properties["InvocationID"] != ready["scope_invocation_id"]
+                        or properties["ControlGroup"] != ready["scope_control_group"]
+                    ):
+                        failures.append(f"child scope {unit} was not the exact active invocation")
+                    sample[unit] = (
+                        properties["ActiveState"],
+                        properties["InvocationID"],
+                        properties["ControlGroup"],
+                    )
+                live_samples.append(sample)
+                time.sleep(0.1)
+            if len(live_samples) != 2 or live_samples[0] != live_samples[1]:
+                failures.append(
+                    "the two exact active scope identities were not stable across samples"
+                )
+    except Exception as error:
+        failures.append(
+            f"concurrent readiness verification failed: {type(error).__name__}: {error}"
+        )
+    finally:
+        for slot in ("0", "1"):
+            release_path = control_root / f"release-{slot}"
+            if not os.path.lexists(release_path):
+                try:
+                    _write_live_concurrent_marker(control_root, release_path.name, b"release")
+                except OSError as error:
+                    failures.append(f"could not release child {slot} from its barrier: {error}")
+
+    def process_group_exists(process: subprocess.Popen[str]) -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def refresh_prepared_records() -> None:
+        records, record_failures = _read_live_concurrent_prepared_records(
+            control_root,
+            expected_pids={str(index): process.pid for index, process in enumerate(processes)},
+        )
+        prepared_records.update(records)
+        for failure in record_failures:
+            if failure not in failures:
+                failures.append(failure)
+
+    def stop_exact_units() -> None:
+        refresh_prepared_records()
+        for record in prepared_records.values():
+            for unit in (
+                record["service_unit"],
+                record["monitor_unit"],
+                record["scope_unit"],
+                record["slice_unit"],
+            ):
+                _best_effort_stop_unit(systemctl, unit, timeout=3.0)
+
+    process_deadline = time.monotonic() + 180
+    while time.monotonic() < process_deadline and any(
+        process.poll() is None for process in processes
+    ):
+        time.sleep(0.1)
+    timed_out = [process for process in processes if process.poll() is None]
+    if timed_out:
+        failures.append("one or more cancellation test processes exceeded the 180-second limit")
+    needs_forced_cleanup = bool(timed_out) or any(
+        process_group_exists(process) for process in processes
+    )
+    if needs_forced_cleanup:
+        for process in processes:
+            if process.poll() is None or process_group_exists(process):
+                _signal_live_test_process_group(process, signal.SIGINT)
+        interrupt_deadline = time.monotonic() + 30
+        while time.monotonic() < interrupt_deadline and any(
+            process.poll() is None or process_group_exists(process) for process in processes
+        ):
+            time.sleep(0.1)
+
+        # Stop receipt-validated units even when the pytest parent exited during
+        # SIGINT; the worker/scope may outlive that process group.
+        stop_exact_units()
+        for process in processes:
+            if process.poll() is None or process_group_exists(process):
+                _signal_live_test_process_group(process, signal.SIGTERM)
+        terminate_deadline = time.monotonic() + 15
+        while time.monotonic() < terminate_deadline and any(
+            process.poll() is None or process_group_exists(process) for process in processes
+        ):
+            time.sleep(0.1)
+        stop_exact_units()
+        for process in processes:
+            if process.poll() is None or process_group_exists(process):
+                _signal_live_test_process_group(process, signal.SIGKILL)
+
+    outputs: list[str] = []
+    for process in processes:
+        try:
+            output, _ = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired as first_timeout:
+            failures.append(f"test process group {process.pid} did not close its output pipes")
+            _signal_live_test_process_group(process, signal.SIGKILL)
+            try:
+                output, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired as second_timeout:
+                failures.append(
+                    f"test process group {process.pid} still held output pipes after SIGKILL"
+                )
+                output = second_timeout.output or first_timeout.output or ""
+        except OSError as error:
+            failures.append(f"could not drain test process {process.pid} output: {error}")
+            _signal_live_test_process_group(process, signal.SIGKILL)
+            output = ""
+        outputs.append(output)
+
+    # Always retry exact stops after process-group and pipe cleanup. This closes
+    # a late systemd activation race and ensures postflight is never skipped by
+    # a communicate timeout.
+    stop_exact_units()
+    if any(process.returncode != 0 for process in processes):
+        failures.append("one or more cancellation test processes exited unsuccessfully")
+    if any(process.poll() is None for process in processes):
+        failures.append("a cancellation test process remained after bounded signal cleanup")
+    for process in processes:
+        if process_group_exists(process):
+            failures.append(f"test-owned process group {process.pid} survived its pytest process")
+
+    try:
+        quiescence_deadline = time.monotonic() + 30
+        remaining = {
+            unit
+            for unit, (active_state, _sub_state) in acp_scope_states().items()
+            if active_state not in {"inactive", "failed"}
+        }
+        while remaining and time.monotonic() < quiescence_deadline:
+            time.sleep(0.1)
+            remaining = {
+                unit
+                for unit, (active_state, _sub_state) in acp_scope_states().items()
+                if active_state not in {"inactive", "failed"}
+            }
+        if remaining:
+            failures.append(f"concurrent proof left active ACP scopes behind: {sorted(remaining)}")
+    except Exception as error:
+        failures.append(f"could not verify global ACP scope quiescence: {error}")
+
+    for record in prepared_records.values():
+        for unit in (
+            record["service_unit"],
+            record["monitor_unit"],
+            record["scope_unit"],
+            record["slice_unit"],
+        ):
+            try:
+                properties = _unit_properties(
+                    unit,
+                    ("ActiveState", "ControlGroup", "Id", "LoadState", "MainPID")
+                    if unit.endswith(".service")
+                    else ("ActiveState", "ControlGroup", "Id", "LoadState"),
+                )
+            except Exception as error:
+                failures.append(f"could not verify exact unit {unit}: {error}")
+                continue
+            if (
+                properties["Id"] != unit
+                or properties["ActiveState"] not in {"inactive", "failed"}
+                or properties["LoadState"] not in {"loaded", "not-found"}
+                or properties["ControlGroup"]
+                or ("MainPID" in properties and properties["MainPID"] != "0")
+            ):
+                failures.append(f"exact unit {unit} was not quiescent after child exit")
+        if os.path.lexists(record["run_root"]):
+            failures.append(
+                f"child test root was not removed after successful cleanup: {record['run_root']}"
+            )
+
+    try:
+        remaining_run_roots = {
+            str(path)
+            for path in Path("/tmp").glob("acp-live-launch-driver-*")
+            if path.is_dir() or path.is_symlink()
+        } - preexisting_run_roots
+        if remaining_run_roots:
+            failures.append(
+                f"concurrent proof left unaccounted test roots: {sorted(remaining_run_roots)}"
+            )
+    except OSError as error:
+        failures.append(f"could not verify launch-driver test-root cleanup: {error}")
+
+    if not failures:
+        expected_markers: set[str] = set()
+        for slot in ("0", "1"):
+            expected_markers.update(
+                {f"prepared-{slot}.json", f"ready-{slot}.json", f"release-{slot}"}
+            )
+        try:
+            control_entries = list(control_root.iterdir())
+        except OSError as error:
+            failures.append(f"could not inspect concurrent control directory: {error}")
+            control_entries = []
+        if not failures and {path.name for path in control_entries} != expected_markers:
+            failures.append("concurrent control directory contains unexpected artifacts")
+        for path in control_entries:
+            if failures:
+                break
+            try:
+                info = path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                ):
+                    failures.append(f"concurrent control artifact has unsafe metadata: {path.name}")
+                elif (
+                    path.name.startswith("release-")
+                    and path.read_text(encoding="ascii") != "release"
+                ):
+                    failures.append(
+                        f"concurrent release marker has unexpected content: {path.name}"
+                    )
+            except OSError as error:
+                failures.append(
+                    f"could not verify concurrent control artifact {path.name}: {error}"
+                )
+        if not failures:
+            for path in control_entries:
+                try:
+                    path.unlink()
+                except OSError as error:
+                    failures.append(
+                        f"could not remove concurrent control artifact {path.name}: {error}"
+                    )
+                    break
+        if not failures:
+            try:
+                control_root.rmdir()
+            except OSError as error:
+                failures.append(f"could not remove concurrent control directory: {error}")
+    if failures:
+        details = "; ".join(
+            f"child {index} exit={process.returncode}: {output[-3000:]}"
+            for index, (process, output) in enumerate(zip(processes, outputs, strict=True))
+        )
+        pytest.fail("; ".join(failures) + "; " + details)
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--monitor-child":
