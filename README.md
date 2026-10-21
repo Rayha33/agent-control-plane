@@ -33,6 +33,7 @@ The service provides the coordination primitives needed to prevent both.
 - Atomic task claims
 - Exact-resource leases for files, services, datasets, or deployment targets
 - Monotonic fencing tokens that reject stale or “zombie” workers
+- Version-checked atomic file writes inside an explicitly configured workspace
 - Heartbeats, checkpoints, expired-claim recovery, and explicit conflict states
 - Immutable artifact submissions tied to the claim and resource versions
 
@@ -89,6 +90,8 @@ uv sync --extra dev
 export ACP_ADMIN_KEY="replace-with-a-long-random-value"
 export ACP_SIGNING_KEY="replace-with-an-independent-long-random-value"
 export ACP_DATABASE_PATH="agent_control_plane.db"
+# Optional; required only for mediated workspace file writes. Use an isolated checkout.
+export ACP_WORKSPACE_ROOT="/absolute/path/to/isolated-worktree"
 
 uv run uvicorn agent_control_plane.app:create_app --factory --reload
 ```
@@ -103,9 +106,12 @@ service is reachable by anyone else.
 1. An administrator registers one `worker` agent and a different `qc` agent.
 2. Each agent receives a mandate containing `coordination.*` on `task:*`.
 3. The administrator creates a task with acceptance criteria, dependencies, and
-   every resource it may mutate.
+   every resource it may mutate. For file writes, declare the exact resource
+   `workspace-file:<relative-posix-path>`.
 4. The worker atomically claims the task and receives task/resource fencing
-   tokens.
+   tokens. A mediated file write also includes the exact SHA-256 of the version
+   read; `409 stale_file_version` means re-read and reconcile, never replay the
+   stale body with a new hash.
 5. The worker heartbeats while working and submits an artifact hash plus test
    evidence.
 6. The independent QC agent returns `pass`, `revise`, `block`, or
@@ -120,6 +126,8 @@ The OpenAPI document contains the complete request schemas. Important endpoints:
 | `POST /v1/tasks` | Create a task with dependencies and resources |
 | `POST /v1/tasks/{id}/claim` | Atomically claim work and obtain fencing tokens |
 | `POST /v1/tasks/{id}/heartbeat` | Renew the claim and store a checkpoint |
+| `POST /v1/tasks/{id}/file-writes` | Atomically replace one file only if its expected SHA-256 still matches |
+| `GET /v1/tasks/{id}/file-writes/{operation_id}` | Read content-safe persisted write state |
 | `POST /v1/tasks/{id}/submissions` | Submit immutable artifact evidence |
 | `POST /v1/submissions/{id}/reviews` | Record independent structured QC |
 | `POST /v1/tasks/{id}/complete` | Open the completion gate after QC passes |
@@ -151,6 +159,10 @@ This is a reference implementation, not a production security product.
   detection are future work.
 - The service coordinates work but does not itself create Git worktrees,
   containers, or merge commits.
+- Mediated file writes are available only under `ACP_WORKSPACE_ROOT` and only
+  through this API. They do not intercept shell/editor writes that bypass the
+  service; use per-task worktrees or a runtime gateway when that bypass must be
+  prevented.
 - Artifact URIs and hashes are recorded but artifact storage is external.
 - Shared HMAC signing should be replaced by asymmetric keys or managed KMS.
 - Multi-tenant isolation, SSO/RBAC, authenticated human approvers, rate limits,

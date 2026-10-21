@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .workspace_files import MAX_WORKSPACE_FILE_BYTES
 
 TaskStatus = Literal[
     "open",
@@ -75,6 +78,29 @@ class SubmissionView(BaseModel):
     evidence: list[str]
     status: str
     created_at: str
+
+
+class WorkspaceFileWriteRequest(BaseModel):
+    operation_id: UUID
+    path: str = Field(min_length=1, max_length=2048)
+    expected_sha256: str | None = Field(..., pattern=r"^[a-fA-F0-9]{64}$")
+    content_base64: str = Field(max_length=4 * ((MAX_WORKSPACE_FILE_BYTES + 2) // 3))
+    claim_fencing_token: int = Field(ge=1)
+    resource_fencing_tokens: dict[str, int]
+
+
+class WorkspaceFileWriteReceipt(BaseModel):
+    operation_id: str
+    task_id: str
+    agent_id: str
+    path: str
+    expected_sha256: str | None
+    observed_sha256: str | None
+    new_sha256: str
+    content_bytes: int
+    status: Literal["prepared", "committed", "conflict"]
+    created_at: str
+    updated_at: str
 
 
 class TaskCreate(BaseModel):

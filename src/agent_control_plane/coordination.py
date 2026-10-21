@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import sqlite3
 import time
@@ -11,18 +14,33 @@ from .coordination_schemas import (
     QCReviewCreate,
     SubmissionCreate,
     TaskCreate,
+    WorkspaceFileWriteRequest,
 )
 from .database import Database, canonical_json, utc_now
 from .policy import scope_allows
 from .service import ControlPlaneError, ControlPlaneService
+from .workspace_files import (
+    MAX_WORKSPACE_FILE_BYTES,
+    WorkspaceFileError,
+    WorkspaceFileStore,
+    canonical_relative_path,
+)
 
 QC_RESERVATION_SECONDS = 3600
 
 
 class CoordinationService:
-    def __init__(self, database: Database, control_plane: ControlPlaneService):
+    def __init__(
+        self,
+        database: Database,
+        control_plane: ControlPlaneService,
+        workspace_root: str | None = None,
+    ):
         self.database = database
         self.control_plane = control_plane
+        self.workspace_files = (
+            WorkspaceFileStore(workspace_root) if workspace_root else None
+        )
 
     def create_task(self, request: TaskCreate) -> dict[str, Any]:
         task_id = str(uuid.uuid4())
@@ -101,6 +119,395 @@ class CoordinationService:
                 "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
             )
         return [self._task_view(row) for row in rows]
+
+    def write_workspace_file(
+        self, task_id: str, token: str, request: WorkspaceFileWriteRequest
+    ) -> dict[str, Any]:
+        claims, _mandate, agent = self._agent_for_action(
+            token, "coordination.write_file", f"task:{task_id}", {"worker"}
+        )
+        if not self.workspace_files:
+            raise ControlPlaneError(
+                503,
+                "workspace_root_unconfigured",
+                "set ACP_WORKSPACE_ROOT before using workspace file writes",
+            )
+        try:
+            relative_path = canonical_relative_path(request.path)
+        except WorkspaceFileError as error:
+            raise ControlPlaneError(
+                error.status_code, error.code, error.message
+            ) from error
+
+        try:
+            content = base64.b64decode(request.content_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ControlPlaneError(
+                422, "invalid_file_content", "content_base64 must be valid base64"
+            ) from error
+        if len(content) > MAX_WORKSPACE_FILE_BYTES:
+            raise ControlPlaneError(
+                413, "workspace_file_too_large", "workspace writes are limited to 1 MiB"
+            )
+
+        operation_id = str(request.operation_id)
+        expected_sha256 = (
+            request.expected_sha256.lower() if request.expected_sha256 else None
+        )
+        new_sha256 = hashlib.sha256(content).hexdigest()
+        lease_resource = f"workspace-file:{relative_path}"
+        conflict_message: str | None = None
+        receipt: dict[str, Any] | None = None
+        should_write = False
+
+        try:
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                task = self._task_row(connection, task_id)
+                prior = connection.execute(
+                    "SELECT * FROM workspace_file_writes WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+
+                if prior:
+                    if prior["task_id"] != task_id or prior["agent_id"] != agent["id"]:
+                        raise ControlPlaneError(
+                            404,
+                            "file_write_not_found",
+                            "workspace file write not found",
+                        )
+                    if (
+                        prior["relative_path"] != relative_path
+                        or prior["expected_sha256"] != expected_sha256
+                        or prior["new_sha256"] != new_sha256
+                        or prior["content_bytes"] != len(content)
+                    ):
+                        raise ControlPlaneError(
+                            409,
+                            "idempotency_key_conflict",
+                            "operation_id was already used for different file content",
+                        )
+                    if prior["status"] == "committed":
+                        return self._workspace_file_write_view(prior)
+                    if prior["status"] == "conflict":
+                        conflict_message = "workspace file write previously conflicted; use a new operation_id"
+                    else:
+                        observed_sha256, _mode = self.workspace_files.current(
+                            relative_path
+                        )
+                        if observed_sha256 == new_sha256:
+                            self.workspace_files.sync_directory(relative_path)
+                            updated_at = utc_now()
+                            connection.execute(
+                                """UPDATE workspace_file_writes
+                                   SET status = 'committed', updated_at = ?
+                                   WHERE operation_id = ?""",
+                                (updated_at, operation_id),
+                            )
+                            self.database.append_audit_in_transaction(
+                                connection,
+                                "workspace_file_write.recovered",
+                                claims["actor"],
+                                self._workspace_file_audit_payload(
+                                    prior, observed_sha256
+                                ),
+                            )
+                            receipt = self._workspace_file_write_view(
+                                connection.execute(
+                                    "SELECT * FROM workspace_file_writes WHERE operation_id = ?",
+                                    (operation_id,),
+                                ).fetchone()
+                            )
+                        elif observed_sha256 != expected_sha256:
+                            updated_at = utc_now()
+                            connection.execute(
+                                """UPDATE workspace_file_writes
+                                   SET status = 'conflict', observed_sha256 = ?, updated_at = ?
+                                   WHERE operation_id = ?""",
+                                (observed_sha256, updated_at, operation_id),
+                            )
+                            self.database.append_audit_in_transaction(
+                                connection,
+                                "workspace_file_write.conflicted",
+                                claims["actor"],
+                                self._workspace_file_audit_payload(
+                                    prior, observed_sha256
+                                ),
+                            )
+                            conflict_message = self._stale_file_message(observed_sha256)
+                        else:
+                            self._assert_active_claim(
+                                connection,
+                                task,
+                                agent["id"],
+                                request.claim_fencing_token,
+                                request.resource_fencing_tokens,
+                                int(time.time()),
+                            )
+                            self._assert_workspace_file_resource(task, lease_resource)
+                            should_write = True
+                else:
+                    self._assert_active_claim(
+                        connection,
+                        task,
+                        agent["id"],
+                        request.claim_fencing_token,
+                        request.resource_fencing_tokens,
+                        int(time.time()),
+                    )
+                    self._assert_workspace_file_resource(task, lease_resource)
+                    observed_sha256, _mode = self.workspace_files.current(relative_path)
+                    created_at = utc_now()
+                    status = (
+                        "prepared" if observed_sha256 == expected_sha256 else "conflict"
+                    )
+                    connection.execute(
+                        """INSERT INTO workspace_file_writes
+                           (operation_id, task_id, agent_id, relative_path,
+                            expected_sha256, observed_sha256, new_sha256,
+                            content_bytes, status, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            operation_id,
+                            task_id,
+                            agent["id"],
+                            relative_path,
+                            expected_sha256,
+                            observed_sha256,
+                            new_sha256,
+                            len(content),
+                            status,
+                            created_at,
+                            created_at,
+                        ),
+                    )
+                    prior = connection.execute(
+                        "SELECT * FROM workspace_file_writes WHERE operation_id = ?",
+                        (operation_id,),
+                    ).fetchone()
+                    if status == "prepared":
+                        self.database.append_audit_in_transaction(
+                            connection,
+                            "workspace_file_write.prepared",
+                            claims["actor"],
+                            self._workspace_file_audit_payload(prior, observed_sha256),
+                        )
+                        should_write = True
+                    else:
+                        self.database.append_audit_in_transaction(
+                            connection,
+                            "workspace_file_write.conflicted",
+                            claims["actor"],
+                            self._workspace_file_audit_payload(prior, observed_sha256),
+                        )
+                        conflict_message = self._stale_file_message(observed_sha256)
+        except WorkspaceFileError as error:
+            raise ControlPlaneError(
+                error.status_code, error.code, error.message
+            ) from error
+
+        if receipt:
+            return receipt
+        if conflict_message:
+            raise ControlPlaneError(409, "stale_file_version", conflict_message)
+        if not should_write:
+            raise ControlPlaneError(
+                500,
+                "file_write_state_invalid",
+                "workspace file write did not reach a safe state",
+            )
+
+        conflict_message = None
+        try:
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                prior = connection.execute(
+                    "SELECT * FROM workspace_file_writes WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if (
+                    not prior
+                    or prior["task_id"] != task_id
+                    or prior["agent_id"] != agent["id"]
+                ):
+                    raise ControlPlaneError(
+                        404, "file_write_not_found", "workspace file write not found"
+                    )
+                if prior["status"] == "committed":
+                    return self._workspace_file_write_view(prior)
+                if prior["status"] == "conflict":
+                    raise ControlPlaneError(
+                        409,
+                        "stale_file_version",
+                        "workspace file write previously conflicted; use a new operation_id",
+                    )
+
+                task = self._task_row(connection, task_id)
+                observed_sha256, _mode = self.workspace_files.current(relative_path)
+                if observed_sha256 == new_sha256:
+                    self.workspace_files.sync_directory(relative_path)
+                    updated_at = utc_now()
+                    connection.execute(
+                        """UPDATE workspace_file_writes
+                           SET status = 'committed', updated_at = ?
+                           WHERE operation_id = ?""",
+                        (updated_at, operation_id),
+                    )
+                    self.database.append_audit_in_transaction(
+                        connection,
+                        "workspace_file_write.recovered",
+                        claims["actor"],
+                        self._workspace_file_audit_payload(prior, observed_sha256),
+                    )
+                elif observed_sha256 != expected_sha256:
+                    updated_at = utc_now()
+                    connection.execute(
+                        """UPDATE workspace_file_writes
+                           SET status = 'conflict', observed_sha256 = ?, updated_at = ?
+                           WHERE operation_id = ?""",
+                        (observed_sha256, updated_at, operation_id),
+                    )
+                    self.database.append_audit_in_transaction(
+                        connection,
+                        "workspace_file_write.conflicted",
+                        claims["actor"],
+                        self._workspace_file_audit_payload(prior, observed_sha256),
+                    )
+                    conflict_message = self._stale_file_message(observed_sha256)
+                else:
+                    self._assert_active_claim(
+                        connection,
+                        task,
+                        agent["id"],
+                        request.claim_fencing_token,
+                        request.resource_fencing_tokens,
+                        int(time.time()),
+                    )
+                    self._assert_workspace_file_resource(task, lease_resource)
+                    try:
+                        self.workspace_files.atomic_replace(
+                            relative_path,
+                            operation_id,
+                            expected_sha256,
+                            content,
+                            new_sha256,
+                        )
+                    except WorkspaceFileError as error:
+                        if error.code != "stale_file_version":
+                            raise
+                        observed_sha256, _mode = self.workspace_files.current(
+                            relative_path
+                        )
+                        updated_at = utc_now()
+                        connection.execute(
+                            """UPDATE workspace_file_writes
+                               SET status = 'conflict', observed_sha256 = ?, updated_at = ?
+                               WHERE operation_id = ?""",
+                            (observed_sha256, updated_at, operation_id),
+                        )
+                        self.database.append_audit_in_transaction(
+                            connection,
+                            "workspace_file_write.conflicted",
+                            claims["actor"],
+                            self._workspace_file_audit_payload(prior, observed_sha256),
+                        )
+                        conflict_message = self._stale_file_message(observed_sha256)
+                    else:
+                        updated_at = utc_now()
+                        connection.execute(
+                            """UPDATE workspace_file_writes
+                               SET status = 'committed', updated_at = ?
+                               WHERE operation_id = ?""",
+                            (updated_at, operation_id),
+                        )
+                        self.database.append_audit_in_transaction(
+                            connection,
+                            "workspace_file_write.committed",
+                            claims["actor"],
+                            self._workspace_file_audit_payload(prior, observed_sha256),
+                        )
+                if not conflict_message:
+                    receipt = self._workspace_file_write_view(
+                        connection.execute(
+                            "SELECT * FROM workspace_file_writes WHERE operation_id = ?",
+                            (operation_id,),
+                        ).fetchone()
+                    )
+        except WorkspaceFileError as error:
+            raise ControlPlaneError(
+                error.status_code, error.code, error.message
+            ) from error
+
+        if conflict_message:
+            raise ControlPlaneError(409, "stale_file_version", conflict_message)
+        if receipt:
+            return receipt
+        raise ControlPlaneError(
+            500,
+            "file_write_state_invalid",
+            "workspace file write did not reach a safe state",
+        )
+
+    def workspace_file_write(
+        self, task_id: str, operation_id: str, token: str
+    ) -> dict[str, Any]:
+        _claims, _mandate, agent = self._agent_for_action(
+            token, "coordination.write_file", f"task:{task_id}", {"worker"}
+        )
+        row = self.database.one(
+            "SELECT * FROM workspace_file_writes WHERE operation_id = ? AND task_id = ?",
+            (operation_id, task_id),
+        )
+        if not row or row["agent_id"] != agent["id"]:
+            raise ControlPlaneError(
+                404, "file_write_not_found", "workspace file write not found"
+            )
+        return self._workspace_file_write_view(row)
+
+    @staticmethod
+    def _assert_workspace_file_resource(task: sqlite3.Row, lease_resource: str) -> None:
+        if lease_resource not in json.loads(task["resources_json"]):
+            raise ControlPlaneError(
+                409,
+                "file_resource_not_leased",
+                f"task must declare the exact resource {lease_resource}",
+            )
+
+    @staticmethod
+    def _stale_file_message(observed_sha256: str | None) -> str:
+        return "workspace file version changed; current sha256 is " + (
+            observed_sha256 or "missing"
+        )
+
+    @staticmethod
+    def _workspace_file_write_view(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "operation_id": row["operation_id"],
+            "task_id": row["task_id"],
+            "agent_id": row["agent_id"],
+            "path": row["relative_path"],
+            "expected_sha256": row["expected_sha256"],
+            "observed_sha256": row["observed_sha256"],
+            "new_sha256": row["new_sha256"],
+            "content_bytes": row["content_bytes"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _workspace_file_audit_payload(
+        row: sqlite3.Row, observed_sha256: str | None
+    ) -> dict[str, Any]:
+        return {
+            "agent_id": row["agent_id"],
+            "expected_sha256": row["expected_sha256"],
+            "new_sha256": row["new_sha256"],
+            "observed_sha256": observed_sha256,
+            "operation_id": row["operation_id"],
+            "path": row["relative_path"],
+            "task_id": row["task_id"],
+        }
 
     def claim_task(self, task_id: str, token: str, ttl_seconds: int) -> dict[str, Any]:
         claims, _mandate, agent = self._agent_for_action(

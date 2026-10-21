@@ -31,6 +31,7 @@ class Settings:
     admin_key: str
     signing_key: str
     issuer: str = "agent-control-plane"
+    workspace_root: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -46,6 +47,7 @@ class Settings:
             admin_key=os.getenv("ACP_ADMIN_KEY", DEV_ADMIN_KEY),
             signing_key=os.getenv("ACP_SIGNING_KEY", DEV_SIGNING_KEY),
             issuer=os.getenv("ACP_ISSUER", "agent-control-plane"),
+            workspace_root=os.getenv("ACP_WORKSPACE_ROOT") or None,
         )
         if settings.insecure_defaults and not dev_mode_enabled():
             raise InsecureDefaultsError(settings.insecure_defaults)
