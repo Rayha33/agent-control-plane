@@ -182,6 +182,20 @@ def parse_openai_responses_usage(
             if source_name in allowed_fields and source_name in detail:
                 measurements[report_name] = detail[source_name]
 
+    if (
+        measurements.get("cached_input_tokens", 0) + measurements.get("cache_write_input_tokens", 0)
+        > input_tokens
+        or measurements.get("reasoning_output_tokens", 0) > output_tokens
+    ):
+        return _report(
+            status="invalid",
+            observed_at=observed,
+            response_id=response_id,
+            model=model,
+            response_created_at=response_created_at,
+            reason="provider_usage_malformed",
+        )
+
     return _report(
         status="reported",
         observed_at=observed,
@@ -319,8 +333,8 @@ def parse_gemini_generate_content_usage(
 ) -> ClientReportedProviderUsage:
     """Extract Google AI Gemini Developer API GenerateContent usage.
 
-    This parser is not for Vertex AI: Vertex has distinct total-token accounting
-    and requires its own provider adapter.
+    This parser is scoped to Google AI Gemini Developer API GenerateContent;
+    Vertex AI and the Gemini Interactions API require their own adapters.
     """
 
     observed = _timestamp(observed_at)
@@ -387,11 +401,14 @@ def parse_gemini_generate_content_usage(
     if details.get("cached_input_tokens", 0) > prompt_tokens:
         return _gemini_invalid_usage(observed, response_id, model)
     reasoning_tokens = details.get("reasoning_output_tokens", 0)
+    tool_use_tokens = details.get("tool_use_prompt_tokens", 0)
+    normalized_input = prompt_tokens + tool_use_tokens
     normalized_output = candidates_tokens + reasoning_tokens
     if (
-        normalized_output > 2**63 - 1
-        or prompt_tokens + normalized_output > 2**63 - 1
-        or total_tokens != prompt_tokens + normalized_output
+        normalized_input > 2**63 - 1
+        or normalized_output > 2**63 - 1
+        or normalized_input + normalized_output > 2**63 - 1
+        or total_tokens != normalized_input + normalized_output
     ):
         return _report(
             status="invalid",
@@ -404,7 +421,7 @@ def parse_gemini_generate_content_usage(
         )
 
     measurements = {
-        "input_tokens": prompt_tokens,
+        "input_tokens": normalized_input,
         "output_tokens": normalized_output,
         "total_tokens": total_tokens,
         **details,

@@ -269,6 +269,16 @@ def reserve_dispatch_attempt(client, task_id, token, claim, idempotency_key):
     )
 
 
+def test_interrupted_resume_database_guard_maps_to_reopen_conflict() -> None:
+    with pytest.raises(ControlPlaneError) as error:
+        coordination_module.CoordinationService._raise_claim_guard_error(
+            sqlite3.IntegrityError("task_interruption_requires_reopen")
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "task_interruption_requires_reopen"
+
+
 def test_simultaneous_claims_have_exactly_one_winner(client, app, admin_headers):
     worker_a = create_agent(client, admin_headers, "parallel-worker-a", "worker")
     worker_b = create_agent(client, admin_headers, "parallel-worker-b", "worker")
@@ -699,6 +709,58 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
     blocked_submission = submit_task(client, task["id"], token, claim)
     assert blocked_submission.status_code == 409
     assert blocked_submission.json()["error"] == "claim_interrupted"
+    replay = client.post(endpoint, headers=headers, json=request)
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["created"] is False
+    assert replay.json()["report"]["id"] == report["id"]
+    conflict = client.post(
+        endpoint,
+        headers=headers,
+        json={**request, "summary": "A conflicting second immutable report."},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"] == "interruption_report_conflict"
+    with app.state.database.connect() as connection:
+        connection.execute("UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (task["id"],))
+    expired_replay = client.post(endpoint, headers=headers, json=request)
+    assert expired_replay.status_code == 201, expired_replay.text
+    assert expired_replay.json()["created"] is False
+
+    reaped = client.post("/v1/coordination/reap", headers=admin_headers)
+    assert reaped.status_code == 200, reaped.text
+    reap_report = reaped.json()
+    assert task["id"] in reap_report["blocked_interruption_task_ids"]
+    assert task["id"] not in reap_report["orphaned_task_ids"]
+
+    task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert task_view["status"] == "blocked"
+    assert task_view["latest_submission"] is None
+    assert task_view["latest_interruption_report"]["id"] == report["id"]
+    assert task_view["latest_interruption_report"]["promotable"] is False
+    cannot_complete = client.post(
+        f"/v1/tasks/{task['id']}/complete",
+        headers=admin_headers,
+        json={"reason": "A partial interruption report is not completed work."},
+    )
+    assert cannot_complete.status_code == 409
+    assert cannot_complete.json()["error"] == "qc_gate_not_passed"
+
+    parked = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
+    assert parked["status"] == "blocked"
+    automatic_resume = claim_task(client, task["id"], token)
+    assert automatic_resume.status_code == 409
+    assert automatic_resume.json()["error"] == "task_unavailable"
+
+    explicit_resume = client.post(
+        f"/v1/tasks/{task['id']}/reopen",
+        headers=admin_headers,
+        json={"reason": "Operator reviewed the partial interruption and authorized resume."},
+    )
+    assert explicit_resume.status_code == 200, explicit_resume.text
+    assert explicit_resume.json()["status"] == "open"
+
+    # Reapply v9 compatibility triggers after a simulated old writer is still
+    # running; the later audited reopen makes this new task fence legitimate.
     with app.state.database.connect() as connection:
         connection.execute("DROP TRIGGER budget_interruption_dispatch_insert_guard")
         connection.execute("DROP TRIGGER budget_interruption_submission_insert_guard")
@@ -744,37 +806,6 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
                 ),
             )
 
-    replay = client.post(endpoint, headers=headers, json=request)
-    assert replay.status_code == 201, replay.text
-    assert replay.json()["created"] is False
-    assert replay.json()["report"]["id"] == report["id"]
-    conflict = client.post(
-        endpoint,
-        headers=headers,
-        json={**request, "summary": "A conflicting second immutable report."},
-    )
-    assert conflict.status_code == 409
-    assert conflict.json()["error"] == "interruption_report_conflict"
-    with app.state.database.connect() as connection:
-        connection.execute("UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (task["id"],))
-    expired_replay = client.post(endpoint, headers=headers, json=request)
-    assert expired_replay.status_code == 201, expired_replay.text
-    assert expired_replay.json()["created"] is False
-
-    task_view = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
-    assert task_view["status"] == claim["task"]["status"]
-    assert task_view["latest_submission"] is None
-    assert task_view["latest_interruption_report"]["id"] == report["id"]
-    assert task_view["latest_interruption_report"]["promotable"] is False
-    cannot_complete = client.post(
-        f"/v1/tasks/{task['id']}/complete",
-        headers=admin_headers,
-        json={"reason": "A partial interruption report is not completed work."},
-    )
-    assert cannot_complete.status_code == 409
-    assert cannot_complete.json()["error"] == "qc_gate_not_passed"
-
-    Database(app.state.database.path).initialize()
     after_restart = client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()
     assert after_restart["latest_interruption_report"] == task_view["latest_interruption_report"]
     with pytest.raises(sqlite3.IntegrityError, match="budget_interruption_report_immutable"):
@@ -788,15 +819,6 @@ def test_interruption_report_is_bounded_fenced_append_only_and_survives_restart(
             connection.execute(
                 "DELETE FROM budget_interruption_reports WHERE id = ?", (report["id"],)
             )
-
-    with app.state.database.connect() as connection:
-        connection.execute("UPDATE tasks SET claim_expires_at = 0 WHERE id = ?", (task["id"],))
-        connection.execute(
-            "UPDATE resource_leases SET expires_at = 0 WHERE task_id = ?", (task["id"],)
-        )
-    reaped = client.post("/v1/coordination/reap", headers=admin_headers)
-    assert reaped.status_code == 200, reaped.text
-    assert task["id"] in reaped.json()["orphaned_task_ids"]
 
     resumed_claim_response = claim_task(client, task["id"], token)
     assert resumed_claim_response.status_code == 200, resumed_claim_response.text
@@ -930,6 +952,90 @@ def test_provider_usage_report_rejects_timestamp_that_cannot_normalize_to_utc():
                 "reason": None,
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("provider", "adapter", "measurements"),
+    [
+        (
+            "openai",
+            "responses",
+            {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "cached_input_tokens": 3,
+                "cache_write_input_tokens": 2,
+            },
+        ),
+        (
+            "openai",
+            "responses",
+            {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "reasoning_output_tokens": 4,
+            },
+        ),
+        (
+            "gemini",
+            "generate_content",
+            {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "tool_use_prompt_tokens": 5,
+            },
+        ),
+    ],
+)
+def test_provider_usage_report_rejects_detail_counts_above_parent(provider, adapter, measurements):
+    with pytest.raises(ValueError, match="detail exceeds its parent token count"):
+        ProviderUsageReport.model_validate(
+            {
+                "status": "reported",
+                "provider": provider,
+                "adapter": adapter,
+                "source": "client_reported",
+                "scope": "single_response",
+                "unit": "tokens",
+                "observed_at": "2026-10-15T00:00:00Z",
+                "response_id": "resp_usage_detail",
+                "model": "model-test",
+                "measurements": measurements,
+                "freshness": "unknown",
+                "enforcement": "report_only",
+                "reason": None,
+            }
+        )
+
+
+def test_provider_usage_report_accepts_details_at_parent_boundaries():
+    ProviderUsageReport.model_validate(
+        {
+            "status": "reported",
+            "provider": "openai",
+            "adapter": "responses",
+            "source": "client_reported",
+            "scope": "single_response",
+            "unit": "tokens",
+            "observed_at": "2026-10-15T00:00:00Z",
+            "response_id": "resp_usage_boundary",
+            "model": "model-test",
+            "measurements": {
+                "input_tokens": 4,
+                "output_tokens": 3,
+                "total_tokens": 7,
+                "cached_input_tokens": 3,
+                "cache_write_input_tokens": 1,
+                "reasoning_output_tokens": 3,
+            },
+            "freshness": "unknown",
+            "enforcement": "report_only",
+            "reason": None,
+        }
+    )
 
 
 def test_task_usage_summary_is_report_only_and_exposes_descendant_gaps(
@@ -2018,6 +2124,7 @@ def test_expired_claim_is_reaped_and_zombie_writer_is_rejected(client, app, admi
 
     reaped = client.post("/v1/coordination/reap", headers=admin_headers)
     assert reaped.status_code == 200
+    assert reaped.json()["blocked_interruption_task_ids"] == []
     assert task["id"] in reaped.json()["orphaned_task_ids"]
 
     replacement = claim_task(client, task["id"], token_b)
@@ -2169,6 +2276,16 @@ def test_blocked_task_is_reopened_after_human_action(client, app, admin_headers)
         client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()["status"] == "blocked"
     )
     assert heartbeat_rows(app, task["id"]) == 0
+
+    blank_reason_reopen = client.post(
+        f"/v1/tasks/{task['id']}/reopen",
+        headers=admin_headers,
+        json={"reason": " \t\n "},
+    )
+    assert blank_reason_reopen.status_code == 422
+    assert (
+        client.get(f"/v1/tasks/{task['id']}", headers=admin_headers).json()["status"] == "blocked"
+    )
 
     reopened = client.post(
         f"/v1/tasks/{task['id']}/reopen",

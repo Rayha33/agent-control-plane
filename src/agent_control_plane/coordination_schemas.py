@@ -397,6 +397,16 @@ class ProviderUsageReport(BaseModel):
                 or self.reason is not None
             ):
                 raise ValueError("reported usage requires consistent per-response token counts")
+            if (
+                self.measurements.get("cached_input_tokens", 0)
+                + self.measurements.get("cache_write_input_tokens", 0)
+                > self.measurements["input_tokens"]
+                or self.measurements.get("tool_use_prompt_tokens", 0)
+                > self.measurements["input_tokens"]
+                or self.measurements.get("reasoning_output_tokens", 0)
+                > self.measurements["output_tokens"]
+            ):
+                raise ValueError("provider usage detail exceeds its parent token count")
         elif self.unit is not None or self.measurements or self.reason is None:
             raise ValueError("missing or invalid usage cannot carry token counts")
         return self
@@ -716,8 +726,17 @@ class TaskCompleteRequest(BaseModel):
 class TaskReopenRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
 
+    @field_validator("reason")
+    @classmethod
+    def require_nonblank_reason(cls, value: str) -> str:
+        reason = value.strip()
+        if not reason:
+            raise ValueError("reason must contain non-whitespace characters")
+        return reason
+
 
 class ReapReport(BaseModel):
+    blocked_interruption_task_ids: list[str]
     orphaned_task_ids: list[str]
     conflicted_task_ids: list[str]
     released_resources: int

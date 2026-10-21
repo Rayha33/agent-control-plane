@@ -371,7 +371,7 @@ def test_gemini_generate_content_adapter_sends_once_and_records_report_only_usag
             "candidatesTokenCount": 4,
             "thoughtsTokenCount": 2,
             "toolUsePromptTokenCount": 1,
-            "totalTokenCount": 11,
+            "totalTokenCount": 12,
         },
     }
     raw = FakeProviderResponse(200, {"content-type": "application/json"}, json.dumps(body).encode())
@@ -396,11 +396,11 @@ def test_gemini_generate_content_adapter_sends_once_and_records_report_only_usag
     assert result.provider_usage_report["status"] == "reported"
     assert result.provider_usage_report["measurements"] == {
         "cached_input_tokens": 1,
-        "input_tokens": 5,
+        "input_tokens": 6,
         "output_tokens": 6,
         "reasoning_output_tokens": 2,
         "tool_use_prompt_tokens": 1,
-        "total_tokens": 11,
+        "total_tokens": 12,
     }
     assert ledger.receipts == [("attempt-1", 200, None)]
     assert ledger.usage_reports == [("attempt-1", result.provider_usage_report)]
@@ -1159,6 +1159,35 @@ def test_explicit_retry_policy_caps_total_wait_across_the_sequence() -> None:
     assert sends == [None, None]
     assert waits == [3.0]
     assert ledger.receipts == [("attempt-1", 503, 3), ("attempt-2", 503, 3)]
+
+
+def test_explicit_retry_policy_stops_after_sleeper_overshoots_total_wait_cap() -> None:
+    ledger = FakeLedger()
+    response = FakeResponse(503, retry_after_seconds=0)
+    sends: list[None] = []
+    waits: list[float] = []
+
+    def oversleep(delay: float) -> None:
+        waits.append(delay)
+        dispatch_client_module.time.sleep(0.02)
+
+    result = _dispatch_retries(
+        ledger,
+        "total-wait-overshoot",
+        lambda _provider_idempotency_key: (sends.append(None), response)[1],
+        DispatchRetryPolicy(
+            max_attempts=3,
+            max_retry_after_seconds=0,
+            max_total_wait_seconds=0,
+        ),
+        oversleep,
+    )
+
+    assert result.response.status_code == 503
+    assert len(result.attempts) == 1
+    assert sends == [None]
+    assert waits == [0.0]
+    assert ledger.receipts == [("attempt-1", 503, 0)]
 
 
 @pytest.mark.parametrize("max_attempts", [True, 0, 11, 1.5])

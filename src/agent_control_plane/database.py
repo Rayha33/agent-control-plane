@@ -24,7 +24,7 @@ from .schema_version import (
 GENESIS_HASH = "0" * 64
 
 
-SERVICE_SCHEMA_VERSION = 9
+SERVICE_SCHEMA_VERSION = 12
 """Schema this binary understands for the FastAPI service database.
 
 Independent of the supervisor's SCHEMA_VERSION on purpose: these are two files with
@@ -847,6 +847,282 @@ def _guard_interrupted_claim_writes(connection: sqlite3.Connection) -> None:
     )
 
 
+def _guard_interrupted_task_resume(connection: sqlite3.Connection) -> None:
+    """Require explicit operator reopen across mixed-version task lifecycles.
+
+    A pre-migration service process can keep writing the migrated database without
+    seeing this binary's Python reaper/claim checks. The persistent trigger prevents
+    its legacy `orphaned` transition or automatic orphaned-task claim from resuming
+    the same interrupted claim generation.
+    """
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS budget_interruption_task_resume_guard
+        BEFORE UPDATE OF status ON tasks
+        WHEN (
+            (OLD.status IN ('claimed', 'working') AND NEW.status = 'orphaned')
+            OR (OLD.status = 'orphaned' AND NEW.status IN ('claimed', 'working'))
+        )
+        AND EXISTS (
+            SELECT 1 FROM budget_interruption_reports
+            WHERE task_id = OLD.id
+              AND claim_fencing_token = OLD.claim_fencing_token
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'task_interruption_requires_reopen');
+        END
+        """
+    )
+
+
+def _park_previously_orphaned_interrupted_tasks(connection: sqlite3.Connection) -> None:
+    """Make pre-migration interrupted orphan rows explicitly recoverable.
+
+    Migration 10 prevents an orphaned interrupted claim from being automatically
+    claimed, while the audited operator reopen path intentionally accepts only
+    ``blocked`` or ``conflicted`` tasks. Older databases may already contain an
+    ``orphaned`` row with a matching client interruption report, so park exactly
+    those rows as blocked before normal service resumes.
+    """
+    rows = connection.execute(
+        """
+        SELECT tasks.id, tasks.claim_fencing_token, tasks.version,
+               report.id AS interruption_report_id
+        FROM tasks
+        JOIN budget_interruption_reports AS report
+          ON report.task_id = tasks.id
+         AND report.claim_fencing_token = tasks.claim_fencing_token
+        WHERE tasks.status = 'orphaned'
+        ORDER BY tasks.id
+        """
+    ).fetchall()
+    for row in rows:
+        changed_at = utc_now()
+        cursor = connection.execute(
+            """
+            UPDATE tasks
+            SET status = 'blocked', owner_agent_id = NULL, claim_expires_at = NULL,
+                version = version + 1, updated_at = ?
+            WHERE id = ? AND status = 'orphaned' AND claim_fencing_token = ?
+            """,
+            (changed_at, row["id"], row["claim_fencing_token"]),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError("interrupted orphan changed during schema migration")
+        _append_audit_event(
+            connection,
+            "task.interruption_migration_parked",
+            "system",
+            {
+                "claim_fencing_token": row["claim_fencing_token"],
+                "from_status": "orphaned",
+                "interruption_report_id": row["interruption_report_id"],
+                "previous_version": row["version"],
+                "schema_version": 11,
+                "task_id": row["id"],
+                "to_status": "blocked",
+            },
+        )
+
+
+def _guard_unresolved_interruption_resumes(connection: sqlite3.Connection) -> None:
+    """Quarantine legacy reclaims unless an operator audited a later reopen.
+
+    Before migration 10, a service process could reap a reported claim to
+    ``orphaned`` and then claim it again under a higher fence. Exact-fence
+    checks no longer recognize that older report. A report is resolved only by
+    a later hash-chained ``task.reopened`` event for the same task; missing
+    report provenance fails closed.
+    """
+    connection.execute("DROP TRIGGER IF EXISTS budget_interruption_task_resume_guard")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_interruption_report_id
+        ON audit_events(json_extract(payload_json, '$.report_id'))
+        WHERE event_type = 'task.interruption_reported'
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_task_reopened_id
+        ON audit_events(json_extract(payload_json, '$.task_id'))
+        WHERE event_type = 'task.reopened'
+        """
+    )
+    connection.execute("DROP VIEW IF EXISTS budget_unresolved_interruption_reports")
+    connection.execute(
+        """
+        CREATE VIEW budget_unresolved_interruption_reports AS
+        SELECT report.id AS report_id,
+               report.task_id,
+               report.agent_id,
+               report.claim_fencing_token,
+               report.received_at
+        FROM budget_interruption_reports AS report
+        LEFT JOIN audit_events AS interruption_event
+          ON interruption_event.event_type = 'task.interruption_reported'
+         AND json_extract(interruption_event.payload_json, '$.report_id') = report.id
+         AND json_extract(interruption_event.payload_json, '$.task_id') = report.task_id
+         AND json_extract(
+                 interruption_event.payload_json, '$.claim_fencing_token'
+             ) = report.claim_fencing_token
+        WHERE interruption_event.sequence IS NULL
+           OR interruption_event.sequence > COALESCE(
+               (
+                   SELECT MAX(reopened_event.sequence)
+                   FROM audit_events AS reopened_event
+                   WHERE reopened_event.event_type = 'task.reopened'
+                     AND reopened_event.actor = 'admin'
+                     AND json_extract(reopened_event.payload_json, '$.task_id') = report.task_id
+               ),
+               0
+           )
+        """
+    )
+    rows = connection.execute(
+        """
+        SELECT task.id, task.status, task.owner_agent_id, task.claim_expires_at,
+               task.claim_fencing_token, task.version,
+               (
+                   SELECT report.report_id
+                   FROM budget_unresolved_interruption_reports AS report
+                   WHERE report.task_id = task.id
+                   ORDER BY report.claim_fencing_token DESC, report.received_at DESC,
+                            report.report_id DESC
+                   LIMIT 1
+               ) AS interruption_report_id,
+               (
+                   SELECT report.claim_fencing_token
+                   FROM budget_unresolved_interruption_reports AS report
+                   WHERE report.task_id = task.id
+                   ORDER BY report.claim_fencing_token DESC, report.received_at DESC,
+                            report.report_id DESC
+                   LIMIT 1
+               ) AS interruption_report_fencing_token,
+               (
+                   SELECT COUNT(*)
+                   FROM budget_unresolved_interruption_reports AS report
+                   WHERE report.task_id = task.id
+               ) AS unresolved_interruption_report_count
+        FROM tasks AS task
+        WHERE EXISTS (
+              SELECT 1 FROM budget_unresolved_interruption_reports AS report
+              WHERE report.task_id = task.id
+          )
+        ORDER BY task.id
+        """
+    ).fetchall()
+    for row in rows:
+        changed_at = utc_now()
+        task_changed = (
+            row["status"] != "blocked"
+            or row["owner_agent_id"] is not None
+            or row["claim_expires_at"] is not None
+        )
+        if task_changed:
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'blocked', owner_agent_id = NULL, claim_expires_at = NULL,
+                    version = version + 1, updated_at = ?
+                WHERE id = ? AND status = ? AND claim_fencing_token = ?
+                """,
+                (changed_at, row["id"], row["status"], row["claim_fencing_token"]),
+            )
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("interrupted task changed during schema migration")
+        released_leases = connection.execute(
+            """
+            UPDATE resource_leases
+            SET task_id = NULL, holder_agent_id = NULL, expires_at = 0, updated_at = ?
+            WHERE task_id = ?
+            """,
+            (changed_at, row["id"]),
+        ).rowcount
+        removed_heartbeats = connection.execute(
+            "DELETE FROM agent_heartbeats WHERE task_id = ?", (row["id"],)
+        ).rowcount
+        if not task_changed and not released_leases and not removed_heartbeats:
+            # Migration 11 already parked and audited this exact-fence orphan.
+            # Do not increment its version or emit a duplicate park event.
+            continue
+        _append_audit_event(
+            connection,
+            "task.interruption_migration_parked",
+            "system",
+            {
+                "claim_fencing_token": row["claim_fencing_token"],
+                "from_status": row["status"],
+                "interruption_report_fencing_token": row["interruption_report_fencing_token"],
+                "interruption_report_id": row["interruption_report_id"],
+                "previous_version": row["version"],
+                "schema_version": 12,
+                "task_id": row["id"],
+                "to_status": "blocked",
+                "unresolved_interruption_report_count": row["unresolved_interruption_report_count"],
+            },
+        )
+
+    # A stale worker may have submitted or passed QC under a higher fence before
+    # this migration acquired SQLite's write lock. Quarantine every lifecycle
+    # state, including qc_review/approved/merging/done, before installing guards.
+    # The report remains unresolved until a later audited task.reopened event.
+    for trigger_name in (
+        "budget_interruption_dispatch_insert_guard",
+        "budget_interruption_submission_insert_guard",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    connection.execute(
+        """
+        CREATE TRIGGER budget_interruption_dispatch_insert_guard
+        BEFORE INSERT ON dispatch_attempt_reservations
+        WHEN EXISTS (
+                 SELECT 1 FROM budget_unresolved_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+             )
+          OR EXISTS (
+                 SELECT 1 FROM budget_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+                   AND report.agent_id = NEW.agent_id
+                   AND report.claim_fencing_token = NEW.claim_fencing_token
+             )
+        BEGIN SELECT RAISE(ABORT, 'claim_interrupted'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER budget_interruption_submission_insert_guard
+        BEFORE INSERT ON submissions
+        WHEN EXISTS (
+                 SELECT 1 FROM budget_unresolved_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+             )
+          OR EXISTS (
+                 SELECT 1 FROM budget_interruption_reports AS report
+                 WHERE report.task_id = NEW.task_id
+                   AND report.agent_id = NEW.worker_agent_id
+                   AND report.claim_fencing_token = NEW.claim_fencing_token
+             )
+        BEGIN SELECT RAISE(ABORT, 'claim_interrupted'); END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER budget_interruption_task_resume_guard
+        BEFORE UPDATE OF status ON tasks
+        WHEN NEW.status <> OLD.status AND NEW.status <> 'blocked'
+         AND NOT (OLD.status = 'blocked' AND NEW.status = 'open')
+         AND EXISTS (
+             SELECT 1 FROM budget_unresolved_interruption_reports AS report
+             WHERE report.task_id = OLD.id
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'task_interruption_requires_reopen');
+        END
+        """
+    )
+
+
 def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3.executescript's implicit COMMIT."""
     statement = ""
@@ -871,6 +1147,9 @@ MIGRATIONS: tuple[Migration, ...] = (
     (7, _add_outstanding_dispatch_budgets),
     (8, _add_budget_interruption_reports),
     (9, _guard_interrupted_claim_writes),
+    (10, _guard_interrupted_task_resume),
+    (11, _park_previously_orphaned_interrupted_tasks),
+    (12, _guard_unresolved_interruption_resumes),
 )
 
 SCHEMA = """
@@ -1064,6 +1343,43 @@ def event_digest(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _append_audit_event(
+    connection: sqlite3.Connection,
+    event_type: str,
+    actor: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Append one event to the hash chain inside the caller's transaction."""
+    if not connection.in_transaction:
+        raise ValueError("audit connection must already hold a transaction")
+    event_id = str(uuid.uuid4())
+    created_at = utc_now()
+    payload_json = canonical_json(payload)
+    previous = connection.execute(
+        "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    previous_hash = previous["event_hash"] if previous else GENESIS_HASH
+    digest = event_digest(previous_hash, event_id, event_type, actor, payload_json, created_at)
+    cursor = connection.execute(
+        """
+        INSERT INTO audit_events
+            (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, event_type, actor, payload_json, previous_hash, digest, created_at),
+    )
+    return {
+        "sequence": cursor.lastrowid,
+        "event_id": event_id,
+        "event_type": event_type,
+        "actor": actor,
+        "payload": payload,
+        "previous_hash": previous_hash,
+        "event_hash": digest,
+        "created_at": created_at,
+    }
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -1171,54 +1487,11 @@ class Database:
         """
         if connection is not None and not connection.in_transaction:
             raise ValueError("audit connection must already hold a transaction")
-        event_id = str(uuid.uuid4())
-        created_at = utc_now()
-        payload_json = canonical_json(payload)
-
         context = self.connect() if connection is None else nullcontext(connection)
         with context as audit_connection:
             if connection is None:
                 audit_connection.execute("BEGIN IMMEDIATE")
-            previous = audit_connection.execute(
-                "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-            previous_hash = previous["event_hash"] if previous else GENESIS_HASH
-            digest = event_digest(
-                previous_hash,
-                event_id,
-                event_type,
-                actor,
-                payload_json,
-                created_at,
-            )
-            cursor = audit_connection.execute(
-                """
-                INSERT INTO audit_events
-                    (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    event_type,
-                    actor,
-                    payload_json,
-                    previous_hash,
-                    digest,
-                    created_at,
-                ),
-            )
-            sequence = cursor.lastrowid
-
-        return {
-            "sequence": sequence,
-            "event_id": event_id,
-            "event_type": event_type,
-            "actor": actor,
-            "payload": payload,
-            "previous_hash": previous_hash,
-            "event_hash": digest,
-            "created_at": created_at,
-        }
+            return _append_audit_event(audit_connection, event_type, actor, payload)
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.all("SELECT * FROM audit_events ORDER BY sequence DESC LIMIT ?", (limit,))

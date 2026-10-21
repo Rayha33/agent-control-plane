@@ -1404,10 +1404,14 @@ def test_open_runc_fd_rejects_inode_replaced_after_initial_verification(
 ) -> None:
     pin = pinned_runc(tmp_path)
     real_open = os.open
+    # Exercise the inode comparison after the production O_NOFOLLOW open, not
+    # an image-specific symlink rejection.
+    replacement = Path("/usr/bin/true").resolve(strict=True)
+    assert replacement.is_file() and not replacement.is_symlink()
 
     def replaced_open(path, flags, *args, **kwargs):
         if Path(path) == pin.path:
-            return real_open("/bin/echo", flags, *args, **kwargs)
+            return real_open(replacement, flags, *args, **kwargs)
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(oci_worker, "_verify_trusted_runc_executable", lambda _pin: pin.path)

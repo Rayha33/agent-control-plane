@@ -442,9 +442,14 @@ class CoordinationService:
                 now,
             )
             interrupted = connection.execute(
-                """SELECT 1 FROM budget_interruption_reports
-                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
-                (task_id, agent["id"], request.claim_fencing_token),
+                """SELECT 1 WHERE EXISTS (
+                       SELECT 1 FROM budget_unresolved_interruption_reports
+                       WHERE task_id = ?
+                   ) OR EXISTS (
+                       SELECT 1 FROM budget_interruption_reports
+                       WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?
+                   )""",
+                (task_id, task_id, agent["id"], request.claim_fencing_token),
             ).fetchone()
             if interrupted is not None:
                 raise ControlPlaneError(
@@ -838,9 +843,14 @@ class CoordinationService:
                 now,
             )
             interrupted = connection.execute(
-                """SELECT 1 FROM budget_interruption_reports
-                   WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?""",
-                (task_id, agent["id"], request.claim_fencing_token),
+                """SELECT 1 WHERE EXISTS (
+                       SELECT 1 FROM budget_unresolved_interruption_reports
+                       WHERE task_id = ?
+                   ) OR EXISTS (
+                       SELECT 1 FROM budget_interruption_reports
+                       WHERE task_id = ? AND agent_id = ? AND claim_fencing_token = ?
+                   )""",
+                (task_id, task_id, agent["id"], request.claim_fencing_token),
             ).fetchone()
             if interrupted is not None:
                 raise ControlPlaneError(
@@ -1143,6 +1153,16 @@ class CoordinationService:
                     "task_not_reopenable",
                     f"task cannot be reopened while status is {previous_status}",
                 )
+            self.database.append_audit(
+                "task.reopened",
+                "admin",
+                {
+                    "previous_status": previous_status,
+                    "reason": reason,
+                    "task_id": task_id,
+                },
+                connection=connection,
+            )
             connection.execute(
                 """
                 UPDATE tasks
@@ -1162,47 +1182,47 @@ class CoordinationService:
                 (reopened_at, task_id),
             )
             self._clear_heartbeats(connection, task_id)
-
-            self.database.append_audit(
-                "task.reopened",
-                "admin",
-                {
-                    "previous_status": previous_status,
-                    "reason": reason,
-                    "task_id": task_id,
-                },
-                connection=connection,
-            )
         return self.task(task_id)
 
     def reap_expired(self) -> dict[str, Any]:
         now = int(time.time())
         updated_at = utc_now()
         orphaned: list[str] = []
+        blocked_interruption_task_ids: list[str] = []
         conflicted: list[str] = []
         released = 0
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
-                SELECT id FROM tasks
-                WHERE status IN ('claimed', 'working')
-                  AND claim_expires_at IS NOT NULL
-                  AND claim_expires_at <= ?
+                SELECT task.id,
+                       EXISTS (
+                           SELECT 1 FROM budget_unresolved_interruption_reports AS report
+                           WHERE report.task_id = task.id
+                       ) AS interruption_reported
+                FROM tasks AS task
+                WHERE task.status IN ('claimed', 'working')
+                  AND task.claim_expires_at IS NOT NULL
+                  AND task.claim_expires_at <= ?
                 """,
                 (now,),
             ).fetchall()
-            orphaned = [row["id"] for row in rows]
-            for task_id in orphaned:
+            orphaned = [row["id"] for row in rows if not row["interruption_reported"]]
+            blocked_interruption_task_ids = [
+                row["id"] for row in rows if row["interruption_reported"]
+            ]
+            for row in rows:
+                task_id = row["id"]
+                expired_status = "blocked" if row["interruption_reported"] else "orphaned"
                 connection.execute(
                     """
                     UPDATE tasks
-                    SET status = 'orphaned', owner_agent_id = NULL,
+                    SET status = ?, owner_agent_id = NULL,
                         claim_expires_at = NULL, version = version + 1,
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (updated_at, task_id),
+                    (expired_status, updated_at, task_id),
                 )
                 released += connection.execute(
                     """
@@ -1247,11 +1267,12 @@ class CoordinationService:
                 (updated_at, now),
             ).rowcount
 
-            if orphaned or conflicted or released:
+            if orphaned or blocked_interruption_task_ids or conflicted or released:
                 self.database.append_audit(
                     "coordination.reaped",
                     "admin",
                     {
+                        "blocked_interruption_task_ids": blocked_interruption_task_ids,
                         "conflicted_task_ids": conflicted,
                         "orphaned_task_ids": orphaned,
                         "released_resources": released,
@@ -1259,6 +1280,7 @@ class CoordinationService:
                     connection=connection,
                 )
         return {
+            "blocked_interruption_task_ids": blocked_interruption_task_ids,
             "conflicted_task_ids": conflicted,
             "orphaned_task_ids": orphaned,
             "released_resources": released,
@@ -1531,6 +1553,10 @@ class CoordinationService:
     def _raise_claim_guard_error(error: sqlite3.IntegrityError) -> None:
         message = str(error)
         errors = {
+            "task_interruption_requires_reopen": (
+                "task_interruption_requires_reopen",
+                "interrupted task requires an audited operator reopen before it can resume",
+            ),
             "task_claim_budget_exhausted": (
                 "task_claim_budget_exhausted",
                 "task has exhausted its successful-claim limit",
