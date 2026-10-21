@@ -5,8 +5,9 @@ incomplete. An explicit experimental, no-model `run_worker()` route now reaches
 the production launch driver, independent cleanup verifier, and host-side
 result-import path; it does not enable the default OCI worker path. Provider
 authentication/egress, supervisor-daemon restart, logout/linger, and reboot
-recovery remain unproven. The dated entries below are historical unless they
-explicitly say they are current.
+recovery remain unproven. The dated entries below describe evidence and status
+as of their stated dates; the current summary above supersedes older
+integration-status statements.
 
 Standalone bounded snapshot and change-set primitives, exact host-side manifest
 replay validation, secure snapshot readback, an isolated-index candidate-tree
@@ -143,14 +144,16 @@ synthetic systemd observations; it is not live manager/start-stop or full
 daemon-restart evidence.
 Cgroup absence is accepted only after mountinfo proves the complete cgroup-v2
 mount-root mapping, and cleanup removes only the exact execution-bound monitor
-socket beneath the verified private runtime directory. Result import now has
-separate opt-in live launch/cleanup/import evidence below, but remains
-unconnected to `run_worker()`, which stays fail-closed. This current status
-supersedes older statements below that no verifier implementation or reaper
-retry path exists; historical run results remain scoped to the source hashes
-actually tested.
+socket beneath the verified private runtime directory. As of this
+2026-10-16 update, result import had separate opt-in live
+launch/cleanup/import evidence but was still unconnected to `run_worker()`.
+The later 2026-10-21 no-model opt-in connection is described in the current
+summary above and in `WORKER_LAUNCH_DRIVER.md`. This dated update superseded
+older statements below that no verifier implementation or reaper retry path
+existed; historical run results remain scoped to the source hashes actually
+tested.
 
-**Current launch ownership decision (2026-10-16):** Use the two-service
+**Launch ownership decision (2026-10-16):** Use the two-service
 topology in [`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md): the exact
 launch-driver service sits inside the attempt slice and owns the process-local
 pinned-runc handle, gate, collector attestation, journal transition, wait/reap,
@@ -1524,33 +1527,33 @@ existence does not establish that it is executable. This removes the
 path-replacement window for the configuration probe. The following describes
 the earlier hold, superseded by the private-bundle implementation above:
 `spawn_pinned_runc()` originally refused to launch while bundle ownership was
-unproved. The current candidate path uses a private read-only tmpfs and
+unproved. The candidate path described here uses a private read-only tmpfs and
 descriptor-anchored `--bundle`. A direct exact-host adversarial replay for this
-handoff is recorded in the evidence history below. The current runtime/test
-sources passed the exact-host replay, and two independent reviewers gave GO for
-the bounded launcher and cleanup-guard slice. GitHub Actions run `37320832762`
-passed all four Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-
-fixture commit `9a6368d`; this receipt does not cover later documentation-only
-commits. Task #2417 records the current PR head and its latest check. The
+handoff is recorded in the evidence history below. The source revision in that
+replay passed, and two independent reviewers gave GO for the bounded launcher
+and cleanup-guard slice. GitHub Actions run `37320832762` passed all four
+Ubuntu/macOS × Python 3.11/3.12 jobs on implementation/test-fixture commit
+`9a6368d`; this receipt does not cover later documentation-only commits. At the
+time of this note, task #2417 tracked the PR head and its latest check. The
 unisolated diagnostic helper remains unsafe and is not called by `run_worker`.
 The earlier statement that no runtime path/digest was tied to the journal before
-candidate exec is superseded: the current journal commits a one-use
-`launch_submission_digest` over every descriptor-backed target field, including
-the verified pinned-runc path/digest, config digest, argv, bundle/rootfs/state/
-workspace path identities, and resource limits, before the private launcher's
-exec acknowledgement. This is a commitment to the launch target, not to every
-reservation field. After the returned handle is bound, the journal persists the
-canonical readable launch plan and the `launch_target` payload in
-`sandbox.execution_launched`. These records bind launch intent; they do not
-prove successful production `run_worker()` execution, and an ambiguous
-post-latch crash remains fenced and cannot resubmit. The attempt journal still
-cannot reach `cleanup_verified`.
-When `[sandbox.oci]` is configured, `run_worker` continues to fail before
-heartbeat or process reservation with `sandbox_executor_unavailable`; it cannot
-silently fall back to host execution. The direct live test exercises a claimed
-attempt and journaled launch components through a test fixture, not the
-production `run_worker()` lifecycle; it establishes no result-import or
-crash/cancel recovery claim.
+candidate exec is superseded: the journal in this source revision commits a
+one-use `launch_submission_digest` over every descriptor-backed target field,
+including the verified pinned-runc path/digest, config digest, argv,
+bundle/rootfs/state/workspace path identities, and resource limits, before the
+private launcher's exec acknowledgement. This is a commitment to the launch
+target, not to every reservation field. After the returned handle is bound, the
+journal persists the canonical readable launch plan and the `launch_target`
+payload in `sandbox.execution_launched`. At this source revision, these records
+bound launch intent but did not prove successful production `run_worker()`
+execution; an ambiguous post-latch crash remained fenced and could not resubmit,
+and the attempt journal could not reach `cleanup_verified`.
+When `[sandbox.oci]` was configured at that stage, `run_worker` failed before
+heartbeat or process reservation with `sandbox_executor_unavailable` rather
+than falling back to host execution. The direct live test at that stage
+exercised a claimed attempt and journaled launch components through a test
+fixture, not the production `run_worker()` lifecycle, and established no
+result-import or crash/cancel recovery claim.
 
 The contained process trampoline now has an opt-in Linux `exec_fd` input: the
 trusted monitor passes a caller-held regular-file descriptor to its blocked
@@ -1559,9 +1562,9 @@ monitor's copy and the descriptor across the final exec. A regression unlinks
 the opened interpreter before launch, successfully executes it despite the
 missing pathname and nonexistent `argv[0]`, and confirms the descriptor is not
 visible to the target.
-This closes the generic path-substitution gap for a future held-runc launch,
-but no current `run_worker` route uses the configured runc pin; OCI worker
-execution remains unavailable and fail-closed.
+This closed the generic path-substitution gap for a future held-runc launch.
+At the source revision covered by this dated entry, no `run_worker` route used
+the configured runc pin; OCI worker execution was unavailable and fail-closed.
 
 ### Durable execution-journal slice (2026-10-04)
 
@@ -3626,7 +3629,7 @@ D-state processes. This run had no AppArmor profile applied to the monitor and
 is not evidence of AppArmor confinement or a production prerequisite policy.
 Keep configured OCI worker execution fail-closed.
 
-### Launch-driver-service cgroup attestation (2026-10-16; current source contract)
+### Launch-driver-service cgroup attestation (2026-10-16 source contract)
 
 The current two-service architecture places the runc client in the deterministic systemd service
 `acp-launch-driver-{execution_id}.service`, derived from the reserved durable
@@ -3651,9 +3654,10 @@ become `running`; the generic transition helper rejects that phase change.
 process-membership, and systemd identities, then opens the SQLite transaction to
 recheck durable row and receipt bindings before writing the phase and event. It
 authorizes the one-shot gate only after that transaction commits. Legacy rows
-are not backfilled and do not become qualified by migration alone. These are
-durable process-local integrity checks, not proof that `run_worker()` currently
-launches all task code inside the OCI boundary described here.
+are not backfilled and do not become qualified by migration alone. At the
+source revision tested for this dated entry, these durable process-local
+integrity checks did not prove that `run_worker()` launched all task code
+inside the OCI boundary described here.
 
 The opt-in live runc lifecycle test passed on the disposable Ubuntu 26.04
 ARM64 / Linux 7.0.0-38 / Python 3.14.4 / systemd 259.5 / cgroup v2 guest with
