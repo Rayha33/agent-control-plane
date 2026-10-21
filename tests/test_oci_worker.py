@@ -1406,7 +1406,7 @@ def test_open_runc_fd_rejects_inode_replaced_after_initial_verification(
     real_open = os.open
     # Exercise the inode comparison after the production O_NOFOLLOW open, not
     # an image-specific symlink rejection.
-    replacement = Path("/usr/bin/true")
+    replacement = Path("/usr/bin/true").resolve(strict=True)
     assert replacement.is_file() and not replacement.is_symlink()
 
     def replaced_open(path, flags, *args, **kwargs):
