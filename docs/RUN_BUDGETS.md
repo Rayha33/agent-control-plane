@@ -55,13 +55,18 @@ controls; they do not establish rates or generalize provider pricing.
 
 A recent Codex desktop report records 8.95 billion input-plus-output tokens
 over a fixed 36-hour window, including compaction responses omitted from a
-legacy counter. Its author explicitly does not establish billed cost, incorrect
-billing, a configured-budget violation, or a concurrency-limit breach. The
-companion feature request proposes one shared reserve-before-request budget for
-root and descendant model calls, including compaction and retries, with honest
-units and conservative handling of unresolved requests. This is a bounded
-practitioner report plus a proposed safeguard, not prevalence or proof of the
-incident's root cause.
+legacy counter. Its source-audited correction attributes 8,788,141,824 tokens
+(98.197% of the total) to cached input. The report says the inspected large
+goals had no configured token budget; for the inspected runtime, its
+goal-budget metric also excluded cached input. These are distinct processed-
+token and task-budget measurements, not an invoice. The author explicitly
+does not establish billed cost, incorrect billing, a configured-budget
+violation, or a concurrency-limit breach. The companion feature request
+proposes one shared reserve-before-request budget for root and descendant
+model calls, including compaction and retries, with honest units and
+conservative handling of unresolved requests. This is a bounded practitioner
+report plus a proposed safeguard, not prevalence or proof of the incident's
+root cause.
 
 ## Budget and usage contract
 
