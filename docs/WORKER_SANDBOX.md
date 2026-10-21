@@ -59,9 +59,22 @@ post-run unit listing showed no `acp-*` entries. The VM was stopped, not
 deleted. Exact-head
 hosted CI for this source passed all four Ubuntu/macOS × Python 3.11/3.12 jobs
 ([run 39522242994](https://github.com/Rayha33/agent-control-plane/actions/runs/39522242994)).
-Each invocation exercised one no-model launch-driver attempt; neither proves
-concurrent live runc workers, `run_worker()` integration, or provider
-authentication/egress. Configured `run_worker()` remains fail-closed.
+Each isolation/import invocation above exercised one no-model launch-driver
+attempt. Separately, two concurrent invocations ran the same test with
+`ACP_LIVE_CANCEL_AFTER_START=1`; both exited 0. A systemd user-manager observer
+sampled two distinct active scopes,
+`acp-acp-23cea377914300d728f65ab9da3557bc3468d3f5e7dd62af2ff9774d309e.scope`
+and
+`acp-acp-29b16f93d8869373ac2605f07e23f563adc029db47af1e125fec293cc8fe.scope`,
+in consecutive samples at 2026-10-21 01:04:04 UTC. Each invocation created its
+own temporary repository, attempt, and private rootfs. The test cancellation
+path also verified lease renewal, rejection of a wrong runner credential,
+fresh-process cancellation, and `cleanup_verified`. This demonstrates
+simultaneous live no-model runc attempts on one guest, not same-repository
+concurrent-workspace or cross-attempt access isolation. Post-run unit listing
+had no `acp-*` entries, no test run roots remained, and the VM was stopped,
+not deleted. It does not prove `run_worker()` integration or provider
+authentication/egress; configured `run_worker()` remains fail-closed.
 
 **Cleanup-verification update (2026-10-16):** The supervisor-owned verifier is
 now implemented in source and wired into reaper recovery for eligible
