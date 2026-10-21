@@ -1,12 +1,21 @@
 # Per-attempt worker sandbox decision
 
-**Status:** proposed end-to-end architecture. Standalone bounded snapshot and
-change-set primitives, exact host-side manifest replay validation, secure
-snapshot readback, an isolated-index candidate-tree builder, and a claim-fenced
-result-import journal/recovery path are implemented. The import API consumes
-host-captured `Snapshot` and `ChangeSet` objects; it is not wired into a worker
-executor, CLI transport, or the existing `run_worker` path. It writes a
-deterministic host-authored commit to an immutable per-attempt ref in
+**Current status (2026-10-21):** Provider-backed end-to-end acceptance remains
+incomplete. An explicit experimental, no-model `run_worker()` route now reaches
+the production launch driver, independent cleanup verifier, and host-side
+result-import path; it does not enable the default OCI worker path. Provider
+authentication/egress, supervisor-daemon restart, logout/linger, and reboot
+recovery remain unproven. The dated entries below are historical unless they
+explicitly say they are current.
+
+Standalone bounded snapshot and change-set primitives, exact host-side manifest
+replay validation, secure snapshot readback, an isolated-index candidate-tree
+builder, and a claim-fenced result-import journal/recovery path are implemented.
+The import API consumes host-captured `Snapshot` and `ChangeSet` objects; it is
+not wired into a general CLI transport or provider-backed executor. The
+experimental no-model `run_worker()` route reaches it only after exact-identity
+cleanup verification. It writes a deterministic host-authored commit to an
+immutable per-attempt ref in
 `refs/acp/worker-results/`, then uses ACP's ordinary submission checks. It does
 not mutate the registered attempt worktree or its real index. Its write-ahead
 record binds the attempt ID, claim token, worker PID plus kernel start identity,
@@ -18,10 +27,10 @@ constructed in bounded per-import private object stores; the prepared journal
 commits before ACP promotes exact object IDs into the common repository store.
 Unjournaled private stages and ambiguous promotions have scoped reconciliation;
 committed result refs remain retained pending a separate retention policy, and
-ACP does not run repository-wide GC. An opt-in disposable-Linux integration
-fixture now exercises production launch, cleanup verification, host-side
-capture/import, and pending-QC handoff; this does not connect `run_worker()` to
-the sandbox path. A separate journal regression concurrently reserves two
+ACP does not run repository-wide GC. A disposable-Linux integration fixture
+exercises production launch, cleanup verification, host-side capture/import,
+and pending-QC handoff through the explicit no-model `run_worker()` opt-in. A
+separate journal regression concurrently reserves two
 different attempts and binds disjoint baseline/workspace roots, proving unique
 execution/container identities and concurrent independent write sentinels at
 the filesystem/journal layer; it does not run two live runc workers concurrently
@@ -29,12 +38,13 @@ or prove cross-container kernel isolation. See the live evidence below and
 [`RESULT_IMPORT_OBJECTS.md`](RESULT_IMPORT_OBJECTS.md) for the current staging,
 retention, and cleanup contract. End-to-end worker isolation proof remains
 incomplete. The OCI policy compiler stages init behind fd 3, and a reusable
-launcher now starts the pinned runc client through a held executable FD while
-retaining that gate. No `run_worker` path yet connects launch to the durable
-journal, runtime attestation, cleanup verification, or result import. This
-record does not authorize `externalSandbox` for ACP workers.
+launcher starts the pinned runc client through a held executable FD while
+retaining that gate. The explicit route is still an experimental no-model
+path: it does not provide provider authentication/egress or enable the default
+OCI `run_worker()` path. This record does not authorize `externalSandbox` for
+ACP workers.
 
-**Current-source live isolation and import probe (2026-10-21):** On exact
+**Earlier live isolation and import probe (2026-10-21):** On exact
 source commit `a70eef36b1b90523be383598bc7d0e0501d710cf`, the opt-in
 `test_live_production_launch_driver_runs_exact_pinned_runc_request` passed in a
 disposable Debian 12 ARM64 Lima guest (Linux 6.1.187-1, Python 3.11.2, systemd
@@ -73,8 +83,12 @@ fresh-process cancellation, and `cleanup_verified`. This demonstrates
 simultaneous live no-model runc attempts on one guest, not same-repository
 concurrent-workspace or cross-attempt access isolation. Post-run unit listing
 had no `acp-*` entries, no test run roots remained, and the VM was stopped,
-not deleted. It does not prove `run_worker()` integration or provider
-authentication/egress; configured `run_worker()` remains fail-closed.
+not deleted. This earlier direct launch-driver probe did not prove
+`run_worker()` integration. The later explicit no-model `run_worker()` proof
+and its exact limitations are recorded in
+[`WORKER_LAUNCH_DRIVER.md`](WORKER_LAUNCH_DRIVER.md). Provider
+authentication/egress remain unproven, and the default non-opt-in OCI worker
+path remains fail-closed.
 
 **Cleanup-verification update (2026-10-16):** The supervisor-owned verifier is
 now implemented in source and wired into reaper recovery for eligible
@@ -159,8 +173,9 @@ itself is not restarted, and there is no full supervisor-daemon restart proof.
 Exact-head hosted CI run 38884017803 passed all four Ubuntu/macOS × Python
 3.11/3.12 jobs for code-bearing commit
 `2383221c1a84cf52c08f42043465baea2ed4d487`.
-Full end-to-end lifecycle proof and `run_worker()` integration remain pending;
-OCI worker execution stays fail-closed.
+As of this ADR's 2026-10-16 status, full lifecycle proof and `run_worker()`
+integration were pending; the later no-model opt-in integration is recorded
+above. Provider-backed/default-path acceptance remains pending.
 
 ## Codex adapter contract (2026-10-15; OpenAI Docs)
 
