@@ -720,3 +720,35 @@ The registered worker host-path probe separately passed on the same upgraded
 VM, including cleanup and exact two-path result import (`launch-driver-marker`
 and `launch-driver-started`). These are narrow, reproducible environment
 results, not a claim that all parent #2370 acceptance gates are closed.
+
+### Deterministic coding edit/test/import replay (2026-10-21; no model)
+
+The updated `test_live_production_launch_driver_runs_exact_pinned_runc_request`
+passed on a fresh, plain Lima 2.2.1 Debian 12 ARM64 guest with no host mounts:
+Linux `6.1.0-53-cloud-arm64`, systemd `252.39`, cgroup v2, Python `3.11.2`,
+rootless runc `1.5.2` (SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`), and
+BusyBox `1.35.0`. The exact source tree was staged over SSH under guest `/tmp`;
+the live test module SHA-256 was
+`f85cb6a0eaad368196742214832cfdf90233ff779bec99ee4a2c558ee08cc305`, matching
+the host copy. The run used the test-only diff atop commit
+`c652f66cff083295e151c10321334405e29a00b7` and the lockfile dependency set via
+uv `0.12.21` with `--frozen` (no lockfile was edited).
+
+The run enabled both `ACP_LIVE_ISOLATION_PROBES=1` and
+`ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1` and passed **1/1**. The deterministic
+no-model task wrote a shell source file into the private writable workspace,
+executed it with the pinned BusyBox closure, and checked its output. After
+production cleanup verification, result import reached `pending_qc`; the
+imported path set was exactly `launch-driver-marker`,
+`launch-driver-started`, `sandbox-coding-task.sh`, and
+`sandbox-coding-task.test`. Raw Git blob bytes matched both the expected source
+and test output and the corresponding private workspace files. The same run
+exercised the documented host-path, symlink/canonical-path, process, socket,
+direct-network, read-only-rootfs, and writable-workspace probes. Postflight
+found no ACP test units/processes or `acp-live-*` fixture directories.
+
+This is still a deterministic no-model fixture, not a provider/model coding
+agent or the default `run_worker()` path. It does not prove provider
+authentication/egress, or close the remaining #2370 recovery and integrated
+worker acceptance gates; configured OCI `run_worker()` remains fail-closed.

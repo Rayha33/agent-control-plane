@@ -8,9 +8,10 @@ fresh-supervisor cancellation and launch-driver timeout. The production
 producer runs in a short-lived process that exits abruptly after durable
 handoff; fresh supervisor processes cancel (when requested) and reap the exact
 execution. An additional opt-in natural-completion branch asks the independent
-cleanup verifier to prove teardown, then imports the host-captured workspace
-result into the normal pending-QC submission path. None of these branches
-wires ``run_worker`` or starts a provider/model worker.
+cleanup verifier to prove teardown, performs a deterministic source edit and
+test inside the private workspace, then imports the host-captured result into
+the normal pending-QC submission path. This is no-model executor evidence: it
+does not wire ``run_worker`` or start a provider/model worker.
 
 The legacy direct-monitor lifecycle fixture is intentionally skipped: it starts
 runc from a monitor-owned service and cannot satisfy the current launch-driver
@@ -63,9 +64,9 @@ activation is requested, add:
 
     ACP_LIVE_CRASH_BEFORE_MONITOR_START=1
 
-For natural completion followed by production cleanup verification and
-host-side sandbox-result import (mutually exclusive with cancellation, timeout,
-and crash modes), add:
+For natural completion followed by production cleanup verification, a
+deterministic in-sandbox source edit and test, and host-side sandbox-result
+import (mutually exclusive with cancellation, timeout, and crash modes), add:
 
     ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP=1
 """
@@ -1922,6 +1923,11 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         pytest.fail("current host does not expose unified cgroup v2")
 
     isolation_probes = os.environ.get("ACP_LIVE_ISOLATION_PROBES") == "1"
+    import_result_after_cleanup = os.environ.get("ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP") == "1"
+    coding_task = isolation_probes or import_result_after_cleanup
+    coding_source = "printf 'coding-task-pass\\n'\n"
+    coding_script_name = "sandbox-coding-task.sh"
+    coding_test_output_name = "sandbox-coding-task.test"
     if isolation_probes:
         if os.getpid() <= _CONTAINER_PIDS_LIMIT:
             pytest.fail("host controller PID must exceed the worker PID limit for this probe")
@@ -2101,6 +2107,19 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                         f"'probe-ok:sentinel-{name}\\n' >> /workspace/launch-driver-started",
                     )
                 )
+            if coding_task:
+                probe_lines.extend(
+                    (
+                        "/bin/busybox printf %s "
+                        f"{shlex.quote(coding_source)} > /workspace/{coding_script_name}",
+                        f"coding_output=$(/bin/busybox sh /workspace/{coding_script_name})",
+                        "test \"$coding_output\" = 'coding-task-pass'",
+                        f"/bin/busybox printf '%s\\n' \"$coding_output\" > "
+                        f"/workspace/{coding_test_output_name}",
+                        "/bin/busybox printf 'probe-ok:coding-task\\n' "
+                        ">> /workspace/launch-driver-started",
+                    )
+                )
             escape_link = f"/workspace/{isolation_link_name}"
             quoted_escape_link = shlex.quote(escape_link)
             quoted_canonical_escape = shlex.quote(
@@ -2222,6 +2241,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             supervisor,
             "launch-driver-marker",
             "launch-driver-started",
+            *((coding_script_name, coding_test_output_name) if coding_task else ()),
             title="launch-driver producer test",
         )
         attempt = supervisor.claim(
@@ -2258,7 +2278,6 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             os.environ.get("ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE") == "1"
         )
         crash_before_monitor_start = os.environ.get("ACP_LIVE_CRASH_BEFORE_MONITOR_START") == "1"
-        import_result_after_cleanup = os.environ.get("ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP") == "1"
         if (
             sum(
                 (
@@ -2305,6 +2324,23 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         sandbox_timeout_seconds = 1 if timeout_after_start else 30
         if isolation_probes:
             payload_command = ("/bin/busybox", "sh", f"/workspace/{isolation_script_name}")
+        elif coding_task:
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "set -eu; "
+                "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+                "/bin/busybox printf %s "
+                f"{shlex.quote(coding_source)} > /workspace/{coding_script_name}; "
+                f"coding_output=$(/bin/busybox sh /workspace/{coding_script_name}); "
+                "test \"$coding_output\" = 'coding-task-pass'; "
+                f"/bin/busybox printf '%s\\n' \"$coding_output\" > "
+                f"/workspace/{coding_test_output_name}; "
+                "/bin/busybox printf 'probe-ok:coding-task\\n' "
+                ">> /workspace/launch-driver-started; "
+                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
+            )
         else:
             payload_command = (
                 "/bin/busybox",
@@ -3075,6 +3111,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 assert not os.path.lexists(isolation_home_scratch_path)
                 assert all(not os.path.lexists(path) for path in isolation_write_probes)
             assert marker.read_text(encoding="ascii") == expected_marker
+        if coding_task:
+            worker_workspace = Path(durable["workspace_root_path"])
+            assert (worker_workspace / coding_script_name).read_text(encoding="ascii") == (
+                coding_source
+            )
+            assert (worker_workspace / coding_test_output_name).read_text(
+                encoding="ascii"
+            ) == "coding-task-pass\n"
+            assert "probe-ok:coding-task" in (worker_workspace / "launch-driver-started").read_text(
+                encoding="ascii"
+            )
         assert not _entry_is_present(source_worktree / "launch-driver-marker")
         with supervisor.connect() as connection:
             events = connection.execute(
@@ -3164,6 +3211,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 )
                 return completed.stdout.strip()
 
+            def git_bytes(*arguments: str) -> bytes:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *arguments],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                return completed.stdout
+
             assert git_text("rev-parse", "HEAD") == task["base_sha"]
             assert (
                 git_text("rev-parse", f"{imported_submission['commit_sha']}^") == task["base_sha"]
@@ -3175,7 +3231,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 task["base_sha"],
                 imported_submission["commit_sha"],
             ).splitlines()
-            assert imported_paths == ["launch-driver-marker", "launch-driver-started"]
+            expected_imported_paths = ["launch-driver-marker", "launch-driver-started"]
+            if coding_task:
+                expected_imported_paths.extend([coding_script_name, coding_test_output_name])
+            assert imported_paths == expected_imported_paths
             assert (
                 git_text("show", f"{imported_submission['commit_sha']}:launch-driver-started")
                 == (Path(verified_before_import["workspace_root_path"]) / "launch-driver-started")
@@ -3185,6 +3244,23 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert git_text(
                 "show", f"{imported_submission['commit_sha']}:launch-driver-marker"
             ) == expected_marker.rstrip("\n")
+            if coding_task:
+                imported_coding_source = git_bytes(
+                    "show",
+                    f"{imported_submission['commit_sha']}:{coding_script_name}",
+                )
+                imported_coding_test_output = git_bytes(
+                    "show",
+                    f"{imported_submission['commit_sha']}:{coding_test_output_name}",
+                )
+                workspace = Path(verified_before_import["workspace_root_path"])
+                assert imported_coding_source == coding_source.encode("ascii")
+                assert imported_coding_source == (workspace / coding_script_name).read_bytes()
+                assert imported_coding_test_output == b"coding-task-pass\n"
+                assert (
+                    imported_coding_test_output
+                    == (workspace / coding_test_output_name).read_bytes()
+                )
             assert (
                 subprocess.run(
                     ["git", "-C", str(source_worktree), "status", "--porcelain=v1"],
@@ -3250,7 +3326,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             ).fetchall()
         lease_before = {row["resource"]: row for row in lease_before_rows}
         assert set(lease_before) == set(task["resources"])
-        assert len(lease_before) == 2
+        assert len(lease_before) == 2 + (2 if coding_task else 0)
         assert len({row["lease_expires_at"] for row in lease_before.values()}) == 1
         expected_lease_expiry = next(iter(lease_before.values()))["lease_expires_at"]
         if lease_expiry_after_stop:
