@@ -1053,6 +1053,34 @@ class ReaperMixin:
                 # A later reap retries the exact row under its inode fence.
                 continue
         with self.connect() as connection:
+            pending_recovery = connection.execute(
+                """
+                SELECT execution.attempt_id, execution.claim_token
+                FROM sandbox_executions AS execution
+                JOIN attempts AS attempt ON attempt.id = execution.attempt_id
+                WHERE execution.phase = 'exited'
+                  AND (
+                    (attempt.status IN ('provisioning', 'working')
+                     AND attempt.lease_expires_at <= ?)
+                    OR attempt.status = 'terminating'
+                  )
+                ORDER BY execution.attempt_id
+                """,
+                (epoch,),
+            ).fetchall()
+        for pending in pending_recovery:
+            try:
+                self._sandbox_execution_recover_cleanup(
+                    pending["attempt_id"],
+                    pending["claim_token"],
+                    reaper_epoch=epoch,
+                )
+            except (OSError, subprocess.SubprocessError, SupervisorError):
+                # Recovery is deliberately best-effort. Its exact receipt or
+                # the normal cleanup verifier is the only path that can release
+                # the attempt and resource fences in the transactional pass.
+                continue
+        with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             attempts = connection.execute(
                 """

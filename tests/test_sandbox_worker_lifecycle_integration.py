@@ -4,7 +4,8 @@ The process-local runc handle must remain in the exact systemd launch-driver
 process; a separate systemd-owned service controls the exact worker scope. The
 default branch proves launch-to-``running``, natural completion, and
 reaper-driven cleanup verification/runtime release. Opt-in branches also cover
-fresh-supervisor cancellation and launch-driver timeout. The production
+fresh-supervisor cancellation, launch-driver timeout, and cleanup recovery after
+a launch-driver crash between durable wait and cleanup report. The production
 producer runs in a short-lived process that exits abruptly after durable
 handoff; fresh supervisor processes cancel (when requested) and reap the exact
 execution. An additional opt-in natural-completion branch asks the independent
@@ -52,6 +53,17 @@ To additionally prove that cancellation closes a connected/open partial UDS
 request, combine ``ACP_LIVE_PROVIDER_PROXY_CANCEL=1`` with
 ``ACP_LIVE_CANCEL_AFTER_START=1``. Neither mode uses provider credentials;
 service-level accepted-channel shutdown is separately covered by unit tests.
+
+For the launch-driver post-wait/pre-report recovery boundary, combine:
+
+    ACP_LIVE_PROVIDER_PROXY_UDS=1
+    ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT=1
+
+This creates and inode-checks the real provider socket/directory but sends no
+provider-proxy request. A test-only service wrapper exits after the kernel wait
+is durably recorded and the proxy is closed, before pinned-runc deletion or the
+cleanup report; a fresh production reaper must finish exact cleanup and resource
+release. It makes no DNS lookup or provider/model call and uses no credentials.
 
 For the fresh-supervisor cancellation branch, add:
 
@@ -686,6 +698,7 @@ def _start_launch_driver_then_crash_controller(
     concurrent_slot: str | None = None,
     concurrent_run_root: Path | None = None,
     concurrent_source_worktree: Path | None = None,
+    crash_phase: str = "",
 ) -> None:
     """Exit the launch-driver service at the selected monitor-handoff crash point."""
 
@@ -768,6 +781,7 @@ def capture_launch_handle(self, *args, **kwargs):
 
 GitSupervisor._sandbox_execution_record_launch = capture_launch_handle
 original_monitor_start = sandbox_monitor_service.start_sandbox_execution_monitor
+original_record_exit = sandbox_launch_driver_service._record_driver_exit_with_lease_recovery
 
 def write_crash_marker(kwargs, receipt):
     identity = kwargs["expected_identity"]
@@ -826,7 +840,48 @@ def crash_at_monitor_start(*args, **kwargs):
         raise AssertionError("unknown live monitor crash phase")
     write_crash_marker(kwargs, client._receipt)
 
-sandbox_monitor_service.start_sandbox_execution_monitor = crash_at_monitor_start
+def crash_after_exit(supervisor, expected_identity, wait_receipt, *, credential):
+    original_record_exit(supervisor, expected_identity, wait_receipt, credential=credential)
+    execution = supervisor._sandbox_execution_get(expected_identity[0])
+    if execution is None or execution["phase"] != "exited":
+        raise AssertionError("production launch driver did not durably record the exact exit")
+    driver_unit = f"acp-launch-driver-{expected_identity[2]}.service"
+    properties = sandbox_launch_driver_service._unit_properties(
+        driver_unit,
+        ("ActiveState", "ControlGroup", "Id", "InvocationID", "MainPID", "Slice"),
+    )
+    driver_pid = os.getpid()
+    if properties["ActiveState"] != "active" or properties["MainPID"] != str(driver_pid):
+        raise AssertionError("post-wait crash hook lost the exact active launch-driver identity")
+    value = {
+        "crash_phase": crash_phase,
+        "identity": list(expected_identity),
+        "driver": {
+            "unit": driver_unit,
+            "pid": driver_pid,
+            "identity": sandbox_monitor_ipc._linux_process_identity(driver_pid),
+            "active_state": properties["ActiveState"],
+            "invocation_id": properties["InvocationID"],
+            "control_group": properties["ControlGroup"],
+            "slice": properties["Slice"],
+            "main_pid": int(properties["MainPID"]),
+        },
+        "execution_phase": execution["phase"],
+        "runc_exit_code": execution["runc_exit_code"],
+        "launch_submission_id": execution["launch_submission_id"],
+        "launch_submission_digest": execution["launch_submission_digest"],
+        "cleanup_receipt": execution["cleanup_receipt"],
+        "provider_proxy_artifact": execution["provider_proxy_artifact"],
+    }
+    marker.write_text(json.dumps(value, sort_keys=True), encoding="ascii")
+    os._exit(74)
+
+if crash_phase == "after_exit_before_cleanup_report":
+    sandbox_launch_driver_service._record_driver_exit_with_lease_recovery = crash_after_exit
+elif crash_phase in {"after_monitor_acceptance", "before_monitor_start"}:
+    sandbox_monitor_service.start_sandbox_execution_monitor = crash_at_monitor_start
+else:
+    raise AssertionError(f"unknown live launch-driver crash phase: {crash_phase!r}")
 raise SystemExit(sandbox_launch_driver_service.main(driver_args))
 """
                 argv[module_flag - 1 :] = [
@@ -834,9 +889,7 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                     "-c",
                     wrapper,
                     str(monitor_acceptance_crash_marker),
-                    "before_monitor_start"
-                    if crash_before_monitor_start
-                    else "after_monitor_acceptance",
+                    crash_phase,
                     *driver_args,
                 ]
         result = original_runner(argv, environment=environment)
@@ -3054,6 +3107,9 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     supervised_run_worker = os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1"
     provider_proxy_uds = os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
     provider_proxy_cancel = os.environ.get("ACP_LIVE_PROVIDER_PROXY_CANCEL") == "1"
+    crash_after_exit_before_cleanup_report = (
+        os.environ.get("ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT") == "1"
+    )
     user_manager_restart_after_driver_crash = (
         os.environ.get("ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH") == "1"
     )
@@ -3322,7 +3378,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             for directory in rootfs_directories:
                 (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
             _busybox_version, busybox_applets = _copy_busybox_closure(busybox_path, rootfs_source)
-            if provider_proxy_uds:
+            if provider_proxy_uds and not crash_after_exit_before_cleanup_report:
                 compiler = shutil.which("cc")
                 if compiler is None:
                     pytest.fail("provider UDS proof requires the guest C compiler")
@@ -3671,6 +3727,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             os.environ.get("ACP_LIVE_CRASH_AFTER_MONITOR_ACCEPTANCE") == "1"
         )
         crash_before_monitor_start = os.environ.get("ACP_LIVE_CRASH_BEFORE_MONITOR_START") == "1"
+        driver_crash_phase = (
+            "after_exit_before_cleanup_report"
+            if crash_after_exit_before_cleanup_report
+            else "before_monitor_start"
+            if crash_before_monitor_start
+            else "after_monitor_acceptance"
+            if crash_after_monitor_acceptance
+            else ""
+        )
         user_manager_reexec_after_driver_crash = (
             os.environ.get("ACP_LIVE_USER_MANAGER_REEXEC_AFTER_DRIVER_CRASH") == "1"
         )
@@ -3683,6 +3748,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     crash_after_manager_acceptance,
                     crash_after_monitor_acceptance,
                     crash_before_monitor_start,
+                    crash_after_exit_before_cleanup_report,
                 )
             )
             > 1
@@ -3712,6 +3778,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 crash_after_manager_acceptance,
                 crash_after_monitor_acceptance,
                 crash_before_monitor_start,
+                crash_after_exit_before_cleanup_report,
                 user_manager_reexec_after_driver_crash,
                 user_manager_restart_after_driver_crash,
             )
@@ -3722,6 +3789,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             or crash_after_monitor_acceptance
             or crash_before_monitor_start
         )
+        if crash_after_exit_before_cleanup_report and not provider_proxy_uds:
+            pytest.fail(
+                "post-wait cleanup-report crash proof requires ACP_LIVE_PROVIDER_PROXY_UDS=1"
+            )
         if supervised_run_worker and (
             not import_result_after_cleanup
             or cancel_after_start
@@ -3779,6 +3850,17 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "sh",
                 f"/workspace/{_CROSS_ATTEMPT_PROBE_SCRIPT_NAME}",
             )
+        elif provider_proxy_uds and crash_after_exit_before_cleanup_report:
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "set -eu; "
+                "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+                "while [ ! -e /workspace/provider-probe-release ]; do "
+                "/bin/busybox sleep 0.1; done; "
+                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
+            )
         elif provider_proxy_uds:
             payload_command = (
                 "/bin/busybox",
@@ -3834,13 +3916,18 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 producer_result_sender,
                 crash_driver_service_before_receipt,
                 monitor_acceptance_marker
-                if crash_after_monitor_acceptance or crash_before_monitor_start
+                if (
+                    crash_after_monitor_acceptance
+                    or crash_before_monitor_start
+                    or crash_after_exit_before_cleanup_report
+                )
                 else None,
                 crash_before_monitor_start,
                 concurrent_control[0] if concurrent_control is not None else None,
                 concurrent_control[1] if concurrent_control is not None else None,
                 run_root if concurrent_control is not None else None,
                 source_worktree if concurrent_control is not None else None,
+                driver_crash_phase,
             ),
         )
         producer_controller.start()
@@ -3918,91 +4005,122 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                     expected_identity=identity,
                 )
             )
-            provider_probe_result = workspace_root / "provider-probe-result"
             provider_probe_release = workspace_root / "provider-probe-release"
-            if provider_proxy_cancel:
-                provider_probe_open = workspace_root / "provider-probe-open"
             provider_started_path = workspace_root / "launch-driver-started"
             probe_deadline = time.monotonic() + 15
             while (
                 not _entry_is_present(provider_started_path) and time.monotonic() < probe_deadline
             ):
                 time.sleep(0.05)
-            while (
-                not _entry_is_present(provider_probe_result) and time.monotonic() < probe_deadline
-            ):
-                time.sleep(0.05)
-            if not _entry_is_present(provider_probe_result):
+            assert _entry_is_present(provider_started_path), (
+                "production worker did not reach its provider-proxy artifact gate"
+            )
+            if crash_after_exit_before_cleanup_report:
                 current = supervisor._sandbox_execution_get(attempt["id"])
-                service_log = (
-                    service_log_path.read_text(encoding="utf-8", errors="replace")
-                    if service_log_path.exists()
-                    else "<launch-driver service log was not created>"
+                assert current is not None and current["execution_id"] == execution["execution_id"]
+                assert current["phase"] == "running"
+                artifact = current["provider_proxy_artifact"]
+                assert artifact["directory"]["path"] == str(provider_proxy_directory)
+                assert artifact["socket"]["path"] == str(provider_proxy_socket_path)
+                directory_info = provider_proxy_directory.lstat()
+                socket_info = provider_proxy_socket_path.lstat()
+                assert (directory_info.st_dev, directory_info.st_ino) == (
+                    artifact["directory"]["device"],
+                    artifact["directory"]["inode"],
                 )
-                service_log = service_log.replace(runner["credential"], "[redacted]")
-                pytest.fail(
-                    "provider UDS in-cgroup probe did not pass; "
-                    f"phase={current['phase'] if current is not None else None!r}; "
-                    f"started={_entry_is_present(provider_started_path)}; "
-                    f"producer_result_ready={producer_result_receiver.poll()}; "
-                    f"service_log_tail={service_log[-4000:]!r}"
+                assert stat.S_ISSOCK(socket_info.st_mode)
+                assert (socket_info.st_dev, socket_info.st_ino) == (
+                    artifact["socket"]["device"],
+                    artifact["socket"]["inode"],
                 )
-            if provider_probe_open is not None:
-                open_deadline = time.monotonic() + 10
+                execution = current
+                provider_probe_release.write_text("release-provider-probe\n", encoding="ascii")
+            else:
+                provider_probe_result = workspace_root / "provider-probe-result"
+                if provider_proxy_cancel:
+                    provider_probe_open = workspace_root / "provider-probe-open"
                 while (
-                    not _entry_is_present(provider_probe_open) and time.monotonic() < open_deadline
+                    not _entry_is_present(provider_probe_result)
+                    and time.monotonic() < probe_deadline
                 ):
                     time.sleep(0.05)
-                assert _entry_is_present(provider_probe_open), (
-                    "worker did not retain a connected open partial provider request"
+                if not _entry_is_present(provider_probe_result):
+                    current = supervisor._sandbox_execution_get(attempt["id"])
+                    service_log = (
+                        service_log_path.read_text(encoding="utf-8", errors="replace")
+                        if service_log_path.exists()
+                        else "<launch-driver service log was not created>"
+                    )
+                    service_log = service_log.replace(runner["credential"], "[redacted]")
+                    pytest.fail(
+                        "provider UDS in-cgroup probe did not pass; "
+                        f"phase={current['phase'] if current is not None else None!r}; "
+                        f"runc_exit_code={current.get('runc_exit_code') if current is not None else None!r}; "
+                        f"exit_evidence={current.get('runc_exit_evidence_source') if current is not None else None!r}; "
+                        f"started={_entry_is_present(provider_started_path)}; "
+                        f"result={_entry_is_present(provider_probe_result)}; "
+                        f"producer_result_ready={producer_result_receiver.poll()}; "
+                        f"service_log_tail={service_log[-4000:]!r}"
+                    )
+                if provider_probe_open is not None:
+                    open_deadline = time.monotonic() + 10
+                    while (
+                        not _entry_is_present(provider_probe_open)
+                        and time.monotonic() < open_deadline
+                    ):
+                        time.sleep(0.05)
+                    assert _entry_is_present(provider_probe_open), (
+                        "worker did not retain a connected open partial provider request"
+                    )
+                current = supervisor._sandbox_execution_get(attempt["id"])
+                assert current is not None and current["execution_id"] == execution["execution_id"]
+                assert current["phase"] == "running", (
+                    "worker left its running cgroup before the outside-peer probe: "
+                    f"{current['phase']!r}"
                 )
-            current = supervisor._sandbox_execution_get(attempt["id"])
-            assert current is not None and current["execution_id"] == execution["execution_id"]
-            assert current["phase"] == "running", (
-                f"worker left its running cgroup before the outside-peer probe: {current['phase']!r}"
-            )
-            workspace_path_text = current.get("workspace_root_path")
-            assert isinstance(workspace_path_text, str) and workspace_path_text, (
-                "running execution row has no bound worker workspace"
-            )
-            assert Path(workspace_path_text) == workspace_root, (
-                "running execution workspace changed during the provider probe"
-            )
-            execution_root = Path(current["bundle_path"]).parent
-            canonical_execution_root = execution_root.resolve(strict=True)
-            assert workspace_root.resolve(strict=True) == canonical_execution_root / "workspace", (
-                "worker workspace is not the exact private attempt execution child"
-            )
-            cgroup_path_text = current.get("cgroup_path")
-            assert isinstance(cgroup_path_text, str) and cgroup_path_text, (
-                "running execution row has no worker cgroup identity"
-            )
-            worker_cgroup = PurePosixPath(cgroup_path_text)
-            assert (
-                worker_cgroup.is_absolute()
-                and worker_cgroup.as_posix() == cgroup_path_text
-                and not any(part in {".", ".."} for part in worker_cgroup.parts)
-            ), "running execution row has a non-canonical worker cgroup identity"
-            execution = current
-            outside_cgroup, _, _ = _process_cgroup_identity(os.getpid())
-            assert not PurePosixPath(outside_cgroup).is_relative_to(worker_cgroup), (
-                "same-UID outside probe unexpectedly runs inside the worker cgroup"
-            )
-            outsider = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            outsider.settimeout(3)
-            try:
-                outsider.connect(str(provider_proxy_socket_path))
-                outsider.sendall(b"NOT-CONNECT / HTTP/1.1\r\n\r\n")
-                outside_response = outsider.recv(1024)
-            finally:
-                outsider.close()
-            assert b"403 Forbidden" in outside_response, (
-                "same-UID outside-cgroup peer reached request parsing instead of failing "
-                f"peer authorization: {outside_response!r}"
-            )
+                workspace_path_text = current.get("workspace_root_path")
+                assert isinstance(workspace_path_text, str) and workspace_path_text, (
+                    "running execution row has no bound worker workspace"
+                )
+                assert Path(workspace_path_text) == workspace_root, (
+                    "running execution workspace changed during the provider probe"
+                )
+                execution_root = Path(current["bundle_path"]).parent
+                canonical_execution_root = execution_root.resolve(strict=True)
+                assert (
+                    workspace_root.resolve(strict=True) == canonical_execution_root / "workspace"
+                ), "worker workspace is not the exact private attempt execution child"
+                cgroup_path_text = current.get("cgroup_path")
+                assert isinstance(cgroup_path_text, str) and cgroup_path_text, (
+                    "running execution row has no worker cgroup identity"
+                )
+                worker_cgroup = PurePosixPath(cgroup_path_text)
+                assert (
+                    worker_cgroup.is_absolute()
+                    and worker_cgroup.as_posix() == cgroup_path_text
+                    and not any(part in {".", ".."} for part in worker_cgroup.parts)
+                ), "running execution row has a non-canonical worker cgroup identity"
+                execution = current
+                outside_cgroup, _, _ = _process_cgroup_identity(os.getpid())
+                assert not PurePosixPath(outside_cgroup).is_relative_to(worker_cgroup), (
+                    "same-UID outside probe unexpectedly runs inside the worker cgroup"
+                )
+                outsider = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                outsider.settimeout(3)
+                try:
+                    outsider.connect(str(provider_proxy_socket_path))
+                    outsider.sendall(b"NOT-CONNECT / HTTP/1.1\r\n\r\n")
+                    outside_response = outsider.recv(1024)
+                finally:
+                    outsider.close()
+                assert b"403 Forbidden" in outside_response, (
+                    "same-UID outside-cgroup peer reached request parsing instead of failing "
+                    f"peer authorization: {outside_response!r}"
+                )
             if not provider_proxy_cancel:
                 assert provider_probe_release is not None
-                provider_probe_release.write_text("release-provider-probe\n", encoding="ascii")
+                if not crash_after_exit_before_cleanup_report:
+                    provider_probe_release.write_text("release-provider-probe\n", encoding="ascii")
         assert producer_result_receiver.poll(35), "launch producer did not report its handoff"
         producer_result = producer_result_receiver.recv()
         assert identity is not None and execution is not None
@@ -4746,6 +4864,168 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 == durable_after_recovery["launch_submission_digest"]
             )
             assert monitor_acceptance_marker.is_file()
+            return
+        if crash_after_exit_before_cleanup_report:
+            _wait_for_receipt(run_root, monitor_acceptance_marker.name, timeout=40.0)
+            crashed = json.loads(monitor_acceptance_marker.read_text(encoding="ascii"))
+            assert crashed["crash_phase"] == "after_exit_before_cleanup_report"
+            assert crashed["identity"] == list(identity)
+            driver = crashed["driver"]
+            assert driver["unit"] == service_unit
+            assert driver["pid"] == driver["main_pid"] > 0
+            assert driver["identity"].startswith(f"linux:{driver['pid']}:")
+            assert driver["active_state"] == "active"
+            assert re.fullmatch(r"[0-9a-f]{32}", driver["invocation_id"])
+            assert driver["slice"] == slice_unit
+            assert PurePosixPath(driver["control_group"]).name == service_unit
+
+            durable_before_recovery = supervisor._sandbox_execution_get(attempt["id"])
+            assert durable_before_recovery is not None
+            assert durable_before_recovery["phase"] == "exited"
+            assert durable_before_recovery["runc_exit_code"] == 0
+            assert (
+                durable_before_recovery["runc_exit_evidence_source"] == "runc_client_kernel_waitpid"
+            )
+            assert durable_before_recovery["cleanup_receipt"] == {}
+            assert durable_before_recovery["cleanup_verification_json"] == "{}"
+            assert (
+                durable_before_recovery["launch_submission_id"] == crashed["launch_submission_id"]
+            )
+            assert (
+                durable_before_recovery["launch_submission_digest"]
+                == crashed["launch_submission_digest"]
+            )
+            assert durable_before_recovery["launch_driver_pid"] == driver["pid"]
+            assert durable_before_recovery["launch_driver_identity"] == driver["identity"]
+            assert durable_before_recovery["launch_driver_invocation_id"] == driver["invocation_id"]
+            assert crashed["execution_phase"] == "exited"
+            assert crashed["runc_exit_code"] == 0
+            assert crashed["cleanup_receipt"] == {}
+
+            driver_after_crash = _unit_properties(
+                service_unit,
+                ("ActiveState", "ControlGroup", "Id", "InvocationID", "LoadState", "MainPID"),
+            )
+            quiescence_deadline = time.monotonic() + 10
+            while time.monotonic() < quiescence_deadline and (
+                driver_after_crash["MainPID"] != "0"
+                or driver_after_crash["ActiveState"] not in {"failed", "inactive"}
+            ):
+                time.sleep(0.05)
+                driver_after_crash = _unit_properties(
+                    service_unit,
+                    (
+                        "ActiveState",
+                        "ControlGroup",
+                        "Id",
+                        "InvocationID",
+                        "LoadState",
+                        "MainPID",
+                    ),
+                )
+            assert driver_after_crash["Id"] == service_unit
+            assert driver_after_crash["LoadState"] == "loaded"
+            assert driver_after_crash["ActiveState"] in {"failed", "inactive"}
+            assert driver_after_crash["MainPID"] == "0"
+            assert driver_after_crash["InvocationID"] == driver["invocation_id"]
+            assert not driver_after_crash["ControlGroup"]
+
+            assert provider_proxy_directory is not None
+            assert provider_proxy_socket_path is not None
+            provider_artifact = durable_before_recovery["provider_proxy_artifact"]
+            assert provider_artifact["directory"]["path"] == str(provider_proxy_directory)
+            assert provider_artifact["socket"]["path"] == str(provider_proxy_socket_path)
+            directory_info = provider_proxy_directory.lstat()
+            assert (directory_info.st_dev, directory_info.st_ino) == (
+                provider_artifact["directory"]["device"],
+                provider_artifact["directory"]["inode"],
+            )
+            assert not os.path.lexists(provider_proxy_socket_path)
+            assert list(provider_proxy_directory.iterdir()) == []
+            container_state_entry = state_root / durable_before_recovery["container_id"]
+            assert container_state_entry.is_dir(), (
+                "the exact stopped runc state entry must still exist at the injected crash"
+            )
+
+            reaper_epoch = (
+                max(int(time.time()), int(supervisor.attempt(attempt["id"])["lease_expires_at"]))
+                + 1
+            )
+            recovery_receiver, recovery_sender = context.Pipe(duplex=False)
+            recovery = context.Process(
+                target=_reap_expired_from_fresh_process,
+                args=(repo, reaper_epoch, recovery_sender),
+            )
+            recovery.start()
+            child_processes.append(recovery)
+            recovery_sender.close()
+            assert recovery_receiver.poll(45), "fresh reaper did not recover the post-wait crash"
+            recovery_result = recovery_receiver.recv()
+            recovery.join(timeout=10)
+            assert not recovery.is_alive()
+            assert recovery.exitcode == 0
+            recovery_receiver.close()
+            assert recovery_result[0] == "ok", recovery_result
+            assert recovery_result[1] not in {controller_pid, driver["pid"]}
+            recovered = supervisor._sandbox_execution_get(attempt["id"])
+            assert recovered is not None and recovered["phase"] == "cleanup_verified"
+            cleanup_receipt = recovered["cleanup_receipt"]
+            assert cleanup_receipt["version"] == 4
+            recovery_receipt = cleanup_receipt["recovery"]
+            assert recovery_receipt["launch_submission_id"] == crashed["launch_submission_id"]
+            assert (
+                recovery_receipt["launch_submission_digest"] == crashed["launch_submission_digest"]
+            )
+            assert recovery_receipt["container_id"] == durable_before_recovery["container_id"]
+            assert recovery_receipt["runc_delete_action"] is not None
+            runc_action = recovery_receipt["runc_delete_action"]
+            assert (
+                runc_action["executable_digest"]
+                == durable_before_recovery["runc_executable_digest"]
+            )
+            assert runc_action["runtime_version"] == _SUPPORTED_RUNC_VERSION
+            assert runc_action["argv"][3:] == (
+                "delete",
+                "--force",
+                durable_before_recovery["container_id"],
+            ) or runc_action["argv"][3:] == [
+                "delete",
+                "--force",
+                durable_before_recovery["container_id"],
+            ]
+            assert runc_action["state_entry_absent"] is True
+            assert (
+                recovered["cleanup_verification"]["observations"]["paths"][
+                    "provider_proxy_directory"
+                ]["absent"]
+                is True
+            )
+            assert not os.path.lexists(provider_proxy_socket_path)
+            assert not os.path.lexists(provider_proxy_directory)
+            assert not container_state_entry.exists()
+            assert not state_root.exists()
+            assert not Path(recovered["bundle_path"]).exists()
+            release_rows = [
+                item
+                for item in recovery_result[2]["runtime_cleanup"]
+                if item.get("attempt_id") == attempt["id"] and item.get("state") == "released"
+            ]
+            assert len(release_rows) == 1, recovery_result[2]
+            assert supervisor.attempt(attempt["id"])["status"] == "orphaned"
+            assert supervisor.task(task["id"])["status"] == "orphaned"
+            with supervisor.connect() as connection:
+                remaining_leases = connection.execute(
+                    "SELECT resource FROM resource_leases WHERE task_id = ? AND attempt_id = ?",
+                    (task["id"], attempt["id"]),
+                ).fetchall()
+                remaining_allocation = connection.execute(
+                    "SELECT pool_name, value FROM runtime_allocations WHERE attempt_id = ?",
+                    (attempt["id"],),
+                ).fetchone()
+            assert not remaining_leases
+            assert remaining_allocation is None
+            service_log = service_log_path.read_text(encoding="utf-8", errors="replace")
+            assert runner["credential"] not in service_log
             return
         launch_receipt_deadline = time.monotonic() + 30
         durable_before_retry = supervisor._sandbox_execution_get(attempt["id"])

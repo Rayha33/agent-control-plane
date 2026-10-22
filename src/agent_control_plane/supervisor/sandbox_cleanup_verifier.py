@@ -18,7 +18,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import sandbox_attestation, sandbox_monitor_lifecycle, sandbox_monitor_receipt
+from . import oci_worker, sandbox_attestation, sandbox_monitor_lifecycle, sandbox_monitor_receipt
 from . import sandbox_execution_journal as journal
 from .common import SupervisorError, canonical_json, utc_now
 from .oci_worker import _runc_execution_gate_fence
@@ -106,8 +106,6 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
         report_digest = hashlib.sha256(row["cleanup_receipt_json"].encode("utf-8")).hexdigest()
         if (
             not isinstance(cleanup, dict)
-            or cleanup.get("version") != 3
-            or type(cleanup.get("version")) is not int
             or cleanup.get("verification_status") != "unverified"
             or cleanup.get("attempt_id") != row["attempt_id"]
             or type(cleanup.get("claim_token")) is not int
@@ -115,10 +113,28 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
             or cleanup.get("execution_id") != row["execution_id"]
             or type(cleanup.get("runc_exit_code")) is not int
             or cleanup["runc_exit_code"] != row["runc_exit_code"]
-            or not isinstance(cleanup.get("action"), dict)
-            or type(cleanup["action"].get("returncode")) is not int
-            or cleanup["action"].get("returncode") != 0
-            or cleanup["action"].get("state_entry_absent_immediately_after_delete") is not True
+        ):
+            return False
+        cleanup_version = cleanup.get("version")
+        if (
+            type(cleanup_version) is not int
+            or (
+                cleanup_version == 3
+                and (
+                    not isinstance(cleanup.get("action"), dict)
+                    or type(cleanup["action"].get("returncode")) is not int
+                    or cleanup["action"].get("returncode") != 0
+                    or cleanup["action"].get("state_entry_absent_immediately_after_delete")
+                    is not True
+                )
+            )
+            or (
+                cleanup_version == 4
+                and not journal._sandbox_cleanup_recovery_report_is_self_consistent(
+                    row, row["cleanup_receipt_json"]
+                )
+            )
+            or cleanup_version not in {3, 4}
         ):
             return False
         expected_keys = {
@@ -1461,6 +1477,274 @@ def _verifier_process_identity() -> str:
     return identity
 
 
+def _recovery_runc_state_entry_is_present(row: Any) -> bool:
+    state_path = Path(row["state_path"])
+    if (
+        not state_path.is_absolute()
+        or str(state_path) != os.path.normpath(str(state_path))
+        or state_path.name != "state"
+        or row["container_id"]
+        != sandbox_monitor_receipt.sandbox_container_id(
+            row["attempt_id"], row["claim_token"], row["execution_id"]
+        )
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_identity_mismatch", "runc state path is not exact"
+        )
+    try:
+        root_info = state_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_unknown", "runc state-root identity is unavailable"
+        ) from error
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+        or (root_info.st_dev, root_info.st_ino) != (row["state_root_dev"], row["state_root_ino"])
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_identity_mismatch", "runc state-root inode changed"
+        )
+    try:
+        entry_info = (state_path / row["container_id"]).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_unknown", "runc state-entry status is unavailable"
+        ) from error
+    if (
+        not stat.S_ISDIR(entry_info.st_mode)
+        or stat.S_ISLNK(entry_info.st_mode)
+        or entry_info.st_uid != os.geteuid()
+        or stat.S_IMODE(entry_info.st_mode) != 0o700
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_identity_mismatch", "runc state entry is not private"
+        )
+    return True
+
+
+def _reaper_recovery_is_due(
+    supervisor: Any, attempt_id: str, claim_token: int, reaper_epoch: int
+) -> bool:
+    with supervisor.connect() as connection:
+        attempt = connection.execute(
+            "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if attempt is None or attempt["claim_token"] != claim_token:
+            return False
+        if (
+            attempt["status"] in {"provisioning", "working"}
+            and attempt["lease_expires_at"] <= reaper_epoch
+        ):
+            return True
+        if (
+            attempt["status"] != "terminating"
+            or attempt["termination_target_status"] != "quarantined"
+        ):
+            return False
+        task = connection.execute(
+            "SELECT current_attempt_id, status, cleanup_target_status FROM tasks WHERE id = ?",
+            (attempt["task_id"],),
+        ).fetchone()
+    return bool(
+        task is not None
+        and task["current_attempt_id"] == attempt_id
+        and task["status"] == "cleanup_pending"
+        and task["cleanup_target_status"] == "blocked"
+    )
+
+
+def recover_sandbox_execution_cleanup(
+    supervisor: Any,
+    attempt_id: str,
+    claim_token: int,
+    *,
+    reaper_epoch: int,
+) -> dict[str, Any]:
+    """Recover an exited execution after the launch driver missed its cleanup report.
+
+    A persisted kernel wait is not sufficient cleanup authority. Recovery binds
+    to the one-use launch latch, retires only exact units, then independently
+    observes every process identity, cgroup, and runc state path before either
+    recording a state-absence receipt or asking the pinned runtime to delete the
+    exact stopped container. Final path removal still runs through the ordinary
+    independent verifier and its durable receipt.
+    """
+
+    attempt_id = supervisor._sandbox_validate_attempt_id(attempt_id)
+    supervisor._sandbox_claim_token(claim_token)
+    if type(reaper_epoch) is not int or reaper_epoch <= 0:
+        raise SupervisorError("sandbox_cleanup_recovery_invalid", "reaper epoch is invalid")
+    with supervisor.connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+    if row is None or row["claim_token"] != claim_token:
+        raise SupervisorError("sandbox_execution_not_found", "recovery execution is missing")
+    if row["phase"] == "cleanup_verified":
+        if journal._sandbox_cleanup_verification_is_self_consistent(row):
+            return supervisor._sandbox_execution_view(row)
+        raise SupervisorError(
+            "sandbox_cleanup_verification_invalid", "stored verification receipt is inconsistent"
+        )
+    if not _reaper_recovery_is_due(supervisor, attempt_id, claim_token, reaper_epoch):
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_not_due", "attempt is not expired or quarantined"
+        )
+    if row["phase"] == "cleanup_reported":
+        return verify_sandbox_execution_cleanup(supervisor, attempt_id, claim_token)
+    if (
+        row["phase"] != "exited"
+        or type(row["runc_exit_code"]) is not int
+        or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
+        or not journal._sandbox_launch_submission_latch_is_self_consistent(row)
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_unavailable",
+            "restart recovery requires one exact durable launch submission and kernel wait",
+        )
+    pin = supervisor.config.oci_runc_executable
+    expected_version = supervisor.config.oci_runc_version
+    if (
+        pin is None
+        or pin.sha256 != row["runc_executable_digest"]
+        or expected_version != row["runtime_version"]
+    ):
+        raise SupervisorError(
+            "sandbox_cleanup_recovery_identity_mismatch", "pinned runc identity changed"
+        )
+    root_identity = journal._sandbox_execution_gate_identity(row)
+    with _runc_execution_gate_fence(*root_identity):
+        with supervisor.connect() as connection:
+            locked_row = connection.execute(
+                "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if (
+            locked_row is None
+            or locked_row["claim_token"] != claim_token
+            or locked_row["execution_id"] != row["execution_id"]
+            or locked_row["phase"] != "exited"
+            or journal._sandbox_execution_gate_identity(locked_row) != root_identity
+            or not journal._sandbox_launch_submission_latch_is_self_consistent(locked_row)
+        ):
+            raise SupervisorError(
+                "sandbox_execution_gate_identity_mismatch",
+                "execution changed under recovery fence",
+            )
+        row = locked_row
+        units = _verify_and_stop_units(row)
+        processes = _observe_processes(row)
+        cgroup_paths = _row_cgroup_paths(row)
+        cgroups = {
+            path: _cgroup_tree_is_unpopulated(path) for path in dict.fromkeys(cgroup_paths.values())
+        }
+        if any(value is not True for value in cgroups.values()):
+            raise SupervisorError(
+                "sandbox_cleanup_recovery_unknown", "recorded cgroup remains populated"
+            )
+        if not _observe_processes(row) == processes:
+            raise SupervisorError(
+                "sandbox_cleanup_recovery_unknown", "a process identity reappeared"
+            )
+        if not _reaper_recovery_is_due(supervisor, attempt_id, claim_token, reaper_epoch):
+            raise SupervisorError(
+                "sandbox_cleanup_recovery_not_due", "attempt changed before recovery commit"
+            )
+        state_entry_present = _recovery_runc_state_entry_is_present(row)
+        recovery_action: dict[str, Any] | None = None
+        if state_entry_present:
+            action = oci_worker._delete_pinned_runc_container(
+                pin,
+                expected_version=expected_version,
+                state_root=row["state_path"],
+                expected_state_device=row["state_root_dev"],
+                expected_state_inode=row["state_root_ino"],
+                container_id=row["container_id"],
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                execution_id=row["execution_id"],
+            )
+            if (
+                not oci_worker._runc_cleanup_action_receipt_is_self_consistent(action)
+                or (action.attempt_id, action.claim_token, action.execution_id)
+                != (attempt_id, claim_token, row["execution_id"])
+                or _recovery_runc_state_entry_is_present(row)
+            ):
+                raise SupervisorError(
+                    "sandbox_cleanup_recovery_unknown",
+                    "pinned runc recovery did not retire the exact state entry",
+                )
+            recovery_action = {
+                "attempt_id": action.attempt_id,
+                "claim_token": action.claim_token,
+                "execution_id": action.execution_id,
+                "executable_path": action.executable_path,
+                "executable_digest": action.executable_digest,
+                "runtime_version": action.runtime_version,
+                "argv": list(action.argv),
+                "argv_sha256": action.argv_digest,
+                "actor_pid": action.actor_pid,
+                "actor_identity": action.actor_identity,
+                "returncode": action.returncode,
+                "state_entry_absent": action.state_entry_absent,
+            }
+        verifier_identity = _verifier_process_identity()
+        recovery = {
+            "version": 1,
+            "attempt_id": attempt_id,
+            "claim_token": claim_token,
+            "execution_id": row["execution_id"],
+            "launch_submission_id": row["launch_submission_id"],
+            "launch_submission_digest": row["launch_submission_digest"],
+            "launch_submission_at": row["launch_submission_at"],
+            "provider_proxy_artifact_sha256": hashlib.sha256(
+                row["provider_proxy_artifact_json"].encode("utf-8")
+            ).hexdigest(),
+            "state_root": {
+                "path": row["state_path"],
+                "device": row["state_root_dev"],
+                "inode": row["state_root_ino"],
+            },
+            "container_id": row["container_id"],
+            "runc_delete_action": recovery_action,
+            "reaper_epoch": reaper_epoch,
+            "recovered_at": utc_now(),
+            "verifier": {"pid": os.getpid(), "identity": verifier_identity},
+            "observations": {
+                "runc_state_entry_absent": True,
+                "units": units,
+                "processes": processes,
+                "cgroups": cgroups,
+            },
+        }
+        encoded = canonical_json(
+            supervisor._sandbox_cleanup_receipt(row, recovery_payload=recovery)
+        )
+        recovery_receipt = journal._SandboxCleanupRecoveryReceipt(
+            attempt_id=attempt_id,
+            claim_token=claim_token,
+            execution_id=row["execution_id"],
+            launch_submission_id=row["launch_submission_id"],
+            launch_submission_digest=row["launch_submission_digest"],
+            reaper_epoch=reaper_epoch,
+            encoded=encoded,
+        )
+        journal._register_sandbox_cleanup_recovery_receipt(recovery_receipt)
+        supervisor._sandbox_execution_record_cleanup_report(
+            attempt_id,
+            claim_token,
+            recovery_receipt=recovery_receipt,
+            _reaper_epoch=reaper_epoch,
+        )
+    return verify_sandbox_execution_cleanup(supervisor, attempt_id, claim_token)
+
+
 def verify_sandbox_execution_cleanup(
     supervisor: Any,
     attempt_id: str,
@@ -1492,13 +1776,18 @@ def verify_sandbox_execution_cleanup(
     if (
         type(row["runc_exit_code"]) is not int
         or row["runc_exit_evidence_source"] != "runc_client_kernel_waitpid"
-        or not supervisor._sandbox_cleanup_receipt_v3_is_self_consistent(
-            row, row["cleanup_receipt_json"]
+        or not (
+            supervisor._sandbox_cleanup_receipt_v3_is_self_consistent(
+                row, row["cleanup_receipt_json"]
+            )
+            or supervisor._sandbox_cleanup_recovery_receipt_is_self_consistent(
+                row, row["cleanup_receipt_json"]
+            )
         )
     ):
         raise SupervisorError(
             "sandbox_cleanup_verification_unavailable",
-            "independent cleanup verification requires an observed kernel wait and exact runc v3 action receipt",
+            "independent cleanup verification requires an observed kernel wait and exact action or recovery receipt",
         )
     if not sys.platform.startswith("linux"):
         raise SupervisorError(
@@ -1528,10 +1817,13 @@ def verify_sandbox_execution_cleanup(
                 "sandbox_cleanup_verification_invalid",
                 "stored verification receipt is inconsistent",
             )
-        if row[
-            "phase"
-        ] != "cleanup_reported" or not supervisor._sandbox_cleanup_receipt_v3_is_self_consistent(
-            row, row["cleanup_receipt_json"]
+        if row["phase"] != "cleanup_reported" or not (
+            supervisor._sandbox_cleanup_receipt_v3_is_self_consistent(
+                row, row["cleanup_receipt_json"]
+            )
+            or supervisor._sandbox_cleanup_recovery_receipt_is_self_consistent(
+                row, row["cleanup_receipt_json"]
+            )
         ):
             raise SupervisorError(
                 "sandbox_cleanup_verification_unavailable", "cleanup report changed under fence"

@@ -4220,9 +4220,53 @@ records the empty sentinel.
 
 Deterministic coverage checks the one-way journal binding and launch digest, plus
 refusal to remove unbound, replaced-directory, and replaced-socket artifacts.
-A crash before the launch latch or before `cleanup_reported` still does not gain
-deletion authority: reaping leaves those artifacts quarantined until an exact
-cleanup report can be independently verified.
+The reaper now also reconciles the narrow post-wait, pre-`cleanup_reported`
+boundary when the exact durable launch-submission latch is present: it verifies
+the recorded systemd activations, process identities, cgroup trees, pinned
+runtime and state-root identity; if the exact state entry remains, it invokes
+only the pinned `runc delete` for that container. A version-4 recovery receipt
+binds the attempt, claim, execution, launch submission and provider-artifact
+digest, after which the ordinary independent cleanup verifier still performs
+the inode-bound path removal. Missing or ambiguous submission evidence, an
+identity mismatch, or any live/unknown process, unit or cgroup remains
+quarantined with fences held; recovery never infers cleanup from the kernel
+wait result alone.
+
+Local deterministic tests use synthetic Linux/systemd observations and a real
+filesystem UDS socket. They inject interruption after pinned-state deletion but
+before the cleanup-report commit and after that commit but before independent
+verification, then confirm retry behavior, exact artifact removal, and receipt
+tamper rejection.
+
+For the exact launch-driver post-wait/pre-report crash boundary with a provider
+artifact, combine `ACP_LIVE_PROVIDER_PROXY_UDS=1` and
+`ACP_LIVE_CRASH_AFTER_EXIT_BEFORE_CLEANUP_REPORT=1`. The opt-in test wrapper
+exits after the durable kernel-wait transition and provider-proxy shutdown, but
+before pinned-runc deletion or `cleanup_reported`; a fresh reaper must recover
+the exact launch latch and state-root identity, write the recovery report, run
+the independent verifier, and release resources only after verification. This
+crash-only branch creates and checks the exact provider socket/directory
+identities but sends no provider-proxy request, performs no DNS lookup, uses no
+provider credentials, and makes no model/provider call.
+
+One live run passed on 2026-10-22 in the disposable Debian 12 ARM64 guest
+`lima-acp-2370-live-sandbox-20261021` (Linux
+`6.1.0-53-cloud-arm64`, Debian kernel package `6.1.187-1`, active systemd user
+manager, pinned root-owned runc `1.5.2`). The test advances the supplied reaper
+epoch to one second after the later of the current time and durable lease expiry,
+so it exercises the expired-attempt branch without waiting in wall-clock time.
+At the injected crash, the execution was `exited`, its exact stopped runc state
+entry still existed, and the provider socket was absent while its empty
+directory still matched the durable device/inode identity. A fresh
+`reap_expired()` recovered a v4 report whose runc action matched the pinned
+binary and exact container; independent cleanup then removed the provider
+directory, state root, and bundle, and released the runtime. The run used no
+provider credentials or model/provider calls.
+
+The separate live guest evidence below covers the already-reported cleanup
+handoff and provider-proxy request/mount path. Keep #3447 and parent #2370 open
+until exact-diff independent QC, focused/full supported tests, and exact-head CI
+are all recorded.
 
 The opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`
 also passed once in natural-completion mode and once in cancellation mode on
@@ -4237,7 +4281,8 @@ The cancellation run opened a partial UDS probe before cancellation; this
 proves the client connection was open, not that the handler had accepted that
 specific partial request. Neither run used provider credentials or called a
 model/provider.
-This covers the reported-cleanup handoff and reaper verification boundary; it
-does not prove crashes before `cleanup_reported`, a full daemon restart, the
-registered `run_worker()` path, provider authentication, model calls, or
-end-to-end provider egress. Parent task #2370 and full acceptance remain open.
+Those natural/cancellation runs cover the reported-cleanup handoff and the
+provider-proxy request/mount path. Together with the post-wait crash run above,
+they do not prove a full daemon restart, the registered `run_worker()` path,
+provider authentication, model calls, or end-to-end provider egress. Parent task
+#2370 and full acceptance remain open.

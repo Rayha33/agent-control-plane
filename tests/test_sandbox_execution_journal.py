@@ -4491,6 +4491,8 @@ def configure_cleanup_verifier_os_observations(
     execution: dict,
     attempt: dict,
     row: dict,
+    *,
+    runtime_directory: Path | None = None,
 ) -> Path:
     """Provide deterministic Linux/systemd observations to the real verifier."""
 
@@ -4498,9 +4500,11 @@ def configure_cleanup_verifier_os_observations(
     monkeypatch.setattr(
         verifier_module, "_trusted_systemctl_executable", lambda: Path("/usr/bin/systemctl")
     )
-    runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir=str(_RUNTIME_TMP_DIR))
-    request.addfinalizer(runtime_context.cleanup)
-    runtime_environment = {"XDG_RUNTIME_DIR": runtime_context.name}
+    if runtime_directory is None:
+        runtime_context = tempfile.TemporaryDirectory(prefix="a-", dir=str(_RUNTIME_TMP_DIR))
+        request.addfinalizer(runtime_context.cleanup)
+        runtime_directory = Path(runtime_context.name)
+    runtime_environment = {"XDG_RUNTIME_DIR": str(runtime_directory)}
     monkeypatch.setattr(
         verifier_module,
         "_trusted_systemd_command_environment",
@@ -4740,6 +4744,316 @@ def test_reaper_retries_cleanup_verification_before_releasing_attempt_fence(
     assert lease["lease_expires_at"] == 0
     assert runtime is not None and runtime["state"] == "released"
     assert allocation is None
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    [
+        None,
+        "after_runc_delete_before_report",
+        "after_report_commit_before_verifier",
+    ],
+    ids=["normal", "delete-before-report", "report-before-verification"],
+)
+def test_reaper_recovers_crash_across_cleanup_report_boundaries(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    crash_point: str | None,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    supervisor.config = replace(
+        supervisor.config,
+        runtime_port_pools=(RuntimePortPool("ACP_TEST_PORT", 24004, 24004),),
+    )
+    supervisor._port_available = lambda _port: True
+    attempt = claimed(supervisor, "reaper-recovery-after-runc-delete.txt")
+    execution = reserve(supervisor, attempt)
+
+    runtime_context = tempfile.TemporaryDirectory(prefix="acp-px-", dir=str(_RUNTIME_TMP_DIR))
+    request.addfinalizer(runtime_context.cleanup)
+    runtime_directory = Path(runtime_context.name)
+    runtime_directory.chmod(0o700)
+    runtime_environment = {"XDG_RUNTIME_DIR": str(runtime_directory)}
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "_trusted_systemd_command_environment",
+        lambda: runtime_environment,
+    )
+    proxy_directory, proxy_socket = monitor_lifecycle_module.sandbox_provider_proxy_control_paths(
+        state_path=execution["state_path"],
+        expected_identity=(attempt["id"], attempt["claim_token"], execution["execution_id"]),
+    )
+    proxy_directory.mkdir(mode=0o700)
+    proxy_directory.chmod(0o700)
+    proxy_socket = proxy_directory / "provider.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(proxy_socket))
+    listener.close()
+    proxy_socket.chmod(0o600)
+    proxy_directory_info = proxy_directory.lstat()
+    proxy_socket_info = proxy_socket.lstat()
+    provider_identity = {
+        "directory_device": proxy_directory_info.st_dev,
+        "directory_inode": proxy_directory_info.st_ino,
+        "socket_device": proxy_socket_info.st_dev,
+        "socket_inode": proxy_socket_info.st_ino,
+    }
+    pin = supervisor.config.oci_runc_executable
+    assert pin is not None
+    target = _test_runc_target(execution)
+    target = replace(
+        target,
+        argv=(str(pin.path), *target.argv[1:]),
+        runc_executable_path=str(pin.path),
+    )
+    record_launch(
+        supervisor,
+        attempt,
+        runc_handle=_test_runc_handle(target=target),
+        provider_proxy_artifact=provider_identity,
+    )
+    record_running(supervisor, attempt)
+    record_exit(supervisor, attempt)
+    row = supervisor._sandbox_execution_get(attempt["id"])
+    assert row is not None and row["phase"] == "exited"
+    assert row["launch_submission_id"]
+    assert row["provider_proxy_artifact"]["socket"]["inode"] == proxy_socket_info.st_ino
+    state_entry = Path(row["state_path"]) / row["container_id"]
+    state_entry.mkdir(mode=0o700)
+    state_entry.chmod(0o700)
+
+    def delete_exact_state_entry(pin: Any, **kwargs: Any) -> Any:
+        assert kwargs["attempt_id"] == attempt["id"]
+        assert kwargs["claim_token"] == attempt["claim_token"]
+        assert kwargs["execution_id"] == row["execution_id"]
+        assert kwargs["container_id"] == row["container_id"]
+        state_root = Path(kwargs["state_root"])
+        state_info = state_root.lstat()
+        assert (state_info.st_dev, state_info.st_ino) == (
+            kwargs["expected_state_device"],
+            kwargs["expected_state_inode"],
+        )
+        (state_root / kwargs["container_id"]).rmdir()
+        argv = [str(pin.path), "--root", str(state_root), "delete", "--force", row["container_id"]]
+        actor_pid = os.getpid()
+        action = oci_worker._RuncCleanupActionReceipt(
+            attempt_id=attempt["id"],
+            claim_token=attempt["claim_token"],
+            execution_id=row["execution_id"],
+            container_id=row["container_id"],
+            state_root=str(state_root),
+            state_root_device=state_info.st_dev,
+            state_root_inode=state_info.st_ino,
+            executable_path=str(pin.path),
+            executable_digest=pin.sha256,
+            runtime_version=supervisor.config.oci_runc_version,
+            argv=tuple(argv),
+            argv_digest=hashlib.sha256(canonical_json(argv).encode("utf-8")).hexdigest(),
+            actor_pid=actor_pid,
+            actor_identity=verifier_module._verifier_process_identity(),
+            returncode=0,
+            state_entry_absent=True,
+        )
+        oci_worker._register_runc_cleanup_action_receipt(action)
+        return action
+
+    monkeypatch.setattr(oci_worker, "_delete_pinned_runc_container", delete_exact_state_entry)
+
+    monitor_socket = configure_cleanup_verifier_os_observations(
+        monkeypatch, request, execution, attempt, row, runtime_directory=runtime_directory
+    )
+    with supervisor.connect() as connection:
+        lease_before = connection.execute(
+            "SELECT resource FROM resource_leases WHERE task_id = ? AND attempt_id = ?",
+            (attempt["task_id"], attempt["id"]),
+        ).fetchone()
+    assert lease_before is not None
+
+    original_record_cleanup_report = supervisor._sandbox_execution_record_cleanup_report
+    simulated_crash = False
+
+    def record_cleanup_report_with_crash(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal simulated_crash
+        if crash_point == "after_runc_delete_before_report" and not simulated_crash:
+            simulated_crash = True
+            raise SupervisorError(
+                "sandbox_cleanup_recovery_unknown", "simulated crash before report commit"
+            )
+        report = original_record_cleanup_report(*args, **kwargs)
+        if crash_point == "after_report_commit_before_verifier" and not simulated_crash:
+            simulated_crash = True
+            raise SupervisorError(
+                "sandbox_cleanup_recovery_unknown", "simulated crash after report commit"
+            )
+        return report
+
+    if crash_point is not None:
+        monkeypatch.setattr(
+            supervisor,
+            "_sandbox_execution_record_cleanup_report",
+            record_cleanup_report_with_crash,
+        )
+
+    runtime_release_calls: list[str] = []
+
+    def release_runtime(
+        attempt_id: str, force: bool, _allow_active: bool, guard_fd: int
+    ) -> dict[str, Any]:
+        assert force is True and guard_fd >= 0
+        runtime_release_calls.append(attempt_id)
+        with supervisor.connect() as connection:
+            assert journal_module._sandbox_execution_cleanup_is_verified(connection, attempt_id)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM runtime_allocations WHERE attempt_id = ?", (attempt_id,)
+            )
+            connection.execute(
+                "UPDATE runtime_environments SET state = 'released', updated_at = ? "
+                "WHERE attempt_id = ?",
+                (journal_module.utc_now(), attempt_id),
+            )
+        return {"attempt_id": attempt_id, "state": "released"}
+
+    monkeypatch.setattr(supervisor, "_runtime_down_locked", release_runtime)
+    original_recover_cleanup = supervisor._sandbox_execution_recover_cleanup
+    recovery_errors: list[Exception] = []
+
+    def record_recovery_error(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return original_recover_cleanup(*args, **kwargs)
+        except Exception as error:
+            recovery_errors.append(error)
+            raise
+
+    monkeypatch.setattr(supervisor, "_sandbox_execution_recover_cleanup", record_recovery_error)
+    reaper_epoch = attempt["lease_expires_at"] + 1
+    result = supervisor.reap_expired(now=reaper_epoch)
+    final_supervisor = supervisor
+
+    if crash_point is not None:
+        assert simulated_crash is True
+        interrupted = supervisor._sandbox_execution_get(attempt["id"])
+        assert interrupted is not None
+        assert interrupted["phase"] == (
+            "cleanup_reported" if crash_point == "after_report_commit_before_verifier" else "exited"
+        )
+        assert proxy_directory.is_dir()
+        assert proxy_socket.is_socket()
+        assert proxy_directory.lstat().st_ino == provider_identity["directory_inode"]
+        assert proxy_socket.lstat().st_ino == provider_identity["socket_inode"]
+        assert result["runtime_cleanup"] == []
+        interrupted_attempt = supervisor.attempt(attempt["id"])
+        interrupted_task = supervisor.task(attempt["task_id"])
+        assert interrupted_attempt["termination_target_status"] == "quarantined"
+        assert interrupted_task["cleanup_target_status"] == "blocked"
+        assert interrupted_task["cleanup_error"]
+        with supervisor.connect() as connection:
+            held_lease = connection.execute(
+                "SELECT resource FROM resource_leases WHERE task_id = ? AND attempt_id = ?",
+                (attempt["task_id"], attempt["id"]),
+            ).fetchone()
+        assert held_lease is not None
+
+        # A fresh reaper pass retries from the durable phase. If delete already
+        # happened but the report did not commit, state absence is reconciled;
+        # if the report committed, the ordinary independent verifier resumes.
+        # Reopen the same durable journal through a fresh supervisor instance;
+        # the retry must not depend on an in-memory recovery capability.
+        final_supervisor = GitSupervisor(repo)
+        final_supervisor.config = supervisor.config
+        final_supervisor._port_available = lambda _port: True
+        monkeypatch.setattr(final_supervisor, "_runtime_down_locked", release_runtime)
+        result = final_supervisor.reap_expired(now=reaper_epoch)
+
+    recovered = final_supervisor._sandbox_execution_get(attempt["id"])
+    assert recovered is not None and recovered["phase"] == "cleanup_verified", (
+        result,
+        final_supervisor.task(attempt["task_id"]),
+        recovered.get("cleanup_receipt"),
+        [str(error) for error in recovery_errors],
+    )
+    assert recovered["cleanup_receipt"]["version"] == 4
+    assert (
+        recovered["cleanup_receipt"]["recovery"]["launch_submission_id"]
+        == (row["launch_submission_id"])
+    )
+    if crash_point == "after_runc_delete_before_report":
+        assert recovered["cleanup_receipt"]["recovery"]["runc_delete_action"] is None
+    elif crash_point is not None:
+        assert recovered["cleanup_receipt"]["recovery"]["runc_delete_action"] is not None
+    with final_supervisor.connect() as connection:
+        persisted_recovery_row = connection.execute(
+            "SELECT * FROM sandbox_executions WHERE attempt_id = ?", (attempt["id"],)
+        ).fetchone()
+    assert persisted_recovery_row is not None
+    assert journal_module._sandbox_cleanup_recovery_report_is_self_consistent(
+        persisted_recovery_row, persisted_recovery_row["cleanup_receipt_json"]
+    )
+    receipt_mutations = [
+        (("attempt_id",), "wrong-attempt"),
+        (("claim_token",), recovered["claim_token"] + 1),
+        (("recovery", "launch_submission_id"), "0" * 32),
+        (("recovery", "provider_proxy_artifact_sha256"), "0" * 64),
+        (("recovery", "state_root", "inode"), persisted_recovery_row["state_root_ino"] + 1),
+        (("recovery", "observations", "processes", "monitor_identity_absent", "absent"), False),
+        (("recovery", "observations", "cgroups", row["cgroup_path"]), False),
+        (("recovery", "observations", "units", "scope", "invocation_id"), "0" * 32),
+    ]
+    for path, value in receipt_mutations:
+        forged = json.loads(persisted_recovery_row["cleanup_receipt_json"])
+        target = forged
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        assert not journal_module._sandbox_cleanup_recovery_report_is_self_consistent(
+            persisted_recovery_row, canonical_json(forged)
+        ), path
+    forged = json.loads(persisted_recovery_row["cleanup_receipt_json"])
+    forged["unexpected"] = True
+    assert not journal_module._sandbox_cleanup_recovery_report_is_self_consistent(
+        persisted_recovery_row, canonical_json(forged)
+    )
+    assert recovered["cleanup_verification"]["observations"]["paths"]["provider_proxy_directory"][
+        "absent"
+    ]
+    assert not proxy_directory.exists()
+    assert not monitor_socket.exists()
+    assert runtime_release_calls == [attempt["id"]]
+    released_rows = [
+        item
+        for item in result["runtime_cleanup"]
+        if item.get("attempt_id") == attempt["id"] and item.get("state") == "released"
+    ]
+    assert len(released_rows) == (2 if crash_point is not None else 1)
+    if crash_point is not None:
+        assert any(item.get("task_id") == attempt["task_id"] for item in released_rows)
+    assert len(recovery_errors) == (1 if crash_point is not None else 0)
+    if crash_point is None:
+        assert result["orphaned"] == [attempt["task_id"]]
+        assert final_supervisor.attempt(attempt["id"])["status"] == "orphaned"
+        assert final_supervisor.task(attempt["task_id"])["status"] == "orphaned"
+    else:
+        # The first interrupted reap explicitly quarantined this attempt. A later
+        # independent verification permits lease release, while the task remains
+        # blocked and the attempt retains its quarantine record for diagnosis.
+        assert result["orphaned"] == []
+        assert final_supervisor.attempt(attempt["id"])["status"] == "quarantined"
+        quarantined_task = final_supervisor.task(attempt["task_id"])
+        assert quarantined_task["status"] == "blocked"
+        assert quarantined_task["cleanup_target_status"] == ""
+        assert quarantined_task["cleanup_error"] == ""
+        with final_supervisor.connect() as connection:
+            held_lease = connection.execute(
+                "SELECT resource FROM resource_leases WHERE task_id = ? AND attempt_id = ?",
+                (attempt["task_id"], attempt["id"]),
+            ).fetchone()
+        assert held_lease is None
+    repeated = final_supervisor._sandbox_execution_recover_cleanup(
+        attempt["id"], attempt["claim_token"], reaper_epoch=attempt["lease_expires_at"] + 1
+    )
+    assert repeated["phase"] == "cleanup_verified"
+    assert final_supervisor.verify_event_chain()["ok"] is True
 
 
 @pytest.mark.parametrize("mutation", ["top_level_version", "action_version"])
