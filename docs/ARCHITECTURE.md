@@ -118,6 +118,55 @@ Workers heartbeat with a checkpoint and renewed TTL. The reaper:
 - clears the task's heartbeat rows, as every other end of a claim does
   (submission, review, completion, reopen).
 
+### 7. A mediated file write is a content-version compare-and-swap
+
+Set `ACP_WORKSPACE_ROOT` to an existing, dedicated checkout directory to enable
+the file-write endpoint. A task must declare the exact resource
+`workspace-file:<relative-posix-path>` before it is claimed. The worker submits
+that relative path, the exact SHA-256 it read (or `null` only when it expects a
+new file), the replacement bytes as base64, a caller-generated UUID operation
+ID, and all current claim/resource fencing tokens to
+`POST /v1/tasks/{id}/file-writes`.
+
+The service serializes mediated writes through SQLite `BEGIN IMMEDIATE`, checks
+the task and file-resource fences, re-reads the file under the configured root,
+and refuses a stale hash with `409 stale_file_version` without replacing the
+file. Successful writes stage and fsync bytes in the same directory, atomically
+replace one regular file, fsync the directory, persist a content-safe receipt,
+and append the corresponding audit event in the same database transaction.
+Reusing the same operation UUID and payload is idempotent. If a process stops
+after the staged file is fsynced but before rename, retrying that exact
+operation reuses the stage only when it is a single-link regular file whose
+bytes match the request, and applies the target's current permission bits when
+replacing an existing file. Newly created files use private mode `0600`,
+including when recovering a crash-left stage. Mismatching, linked, symlink, and
+special-file staging entries are rejected as `workspace_stage_conflict` and
+left untouched. A matching pre-existing stage's mode is normalized before
+rename; if that fsync fails, its bytes and the target remain unchanged, but the
+stage can retain the normalized mode for a later retry.
+A failed request removes only a staging file created by that invocation. If a
+process stops after rename but before its receipt commits, retrying that exact
+operation reconciles the file hash and completes the receipt; it never blindly
+replays stale content. Callers must retain the exact request body (including
+its operation UUID) to perform that recovery; a GET alone reports the persisted
+state and does not reconcile a `prepared` write. `GET
+/v1/tasks/{id}/file-writes/{operation_id}` returns the content-safe write state
+without file contents.
+
+Paths are canonical relative POSIX paths. Parent symlinks and non-directories,
+target symlinks/non-regular files, `.git`, and reserved `.acp-*` paths are
+rejected; parent directories must already exist. Both replacement content and
+existing target files are limited to 1 MiB; oversized targets are rejected
+before hashing so a single request cannot hold the database writer lock for an
+unbounded file read. The caller must re-read and resolve every stale-write
+conflict rather than automatically retrying it.
+
+This protects only writers that use the ACP endpoint and the same transactional
+database. Arbitrary shell/editor processes can bypass it; use an isolated
+worktree, sandbox, or write-enforcing runtime gateway when bypass must be
+prevented. The SQLite and workspace filesystem must also share a failure domain;
+multi-host deployments need a shared transactional coordinator and storage layer.
+
 ## Recommended runner topology
 
 ```text

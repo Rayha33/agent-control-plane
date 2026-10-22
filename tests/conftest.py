@@ -9,11 +9,14 @@ from agent_control_plane.config import Settings
 
 @pytest.fixture
 def app(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
     settings = Settings(
         database_path=str(tmp_path / "test.db"),
         admin_key="test-admin",
         signing_key="test-signing-key-with-enough-entropy",
         issuer="test-control-plane",
+        workspace_root=str(workspace_root),
     )
     return create_app(settings)
 

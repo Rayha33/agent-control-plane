@@ -134,6 +134,20 @@ CREATE TABLE IF NOT EXISTS submissions (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workspace_file_writes (
+    operation_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    relative_path TEXT NOT NULL,
+    expected_sha256 TEXT,
+    observed_sha256 TEXT,
+    new_sha256 TEXT NOT NULL,
+    content_bytes INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('prepared', 'committed', 'conflict')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY,
     submission_id TEXT NOT NULL REFERENCES submissions(id),
@@ -150,6 +164,8 @@ CREATE INDEX IF NOT EXISTS idx_actions_status ON action_requests(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_agent_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_task ON submissions(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_file_writes_task
+    ON workspace_file_writes(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reviews_submission ON reviews(submission_id, created_at DESC);
 """
 
@@ -241,41 +257,51 @@ class Database:
     def append_audit(
         self, event_type: str, actor: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self.append_audit_in_transaction(
+                connection, event_type, actor, payload
+            )
+
+    @staticmethod
+    def append_audit_in_transaction(
+        connection: sqlite3.Connection,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         event_id = str(uuid.uuid4())
         created_at = utc_now()
         payload_json = canonical_json(payload)
-
-        with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            previous = connection.execute(
-                "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-            previous_hash = previous["event_hash"] if previous else GENESIS_HASH
-            digest = event_digest(
-                previous_hash,
+        previous = connection.execute(
+            "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        previous_hash = previous["event_hash"] if previous else GENESIS_HASH
+        digest = event_digest(
+            previous_hash,
+            event_id,
+            event_type,
+            actor,
+            payload_json,
+            created_at,
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO audit_events
+                (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
                 event_id,
                 event_type,
                 actor,
                 payload_json,
+                previous_hash,
+                digest,
                 created_at,
-            )
-            cursor = connection.execute(
-                """
-                INSERT INTO audit_events
-                    (event_id, event_type, actor, payload_json, previous_hash, event_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    event_type,
-                    actor,
-                    payload_json,
-                    previous_hash,
-                    digest,
-                    created_at,
-                ),
-            )
-            sequence = cursor.lastrowid
+            ),
+        )
+        sequence = cursor.lastrowid
 
         return {
             "sequence": sequence,

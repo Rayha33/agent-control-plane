@@ -25,6 +25,8 @@ from .coordination_schemas import (
     TaskReopenRequest,
     TaskStatus,
     TaskView,
+    WorkspaceFileWriteReceipt,
+    WorkspaceFileWriteRequest,
 )
 from .database import Database
 from .schemas import (
@@ -60,7 +62,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database = Database(active_settings.database_path)
     database.initialize()
     service = ControlPlaneService(database, active_settings)
-    coordination = CoordinationService(database, service)
+    coordination = CoordinationService(
+        database, service, active_settings.workspace_root
+    )
 
     app = FastAPI(
         title="Agent Control Plane",
@@ -240,6 +244,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_task(task_id: str) -> dict:
         return coordination.task(task_id)
+
+    @app.post(
+        "/v1/tasks/{task_id}/file-writes",
+        response_model=WorkspaceFileWriteReceipt,
+    )
+    def write_workspace_file(
+        task_id: str,
+        request: WorkspaceFileWriteRequest,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.write_workspace_file(task_id, token, request)
+
+    @app.get(
+        "/v1/tasks/{task_id}/file-writes/{operation_id}",
+        response_model=WorkspaceFileWriteReceipt,
+    )
+    def get_workspace_file_write(
+        task_id: str,
+        operation_id: str,
+        token: str = Depends(require_mandate),
+    ) -> dict:
+        return coordination.workspace_file_write(task_id, operation_id, token)
 
     @app.post("/v1/tasks/{task_id}/claim", response_model=TaskClaimView)
     def claim_task(
