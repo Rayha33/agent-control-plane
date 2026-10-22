@@ -603,8 +603,15 @@ ACP's worker boundary:
   experimental and unsupported for production workloads; do not select this as
   ACP's supported production worker path. If that status changes, the App Server
   process must still run inside ACP's independently enforced per-attempt
-  boundary, with a local stdio or Unix-socket control channel. See [Codex App
-  Server](https://learn.chatgpt.com/docs/app-server).
+  boundary, with a local stdio or Unix-socket control channel. The API also lists
+  `thread/shellCommand` as a user-initiated full-access command outside the
+  sandbox and experimental `process/spawn` as an execution surface outside the
+  sandbox. Do not expose either capability to a worker-controlled client by
+  default; any future use needs its own authorization and independently enforced
+  confinement. A command sandbox or its network proxy does not automatically
+  govern these outside-sandbox execution capabilities or the client's separate
+  model and authentication traffic. See the [App Server API overview](https://learn.chatgpt.com/docs/app-server#api-overview)
+  and [agent security guidance](https://learn.chatgpt.com/docs/agent-approvals-security#traffic-outside-the-command-network-proxy).
 - The Agents API self-hosted-environment path instead keeps OpenAI's harness
   outside and runs `codex exec-server` in the supplied environment. The
   executor receives a separate environment key as `CODEX_API_KEY`; generated
