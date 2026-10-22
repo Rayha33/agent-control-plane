@@ -107,7 +107,8 @@ service is reachable by anyone else.
 2. Each agent receives a mandate containing `coordination.*` on `task:*`.
 3. The administrator creates a task with acceptance criteria, dependencies, and
    every resource it may mutate. For file writes, declare the exact resource
-   `workspace-file:<relative-posix-path>`.
+   `workspace-file:<relative-posix-path>`. ACP checks case aliases against the
+   configured workspace volume before granting the claim.
 4. The worker atomically claims the task and receives task/resource fencing
    tokens. A mediated file write also includes the exact SHA-256 of the version
    read; `409 stale_file_version` means re-read and reconcile, never replay the
@@ -155,8 +156,20 @@ This is a reference implementation, not a production security product.
 
 - SQLite is intentionally single-node. Use a transactional shared database for
   a distributed deployment.
-- Resource names are exact strings; hierarchical and intent-level conflict
-  detection are future work.
+- Non-file resource names are exact strings; hierarchical and intent-level
+  conflict detection are future work. Workspace-file aliases follow the
+  configured root's detected case behavior: ASCII case variants cannot be
+  claimed concurrently on case-insensitive volumes, and distinct case is
+  preserved on case-sensitive volumes. ACP also probes Unicode normalization:
+  canonically equivalent paths share a lease on normalization-insensitive
+  volumes, while distinct spellings remain separate on normalization-sensitive
+  volumes. Non-ASCII paths on case-insensitive volumes are rejected; non-ASCII
+  paths are also rejected when normalization behavior is unknown. If case
+  behavior cannot be probed safely, all workspace-file claims fail closed. On
+  case-sensitive roots, existing parent directories are also probed for case
+  and Unicode aliases. Paths whose aliases are not represented by the
+  configured-root lease key are rejected at claim time and checked again
+  before mediated writes; unknown directory behavior fails closed.
 - The service coordinates work but does not itself create Git worktrees,
   containers, or merge commits.
 - Mediated file writes are available only under `ACP_WORKSPACE_ROOT` and only

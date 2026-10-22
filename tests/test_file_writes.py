@@ -254,10 +254,12 @@ def test_new_file_requires_expected_missing_and_symlinks_are_rejected(
     outside_file = outside_dir / "parent-link.py"
     outside_file.write_bytes(b"keep\n")
     parent_link = Path(app.state.settings.workspace_root) / "src/jump"
-    parent_link.symlink_to(outside_dir, target_is_directory=True)
+    parent_link.mkdir()
     parent_context = worker_and_claim(
         client, admin_headers, ["workspace-file:src/jump/parent-link.py"]
     )
+    parent_link.rmdir()
+    parent_link.symlink_to(outside_dir, target_is_directory=True)
     parent_payload = write_payload(
         parent_context, "src/jump/parent-link.py", None, b"nope\n"
     )

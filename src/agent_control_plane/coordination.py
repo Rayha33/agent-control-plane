@@ -27,6 +27,7 @@ from .workspace_files import (
 )
 
 QC_RESERVATION_SECONDS = 3600
+WORKSPACE_FILE_RESOURCE_PREFIX = "workspace-file:"
 
 
 class CoordinationService:
@@ -119,6 +120,68 @@ class CoordinationService:
                 "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
             )
         return [self._task_view(row) for row in rows]
+
+    def _workspace_file_alias_key(self, resource: str) -> str | None:
+        if not resource.startswith(WORKSPACE_FILE_RESOURCE_PREFIX):
+            return None
+        if not self.workspace_files:
+            raise ControlPlaneError(
+                503,
+                "workspace_root_unconfigured",
+                "workspace-file resources require ACP_WORKSPACE_ROOT",
+            )
+        relative_path = resource[len(WORKSPACE_FILE_RESOURCE_PREFIX) :]
+        try:
+            return self.workspace_files.lease_alias_key(relative_path)
+        except WorkspaceFileError as error:
+            raise ControlPlaneError(
+                error.status_code, error.code, error.message
+            ) from error
+
+    def _assert_no_workspace_file_alias_conflicts(
+        self,
+        connection: sqlite3.Connection,
+        resources: list[str],
+        task_id: str,
+        now: int,
+    ) -> None:
+        requested_aliases: dict[str, str] = {}
+        for resource in resources:
+            alias_key = self._workspace_file_alias_key(resource)
+            if alias_key is None:
+                continue
+            prior_resource = requested_aliases.get(alias_key)
+            if prior_resource is not None and prior_resource != resource:
+                raise ControlPlaneError(
+                    409,
+                    "resource_alias_conflict",
+                    f"task declares workspace resources {prior_resource} and {resource} for the same filesystem path",
+                )
+            requested_aliases[alias_key] = resource
+
+        if not requested_aliases:
+            return
+
+        requested_resources = set(resources)
+        active_leases = connection.execute(
+            """
+            SELECT resource, task_id FROM resource_leases
+            WHERE task_id IS NOT NULL AND expires_at > ?
+              AND substr(resource, 1, 15) = 'workspace-file:'
+            """,
+            (now,),
+        ).fetchall()
+        for lease in active_leases:
+            if lease["task_id"] == task_id and lease["resource"] in requested_resources:
+                continue
+            alias_key = self._workspace_file_alias_key(lease["resource"])
+            if alias_key in requested_aliases:
+                requested_resource = requested_aliases[alias_key]
+                raise ControlPlaneError(
+                    409,
+                    "resource_busy",
+                    f"resource {requested_resource} aliases active leased workspace file {lease['resource']}",
+                )
 
     def write_workspace_file(
         self, task_id: str, token: str, request: WorkspaceFileWriteRequest
@@ -544,6 +607,9 @@ class CoordinationService:
                 )
 
             resources = json.loads(task["resources_json"])
+            self._assert_no_workspace_file_alias_conflicts(
+                connection, resources, task_id, now
+            )
             for resource in resources:
                 lease = connection.execute(
                     "SELECT * FROM resource_leases WHERE resource = ?", (resource,)
@@ -1225,13 +1291,17 @@ class CoordinationService:
             raise ControlPlaneError(
                 409, "stale_claim_fencing_token", "task claim is stale or expired"
             )
-        resources = set(json.loads(task["resources_json"]))
+        resource_list = json.loads(task["resources_json"])
+        resources = set(resource_list)
         if set(resource_fencing_tokens) != resources:
             raise ControlPlaneError(
                 409,
                 "incomplete_resource_fencing_tokens",
                 "submission must carry every leased resource token",
             )
+        self._assert_no_workspace_file_alias_conflicts(
+            connection, resource_list, task["id"], now
+        )
         for resource, fencing_token in resource_fencing_tokens.items():
             lease = connection.execute(
                 "SELECT * FROM resource_leases WHERE resource = ?", (resource,)
