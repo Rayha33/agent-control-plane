@@ -7,6 +7,7 @@ import os
 import select
 import socket
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -2793,6 +2794,7 @@ def record_launch(
     attempt: dict,
     *,
     runc_handle: oci_worker.RuncLaunchHandle | None = None,
+    provider_proxy_artifact: dict[str, int] | None = None,
     wrapper_unit: str | None = None,
     wrapper_cgroup_path: str | None = None,
     monitor_start_calls: list[dict[str, Any]] | None = None,
@@ -2818,7 +2820,12 @@ def record_launch(
         if launch_target.launch_mode == "private_bundle" and launch_submission is None:
             # The synthetic launcher calls the durable callback first, then
             # captures its returned capability in the exact registered handle.
-            launch_submission = authorize_test_launch_submission(supervisor, attempt, launch_target)
+            launch_submission = authorize_test_launch_submission(
+                supervisor,
+                attempt,
+                launch_target,
+                provider_proxy_artifact=provider_proxy_artifact,
+            )
             attempt["_test_launch_submission"] = launch_submission
         _register_test_runc_launch(
             runc_handle,
@@ -7735,6 +7742,7 @@ def test_reaper_retries_cleanup_verification_but_legacy_receipt_stays_fenced(
     [
         ("reserved", "absent"),
         ("ambiguous", "absent"),
+        ("ambiguous_after_submission", "recorded"),
         ("running", "recorded"),
         ("exited", "recorded"),
         ("cleanup_reported", "recorded"),
@@ -7743,6 +7751,7 @@ def test_reaper_retries_cleanup_verification_but_legacy_receipt_stays_fenced(
 def test_reaper_quarantine_diagnoses_proxy_artifact_hold(
     repo: Path,
     tmp_path: Path,
+    request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
     submission_state: str,
@@ -7755,12 +7764,53 @@ def test_reaper_quarantine_diagnoses_proxy_artifact_hold(
     supervisor._port_available = lambda _port: True
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
-    if phase == "ambiguous":
+
+    proxy_directory = Path(tempfile.mkdtemp(prefix="acp-px-", dir="/tmp"))
+    proxy_socket = proxy_directory / "provider.sock"
+    request.addfinalizer(lambda: (proxy_socket.unlink(missing_ok=True), proxy_directory.rmdir()))
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(proxy_socket))
+    listener.close()
+    proxy_socket.chmod(0o600)
+    proxy_directory_info = proxy_directory.lstat()
+    proxy_socket_info = proxy_socket.lstat()
+    assert stat.S_ISDIR(proxy_directory_info.st_mode)
+    assert stat.S_ISSOCK(proxy_socket_info.st_mode)
+    provider_identity = {
+        "directory_device": proxy_directory_info.st_dev,
+        "directory_inode": proxy_directory_info.st_ino,
+        "socket_device": proxy_socket_info.st_dev,
+        "socket_inode": proxy_socket_info.st_ino,
+    }
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "sandbox_provider_proxy_control_paths",
+        lambda **_kwargs: (proxy_directory, proxy_socket),
+    )
+
+    if phase == "ambiguous_after_submission":
+        execution = supervisor._sandbox_execution_get(attempt["id"])
+        assert execution is not None
+        submission = authorize_test_launch_submission(
+            supervisor,
+            attempt,
+            _test_runc_target(execution),
+            provider_proxy_artifact=provider_identity,
+        )
+        attempt["_test_launch_submission"] = submission
+
+    if phase in {"ambiguous", "ambiguous_after_submission"}:
         supervisor._sandbox_execution_mark_ambiguous(
             attempt["id"], attempt["claim_token"], "injected restart ambiguity"
         )
     elif phase != "reserved":
-        record_launch(supervisor, attempt)
+        record_launch(
+            supervisor,
+            attempt,
+            provider_proxy_artifact=(
+                provider_identity if phase in {"running", "exited", "cleanup_reported"} else None
+            ),
+        )
     if phase in {"running", "exited", "cleanup_reported"}:
         record_running(supervisor, attempt)
     if phase in {"exited", "cleanup_reported"}:
@@ -7777,27 +7827,42 @@ def test_reaper_quarantine_diagnoses_proxy_artifact_hold(
             supervisor, "_sandbox_execution_verify_cleanup", reject_cleanup_verification
         )
 
-    proxy_directory = tmp_path / "attempt-provider-proxy"
-    proxy_directory.mkdir(mode=0o700)
-    proxy_socket = proxy_directory / "provider.sock"
-    proxy_socket.write_text("must remain quarantined\n", encoding="utf-8")
-    monkeypatch.setattr(
-        monitor_lifecycle_module,
-        "sandbox_provider_proxy_control_paths",
-        lambda **_kwargs: (proxy_directory, proxy_socket),
-    )
-
     result = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
 
     assert result["runtime_cleanup"] == []
-    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == phase
+    execution = supervisor._sandbox_execution_get(attempt["id"])
+    assert execution is not None
+    expected_phase = "ambiguous" if phase == "ambiguous_after_submission" else phase
+    assert execution["phase"] == expected_phase
     task = supervisor.task(attempt["task_id"])
     assert task["status"] == "cleanup_pending"
     assert task["cleanup_target_status"] == "blocked"
-    assert f"phase={phase}" in task["cleanup_error"]
+    assert f"phase={expected_phase}" in task["cleanup_error"]
     assert f"launch_submission={submission_state}" in task["cleanup_error"]
     assert "provider proxy artifact, if present, is retained" in task["cleanup_error"]
-    assert proxy_socket.read_text(encoding="utf-8") == "must remain quarantined\n"
+    assert proxy_directory.is_dir()
+    assert proxy_socket.is_socket()
+    retained_directory = proxy_directory.lstat()
+    retained_socket = proxy_socket.lstat()
+    assert (retained_directory.st_dev, retained_directory.st_ino) == (
+        proxy_directory_info.st_dev,
+        proxy_directory_info.st_ino,
+    )
+    assert (retained_socket.st_dev, retained_socket.st_ino) == (
+        proxy_socket_info.st_dev,
+        proxy_socket_info.st_ino,
+    )
+    if submission_state == "recorded":
+        assert execution["provider_proxy_artifact"]["directory"] == {
+            "path": str(proxy_directory),
+            "device": proxy_directory_info.st_dev,
+            "inode": proxy_directory_info.st_ino,
+        }
+        assert execution["provider_proxy_artifact"]["socket"] == {
+            "path": str(proxy_socket),
+            "device": proxy_socket_info.st_dev,
+            "inode": proxy_socket_info.st_ino,
+        }
     assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
     with supervisor.connect() as connection:
         leases = connection.execute(
