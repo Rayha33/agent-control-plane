@@ -424,7 +424,7 @@ def test_active_intent_list_reports_its_attempt_limit(
 
 
 def test_intent_schema_migration_is_versioned_and_installs_immutability_guards() -> None:
-    assert SCHEMA_VERSION == 34
+    assert SCHEMA_VERSION == 35
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE attempts(id TEXT PRIMARY KEY)")
 
@@ -477,7 +477,7 @@ def test_schema_22_control_database_upgrades_to_current_schema(repo: Path) -> No
     upgraded = GitSupervisor(repo)
     assert upgraded.schema_version_on_open == 22
     read_only = GitSupervisor(repo, read_only=True)
-    assert read_only.schema_version_on_open == 34
+    assert read_only.schema_version_on_open == 35
     with read_only.connect() as connection:
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_intent_revisions'"

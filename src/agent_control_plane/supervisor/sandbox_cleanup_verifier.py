@@ -177,6 +177,11 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
             "monitor_socket",
         }
         provider_paths = legacy_paths | {"provider_proxy_directory"}
+        provider_artifact_json = journal._sandbox_provider_proxy_artifact_json_from_row(row)
+        if not journal._sandbox_provider_proxy_artifact_is_self_consistent(
+            row, provider_artifact_json
+        ) or (provider_artifact_json != "{}" and set(paths) != provider_paths):
+            return False
         expected_container_id = sandbox_monitor_receipt.sandbox_container_id(
             row["attempt_id"], row["claim_token"], row["execution_id"]
         )
@@ -263,29 +268,48 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
             return False
         provider_directory = paths.get("provider_proxy_directory")
         if provider_directory is not None:
+            provider_artifact = (
+                json.loads(provider_artifact_json) if provider_artifact_json != "{}" else None
+            )
             expected_provider_path = monitor_socket_path.parent / (
                 sandbox_monitor_lifecycle.sandbox_provider_proxy_directory_name(
                     (row["attempt_id"], row["claim_token"], row["execution_id"])
                 )
             )
+            legacy_provider_keys = {
+                "path",
+                "socket_path",
+                "device",
+                "inode",
+                "socket_device",
+                "socket_inode",
+                "removed",
+                "absent",
+            }
+            fenced_provider_keys = legacy_provider_keys | {
+                "identity_bound",
+                "expected_device",
+                "expected_inode",
+                "expected_socket_device",
+                "expected_socket_inode",
+            }
+            is_legacy_provider_proof = (
+                isinstance(provider_directory, dict)
+                and set(provider_directory) == legacy_provider_keys
+            )
             if (
                 not isinstance(provider_directory, dict)
-                or set(provider_directory)
-                != {
-                    "path",
-                    "socket_path",
-                    "device",
-                    "inode",
-                    "socket_device",
-                    "socket_inode",
-                    "removed",
-                    "absent",
-                }
+                or set(provider_directory) not in (legacy_provider_keys, fenced_provider_keys)
+                or (is_legacy_provider_proof and provider_artifact_json != "{}")
                 or provider_directory.get("path") != str(expected_provider_path)
                 or provider_directory.get("socket_path")
                 != str(expected_provider_path / "provider.sock")
                 or provider_directory.get("absent") is not True
                 or type(provider_directory.get("removed")) is not bool
+                or (
+                    not is_legacy_provider_proof
+                    and type(provider_directory.get("identity_bound")) is not bool
+                )
                 or len(os.fsencode(expected_provider_path / "provider.sock")) >= 103
             ):
                 return False
@@ -313,6 +337,38 @@ def _sandbox_cleanup_verification_json_is_self_consistent(row: Any, encoded: Any
                 )
             ):
                 return False
+            if not is_legacy_provider_proof:
+                expected_directory = provider_artifact["directory"] if provider_artifact else None
+                expected_socket = provider_artifact["socket"] if provider_artifact else None
+                if (
+                    provider_directory.get("identity_bound") is not (expected_directory is not None)
+                    or provider_directory.get("expected_device")
+                    != (expected_directory["device"] if expected_directory else None)
+                    or provider_directory.get("expected_inode")
+                    != (expected_directory["inode"] if expected_directory else None)
+                    or provider_directory.get("expected_socket_device")
+                    != (expected_socket["device"] if expected_socket else None)
+                    or provider_directory.get("expected_socket_inode")
+                    != (expected_socket["inode"] if expected_socket else None)
+                    or (directory_device, directory_inode)
+                    not in (
+                        (None, None),
+                        (
+                            expected_directory["device"],
+                            expected_directory["inode"],
+                        )
+                        if expected_directory
+                        else (None, None),
+                    )
+                    or (provider_socket_device, provider_socket_inode)
+                    not in (
+                        (None, None),
+                        (expected_socket["device"], expected_socket["inode"])
+                        if expected_socket
+                        else (None, None),
+                    )
+                ):
+                    return False
         expected_units = {
             "monitor": (
                 row["wrapper_unit"],
@@ -1030,10 +1086,18 @@ def _remove_provider_proxy_directory(row: Any) -> dict[str, Any]:
 
     The launch-driver-owned listener normally removes its socket first. This
     independent postflight also removes a stale socket after driver failure,
-    but only from the deterministic, exact-attempt private runtime directory.
-    Unknown entries and replaced directories remain fenced.
+    but only when the pre-runc launch latch durably bound the exact directory
+    and socket inodes. Unknown, unbound, or replaced artifacts remain fenced.
     """
 
+    artifact_json = journal._sandbox_provider_proxy_artifact_json_from_row(row)
+    if not journal._sandbox_provider_proxy_artifact_is_self_consistent(row, artifact_json):
+        raise SupervisorError(
+            "sandbox_cleanup_verification_unknown", "provider proxy artifact identity is invalid"
+        )
+    artifact = json.loads(artifact_json)
+    expected_directory = artifact.get("directory") if artifact_json != "{}" else None
+    expected_socket = artifact.get("socket") if artifact_json != "{}" else None
     expected_identity = (row["attempt_id"], row["claim_token"], row["execution_id"])
     try:
         directory, socket_path = sandbox_monitor_lifecycle.sandbox_provider_proxy_control_paths(
@@ -1110,14 +1174,22 @@ def _remove_provider_proxy_directory(row: Any) -> dict[str, Any]:
                 "sandbox_cleanup_verification_unknown", "provider directory identity is unavailable"
             ) from error
         if directory_info is not None:
+            if expected_directory is None:
+                raise SupervisorError(
+                    "sandbox_cleanup_verification_unknown",
+                    "provider proxy directory has no durable launch identity",
+                )
             if (
                 not stat.S_ISDIR(directory_info.st_mode)
                 or directory_info.st_uid != os.geteuid()
                 or stat.S_IMODE(directory_info.st_mode) != 0o700
                 or directory_info.st_dev != opened_parent.st_dev
+                or (directory_info.st_dev, directory_info.st_ino)
+                != (expected_directory["device"], expected_directory["inode"])
             ):
                 raise SupervisorError(
-                    "sandbox_cleanup_verification_unknown", "provider directory identity is unsafe"
+                    "sandbox_cleanup_verification_unknown",
+                    "provider directory identity is unsafe or changed since launch",
                 )
             directory_fd = os.open(directory.name, flags, dir_fd=parent_fd)
             try:
@@ -1151,10 +1223,13 @@ def _remove_provider_proxy_directory(row: Any) -> dict[str, Any]:
                         or socket_info.st_uid != os.geteuid()
                         or socket_info.st_dev != opened_directory.st_dev
                         or stat.S_IMODE(socket_info.st_mode) != 0o600
+                        or expected_socket is None
+                        or (socket_info.st_dev, socket_info.st_ino)
+                        != (expected_socket["device"], expected_socket["inode"])
                     ):
                         raise SupervisorError(
                             "sandbox_cleanup_verification_unknown",
-                            "provider socket identity is unsafe",
+                            "provider socket identity is unsafe or changed since launch",
                         )
                     current_socket = os.stat(
                         "provider.sock", dir_fd=directory_fd, follow_symlinks=False
@@ -1213,6 +1288,11 @@ def _remove_provider_proxy_directory(row: Any) -> dict[str, Any]:
         "inode": directory_info.st_ino if directory_info is not None else None,
         "socket_device": socket_info.st_dev if socket_info is not None else None,
         "socket_inode": socket_info.st_ino if socket_info is not None else None,
+        "identity_bound": expected_directory is not None,
+        "expected_device": expected_directory["device"] if expected_directory else None,
+        "expected_inode": expected_directory["inode"] if expected_directory else None,
+        "expected_socket_device": expected_socket["device"] if expected_socket else None,
+        "expected_socket_inode": expected_socket["inode"] if expected_socket else None,
         "removed": removed_directory or removed_socket,
         "absent": True,
     }

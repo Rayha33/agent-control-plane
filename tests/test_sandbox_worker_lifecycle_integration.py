@@ -5028,9 +5028,21 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert not os.path.lexists(provider_proxy_socket_path), (
                 "attempt provider proxy socket remained after production cleanup"
             )
-            assert not os.path.lexists(provider_proxy_directory), (
-                "attempt provider proxy directory remained after production cleanup"
-            )
+            if expected_cleanup_phase == "cleanup_reported":
+                provider_artifact = durable["provider_proxy_artifact"]
+                assert provider_artifact["directory"]["path"] == str(provider_proxy_directory)
+                provider_directory_info = provider_proxy_directory.lstat()
+                assert (provider_directory_info.st_dev, provider_directory_info.st_ino) == (
+                    provider_artifact["directory"]["device"],
+                    provider_artifact["directory"]["inode"],
+                ), "cleanup_reported provider directory no longer matches its durable inode fence"
+                assert list(provider_proxy_directory.iterdir()) == [], (
+                    "provider directory must be empty, but remain fenced until independent cleanup verification"
+                )
+            else:
+                assert not os.path.lexists(provider_proxy_directory), (
+                    "verified provider proxy directory remained after production cleanup"
+                )
         if not cancel_after_start and not timeout_after_start and not lease_expiry_after_stop:
             assert durable["runc_exit_code"] == 0
         else:
@@ -5592,6 +5604,13 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         verified = supervisor._sandbox_execution_get(attempt["id"])
         assert verified is not None
         assert verified["phase"] == "cleanup_verified"
+        if provider_proxy_uds:
+            assert provider_proxy_directory is not None
+            assert provider_proxy_socket_path is not None
+            assert not os.path.lexists(provider_proxy_socket_path)
+            assert not os.path.lexists(provider_proxy_directory), (
+                "provider proxy directory remained after independent cleanup verification"
+            )
         if cancel_after_start or timeout_after_start or lease_expiry_after_stop:
             assert verified["runc_exit_code"] != 0
             if timeout_after_start:

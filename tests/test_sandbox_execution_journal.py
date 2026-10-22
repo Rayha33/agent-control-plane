@@ -922,6 +922,8 @@ def authorize_test_launch_submission(
     supervisor: GitSupervisor,
     attempt: dict,
     launch_target: oci_worker._RuncLaunchTarget,
+    *,
+    provider_proxy_artifact: dict[str, int] | None = None,
 ) -> Any:
     """Give legacy journal tests an explicit synthetic service-receipt setup."""
 
@@ -950,7 +952,10 @@ def authorize_test_launch_submission(
         ),
     ):
         return supervisor._sandbox_execution_authorize_launch_submission(
-            attempt["id"], attempt["claim_token"], launch_target=launch_target
+            attempt["id"],
+            attempt["claim_token"],
+            launch_target=launch_target,
+            provider_proxy_artifact=provider_proxy_artifact,
         )
 
 
@@ -3956,6 +3961,67 @@ def test_launch_submission_is_not_retried_after_monitor_restart(repo: Path) -> N
     assert after_restart["launch_submission_id"] == submission.submission_id
 
 
+def test_launch_submission_binds_provider_proxy_directory_and_socket_identity(
+    repo: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_base = Path("/private/tmp")
+    if not runtime_base.is_dir() or runtime_base.is_symlink():
+        runtime_base = Path("/tmp")
+    runtime_context = tempfile.TemporaryDirectory(prefix="acppx-", dir=str(runtime_base))
+    request.addfinalizer(runtime_context.cleanup)
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "_trusted_systemd_command_environment",
+        lambda: {"XDG_RUNTIME_DIR": runtime_context.name},
+    )
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    execution = reserve(supervisor, attempt)
+    target = _test_runc_target(execution)
+    provider_identity = {
+        "directory_device": execution["state_root_dev"],
+        "directory_inode": execution["state_root_ino"] + 100,
+        "socket_device": execution["state_root_dev"],
+        "socket_inode": execution["state_root_ino"] + 101,
+    }
+
+    submission = authorize_test_launch_submission(
+        supervisor, attempt, target, provider_proxy_artifact=provider_identity
+    )
+
+    durable = supervisor._sandbox_execution_get(attempt["id"])
+    assert durable is not None and durable["phase"] == "reserved"
+    artifact_json = durable["provider_proxy_artifact_json"]
+    assert artifact_json != "{}"
+    assert durable["provider_proxy_artifact"] == json.loads(artifact_json)
+    assert journal_module._sandbox_provider_proxy_artifact_is_self_consistent(
+        durable, artifact_json
+    )
+    assert journal_module._sandbox_launch_submission_digest(durable, target) == (
+        submission.submission_digest
+    )
+
+    replaced = dict(durable)
+    replaced["provider_proxy_artifact_json"] = journal_module._sandbox_provider_proxy_artifact_json(
+        replaced,
+        {**provider_identity, "socket_inode": provider_identity["socket_inode"] + 1},
+    )
+    assert journal_module._sandbox_launch_submission_digest(replaced, target) != (
+        submission.submission_digest
+    )
+    with supervisor.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE sandbox_executions SET provider_proxy_artifact_json = ? WHERE attempt_id = ?",
+            (replaced["provider_proxy_artifact_json"], attempt["id"]),
+        )
+
+    assert supervisor._sandbox_execution_get(attempt["id"])["provider_proxy_artifact_json"] == (
+        artifact_json
+    )
+
+
 def test_fresh_processes_cannot_submit_with_parent_driver_redemption(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
@@ -4845,7 +4911,7 @@ def test_current_schema_requires_durable_workspace_and_private_path_binding_befo
     attempt = claimed(supervisor)
     row = reserve(supervisor, attempt)
 
-    assert SCHEMA_VERSION == 34
+    assert SCHEMA_VERSION == 35
     assert row["phase"] == "reserved"
     assert row["workspace_binding_version"] == 1
     assert row["private_path_binding_version"] == 1

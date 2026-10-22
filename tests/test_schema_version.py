@@ -77,6 +77,98 @@ def test_initialize_stamps_the_version_and_the_writer(repo: Path) -> None:
     assert recorded[SCHEMA_WRITTEN_BY_KEY] == __version__
 
 
+def test_v34_database_upgrades_provider_proxy_artifact_column(repo: Path) -> None:
+    supervisor = GitSupervisor(repo)
+    with supervisor.connect() as connection:
+        connection.execute("DROP TRIGGER sandbox_provider_proxy_artifact_insert_guard")
+        connection.execute("DROP TRIGGER sandbox_provider_proxy_artifact_write_once")
+        connection.execute(
+            "ALTER TABLE sandbox_executions DROP COLUMN provider_proxy_artifact_json"
+        )
+        connection.execute("UPDATE meta SET value = '34' WHERE key = ?", (SCHEMA_VERSION_KEY,))
+
+    upgraded = GitSupervisor(repo)
+    assert upgraded.schema_version_on_open == 34
+    assert meta(repo)[SCHEMA_VERSION_KEY] == str(SCHEMA_VERSION)
+
+    read_only = GitSupervisor(repo, read_only=True)
+    assert read_only.schema_version_on_open == SCHEMA_VERSION
+    with read_only.connect() as connection:
+        columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(sandbox_executions)")
+        }
+        assert columns["provider_proxy_artifact_json"][4] == "'{}'"
+        triggers = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        }
+        assert "sandbox_provider_proxy_artifact_insert_guard" in triggers
+        assert "sandbox_provider_proxy_artifact_write_once" in triggers
+
+
+def test_v35_provider_proxy_migration_is_idempotent_and_write_once() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE sandbox_executions ("
+            "attempt_id TEXT NOT NULL, claim_token INTEGER NOT NULL, "
+            "execution_id TEXT NOT NULL, phase TEXT NOT NULL, state_path TEXT NOT NULL, "
+            "state_root_dev INTEGER NOT NULL, state_root_ino INTEGER NOT NULL, "
+            "launch_submission_id TEXT NOT NULL DEFAULT '', "
+            "launch_submission_digest TEXT NOT NULL DEFAULT '', "
+            "launch_submission_at TEXT NOT NULL DEFAULT '', "
+            "PRIMARY KEY(attempt_id, claim_token, execution_id))"
+        )
+        connection.execute(
+            "INSERT INTO sandbox_executions "
+            "(attempt_id, claim_token, execution_id, phase, state_path, state_root_dev, state_root_ino) "
+            "VALUES ('attempt', 7, 'execution', 'reserved', '/state', 1, 2)"
+        )
+        migration = dict(MIGRATIONS)[35]
+        migration(connection)
+        migration(connection)
+
+        legacy = connection.execute("SELECT * FROM sandbox_executions").fetchone()
+        assert legacy["provider_proxy_artifact_json"] == "{}"
+        artifact = (
+            '{"version":1,"attempt_id":"attempt","claim_token":7,'
+            '"execution_id":"execution","state_root":{"path":"/state",'
+            '"device":1,"inode":2},"directory":{"device":1,"inode":3},'
+            '"socket":{"device":1,"inode":4}}'
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="must_follow_reservation"):
+            connection.execute(
+                "INSERT INTO sandbox_executions "
+                "(attempt_id, claim_token, execution_id, phase, state_path, state_root_dev, "
+                "state_root_ino, provider_proxy_artifact_json) "
+                "VALUES ('other', 8, 'other-execution', 'reserved', '/other', 1, 2, ?)",
+                (artifact,),
+            )
+
+        update = (
+            "UPDATE sandbox_executions SET provider_proxy_artifact_json = ?, "
+            "launch_submission_id = ?, launch_submission_digest = ?, launch_submission_at = ? "
+            "WHERE attempt_id = 'attempt'"
+        )
+        launch = (artifact, "a" * 32, "b" * 64, "2026-10-22T00:00:00Z")
+        connection.create_function("acp_sandbox_launch_submission_authorized", 5, lambda *_: 0)
+        with pytest.raises(sqlite3.IntegrityError, match="must_be_bound_to_launch_once"):
+            connection.execute(update, launch)
+
+        connection.create_function("acp_sandbox_launch_submission_authorized", 5, lambda *_: 1)
+        connection.execute(update, launch)
+        replacement = artifact.replace('"inode":3', '"inode":5')
+        with pytest.raises(sqlite3.IntegrityError, match="must_be_bound_to_launch_once"):
+            connection.execute(
+                "UPDATE sandbox_executions SET provider_proxy_artifact_json = ? "
+                "WHERE attempt_id = 'attempt'",
+                (replacement,),
+            )
+    finally:
+        connection.close()
+
+
 def test_attempt_progress_migration_keeps_legacy_ages_unknown() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
@@ -319,7 +411,7 @@ def test_v29_launch_driver_identity_migration_is_idempotent_and_authorization_ga
 
 
 def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
-    assert SCHEMA_VERSION == 34
+    assert SCHEMA_VERSION == 35
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -375,7 +467,7 @@ def test_v30_launch_driver_start_intent_migration_is_write_once() -> None:
 
 
 def test_v31_launch_driver_redemption_migration_is_idempotent_and_fences_submission() -> None:
-    assert SCHEMA_VERSION == 34
+    assert SCHEMA_VERSION == 35
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:
@@ -458,7 +550,7 @@ def test_v31_launch_driver_redemption_migration_is_idempotent_and_fences_submiss
 def test_v32_cleanup_report_migration_requires_scoped_provenance(
     encoded_receipt: str,
 ) -> None:
-    assert SCHEMA_VERSION == 34
+    assert SCHEMA_VERSION == 35
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     try:

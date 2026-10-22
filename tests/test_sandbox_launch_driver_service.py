@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import sqlite3
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -34,6 +36,9 @@ from agent_control_plane.supervisor.sandbox_monitor_receipt import (
 )
 
 _IDENTITY = ("attempt-1", 7, "execution-1")
+_RUNTIME_TMP_DIR = Path("/private/tmp")
+if not _RUNTIME_TMP_DIR.is_dir() or _RUNTIME_TMP_DIR.is_symlink():
+    _RUNTIME_TMP_DIR = Path("/tmp")
 _RESOURCES = {
     "memory_max_bytes": 64 * 1024 * 1024,
     "cpu_quota": 100_000,
@@ -584,7 +589,10 @@ def test_invalid_named_provider_policy_fails_before_request_creation(
     ],
 )
 def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
 ) -> None:
     from agent_control_plane.supervisor import sandbox_launch_driver_service as service
 
@@ -672,9 +680,16 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
     class Listener:
         def __init__(self, directory: Path) -> None:
             self.path = directory / "provider.sock"
+            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.socket.bind(str(self.path))
+            self.path.chmod(0o600)
+            info = self.path.lstat()
+            self.identity = (info.st_dev, info.st_ino)
 
         def close(self) -> None:
             events.append("listener_close")
+            self.socket.close()
+            self.path.unlink(missing_ok=True)
 
     class ProxyService:
         def __init__(self, listener: Listener, _policy: object, *, authorize_peer: object) -> None:
@@ -695,7 +710,9 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
                 raise RuntimeError("provider proxy handler drain unverified")
 
     peer_authorizer = object()
-    proxy_directory = state_root / "provider-proxy"
+    runtime_context = tempfile.TemporaryDirectory(prefix="acppx-", dir=str(_RUNTIME_TMP_DIR))
+    request.addfinalizer(runtime_context.cleanup)
+    proxy_directory = Path(runtime_context.name) / "provider-proxy"
     proxy_socket = proxy_directory / "provider.sock"
     config_listener: list[object] = []
 

@@ -195,7 +195,7 @@ from .trust_bundles import (
 from .worker_trampoline import LIFECYCLE_FDS_PREFIX as LIFECYCLE_FDS_PREFIX
 from .worker_trampoline import MONITOR_MODE as MONITOR_MODE
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 """Schema this binary understands. Raise it in the same commit that adds a MIGRATIONS entry."""
 
 
@@ -2463,6 +2463,76 @@ def _allow_lease_loss_quarantined_exit(connection: sqlite3.Connection) -> None:
     )
 
 
+def _bind_provider_proxy_artifact_to_launch_submission(connection: sqlite3.Connection) -> None:
+    """Persist the exact provider-proxy inode fence in the one-use launch latch."""
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(sandbox_executions)")}
+    if not columns:
+        raise sqlite3.DatabaseError(
+            "sandbox_executions must exist before provider-proxy artifact migration"
+        )
+    if "provider_proxy_artifact_json" not in columns:
+        connection.execute(
+            "ALTER TABLE sandbox_executions ADD COLUMN provider_proxy_artifact_json "
+            "TEXT NOT NULL DEFAULT '{}'"
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_provider_proxy_artifact_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_provider_proxy_artifact_insert_guard
+        BEFORE INSERT ON sandbox_executions
+        WHEN NEW.provider_proxy_artifact_json != '{}'
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_provider_proxy_artifact_must_follow_reservation');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS sandbox_provider_proxy_artifact_write_once")
+    connection.execute(
+        """
+        CREATE TRIGGER sandbox_provider_proxy_artifact_write_once
+        BEFORE UPDATE OF provider_proxy_artifact_json ON sandbox_executions
+        WHEN OLD.provider_proxy_artifact_json IS NOT NEW.provider_proxy_artifact_json
+          AND NOT (
+            OLD.phase = 'reserved' AND NEW.phase = 'reserved'
+            AND OLD.provider_proxy_artifact_json = '{}'
+            AND length(NEW.provider_proxy_artifact_json) BETWEEN 1 AND 16384
+            AND json_valid(NEW.provider_proxy_artifact_json)
+            AND json_type(NEW.provider_proxy_artifact_json, '$.version') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.version') = 1
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.attempt_id') = OLD.attempt_id
+            AND json_type(NEW.provider_proxy_artifact_json, '$.claim_token') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.claim_token') = OLD.claim_token
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.execution_id') = OLD.execution_id
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.state_root.path') = OLD.state_path
+            AND json_type(NEW.provider_proxy_artifact_json, '$.state_root.device') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.state_root.device') = OLD.state_root_dev
+            AND json_type(NEW.provider_proxy_artifact_json, '$.state_root.inode') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.state_root.inode') = OLD.state_root_ino
+            AND json_type(NEW.provider_proxy_artifact_json, '$.directory.device') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.directory.device') >= 0
+            AND json_type(NEW.provider_proxy_artifact_json, '$.directory.inode') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.directory.inode') > 0
+            AND json_type(NEW.provider_proxy_artifact_json, '$.socket.device') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.socket.device') >= 0
+            AND json_type(NEW.provider_proxy_artifact_json, '$.socket.inode') = 'integer'
+            AND json_extract(NEW.provider_proxy_artifact_json, '$.socket.inode') > 0
+            AND NEW.launch_submission_id != ''
+            AND NEW.launch_submission_digest != ''
+            AND NEW.launch_submission_at != ''
+            AND acp_sandbox_launch_submission_authorized(
+              OLD.attempt_id, OLD.claim_token, OLD.execution_id,
+              NEW.launch_submission_id, NEW.launch_submission_digest
+            ) = 1
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'sandbox_provider_proxy_artifact_must_be_bound_to_launch_once');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (2, _add_declared_resources),
     (3, _add_attempt_progress_timestamps),
@@ -2497,6 +2567,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (32, _require_pinned_runc_cleanup_action_receipt),
     (33, _require_independent_sandbox_cleanup_verification),
     (34, _allow_lease_loss_quarantined_exit),
+    (35, _bind_provider_proxy_artifact_to_launch_submission),
 )
 
 

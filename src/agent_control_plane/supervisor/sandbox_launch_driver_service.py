@@ -1777,6 +1777,7 @@ def _execute_pinned_request(
     provider_proxy_directory: Path | None = None
     provider_proxy_directory_identity: tuple[int, int] | None = None
     provider_proxy_listener: provider_proxy.AttemptProviderProxyListener | None = None
+    provider_proxy_artifact_identity: dict[str, int] | None = None
     provider_proxy_service: provider_proxy.AttemptProviderProxyService | None = None
     provider_proxy_closed = False
     launch_submission_attempted = False
@@ -1803,6 +1804,7 @@ def _execute_pinned_request(
             and not current.get("launch_submission_id")
             and not current.get("launch_submission_digest")
             and not current.get("launch_submission_at")
+            and current.get("provider_proxy_artifact_json", "{}") == "{}"
         )
 
     def close_provider_proxy() -> None:
@@ -1860,6 +1862,22 @@ def _execute_pinned_request(
                 raise SandboxLaunchDriverServiceError(
                     "provider proxy listener path differs from its exact attempt path"
                 )
+            socket_identity = provider_proxy_listener.identity
+            if (
+                type(socket_identity) is not tuple
+                or len(socket_identity) != 2
+                or any(type(value) is not int or value < 0 for value in socket_identity)
+                or socket_identity[1] == 0
+            ):
+                raise SandboxLaunchDriverServiceError(
+                    "provider proxy listener identity is incomplete"
+                )
+            provider_proxy_artifact_identity = {
+                "directory_device": provider_proxy_directory_identity[0],
+                "directory_inode": provider_proxy_directory_identity[1],
+                "socket_device": socket_identity[0],
+                "socket_inode": socket_identity[1],
+            }
         config = oci_worker.build_oci_worker_config(
             bundle_root,
             workspace_snapshot,
@@ -1889,8 +1907,45 @@ def _execute_pinned_request(
     def authorize(target: oci_worker._RuncLaunchTarget) -> Any:
         nonlocal launch_submission_attempted, submission
         launch_submission_attempted = True
+        if (
+            provider_proxy_directory is not None
+            and provider_proxy_directory_identity is not None
+            and provider_proxy_artifact_identity is not None
+            and provider_proxy_listener is not None
+        ):
+            try:
+                directory_info = provider_proxy_directory.lstat()
+                socket_info = provider_proxy_listener.path.lstat()
+            except OSError as error:
+                raise SandboxLaunchDriverServiceError(
+                    "provider proxy artifact changed before launch submission"
+                ) from error
+            expected_socket_identity = (
+                provider_proxy_artifact_identity["socket_device"],
+                provider_proxy_artifact_identity["socket_inode"],
+            )
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or stat.S_ISLNK(directory_info.st_mode)
+                or directory_info.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+                or (directory_info.st_dev, directory_info.st_ino)
+                != provider_proxy_directory_identity
+                or not stat.S_ISSOCK(socket_info.st_mode)
+                or socket_info.st_uid != os.geteuid()
+                or stat.S_IMODE(socket_info.st_mode) != 0o600
+                or socket_info.st_dev != directory_info.st_dev
+                or (socket_info.st_dev, socket_info.st_ino) != expected_socket_identity
+            ):
+                raise SandboxLaunchDriverServiceError(
+                    "provider proxy artifact identity changed before launch submission"
+                )
         submission = supervisor._sandbox_execution_authorize_launch_submission(
-            attempt_id, claim_token, launch_target=target, credential=credential
+            attempt_id,
+            claim_token,
+            launch_target=target,
+            provider_proxy_artifact=provider_proxy_artifact_identity,
+            credential=credential,
         )
         return submission
 

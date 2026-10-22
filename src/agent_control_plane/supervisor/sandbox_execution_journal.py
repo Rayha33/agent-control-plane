@@ -370,7 +370,7 @@ def _sandbox_launch_submission_is_self_consistent(
 
 
 def _sandbox_launch_submission_digest(row: Any, target: _RuncLaunchTarget) -> str:
-    """Bind the one-use launch latch to the exact descriptor-backed runc target."""
+    """Bind the one-use launch latch to runc and any exact provider-proxy artifact."""
 
     if type(target) is not _RuncLaunchTarget or target.launch_mode != "private_bundle":
         raise SupervisorError(
@@ -419,14 +419,162 @@ def _sandbox_launch_submission_digest(row: Any, target: _RuncLaunchTarget) -> st
         name: (list(value) if name == "argv" else value)
         for name, value in ((name, getattr(target, name)) for name in target.__dataclass_fields__)
     }
+    provider_proxy_artifact_json = _sandbox_provider_proxy_artifact_json_from_row(row)
+    if not _sandbox_provider_proxy_artifact_is_self_consistent(row, provider_proxy_artifact_json):
+        raise SupervisorError(
+            "sandbox_provider_proxy_artifact_invalid",
+            "launch submission requires an exact attempt-bound provider proxy artifact identity",
+        )
     material = {
         "version": 1,
         "attempt_id": row["attempt_id"],
         "claim_token": row["claim_token"],
         "execution_id": row["execution_id"],
         "target": target_fields,
+        "provider_proxy_artifact_sha256": hashlib.sha256(
+            provider_proxy_artifact_json.encode("utf-8")
+        ).hexdigest(),
     }
     return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def _sandbox_provider_proxy_artifact_json_from_row(row: Any) -> str:
+    try:
+        encoded = row["provider_proxy_artifact_json"]
+    except (IndexError, KeyError, TypeError):
+        encoded = "{}"
+    return encoded if isinstance(encoded, str) else ""
+
+
+def _sandbox_provider_proxy_artifact_json(
+    row: Any, observed_identity: dict[str, int] | None
+) -> str:
+    """Encode the exact attempt-local directory and socket identities before runc."""
+
+    if observed_identity is None:
+        return "{}"
+    if type(observed_identity) is not dict or set(observed_identity) != {
+        "directory_device",
+        "directory_inode",
+        "socket_device",
+        "socket_inode",
+    }:
+        raise SupervisorError(
+            "sandbox_provider_proxy_artifact_invalid", "provider proxy inode identity is incomplete"
+        )
+    values = tuple(observed_identity.values())
+    if any(type(value) is not int or value < 0 for value in values) or any(
+        observed_identity[name] == 0 for name in ("directory_inode", "socket_inode")
+    ):
+        raise SupervisorError(
+            "sandbox_provider_proxy_artifact_invalid", "provider proxy inode identity is invalid"
+        )
+    from . import sandbox_monitor_lifecycle
+
+    identity = (row["attempt_id"], row["claim_token"], row["execution_id"])
+    directory, socket_path = sandbox_monitor_lifecycle.sandbox_provider_proxy_control_paths(
+        state_path=row["state_path"], expected_identity=identity
+    )
+    if (
+        not directory.is_absolute()
+        or str(directory) != os.path.normpath(str(directory))
+        or socket_path.parent != directory
+        or socket_path.name != "provider.sock"
+        or len(os.fsencode(socket_path)) >= 103
+    ):
+        raise SupervisorError(
+            "sandbox_provider_proxy_artifact_invalid", "provider proxy path is noncanonical"
+        )
+    return canonical_json(
+        {
+            "version": 1,
+            "attempt_id": row["attempt_id"],
+            "claim_token": row["claim_token"],
+            "execution_id": row["execution_id"],
+            "state_root": {
+                "path": row["state_path"],
+                "device": row["state_root_dev"],
+                "inode": row["state_root_ino"],
+            },
+            "directory": {
+                "path": str(directory),
+                "device": observed_identity["directory_device"],
+                "inode": observed_identity["directory_inode"],
+            },
+            "socket": {
+                "path": str(socket_path),
+                "device": observed_identity["socket_device"],
+                "inode": observed_identity["socket_inode"],
+            },
+        }
+    )
+
+
+def _sandbox_provider_proxy_artifact_is_self_consistent(
+    row: Any, encoded: str | None = None
+) -> bool:
+    """Check the durable proxy identity against the exact attempt and state root."""
+
+    encoded = _sandbox_provider_proxy_artifact_json_from_row(row) if encoded is None else encoded
+    if encoded == "{}":
+        return True
+    if (
+        not isinstance(encoded, str)
+        or not encoded
+        or len(encoded.encode("utf-8", errors="ignore")) > 16 * 1024
+    ):
+        return False
+    try:
+        candidate = json.loads(encoded)
+        if not isinstance(candidate, dict) or set(candidate) != {
+            "version",
+            "attempt_id",
+            "claim_token",
+            "execution_id",
+            "state_root",
+            "directory",
+            "socket",
+        }:
+            return False
+        if (
+            type(candidate.get("version")) is not int
+            or candidate["version"] != 1
+            or candidate.get("attempt_id") != row["attempt_id"]
+            or type(candidate.get("claim_token")) is not int
+            or candidate.get("claim_token") != row["claim_token"]
+            or candidate.get("execution_id") != row["execution_id"]
+        ):
+            return False
+        state_root = candidate.get("state_root")
+        directory = candidate.get("directory")
+        socket_path = candidate.get("socket")
+        if (
+            not isinstance(state_root, dict)
+            or set(state_root) != {"path", "device", "inode"}
+            or state_root
+            != {
+                "path": row["state_path"],
+                "device": row["state_root_dev"],
+                "inode": row["state_root_ino"],
+            }
+            or not isinstance(directory, dict)
+            or set(directory) != {"path", "device", "inode"}
+            or not isinstance(socket_path, dict)
+            or set(socket_path) != {"path", "device", "inode"}
+        ):
+            return False
+        identity = {
+            "directory_device": directory.get("device"),
+            "directory_inode": directory.get("inode"),
+            "socket_device": socket_path.get("device"),
+            "socket_inode": socket_path.get("inode"),
+        }
+        if any(type(value) is not int for value in identity.values()):
+            return False
+        expected = _sandbox_provider_proxy_artifact_json(row, identity)
+        return canonical_json(candidate) == encoded == expected
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError, SupervisorError):
+        return False
 
 
 def _sandbox_container_id(attempt_id: str, claim_token: int, execution_id: str) -> str:
@@ -2577,6 +2725,7 @@ class SandboxExecutionJournalMixin:
         claim_token: int,
         *,
         launch_target: _RuncLaunchTarget,
+        provider_proxy_artifact: dict[str, int] | None = None,
         credential: str | None = None,
     ) -> _SandboxLaunchSubmission:
         """Durably consume the one launch opportunity immediately before runc exec.
@@ -2612,6 +2761,11 @@ class SandboxExecutionJournalMixin:
                 raise SupervisorError(
                     "sandbox_execution_launch_submission_exists",
                     "this fenced execution already consumed its only runc submission opportunity",
+                )
+            if row["provider_proxy_artifact_json"] != "{}":
+                raise SupervisorError(
+                    "sandbox_execution_launch_submission_exists",
+                    "provider proxy identity was already bound to this execution",
                 )
             if row["launch_plan_required"] != 1:
                 raise SupervisorError(
@@ -2725,7 +2879,12 @@ class SandboxExecutionJournalMixin:
                     "sandbox_execution_content_pins_required",
                     "launch submission requires pinned rootfs closure and runc executable digests",
                 )
-            submission_digest = _sandbox_launch_submission_digest(row, launch_target)
+            provider_proxy_artifact_json = _sandbox_provider_proxy_artifact_json(
+                row, provider_proxy_artifact
+            )
+            submission_row = dict(row)
+            submission_row["provider_proxy_artifact_json"] = provider_proxy_artifact_json
+            submission_digest = _sandbox_launch_submission_digest(submission_row, launch_target)
             submission_id = uuid.uuid4().hex
             submission = _SandboxLaunchSubmission(
                 attempt_id=attempt_id,
@@ -2745,12 +2904,14 @@ class SandboxExecutionJournalMixin:
                     submission_digest,
                 ):
                     changed = connection.execute(
-                        "UPDATE sandbox_executions SET launch_submission_id = ?, "
-                        "launch_submission_digest = ?, launch_submission_at = ?, updated_at = ? "
+                        "UPDATE sandbox_executions SET provider_proxy_artifact_json = ?, "
+                        "launch_submission_id = ?, launch_submission_digest = ?, "
+                        "launch_submission_at = ?, updated_at = ? "
                         "WHERE attempt_id = ? AND claim_token = ? AND phase = 'reserved' "
                         "AND launch_submission_id = '' AND launch_submission_digest = '' "
-                        "AND launch_submission_at = ''",
+                        "AND launch_submission_at = '' AND provider_proxy_artifact_json = '{}'",
                         (
+                            provider_proxy_artifact_json,
                             submission_id,
                             submission_digest,
                             utc_now(),
@@ -2774,6 +2935,9 @@ class SandboxExecutionJournalMixin:
                         "execution_id": row["execution_id"],
                         "submission_id": submission_id,
                         "submission_digest": submission_digest,
+                        "provider_proxy_artifact_sha256": hashlib.sha256(
+                            provider_proxy_artifact_json.encode("utf-8")
+                        ).hexdigest(),
                         "boundary": "before_private_runc_exec_ack",
                     },
                 )
@@ -4549,6 +4713,11 @@ class SandboxExecutionJournalMixin:
             value["cleanup_verification"] = json.loads(raw_verification)
         except (TypeError, ValueError, json.JSONDecodeError):
             value["cleanup_verification"] = {"state": "unavailable"}
+        raw_provider_proxy = value.get("provider_proxy_artifact_json", "{}")
+        try:
+            value["provider_proxy_artifact"] = json.loads(raw_provider_proxy)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value["provider_proxy_artifact"] = {"state": "unavailable"}
         raw_candidate = value.pop("result_candidate_json", "")
         try:
             value["result_candidate"] = json.loads(raw_candidate) if raw_candidate else None

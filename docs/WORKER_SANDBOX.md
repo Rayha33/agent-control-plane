@@ -4206,3 +4206,38 @@ SDK/backend/runtime pin, then independently prove the separate opt-in
 TCP-only seccomp, no external interface/route/capabilities, direct off-net
 denial, exact worker-cgroup-to-UDS authorization, and full cancellation,
 recovery, and cleanup gates. Keep the bridge disabled by default.
+
+### Provider-proxy inode recovery fence (2026-10-22; unit + scoped live evidence)
+
+For provider-enabled launches, the one-use pre-runc submission transaction now
+stores the exact attempt-bound state-root, provider-directory, and socket
+device/inode identities, and includes their digest in the immutable launch
+submission. The independent cleanup verifier removes the directory only when
+the durable identity matches; an unrecorded artifact or replaced directory or
+socket remains untouched and the attempt stays quarantined with its resource
+fences. The no-provider launch behavior is unchanged; its durable metadata
+records the empty sentinel.
+
+Deterministic coverage checks the one-way journal binding and launch digest, plus
+refusal to remove unbound, replaced-directory, and replaced-socket artifacts.
+A crash before the launch latch or before `cleanup_reported` still does not gain
+deletion authority: reaping leaves those artifacts quarantined until an exact
+cleanup report can be independently verified.
+
+The opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`
+also passed once in natural-completion mode and once in cancellation mode on
+the disposable Debian 12 ARM64 guest (Linux
+`6.12.95+deb12-cloud-arm64`, systemd user manager, pinned root-owned runc
+`1.5.2`) with `ACP_LIVE_PROVIDER_PROXY_UDS=1`. Before recovery, it verified
+that the provider socket was absent while the empty directory still matched
+the durable device/inode identity in `cleanup_reported`. A fresh supervisor
+then invoked the production reaper, advanced the execution to
+`cleanup_verified`, and the test verified the exact directory was absent.
+The cancellation run opened a partial UDS probe before cancellation; this
+proves the client connection was open, not that the handler had accepted that
+specific partial request. Neither run used provider credentials or called a
+model/provider.
+This covers the reported-cleanup handoff and reaper verification boundary; it
+does not prove crashes before `cleanup_reported`, a full daemon restart, the
+registered `run_worker()` path, provider authentication, model calls, or
+end-to-end provider egress. Parent task #2370 and full acceptance remain open.
