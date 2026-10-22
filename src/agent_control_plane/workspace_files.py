@@ -212,46 +212,87 @@ class WorkspaceFileStore:
                     f"workspace file version changed; current sha256 is {current_sha256 or 'missing'}",
                 )
 
+            # New workspace files are private by default. Existing targets keep
+            # their current permission bits, including across crash recovery.
+            target_mode = mode if mode is not None else 0o600
+
             temp_name = f".acp-{operation_id}.tmp"
             temp_fd: int | None = None
+            stage_created = False
+            stage_identity: tuple[int, int] | None = None
             replaced = False
+
+            def stage_conflict(cause: BaseException | None = None) -> None:
+                conflict = WorkspaceFileError(
+                    409,
+                    "workspace_stage_conflict",
+                    "staging path is not a safe, matching retry file",
+                )
+                if cause is not None:
+                    raise conflict from cause
+                raise conflict
+
             try:
                 try:
                     temp_fd = os.open(
                         temp_name,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o666,
+                        target_mode,
                         dir_fd=directory_fd,
                     )
+                    stage_created = True
+                    created_stat = os.fstat(temp_fd)
+                    stage_identity = (created_stat.st_dev, created_stat.st_ino)
                     view = memoryview(content)
                     while view:
                         written = os.write(temp_fd, view)
                         if written <= 0:
                             raise OSError("short write to workspace staging file")
                         view = view[written:]
-                    if mode is not None:
-                        os.fchmod(temp_fd, mode)
+                    os.fchmod(temp_fd, target_mode)
                     os.fsync(temp_fd)
-                    os.close(temp_fd)
-                    temp_fd = None
                 except FileExistsError as error:
                     # A retry may reuse a complete staging file left before a
-                    # process crash. It is accepted only when its exact bytes
-                    # match the requested content; symlinks are never followed.
-                    temp_fd = os.open(
-                        temp_name,
-                        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                        dir_fd=directory_fd,
-                    )
-                    staged_sha256, _ = self._hash_fd(temp_fd)
+                    # process crash. Keep it only when it is a single-link
+                    # regular file with the exact bytes; never mutate a hardlink.
+                    try:
+                        temp_fd = os.open(
+                            temp_name,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            dir_fd=directory_fd,
+                        )
+                    except OSError as stage_error:
+                        stage_conflict(stage_error)
+                    staged_stat = os.fstat(temp_fd)
+                    if (
+                        not stat.S_ISREG(staged_stat.st_mode)
+                        or staged_stat.st_nlink != 1
+                    ):
+                        stage_conflict(error)
+                    stage_identity = (staged_stat.st_dev, staged_stat.st_ino)
+                    try:
+                        staged_sha256, staged_mode = self._hash_fd(temp_fd)
+                    except WorkspaceFileError as stage_error:
+                        stage_conflict(stage_error)
                     if staged_sha256 != new_sha256:
-                        raise WorkspaceFileError(
-                            409,
-                            "workspace_stage_conflict",
-                            "staging path contains different content",
-                        ) from error
-                    os.close(temp_fd)
+                        stage_conflict(error)
+                    if staged_mode != target_mode:
+                        os.fchmod(temp_fd, target_mode)
+                        os.fsync(temp_fd)
+
+                try:
+                    current_stage = os.stat(
+                        temp_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                except OSError as error:
+                    stage_conflict(error)
+                if stage_identity != (current_stage.st_dev, current_stage.st_ino):
+                    stage_conflict()
+
+                if temp_fd is not None:
+                    staged_fd = temp_fd
                     temp_fd = None
+                    os.close(staged_fd)
 
                 os.replace(
                     temp_name,
@@ -270,11 +311,22 @@ class WorkspaceFileStore:
             finally:
                 if temp_fd is not None:
                     os.close(temp_fd)
-                if not replaced:
+                if not replaced and stage_created and stage_identity is not None:
                     try:
-                        os.unlink(temp_name, dir_fd=directory_fd)
-                    except FileNotFoundError:
-                        pass
+                        current_stage = os.stat(
+                            temp_name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                    except OSError:
+                        # On uncertain path state, leave the entry for a safe retry.
+                        current_stage = None
+                    if current_stage is not None and stage_identity == (
+                        current_stage.st_dev,
+                        current_stage.st_ino,
+                    ):
+                        try:
+                            os.unlink(temp_name, dir_fd=directory_fd)
+                        except OSError:
+                            pass
 
     def sync_directory(self, relative_path: str) -> None:
         with self._open_parent(relative_path) as (directory_fd, _name):

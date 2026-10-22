@@ -135,10 +135,20 @@ file. Successful writes stage and fsync bytes in the same directory, atomically
 replace one regular file, fsync the directory, persist a content-safe receipt,
 and append the corresponding audit event in the same database transaction.
 Reusing the same operation UUID and payload is idempotent. If a process stops
-after rename but before its receipt commits, retrying that exact operation
-reconciles the file hash and completes the receipt; it never blindly replays
-stale content. Callers must retain the exact request body (including its
-operation UUID) to perform that recovery; a GET alone reports the persisted
+after the staged file is fsynced but before rename, retrying that exact
+operation reuses the stage only when it is a single-link regular file whose
+bytes match the request, and applies the target's current permission bits when
+replacing an existing file. Newly created files use private mode `0600`,
+including when recovering a crash-left stage. Mismatching, linked, symlink, and
+special-file staging entries are rejected as `workspace_stage_conflict` and
+left untouched. A matching pre-existing stage's mode is normalized before
+rename; if that fsync fails, its bytes and the target remain unchanged, but the
+stage can retain the normalized mode for a later retry.
+A failed request removes only a staging file created by that invocation. If a
+process stops after rename but before its receipt commits, retrying that exact
+operation reconciles the file hash and completes the receipt; it never blindly
+replays stale content. Callers must retain the exact request body (including
+its operation UUID) to perform that recovery; a GET alone reports the persisted
 state and does not reconcile a `prepared` write. `GET
 /v1/tasks/{id}/file-writes/{operation_id}` returns the content-safe write state
 without file contents.

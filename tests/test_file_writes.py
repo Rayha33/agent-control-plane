@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import subprocess
+import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -213,6 +215,9 @@ def test_new_file_requires_expected_missing_and_symlinks_are_rejected(
     )
     assert response.status_code == 200, response.text
     assert (Path(app.state.settings.workspace_root) / path).read_bytes() == b"created\n"
+    assert (
+        Path(app.state.settings.workspace_root) / path
+    ).stat().st_mode & 0o777 == 0o600
 
     outside = tmp_path / "outside.txt"
     outside.write_bytes(b"preserve\n")
@@ -320,15 +325,247 @@ def test_staging_fifo_is_rejected_without_blocking(client, app, admin_headers):
 
     context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
     payload = write_payload(context, path, original, b"after\n", operation_id)
+    staging_inode = staging_path.lstat().st_ino
     response = client.post(
         f"/v1/tasks/{context['task_id']}/file-writes",
         headers={"Authorization": f"Bearer {context['token']}"},
         json=payload,
     )
-    assert response.status_code == 422
-    assert response.json()["error"] == "workspace_target_not_regular"
+    assert response.status_code == 409
+    assert response.json()["error"] == "workspace_stage_conflict"
     assert workspace_path.read_bytes() == original
+    assert staging_path.is_fifo()
+    assert staging_path.lstat().st_ino == staging_inode
+
+
+def test_conflicting_preexisting_stage_is_preserved(client, app, admin_headers):
+    path = "src/stage-conflict.py"
+    original = b"before\n"
+    workspace_path = prepare_workspace_file(app, path, original)
+    operation_id = uuid.uuid4()
+    staging_path = workspace_path.parent / f".acp-{operation_id}.tmp"
+    staging_path.write_bytes(b"foreign bytes\n")
+    staging_inode = staging_path.stat().st_ino
+
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, original, b"after\n", operation_id)
+    response = client.post(
+        f"/v1/tasks/{context['task_id']}/file-writes",
+        headers={"Authorization": f"Bearer {context['token']}"},
+        json=payload,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workspace_stage_conflict"
+    assert workspace_path.read_bytes() == original
+    assert staging_path.read_bytes() == b"foreign bytes\n"
+    assert staging_path.stat().st_ino == staging_inode
+
+
+def test_hardlinked_preexisting_stage_is_rejected_and_preserved(
+    client, app, admin_headers, tmp_path
+):
+    path = "src/stage-hardlink.py"
+    original = b"before\n"
+    updated = b"after\n"
+    workspace_path = prepare_workspace_file(app, path, original)
+    outside = tmp_path / "outside-hardlink"
+    outside.write_bytes(updated)
+    operation_id = uuid.uuid4()
+    staging_path = workspace_path.parent / f".acp-{operation_id}.tmp"
+    os.link(outside, staging_path)
+    staging_inode = staging_path.stat().st_ino
+
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, original, updated, operation_id)
+    response = client.post(
+        f"/v1/tasks/{context['task_id']}/file-writes",
+        headers={"Authorization": f"Bearer {context['token']}"},
+        json=payload,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workspace_stage_conflict"
+    assert workspace_path.read_bytes() == original
+    assert staging_path.stat().st_ino == staging_inode
+    assert outside.stat().st_ino == staging_inode
+    assert outside.read_bytes() == updated
+
+
+def test_matching_preexisting_stage_preserves_target_mode(client, app, admin_headers):
+    path = "src/stage-mode.py"
+    original = b"before\n"
+    updated = b"after\n"
+    workspace_path = prepare_workspace_file(app, path, original)
+    workspace_path.chmod(0o600)
+    operation_id = uuid.uuid4()
+    staging_path = workspace_path.parent / f".acp-{operation_id}.tmp"
+    staging_path.write_bytes(updated)
+    staging_path.chmod(0o644)
+
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, original, updated, operation_id)
+    response = client.post(
+        f"/v1/tasks/{context['task_id']}/file-writes",
+        headers={"Authorization": f"Bearer {context['token']}"},
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    assert workspace_path.read_bytes() == updated
+    assert workspace_path.stat().st_mode & 0o777 == 0o600
     assert not staging_path.exists()
+
+
+def test_matching_preexisting_stage_for_new_file_uses_private_mode(
+    client, app, admin_headers
+):
+    path = "src/new-stage-mode.py"
+    workspace_path = prepare_workspace_file(app, path, None)
+    updated = b"new private file\n"
+    operation_id = uuid.uuid4()
+    staging_path = workspace_path.parent / f".acp-{operation_id}.tmp"
+    staging_path.write_bytes(updated)
+    staging_path.chmod(0o777)
+
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, None, updated, operation_id)
+    response = client.post(
+        f"/v1/tasks/{context['task_id']}/file-writes",
+        headers={"Authorization": f"Bearer {context['token']}"},
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    assert workspace_path.read_bytes() == updated
+    assert workspace_path.stat().st_mode & 0o777 == 0o600
+    assert not staging_path.exists()
+
+
+@pytest.mark.parametrize("existing_target", [False, True])
+def test_new_stage_is_private_before_first_write(
+    client, app, admin_headers, monkeypatch, existing_target
+):
+    path = (
+        "src/first-write-mode-existing.py"
+        if existing_target
+        else "src/first-write-mode-new.py"
+    )
+    original = b"before\n" if existing_target else None
+    workspace_path = prepare_workspace_file(app, path, original)
+    if existing_target:
+        workspace_path.chmod(0o600)
+    updated = b"content written only after stage is private\n"
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, original, updated)
+    staging_name = f".acp-{payload['operation_id']}.tmp"
+    stage_identity = []
+    stage_open_modes = []
+    first_write_modes = []
+    real_open = os.open
+    real_write = os.write
+
+    def capture_stage_open(file_path, flags, mode=0o777, *args, **kwargs):
+        file_descriptor = real_open(file_path, flags, mode, *args, **kwargs)
+        if file_path == staging_name and flags & os.O_CREAT:
+            file_stat = os.fstat(file_descriptor)
+            stage_identity.append((file_stat.st_dev, file_stat.st_ino))
+            stage_open_modes.append(file_stat.st_mode & 0o777)
+        return file_descriptor
+
+    def observe_stage_mode_before_write(file_descriptor, data):
+        file_stat = os.fstat(file_descriptor)
+        if stage_identity == [(file_stat.st_dev, file_stat.st_ino)]:
+            first_write_modes.append(file_stat.st_mode & 0o777)
+        return real_write(file_descriptor, data)
+
+    previous_umask = os.umask(0)
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.setattr(os, "open", capture_stage_open)
+            patcher.setattr(os, "write", observe_stage_mode_before_write)
+            response = client.post(
+                f"/v1/tasks/{context['task_id']}/file-writes",
+                headers={"Authorization": f"Bearer {context['token']}"},
+                json=payload,
+            )
+    finally:
+        os.umask(previous_umask)
+
+    assert response.status_code == 200, response.text
+    assert stage_open_modes == [0o600]
+    assert set(first_write_modes) == {0o600}
+    assert workspace_path.read_bytes() == updated
+    assert workspace_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_failed_matching_stage_retry_keeps_bytes_and_normalizes_mode(
+    client, app, admin_headers, monkeypatch
+):
+    path = "src/stage-fsync-failure.py"
+    original = b"before\n"
+    updated = b"after\n"
+    workspace_path = prepare_workspace_file(app, path, original)
+    workspace_path.chmod(0o600)
+    operation_id = uuid.uuid4()
+    staging_path = workspace_path.parent / f".acp-{operation_id}.tmp"
+    staging_path.write_bytes(updated)
+    staging_path.chmod(0o644)
+    staging_inode = staging_path.stat().st_ino
+
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, original, updated, operation_id)
+    real_fsync = os.fsync
+
+    def fail_stage_fsync(file_descriptor):
+        if os.fstat(file_descriptor).st_ino == staging_inode:
+            raise OSError("simulated stage fsync failure")
+        return real_fsync(file_descriptor)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "fsync", fail_stage_fsync)
+        response = client.post(
+            f"/v1/tasks/{context['task_id']}/file-writes",
+            headers={"Authorization": f"Bearer {context['token']}"},
+            json=payload,
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "workspace_write_failed"
+    assert workspace_path.read_bytes() == original
+    assert workspace_path.stat().st_mode & 0o777 == 0o600
+    assert staging_path.read_bytes() == updated
+    assert staging_path.stat().st_ino == staging_inode
+    assert staging_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_symlink_stage_is_rejected_and_preserved(client, app, admin_headers, tmp_path):
+    path = "src/stage-symlink.py"
+    original = b"before\n"
+    workspace_path = prepare_workspace_file(app, path, original)
+    outside = tmp_path / "outside-stage"
+    outside.write_bytes(b"outside bytes\n")
+    operation_id = uuid.uuid4()
+    staging_path = workspace_path.parent / f".acp-{operation_id}.tmp"
+    staging_path.symlink_to(outside)
+    staging_inode = staging_path.lstat().st_ino
+    staging_target = staging_path.readlink()
+
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, original, b"after\n", operation_id)
+    response = client.post(
+        f"/v1/tasks/{context['task_id']}/file-writes",
+        headers={"Authorization": f"Bearer {context['token']}"},
+        json=payload,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workspace_stage_conflict"
+    assert workspace_path.read_bytes() == original
+    assert staging_path.is_symlink()
+    assert staging_path.lstat().st_ino == staging_inode
+    assert staging_path.readlink() == staging_target
+    assert outside.read_bytes() == b"outside bytes\n"
 
 
 def test_stale_resource_fencing_is_rejected(client, app, admin_headers):
@@ -450,6 +687,69 @@ def test_retry_recovers_failure_before_atomic_replace(
     )
     assert receipt["status"] == "committed"
     assert workspace_path.read_bytes() == updated
+
+
+def test_retry_recovers_stage_after_process_crash_before_replace(
+    client, app, admin_headers
+):
+    path = "src/process-crash.py"
+    original = b"before\n"
+    updated = b"after\n"
+    workspace_path = prepare_workspace_file(app, path, original)
+    workspace_path.chmod(0o640)
+    operation_id = uuid.uuid4()
+    context = worker_and_claim(client, admin_headers, [f"workspace-file:{path}"])
+    payload = write_payload(context, path, original, updated, operation_id)
+    request = WorkspaceFileWriteRequest.model_validate(payload)
+    staging_path = workspace_path.parent / f".acp-{operation_id}.tmp"
+
+    child_code = (
+        "import os, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from agent_control_plane.workspace_files import WorkspaceFileStore\n"
+        "workspace_root, relative_path, operation_id, expected_sha256, content_hex, new_sha256 = sys.argv[2:]\n"
+        "store = WorkspaceFileStore(workspace_root)\n"
+        "os.replace = lambda *args, **kwargs: os._exit(73)\n"
+        "store.atomic_replace(relative_path, operation_id, expected_sha256, bytes.fromhex(content_hex), new_sha256)\n"
+    )
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    workspace_root = str(app.state.settings.workspace_root)
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(source_root),
+            workspace_root,
+            path,
+            str(operation_id),
+            request.expected_sha256,
+            updated.hex(),
+            hashlib.sha256(updated).hexdigest(),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert crashed.returncode == 73, crashed.stderr
+    assert staging_path.read_bytes() == updated
+    assert workspace_path.read_bytes() == original
+
+    # Reuse must honor the target mode as it exists at retry time, not the mode
+    # captured in the crash-left stage.
+    workspace_path.chmod(0o600)
+    response = client.post(
+        f"/v1/tasks/{context['task_id']}/file-writes",
+        headers={"Authorization": f"Bearer {context['token']}"},
+        json=payload,
+    )
+
+    assert response.status_code == 200, response.text
+    assert workspace_path.read_bytes() == updated
+    assert workspace_path.stat().st_mode & 0o777 == 0o600
+    assert not staging_path.exists()
 
 
 def test_retry_recovers_crash_after_replace_before_receipt_commit(
