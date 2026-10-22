@@ -693,6 +693,38 @@ def test_experimental_sandbox_worker_rejects_missing_limits_and_manifest(
     assert supervisor.attempt(attempt["id"]) == attempt_before
 
 
+@pytest.mark.parametrize("opt_in", [None, 0, 1, "true"])
+def test_worker_rejects_non_boolean_sandbox_opt_in_before_host_launch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, opt_in: object
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    worker_log = supervisor.state_dir / "logs" / f"worker-{attempt['id']}.log"
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("invalid sandbox opt-in must fail before host worker side effects")
+
+    monkeypatch.setattr(workers_module.sys, "platform", "linux")
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as invalid_opt_in:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            [sys.executable, "-c", "pass"],
+            sandbox_experimental_opt_in=opt_in,  # type: ignore[arg-type]
+        )
+
+    assert invalid_opt_in.value.code == "invalid_sandbox_opt_in"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+    assert not worker_log.exists()
+
+
 def test_experimental_sandbox_worker_never_imports_nonzero_exit(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

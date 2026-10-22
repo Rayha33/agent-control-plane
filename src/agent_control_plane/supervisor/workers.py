@@ -255,6 +255,12 @@ class WorkersMixin:
     ) -> dict[str, Any]:
         from ..worker_trampoline import _monitor_argv_prefix
 
+        if type(sandbox_experimental_opt_in) is not bool:
+            raise SupervisorError(
+                "invalid_sandbox_opt_in",
+                "experimental sandbox opt-in must be a boolean",
+            )
+
         # Freeze caller-owned mutable argv before it is logged, expanded into
         # Popen, or hashed for the pre-exec receipt.
         command = tuple(command)
