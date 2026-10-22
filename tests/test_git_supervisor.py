@@ -552,6 +552,8 @@ def test_experimental_sandbox_worker_verifies_cleanup_before_import(
         assert kwargs["cpu_period"] == 100_000
         assert kwargs["pids_max"] == 32
         assert kwargs["timeout_seconds"] == 10.0
+        assert kwargs["provider_egress_policy_name"] == "test-provider"
+        assert kwargs["provider_egress_destinations"] == {"api.example.com": [443]}
         return expected_execution, SimpleNamespace(
             attempt_id=attempt["id"],
             claim_token=attempt["claim_token"],
@@ -597,6 +599,8 @@ def test_experimental_sandbox_worker_verifies_cleanup_before_import(
         sandbox_cpu_period=100_000,
         sandbox_pids_max=32,
         sandbox_timeout_seconds=10,
+        sandbox_provider_uds_policy_name="test-provider",
+        sandbox_provider_uds_destinations={"api.example.com": [443]},
     )
 
     assert events == ["start", "observe", "observe", "verify_cleanup", "import"]
@@ -723,6 +727,74 @@ def test_worker_rejects_non_boolean_sandbox_opt_in_before_host_launch(
     assert invalid_opt_in.value.code == "invalid_sandbox_opt_in"
     assert supervisor.attempt(attempt["id"]) == attempt_before
     assert not worker_log.exists()
+
+
+def test_provider_uds_policy_requires_explicit_sandbox_opt_in(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_config(repo)
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+
+    def launch_must_not_run(*_args, **_kwargs):
+        pytest.fail("provider UDS policy must fail before host worker side effects")
+
+    monkeypatch.setattr(supervisor, "heartbeat", launch_must_not_run)
+    monkeypatch.setattr(supervisor, "_reserve_worker_launch", launch_must_not_run)
+    monkeypatch.setattr(workers_module.subprocess, "Popen", launch_must_not_run)
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            sandbox_provider_uds_policy_name="test-provider",
+            sandbox_provider_uds_destinations={"api.example.com": [443]},
+        )
+
+    assert error.value.code == "sandbox_opt_in_required"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
+
+
+def test_provider_uds_policy_pair_is_validated_before_execution_reservation(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    append_oci_config(repo, 'runc_executable = "/usr/bin/runc"\nrunc_version = "1.5.2"')
+    pin = object()
+    monkeypatch.setattr(oci_worker_module, "_pin_trusted_runc_executable", lambda *_args: pin)
+    monkeypatch.setattr(
+        oci_worker_module,
+        "_probe_trusted_runc_version",
+        lambda _pin, expected: expected,
+    )
+    supervisor = GitSupervisor(repo)
+    created = task(supervisor, "alpha.txt")
+    attempt = supervisor.claim(created["id"], "sandbox-worker")
+    attempt_before = supervisor.attempt(attempt["id"])
+    monkeypatch.setattr(
+        workers_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("invalid provider policy reached process launch"),
+    )
+
+    with pytest.raises(SupervisorError) as error:
+        supervisor.run_worker(
+            attempt["id"],
+            attempt["claim_token"],
+            ["/bin/busybox", "true"],
+            sandbox_experimental_opt_in=True,
+            sandbox_memory_max_bytes=64 * 1024 * 1024,
+            sandbox_cpu_quota=50_000,
+            sandbox_cpu_period=100_000,
+            sandbox_pids_max=32,
+            sandbox_timeout_seconds=10,
+            sandbox_provider_uds_policy_name="test-provider",
+        )
+
+    assert error.value.code == "invalid_sandbox_provider_uds_policy"
+    assert supervisor.attempt(attempt["id"]) == attempt_before
 
 
 class _UnstableWorkerCommand(tuple):

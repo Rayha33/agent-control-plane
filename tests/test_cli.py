@@ -306,6 +306,12 @@ def test_cli_run_forwards_explicit_experimental_sandbox_limits(
             "32",
             "--sandbox-timeout-seconds",
             "10",
+            "--sandbox-provider-uds-policy-name",
+            "openai-api",
+            "--sandbox-provider-uds-destination",
+            "api.openai.com:443",
+            "--sandbox-provider-uds-destination",
+            "api.anthropic.com:443",
             "attempt-1",
             "--",
             "python",
@@ -327,6 +333,11 @@ def test_cli_run_forwards_explicit_experimental_sandbox_limits(
         "sandbox_cpu_period": 100_000,
         "sandbox_pids_max": 32,
         "sandbox_timeout_seconds": 10.0,
+        "sandbox_provider_uds_policy_name": "openai-api",
+        "sandbox_provider_uds_destinations": {
+            "api.openai.com": [443],
+            "api.anthropic.com": [443],
+        },
     }
 
 

@@ -2118,6 +2118,9 @@ def start_registered_no_model_sandbox_worker(
     journal, and hands off to the authenticated launch-driver service. It does
     not call a model/provider or import results; the caller retains the
     cleanup-gated result-import decision.
+    An optional labeled UDS egress policy grants only the proxy capability;
+    this helper has no built-in provider-credential delivery channel. Callers
+    remain responsible for secrets embedded in commands or workspaces.
 
     The default worker entrypoint remains fail-closed. Every argument that can
     be rejected without side effects is validated before reservation. During

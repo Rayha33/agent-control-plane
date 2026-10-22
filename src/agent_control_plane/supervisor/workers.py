@@ -252,6 +252,8 @@ class WorkersMixin:
         sandbox_cpu_period: int | None = None,
         sandbox_pids_max: int | None = None,
         sandbox_timeout_seconds: float | None = None,
+        sandbox_provider_uds_policy_name: str | None = None,
+        sandbox_provider_uds_destinations: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from ..worker_trampoline import _monitor_argv_prefix
 
@@ -288,9 +290,34 @@ class WorkersMixin:
             sandbox_pids_max,
             sandbox_timeout_seconds,
         )
+        provider_options = (
+            sandbox_provider_uds_policy_name,
+            sandbox_provider_uds_destinations,
+        )
+        provider_requested = any(value is not None for value in provider_options)
+        if provider_requested and not sandbox_experimental_opt_in:
+            raise SupervisorError(
+                "sandbox_opt_in_required",
+                "provider UDS policy requires the explicit experimental sandbox opt-in",
+            )
         if sandbox_experimental_opt_in is True:
             from . import oci_worker
-            from .sandbox_launch_driver_service import _MAX_TIMEOUT_SECONDS
+            from .sandbox_launch_driver_service import (
+                _MAX_TIMEOUT_SECONDS,
+                SandboxLaunchDriverServiceError,
+                _normalize_provider_egress_policy,
+            )
+
+            try:
+                _normalize_provider_egress_policy(
+                    sandbox_provider_uds_policy_name,
+                    sandbox_provider_uds_destinations,
+                )
+            except SandboxLaunchDriverServiceError as error:
+                raise SupervisorError(
+                    "invalid_sandbox_provider_uds_policy",
+                    "experimental provider UDS policy requires one valid name and destination map",
+                ) from error
 
             if result_manifest_path is not None:
                 raise SupervisorError(
@@ -331,8 +358,10 @@ class WorkersMixin:
                 cpu_period=sandbox_cpu_period,
                 pids_max=sandbox_pids_max,
                 timeout_seconds=sandbox_timeout_seconds,
+                provider_uds_policy_name=sandbox_provider_uds_policy_name,
+                provider_uds_destinations=sandbox_provider_uds_destinations,
             )
-        if any(value is not None for value in sandbox_options):
+        if any(value is not None for value in sandbox_options) or provider_requested:
             raise SupervisorError(
                 "sandbox_opt_in_required",
                 "sandbox resource limits require the explicit experimental opt-in",
@@ -680,12 +709,17 @@ class WorkersMixin:
         cpu_period: int,
         pids_max: int,
         timeout_seconds: float,
+        provider_uds_policy_name: str | None,
+        provider_uds_destinations: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Run a no-provider worker through the explicit OCI lifecycle experiment.
+        """Run an experimental OCI worker without provider credentials.
 
-        Provider authentication and egress are intentionally not configured by
-        this path. Result transfer is allowed only after the exact execution
-        exits successfully, its independent cleanup verifier passes, and the
+        An optional labeled egress policy exposes only the mounted UDS proxy
+        path; there is no built-in provider-credential channel or generic
+        TCP/SDK bridge. Callers remain responsible for secrets in commands or
+        workspaces.
+        Result transfer is allowed only after the exact execution exits
+        successfully, its independent cleanup verifier passes, and the
         existing host-side importer validates the private workspace diff.
         """
 
@@ -712,6 +746,8 @@ class WorkersMixin:
                 timeout_seconds=float(timeout_seconds),
                 credential=credential,
                 experimental_opt_in=True,
+                provider_egress_policy_name=provider_uds_policy_name,
+                provider_egress_destinations=provider_uds_destinations,
             )
         except SandboxLaunchDriverServiceError as error:
             raise SupervisorError("sandbox_execution_start_failed", str(error)) from error

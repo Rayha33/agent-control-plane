@@ -3,7 +3,10 @@
 **Current status (2026-10-22):** Provider-backed end-to-end acceptance remains
 incomplete. An explicit experimental, no-model `run_worker()` route now reaches
 the production launch driver, independent cleanup verifier, and host-side
-result-import path; it does not enable the default OCI worker path. A live
+result-import path. It can carry an explicitly named UDS-only provider egress
+policy, but it does not provide a built-in provider-credential channel or generic
+TCP HTTP-proxy/SDK compatibility. Callers remain responsible for keeping secrets
+out of worker commands and workspaces. It does not enable the default OCI worker path. A live
 two-worker test on one shared repository recorded `/proc/self/mountinfo` from
 each worker and verified its `/workspace` mount root matched that attempt's
 exact workspace path, `/tmp`, `/dev`, and `/home/agent` were tmpfs, `/proc` was
@@ -50,10 +53,9 @@ isolation. See the live evidence below and
 retention, and cleanup contract. End-to-end worker isolation proof remains
 incomplete. The OCI policy compiler stages init behind fd 3, and a reusable
 launcher starts the pinned runc client through a held executable FD while
-retaining that gate. The explicit route is still an experimental no-model
-path: it does not provide provider authentication/egress or enable the default
-OCI `run_worker()` path. This record does not authorize `externalSandbox` for
-ACP workers.
+retaining that gate. The explicit route remains experimental and the default
+OCI `run_worker()` path remains disabled/fail-closed. This record does not
+authorize `externalSandbox` for ACP workers.
 
 **Test-only loopback TCP-to-UDS bridge probe (2026-10-22):** The opt-in
 `test_live_rootless_runc_mounts_attempt_proxy_socket_directory_read_only`
@@ -89,6 +91,21 @@ path. This is one guest's test-only bridge/proxy proof, not production
 `run_worker()` integration, provider authentication, general egress policy,
 active-channel cancellation, or supervisor-crash recovery; the default OCI
 worker route remains disabled/fail-closed.
+
+**Registered UDS-only egress opt-in (2026-10-22):** The `acp run` command and
+`GitSupervisor.run_worker()` now accept an audit label and a caller-supplied
+`HOST:PORT` destination allowlist only with `--sandbox-experimental-opt-in`. The
+label does not select a central policy profile; the supplied destinations define
+the actual allowlist. ACP passes the validated values through the registered
+launch-driver request; the worker receives only the non-secret
+`ACP_PROVIDER_PROXY_UNIX_SOCKET` path. Omitting the policy keeps the no-provider
+path unchanged, and supplying any provider policy without the explicit sandbox
+opt-in fails before worker launch. ACP does not provision provider credentials
+through a built-in secret channel; callers must ensure commands and workspaces
+contain no secrets. The route does not set `HTTP_PROXY`, run the test-only TCP
+bridge, or claim that an SDK can speak directly to the UDS protocol. Unit tests
+cover CLI parsing, forwarding, and fail-closed opt-in/policy validation. A live
+provider-backed `run_worker()` composition test remains outstanding.
 
 **Live same-repository concurrent probe (2026-10-22):**
 `test_live_concurrent_attempts_use_distinct_scopes_and_clean_up` passed 1/1 on
@@ -4069,9 +4086,10 @@ service to the existing provider-neutral CONNECT handler, but only through the
 explicit no-model sandbox composition and a separately named destination
 policy. The authenticated launch request contains the normalized policy and
 binds it into the one-shot request digest. Without that field, the existing
-request shape and default OCI config remain unchanged. `run_worker()` does not
-yet expose provider options, fake credentials, or a provider-enabled worker
-mode.
+request shape and default OCI config remain unchanged. At the time of this
+initial implementation, `run_worker()` did not expose provider options; the
+later UDS-only forwarding route is recorded above. Fake credentials and a
+provider-backed worker mode remain unimplemented.
 
 For an opted-in request, the launch driver derives a short deterministic
 directory name from the exact execution identity beneath the already-private
