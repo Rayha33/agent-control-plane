@@ -906,6 +906,29 @@ Current source-level constraints and deployment evidence:
 | Codex adapter | The repository has no pinned Codex CLI/App Server in this execution path. The current App Server docs describe stdio/Unix socket transports; WebSocket transport is marked experimental/unsupported. | Pin an exact binary/version and protocol schema, then test it inside the proven boundary without a model call. |
 | Authentication | No host Codex config, OAuth file, API key, or Git credential may be mounted into the candidate tree. | Prove a brokered/least-privilege auth path or reject the adapter; no credential material has been tested here. |
 
+**Provider-auth boundary update (2026-10-22).** Current [Codex App Server
+documentation](https://learn.chatgpt.com/docs/app-server) describes API-key and
+managed ChatGPT authentication, plus experimental `chatgptAuthTokens` supplied
+and refreshed by the host application. Those are auth/account mechanisms, not
+an outer sandbox: `externalSandbox` still tells Codex to skip its own command
+sandbox when a separate boundary already exists. OpenAI's [Codex security
+guidance](https://learn.chatgpt.com/docs/agent-approvals-security) warns that,
+when Codex's sandbox is bypassed inside a dev container, a malicious project can
+exfiltrate anything available there. Accordingly, ACP will not pass
+model/provider tokens through worker argv,
+environment, mounted host auth files, or shared user-readable state. Keep the
+App Server and model-auth lifecycle in the trusted host-side harness; the
+attempt worker remains no-provider. The current CONNECT proxy relays TLS
+unchanged and does not inject provider authorization, so it is not yet a
+credential broker. Provider execution stays fail-closed until a separately
+reviewed adapter proves host-owned token refresh/revocation, a worker-unreadable
+credential path, and exact destination/port enforcement. This is an
+architecture constraint, not evidence that such an adapter is implemented.
+The same [App Server docs](https://learn.chatgpt.com/docs/app-server) state that
+App Server authentication is not permitted for commercial or hosted services;
+any future hosted ACP deployment therefore needs a separately authorized
+sign-in path, not an assumption that local App Server auth can be reused.
+
 **Target NAS read-only compatibility probe (2026-10-21).** The Debian/kernel,
 systemd, cgroup-v2, user-namespace settings, and `/usr/bin/runc` identity above
 were read over SSH; a transient user/mount/PID/network namespace command
