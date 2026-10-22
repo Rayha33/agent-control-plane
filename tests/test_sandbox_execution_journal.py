@@ -4990,6 +4990,18 @@ def test_reaper_recovers_crash_across_cleanup_report_boundaries(
     assert journal_module._sandbox_cleanup_recovery_report_is_self_consistent(
         persisted_recovery_row, persisted_recovery_row["cleanup_receipt_json"]
     )
+    recovered_cleanup_json = persisted_recovery_row["cleanup_receipt_json"]
+    assert final_supervisor._sandbox_cleanup_receipt_is_exact_for_result(
+        persisted_recovery_row, recovered_cleanup_json
+    )
+    with final_supervisor.connect() as connection:
+        import_source = final_supervisor._sandbox_execution_result_import_source(
+            connection, attempt["id"], attempt["claim_token"]
+        )
+    assert (
+        import_source["cleanup_receipt_digest"]
+        == hashlib.sha256(recovered_cleanup_json.encode("utf-8")).hexdigest()
+    )
     receipt_mutations = [
         (("attempt_id",), "wrong-attempt"),
         (("claim_token",), recovered["claim_token"] + 1),
@@ -5009,9 +5021,15 @@ def test_reaper_recovers_crash_across_cleanup_report_boundaries(
         assert not journal_module._sandbox_cleanup_recovery_report_is_self_consistent(
             persisted_recovery_row, canonical_json(forged)
         ), path
+        assert not final_supervisor._sandbox_cleanup_receipt_is_exact_for_result(
+            persisted_recovery_row, canonical_json(forged)
+        ), path
     forged = json.loads(persisted_recovery_row["cleanup_receipt_json"])
     forged["unexpected"] = True
     assert not journal_module._sandbox_cleanup_recovery_report_is_self_consistent(
+        persisted_recovery_row, canonical_json(forged)
+    )
+    assert not final_supervisor._sandbox_cleanup_receipt_is_exact_for_result(
         persisted_recovery_row, canonical_json(forged)
     )
     assert recovered["cleanup_verification"]["observations"]["paths"]["provider_proxy_directory"][

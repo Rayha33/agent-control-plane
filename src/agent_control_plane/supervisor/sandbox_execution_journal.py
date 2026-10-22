@@ -2242,11 +2242,7 @@ class SandboxExecutionJournalMixin:
                 )
 
             cleanup_json = row["cleanup_receipt_json"]
-            if cleanup_json not in {
-                canonical_json(self._sandbox_cleanup_receipt(row)),
-                canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row)),
-                canonical_json(self._sandbox_cleanup_receipt_v1(row)),
-            } and not self._sandbox_cleanup_receipt_v3_is_self_consistent(row, cleanup_json):
+            if not self._sandbox_cleanup_receipt_is_exact_for_result(row, cleanup_json):
                 raise SupervisorError(
                     "sandbox_result_evidence_unverified",
                     "cleanup report is not the exact unverified journal receipt",
@@ -2381,11 +2377,7 @@ class SandboxExecutionJournalMixin:
                 "attempt already has a direct-worker result import",
             )
         cleanup_json = row["cleanup_receipt_json"]
-        if cleanup_json not in {
-            canonical_json(self._sandbox_cleanup_receipt(row)),
-            canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row)),
-            canonical_json(self._sandbox_cleanup_receipt_v1(row)),
-        } and not self._sandbox_cleanup_receipt_v3_is_self_consistent(row, cleanup_json):
+        if not self._sandbox_cleanup_receipt_is_exact_for_result(row, cleanup_json):
             raise SupervisorError(
                 "sandbox_cleanup_report_invalid",
                 "verified execution does not retain its exact journaled cleanup report",
@@ -4761,6 +4753,20 @@ class SandboxExecutionJournalMixin:
             return canonical_json(candidate) == canonical_json(expected)
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):
             return False
+
+    def _sandbox_cleanup_receipt_is_exact_for_result(self, row: Any, encoded: str) -> bool:
+        """Accept only a byte-exact legacy, action, or recovered cleanup report."""
+
+        return (
+            encoded
+            in {
+                canonical_json(self._sandbox_cleanup_receipt(row)),
+                canonical_json(self._sandbox_cleanup_receipt_v2_legacy(row)),
+                canonical_json(self._sandbox_cleanup_receipt_v1(row)),
+            }
+            or self._sandbox_cleanup_receipt_v3_is_self_consistent(row, encoded)
+            or self._sandbox_cleanup_recovery_receipt_is_self_consistent(row, encoded)
+        )
 
     def _sandbox_cleanup_recovery_receipt_is_self_consistent(self, row: Any, encoded: str) -> bool:
         pin = self.config.oci_runc_executable
