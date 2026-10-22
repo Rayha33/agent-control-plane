@@ -4120,8 +4120,11 @@ cgroup, and unit state before recording verification. Proxy close/drain
 failure is reported as unverified and is not cleanup proof; when a launched
 handle exists, the error path attempts exact-monitor stop/cancel and retries
 proxy shutdown after the worker stops. If shutdown remains unverified, the
-driver withholds the cleanup report and leaves the execution fenced. Unknown
-entries, identity changes, or failed rechecks remain fenced.
+driver withholds the cleanup report and leaves the execution fenced. On restart,
+the reaper records the execution phase and launch-submission latch state; any
+provider artifact remains quarantined with resource fences until independent
+verification succeeds. Unknown entries, identity changes, or failed rechecks
+remain fenced.
 
 **Scoped live guest qualification (2026-10-22):** The opt-in production
 launch-driver test passed once in natural-completion mode and once in

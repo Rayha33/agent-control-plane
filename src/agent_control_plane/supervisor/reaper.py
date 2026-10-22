@@ -30,6 +30,32 @@ from .common import (
 from .sandbox_execution_journal import _sandbox_execution_cleanup_is_verified
 
 
+def _sandbox_execution_cleanup_hold_diagnostic(execution: Any | None) -> tuple[str, str]:
+    """Describe why proxy artifacts remain fenced without treating them as removable."""
+
+    if execution is None:
+        phase = "missing"
+        submission_state = "unknown"
+    else:
+        phase = str(execution["phase"])
+        submission = (
+            execution["launch_submission_id"],
+            execution["launch_submission_digest"],
+            execution["launch_submission_at"],
+        )
+        if all(submission):
+            submission_state = "recorded"
+        elif any(submission):
+            submission_state = "partial_or_ambiguous"
+        else:
+            submission_state = "absent"
+    reason = (
+        f"sandbox cleanup unverified (phase={phase}, launch_submission={submission_state}); "
+        "provider proxy artifact, if present, is retained; attempt and resources remain fenced"
+    )
+    return submission_state, reason
+
+
 class ReaperMixin:
     """Lease expiry, two-phase cleanup, worktree GC and quarantine recovery."""
 
@@ -1067,10 +1093,15 @@ class ReaperMixin:
                     (CLEANUP_FENCE_EPOCH, stamp, attempt["id"]),
                 )
                 if not _sandbox_execution_cleanup_is_verified(connection, attempt["id"]):
-                    phase = connection.execute(
-                        "SELECT phase FROM sandbox_executions WHERE attempt_id = ?",
+                    execution = connection.execute(
+                        "SELECT phase, launch_submission_id, launch_submission_digest, "
+                        "launch_submission_at FROM sandbox_executions WHERE attempt_id = ?",
                         (attempt["id"],),
-                    ).fetchone()["phase"]
+                    ).fetchone()
+                    submission_state, cleanup_reason = _sandbox_execution_cleanup_hold_diagnostic(
+                        execution
+                    )
+                    phase = execution["phase"] if execution is not None else "missing"
                     connection.execute(
                         "UPDATE attempts SET termination_target_status = 'quarantined', "
                         "updated_at = ? WHERE id = ?",
@@ -1082,8 +1113,7 @@ class ReaperMixin:
                         "cleanup_error = ?, updated_at = ? "
                         "WHERE id = ? AND current_attempt_id = ?",
                         (
-                            "sandbox execution cleanup is not independently verified; "
-                            "attempt and resources remain fenced",
+                            cleanup_reason,
                             stamp,
                             attempt["task_id"],
                             attempt["id"],
@@ -1101,6 +1131,8 @@ class ReaperMixin:
                                 "attempt_id": attempt["id"],
                                 "claim_token": attempt["claim_token"],
                                 "phase": phase,
+                                "launch_submission_state": submission_state,
+                                "provider_proxy_artifact_action": "retained_if_present",
                             },
                         )
                     continue

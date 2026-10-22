@@ -7663,6 +7663,73 @@ def test_reaper_retries_cleanup_verification_but_legacy_receipt_stays_fenced(
     assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == "cleanup_reported"
 
 
+@pytest.mark.parametrize(
+    ("phase", "submission_state"),
+    [
+        ("reserved", "absent"),
+        ("running", "recorded"),
+        ("exited", "recorded"),
+        ("cleanup_reported", "recorded"),
+    ],
+)
+def test_reaper_quarantine_diagnoses_proxy_artifact_hold(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    submission_state: str,
+) -> None:
+    supervisor = GitSupervisor(repo)
+    attempt = claimed(supervisor)
+    reserve(supervisor, attempt)
+    if phase != "reserved":
+        record_launch(supervisor, attempt)
+    if phase in {"running", "exited", "cleanup_reported"}:
+        record_running(supervisor, attempt)
+    if phase in {"exited", "cleanup_reported"}:
+        record_exit(supervisor, attempt)
+    if phase == "cleanup_reported":
+        supervisor._sandbox_execution_record_cleanup_report(
+            attempt["id"], attempt["claim_token"], cleanup_receipt(supervisor, attempt["id"])
+        )
+
+        def reject_cleanup_verification(*_args: Any, **_kwargs: Any) -> None:
+            raise SupervisorError("sandbox_cleanup_verification_unavailable", "injected hold")
+
+        monkeypatch.setattr(
+            supervisor, "_sandbox_execution_verify_cleanup", reject_cleanup_verification
+        )
+
+    proxy_directory = tmp_path / "attempt-provider-proxy"
+    proxy_directory.mkdir(mode=0o700)
+    proxy_socket = proxy_directory / "provider.sock"
+    proxy_socket.write_text("must remain quarantined\n", encoding="utf-8")
+    monkeypatch.setattr(
+        monitor_lifecycle_module,
+        "sandbox_provider_proxy_control_paths",
+        lambda **_kwargs: (proxy_directory, proxy_socket),
+    )
+
+    result = supervisor.reap_expired(now=attempt["lease_expires_at"] + 1)
+
+    assert result["runtime_cleanup"] == []
+    assert supervisor._sandbox_execution_get(attempt["id"])["phase"] == phase
+    task = supervisor.task(attempt["task_id"])
+    assert task["status"] == "cleanup_pending"
+    assert task["cleanup_target_status"] == "blocked"
+    assert f"phase={phase}" in task["cleanup_error"]
+    assert f"launch_submission={submission_state}" in task["cleanup_error"]
+    assert "provider proxy artifact, if present, is retained" in task["cleanup_error"]
+    assert proxy_socket.read_text(encoding="utf-8") == "must remain quarantined\n"
+    assert supervisor.attempt(attempt["id"])["termination_target_status"] == "quarantined"
+    with supervisor.connect() as connection:
+        leases = connection.execute(
+            "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchall()
+    assert leases and all(item["lease_expires_at"] == CLEANUP_FENCE_EPOCH for item in leases)
+
+
 def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: Path) -> None:
     supervisor = GitSupervisor(repo)
     attempt = claimed(supervisor)
