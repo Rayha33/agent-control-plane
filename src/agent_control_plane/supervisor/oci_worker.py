@@ -2,29 +2,39 @@
 
 This module compiles the narrow OCI config and attached ``runc`` argv, and
 provides a held-executable-FD launcher that maps one private gate descriptor to
-fd 3. The launcher is not wired into ``run_worker``: it does not reserve the
-supervisor lifecycle journal, attest the live runtime, verify cleanup, recover
-after crashes, or authorize result import. It therefore does not establish
-that ACP currently enforces this policy. The request is offline-only: it passes
-no caller environment or credentials into the OCI process and creates an
-unconfigured network namespace. It encodes finite memory, CPU, process-count,
-and tmpfs limits, but no aggregate quota for the host-backed workspace. The
-device-cgroup deny entry is a requested rule, not device isolation evidence:
-OCI runtimes provide default device nodes and may apply additional device rules,
-while rootless cgroup setup may be unavailable. The generated
+fd 3. The explicit experimental no-provider ``run_worker`` route calls this
+launcher only through ``start_registered_no_model_sandbox_worker`` in the
+``sandbox_launch_driver_service`` module. This low-level API does not itself
+reserve an attempt, supervise cancellation or recovery, verify cleanup, or
+authorize result import. The launch driver owns its wait/reap receipt, the
+authenticated monitor handles scoped stop requests, and the supervisor's
+independent verifier alone records ``cleanup_verified``. Separately,
+``WorkersMixin._run_experimental_sandbox_worker`` imports the workspace result
+only after exact-identity cleanup verification and runc exit code zero. The
+recorded guest/runtime evidence does not establish broad supervisor-daemon
+crash/restart, manager logout/linger, or reboot recovery. The request is
+offline-only: it passes no caller environment or credentials into the OCI
+process and creates an unconfigured network namespace. It encodes finite
+memory, CPU, process-count, and tmpfs limits, but no aggregate quota for the
+host-backed workspace. The device-cgroup deny entry is a requested rule, not
+evidence of device isolation: OCI runtimes provide default device nodes and
+may apply additional device rules, while rootless cgroup setup may be
+unavailable. The generated
 ``linux.seccomp`` profile is a denylist defense-in-depth layer, not a complete
 syscall allowlist or a substitute for the namespace/mount boundary. Runtime
-application and behavioral denial still require exact-host verification before
-worker launch is enabled. The public low-level runc API places the sealed config
-and a verified copy of the rootfs in private, read-only tmpfs mounts addressed
-through an inherited bundle FD. The rootfs copy is bounded and rejects
-unsupported ownership or extended attributes. State and workspace directory
-objects are pinned through inherited descriptors to prevent launch-time path
-replacement, but remain host-backed and are not an outer worker isolation
-boundary. The helper binds the workspace descriptor into a private tmpfs anchor
-inside its mount namespace so runc's container-init child does not depend on
-inheriting the supervisor's FD. Lifecycle journal ownership, cleanup, and result
-import remain subject to separate gates.
+application and behavioral denial are established only for the exact guest,
+kernel, and runtime combinations recorded in ``WORKER_LAUNCH_DRIVER.md``; they
+do not generalize to other hosts. The public low-level runc API places the
+sealed config and a verified copy of the rootfs in private, read-only tmpfs
+mounts addressed through an inherited bundle FD. The rootfs copy is bounded and
+rejects unsupported ownership or extended attributes. State and workspace
+directory objects are pinned through inherited descriptors to prevent
+launch-time path replacement, but remain host-backed and are not an outer
+worker isolation boundary. The helper binds the workspace descriptor into a
+private tmpfs anchor inside its mount namespace so runc's container-init child
+does not depend on inheriting the supervisor's FD. The integrated OCI route
+remains experimental and fail-closed by default; provider authentication and
+egress are not configured.
 """
 
 from __future__ import annotations
@@ -5903,11 +5913,15 @@ def spawn_pinned_runc(
     copied tree before runc exec as a separate read-only mount.
     Runc receives the tmpfs mount through an inherited FD, so same-UID host-path
     replacement cannot redirect the config handoff.
-    This low-level API still does not reserve a supervisor attempt, attest
+    This low-level API does not itself reserve a supervisor attempt, attest
     runtime state, supervise cancellation/recovery, prove cleanup, or authorize
-    result import; ``run_worker`` remains fail-closed for configured OCI. A
-    supervised monitor may supply the private submission callback, which must
-    return the process-local capability committed for this exact launch target.
+    result import. The experimental no-provider ``run_worker`` opt-in reaches
+    it only through ``start_registered_no_model_sandbox_worker`` in the
+    ``sandbox_launch_driver_service`` module. The default configured-OCI
+    ``run_worker`` call remains fail-closed without explicit opt-in, required
+    resource limits, and pinned runtime/rootfs. A supervised monitor may
+    supply the private submission callback, which must return the
+    process-local capability committed for this exact launch target.
     """
 
     if type(binding) is not _PinnedRuncWorkerConfig:
