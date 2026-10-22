@@ -4026,7 +4026,7 @@ OCI test, test receipt, and injected resolver/dial hooks are not production
 integration evidence. No provider policy, worker seccomp rule, mount policy,
 or configured-OCI default was changed by this design review.
 
-### Attempt-scoped provider UDS lifecycle (2026-10-22; source and unit proof)
+### Attempt-scoped provider UDS lifecycle (2026-10-22; source, unit, and live guest proof)
 
 The first implementation stage now connects the production launch-driver
 service to the existing provider-neutral CONNECT handler, but only through the
@@ -4055,11 +4055,34 @@ remove a stale mode-0600 socket and mode-0700 directory only after the
 recorded units, processes, and cgroup are quiescent; unknown entries or
 identity changes remain fenced.
 
-This is not end-to-end Linux qualification: the current increment has focused
-source/unit coverage, but has not exercised this launch-driver composition on
-the disposable guest. It adds no TCP-to-UDS bridge, no seccomp relaxation, no
-fake-credential channel, no real provider credential or paid call, and no
-default-path enablement. The earlier direct-runc UDS test remains primitive
-evidence; the next gate is a disposable-Linux test of this exact service
-lifecycle and cancellation path, then separately reviewed bridge/credential
-stages before any general `run_worker()` composition.
+**Scoped live guest qualification (2026-10-22):** The opt-in production
+launch-driver test passed once in natural-completion mode and once in
+cancellation mode on disposable Debian 12 ARM64 (Linux
+`6.12.95+deb12-cloud-arm64`, systemd `252.39`, Python `3.11.2`) with root-owned
+runc `1.5.2`, SHA-256
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`. The
+natural run checked the read-only `/run/acp` mount and fixed socket path,
+denied IPv4/IPv6 TCP and UDP socket creation, exercised a malformed in-cgroup
+request (400), rejected a disallowed destination (403), and observed a
+same-UID outside-cgroup peer rejected (403) while the exact durable execution
+row was still `running`. The cancellation variant held a connected/open
+partial UDS request while the production cancellation/cleanup path ran. Its
+marker proves the client connection was open, not that the handler had
+accepted that specific partial request; accepted-channel drain and join remain
+covered by `test_attempt_proxy_service_cancels_and_joins_active_channel`.
+Both modes required exact workspace/cgroup identity, completed cleanup
+verification, and removed only the execution-scoped socket directory. The
+harness asserted exact attempt-unit cleanup; a separate postflight queried all
+user units and scanned `/tmp`, finding no ACP-named unit or
+`acp-live-launch-driver-*` fixture root. The test source file SHA-256 was
+`c439b9d23b168e595800683aa83051c1a9873fd9ced5e1987bf1d0ce6545962c`.
+
+This is scoped UDS lifecycle evidence, not end-to-end provider qualification.
+The probe sent only a disallowed hostname, which the policy rejected before
+DNS resolution; it made no allowed-host connection, provider request, TLS
+handshake, model call, or paid call. No provider credentials were configured
+or used (the harness used its local ACP control-plane credential). No
+TCP-to-UDS bridge, seccomp relaxation, fake-credential channel, or default-path
+enablement was added.
+The general provider-enabled `run_worker()` composition, bridge/credential
+stages, and full task #3441/#2370 acceptance remain open.

@@ -41,6 +41,18 @@ delegated cgroup v2, and an active private systemd user manager:
     ACP_OCI_TEST_RUNC_VERSION=1.5.2 \
     uv run --extra dev pytest -q tests/test_sandbox_worker_lifecycle_integration.py
 
+For a disposable-guest proof of the production attempt-scoped provider UDS
+mount, cgroup peer authorization, destination denial, and teardown, add:
+
+    ACP_LIVE_PROVIDER_PROXY_UDS=1
+
+This mode makes no DNS lookup or provider connection. It must run alone with
+natural worker completion; it does not enable the generic ``run_worker`` path.
+To additionally prove that cancellation closes a connected/open partial UDS
+request, combine ``ACP_LIVE_PROVIDER_PROXY_CANCEL=1`` with
+``ACP_LIVE_CANCEL_AFTER_START=1``. Neither mode uses provider credentials;
+service-level accepted-channel shutdown is separately covered by unit tests.
+
 For the fresh-supervisor cancellation branch, add:
 
     ACP_LIVE_CANCEL_AFTER_START=1
@@ -168,6 +180,155 @@ from agent_control_plane.supervisor.sandbox_workspace import collect_changes, co
 
 _LIVE_ENABLED = os.environ.get("ACP_RUN_SANDBOX_WORKER_LIFECYCLE") == "1"
 _SUPPORTED_RUNC_VERSION = "1.5.2"
+_PROVIDER_PROXY_PROBE_SOURCE = r"""#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static bool denied_socket_family(int family, int type) {
+    int fd = socket(family, type, 0);
+    if (fd >= 0) {
+        close(fd);
+        return false;
+    }
+    return errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT || errno == ENOSYS;
+}
+
+static bool proxy_request_has_status(const char *request, const char *status) {
+    const char *path = getenv("ACP_PROVIDER_PROXY_UNIX_SOCKET");
+    if (path == NULL || strcmp(path, "/run/acp/provider.sock") != 0) {
+        return false;
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(address.sun_path)) {
+        close(fd);
+        return false;
+    }
+    memcpy(address.sun_path, path, strlen(path) + 1);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return false;
+    }
+    size_t request_size = strlen(request);
+    size_t sent = 0;
+    while (sent < request_size) {
+        ssize_t count = send(fd, request + sent, request_size - sent, 0);
+        if (count <= 0) {
+            close(fd);
+            return false;
+        }
+        sent += (size_t)count;
+    }
+    shutdown(fd, SHUT_WR);
+    char response[1024];
+    size_t received = 0;
+    while (received + 1 < sizeof(response)) {
+        ssize_t count = recv(fd, response + received, sizeof(response) - received - 1, 0);
+        if (count <= 0) {
+            break;
+        }
+        received += (size_t)count;
+    }
+    response[received] = '\0';
+    close(fd);
+    return strstr(response, status) != NULL;
+}
+
+#if defined(ACP_LIVE_PROVIDER_CANCEL)
+static int connect_provider_proxy(void) {
+    const char *path = getenv("ACP_PROVIDER_PROXY_UNIX_SOCKET");
+    if (path == NULL || strcmp(path, "/run/acp/provider.sock") != 0) {
+        return -1;
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(address.sun_path)) {
+        close(fd);
+        return -1;
+    }
+    memcpy(address.sun_path, path, strlen(path) + 1);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+#endif
+
+int main(void) {
+    const char *path = getenv("ACP_PROVIDER_PROXY_UNIX_SOCKET");
+    struct statvfs mount_info;
+    struct stat socket_info;
+    if (path == NULL || strcmp(path, "/run/acp/provider.sock") != 0) return 2;
+    if (statvfs("/run/acp", &mount_info) != 0 || !(mount_info.f_flag & ST_RDONLY)) return 3;
+    if (lstat(path, &socket_info) != 0 || !S_ISSOCK(socket_info.st_mode)) return 4;
+    if (!denied_socket_family(AF_INET, SOCK_STREAM)) return 5;
+    if (!denied_socket_family(AF_INET, SOCK_DGRAM)) return 6;
+    if (!denied_socket_family(AF_INET6, SOCK_STREAM)) return 7;
+    if (!denied_socket_family(AF_INET6, SOCK_DGRAM)) return 8;
+    if (!proxy_request_has_status("NOT-CONNECT / HTTP/1.1\r\n\r\n", "400 Bad Request")) return 9;
+    if (!proxy_request_has_status(
+            "CONNECT blocked.example.invalid:443 HTTP/1.1\r\n"
+            "Host: blocked.example.invalid:443\r\n\r\n",
+            "403 Forbidden")) return 10;
+    int marker = open("/workspace/provider-probe-result", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (marker < 0) return 11;
+    const char result[] = "attempt-uds-policy-pass\n";
+    if (write(marker, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) {
+        close(marker);
+        return 12;
+    }
+    close(marker);
+#if defined(ACP_LIVE_PROVIDER_CANCEL)
+    int pending = connect_provider_proxy();
+    if (pending < 0) return 13;
+    const char partial_request[] = "CONNECT ";
+    if (send(pending, partial_request, sizeof(partial_request) - 1, 0)
+            != (ssize_t)(sizeof(partial_request) - 1)) {
+        close(pending);
+        return 14;
+    }
+    int open_marker = open("/workspace/provider-probe-open", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (open_marker < 0) {
+        close(pending);
+        return 15;
+    }
+    const char opened[] = "partial-connect-open\n";
+    if (write(open_marker, opened, sizeof(opened) - 1) != (ssize_t)(sizeof(opened) - 1)) {
+        close(open_marker);
+        close(pending);
+        return 16;
+    }
+    close(open_marker);
+    for (;;) pause();
+#else
+    for (int attempt = 0; attempt < 30000; ++attempt) {
+        if (access("/workspace/provider-probe-release", F_OK) == 0) return 0;
+        usleep(1000);
+    }
+    return 17;
+#endif
+    return 0;
+}
+"""
 _MONITOR_SLICE_UNIT = "user-acp.slice"
 _PAYLOAD_MARKER = "lifecycle-gate-marker"
 _GIT_METADATA_MARKER = "git-metadata-absent-marker"
@@ -729,6 +890,16 @@ raise SystemExit(sandbox_launch_driver_service.main(driver_args))
                         timeout_seconds=timeout_seconds,
                         credential=credential,
                         experimental_opt_in=True,
+                        provider_egress_policy_name=(
+                            "live-uds-only"
+                            if os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
+                            else None
+                        ),
+                        provider_egress_destinations=(
+                            {"allowed.example.invalid": [443]}
+                            if os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
+                            else None
+                        ),
                     )
                 )
                 receipt_payload = {
@@ -2881,6 +3052,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     isolation_probes = os.environ.get("ACP_LIVE_ISOLATION_PROBES") == "1"
     import_result_after_cleanup = os.environ.get("ACP_LIVE_IMPORT_RESULT_AFTER_CLEANUP") == "1"
     supervised_run_worker = os.environ.get("ACP_LIVE_SUPERVISED_RUN_WORKER") == "1"
+    provider_proxy_uds = os.environ.get("ACP_LIVE_PROVIDER_PROXY_UDS") == "1"
+    provider_proxy_cancel = os.environ.get("ACP_LIVE_PROVIDER_PROXY_CANCEL") == "1"
     user_manager_restart_after_driver_crash = (
         os.environ.get("ACP_LIVE_USER_MANAGER_RESTART_AFTER_DRIVER_CRASH") == "1"
     )
@@ -3093,6 +3266,10 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
     monitor_start_attempted = False
     slice_start_attempted = False
     safe_to_remove = False
+    provider_probe_release: Path | None = None
+    provider_probe_result: Path | None = None
+    provider_probe_open: Path | None = None
+    provider_probe_release_error: OSError | None = None
     child_processes: list[multiprocessing.Process] = []
     host_process_sentinel: subprocess.Popen[bytes] | None = None
     try:
@@ -3130,7 +3307,7 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             runtime_test_port = shared_port_range[0]
         else:
             rootfs_source.mkdir(mode=0o755)
-            for directory in (
+            rootfs_directories = [
                 "bin",
                 "dev",
                 "etc",
@@ -3139,9 +3316,42 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "run",
                 "tmp",
                 "workspace",
-            ):
+            ]
+            if provider_proxy_uds:
+                rootfs_directories.append("run/acp")
+            for directory in rootfs_directories:
                 (rootfs_source / directory).mkdir(parents=True, exist_ok=True, mode=0o755)
             _busybox_version, busybox_applets = _copy_busybox_closure(busybox_path, rootfs_source)
+            if provider_proxy_uds:
+                compiler = shutil.which("cc")
+                if compiler is None:
+                    pytest.fail("provider UDS proof requires the guest C compiler")
+                provider_source_path = run_root / "provider-proxy-probe.c"
+                provider_client_path = rootfs_source / "bin" / "provider-proxy-probe"
+                provider_source_path.write_text(_PROVIDER_PROXY_PROBE_SOURCE, encoding="ascii")
+                compile_result = subprocess.run(
+                    [
+                        compiler,
+                        "-static",
+                        "-O2",
+                        "-Wall",
+                        "-Wextra",
+                        "-Werror",
+                        *(["-DACP_LIVE_PROVIDER_CANCEL=1"] if provider_proxy_cancel else []),
+                        str(provider_source_path),
+                        "-o",
+                        str(provider_client_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if compile_result.returncode != 0:
+                    pytest.fail(
+                        "provider UDS guest probe failed to compile: "
+                        f"{compile_result.stderr[-4000:]}"
+                    )
+                provider_client_path.chmod(0o755)
             if isolation_probes and "rm" not in busybox_applets:
                 pytest.fail("trusted BusyBox lacks rm for the temporary workspace symlink probe")
             repo_root = run_root / "repo"
@@ -3403,10 +3613,20 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         if cross_attempt_probes and concurrent_control is not None:
             runner_name = f"{runner_name}-{concurrent_control[1]}"
         runner = supervisor.enroll_runner(runner_name, "worker")
+        provider_probe_resources = (
+            (
+                "provider-probe-result",
+                "provider-probe-release",
+            )
+            + (("provider-probe-open",) if provider_proxy_cancel else ())
+            if provider_proxy_uds
+            else ()
+        )
         task = make_task(
             supervisor,
             live_marker_resource,
             live_started_resource,
+            *provider_probe_resources,
             *((coding_script_name, coding_test_output_name) if coding_task else ()),
             title=(
                 f"launch-driver producer test {concurrent_control[1]}"
@@ -3437,6 +3657,8 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert source_worktree != isolation_sibling_root
         execution: dict[str, Any] | None = None
         identity: tuple[str, int, str] | None = None
+        provider_proxy_directory: Path | None = None
+        provider_proxy_socket_path: Path | None = None
 
         cancel_after_start = os.environ.get("ACP_LIVE_CANCEL_AFTER_START") == "1"
         timeout_after_start = os.environ.get("ACP_LIVE_TIMEOUT_AFTER_START") == "1"
@@ -3517,6 +3739,29 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             or crash_driver_service_before_receipt
         ):
             pytest.fail("live isolation probes require natural worker completion")
+        if provider_proxy_uds and any(
+            (
+                cross_attempt_probes,
+                isolation_probes,
+                import_result_after_cleanup,
+                supervised_run_worker,
+                cancel_after_start and not provider_proxy_cancel,
+                timeout_after_start,
+                lease_expiry_after_stop,
+                crash_driver_service_before_receipt,
+                user_manager_reexec_after_driver_crash,
+                user_manager_restart_after_driver_crash,
+                concurrent_live_child,
+            )
+        ):
+            pytest.fail("provider UDS live proof must run alone except for its cancellation mode")
+        if provider_proxy_cancel and not (provider_proxy_uds and cancel_after_start):
+            pytest.fail(
+                "provider cancellation proof requires ACP_LIVE_PROVIDER_PROXY_UDS=1 and "
+                "ACP_LIVE_CANCEL_AFTER_START=1"
+            )
+        if provider_proxy_uds and cancel_after_start and not provider_proxy_cancel:
+            pytest.fail("provider UDS cancellation requires ACP_LIVE_PROVIDER_PROXY_CANCEL=1")
         monitor_acceptance_marker = run_root / "monitor-handoff-crash.json"
         payload_sleep_seconds = (
             120
@@ -3533,6 +3778,16 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 "/bin/busybox",
                 "sh",
                 f"/workspace/{_CROSS_ATTEMPT_PROBE_SCRIPT_NAME}",
+            )
+        elif provider_proxy_uds:
+            payload_command = (
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "set -eu; "
+                "printf 'production-driver-started\\n' > /workspace/launch-driver-started; "
+                "/bin/provider-proxy-probe; "
+                "printf 'production-driver-ran\\n' > /workspace/launch-driver-marker",
             )
         elif coding_task:
             payload_command = (
@@ -3618,6 +3873,136 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
         service_start_attempted = True
         slice_start_attempted = True
         monitor_start_attempted = True
+        if provider_proxy_uds:
+            bound_execution: dict[str, Any] | None = None
+            bound_deadline = time.monotonic() + 20
+            while time.monotonic() < bound_deadline:
+                candidate = supervisor._sandbox_execution_get(attempt["id"])
+                if (
+                    candidate is not None
+                    and candidate["execution_id"] == execution["execution_id"]
+                    and candidate["phase"] == "running"
+                    and candidate.get("workspace_root_path")
+                    and candidate.get("cgroup_path")
+                ):
+                    bound_execution = candidate
+                    break
+                if candidate is not None and candidate["phase"] in {
+                    "cleanup_reported",
+                    "cleanup_verified",
+                    "ambiguous",
+                }:
+                    break
+                time.sleep(0.05)
+            assert bound_execution is not None, (
+                "production worker never reached a bound running row with a workspace and cgroup"
+            )
+            execution = bound_execution
+            workspace_path_text = execution["workspace_root_path"]
+            assert isinstance(workspace_path_text, str) and workspace_path_text, (
+                "running execution row has no bound worker workspace"
+            )
+            workspace_root = Path(workspace_path_text)
+            execution_root = Path(execution["bundle_path"]).parent
+            canonical_execution_root = execution_root.resolve(strict=True)
+            canonical_workspace = workspace_root.resolve(strict=True)
+            assert workspace_root.is_absolute() and workspace_root == canonical_workspace, (
+                "worker workspace path is not absolute and canonical"
+            )
+            assert canonical_workspace == canonical_execution_root / "workspace", (
+                "worker workspace is not the exact private attempt execution child"
+            )
+            provider_proxy_directory, provider_proxy_socket_path = (
+                sandbox_monitor_lifecycle.sandbox_provider_proxy_control_paths(
+                    state_path=execution["state_path"],
+                    expected_identity=identity,
+                )
+            )
+            provider_probe_result = workspace_root / "provider-probe-result"
+            provider_probe_release = workspace_root / "provider-probe-release"
+            if provider_proxy_cancel:
+                provider_probe_open = workspace_root / "provider-probe-open"
+            provider_started_path = workspace_root / "launch-driver-started"
+            probe_deadline = time.monotonic() + 15
+            while (
+                not _entry_is_present(provider_started_path) and time.monotonic() < probe_deadline
+            ):
+                time.sleep(0.05)
+            while (
+                not _entry_is_present(provider_probe_result) and time.monotonic() < probe_deadline
+            ):
+                time.sleep(0.05)
+            if not _entry_is_present(provider_probe_result):
+                current = supervisor._sandbox_execution_get(attempt["id"])
+                service_log = (
+                    service_log_path.read_text(encoding="utf-8", errors="replace")
+                    if service_log_path.exists()
+                    else "<launch-driver service log was not created>"
+                )
+                service_log = service_log.replace(runner["credential"], "[redacted]")
+                pytest.fail(
+                    "provider UDS in-cgroup probe did not pass; "
+                    f"phase={current['phase'] if current is not None else None!r}; "
+                    f"started={_entry_is_present(provider_started_path)}; "
+                    f"producer_result_ready={producer_result_receiver.poll()}; "
+                    f"service_log_tail={service_log[-4000:]!r}"
+                )
+            if provider_probe_open is not None:
+                open_deadline = time.monotonic() + 10
+                while (
+                    not _entry_is_present(provider_probe_open) and time.monotonic() < open_deadline
+                ):
+                    time.sleep(0.05)
+                assert _entry_is_present(provider_probe_open), (
+                    "worker did not retain a connected open partial provider request"
+                )
+            current = supervisor._sandbox_execution_get(attempt["id"])
+            assert current is not None and current["execution_id"] == execution["execution_id"]
+            assert current["phase"] == "running", (
+                f"worker left its running cgroup before the outside-peer probe: {current['phase']!r}"
+            )
+            workspace_path_text = current.get("workspace_root_path")
+            assert isinstance(workspace_path_text, str) and workspace_path_text, (
+                "running execution row has no bound worker workspace"
+            )
+            assert Path(workspace_path_text) == workspace_root, (
+                "running execution workspace changed during the provider probe"
+            )
+            execution_root = Path(current["bundle_path"]).parent
+            canonical_execution_root = execution_root.resolve(strict=True)
+            assert workspace_root.resolve(strict=True) == canonical_execution_root / "workspace", (
+                "worker workspace is not the exact private attempt execution child"
+            )
+            cgroup_path_text = current.get("cgroup_path")
+            assert isinstance(cgroup_path_text, str) and cgroup_path_text, (
+                "running execution row has no worker cgroup identity"
+            )
+            worker_cgroup = PurePosixPath(cgroup_path_text)
+            assert (
+                worker_cgroup.is_absolute()
+                and worker_cgroup.as_posix() == cgroup_path_text
+                and not any(part in {".", ".."} for part in worker_cgroup.parts)
+            ), "running execution row has a non-canonical worker cgroup identity"
+            execution = current
+            outside_cgroup, _, _ = _process_cgroup_identity(os.getpid())
+            assert not PurePosixPath(outside_cgroup).is_relative_to(worker_cgroup), (
+                "same-UID outside probe unexpectedly runs inside the worker cgroup"
+            )
+            outsider = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            outsider.settimeout(3)
+            try:
+                outsider.connect(str(provider_proxy_socket_path))
+                outsider.sendall(b"NOT-CONNECT / HTTP/1.1\r\n\r\n")
+                outside_response = outsider.recv(1024)
+            finally:
+                outsider.close()
+            assert b"403 Forbidden" in outside_response, (
+                "same-UID outside-cgroup peer reached request parsing instead of failing "
+                f"peer authorization: {outside_response!r}"
+            )
+            if not provider_proxy_cancel:
+                assert provider_probe_release is not None
+                provider_probe_release.write_text("release-provider-probe\n", encoding="ascii")
         assert producer_result_receiver.poll(35), "launch producer did not report its handoff"
         producer_result = producer_result_receiver.recv()
         assert identity is not None and execution is not None
@@ -4625,6 +5010,27 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             assert not os.path.lexists(isolation_home_scratch_path), (
                 "worker /home/agent scratch leaked into the host filesystem"
             )
+        if provider_proxy_uds:
+            assert provider_probe_result is not None
+            assert provider_probe_result.read_text(encoding="ascii") == (
+                "attempt-uds-policy-pass\n"
+            )
+            if provider_proxy_cancel:
+                assert provider_probe_open is not None
+                assert provider_probe_open.read_text(encoding="ascii") == ("partial-connect-open\n")
+            else:
+                assert provider_probe_release is not None
+                assert provider_probe_release.read_text(encoding="ascii") == (
+                    "release-provider-probe\n"
+                )
+            assert provider_proxy_directory is not None
+            assert provider_proxy_socket_path is not None
+            assert not os.path.lexists(provider_proxy_socket_path), (
+                "attempt provider proxy socket remained after production cleanup"
+            )
+            assert not os.path.lexists(provider_proxy_directory), (
+                "attempt provider proxy directory remained after production cleanup"
+            )
         if not cancel_after_start and not timeout_after_start and not lease_expiry_after_stop:
             assert durable["runc_exit_code"] == 0
         else:
@@ -4884,7 +5290,12 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
             ).fetchall()
         lease_before = {row["resource"]: row for row in lease_before_rows}
         assert set(lease_before) == set(task["resources"])
-        assert len(lease_before) == 2 + (2 if coding_task else 0)
+        assert len(lease_before) == (
+            2
+            + (2 if provider_proxy_uds else 0)
+            + (1 if provider_proxy_cancel else 0)
+            + (2 if coding_task else 0)
+        )
         assert len({row["lease_expires_at"] for row in lease_before.values()}) == 1
         expected_lease_expiry = next(iter(lease_before.values()))["lease_expires_at"]
         if lease_expiry_after_stop:
@@ -5217,6 +5628,15 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 f"pid={host_process_sentinel.pid}"
             )
     finally:
+        if (
+            provider_probe_release is not None
+            and not provider_proxy_cancel
+            and provider_probe_release.parent.is_dir()
+        ):
+            try:
+                provider_probe_release.write_text("release-provider-probe\n", encoding="ascii")
+            except OSError as error:
+                provider_probe_release_error = error
         for child in child_processes:
             child.join(timeout=30)
         live_children = [child.pid for child in child_processes if child.is_alive()]
@@ -5360,9 +5780,18 @@ def test_live_production_launch_driver_runs_exact_pinned_runc_request(
                 )
             _remove_private_test_tree(run_root)
         else:
-            pytest.fail(
+            teardown_error = (
                 "exact production-driver test units are not quiescent; preserving "
                 f"artifacts at {run_root}"
+            )
+            if provider_probe_release_error is not None:
+                teardown_error += f"; release marker also failed: {provider_probe_release_error}"
+            pytest.fail(teardown_error)
+        if provider_probe_release_error is not None:
+            pytest.fail(
+                "provider proxy release marker failed, but exact unit stop/quiescence and "
+                "fixture teardown completed: "
+                f"{provider_probe_release_error}"
             )
 
 
