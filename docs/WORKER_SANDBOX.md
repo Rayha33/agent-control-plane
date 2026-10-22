@@ -4264,9 +4264,10 @@ directory, state root, and bundle, and released the runtime. The run used no
 provider credentials or model/provider calls.
 
 The separate live guest evidence below covers the already-reported cleanup
-handoff and provider-proxy request/mount path. Keep #3447 and parent #2370 open
-until exact-diff independent QC, focused/full supported tests, and exact-head CI
-are all recorded.
+handoff and provider-proxy request/mount path. This evidence contributed to
+#3447's later closure after its focused review and CI gates passed. Parent #2370
+remains open because its broader per-attempt sandbox acceptance criteria are
+still outstanding.
 
 The opt-in `test_live_production_launch_driver_runs_exact_pinned_runc_request`
 also passed once in natural-completion mode and once in cancellation mode on
@@ -4286,3 +4287,27 @@ provider-proxy request/mount path. Together with the post-wait crash run above,
 they do not prove a full daemon restart, the registered `run_worker()` path,
 provider authentication, model calls, or end-to-end provider egress. Parent task
 #2370 and full acceptance remain open.
+
+### Recovered cleanup receipts in result evidence (2026-10-22)
+
+Result-candidate capture and result-import validation previously accepted
+version-1/version-2 receipts and the self-consistent version-3 action receipt,
+but rejected a valid version-4 crash-recovery receipt. Commit `95156f7e` routes
+both result readers through one exact-receipt validator, which adds the
+recovery-specific structural checks without weakening tamper rejection. The
+regression exercises the persisted recovered receipt through result import,
+checks that its exact receipt digest is retained, and rejects mutated and
+unexpected fields.
+
+Validation for that exact commit: full local `pytest` passed with 92
+platform/opt-in skips; Ruff check and format plus `uv build` passed; independent
+exact-diff QC returned GO with no P1/P2 findings; hosted CI run
+`39844524279` passed all four Ubuntu/macOS and Python 3.11/3.12 jobs. QC noted a
+non-blocking distinction: historical version-4 validation binds to the
+persisted launch plan, execution row, and pinned executable digest rather than
+requiring today's configured executable path/runtime version. This preserves
+historical receipt import across path/runtime-label changes when the pinned
+executable digest is unchanged; no cleanup action is performed by the result
+readers. This increment does not enable the provider route or prove registered
+provider-backed `run_worker()` execution. PR #42 remains draft/open, and
+#2370/#3441 remain open for their broader acceptance.
