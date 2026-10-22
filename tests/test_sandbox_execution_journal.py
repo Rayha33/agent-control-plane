@@ -33,6 +33,7 @@ from agent_control_plane.git_supervisor import (
 )
 from agent_control_plane.supervisor import claims as claims_module
 from agent_control_plane.supervisor import oci_worker
+from agent_control_plane.supervisor import reaper as reaper_module
 from agent_control_plane.supervisor import sandbox_attestation as sandbox_attestation_module
 from agent_control_plane.supervisor import sandbox_cleanup_verifier as verifier_module
 from agent_control_plane.supervisor import sandbox_execution_journal as journal_module
@@ -7681,6 +7682,11 @@ def test_reaper_quarantine_diagnoses_proxy_artifact_hold(
     submission_state: str,
 ) -> None:
     supervisor = GitSupervisor(repo)
+    supervisor.config = replace(
+        supervisor.config,
+        runtime_port_pools=(RuntimePortPool("ACP_TEST_PORT", 24004, 24004),),
+    )
+    supervisor._port_available = lambda _port: True
     attempt = claimed(supervisor)
     reserve(supervisor, attempt)
     if phase == "ambiguous":
@@ -7732,7 +7738,29 @@ def test_reaper_quarantine_diagnoses_proxy_artifact_hold(
             "SELECT lease_expires_at FROM resource_leases WHERE attempt_id = ?",
             (attempt["id"],),
         ).fetchall()
+        runtime_allocations = connection.execute(
+            "SELECT lease_expires_at FROM runtime_allocations WHERE attempt_id = ?",
+            (attempt["id"],),
+        ).fetchall()
     assert leases and all(item["lease_expires_at"] == CLEANUP_FENCE_EPOCH for item in leases)
+    assert runtime_allocations and all(
+        item["lease_expires_at"] == CLEANUP_FENCE_EPOCH for item in runtime_allocations
+    )
+
+
+def test_cleanup_hold_diagnostic_classifies_partial_submission_latch() -> None:
+    submission_state, reason = reaper_module._sandbox_execution_cleanup_hold_diagnostic(
+        {
+            "phase": "running",
+            "launch_submission_id": "launch-id",
+            "launch_submission_digest": "",
+            "launch_submission_at": "",
+        }
+    )
+
+    assert submission_state == "partial_or_ambiguous"
+    assert "phase=running, launch_submission=partial_or_ambiguous" in reason
+    assert "provider proxy artifact, if present, is retained" in reason
 
 
 def test_result_candidate_is_versioned_bound_and_never_authorizes_import(repo: Path) -> None:
