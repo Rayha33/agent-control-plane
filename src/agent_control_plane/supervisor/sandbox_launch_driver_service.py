@@ -2096,6 +2096,24 @@ def _execute_pinned_request(
                         )
                     exited = supervisor._sandbox_execution_get(attempt_id)
                     if exited is not None and exited["phase"] == "exited":
+                        # A handler may drain only after the worker has been
+                        # stopped. Retry shutdown now; never emit a cleanup
+                        # report while the host-side provider service remains
+                        # unverified, because postflight cannot observe its
+                        # handler threads independently.
+                        if not provider_proxy_closed:
+                            try:
+                                close_provider_proxy()
+                            except BaseException as close_error:
+                                launch_error.add_note(
+                                    "provider proxy shutdown remained unverified "
+                                    f"after worker stop: {type(close_error).__name__}"
+                                )
+                        if not provider_proxy_closed:
+                            raise SandboxLaunchDriverServiceError(
+                                "provider proxy shutdown remains unverified; "
+                                "sandbox cleanup report withheld"
+                            )
                         lease_loss_quarantine = (
                             exited.get("failure_reason") == _LAUNCH_DRIVER_LEASE_LOSS_REASON
                         )

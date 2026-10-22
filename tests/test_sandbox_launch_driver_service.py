@@ -574,7 +574,14 @@ def test_invalid_named_provider_policy_fails_before_request_creation(
 
 @pytest.mark.parametrize(
     "scenario",
-    ["complete", "cancel", "authorization_rejected", "authorization_commit_uncertain"],
+    [
+        "complete",
+        "cancel",
+        "proxy_close_unverified",
+        "proxy_close_drains_after_worker_stop",
+        "authorization_rejected",
+        "authorization_commit_uncertain",
+    ],
 )
 def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
@@ -681,6 +688,11 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
             assert timeout == 10.0
             events.append("proxy_close")
             self.listener.close()
+            close_attempt = events.count("proxy_close")
+            if scenario == "proxy_close_unverified" or (
+                scenario == "proxy_close_drains_after_worker_stop" and close_attempt < 3
+            ):
+                raise RuntimeError("provider proxy handler drain unverified")
 
     peer_authorizer = object()
     proxy_directory = state_root / "provider-proxy"
@@ -810,7 +822,11 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
         execution["phase"] = "exited"
 
     monkeypatch.setattr(service, "_record_driver_exit_with_lease_recovery", record_exit)
-    if scenario == "cancel":
+    if scenario in {
+        "cancel",
+        "proxy_close_unverified",
+        "proxy_close_drains_after_worker_stop",
+    }:
 
         def cancel_exact_attempt(*_args: object, **_kwargs: object) -> None:
             events.append("cancel_exact_attempt")
@@ -820,7 +836,9 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
             service, "_request_driver_failure_stop_and_cancel_monitor", cancel_exact_attempt
         )
     monkeypatch.setattr(
-        service.oci_worker, "_delete_pinned_runc_container", lambda *_args, **_kwargs: object()
+        service.oci_worker,
+        "_delete_pinned_runc_container",
+        lambda *_args, **_kwargs: events.append("delete_runc") or object(),
     )
 
     def execute_request() -> None:
@@ -842,6 +860,27 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
     if scenario == "cancel":
         with pytest.raises(KeyboardInterrupt):
             execute_request()
+    elif scenario == "proxy_close_unverified":
+        with pytest.raises(RuntimeError, match="handler drain unverified"):
+            execute_request()
+        assert execution["phase"] == "exited"
+        assert events.count("proxy_close") == 3
+        assert "delete_runc" not in events
+        assert "record_cleanup" not in events
+        assert proxy_directory.is_dir()
+        return
+    elif scenario == "proxy_close_drains_after_worker_stop":
+        with pytest.raises(RuntimeError, match="handler drain unverified"):
+            execute_request()
+        assert events.count("proxy_close") == 3
+        assert events.index("cancel_wait") < max(
+            index for index, event in enumerate(events) if event == "proxy_close"
+        )
+        assert execution["phase"] == "exited"
+        assert events.index("delete_runc") < events.index("record_cleanup")
+        assert proxy_directory.is_dir()
+        assert list(proxy_directory.iterdir()) == []
+        return
     elif scenario in {"authorization_rejected", "authorization_commit_uncertain"}:
         with pytest.raises(RuntimeError, match="authorization"):
             execute_request()
@@ -863,7 +902,7 @@ def test_pinned_request_leaves_provider_directory_for_independent_cleanup(
     assert events.index("wait") < events.index("proxy_close")
     assert events.index("proxy_close") < events.index("record_exit")
     assert events.index("listener_close") < events.index("record_exit")
-    if scenario == "cancel":
+    if scenario in {"cancel", "proxy_close_drains_after_worker_stop"}:
         assert events.index("proxy_close") < events.index("close_gate")
         assert events.index("close_gate") < events.index("cancel_exact_attempt")
         assert events.index("cancel_exact_attempt") < events.index("cancel_wait")

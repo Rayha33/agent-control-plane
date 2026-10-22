@@ -4101,13 +4101,27 @@ after collector-issued runtime attestation and the durable `running` record,
 but before the inherited runc gate is released. The existing peer authorizer
 still treats the exact worker cgroup as the principal and fails closed when
 kernel PIDFD or proc/cgroup checks are unavailable. After the exact runc wait,
-the normal path closes tracked channels and tunnels, joins handlers, and
-removes only its empty directory. The error path first closes/revokes the
-proxy, then uses the existing exact-monitor stop/cancel flow; an unverified
-close is recorded and does not satisfy cleanup. Independent postflight can
-remove a stale mode-0600 socket and mode-0700 directory only after the
-recorded units, processes, and cgroup are quiescent; unknown entries or
-identity changes remain fenced.
+the normal path closes tracked channels and tunnels and joins handlers, but
+closing the listener does not itself authorize deleting its directory. Once
+launch submission may have begun, the driver retains that directory for the
+independent cleanup verifier unless an exact durable reread proves the same
+execution is still `reserved` with no submission latch. If the submission
+callback never began, the driver may remove its exact empty directory after
+closing the proxy; if the callback began but returned no receipt, removal
+requires that exact reread. A returned launch-submission receipt or
+failed/uncertain reread leaves the directory retained. For a new verification,
+the verifier accepts only the exact `cleanup_reported` execution with kernel
+`waitpid` evidence and a self-consistent cleanup receipt; an
+already-`cleanup_verified` execution is returned idempotently only when its
+stored verification receipt is self-consistent. Under the execution fence it
+checks the recorded systemd units and processes, runc-state absence, and cgroup emptiness, removes only
+identity-bound paths and the provider proxy directory, then rechecks process,
+cgroup, and unit state before recording verification. Proxy close/drain
+failure is reported as unverified and is not cleanup proof; when a launched
+handle exists, the error path attempts exact-monitor stop/cancel and retries
+proxy shutdown after the worker stops. If shutdown remains unverified, the
+driver withholds the cleanup report and leaves the execution fenced. Unknown
+entries, identity changes, or failed rechecks remain fenced.
 
 **Scoped live guest qualification (2026-10-22):** The opt-in production
 launch-driver test passed once in natural-completion mode and once in
